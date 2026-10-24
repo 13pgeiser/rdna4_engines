@@ -87,9 +87,7 @@
 #include <arch/rad_block_mtp_fp8.h>
 #include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_vit.h>
-#include <arch/rad_prefill_pipe.h>
 
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -284,6 +282,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
 
     Dflash2::Config dc{};
+    dc.short_block = 1;   /* rad_drafter_short_block below */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -434,6 +433,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_FORMAT;
     }
     RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.df.block_lo > 0) RAD_ARCH_TRY(rad_drafter_short_block(b, m.df.block_lo));
 
     rad_note(b, "DFlash2 drafter: %lld layers at absolute %d..%d, %lld heads / %lld kv x %lld, "
                 "ffn %lld, %s attention with a %lld-token window, %d trunk tap(s); one forward "
@@ -604,17 +604,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
                  (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
 
-    /* The SSM state cache is f32.
+    /* The SSM state cache is f32, or f16 under --state-cache-dtype f16 (RadBuildCtx::state_dtype).
      *
      * State reads and writes dominate the two GDN kernels: one [128,128] state is 64 KiB at f32,
-     * and a speculative step writes one per candidate token per head, since the surviving
-     * candidate is unknown until after the layer. At depth 7 that is hundreds of MB per rank per
-     * step; f16 would halve it. libr4d compiles both widths (`SDT`) and the f16 round-trip error is
-     * ~5e-4 relative (elements are O(0.1)); vLLM's `--mamba-ssm-cache-dtype` is commonly float16.
-     * It stays f32 because f16 changes the generated text. */
+     * and a step reads a sequence's state and writes it back (under the anchor form once, whatever
+     * the draft depth). libr4d compiles both widths (`SDT`, from the cache's dtype); the f16
+     * round trip is ~5e-4 relative (elements are O(0.1)). f16 halves the state pool, its host
+     * checkpoints and the state traffic, and changes the generated text, so f32 is the default. */
     RadKVGroupDecl sd{};
     sd.kind         = RAD_KV_LINEAR;
-    sd.dtype        = RAD_F32;
+    sd.dtype        = ctx->state_dtype == RAD_F16 ? RAD_F16 : RAD_F32;
+    if (sd.dtype == RAD_F16) rad_note(b, "GDN state cache f16 (--state-cache-dtype f16)");
     sd.n_head_kv    = gc.n_head_v;
     sd.state_dim[0] = gc.head_v;
     sd.state_dim[1] = gc.head_k;
@@ -890,22 +890,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
 #if !QWEN35_MOE
-    /* The pipelined prefill (step_pipelined), wherever a step can be wide enough, at the rank
-     * counts RADIANCE_PREFILL_PIPELINE allows (rad_prefill_pipe.h: two by default). Its second
-     * lane touches the residual stream, the normed input in both forms and the bounds, so those
-     * leave the sharing pool (the drafter taps are copied on the first lane: pipe_taps)
-     * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
-     * transient dead before the kernels that take them raw. */
-    /* Not on a trunk whose norms write rotated int8 codes (qwen35_w8a8 where libr4d serves the
+    /* The pipelined prefill (step_pipelined), at two ranks wherever a step can be wide enough.
+     * Its second lane needs a narrow `overlap` all-reduce beside the GEMMs; two ranks is the only
+     * rank count where the step has been timed against the serial one, so elsewhere prefill stays
+     * serial. The second lane touches the residual stream, the normed input in both forms and the
+     * bounds, so those leave the sharing pool (Ctx::lane1_; the drafter taps are copied on the
+     * first lane, pipe_taps); the bounds also because no declared op reads them, which would leave
+     * a transient dead before the kernels that take them raw.
+     *
+     * Not on a trunk whose norms write rotated int8 codes (qwen35_w8a8 where libr4d serves the
      * `_had_quant_i8g` forms, a_h.q8_fed): the boundary norms on the second lane
-     * (NormQuantFP8::step_plain) issue the E4M3 pair only, and that int8 path is unmeasured, so such a
-     * trunk prefills serially, as before this pipeline. */
+     * (NormQuantFP8::step_plain) issue the E4M3 pair only, so such a trunk prefills serially. */
     if (m.a_h.q8_fed) {
-        if (g.world > 1 && g.max_tok >= kPipeMinRows && ctx->rank == 0)
+        if (g.world == 2 && g.max_tok >= kPipeMinRows && ctx->rank == 0)
             fprintf(stderr, "radiance: qwen35: the pipelined prefill stays off on this trunk: its norms "
                             "write rotated int8 codes, which the pipeline's boundary norms do not\n");
     } else {
-        m.pipe_on = g.max_tok >= kPipeMinRows && rad::arch::prefill_pipeline(b, (int)g.world, "qwen35");
+        m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows;
     }
     if (m.pipe_on) {
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_x));
@@ -1215,8 +1216,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * block's all-reduce at `overlap` 1 (a narrow launch that leaves the CUs to the compute beside it;
  * the fused all-reduce and norm would hold its blocks on the card while it waits on the link and
  * slow the GEMM beside it by a third), then the next block's plain norm, and after a feed-forward
- * that keeps its add, the add and the final norm (the drafter taps go on the first lane, pipe_taps). Measured on Qwen3.8-27B at two
- * R9700s: a 41k-token prompt 9.0 -> 8.4 s.
+ * that keeps its add, the add and the final norm (the drafter taps go on the first lane, pipe_taps).
  *
  *   mixer     the delta net and the dense attention run whole a piece at a time and hand the
  *             first piece off behind its out projection (ArPieces), so its boundary runs beside
@@ -1228,12 +1228,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * band of a whole step (pipe_rows), the all-reduce reduces within a row, the delta net carries its
  * state through the cache as between two chunks, and each attention piece sees the cache up to its
  * own end. The narrow all-reduce and the plain norm write the fused op's bytes, so a pipelined
- * step is bit for bit the serial one (Qwen's KL recordings compare equal).
+ * step is bit for bit the serial one.
  *
  * The second lane's requirements (Ctx::lane1_) hold: every collective of the step is on it, the
  * embedding's included; none carries a device-wide arrival counter (the all-reduce's sequence
  * counters order its own launches, which one lane keeps in order); and the buffers it touches left
- * the sharing pool at declare -- not the drafter taps, which it no longer touches (pipe_taps). */
+ * the sharing pool at declare (the drafter taps it does not touch: pipe_taps). */
 
 template <class F>
 static void pipe_on1(RadCtx* c, const F& issue) {
@@ -1363,8 +1363,7 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
         rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
             RAD_OK) {
         rad_step_fail(c, "qwen35: the pipelined prefill's piece bounds could not be put on the card "
-                         "(no pinned host memory, or the copy failed); RADIANCE_PREFILL_PIPELINE=off "
-                         "runs prefill serially");
+                         "(no pinned host memory, or the copy failed)");
         *failed = true;
         return nullptr;
     }
@@ -1553,6 +1552,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
+    out->state_f16_ok = 1;
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);

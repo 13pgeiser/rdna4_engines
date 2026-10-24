@@ -5,9 +5,15 @@
  * `done()` folds its result back once every rank has run it. Requests arrive from HTTP threads
  * through `submit()` and leave through their AudioTicket.
  *
- * A request holds a lane and two KV sequences, its conditional and unconditional branches, from
- * admission to its last window; both are reserved for the whole piece at admission (prompt plus
- * every frame the request may make), so a request in flight never waits for KV.
+ * A request holds a lane and two KV sequences, its conditional and unconditional branches (one,
+ * for a model of one branch: RadAudioGenDecl::branches), from admission to its last window; they
+ * are reserved for the whole piece at admission (prompt plus every frame the request may make), so
+ * a request in flight never waits for KV.
+ *
+ * The language model's KV is one paged full-attention group, beside which a hybrid model keeps
+ * the linear-attention state and convolution groups of its recurrent layers (RAD_KV_LINEAR,
+ * RAD_KV_CONV): one slot a sequence each, staged as their `state_index` rows, zeroed by the engine
+ * before the pass that first reads them.
  *
  * Pass priority, one pass at a time:
  *
@@ -54,6 +60,9 @@ public:
     /* The longest sequence a branch holds: the whole prompt and every frame. The KV group is
      * sized from it. */
     static int64_t max_seq_rows(const RadAudioGenDecl& d) { return d.max_prompt + d.max_frames + 1; }
+    /* State slots a state_index row holds at most: the state, and the scratch a kernel serving
+     * speculation asks for (RadKVGroupBatch::state_index_pitch), which a generator never runs. */
+    static constexpr int64_t kMaxStateWidth = 8;
 
     /* ---------------------------------------------------------- HTTP threads */
     /* Queue a request, refused at once with `why` when it can never run. */
@@ -115,7 +124,11 @@ private:
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_CU, R_SLOT, R_BT, R_USED, R_LANE, R_LAST, R_FRAME, R_SEED,
            R_T, R_TN, R_CFG, R_PAIR, R_WLANE, R_FLAGS, R_WIDX, R_WF0, R_WNF, R_LCU, R_LSRC,
-           R_ESLOT, R_LROW, R_PREFIX, R_N };
+           R_ESLOT, R_LROW, R_PREFIX, R_CTX, R_ACC, R_SBT, R_SIDX, R_PSLOT, R_PPOS, R_PUSED,
+           R_RAUD, R_RCU, R_RFRM, R_N };
+    /* A hybrid model's stateful groups (linear-attention state, convolution history), each staged
+     * as one block-table word a sequence (its slot) and its state_index row. */
+    struct StateGroup { int32_t g = 0; int64_t width = 1; };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -124,6 +137,9 @@ private:
     int  upload();
     void base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int32_t max_ctx, int step,
                       bool kv, int64_t bt_pitch);
+    /* The stateful groups' rows for the entries of a PROMPT or FRAME pass, entry e being `seq[e]`,
+     * with each entry's context before the pass (ctx_lens). */
+    void stage_state(const std::vector<uint64_t>& seqs, const std::vector<int32_t>& ctx);
 
     int  admit_locked();
     void release_locked(Job& j);
@@ -152,6 +168,8 @@ private:
     int64_t             max_tok_ = 0, max_seqs_ = 0;
     int64_t             block_size_ = 0, max_blocks_ = 0;
     int32_t             kv_group_ = 0;
+    std::vector<StateGroup> state_groups_;
+    int                 nb_ = 2;            /* sequences a request: RadAudioGenDecl::branches */
     bool                neg_own_ = false;   /* the unconditional prompt is the request's own */
     std::vector<RankIO> ranks_;
     IKVManager*         kv_ = nullptr;
@@ -167,12 +185,12 @@ private:
 
     std::vector<RadBatch>         out_;      /* one per rank */
     std::vector<RadAudioGenBatch> aout_;
-    std::vector<RadKVGroupBatch>  kout_;
+    std::vector<RadKVGroupBatch>  kout_;    /* [rank][1 + state groups] */
     Pass                          pass_;
     bool                          frame_turn_ = true;   /* FRAME goes first when both are due */
     /* Host arrays a pass's plugin reads on the host (the _h fields), for the life of the pass. */
     std::vector<int32_t>          h_lane_, h_last_, h_frame_, h_wlane_, h_flags_, h_widx_,
-                                  h_wf0_, h_wnf_, h_lcu_;
+                                  h_wf0_, h_wnf_, h_lcu_, h_rcu_, h_rfrm_;
 
     mutable std::mutex              mu_;
     std::deque<std::unique_ptr<Job>> jobs_;  /* arrival order */

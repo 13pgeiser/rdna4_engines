@@ -1263,14 +1263,16 @@ libref function says which (`libref/ref_audio.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
+| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt `stride`/opt `cu_div`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
 | `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
-| `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
-| `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt | `codes`, `t0`w, `t1`w → `y` |
+| `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt `top_p`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
+| `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt `clamp`/opt | `codes`, `t0`w, `t1`w → `y` |
+| `vq_encode` | `M`(range) `n` `dim` `bins` `dtype` | `x`:inout, `in_w`w, `in_b`w, `cb`w, `out_w`w, `out_b`w → `codes` |
 | `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
 | `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
+| `ras_pick` | `M`(range) `win` `lo` `hi` `rep`/opt `clear`/opt | `first`, `alt`, `lane`, `hist`:inout → `ids` |
 | `frame_store` | `M`(range) `n_codes` `stride` `rep`/opt `skip`/opt | `codes`, `lane`, `frame`, `status`, `dst`:inout |
 | `resample_nearest` | `M`(range) `n` `dtype` | `x` → `y` |
 | `fourier_embed` | `M`(range) `n` `round`/opt `dtype` | `t`, `w`w → `y` |
@@ -1295,14 +1297,34 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `cond_k` > 0 only the entries where `c` reaches its `cond_k`-th largest value are. The `k`
   largest `g` (ties to the lower index) are kept, divided by `temp`, softmaxed in f32 and drawn by
   inverse CDF in descending `g`, `u = rad_philox_uniform_s(seed, 2^32 + frame, stream)`
-  (`abi/rad_philox.h`); the pick goes to every one of the lane's `rep` slots. `logits`
-  `[rep n, n_vocab]` f32 or bf16, `seed` `[n, 2]` u32 low word first, `frame` `[n]`.
+  (`abi/rad_philox.h`); the pick goes to every one of the lane's `rep` slots. With `top_p` < 1
+  (Fish Audio's draw) the kept list is cut first: over the softmax of every candidate's `g / temp`
+  (its normaliser summed in index order), a kept rank whose inclusive cumulative probability in
+  descending `g` exceeds `top_p` is dropped, rank 0 never, so the nucleus is taken over the whole
+  distribution and the `k` cut applies after it. `logits` `[rep n, n_vocab]` f32 or bf16, `seed`
+  `[n, 2]` u32 low word first, `frame` `[n]`.
+- `ras_pick`: Fish Audio's repetition-aware sampling, a choice between two draws of each lane:
+  `ids[rep i] = alt[rep i]` when `first[rep i]` is in `[lo, hi)` and the lane's window holds it,
+  else `first[rep i]`. The window `hist` `[lanes, win]` i32 is the lane's last `win` picks, oldest
+  first, -1 empty (`clear` 1 empties it first, for a piece's first pick); the pick then enters it
+  and the oldest leaves. A pick outside `[lo, hi)` (an end of speech) is never redrawn.
 - `end_status`: `status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]`.
 - `rvq_embed`: `codes` is code-major `[n_codes, rows]`, read at the operand's own strides (a block
   of a wider plane is a view);
   `y = bf16(bf16(t0[c_0 + off0] + bf16(sum_k t1[c_k + (k - 1) vocab])) * scale)`, or with `round` 1
   one f32 sum of every codebook's row in codebook order, times `scale`, rounded once to `y`'s dtype.
   A first code outside `t0` leaves its row unwritten; a later code outside `t1` adds nothing.
+  With `clamp` n > 0 a code above `n - 1` reads row `n - 1` (before `off0` and the codebook's
+  offset; a negative code still reads nothing): a codec whose codebooks are smaller than the heads
+  that write its codes, as Fish Audio's 1024-entry residual codebooks under 4096-way heads.
+- `vq_encode`: one step of a residual vector quantiser with factorised, L2-normalised codes (DAC's,
+  as Fish Audio's codec encodes a reference): per row of `x` `[rows, n]`, `e = in_w x + in_b`
+  (`in_w` `[dim, n]`, a 1x1 convolution's weight); the code is the row of `cb` `[bins, dim]` of
+  greatest cosine with `e`, `(e / max(|e|, 1e-12)) . (cb_c / max(|cb_c|, 1e-12))`, the lower index
+  on a tie (0 when no score is above -inf), written to `codes[i]` at the operand's own stride; then
+  `x -= out_w cb[code] + out_b` (`out_w` `[n, dim]`, the raw codebook row), rounded once into `x`.
+  f32 arithmetic. A chain of these over a codec's codebooks, each quantising what the last left, is
+  its residual quantiser.
 - `frame_store`: `dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]` for every `k`,
   when `frame >= skip` and `status[lane] >= 0`: a frame's codes into its lane's history, each
   codebook a row over the lane's frames, so a run of a lane's frames is a block of `n_codes`
@@ -1345,7 +1367,14 @@ input reads zero outside it.
 - `conv1d`: PyTorch's `[cout, cin, k]` weight, `k` odd, dilation `dil` and padding
   `dil (k - 1) / 2` a side, or with `causal` 1 (any `k`) `dil (k - 1)` on the left; `res` is added
   after the bias, then `act` `none`, `tanh` or `clamp`, `min(max(y, -1), 1)` (BigVGAN's output
-  clamp; a NaN stays NaN). f32 accumulation, one rounding.
+  clamp; a NaN stays NaN). f32 accumulation, one rounding. `stride` s > 1 (causal only, the reach
+  `dil (k - 1) + 1` at least s) pads `dil (k - 1) + 1 - s` on the left and keeps every s-th row:
+  output row `o` of a sequence reads input rows `o s - pad + t dil`, and sequence `e`'s rows
+  `[cu[e], cu[e+1])` become `[cu[e] / s, cu[e+1] / s)`, so every bound is a multiple of s; `res`
+  and `y` have the output's rows (a causal codec encoder's downsampling, as Fish Audio's).
+  `cu_div` reads the bounds in units that many input rows apart, as the other encoder ops do:
+  sequence `e` is input rows `[cu[e] / cu_div, cu[e+1] / cu_div)`, each bound a multiple of
+  `cu_div` times the stride, so one bounds array in samples serves every rate of an encoder.
 - `conv_t1d`: PyTorch's `[cin, cout, k]` transposed weight, any `k` of at least a stride (two
   strides by default), padding `pad` (`(k - stride) / 2` by default, which needs `k - stride` even;
   0 is the causal form, whose full output's last `k - stride` rows are dropped; it may exceed a
@@ -2160,11 +2189,7 @@ start above 524288 elements (8192 at eight ranks), a band edge of the ranged `nu
 all-reduce kernel serves `y` absent, in place. `overlap` 1 says the caller issues the collective on
 its second lane, beside compute; libr4d then picks rows with a narrow launch (8 blocks of 256
 threads at two ranks, 4 of 1024 for the four-rank two-shots, exact and tiered-int8) that compute the
-same bits and leave the CUs to the kernels running beside them. At three and eight ranks the lane
-rows (exact at both, tiered-int8 at three) launch as the wide rows unless `R4D_AR_LANE_3_8=1` gives
-them the four-rank launch, unmeasured there (GUIDE §4.7); the eight-rank one starts above 524288
-elements, so an `overlap` 1 message of 8193..524288 elements keeps the wide two-shot there. libref
-ignores it.
+same bits and leave the CUs to the kernels running beside them. libref ignores it.
 
 libr4d serves these at 2, 3, 4 and 8 ranks:
 
@@ -2534,6 +2559,29 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
+| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
+| `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
+
+`mtp_couple_propose` and `mtp_couple_verify` are the linear-MTP coupling (`--draft-coupling on`),
+and nothing else in the engine knows about coupling. Turning coupling on requires the
+linear serial draft chain: a block drafter (`RAD_DRAFT_BLOCK`) or no drafter at all is refused at
+bringup, because neither has a per-round draw to couple. The `spechub` plugin ships both rows and
+their host oracle in one library and marks them per row, so the device rows count as production
+kernels while the oracle stays reference; on a machine with no card only the oracle is left, and
+the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
+if it is set, it must name `spechub` or the coupled ops are not loaded at all.
+
+`mtp_couple_propose` runs on a draft round's
+final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
+scores at temperature 1; it writes `x` into column 0 of `idx` and one state row per round. A row
+whose `seq_ids` does not name the card its draw was staged for, or whose shortlist is malformed,
+leaves column 0 alone with `status = -1`. `mtp_couple_verify` runs after `sample_pick`, over the same
+final candidate plane, and applies the maximal coupling: the draft is accepted when it equals the
+token the target itself drew at that position, and otherwise the token is a draw from the FP64
+residual `(P - Q)+`. Both use 53-bit uniforms at `params.pos`; a row whose state is not bound to
+that seed and position keeps the ordinary token. `P` is FP64-normalised where `sample_pick` is
+FP32/24-bit, so a coupled row realizes the ideal filtered target law and is **not** seed-identical
+to the ordinary pick.
 
 `sample_temp` divides a row's logits by its `temp` and leaves a row whose `temp` is 0 or less, or
 exactly 1, as it is. The sampler relies on that: a step none of whose chain rows has another
@@ -2887,7 +2935,7 @@ contributes nothing, and a row with no visible key outputs zero. The softmax is 
 rounded once. `scale` is positive and finite and comes from the original query/key head width,
 not the latent width (GLM: `1/sqrt(256)` against a latent of 512).
 
-libr4d has two `mla_attn` rows, both at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
+libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
 heads are the WMMA tile's rows, so all of them share each latent load, and the probabilities enter
 it as bf16 high and low parts with f32 accumulation. At a multiple of 16 a tile holds 16 heads of
@@ -2898,6 +2946,19 @@ by table position, with a second pass where the two differ. Other head counts ta
 `mla_attn_bf16`: a wave per head with an online softmax. Both split a short batch's history across
 workgroups and merge the f32 partials before narrowing, into the fixed scratch their hooks
 reserve; without scratch they compute unsplit.
+
+At exactly 64 heads the rows row, `mla_attn_rows_bf16`, ranks above both. A workgroup takes one
+query row and all its heads, four waves to each group of sixteen, and loads each 16-token key chunk
+once for all of them, where the matrix row loads it once a tile of sixteen. The scores are
+`K Q^T`, tokens as the tile's rows and heads as its columns, so a head's running maximum and
+denominator stay in its lane; the four waves of a group each take a quarter of the latent's dot
+products and add the four partials in one order, and the probabilities reach the value product
+through a lane swap instead of LDS. The next chunk's keys are fetched while the current one is
+multiplied. A row's output does not depend on the other rows of the batch, so a run of rows gives
+the bytes the whole batch would. Under 32 rows (a decode step at one rank) too few workgroups fill the card, and its launcher
+runs the matrix row's kernel instead. It also takes multiples of 32 heads (two groups a
+workgroup), which no constraint routes to it. GLM-5.3 splits a prefill's MLA by rows under tensor
+parallelism, so each rank holds all 64 heads of its rows (ARCHITECTURES.md, `glm5next`).
 
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.

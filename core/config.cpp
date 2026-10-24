@@ -56,6 +56,10 @@ static const Flag g_flags[] = {
                                         "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
                                         "and 4, none at 8" },
     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
+    { "--tp-attn-split",      "MODE",   "heads (default) | rows -- how a prefill-sized step's\n"
+                                        "attention splits over the ranks: rows gives each rank all\n"
+                                        "heads of its rows, a faster prefill for the projections at\n"
+                                        "full width on every card; not bit-identical to heads" },
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
@@ -75,6 +79,9 @@ static const Flag g_flags[] = {
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
+                                        "f16 halves the state pool, its checkpoints and its traffic,\n"
+                                        "and is lossy; the qwen35 plugins serve it" },
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
@@ -158,6 +165,13 @@ static const Flag g_flags[] = {
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
+    { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
+                                        "from N decoding sequences on (0 never, the default): the\n"
+                                        "long block pays at one sequence, the short one at many" },
+    { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter samples each proposal\n"
+    "                                    from its own shortlist and the sampler couples the target's draw\n"
+    "                                    to it: more accepted drafts on sampled requests, the same output\n"
+    "                                    law, other tokens than off for a fixed seed" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -441,6 +455,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "wht6"))  c->tp_wire_exact = 0;
             else { RAD_ERR("--tp-wire takes exact or wht6, not '%s'", v); return RAD_E_INVAL; }
         }
+        else if (S("--tp-attn-split")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "heads")) c->tp_attn_rows = 0;
+            else if (!std::strcmp(v, "rows"))  c->tp_attn_rows = 1;
+            else { RAD_ERR("--tp-attn-split takes heads or rows, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--p2p")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "auto")) c->p2p = RAD_P2P_AUTO;
@@ -491,6 +511,14 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
+        }
+        else if (S("--state-cache-dtype")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "f32") && std::strcmp(v, "f16")) {
+                RAD_ERR("--state-cache-dtype takes f32 or f16, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->state_cache_dtype = v;
         }
         else if (S("--attn-prefill-fp8")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -649,6 +677,16 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "adaptive")) c->draft_window = DraftWindow::Adaptive;
             else {
                 RAD_ERR("--draft-window takes fixed or adaptive, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-short-from"))      { if (!num(0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL; }
+        else if (S("--draft-coupling")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_coupling = false;
+            else if (!std::strcmp(v, "on"))  c->draft_coupling = true;
+            else {
+                RAD_ERR("--draft-coupling takes off or on, not '%s'", v);
                 return RAD_E_INVAL;
             }
         }
@@ -1034,6 +1072,7 @@ const ShowRow kShow[] = {
           return or_none(s, "every library found"); } },
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
+    { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },
     { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
     { "--p2p",                [](const Config& c) {
           return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
@@ -1049,6 +1088,7 @@ const ShowRow kShow[] = {
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
+    { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
@@ -1087,6 +1127,9 @@ const ShowRow kShow[] = {
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
+    { "--draft-short-from",   [](const Config& c) {
+          return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
+    { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

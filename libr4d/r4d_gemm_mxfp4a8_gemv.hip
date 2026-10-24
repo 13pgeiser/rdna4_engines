@@ -13,15 +13,15 @@
 // Two forms, chosen from K alone so that a row's output bits do not depend on how many rows the
 // step carries (a verify step's first row is bit-identical to a plain decode of it):
 //
-// - K a multiple of 128: the WMMA form. One 16-column tile a block (two from 25 rows where N >= 4096,
-//   K >= 3072 and the tile count is even), eight waves on
-//   its K in chunks of one 128 block, and up to four 16-row tiles (M <= 64), each weight word
-//   multiplied with every row tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step straight
-//   from the fragment-order weight (the order is the fragment's), the rows sit in the A fragments
-//   (rows >= M zero), and v_wmma_f32_16x16x16_fp8_fp8 multiplies. The per-(row, 128) activation scale is
-//   applied to each chunk's partial. At M = 1 the WMMA does sixteen times the work it needs, which
-//   costs nothing next to the weight stream; from M = 2 up it is what keeps the kernel on the
-//   stream (the dot form pays a dot per row).
+// - K a multiple of 128: the WMMA form. One 16-column tile a block (two from 25 rows where
+//   N >= 4096, K >= 3072 and the tile count is even), eight waves on its K in chunks of one 128
+//   block, and up to four 16-row tiles (M <= 64), each weight word multiplied with every row
+//   tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step
+//   straight from the fragment-order weight (the order is the fragment's), the rows sit in the A
+//   fragments (rows >= M zero), and v_wmma_f32_16x16x16_fp8_fp8 multiplies. The per-(row, 128)
+//   activation scale is applied to each chunk's partial. At M = 1 the WMMA does sixteen times the
+//   work it needs, which costs nothing next to the weight stream; from M = 2 up it is what keeps
+//   the kernel on the stream (the dot form pays a dot per row).
 // - Otherwise (K = 64 mod 128): the dot form. A lane loads 16 bytes -- four columns' eight codes of
 //   one k-step -- so a wave reads four k-steps, 512 contiguous bytes, from each of its TN tiles, and
 //   multiplies with v_dot4_f32_fp8_fp8; the activation a lane reads (eight k of each row) serves its
@@ -160,16 +160,11 @@ void r4d_gemm_mxfp4a8_gemv_kernel(
 // weight streams once whatever M is, and a row's sum is its tile's chain alone -- the same at every RT
 // and TN.
 //
-// TN: the activation is read per block, so one column tile a block reads all of it N/16 times (356 MB
-// from L2 at M = 64 on a 27B's 17408-row gate_up, against its 47 MB weight). Two tiles a block load
-// each activation fragment once for both. r4d_selftest --perfmxd, clocks warmed, TN 1 -> 2: 17408 x 5120
-// at 32 rows 125 -> 85 us, at 64 157 -> 122; 5120 x 8704 75 -> 56, 95 -> 75; 21504 x 5376 154 -> 111,
-// 183 -> 150; at 16 to 24 rows within a few percent either way. Four tiles spill past 32 rows.
-// Narrow or shallow weights lose with two (fewer blocks than the part has units, a short K a wave):
-// at 32..64 rows 1024 x 2048 +7..30 %, 2048 x 2048 +6..28 %, 2048 x 4096 +4..37 %, 6144 x 1536 at 32
-// rows +14..30 % (two repetitions each), so the launcher takes two from N 4096 and K 3072 only, where
-// every measured shape gained or held (4096 x 2048 even, 14336 x 4096 64 rows 120 -> 90 us,
-// 4096 x 7168 67 -> 55).
+// TN: the activation is read per block, so with one column tile a block it is read N/16 times
+// (356 MB from L2 at M = 64 on a 17408 x 5120 weight, against its 47 MB). Two tiles a block load
+// each activation fragment once for both. On narrow or shallow weights two tiles lose (fewer
+// blocks than the part has units, a short K a wave), so the launcher takes two only from N 4096
+// and K 3072, past 24 rows. Four tiles spill past 32 rows.
 template <bool ABLK, int RT, int TN = 1>
 __global__ __launch_bounds__(R4D_MXG_KW * 32)
 void r4d_gemm_mxfp4a8_gemvw_kernel(

@@ -17,23 +17,19 @@
 // split the K slabs; each writes an fp32 partial [DKS][M][N], and the last to arrive (an
 // agent-scope counter per column block) sums them, with no second launch.
 //
-// Split, slab and load hint follow a rule tuned per cell on the 27B's per-rank shapes at
-// M = 8..128 (tunables `ks`, `bk`, `nt`; 0 selects the rule):
-//   - split: the smallest power of two whose grid reaches 48 blocks at M <= 16, 56 at M <= 96 and
-//     40 above; for K >= 8192 keep doubling while a split has >= 24 128-wide slabs; never past
+// Split, slab and load hint follow a rule tuned on the 27B's and TranslateGemma's per-rank shapes
+// (tunables `ks`, `bk`, `nt`; 0 selects the rule):
+//   - split up to 64 rows: the smallest power of two whose grid reaches 48 blocks at M <= 16 and
+//     56 above; for K >= 8192 keep doubling while a split has >= 24 128-wide slabs; never past
 //     ks*M = 512, where partial traffic outweighs the gain.
-//   - slab: 128, or 64 where LDS per block would cost a wide or deeply split grid its resident
-//     blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and a 2-way split widens to 4).
-//     The rule was tuned when the weight was staged through LDS too, (16*DTM + 128) * (DBK+8)
-//     bytes a block; the multi-fragment kernel now takes 2 * 16*DTM * (DBK+8).
-//   - past 64 rows, re-tuned for the register kernel (r4d_selftest --perfmxd, warmed, every split
-//     1..8 at both slabs on the 27B's and TranslateGemma's per-rank shapes at 96 and 128 rows): the
-//     128-wide slab always (it never lost to 64), and a split only while every split keeps 16 slabs,
-//     towards a 48-block grid or, at K >= 8192, regardless, up to ks*M = 1024 split rows. Against the
-//     old rule at 96 / 128 rows: 5120 x 8704 116 / 160 -> 116 / 149 us (a split of 4), 6144 x 5120
-//     97 / 105 -> 87 / 109, 5120 x 3072 79 / 67 -> 60 / 69 (none), 17408 x 5120 187 / 215 -> 175 / 197
-//     (the wide slab). A different split changes a split row's summation order, so bits move here.
+//   - split past 64 rows: double only while every split keeps 16 128-wide slabs, towards a
+//     48-block grid or, at K >= 8192, regardless; never past ks*M = 1024.
+//   - slab: 128, or 64 where LDS per block would cost a wide grid its resident blocks (see
+//     mxd_plan); past 64 rows always 128. A K not a multiple of 128 takes 64 (and a 2-way split
+//     widens to 4).
 //   - non-temporal weight loads for weights of 4 MiB or more.
+// The split count sets a row's summation order, so a change to the rule moves the bits of the rows
+// it splits differently.
 //
 // No state is keyed on the stream, since a recorded pass may replay on another stream. The split
 // partial is the op's scratch (sized by the scratch hook, read+write, so overlapping ops get
@@ -89,8 +85,8 @@ static __device__ __forceinline__ T mxd_ld(const T* p) {
 // The (row, 128) scale grid: thread t < ROWS owns row t, loads the next boundary's two scales a
 // boundary early and writes s_prev / s_next to LDS for the boundary's slab (the one-fragment kernel
 // at that slab, published by its staging barrier; the multi-fragment kernel a slab early into the
-// other half of its double buffer, published by the slab's closing barrier). A zero next block keeps the carried scale; after a zero block the carried scale is
-// looked up from the grid.
+// other half of its double buffer, published by the slab's closing barrier). A zero next block
+// keeps the carried scale; after a zero block the carried scale is looked up from the grid.
 static __device__ __forceinline__ float mxd_ratio(float ns, float np, const float* __restrict__ row,
                                                   int kb) {
   return ns > 0.f ? (np > 0.f ? np : r4d_mxfp4_carried(row, kb - 2)) / ns : 1.f;
@@ -206,15 +202,12 @@ constexpr int mxd_waves(int dbk, int dtm, bool ablk) {
        : 6;
 }
 
-// The multi-fragment form (M > 16). A fragment-order weight word is the WMMA fragment's own register
-// (one dword a lane a k-step), so a wave loads its tile's words for a slab straight to registers and
-// folds them there, with no barrier between a wave and its weight; only the activation, shared by the
-// eight tiles, goes through LDS, double-buffered so a slab takes one barrier. The next slab's
-// activation and weight are loaded while this slab computes. The arithmetic -- the fold, the k-step
-// and slab order, the scale carry and the epilogue -- is the one the kernel staging the weight through
-// LDS had, so the bits are its own (checked byte for byte when it was replaced). r4d_selftest
-// --perfmxd, clocks warmed, LDS-staged -> registers: 17408 x 5120 at 64 rows 149 -> 129 us, at 96
-// 205 -> 159, at 128 245 -> 214; 5120 x 8704 at 128 169 -> 139; 6144 x 5120 at 128 121 -> 92.
+// The multi-fragment form (M > 16). A fragment-order weight word is the WMMA fragment's own
+// register (one dword a lane a k-step), so a wave loads its tile's words for a slab straight to
+// registers and folds them there, with no barrier between a wave and its weight. Only the
+// activation, shared by the eight tiles, goes through LDS, double-buffered so a slab takes one
+// barrier. The next slab's activation and weight are loaded while this slab computes. The fold,
+// k-step and slab order, scale carry and epilogue are the one-fragment form's (below).
 template <int DBK, int DKS, int DTM, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(mxd_waves(DBK, DTM, ABLK))
 void r4d_gemm_mxfp4a8_decode_kernel(
@@ -345,9 +338,10 @@ void r4d_gemm_mxfp4a8_decode_kernel(
 }
 
 // The one-fragment form (M <= 16), every single-sequence verify step. Same tile, fold and split as
-// above, with the weight staged through LDS, plus: the next slab's A, codes and exponents are loaded
-// into registers while this slab computes, keeping loads in flight across barriers; a thread takes four adjacent slots (one 16 B
-// load); and each row's reference exponent is read once. Bit-identical to the kernel above.
+// above, with the weight staged through LDS, plus: the next slab's A, codes and exponents are
+// loaded into registers while this slab computes, keeping loads in flight across barriers; a thread
+// takes four adjacent slots (one 16 B load); and each row's reference exponent is read once.
+// Bit-identical to the kernel above.
 template <int DBK, int DKS, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(DBK == 64 ? 16 : 12)
 void r4d_gemm_mxfp4a8_decode1_kernel(
@@ -527,22 +521,22 @@ MxdPlan mxd_plan(int M, int K, int N, int KS, int BK, int NT) {
   MxdPlan p;
   int ks = 1;
   if (tm > 4) {
-    // Past 64 rows (the register kernel; see the header): split only while every split keeps 16
-    // 128-wide slabs, towards a 48-block grid, or at a deep K regardless.
+    // Past 64 rows (see the header): split only while every split keeps 16 128-wide slabs, towards
+    // a 48-block grid, or at a deep K regardless.
     const int slabs = K / 128;
     while (ks < R4D_MXD_MAX_KS && (nblk * ks < 48 || K >= 8192) && slabs / (2 * ks) >= 16 &&
            2 * ks * M <= 1024)
       ks <<= 1;
   } else {
-    const int fill = M <= 16 ? 48 : (M <= 96 ? 56 : 40);
+    const int fill = M <= 16 ? 48 : 56;
     while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
     if (K >= 8192)                     // a deep K: a split of 24 or more slabs still waits on them
       while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
   }
   p.ks = KS > 0 ? KS : ks;
   // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
-  // blocks, by the split the launch runs (a pin or a tuned point included), as before the register
-  // kernel; past 64 rows the 128-wide slab always.
+  // blocks, by the split the launch runs (a pin or a tuned point included); past 64 rows the
+  // 128-wide slab always.
   const bool slab64 = tm == 4 && p.ks == 1 && nblk >= 110;
   p.bk = BK > 0 ? BK : (slab64 ? 64 : 128);
   p.nt = NT == 1 || (NT == 0 && (long)N * K / 2 >= (4l << 20));

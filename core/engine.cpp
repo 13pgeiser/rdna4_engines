@@ -156,6 +156,7 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.max_spec      = cfg_.n_spec;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
+    sc.draft_coupling = cfg_.draft_coupling;
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -354,7 +355,7 @@ int Engine::issue_ahead(const RadBatch** out) {
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, drafter_.depth);
+        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
@@ -452,22 +453,7 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        /* Zero freshly assigned recurrent slots before the step that reads them. The manager
-         * records the grab but cannot write (StateClear in core/mem/kv.h); the list is empty except
-         * on a sequence's first step. Each rank clears by its own plan: the slot number is the
-         * scheduler's, but the state size depends on the heads this rank holds, which can differ
-         * per rank (rad_arch.h remainder_place). */
-        for (const StateClear& c : ranks_[0]->kv.state_clears()) {
-            for (auto& rk : ranks_) {
-                const KVGroupPlan* gp = rk->kv.plan(c.group);
-                if (!gp || !gp->stateful()) continue;
-                const int64_t bytes = gp->layer_bytes_per_state();
-                for (int64_t l = 0; l < gp->n_layers; ++l)
-                    if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
-                        rad_memset_async(p, 0, bytes, rk->ctx.stream());
-            }
-        }
-        ranks_[0]->kv.clear_state_clears();
+        clear_fresh_states();
 
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
@@ -526,7 +512,7 @@ int Engine::step_loop() {
             }
             if (t_on) phase_mark(PH_BEGIN);
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs);
+                const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
                 for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
@@ -714,6 +700,9 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* The step's sampler chain, verify op included, has returned: one line at the first
+         * coupled verify that actually completed. */
+        couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
             if (st < 0) return fail_loop(st);
@@ -1364,6 +1353,25 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+/* Zero freshly assigned recurrent slots before the step that reads them. The manager records the
+ * grab but cannot write (StateClear in core/mem/kv.h); the list is empty except on a sequence's
+ * first step. Each rank clears by its own plan: the slot number is the scheduler's, but the state
+ * size depends on the heads this rank holds, which can differ per rank (rad_arch.h
+ * remainder_place). */
+void Engine::clear_fresh_states() {
+    for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+        for (auto& rk : ranks_) {
+            const KVGroupPlan* gp = rk->kv.plan(c.group);
+            if (!gp || !gp->stateful()) continue;
+            const int64_t bytes = gp->layer_bytes_per_state();
+            for (int64_t l = 0; l < gp->n_layers; ++l)
+                if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
+                    rad_memset_async(p, 0, bytes, rk->ctx.stream());
+        }
+    }
+    ranks_[0]->kv.clear_state_clears();
+}
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -1687,6 +1695,7 @@ std::string Engine::engine_info() const {
     e["tp_wire"]                = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
     e["attn_prefill_fp8"]       = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
+    e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
@@ -2568,8 +2577,9 @@ int Engine::run_server() {
                     std::string* why) const override {
             const int s = rad_tools_text_prepare(*plugins, field, in, out);
             if (s < 0 && why)
-                *why = s == RAD_E_INVAL ? "the model cannot take this text"
-                                        : std::string(rad_strerror(s));
+                *why = !out->empty()       ? *out
+                       : s == RAD_E_INVAL ? "the model cannot take this text"
+                                          : std::string(rad_strerror(s));
             return s;
         }
         int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) override {
@@ -2595,6 +2605,14 @@ int Engine::run_server() {
         in.default_steps = ad.voc_chunk > 0 ? 0 : ad.default_steps;
         in.default_cfg = ad.default_cfg;
         in.max_lanes = ad.max_lanes;
+        in.branches = ad.branches == 1 ? 1 : 2;
+        in.input_special = ad.input_special != 0;
+        in.tmpl_ref = pg.agen_str.tmpl_ref;
+        in.ref_item = pg.agen_str.ref_item;
+        in.ref_rate = ad.ref_rate;
+        in.ref_hop = ad.ref_hop;
+        in.ref_max_samples = ad.ref_max_samples;
+        in.ref_max = ad.ref_max;
         audio_bridge.drv = aud_gen_;
         audio_bridge.plugins = &plugins_;
         d.audio = &audio_bridge;

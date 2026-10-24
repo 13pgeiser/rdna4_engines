@@ -997,6 +997,13 @@ std::vector<Case> build_cases() {
         for (int dil : { 1, 3 })
             add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 7),
                             HI("dil", dil), HI("causal", 1), HS("dtype", dt) });
+        /* Strided, causal: Fish Audio's codec encoder downsamples with kernels of two strides
+         * (2, 4, 8) and its quantiser with a kernel of one (k 2, stride 2). */
+        for (int s : { 2, 4, 8 })
+            add("conv1d", { HI("M", 64), HI("cin", 20), HI("cout", 13), HI("k", 2 * s),
+                            HI("dil", 1), HI("causal", 1), HI("stride", s), HS("dtype", dt) });
+        add("conv1d", { HI("M", 64), HI("cin", 24), HI("cout", 16), HI("k", 2), HI("dil", 1),
+                        HI("causal", 1), HI("stride", 2), HS("dtype", dt) });
         for (int s : { 2, 4, 8 })
             add("conv_t1d", { HI("M", 12), HI("cin", 20), HI("cout", 13), HI("stride", s),
                               HS("dtype", dt) });
@@ -1041,6 +1048,12 @@ std::vector<Case> build_cases() {
     add("cfg_topk_sample", { HI("M", 6), HI("n_vocab", 645), HI("k", 645), HI("rep", 2),
                              HF("cfg", 1.7), HF("temp", 0.8), HI("stream", 0),
                              HS("dtype", "f32") });
+    /* Fish Audio's draw: the nucleus over the whole candidate set's softmax, then the top-k cut;
+     * at a small top_p the head alone, and above 1 none. */
+    for (double tp : { 0.7, 0.05, 0.95 })
+        add("cfg_topk_sample", { HI("M", 4), HI("n_vocab", 645), HI("k", 30), HI("rep", 1),
+                                 HF("cfg", 1.0), HF("temp", 0.7), HI("stream", 2),
+                                 HF("top_p", tp), HS("dtype", "f32") });
     /* A speech model's backbone pick: reserved ids suppressed (the vocabulary's last class stays a
      * candidate), a temperature, the penalty idle without a history. */
     for (int rep : { 1, 2 })
@@ -1052,6 +1065,9 @@ std::vector<Case> build_cases() {
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 8), HI("vocab", 64),
                                HI("off0", 5), HF("scale", sc), HS("dtype", dt) });
+        /* Codes past a codebook smaller than its heads read its last row (Fish Audio's codec). */
+        add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 4), HI("vocab", 64),
+                           HI("off0", 0), HF("scale", 1.0), HI("clamp", 40), HS("dtype", dt) });
         /* One rounding of the whole sum: sixteen codebooks, as a speech model's frame embedding. */
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 16), HI("vocab", 64),
@@ -1081,6 +1097,19 @@ std::vector<Case> build_cases() {
     }
     add("end_status", { HI("M", 2), HI("end", 5), HI("rep", 2) });
     add("end_status", { HI("M", 4), HI("end", 3), HI("rep", 1) });
+    add("ras_pick", { HI("M", 4), HI("win", 16), HI("lo", 1), HI("hi", 9), HI("rep", 1) });
+    add("ras_pick", { HI("M", 2), HI("win", 4), HI("lo", 0), HI("hi", 12), HI("rep", 2),
+                      HI("clear", 1) });
+    /* A codec encoder's residual quantiser step: DAC's eight-wide codes over a semantic codebook
+     * and a residual one, both dtypes; a dimension that is no vector's width. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("vq_encode", { HI("M", 7), HI("n", 64), HI("dim", 8), HI("bins", 4096),
+                           HS("dtype", dt) });
+        add("vq_encode", { HI("M", 5), HI("n", 128), HI("dim", 8), HI("bins", 1024),
+                           HS("dtype", dt) });
+    }
+    add("vq_encode", { HI("M", 3), HI("n", 40), HI("dim", 5), HI("bins", 33),
+                       HS("dtype", "f32") });
     add("frame_store", { HI("M", 2), HI("n_codes", 16), HI("stride", 9), HI("rep", 2),
                          HI("skip", 0) });
     add("frame_store", { HI("M", 4), HI("n_codes", 3), HI("stride", 5), HI("rep", 1),
@@ -1093,6 +1122,8 @@ std::vector<Case> build_cases() {
     add("cu_repeat", { HI("M", 9), HI("mult", 1) });
     add("int_affine", { HI("M", 4), HS("src", "0 -1 2 1"), HS("mul", "2 0 8 4"),
                         HS("add", "-1 7 -7 -3") });
+    add("sub_i32", { HI("M", 1) });
+    add("sub_i32", { HI("M", 37) });
 
     /* ================================================================== speed-only, at model size
      *

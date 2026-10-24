@@ -3227,16 +3227,20 @@ static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
 int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
-    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0))
+    const int64_t st = gi(p, n_p, "stride", 1), dil = gi(p, n_p, "dil", 1);
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || st < 1 ||
+        (st > 1 && (!causal || dil * (k - 1) + 1 < st || M % st)) || gi(p, n_p, "cu_div", 1) != 1)
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
-    const int64_t S = two_seqs(M);
+    /* A strided convolution is described over one sequence: two would each need a whole number
+     * of strides. Bounds in coarser units (cu_div) are not drawn; ref_test checks them. */
+    const int64_t S = st > 1 ? 1 : two_seqs(M);
     Opd o;
     o.t(D, { M, cin });                                       /* x */
     o.t(D, { cout, cin, k });                                 /* w */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
-    o.t(D, { M, cout });                                      /* res */
-    o.t(D, { M, cout });                                      /* y */
+    o.t(D, { M / st, cout });                                 /* res */
+    o.t(D, { M / st, cout });                                 /* y */
     o.t(D, { cout });                                         /* b */
     return o.finish("conv1d", operand, out);
 }
@@ -3314,6 +3318,22 @@ int ref_rvq_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("rvq_embed", operand, out);
 }
 
+int ref_vq_encode_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t dim = gi(p, n_p, "dim", 0), bins = gi(p, n_p, "bins", 0);
+    if (M <= 0 || n <= 0 || dim <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* x, INOUT */
+    o.t(F, { dim, n });                                       /* in_w */
+    o.t(F, { dim });                                          /* in_b */
+    o.t(F, { bins, dim });                                    /* cb */
+    o.t(F, { n, dim });                                       /* out_w */
+    o.t(F, { n });                                            /* out_b */
+    o.t_idx({ M }, bins, -1, 0);                              /* codes, OUT */
+    return o.finish("vq_encode", operand, out);
+}
+
 int ref_frame_mix_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "n_embd", 0), L = gi(p, n_p, "L", 0);
     const int64_t st = gi(p, n_p, "stride", 0);
@@ -3339,6 +3359,21 @@ int ref_end_status_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
     o.t_idx({ REF_LANES }, 8, -1, 0);                         /* status, INOUT */
     return o.finish("end_status", operand, out);
+}
+
+int ref_ras_pick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), rep = gi(p, n_p, "rep", 1), W = gi(p, n_p, "win", 0);
+    const int64_t hi = gi(p, n_p, "hi", 0);
+    if (M <= 0 || rep < 1 || W <= 0 || hi <= 0 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    Opd o;
+    /* Picks over a small band so the windows repeat them often enough to exercise the redraw. */
+    const int64_t band = std::min<int64_t>(hi + 2, 12);
+    o.t_idx({ rep * M }, band, -1, 0);                        /* first */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* alt */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ REF_LANES * W }, band, -1, 0);                  /* hist, INOUT */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* ids, OUT */
+    return o.finish("ras_pick", operand, out);
 }
 
 int ref_frame_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -3477,6 +3512,16 @@ int ref_int_affine_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t_idx({ 16 }, 1000, -1, 0);                             /* x */
     o.t_idx({ M }, 1, -1, 0);                                 /* y */
     return o.finish("int_affine", operand, out);
+}
+
+int ref_sub_i32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, 100000, -1, 0);                            /* x */
+    o.t_idx({ 1 }, 1000, -1, 0);                              /* s */
+    o.t_idx({ M }, 1, -1, 0);                                 /* y */
+    return o.finish("sub_i32", operand, out);
 }
 
 /* ================================================================== LTX-2 (ref_ltx.cpp) */

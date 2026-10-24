@@ -506,7 +506,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * anthropic-version and anthropic-beta headers of Anthropic's clients, which nothing reads. */
     static const char* const kCorsHeaders =
         "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta";
-    static const char* const kCorsMethods = "GET, POST, OPTIONS";
+    static const char* const kCorsMethods = "GET, POST, DELETE, OPTIONS";
 
     /* Whether a request carries the API key: `Authorization: Bearer` (OpenAI; the scheme is
      * case-insensitive, RFC 9110) or `X-Api-Key` (Anthropic, also accepted by llama-server). */

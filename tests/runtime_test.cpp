@@ -965,6 +965,34 @@ TEST(an_op_on_the_second_lane_outside_its_window_is_refused_by_name) {
     CHECK(std::strstr(f.ctx.step_error(), "outside its declared window") != nullptr);
 }
 
+/* Lane 0 joins pending lane-1 work before an op outside the window on either side: a transient of an
+ * op declared before the window may share bytes with a concurrent buffer as much as one declared
+ * after it. Inside the window lane 0 runs beside lane 1. */
+TEST(an_op_outside_the_window_on_lane_0_joins_the_second_lane_first) {
+    Fixture f;
+    f.P.scratch_regions = 2;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    rad_op a1 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" }, nullptr, {});
+    rad_op a2 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    f.P.lane1_w0 = f.P.lane1_w1 = (int32_t)a1;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        for (rad_op before_or_after : { a0, a2 }) {
+            CHECK_OK(c.set_lane(1));
+            CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));
+            CHECK_OK(c.set_lane(0));
+            CHECK(c.lane1_pending());
+            CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));        /* inside: no join */
+            CHECK(c.lane1_pending());
+            CHECK_OK(c.issue(before_or_after, opd, 1, RAD_N_BATCH));
+            CHECK(!c.lane1_pending());
+        }
+    }));
+}
+
 /* Operands are positional (spec §2.3), so a miscount is silent numerical garbage at the kernel,
  * not a diagnosable failure. The runtime checks the given arity against the schema. */
 TEST(operand_arity_is_checked_against_the_schema) {

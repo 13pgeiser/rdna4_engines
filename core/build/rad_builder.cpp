@@ -1418,7 +1418,12 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                 : prog_.generator.layout != 0 ? "an image generator" : "a video generator");
         return RAD_E_STATE;
     }
-    if (!d->tmpl || !std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}")) {
+    if (!d->tmpl && !d->tmpl_plain) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': no prompt template (tmpl or tmpl_plain)",
+            nm);
+        return RAD_E_INVAL;
+    }
+    if (d->tmpl && (!std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}"))) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl needs {instructions} and {input}", nm);
         return RAD_E_INVAL;
     }
@@ -1426,6 +1431,45 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         (!std::strstr(d->tmpl_plain, "{input}") || std::strstr(d->tmpl_plain, "{instructions}"))) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_plain is the prompt without "
                          "instructions and needs {input} alone", nm);
+        return RAD_E_INVAL;
+    }
+    /* References: a template with both of its slots, an item with one transcript before its one
+     * clip, and the clips' geometry; read whole by one branch's prompt (an unconditional branch
+     * would need references of its own). */
+    if (d->tmpl_ref) {
+        auto once = [](const char* t, const char* k) {
+            const char* a = t ? std::strstr(t, k) : nullptr;
+            return a && !std::strstr(a + 1, k);
+        };
+        const char* au = d->ref_item ? std::strstr(d->ref_item, "{audio}") : nullptr;
+        const char* tx = d->ref_item ? std::strstr(d->ref_item, "{text}") : nullptr;
+        if (!once(d->tmpl_ref, "{references}") || !once(d->tmpl_ref, "{input}") ||
+            std::strstr(d->tmpl_ref, "{instructions}") || !once(d->ref_item, "{audio}") ||
+            !once(d->ref_item, "{text}") || !au || !tx || tx > au) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_ref needs {references} and "
+                             "{input} once each, and ref_item {text} before its one {audio}", nm);
+            return RAD_E_INVAL;
+        }
+        if (d->branches != 1 || !d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
+            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': references are read by a model of one "
+                             "branch from whole prompts, clips at a rate (%lld Hz) in frames of "
+                             "%lld samples, at most %d of them and %lld samples a request", nm,
+                (long long)d->ref_rate, (long long)d->ref_hop, (int)d->ref_max,
+                (long long)d->ref_max_samples);
+            return RAD_E_INVAL;
+        }
+    }
+    if (d->branches != 0 && d->branches != 1 && d->branches != 2) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': branches is %d; a request runs 1 sequence "
+                         "or 2 (0 means 2)", nm, (int)d->branches);
+        return RAD_E_INVAL;
+    }
+    /* One branch has no unconditional prompt to render and no guidance to apply. */
+    if (d->branches == 1 && (d->neg_tmpl || d->default_cfg != 1.0)) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': a model of one branch has no "
+                         "unconditional template and no guidance (default_cfg %g)", nm,
+            d->default_cfg);
         return RAD_E_INVAL;
     }
     if (d->neg_tmpl && !d->prompt_whole) {
@@ -1505,15 +1549,24 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         !buf_ok(d->audio_out, RAD_F32, win_samples * d->channels, "audio_out"))
         return RAD_E_INVAL;
     prog_.agen_str.name = nm;
-    prog_.agen_str.tmpl = d->tmpl;
+    prog_.agen_str.tmpl = d->tmpl ? d->tmpl : "";
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
+    prog_.agen_str.tmpl_ref = d->tmpl_ref ? d->tmpl_ref : "";
+    prog_.agen_str.ref_item = d->tmpl_ref && d->ref_item ? d->ref_item : "";
     prog_.audio_gen = *d;
     /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
     prog_.audio_gen.name = nullptr;
     prog_.audio_gen.tmpl = nullptr;
     prog_.audio_gen.tmpl_plain = nullptr;
     prog_.audio_gen.neg_tmpl = nullptr;
+    prog_.audio_gen.tmpl_ref = nullptr;
+    prog_.audio_gen.ref_item = nullptr;
+    /* Without references the clips' geometry is nothing: the driver stages none. */
+    if (!d->tmpl_ref) {
+        prog_.audio_gen.ref_rate = prog_.audio_gen.ref_hop = prog_.audio_gen.ref_max_samples = 0;
+        prog_.audio_gen.ref_max = 0;
+    }
     return RAD_OK;
 }
 
@@ -1800,6 +1853,13 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             (long long)d->proposal_pitch);
         return RAD_E_INVAL;
     }
+    if (d->kind == RAD_DRAFT_BLOCK && d->proposal_pitch > 0 && d->proposal_pitch < d->depth) {
+        err(RAD_E_INVAL, "declare_drafter '%s': proposal_pitch %lld under depth %d. A block pass "
+                         "writes each sequence's %d proposals into one row of the proposal buffer, "
+                         "so a row must hold them.", nm, (long long)d->proposal_pitch, d->depth,
+            d->depth);
+        return RAD_E_INVAL;
+    }
     /* A block pass embeds the mask id at every unfilled position, so it needs one. */
     if (d->kind == RAD_DRAFT_BLOCK && d->mask_token < 0) {
         err(RAD_E_INVAL, "declare_drafter '%s': RAD_DRAFT_BLOCK with no mask_token. Every "
@@ -1843,7 +1903,11 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     prog_.drafter_name = nm;
     prog_.drafter.name = nullptr;
     prog_.drafter.block = block;
-    if (prog_.drafter.proposal_pitch == 0) prog_.drafter.proposal_pitch = 1;
+    /* A block drafter's proposal row holds its whole block's tokens, and the engine reads row s
+     * at s * pitch (a short block fills only its front), so its pitch defaults to depth; a serial
+     * one writes a token a pass, at pitch 1 by default. */
+    if (prog_.drafter.proposal_pitch == 0)
+        prog_.drafter.proposal_pitch = prog_.drafter.kind == RAD_DRAFT_BLOCK ? prog_.drafter.depth : 1;
     return RAD_OK;
 }
 
@@ -1932,6 +1996,33 @@ int Builder::lora_alias(const char* native, const char* from, const char* to, in
     a.root = native; a.from = from; a.to = to;
     a.from_lo = from_lo; a.from_hi = from_hi; a.to_lo = to_lo;
     prog_.lora_aliases.push_back(std::move(a));
+    return RAD_OK;
+}
+
+/* A block drafter's shorter block (rad_builder.h). Validated at declare: the core stages the block
+ * from it, and a block the plugin did not declare its ops at would fail the step. */
+int Builder::drafter_short_block(int64_t block) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_short_block after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_STATE, "drafter_short_block: %s. Only a BLOCK drafter proposes a block; declare "
+                         "it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a SERIAL head");
+        return RAD_E_STATE;
+    }
+    const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
+    const int64_t lead = full - prog_.drafter.depth;     /* rows ahead of the proposing ones */
+    if (block >= full || block - lead < 1) {
+        err(RAD_E_INVAL, "drafter_short_block '%s': %lld rows. The short block must be shorter "
+                         "than the drafter's own (%lld) and still propose a token (more than %lld "
+                         "rows).", prog_.drafter_name.c_str(), (long long)block, (long long)full,
+            (long long)lead);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_short_block = block;
     return RAD_OK;
 }
 
@@ -2461,6 +2552,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }
+
+int rad_drafter_short_block(RadBuilder* b, int64_t block) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_short_block(block);
+}
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

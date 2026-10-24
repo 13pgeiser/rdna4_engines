@@ -638,6 +638,14 @@ same path runs. Trivial means served as stored:
   `fp4_e2m1*e8m0[1x32]`, byte for byte;
 - GGUF `F32`, `F16` and `BF16`.
 
+**A torch.save file beside the safetensors is read as data** (`core/format/torch_zip.h`), for a
+model part that ships only that way (Fish Audio drama-3's `codec.pth`): its tensors join the
+namespace under `<stem>.`. The zip's stored entries are mapped, and its pickle is read by a machine
+over the weights-only subset (the state dict's `OrderedDict`, `_rebuild_tensor_v2`,
+`_rebuild_parameter` and the typed storages), so nothing in the file runs; any other global or
+opcode is refused by name, and the file is then left out with a warning. A torch copy of the
+model's own weights (`pytorch_model*.pth`, `consolidated*.pth`) is passed over.
+
 **Nothing is quantised at load.** A served form that needs quantisation (Flash-Next's int4
 experts, an fp8 `lm_head` from a bf16 one) is converted ahead of time (§4.4). A direct load has no
 file tier, no mapped tier (a checkpoint is neither grouped by movement unit nor aligned for

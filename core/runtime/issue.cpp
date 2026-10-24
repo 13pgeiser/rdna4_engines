@@ -593,18 +593,20 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                 "it on the host anyway"
                               : "has no device kernel for this band");
     /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
-     * it, so lane 1 runs nothing outside it, and lane 1 is joined before lane 0 runs past it. */
+     * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
+     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. */
     if (program_ && program_->lane1_w1 >= 0) {
-        if (lane_ == 1 && (p.order < program_->lane1_w0 || p.order > program_->lane1_w1))
+        const bool outside = p.order < program_->lane1_w0 || p.order > program_->lane1_w1;
+        if (lane_ == 1 && outside)
             return abort_step_msg(h, RAD_E_STATE,
                                   fmt("issued on the second lane outside its declared window (ops "
                                       "%d..%d, this one %d): the buffers it may touch there are "
                                       "live only across the window",
                                       (int)program_->lane1_w0, (int)program_->lane1_w1, (int)p.order));
-        if (lane_ == 0 && lane1_pending_ && p.order > program_->lane1_w1) {
+        if (lane_ == 0 && lane1_pending_ && outside) {
             const int js = lane_join(1, 0);
             if (js < 0)
-                return abort_step_msg(h, js, "joining the second lane at its window's end failed");
+                return abort_step_msg(h, js, "joining the second lane outside its window failed");
         }
     }
     if (lane_ == 1) lane1_pending_ = true;

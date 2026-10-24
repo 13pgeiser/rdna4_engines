@@ -935,7 +935,8 @@ static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -951,19 +952,28 @@ static const RadOperandSpec oSnakeAa[] = { OPD("x"), WGT("alpha"), WGT("beta"), 
 static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
                                          P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
                                          P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
-                                         P_INTO("sup_hi"), P_F64O("penalty") };
+                                         P_INTO("sup_hi"), P_F64O("penalty"),
+                                         P_F64O("top_p") };
 static const RadOperandSpec oCfgTopk[] = { OPD("logits"), OPD("seed"), OPD("frame"), OUT("ids"),
                                            OPD_O("cfg"), OPD_O("lane"), INOUT_O("hist") };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
-                                          P_STR("dtype"), P_INTO("round") };
+                                          P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
+                                            WGT("out_w"), WGT("out_b"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
                                             OPD("frame"), OPD("status"), INOUT("dst") };
 static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
 static const RadOperandSpec oEndStatus[] = { OPD("ids"), OPD("lane"), INOUT("status") };
+static const RadParamSpec pRasPick[] = { P_INT("M"), P_INT("win"), P_INT("lo"), P_INT("hi"),
+                                         P_INTO("rep"), P_INTO("clear") };
+static const RadOperandSpec oRasPick[] = { OPD("first"), OPD("alt"), OPD("lane"), INOUT("hist"),
+                                           OUT("ids") };
 static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
                                             P_INTO("rep"), P_INTO("skip") };
 static const RadOperandSpec oFrameStore[] = { OPD("codes"), OPD("lane"), OPD("frame"),
@@ -993,6 +1003,8 @@ static const RadOperandSpec oIota[] = { OUT("y") };
 static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
 static const RadParamSpec pIntAffine[] = { P_INT("M"), P_STR("src"), P_STR("mul"), P_STR("add") };
 static const RadOperandSpec oIntAffine[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pSubI32[] = { P_INT("M") };
+static const RadOperandSpec oSubI32[] = { OPD("x"), OPD("s"), OUT("y") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ================================================================== the schema table */
@@ -1845,11 +1857,19 @@ static const RadOpSchema kSchemas[] = {
   "a frame's embedding from code-major residual codes [n_codes, rows]: t0[c0 + off0] plus the sum "
   "of t1[c_k + (k - 1) vocab], times `scale`, rounded as bf16(bf16(t0 + bf16(sum)) * scale), or "
   "with `round` 1 one f32 sum in codebook order times scale, rounded once." },
+{ "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
+  "one residual vector quantiser step: e = in_w x + in_b, the code the row of cb of greatest "
+  "cosine with e (the lower index on a tie), then x -= out_w cb[code] + out_b; f32, x rounded "
+  "once." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's conditioning row: the softmax(logits)-weighted sum of hid's L planes times scale, "
   "stored at dst[lane * stride + frame - 1] for frame >= 1 and status[lane] >= 0." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
   "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]." },
+{ "ras_pick", ARR(pRasPick), ARR(oRasPick),
+  "repetition-aware sampling: ids[rep i] = alt[rep i] where first[rep i] is in [lo, hi) and in "
+  "the lane's window of its last `win` picks (hist [lanes, win], -1 empty, cleared first with "
+  "`clear` 1), else first[rep i]; the pick then enters the window." },
 { "frame_store", ARR(pFrameStore), ARR(oFrameStore),
   "a frame's codes into its lane's history: dst[(lane n_codes + k) stride + frame - skip] = "
   "codes[k, rep i] when frame >= skip and status[lane] >= 0." },
@@ -1883,6 +1903,8 @@ static const RadOpSchema kSchemas[] = {
 { "int_affine", ARR(pIntAffine), ARR(oIntAffine),
   "y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists: shapes and "
   "bounds derived from a pass's device geometry." },
+{ "sub_i32", ARR(pSubI32), ARR(oSubI32),
+  "y[i] = x[i] - s[0], int32: a device length less a device offset." },
 };
 
 /* ================================================================== the kernel table */
@@ -2430,10 +2452,14 @@ SIMPLE("ref_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick 
        DT_FLOAT, ref_cfg_topk_sample),
 SIMPLE("ref_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
        DT_FLOAT, ref_rvq_embed),
+SIMPLE("ref_vq_encode", "vq_encode", "elem",
+       "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, ref_vq_encode),
 SIMPLE("ref_frame_mix_store", "frame_mix_store", "elem", "a frame's conditioning row into its lane",
        DT_FLOAT, ref_frame_mix_store),
 SIMPLE("ref_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,
        ref_end_status),
+SIMPLE("ref_ras_pick", "ras_pick", "elem", "a repetition-aware choice between two draws a lane",
+       DT_ANY, ref_ras_pick),
 SIMPLE("ref_frame_store", "frame_store", "elem", "a frame's codes into its lane's history", DT_ANY,
        ref_frame_store),
 SIMPLE("ref_resample_nearest", "resample_nearest", "elem", "rows resampled nearest-neighbour",
@@ -2454,6 +2480,8 @@ SIMPLE("ref_iota", "iota", "elem", "an arithmetic index sequence", DT_ANY, ref_i
 SIMPLE("ref_cu_repeat", "cu_repeat", "elem", "bounds of equal sequences", DT_ANY, ref_cu_repeat),
 SIMPLE("ref_int_affine", "int_affine", "elem", "integers derived from device geometry", DT_ANY,
        ref_int_affine),
+SIMPLE("ref_sub_i32", "sub_i32", "elem", "a device int32 vector less a device scalar", DT_ANY,
+       ref_sub_i32),
 };
 
 /* ================================================================== plugin exports */

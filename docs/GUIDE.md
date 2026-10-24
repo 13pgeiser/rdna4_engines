@@ -285,6 +285,7 @@ and runs.
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 | `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
 | `breeze` | Breeze-TTS-2, speech from text and an optional description of the voice (§5.15) |
+| `fishomni` | Fish Audio drama-3, speech from text with speaker tags and inline direction (§5.15) |
 | `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
 | `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
 
@@ -461,6 +462,12 @@ rad-convert /srv/models/MiniMaxAI/MiniMax-Music3 -o minimax-music3-bf16.rad \
 # bf16 (6 GB, one card)
 rad-convert /srv/models/BreezeBlue/Breeze-TTS-2 -o breeze-tts2-bf16.rad \
     --recipe data/recipes/breeze-tts2-bf16.recipe
+
+# Fish Audio drama-3, speech (§5.15): the release directory, its codec in codec.pth read with it
+# (a torch.save checkpoint read as data, never unpickled); the experts stay block fp8 as shipped,
+# the codec is cast to bf16 (39 GB, two cards)
+rad-convert /srv/models/fishaudio/drama-3 -o drama3-fp8.rad \
+    --recipe data/recipes/drama3-fp8.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -922,6 +929,36 @@ the pool that holds context; compare M with the sessions you expect to keep live
 wht6`, a decode step above the row count startup names is all-reduced lossily like a prefill chunk;
 at 8 sequences and depth 3, Flash-Next's decode steps are above it.
 
+**The delta-net state at f16** (`--state-cache-dtype f16`). The `qwen35` plugins (`qwen35_fp8`,
+and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) declare the recurrent state cache f32. With
+`--state-cache-dtype f16` they declare it f16; startup and the declare log say so (`GDN state cache
+f16`), and a plugin that does not serve it is refused at startup by name. **It is lossy**: the
+state is rounded wherever it is stored, so the generated text changes. It halves the state pool and
+its host checkpoints, and the state's traffic, which grows with the number of decoding sequences.
+Measured on `qwen35_fp8` only, Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W),
+against the bf16 model:
+
+| state | mean KL, 2048 chunk | mean KL, 64 chunk | top-1, 64 chunk |
+|---|---|---|---|
+| f32, `k6_v4` KV | 0.040238 | 0.039607 | 94.07% |
+| f16, `k6_v4` KV | 0.040005 | 0.040468 (+2.2%) | 94.00% |
+| f32, `fp8` KV | 0.039171 | 0.039327 | |
+| f16, `fp8` KV | 0.039600 (+1.1%) | 0.039690 (+0.9%) | |
+
+A 64-token chunk stores the state, and rounds it, every 64 tokens. Decode, greedy, three rounds
+(medians, tok/s):
+
+| streams | f32, no speculation | f16 | f32, speculation 7 | f16 |
+|---|---|---|---|---|
+| 1 | 67.1 | 67.5 (+0.6%) | 222.2 | 215.1 (-3.2%) |
+| 4 | 246.8 | 253.3 (+2.6%) | 636.9 | 621.0 (-2.5%) |
+| 16 | 708.0 | 779.5 (+10.1%) | 1223.8 | 1276.7 (+4.3%) |
+
+Without speculation the rounds agree to a tenth and the gain grows with the streams. With
+speculation f16 also changes which drafts the greedy text accepts, so one and four streams moved
+down; whether that is the text or the step was not separated. Use it for many concurrent sequences
+where the KL above is acceptable, and measure your own load.
+
 ### 4.5 Prefill chunk size
 
 A long prompt is prefilled in chunks of at most `--max-num-batched-tokens`. On a mixture-of-experts
@@ -1049,61 +1086,37 @@ avoids the extra copies, at the cost of full re-prefill if an edit precedes the 
 Recurrent-state models still checkpoint at intervals under `tip-only`; their
 existing scheduling is unchanged.
 
-**One prefill sequence in two pieces** (`RADIANCE_PREFILL_PIPELINE`). On `qwen35_fp8` (and
-`qwen35_w8a8`, built from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk, a step of at least 1024 tokens that
-carries one prefill sequence and nothing else runs in two pieces of about half, the first rounded up
-to 64 rows so both sit in the whole step's kernel band. Every block runs a piece at a time; the work
-between two blocks (the block's all-reduce, the next norm, and after a feed-forward the add) runs a
-piece at a time on the second lane, beside the other piece's compute. The all-reduce there is the
-narrow `overlap` launch ([OPS.md](OPS.md#collectives)): the fused all-reduce and norm holds its
-blocks while it waits on the link and slowed the GEMM beside it by a third, and a wide launch slows
-it 1.45-2.1x; either ate the whole gain at two ranks. A piece computes what a narrower chunk
-computes, so a pipelined step is the serial step bit for bit: Qwen3.8-27B's KL recordings (`k6_v4`,
-`--tp-wire wht6`) and TranslateGemma's compare equal with it on and off. One setting makes a piece
-differ from the whole step: a lossy `--tp-wire` whose `--tp-wire-min-kb` a piece's message falls
-under while the whole step's does not (that piece goes out exact).
+**One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
+from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the
+fused fp8 junctions, a step of at least 1024 tokens that carries one prefill sequence and nothing
+else runs in two pieces of about half, the first rounded up to 64 rows so both sit in the whole
+step's kernel band. Every block runs a piece at a time; the work between two blocks (the block's
+all-reduce, the next norm, and after a feed-forward the add) runs a piece at a time on the second
+lane, beside the other piece's compute. The all-reduce there is the narrow `overlap` launch
+([OPS.md](OPS.md#collectives)): the fused all-reduce and norm holds its blocks while it waits on
+the link and slows the GEMM beside it by a third, and a wide launch slows it 1.45-2.1x. A piece
+computes what a narrower chunk computes, so a pipelined step is the serial step bit for bit, with
+one exception: a lossy `--tp-wire` whose `--tp-wire-min-kb` a piece's message falls under while the
+whole step's does not (that piece goes out exact). Decode steps are unchanged. There is no switch:
+the startup log says once that prefill steps are pipelined, and the first wide step that runs
+serially says why (`radiance: qwen35: a 2048-row prefill step runs serially: more than one
+sequence`).
 
-| `RADIANCE_PREFILL_PIPELINE` | |
-|---|---|
-| `auto`, or unset | pipelined at two ranks |
-| `on` (`1`, `true`) | also at three, four and eight ranks; startup notes that it is not measured there |
-| `off` (`0`, `false`) | never |
+PIPE_TABLE
 
-Another value is noted at startup and taken as `auto`. On two R9700s (PCIe Gen5 x8, 265 W):
-
-| model, chunk | prompt | serial | pipelined |
-|---|---|---|---|
-| Qwen3.8-27B MXFP4, 2048 | 41k tokens | 9.00 s | 8.41 s |
-| TranslateGemma 27B MXFP4, 2048 | 6k | 1.27 s | 1.21 s |
-| | 12k | 2.48 s | 2.42 s |
-
-The Qwen figure includes the tiled GEMM's TN=4 crossover at 1024 rows, which the 1024-row pieces
-need. At a 1024-token chunk TranslateGemma's pieces are 512 rows and gain nothing, so serve it at
-2048 (against 1024: -9% at 6k, -7% at 12k). Decode steps are unchanged.
-
-- **Above two ranks it is not measured.** `on` lets it run at three, four and eight ranks. At four
-  libr4d's `overlap` all-reduce rows take a narrow launch that leaves the CUs to compute
-  ([TP4.md](TP4.md)); at three and eight they launch wide unless `R4D_AR_LANE_3_8=1` (§4.7), and a
-  wide all-reduce beside the other piece's GEMM is what ate the whole gain at two ranks, so try the
-  pipeline there with the variable set too. Compare a long prompt's prefill with `on` and `off` at
-  the chunk you serve before keeping it. On the exact wire only the two-shot band above 524288
-  elements has a lane row: a smaller piece (512 rows of a model 1024 wide) keeps the wide launch,
-  the one-shot at three and four ranks, the one-shot or the wide two-shot at eight. The
-  tiered-int8 lane rows at three and four ranks have no such floor. Eight ranks have no
-  lossy wire, so `on` there pipelines on the exact wire only. Qwen3.8-27B (4 KV heads) and
-  TranslateGemma (16) do not serve at three ranks.
-- **Measured on MXFP4 containers.** `qwen35_w8a8` prefills serially where libr4d serves its
-  rotated int8 norms (the boundary norms would need the int8 codes on the second lane; startup says
-  so). Without them it builds the same code, not checked bit for bit on its int8 trunk.
+- **Two ranks only.** Other rank counts prefill serially: the pipeline has been timed against the
+  serial step at two ranks only.
 - **Which steps.** A prefill step with more than one sequence, decode rows beside it, or media rows
-  (an image's tokens) runs serially; the first wide step that does says why, once, on rank 0
-  (`radiance: qwen35: a 2048-row prefill step runs serially: more than one sequence`). `gemma3`
-  needs the fused fp8 junctions, a library that serves `sub_i32`, and no calibration tap
-  (`RADIANCE_CALIB_DIR`); without them a startup note says the pipeline is off.
+  (an image's tokens) runs serially. `qwen35_w8a8` prefills serially where libr4d serves its
+  rotated int8 norms (the boundary norms issue E4M3 codes only; startup says so). `gemma3` needs
+  the fused fp8 junctions, a library that serves `sub_i32`, and no calibration tap
+  (`RADIANCE_CALIB_DIR`); without them a startup note says the pipeline is off. The pieces need
+  1024 rows, so the gain needs a chunk of 2048 (the default `--max-num-batched-tokens`).
 - **Memory.** The buffers the second lane touches leave the arena's sharing pool across the
-  architecture's second-lane window ([PLUGIN.md](PLUGIN.md) §11). On Qwen3.8-27B with its DFlash2
-  drafter at 64 sequences and speculation 7 the activation arena is 526.32 MiB a card, as without
-  a second lane; the second lane's third hardware queue (33 MiB, §4.3) remains.
+  architecture's second-lane window ([PLUGIN.md](PLUGIN.md) §11), so the drafter's and the heads'
+  buffers still share their bytes; the second lane's scratch region holds only what its ops ask
+  for ([IMPLEMENTATION.md](IMPLEMENTATION.md)). The second lane's hardware queue (33 MiB, §4.3)
+  remains.
 
 **Sharing a step** (`--busy-prefill-chunk`, default `auto`). When other work is pending, a prefill
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
@@ -1187,6 +1200,38 @@ behind the packet processor's barrier bit, which saves most of the launch gap be
 kernels. The bytes are the same. Plain decode measured slower with them, so they stay off there
 and on every other model; the startup report's `chained launches` row says which and why.
 
+**A shorter block under load: `--draft-short-from N`.** A block drafter's block is paid for by
+every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
+drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
+serves a shorter block declares it (PLUGIN.md §11); DFlash2 declares a block of 4 (3 drafts) wherever its
+own is longer, on `qwen35_fp8` and `gemma3`. With `--draft-short-from N` the engine runs that short block
+once N sequences decoded in the step just run, and the drafter's own block again only once the count
+falls two below N, so a load wavering at N does not change the pass shape every step. `0`, the default,
+never switches. Startup names what it will run:
+
+```
+speculation: from 16 decoding sequences on, 'dflash2' runs its short block of 4 row(s), 3 token(s)
+```
+
+or warns that the drafter declares no shorter block, is a serial head, or that none runs. The block driver runs the
+short block on the card as it runs the drafter's own: the query pass is the shorter batch, each row's
+proposals are the front of the drafter's proposal row, and the step issued ahead verifies that many.
+Qwen3.8-27B MXFP4 + DFlash2 on two R9700s, `--num-speculative-tokens 7` at the fixed window, `k6_v4`,
+sampled (temperature 1.0), medians of six rounds at 8 streams and three at 16-64, tok/s:
+
+| streams | unset | `--draft-short-from 8` |
+|---|---|---|
+| 8 | 652.8 | 696.8 |
+| 16 | 751.9 | 945.6 |
+| 32 | 985.7 | 1070.8 |
+| 64 | 1055.0 | 1334.6 |
+
+Below N the engine runs the drafter's own block, the same shapes as with the flag unset (greedy, six
+rounds: 1 stream 183.4 and 183.1, 4 streams 529.1 and 537.2). Set it to 8 for a server that decodes
+eight or more sequences at once. The drafts are verified as any others; as with
+`--num-speculative-tokens`, a different block is a different verify shape, so greedy text can differ at
+a near-tie.
+
 ### 4.7 Multiple cards
 
 ```sh
@@ -1199,6 +1244,14 @@ Walsh-Hadamard-rotated 6-bit payload, 2.4x smaller over PCIe. The sum a rank rec
 the exact sum and nothing downstream can detect it, so it is an explicit flag. `--tp-wire-min-kb` is
 the size below which messages stay exact; 128 KiB keeps single-sequence decode exact and compresses
 prefill.
+
+`--tp-attn-split rows` runs a prefill-sized step's attention by rows: each rank takes its run of the
+step's rows with every head, and an `all_gather` of the runs replaces the all-reduce. Where the
+attention dominates a prefill that is faster, but every card then holds the attention's projections
+at full width, and the result is not bit-identical to the default `heads` split. Only a plugin that
+declares the row split takes it (GLM-5.3: +18 to 21 % prefill at eight ranks for 1.29 GiB a card, a
+mean KL of 0.038 against `heads`, docs/ARCHITECTURES.md); elsewhere, and at `--tp 1`, the flag stops
+the start by name.
 
 At three and four ranks `wht6` selects tiered int8 over a two-shot all-reduce, both hops quantised
 (at three ranks the shards are whole 32-element groups, one uneven where the message does not
@@ -1295,17 +1348,6 @@ engine does not use it: on this board those weights lost their lead within a tim
 served no faster. `r4d_selftest --perfar8 --ar8-weights W0,..,W7` times other weights on another
 board (`off` for even shards).
 
-**An all-reduce beside compute at three and eight ranks** (`R4D_AR_LANE_3_8`). An all-reduce a
-plugin issues on its second lane (`overlap` 1: a pipelined prefill, §4.5; qwen4exp's
-`--prefill-span`; gemma4's prefill trunk overlap; the image and video plugins' second-lane
-collectives) takes a narrow launch at two and four ranks, measured there: a wide all-reduce's
-blocks spin on peer flags on the CUs the GEMM beside it needs, and at two ranks slowed it
-1.45-2.1x. At three and eight ranks `ar_twoshot_3rank_exact_lane`, `ar_twoshot_3rank_ti8_lane` and
-`ar_twoshot_8rank_exact_lane` take those collectives, but by default they launch exactly as the
-wide rows do, so nothing changes against a build without them. With `R4D_AR_LANE_3_8=1` they take
-the four-rank launch, 4 blocks of 1024 threads. The bits are the same either way; only the time
-moves:
-
 ### 4.8 Host tier for finished conversations
 
 By default a finished conversation's KV blocks stay in VRAM, held by the prefix cache, until evicted
@@ -1334,6 +1376,29 @@ Every stored conversation expires: one unused for `--prefix-cache-ttl` seconds i
 whichever tier holds it (VRAM blocks to the pool, host slot to the arena, snapshots to the store). A
 hit or a new turn counts as a use, and a system prompt shared by several conversations stays while
 any of them is used.
+
+A client that knows a conversation is dead need not wait for the TTL: `DELETE /sessions/<label>`
+forgets it now, with `<label>` the `session_id` (or Anthropic `metadata.user_id`) its requests
+carried, or `DELETE /sessions?id=<id>` by the engine id `GET /sessions` lists (`?label=` works for
+a label the path cannot carry). `?keep_tokens=N` keeps the first N tokens of the chain, rounded up
+to whole blocks, for a client that replaced everything past a prefix (a compaction) and wants the
+prefix to keep hitting; on a hybrid model the hit resumes at the last linear-state snapshot inside
+the kept prefix (one every `--checkpoint-interval` tokens), so a prefix shorter than the interval
+keeps nothing that hits. The chain goes from the tip inwards like expiry, host copy and the
+session's snapshots with it; a block another stored conversation also walks (the shared system
+prompt) stays, as does one a running request reads. A request of the same conversation in flight
+is refused with 409: finish or cancel it first. Like every route but the probes and the page, it
+takes `--api-key` when the server has one. The answer says what went and what stayed:
+
+```json
+{"label":"chat-7","keep_tokens":0,"sessions":1,"entries":2048,"tokens":32768,
+ "device_bytes":417792000,"host_bytes":835584000,"snapshots":6,
+ "kept":{"tokens":0,"shared":64,"live":0}}
+```
+
+An unknown label or id is 404; an engine without a prefix cache answers 501. `/sessions` and
+`/stats` count what was released under `released`, `/metrics` as
+`prefix_cache_released_total{what}`.
 
 ```sh
 radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
@@ -1731,6 +1796,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
+| `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
@@ -1775,6 +1841,7 @@ by 0.002-0.003 nats.
 | `--tp N` | 1 | tensor-parallel ranks |
 | `--tp-wire MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
 | `--tp-wire-min-kb N` | 128 | smallest all-reduce, in KiB, the lossy wire is used for |
+| `--tp-attn-split MODE` | heads | `heads` or `rows`: how a prefill-sized step's attention splits over the ranks, on a plugin that serves the row split (§4.7) |
 | `--p2p MODE` | auto | `auto` asks the driver, `on` requires peer access, `off` exchanges through host memory (§4.7) |
 
 **Speculation**
@@ -1783,6 +1850,8 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
+| `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged; any other drafter is refused at startup |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -1879,7 +1948,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
-| `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2), `instructions` describing the voice; songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
+| `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
@@ -1898,6 +1967,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
 | `GET /get_tokenizer_info` | the tokeniser's configuration |
 | `POST /reset_prefix_cache` | drop every cached prefix |
+| `DELETE /sessions/<label>`, `DELETE /sessions?id=<id>` | forget one stored conversation (§4.8) |
 | `GET /` or `/dashboard` | the web dashboard |
 | `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
 
@@ -2249,7 +2319,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 | `stream`, `stream_options.include_usage` | |
 | `timings_per_token`, `return_progress` | llama-server's: `timings` on every chunk, and `prompt_progress` chunks while the prompt is read |
 | `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC, with temperature first (the default) or last (llama-server's default), so a list in either order is honoured and any other is refused by name |
-| `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard |
+| `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard, and names it for `DELETE /sessions/<label>` (§4.8) |
 | `control_vector` | `true` applies the control vector this deployment found to this request's steps, `false` leaves them on the stock model; absent or null takes the deployment's default (`--control-vector on\|off`, or as changed in the dashboard's Model view). A deployment with no vector refuses `true` by name. On a compatible container (Qwen3.8-Flash-Next), a refusal-direction vector makes the model decline far fewer requests -- that is a safety behaviour removed, and you own what it writes (§4.10, "Control vectors") |
 | `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives (§5.12). Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
@@ -2453,7 +2523,7 @@ each field is read, taken without effect, or refused by name.
 | `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
 | `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
 | `thread` | `create` is served as any request; `continue` is refused, since no conversation is stored |
-| `metadata` | `user_id` is the conversation's label on `/sessions` |
+| `metadata` | `user_id` is the conversation's label on `/sessions` and its name for `DELETE /sessions/<label>` (§4.8) |
 | `service_tier`, `inference_geo`, `speed`, `cache_control`, `diagnostics`, `safeguards`, `fallbacks`, `context_hint` | taken; none can change the answer here. `cache_control` on a block is dropped too |
 | `mcp_servers`, `container` | refused |
 | anything else | refused: `"<field>: Extra inputs are not permitted ..."`, Anthropic's own words, which Claude Code matches to retry without a beta field it can drop |
@@ -2685,10 +2755,11 @@ socket.
 
 ### 5.15 Speech and music: `/v1/audio/speech`
 
-An audio generation model answers OpenAI's `POST /v1/audio/speech`: a speech model (Breeze-TTS-2)
-speaks `input`, in a voice `instructions` may describe; a music model (MiniMax-Music3) sings `input`
-as lyrics, as `instructions` describe the song (SGLang-Omni's reading of the route). Both are
-converted from their release directories (§3.2).
+An audio generation model answers OpenAI's `POST /v1/audio/speech`: a speech model speaks `input`,
+in a voice `instructions` may describe (Breeze-TTS-2) or with its speakers and direction written in
+the input itself (drama-3); a music model (MiniMax-Music3) sings `input` as lyrics, as
+`instructions` describe the song (SGLang-Omni's reading of the route). Each is converted from its
+release directory (§3.2).
 
 #### Speech: Breeze-TTS-2
 
@@ -2716,6 +2787,60 @@ as it is spoken. On one R9700 a sentence is made at 0.6 of the time it plays (5.
 3.1 s), and a stream's first audio comes 0.21 s after the request; four speak at once at about the
 speed they play (43 s of speech in 12.1 s). Breeze-TTS-2 is licensed for research and
 non-commercial use only, and BreezeBlue counts hosting it as an API as commercial.
+
+#### Speech: drama-3
+
+```sh
+radiance --model drama3-fp8.rad --tp 2                               # two cards
+
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "The lighthouse keeper counted seven ships before the fog rolled in."}' -o ships.wav
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "<|speaker:0|> Did you lock the back door?\n<|speaker:1|> [sighs] I thought you did."}' \
+  -o door.wav                                                        # 44.1 kHz mono, 16-bit
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d @- \
+  -o cloned.wav <<EOF                                                # the voice of voice.wav
+{"input": "The lighthouse keeper counted seven ships before the fog rolled in.",
+ "references": [{"audio": "$(base64 -w0 voice.wav)", "text": "What voice.wav says."}]}
+EOF
+```
+
+- **`input`** is the script. Speakers are named in it, `<|speaker:0|>` to `<|speaker:15|>`, and
+  text before any tag is speaker 0's; each speaker's turn is written as Fish Audio's server writes
+  it (the tag, a space, the turn's text stripped, each turn on a line of its own), so the turns may
+  be given on one line. The direction is written in the text too: point tags such as `[laughs]`,
+  `[sighs]` or `[pause]`, a bracketed style before a line (`[with bright eager excitement] We
+  won!`), `<whisper>...</whisper>`. The tokens only the prompt is built from (`<|im_start|>`,
+  `<|im_end|>`, `<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:...|>`) are refused, and so
+  is any other spelling of a speaker.
+- **`instructions` are refused**, the direction being the input's; `guidance_scale` must be 1 (the
+  model runs one branch). Without references each speaker's voice is the model's choice, the same
+  within a take.
+- **`references`** clone voices from recordings: an array of `{"audio": ..., "text": ...}`, the
+  clip a `data:` URL or the base64 of an audio file (anything ffmpeg reads, decoded to mono
+  44.1 kHz), its text what the clip says; at most 8 clips and 30 s of audio together. A
+  reference's voice is the speaker its transcript is tagged with, speaker 0 when untagged, so a
+  dialogue gives each speaker a clip: `"<|speaker:1|> ..."` as the second reference's text voices
+  the input's `<|speaker:1|>` turns. The clips are encoded by the codec's own encoder in the
+  request's first pass, in bf16 as fish-speech's server encodes them (a 12 s clip adds about
+  0.12 s before the first audio), and the prompt is fish-speech's with references:
+  `[Reference 1]`, its transcript and its frames, for each.
+- **The length** is `duration` in seconds or `max_new_tokens` in frames (21.5 a second), up to 95 s;
+  the model ends the speech at the end of the script. The prompt holds at most 3072 tokens, a
+  reference adding 21.5 a second of its clip.
+- **Sampling** is SGLang-Omni's: temperature 1.0 and top-p 0.9 (Fish Audio's model card), the
+  first code uncapped and each later code at top-k 30, with fish-speech's repetition-aware redraw
+  of the first code. fish-speech's server samples at 0.7, 0.7 and 30, where the model often falls
+  silent after a tag or a speaker's line and runs to its length (docs/ARCHITECTURES.md has the
+  counts). A take can still end before its last line; another `seed` usually speaks it all.
+- **`seed`**, **`response_format`**, **`speed`** and **`voice`** are read as for music below.
+
+Speech is played sixteen frames (0.74 s) at a time as it is made. On two R9700s a sentence is made
+at 0.30 of the time it plays (3.67 s of speech in 1.08 s) and a stream's first audio comes 0.23 s
+after the request; four paragraphs at once make 50.4 s of speech in 5.15 s. drama-3 is under the
+Fish Audio Community License: research, non-commercial and small commercial use are free; a
+service that lets others generate speech needs a licence from Fish Audio, and so does imitating a
+real person's voice without their consent.
 
 #### Music: MiniMax-Music3
 
@@ -2778,7 +2903,8 @@ is complete, so the first audio waits for the first sentence rather than the who
 
 - **`session.config`** takes the fields of `POST /v1/audio/speech` but `input` (`instructions`,
   `voice`, `seed`, `guidance_scale`, `max_new_tokens` or `duration` for each sentence, `speed`,
-  `num_inference_steps` where the model has a denoiser), checked as that route checks them, and
+  `num_inference_steps` where the model has a denoiser, `references` where it clones a voice),
+  checked as that route checks them, and
   four of its own: `response_format` `pcm` (the default) or `wav`; `stream_audio`, false (the
   default) for one binary message a sentence or true for the audio as the model makes it;
   `split_granularity`, `sentence` (the default), `clause` (also at commas and semicolons) or `none`
@@ -3109,6 +3235,7 @@ scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's 
 ```sh
 curl -s localhost:8000/stats | jq          # counters, memory, throughput
 curl -s localhost:8000/sessions | jq       # what is stored and where
+curl -s -X DELETE localhost:8000/sessions/chat-7 | jq   # forget one stored conversation (§4.8)
 curl -s localhost:8000/graph | jq          # the resolved kernel graph
 curl -s localhost:8000/server_info | jq    # model, cards, KV, draft depth, wire
 curl -s localhost:8000/diagnostics | jq    # the startup report, hardware read again now (§7.1)
@@ -3157,6 +3284,7 @@ there is none.
 | `prefix_hit_cuts_total{reason}`, `prefix_hit_cut_tokens_total` | admissions whose hit reused nothing (`no_snapshot`, `windowed_group`, `adopt_failed`) or resumed at a snapshot more than one checkpoint interval below it (`resumed_below`: the previous reply was longer than an interval, since decode writes no snapshot, the retention policy kept nothing nearer, or a restore was cut), and the checkpoint shortfall: cached prompt tokens computed again because the hit resumed at a snapshot below it. `/stats` and `/sessions` carry the same counts; `RADIANCE_LOG=debug` logs each eviction and each cut hit |
 | `prefix_restore_cuts_total` | restores from the host tier the pool could not hold whole, even after giving up other conversations' VRAM copies (§4.8); `RADIANCE_LOG=debug` logs where each was cut |
 | `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
+| `prefix_cache_released_total{what}` | entries and snapshots clients forgot through `DELETE /sessions` (§4.8) |
 | `num_requests_preempted` | |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
@@ -3256,7 +3384,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.11.0
+I STARTUP REPORT -- radiance 1.12.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -3355,8 +3483,6 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
-| `R4D_AR_LANE_3_8` | `1`: at three and eight ranks an all-reduce beside compute (`overlap` 1) takes the narrow four-rank launch instead of the wide one. Same bits; faster where the all-reduce is the shorter of the two, slower where it is the longer; not measured on such machines. Unset or `0`: the wide launch, as without the lane rows (§4.7) |
-| `RADIANCE_PREFILL_PIPELINE` | a prefill step of one sequence and 1024 tokens or more in two pieces, the work between blocks of one piece on the second lane beside the other's compute (§4.5): unset or `auto` at two ranks, `on` also at three, four and eight ranks (not measured there), `off` never. The bits are the serial step's |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

@@ -56,6 +56,9 @@ struct ChunkGeometry {
      * snapshots let an edited prompt resume below its divergence instead of from zero.
      * tip-only skips interval snapshots and keeps the original tail-only chunking. */
     bool window_ckpt = false;
+    /* Window checkpoints at interval boundaries too, not only at the tail: every policy but
+     * tip-only, which keeps the tail alone and so splits no chunk at the interval. */
+    bool window_periodic = false;
 
     bool checkpoints() const { return checkpoint_interval > 0; }
 };

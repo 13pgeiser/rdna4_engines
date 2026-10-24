@@ -174,6 +174,23 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
                                       int64_t ctx, int64_t interval, int64_t slot_bytes,
                                       int64_t share_bytes, int64_t room_bytes);
 
+/* ------------------------------------------------------------------ a release */
+/* What PrefixCache::release_session took out and what it left. Blocks are left for three
+ * reasons, counted apart so a caller can tell a half-shared conversation from a busy one: the
+ * caller asked for them (`keep_tokens`), another stored session's chain runs through them (a
+ * system prompt two conversations open with belongs to both), or a live sequence holds them. */
+struct SessionRelease {
+    int64_t sessions = 0;        /* rows the label or id named */
+    int64_t entries = 0;         /* blocks forgotten, from VRAM or the host tier */
+    int64_t tokens = 0;          /* entries x block size */
+    int64_t device_bytes = 0;    /* pool bytes given back */
+    int64_t host_bytes = 0;      /* host-tier slots given back */
+    int64_t snapshots = 0;
+    int64_t kept_tokens = 0;     /* the chain's start, as asked, whole blocks */
+    int64_t kept_shared = 0;     /* blocks beyond that on another stored session's chain */
+    int64_t kept_live = 0;       /* blocks a running or waiting request holds */
+};
+
 /* ------------------------------------------------------------------ the cache */
 class PrefixCache {
 public:
@@ -314,6 +331,21 @@ public:
      * than what follows it: conversations expire from the tip inwards and a shared system prompt
      * outlives its readers. Returns how many entries went. */
     int64_t expire(uint64_t now_ns, uint64_t ttl_ns);
+
+    /* ---------------- release on request ----------------
+     *
+     * Forget one stored conversation now instead of at the TTL: a client that deleted it, or
+     * replaced everything past a prefix (a compaction) and knows the rest is dead. `label` names
+     * every row carrying it, `id` (nonzero) one row by its engine id (IdleTiers::SessionInfo).
+     * The chain goes from the tip inwards like expire(): VRAM blocks to the pool, the host copy
+     * with them, the session's snapshots on the released blocks to the store. `keep_tokens`
+     * leaves the chain's first blocks standing (rounded up to whole blocks), so the prefix the
+     * client kept still hits. A block another stored session's chain shares stays, as does one a
+     * live sequence holds or a waiting request has restored; snapshots handed out or reserved
+     * this step stay too. RAD_E_NOTFOUND when nothing matches, RAD_E_UNSUPPORTED without the
+     * session table (no tiers attached). */
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionRelease* out);
     /* ---------------- linear checkpoints ---------------- */
     /* The next position strictly after `pos` at which the scheduler must split a chunk so that a
      * checkpoint lands on a boundary (spec §7.1, §7.3). */
@@ -356,6 +388,8 @@ public:
         int64_t drops = 0;
         /* Entries and snapshots removed by --prefix-cache-ttl, from any tier. */
         int64_t expired = 0, ckpt_expired = 0;
+        /* Entries and snapshots a client released (release_session). */
+        int64_t released = 0, ckpt_released = 0;
     };
     const Stats& stats() const { return stats_; }
 

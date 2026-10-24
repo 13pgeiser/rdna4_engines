@@ -1017,6 +1017,9 @@ TEST(op_vocabulary) {
         "conv1d", "conv_t1d", "snake", "cfg_topk_sample", "rvq_embed", "frame_mix_store",
         "end_status", "resample_nearest", "fourier_embed", "win_input", "win_prep", "win_finish",
         "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
+        /* Fish Audio drama-3's (arch/fishomni): the repetition-aware choice between two draws,
+         * and its codec encoder's residual quantiser step. */
+        "ras_pick", "vq_encode",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
@@ -1045,6 +1048,8 @@ TEST(op_vocabulary) {
         "vol_index", "attn_na3d",
         /* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position. */
         "sam_attn",
+        /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
+        "sub_i32",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -7438,6 +7443,68 @@ TEST(conv1d_act_clamp_bounds_the_output) {
     CHECK_EQ(y.at(2), -1.0f); CHECK_EQ(y.at(3), -0.75f);
 }
 
+/* conv1d `stride`: Fish Audio's causal downsampling conv (modded_dac.py, CausalConvNet), the reach
+ * k less the stride padded on the left. k 4, stride 2 over [1..8] pads 2: windows [0 0 1 2],
+ * [1 2 3 4], [3 4 5 6], [5 6 7 8] against taps 1, 10, 100, 1000 are 2100, 4321, 6543, 8765. A
+ * second sequence [1 2 3 4] starts its own padding; a bound that is not a whole stride, and a
+ * stride on the symmetric form, are refused. `cu_div` reads the same bounds in samples. */
+TEST(conv1d_stride_downsamples_each_sequence_causally) {
+    T x(RAD_F32, {12, 1}); x.f({1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4});
+    T w(RAD_F32, {1, 1, 4}); w.f({1, 10, 100, 1000});
+    T cu(RAD_I32, {3}); cu.n({0, 8, 12});
+    T y(RAD_F32, {6, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(0), 2100.0f); CHECK_EQ(y.at(1), 4321.0f);
+    CHECK_EQ(y.at(2), 6543.0f); CHECK_EQ(y.at(3), 8765.0f);
+    CHECK_EQ(y.at(4), 2100.0f); CHECK_EQ(y.at(5), 4321.0f);
+    T cu2(RAD_I32, {3}); cu2.n({0, 7, 12});
+    A b; b.t(x).t(w).t(cu2).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", b), RAD_E_SHAPE);
+    T w3(RAD_F32, {1, 1, 3}); w3.f({1, 1, 1});
+    A c; c.t(x).t(w3).t(cu).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("dil", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", c), RAD_E_SHAPE);
+    /* The same bounds in units of 4 rows (samples, 4 a row): the same rows; a bound that is not
+     * a whole number of strides in rows is refused. */
+    T y2(RAD_F32, {6, 1});
+    T cu4(RAD_I32, {3}); cu4.n({0, 32, 48});
+    A d; d.t(x).t(w).t(cu4).tnull().t(y2).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).i("cu_div", 4).s("dtype", "f32");
+    CHECK_OK(run("conv1d", d));
+    for (int64_t i = 0; i < 6; ++i) CHECK_EQ(y2.at(i), y.at(i));
+    T cu6(RAD_I32, {3}); cu6.n({0, 28, 48});
+    A e; e.t(x).t(w).t(cu6).tnull().t(y2).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).i("cu_div", 4).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", e), RAD_E_SHAPE);
+}
+
+/* vq_encode by hand. in_w scales the first channel by 2; codebook rows 0 and 2 point the same way
+ * (a cosine tie, so the lower index), row 1 the other; out_w the identity and out_b
+ * [0.5, -0.5]. Row [4, 1]: e [8, 1], code 0, x - [1.5, -0.5] = [2.5, 1.5]. Row [-1, 3]: e [-2, 3],
+ * code 1, x - [0.5, 1.5] = [-1.5, 1.5]. Row [0, 0]: e 0, every cosine 0, code 0. */
+TEST(vq_encode_takes_the_nearest_code_by_cosine_and_leaves_the_residual) {
+    T x(RAD_F32, {3, 2}); x.f({4, 1, -1, 3, 0, 0});
+    T iw(RAD_F32, {2, 2}); iw.f({2, 0, 0, 1});
+    T ib(RAD_F32, {2}); ib.f({0, 0});
+    T cb(RAD_F32, {3, 2}); cb.f({1, 0, 0, 2, 3, 0});
+    T ow(RAD_F32, {2, 2}); ow.f({1, 0, 0, 1});
+    T ob(RAD_F32, {2}); ob.f({0.5f, -0.5f});
+    T codes(RAD_I32, {3}); codes.n({-1, -1, -1});
+    A a; a.t(x).t(iw).t(ib).t(cb).t(ow).t(ob).t(codes).i("M", 3).i("n", 2).i("dim", 2)
+          .i("bins", 3).s("dtype", "f32");
+    CHECK_OK(run("vq_encode", a));
+    CHECK_EQ(codes.iat(0), 0); CHECK_EQ(codes.iat(1), 1); CHECK_EQ(codes.iat(2), 0);
+    CHECK_EQ(x.at(0), 2.5f); CHECK_EQ(x.at(1), 1.5f);
+    CHECK_EQ(x.at(2), -1.5f); CHECK_EQ(x.at(3), 1.5f);
+    CHECK_EQ(x.at(4), -1.5f); CHECK_EQ(x.at(5), 0.5f);
+    A b; b.t(x).t(iw).t(ib).t(cb).t(ow).t(ob).t(codes).i("M", 3).i("n", 2).i("dim", 2)
+          .i("bins", 4).s("dtype", "f32");
+    CHECK_EQ(run("vq_encode", b), RAD_E_SHAPE);
+}
+
 /* snake_aa's paddings, with the activation the identity (alpha 0: sin(0 u) = 0). Ratio 2, filters
  * of 4: P = 1. Sequence [10, 20, 40] pads to [10, 10, 20, 40, 40]; the transposed f_up [1, 2, 3, 4]
  * gives [10, 20, 40, 60, 50, 80, 100, 160, 160, 240, 120, 160], doubled and cropped by 3 a side:
@@ -8578,6 +8645,9 @@ std::vector<Geo> geometries() {
         G("frame_mix_store", "M", 2, a.i("M", R).i("n_embd", 8).i("L", 3).i("stride", 4)
                                      .i("rep", 2).s("dtype", "bf16")),
         G("end_status", "M", 2, a.i("M", R).i("end", 5).i("rep", 2)),
+        G("ras_pick", "M", 2, a.i("M", R).i("win", 4).i("lo", 1).i("hi", 9).i("rep", 1)),
+        G("vq_encode", "M", 3, a.i("M", R).i("n", 16).i("dim", 4).i("bins", 24)
+                                .s("dtype", "f32")),
         G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)
@@ -8590,6 +8660,7 @@ std::vector<Geo> geometries() {
         G("iota", "M", 4, a.i("M", R).i("start", 0).i("step", 1)),
         G("cu_repeat", "M", 3, a.i("M", R).i("mult", 2)),
         G("int_affine", "M", 3, a.i("M", R).s("src", "0 -1 2").s("mul", "2 0 4").s("add", "-1 5 -3")),
+        G("sub_i32", "M", 3, a.i("M", R)),
         G("frame_store", "M", 2, a.i("M", R).i("n_codes", 4).i("stride", 6).i("rep", 2)
                                  .i("skip", 0)),
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),

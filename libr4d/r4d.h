@@ -689,6 +689,10 @@ void r4d_hc_read_pin_prefill(int form);
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.
 void r4d_mla_matrix_pin_form(int form);
+// Test hook: pins the MLA rows row's form. 0 is the launcher's rule (64 heads a workgroup, vector
+// key loads where aligned; the matrix row's kernel under 32 rows), 1 the element-wise key load
+// (bit-identical to 3), 2 32 heads a workgroup, 3 the rows kernel of the rule at any row count.
+void r4d_mla_rows_pin_form(int form);
 // Test hook: records the function each launch dispatches into `fns[0..cap)`, in order, until the
 // next call, and returns how many launches the previous recording saw (which may exceed its cap).
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel

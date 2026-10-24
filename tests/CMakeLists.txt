@@ -244,6 +244,22 @@ if(RAD_HIP_FOUND)
   endforeach()
 endif()
 
+# spechub_wiring_test dlopens the built spechub plugin and checks how its rows are classified: the
+# device rows must be production kernels and the host oracle rows must stay reference. It needs the
+# library path and the same RAD_SPECHUB_WITH_DEVICE answer the plugin was built with.
+if(TARGET spechub)
+  target_link_libraries(spechub_wiring_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(spechub_wiring_test PRIVATE
+    RAD_SPECHUB_LIB="${RAD_PLUGIN_OUT}/kernels/spechub.so")
+  if(RAD_HIP_FOUND)
+    target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
+  endif()
+  add_dependencies(spechub_wiring_test spechub)
+  # sample_test's coupling case declares a Sampler with draft_coupling set and needs the verify
+  # op the spechub plugin carries (its host row); it skips when the library is absent.
+  add_dependencies(sample_test spechub)
+endif()
+
 # ================================================================== whole models on the CPU
 #
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on
@@ -308,14 +324,14 @@ endif()
 #
 # r4d_selftest is the only check of libr4d's fusion claims: rows declaring a fused kernel
 # byte-identical to the ops it replaces, verified by memcmp against the unfused kernels on the same
-# inputs. It needs a card and forks a child per row (about six minutes), so it is labelled `slow`;
-# the default `ctest` still runs it.
+# inputs. It needs a card and forks a child per row (about fifteen minutes on an R9700), so it is
+# labelled `slow`; the default `ctest` still runs it.
 if(RAD_HIP_FOUND AND TARGET r4d_selftest)
   add_test(NAME r4d_selftest
            COMMAND r4d_selftest ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
   set_tests_properties(r4d_selftest PROPERTIES
     LABELS "slow;gpu"
-    TIMEOUT 900
+    TIMEOUT 2400
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
 endif()
 
@@ -520,6 +536,9 @@ endif()
 # parameters). Cheap, so in the fast tier. libr4d.so is added when built; the script reports
 # "  SKIP " rather than passing when a plugin will not dump.
 set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
+if(TARGET spechub)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/spechub.so)
+endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
 endif()

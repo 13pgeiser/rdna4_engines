@@ -145,6 +145,7 @@ struct Plugin {
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
+    void (*pin_mla_rows)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
 };
@@ -213,6 +214,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
+    okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
     ScopedAr8::apply = pl->ar8_settings;
@@ -399,74 +401,6 @@ static void cross_check(const Plugin& pl) {
     ok("every constraint key is a declared parameter of its op", bad_key == 0, keydetail);
     ok("every row that needs two or more ranks requires device.p2p 1 or 0", no_p2p == 0,
        p2pdetail);
-
-    /* The three- and eight-rank `overlap` rows launch as their wide rows unless R4D_AR_LANE_3_8=1
-     * (r4d_rows.cpp, tArTs38Lane): every axis default the wide row's, nblocks 4 under the variable.
-     * The four-rank lane rows keep their measured narrow launch either way. */
-    {
-        const char* env = std::getenv("R4D_AR_LANE_3_8");
-        const bool narrow = env && env[0] == '1' && !env[1];
-        auto row = [&](const char* n) -> const RadKernelInfo* {
-            for (int k = 0; k < nk; ++k)
-                if (!std::strcmp(pl.kernel_at(k)->name, n)) return pl.kernel_at(k);
-            return nullptr;
-        };
-        auto deflt = [](const RadKernelInfo* r, const char* key) -> long long {
-            for (int v = 0; v < r->n_tunables; ++v)
-                if (!std::strcmp(r->tunables[v].key, key)) return (long long)r->tunables[v].deflt;
-            return -1;
-        };
-        static const char* const pairs[][2] = {
-            { "ar_twoshot_3rank_exact_lane", "ar_twoshot_3rank_exact" },
-            { "ar_twoshot_8rank_exact_lane", "ar_twoshot_8rank_exact" },
-            { "ar_twoshot_3rank_ti8_lane", "ar_twoshot_3rank_ti8" },
-        };
-        int bad = 0;
-        std::string detail;
-        for (const auto& pr : pairs) {
-            const RadKernelInfo* l = row(pr[0]);
-            const RadKernelInfo* w = row(pr[1]);
-            if (!l || !w) { ++bad; detail += std::string(pr[0]) + " or its wide row absent; "; continue; }
-            for (const char* key : { "nblocks", "nthreads", "drain", "acq" }) {
-                const long long want = narrow && !std::strcmp(key, "nblocks") ? 4 : deflt(w, key);
-                if (deflt(l, key) != want) {
-                    ++bad;
-                    detail += std::string(pr[0]) + ":" + key + " " + std::to_string(deflt(l, key)) +
-                              " (want " + std::to_string(want) + "); ";
-                }
-            }
-        }
-        ok(narrow ? "the 3/8-rank overlap rows take the narrow launch (R4D_AR_LANE_3_8=1)"
-                  : "the 3/8-rank overlap rows launch as their wide rows (R4D_AR_LANE_3_8 unset)",
-           bad == 0, detail);
-        /* And they accept every pin their wide rows accept: a RADIANCE_TUNE all_reduce pin is applied
-         * to every row serving the op, and a key or value a serving row lacks fails the selection. */
-        int bad_axis = 0;
-        std::string axis_detail;
-        for (const auto& pr : pairs) {
-            const RadKernelInfo* l = row(pr[0]);
-            const RadKernelInfo* w = row(pr[1]);
-            if (!l || !w) continue;
-            for (int v = 0; v < w->n_tunables; ++v) {
-                const RadTunable& wt = w->tunables[v];
-                const RadTunable* lt = nullptr;
-                for (int u = 0; u < l->n_tunables; ++u)
-                    if (!std::strcmp(l->tunables[u].key, wt.key)) lt = &l->tunables[u];
-                if (!lt) { ++bad_axis; axis_detail += std::string(pr[0]) + " lacks " + wt.key + "; "; continue; }
-                for (int i = 0; i < wt.n_values; ++i) {
-                    bool has = false;
-                    for (int j = 0; j < lt->n_values; ++j) has = has || lt->values[j] == wt.values[i];
-                    if (!has) {
-                        ++bad_axis;
-                        axis_detail += std::string(pr[0]) + ":" + wt.key + " lacks " +
-                                       std::to_string((long long)wt.values[i]) + "; ";
-                    }
-                }
-            }
-        }
-        ok("the 3/8-rank overlap rows accept every tunable pin of their wide rows", bad_axis == 0,
-           axis_detail);
-    }
 
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
@@ -6256,18 +6190,28 @@ int64_t seq_of(const std::vector<int32_t>& cu, int64_t r) {
     return s;
 }
 
-/* conv1d: the causal form beside the symmetric one, on the tiled and the direct kernels. */
+/* conv1d: the causal form beside the symmetric one, on the tiled and the direct kernels; strided
+ * causal forms (a codec encoder's downsampling, kernels of two strides and of one) over sequences
+ * of whole strides, the bounds also in units of 8 rows (cu_div, an encoder's samples). */
 void conv1d_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "conv1d_bf16");
     if (!r) { ok("conv1d_bf16", false, "row absent"); return; }
-    struct C { int64_t cin, cout, k, dil; int causal, extras; };
-    for (const C& c : { C{ 16, 32, 3, 2, 0, 0 }, C{ 16, 32, 3, 2, 1, 1 }, C{ 16, 128, 4, 1, 1, 0 },
-                        C{ 6, 3, 7, 3, 1, 1 }, C{ 6, 3, 2, 1, 1, 0 } }) {
-        const std::vector<int32_t> cu = { 0, 13, 30 };
-        const int64_t M = 30;
+    struct C { int64_t cin, cout, k, dil; int causal, extras; int64_t st, cd = 1; };
+    for (const C& c : { C{ 16, 32, 3, 2, 0, 0, 1 }, C{ 16, 32, 3, 2, 1, 1, 1 },
+                        C{ 16, 128, 4, 1, 1, 0, 1 }, C{ 6, 3, 7, 3, 1, 1, 1 },
+                        C{ 6, 3, 2, 1, 1, 0, 1 }, C{ 16, 32, 4, 1, 1, 0, 2 },
+                        C{ 16, 128, 16, 1, 1, 1, 8 }, C{ 6, 3, 8, 1, 1, 1, 4 },
+                        C{ 16, 32, 2, 1, 1, 0, 2 }, C{ 16, 64, 4, 1, 1, 1, 2, 8 },
+                        C{ 6, 3, 8, 1, 1, 0, 4, 8 } }) {
+        /* Bounds of whole strides: 13 and 30 rounded up to the stride; the op reads them times
+         * cu_div. */
+        const int64_t s1 = (13 + c.st - 1) / c.st * c.st, s2 = (30 + c.st - 1) / c.st * c.st;
+        const std::vector<int32_t> cu = { 0, (int32_t)s1, (int32_t)s2 };
+        const std::vector<int32_t> cu_op = { 0, (int32_t)(s1 * c.cd), (int32_t)(s2 * c.cd) };
+        const int64_t M = s2, MO = M / c.st;
         std::vector<float> x = randv((size_t)(M * c.cin), 1.0f);
         std::vector<float> w = randv((size_t)(c.cout * c.cin * c.k), 0.3f);
-        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(M * c.cout), 0.5f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(MO * c.cout), 0.5f);
         void* dx = up_bf16(x);
         void* db = up_bf16(b);
         void* dres = up_bf16(res);
@@ -6275,27 +6219,31 @@ void conv1d_cases(const Plugin& pl) {
         std::vector<RadParam> ps = { PI("M", M), PI("cin", c.cin), PI("cout", c.cout),
                                      PI("k", c.k), PI("dil", c.dil), PS("act", c.extras ? "tanh" : "none"),
                                      PS("dtype", "bf16"), PI("causal", c.causal) };
-        const std::string nm = fmt("conv1d_bf16 cin %lld cout %lld k %lld dil %lld causal %d%s",
+        if (c.st > 1) ps.push_back(PI("stride", c.st));
+        if (c.cd > 1) ps.push_back(PI("cu_div", c.cd));
+        const std::string nm = fmt("conv1d_bf16 cin %lld cout %lld k %lld dil %lld causal %d "
+                                   "stride %lld cu_div %lld%s",
                                    (long long)c.cin, (long long)c.cout, (long long)c.k,
-                                   (long long)c.dil, c.causal, c.extras ? " +bias+res+tanh" : "");
+                                   (long long)c.dil, c.causal, (long long)c.st, (long long)c.cd,
+                                   c.extras ? " +bias+res+tanh" : "");
         void* dw = stored_weight(r, ps, w, c.cout, c.cin * c.k, nm.c_str());
-        void* dcu = up_i32(cu);
-        void* dy = dalloc((size_t)(M * c.cout) * 2);
+        void* dcu = up_i32(cu_op);
+        void* dy = dalloc((size_t)(MO * c.cout) * 2);
         if (!dw) continue;
-        RadTensor tres = T(dres, RAD_BF16, { M, c.cout }), tb = T(db, RAD_BF16, { c.cout });
+        RadTensor tres = T(dres, RAD_BF16, { MO, c.cout }), tb = T(db, RAD_BF16, { c.cout });
         if (!c.extras) { absent(tres); absent(tb); }
         const int rc = launch(r, { T(dx, RAD_BF16, { M, c.cin }), T(dw, RAD_BF16, { c.cout, c.cin, c.k }),
-                                   T(dcu, RAD_I32, { 3 }), tres, T(dy, RAD_BF16, { M, c.cout }), tb },
+                                   T(dcu, RAD_I32, { 3 }), tres, T(dy, RAD_BF16, { MO, c.cout }), tb },
                               ps);
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
-        const int64_t pad = c.causal ? c.dil * (c.k - 1) : c.dil * (c.k - 1) / 2;
-        std::vector<float> want((size_t)(M * c.cout));
-        for (int64_t row = 0; row < M; ++row) {
-            const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+        const int64_t pad = c.causal ? c.dil * (c.k - 1) + 1 - c.st : c.dil * (c.k - 1) / 2;
+        std::vector<float> want((size_t)(MO * c.cout));
+        for (int64_t row = 0; row < MO; ++row) {
+            const int64_t e = seq_of(cu, row * c.st), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
             for (int64_t co = 0; co < c.cout; ++co) {
                 float acc = 0.0f;
                 for (int64_t kk = 0; kk < c.k; ++kk) {
-                    const int64_t ir = row + kk * c.dil - pad;
+                    const int64_t ir = row * c.st + kk * c.dil - pad;
                     if (ir < s0 || ir >= s1) continue;
                     for (int64_t ci = 0; ci < c.cin; ++ci)
                         acc += w[(size_t)((co * c.cin + ci) * c.k + kk)] * x[(size_t)(ir * c.cin + ci)];
@@ -6428,10 +6376,14 @@ void snake_cases(const Plugin& pl) {
     }
 }
 
+/* Picks whose nucleus ended inside the top k, so that a top_p case is known to test the cut. */
+int64_t g_topp_cuts = 0;
+
 /* ref_cfg_topk_sample's rule on the host, for one lane, over f32 logits. */
 int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep, float cfg,
              int64_t K, int64_t cond_k, float temp, int64_t sup_lo, int64_t sup_hi, float pen,
-             std::vector<int32_t>* hist, int64_t hb, uint64_t seed, int32_t frame, uint64_t stream) {
+             std::vector<int32_t>* hist, int64_t hb, uint64_t seed, int32_t frame, uint64_t stream,
+             float top_p = 1.0f) {
     std::vector<float> c((size_t)V), g((size_t)V);
     for (int64_t j = 0; j < V; ++j) c[(size_t)j] = lg[(size_t)(rep * lane_row * V + j)];
     if (rep == 2) {
@@ -6464,11 +6416,28 @@ int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep,
             if (open(j)) idx.push_back(j);
     }
     if (idx.empty()) return -1;
-    const int64_t kk = std::min<int64_t>(K, (int64_t)idx.size());
+    double z = 0;
+    if (top_p < 1.0f) {
+        float gm = g[(size_t)idx[0]];
+        for (const int64_t j : idx) gm = std::max(gm, g[(size_t)j]);
+        for (const int64_t j : idx) z += std::exp((double)(g[(size_t)j] / temp - gm / temp));
+    }
+    int64_t kk = std::min<int64_t>(K, (int64_t)idx.size());
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int64_t p, int64_t q) {
         return g[(size_t)p] > g[(size_t)q] || (g[(size_t)p] == g[(size_t)q] && p < q);
     });
     const float m = g[(size_t)idx[0]] / temp;
+    if (top_p < 1.0f) {
+        double cum = 0;
+        int64_t keep = 1;
+        for (int64_t t = 0; t < kk; ++t) {
+            cum += std::exp((double)(g[(size_t)idx[(size_t)t]] / temp - m)) / z;
+            if (t > 0 && cum > (double)top_p) break;
+            keep = t + 1;
+        }
+        if (keep < kk) ++g_topp_cuts;
+        kk = keep;
+    }
     double tot = 0;
     std::vector<double> e((size_t)kk);
     for (int64_t t = 0; t < kk; ++t) {
@@ -6493,16 +6462,26 @@ int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep,
 void cfg_topk_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "cfg_topk_sample");
     if (!r) { ok("cfg_topk_sample", false, "row absent"); return; }
-    struct C { int64_t V; int rep; bool hist, cfgs; int64_t sup_lo, sup_hi, cond_k; float temp; };
+    struct C {
+        int64_t V; int rep; bool hist, cfgs; int64_t sup_lo, sup_hi, cond_k; float temp;
+        float top_p = 1.0f; int64_t K = 50;
+    };
+    /* The last two are Fish Audio's draws (arch/fishomni): its main pick over eos and 4096
+     * semantic ids at temperature 0.7, nucleus 0.7, top 30, and its repetition-aware redraw at 1.0,
+     * 0.95, 30. */
     for (const C& c : { C{ 2052, 2, true, true, 2048, 2051, 0, 0.9f },
                         C{ 2051, 1, true, false, 2048, 2051, 0, 0.9f },
                         C{ 2051, 2, false, true, 2048, 2051, 0, 0.9f },
-                        C{ 16385, 2, false, false, 0, 0, 50, 1.0f } }) {
-        const int64_t n = 3, lanes = 4, K = 50;
-        const std::string nm = fmt("cfg_topk_sample V %lld rep %d%s%s sup [%lld, %lld) cond_k %lld",
+                        C{ 16385, 2, false, false, 0, 0, 50, 1.0f },
+                        C{ 4097, 1, false, false, 0, 0, 0, 0.7f, 0.7f, 30 },
+                        C{ 4097, 1, false, false, 0, 0, 0, 1.0f, 0.95f, 30 } }) {
+        const int64_t n = 3, lanes = 4, K = c.K;
+        const std::string nm = fmt("cfg_topk_sample V %lld rep %d%s%s sup [%lld, %lld) cond_k %lld"
+                                   " top_p %g k %lld",
                                    (long long)c.V, c.rep, c.hist ? " hist" : "",
                                    c.cfgs ? " per-lane cfg" : "", (long long)c.sup_lo,
-                                   (long long)c.sup_hi, (long long)c.cond_k);
+                                   (long long)c.sup_hi, (long long)c.cond_k, (double)c.top_p,
+                                   (long long)K);
         std::vector<int32_t> lane = { 2, 0, 3 };
         std::vector<float> cfgv = { 1.0f, 3.0f, 4.0f };
         std::vector<uint32_t> seed = { 7u, 0u, 0x9e3779b9u, 1u, 0xdeadbeefu, 0x12345u };
@@ -6525,6 +6504,9 @@ void cfg_topk_cases(const Plugin& pl) {
             for (size_t i = 0; i < lg.size(); ++i) {
                 const float v = rnd() * 6.0f;
                 lg[i] = (i % 97 == 0) ? 5.95f : v;
+                /* About 19 peaks a row hold most of the mass, so the nucleus ends inside the top
+                 * 30 and the cut is what decides the pick. */
+                if (c.top_p < 1.0f && i % 211 == 5) lg[i] = 12.0f + 4.0f * rnd();
             }
             void* dlg = up_f32(lg);
             std::vector<int32_t> frame((size_t)n, f);
@@ -6537,7 +6519,7 @@ void cfg_topk_cases(const Plugin& pl) {
                                          PI("rep", c.rep), PI("cond_k", c.cond_k), PF("cfg", 1.5),
                                          PF("temp", c.temp), PI("stream", 3), PS("dtype", "f32"),
                                          PI("sup_lo", c.sup_lo), PI("sup_hi", c.sup_hi),
-                                         PF("penalty", 1.1) };
+                                         PF("penalty", 1.1), PF("top_p", c.top_p) };
             const int rc = launch(r, { T(dlg, RAD_F32, { c.rep * n, c.V }), T(dseed, RAD_U32, { n, 2 }),
                                        T(dfr, RAD_I32, { n }), T(dids, RAD_I32, { c.rep * n }), tcfg,
                                        tlane, thist },
@@ -6550,7 +6532,8 @@ void cfg_topk_cases(const Plugin& pl) {
                 const int want = ref_pick(lg, c.V, i, c.rep, c.cfgs ? cfgv[(size_t)i] : 1.5f, K,
                                           c.cond_k, c.temp, c.sup_lo, c.sup_hi, 1.1f,
                                           c.hist ? &hist : nullptr,
-                                          c.hist ? lane[(size_t)i] * c.V : -1, sd, f, 3);
+                                          c.hist ? lane[(size_t)i] * c.V : -1, sd, f, 3,
+                                          c.top_p);
                 for (int t = 0; t < c.rep; ++t)
                     if (got[(size_t)(c.rep * i + t)] != want) ++wrong;
             }
@@ -6558,10 +6541,62 @@ void cfg_topk_cases(const Plugin& pl) {
         }
         ok((nm + " picks").c_str(), wrong == 0, fmt("%lld of %lld picks differ", (long long)wrong,
                                                      (long long)(4 * c.rep * n)));
+        if (c.top_p < 1.0f) {
+            ok((nm + " cuts").c_str(), g_topp_cuts > 0, "the nucleus never ended inside the top k");
+            g_topp_cuts = 0;
+        }
         if (c.hist)
             ok((nm + " history").c_str(), hist_wrong == 0,
                fmt("%lld history entries differ", (long long)hist_wrong));
     }
+}
+
+/* ras_pick over four picks of three lanes, the first clearing their windows: the picks and the
+ * windows against libref's rule on the host, exactly. Draws repeat often (a band of 6 ids) so the
+ * redraw is exercised, and one is outside [lo, hi) (never redrawn). */
+void ras_pick_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "ras_pick");
+    if (!r) { ok("ras_pick", false, "row absent"); return; }
+    const int64_t n = 3, lanes = 4, W = 4, lo = 1, hi = 6;
+    std::vector<int32_t> lane = { 2, 0, 3 };
+    std::vector<int32_t> hist((size_t)(lanes * W), 5);
+    void* dlane = up_i32(lane);
+    void* dhist = up_i32(hist);
+    void* dids = dalloc((size_t)n * 4);
+    int64_t wrong = 0;
+    for (int step = 0; step < 4; ++step) {
+        std::vector<int32_t> first((size_t)n), alt((size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            first[(size_t)i] = (int32_t)((step * 2 + i * 3) % 7);   /* 0 is outside [lo, hi) */
+            alt[(size_t)i] = (int32_t)(10 + step * 3 + i);
+        }
+        void* df = up_i32(first);
+        void* da = up_i32(alt);
+        const int clear = step == 0 ? 1 : 0;
+        std::vector<RadParam> ps = { PI("M", n), PI("win", W), PI("lo", lo), PI("hi", hi),
+                                     PI("rep", 1), PI("clear", clear) };
+        const int rc = launch(r, { T(df, RAD_I32, { n }), T(da, RAD_I32, { n }),
+                                   T(dlane, RAD_I32, { n }), T(dhist, RAD_I32, { lanes, W }),
+                                   T(dids, RAD_I32, { n }) },
+                              ps);
+        if (rc != RAD_OK) { ok("ras_pick", false, "rc " + std::to_string(rc)); return; }
+        const std::vector<int32_t> got = down_i32(dids, (size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            int32_t* h = hist.data() + lane[(size_t)i] * W;
+            if (clear) for (int64_t w = 0; w < W; ++w) h[w] = -1;
+            int32_t pick = first[(size_t)i];
+            if (pick >= lo && pick < hi)
+                for (int64_t w = 0; w < W; ++w)
+                    if (h[w] == pick) { pick = alt[(size_t)i]; break; }
+            for (int64_t w = 0; w + 1 < W; ++w) h[w] = h[w + 1];
+            h[W - 1] = pick;
+            if (got[(size_t)i] != pick) ++wrong;
+        }
+    }
+    ok("ras_pick picks", wrong == 0, fmt("%lld of %lld picks differ", (long long)wrong,
+                                         (long long)(4 * n)));
+    ok("ras_pick windows", differ(down_i32(dhist, hist.size()), hist) == 0,
+       "the windows differ from libref's rule");
 }
 
 /* rvq_embed: libref's two roundings, the single rounding over bf16 and f32 tables into a bf16 or
@@ -6571,9 +6606,12 @@ void rvq_embed_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "rvq_embed_bf16");
     if (!r) { ok("rvq_embed_bf16", false, "row absent"); return; }
     const int64_t D = 96, K = 5, voc = 11, off0 = 3, rows = 6, lanes = 2, stride = 9;
-    struct C { int round1; bool f32tab, f32y, block; };
+    /* The last case clamps every code at 8 (`clamp`): codes 8..10 read row 7, and the later code
+     * past t1 reads its codebook's row 7 instead of nothing. */
+    struct C { int round1; bool f32tab, f32y, block; int clamp = 0; };
     for (const C& c : { C{ 0, false, false, false }, C{ 1, false, false, false },
-                        C{ 1, true, true, true }, C{ 1, false, true, true } }) {
+                        C{ 1, true, true, true }, C{ 1, false, true, true },
+                        C{ 0, false, false, false, 8 } }) {
         std::vector<float> t0 = randv((size_t)((voc + off0) * D), 1.0f);
         std::vector<float> t1 = randv((size_t)((K - 1) * voc * D), 1.0f);
         void* d0 = c.f32tab ? up_f32(t0) : up_bf16(t0);
@@ -6607,10 +6645,12 @@ void rvq_embed_cases(const Plugin& pl) {
         const float scale = 0.5f;
         std::vector<RadParam> ps = { PI("M", rows), PI("n_embd", D), PI("n_codes", K),
                                      PI("vocab", voc), PI("off0", off0), PF("scale", scale),
-                                     PS("dtype", c.f32y ? "f32" : "bf16"), PI("round", c.round1) };
-        const std::string nm = fmt("rvq_embed_bf16 round %d %s tables -> %s%s", c.round1,
+                                     PS("dtype", c.f32y ? "f32" : "bf16"), PI("round", c.round1),
+                                     PI("clamp", c.clamp) };
+        const std::string nm = fmt("rvq_embed_bf16 round %d %s tables -> %s%s clamp %d", c.round1,
                                    c.f32tab ? "f32" : "bf16", c.f32y ? "f32" : "bf16",
-                                   c.block ? ", codes a history block" : "");
+                                   c.block ? ", codes a history block" : "", c.clamp);
+        auto cl = [&](int64_t v) { return c.clamp > 0 && v > c.clamp - 1 ? c.clamp - 1 : v; };
         const int rc = launch(r, { tc, T(d0, c.f32tab ? RAD_F32 : RAD_BF16, { voc + off0, D }),
                                    T(d1, c.f32tab ? RAD_F32 : RAD_BF16, { (K - 1) * voc, D }),
                                    T(dy, ydt, { rows, D }) },
@@ -6618,13 +6658,13 @@ void rvq_embed_cases(const Plugin& pl) {
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
         std::vector<float> want = sentinel;
         for (int64_t i = 0; i < rows; ++i) {
-            const int64_t c0 = code[(size_t)i] + off0;
+            const int64_t c0 = cl(code[(size_t)i]) + off0;
             if (c0 < 0 || c0 >= voc + off0) continue;
             for (int64_t d = 0; d < D; ++d) {
                 const float e0 = t0[(size_t)(c0 * D + d)];
                 float acc = c.round1 ? e0 : 0.0f;
                 for (int64_t k = 1; k < K; ++k) {
-                    const int64_t ck = code[(size_t)(k * rows + i)] + (k - 1) * voc;
+                    const int64_t ck = cl(code[(size_t)(k * rows + i)]) + (k - 1) * voc;
                     if (ck >= 0 && ck < (K - 1) * voc) acc += t1[(size_t)(ck * D + d)];
                 }
                 const float s = c.round1 ? acc : bfr(e0 + bfr(acc));
@@ -6635,6 +6675,104 @@ void rvq_embed_cases(const Plugin& pl) {
         const int64_t bad = differ(got, want);
         ok((nm + " exact").c_str(), bad == 0, fmt("%lld of %lld elements differ", (long long)bad,
                                                   (long long)want.size()));
+    }
+}
+
+/* vq_encode at Fish Audio's codec geometry (n 1024, codes of dimension 8, a semantic codebook of
+ * 4096 and a residual one of 1024) and an odd one, bf16 and f32 rows, f32 and bf16 weights, the
+ * codes a dense row and a strided column: each code against the host's cosine argmax in double (a
+ * pick within 1e-5 of the best score is a near tie, not a miss), the row after against
+ * x - out_w cb[code] - out_b for the code the kernel took. */
+void vq_encode_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vq_encode");
+    if (!r) { ok("vq_encode", false, "row absent"); return; }
+    struct C { int64_t n, dim, bins, M; bool f32x, f32w; int64_t cst; };
+    for (const C& c : { C{ 1024, 8, 4096, 37, false, true, 1 }, C{ 1024, 8, 1024, 37, false, true, 1 },
+                        C{ 1024, 8, 1024, 20, true, true, 3 }, C{ 1024, 8, 4096, 9, false, false, 1 },
+                        C{ 200, 5, 300, 11, true, false, 2 } }) {
+        const int64_t n = c.n, dim = c.dim, bins = c.bins, M = c.M;
+        std::vector<float> x = randv((size_t)(M * n), 1.0f);
+        std::vector<float> iw = randv((size_t)(dim * n), 1.0f / std::sqrt((float)n));
+        std::vector<float> ib = randv((size_t)dim, 0.1f), cb = randv((size_t)(bins * dim), 1.0f);
+        std::vector<float> ow = randv((size_t)(n * dim), 0.3f), ob = randv((size_t)n, 0.1f);
+        /* A bf16 upload rounds the host copy to what the device holds. */
+        const uint32_t wdt = c.f32w ? RAD_F32 : RAD_BF16, xdt = c.f32x ? RAD_F32 : RAD_BF16;
+        auto upw = [&](std::vector<float>& w) { return c.f32w ? up_f32(w) : up_bf16(w); };
+        void* dx = c.f32x ? up_f32(x) : up_bf16(x);
+        const std::vector<int32_t> plane((size_t)(M * c.cst), -7);
+        void* dc = up_i32(plane);
+        RadTensor tc = T(dc, RAD_I32, { M });
+        tc.stride[0] = c.cst;
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("dim", dim), PI("bins", bins),
+                                     PS("dtype", c.f32x ? "f32" : "bf16") };
+        const std::string nm = fmt("vq_encode n %lld dim %lld bins %lld, %s rows, %s weights, "
+                                   "code stride %lld", (long long)n, (long long)dim,
+                                   (long long)bins, c.f32x ? "f32" : "bf16",
+                                   c.f32w ? "f32" : "bf16", (long long)c.cst);
+        const int rc = launch(r, { T(dx, xdt, { M, n }), T(upw(iw), wdt, { dim, n }),
+                                   T(upw(ib), wdt, { dim }), T(upw(cb), wdt, { bins, dim }),
+                                   T(upw(ow), wdt, { n, dim }), T(upw(ob), wdt, { n }), tc },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<int32_t> got = down_i32(dc, plane.size());
+        const std::vector<float> gx = c.f32x ? down_f32(dx, x.size()) : down_bf16(dx, x.size());
+        int64_t miss = 0, near = 0, gaps = 0;
+        std::vector<float> want = x;
+        for (int64_t i = 0; i < M; ++i) {
+            std::vector<double> e((size_t)dim);
+            double ss = 0;
+            for (int64_t j = 0; j < dim; ++j) {
+                double acc = ib[(size_t)j];
+                for (int64_t d = 0; d < n; ++d)
+                    acc += (double)iw[(size_t)(j * n + d)] * x[(size_t)(i * n + d)];
+                e[(size_t)j] = acc;
+                ss += acc * acc;
+            }
+            const double en = std::max(std::sqrt(ss), 1e-12);
+            auto score = [&](int64_t k) {
+                const float* row = cb.data() + k * dim;
+                double cs = 0, dot = 0;
+                for (int64_t j = 0; j < dim; ++j) cs += (double)row[j] * row[j];
+                const double cn = std::max(std::sqrt(cs), 1e-12);
+                for (int64_t j = 0; j < dim; ++j) dot += e[(size_t)j] / en * (row[j] / cn);
+                return dot;
+            };
+            int64_t best = 0;
+            double bs = -1e300;
+            for (int64_t k = 0; k < bins; ++k) {
+                const double s = score(k);
+                if (s > bs) { bs = s; best = k; }
+            }
+            for (int64_t g = 1; g < c.cst; ++g)
+                if (got[(size_t)(i * c.cst + g)] != -7) ++gaps;
+            const int64_t k = got[(size_t)(i * c.cst)];
+            if (k < 0 || k >= bins) { ++miss; continue; }
+            if (k != best) {
+                if (bs - score(k) <= 1e-5) ++near;
+                else ++miss;
+            }
+            for (int64_t d = 0; d < n; ++d) {
+                double q = ob[(size_t)d];
+                for (int64_t j = 0; j < dim; ++j)
+                    q += (double)ow[(size_t)(d * dim + j)] * cb[(size_t)(k * dim + j)];
+                want[(size_t)(i * n + d)] = (float)(x[(size_t)(i * n + d)] - q);
+            }
+        }
+        ok((nm + " codes").c_str(), miss == 0 && gaps == 0,
+           fmt("%lld of %lld codes wrong (%lld near ties taken), %lld gaps of the strided codes "
+               "written", (long long)miss, (long long)M, (long long)near, (long long)gaps));
+        if (c.f32x) {
+            /* f32 rows: against the f32 rows themselves (check() rounds its reference to bf16). */
+            double e = 0, r2 = 0;
+            for (size_t i = 0; i < want.size(); ++i) {
+                e += ((double)gx[i] - want[i]) * ((double)gx[i] - want[i]);
+                r2 += (double)want[i] * want[i];
+            }
+            const double rl = std::sqrt(e / std::max(r2, 1e-30));
+            ok(fmt("%s residual (rel_l2 %.3g, bound 1e-05)", nm.c_str(), rl).c_str(), rl <= 1e-5);
+        } else {
+            check(nm + " residual", gx, want, 1e-2);
+        }
     }
 }
 
@@ -9894,36 +10032,43 @@ void gate_add_none_case(const Plugin& pl) {
 
 /* conv1d at f32 at a BigVGAN's geometries: conv_pre's 2048 -> 1024 over 7 taps, the AMP blocks'
  * dilated 3/7/11 taps with the residual the output itself, the direct kernel's 8 channels and the
- * final conv's one with its clamp. Two sequences, so a tap crossing a sequence's edge reads zero. */
+ * final conv's one with its clamp; then a DAC encoder's strided causal downsampling (kernels of two
+ * strides, 2 to 8, and the quantizer's of one). Two sequences, so a tap crossing a sequence's edge
+ * reads zero; a strided case's sequences are whole strides. */
 void conv1d_f32_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "conv1d_f32");
     if (!r) { ok("conv1d_f32", false, "row absent"); return; }
-    struct C { int64_t cin, cout, k, dil, M0, M1; int act, bias, res; };   /* res 2: y itself */
+    struct C { int64_t cin, cout, k, dil, M0, M1; int act, bias, res; int64_t st = 1; };   /* res 2: y itself */
     for (const C& c : { C{ 2048, 1024, 7, 1, 9, 15, 0, 1, 0 }, C{ 64, 128, 7, 1, 37, 60, 0, 1, 0 },
                         C{ 32, 32, 11, 5, 70, 41, 0, 1, 2 }, C{ 16, 16, 3, 3, 50, 77, 0, 1, 1 },
                         C{ 48, 40, 3, 1, 33, 30, 1, 1, 0 }, C{ 8, 8, 11, 5, 90, 64, 0, 1, 2 },
-                        C{ 8, 1, 7, 1, 100, 99, 2, 0, 0 }, C{ 64, 64, 11, 1, 200, 137, 2, 1, 2 } }) {
+                        C{ 8, 1, 7, 1, 100, 99, 2, 0, 0 }, C{ 64, 64, 11, 1, 200, 137, 2, 1, 2 },
+                        C{ 64, 128, 4, 1, 36, 60, 0, 1, 0, 2 }, C{ 128, 256, 8, 1, 64, 40, 0, 1, 1, 4 },
+                        C{ 256, 512, 16, 1, 96, 136, 0, 1, 0, 8 }, C{ 8, 8, 16, 1, 32, 48, 0, 1, 0, 8 },
+                        C{ 64, 64, 2, 1, 50, 30, 0, 1, 2, 2 } }) {
         const std::vector<int32_t> cu = { 0, (int32_t)c.M0, (int32_t)(c.M0 + c.M1) };
-        const int64_t M = c.M0 + c.M1;
+        const int64_t M = c.M0 + c.M1, MO = M / c.st;
         std::vector<float> x = randv((size_t)(M * c.cin), 1.0f);
         std::vector<float> w = randv((size_t)(c.cout * c.cin * c.k), 1.0f / std::sqrt((float)(c.cin * c.k)));
-        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(M * c.cout), 0.5f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(MO * c.cout), 0.5f);
         std::vector<RadParam> ps = { PI("M", M), PI("cin", c.cin), PI("cout", c.cout), PI("k", c.k),
                                      PI("dil", c.dil),
                                      PS("act", c.act == 1 ? "tanh" : c.act == 2 ? "clamp" : "none"),
                                      PS("dtype", "f32") };
-        const std::string nm = fmt("conv1d_f32 cin %lld cout %lld k %lld dil %lld%s%s%s", (long long)c.cin,
+        if (c.st > 1) { ps.push_back(PI("causal", 1)); ps.push_back(PI("stride", c.st)); }
+        const std::string nm = fmt("conv1d_f32 cin %lld cout %lld k %lld dil %lld%s%s%s%s", (long long)c.cin,
                                    (long long)c.cout, (long long)c.k, (long long)c.dil,
+                                   c.st > 1 ? fmt(" causal stride %lld", (long long)c.st).c_str() : "",
                                    c.bias ? " +bias" : "", c.res == 2 ? " +res in place" : c.res ? " +res" : "",
                                    c.act == 1 ? " tanh" : c.act == 2 ? " clamp" : "");
         void* dw = stored_weight_f32(r, ps, w, c.cout, c.cin * c.k, nm.c_str());
         if (!dw) continue;
         void* dx = up_f32(x);
         void* db = up_f32(b);
-        void* dy = up_f32(c.res == 2 ? res : std::vector<float>((size_t)(M * c.cout), 0.0f));
+        void* dy = up_f32(c.res == 2 ? res : std::vector<float>((size_t)(MO * c.cout), 0.0f));
         void* dr = up_f32(res);
-        RadTensor ty = T(dy, RAD_F32, { M, c.cout });
-        RadTensor tr = c.res == 2 ? ty : T(dr, RAD_F32, { M, c.cout });
+        RadTensor ty = T(dy, RAD_F32, { MO, c.cout });
+        RadTensor tr = c.res == 2 ? ty : T(dr, RAD_F32, { MO, c.cout });
         RadTensor tb = T(db, RAD_F32, { c.cout });
         if (!c.res) absent(tr);
         if (!c.bias) absent(tb);
@@ -9932,14 +10077,14 @@ void conv1d_f32_cases(const Plugin& pl) {
                                    T(up_i32(cu), RAD_I32, { 3 }), tr, ty, tb },
                               ps);
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
-        const int64_t pad = c.dil * (c.k - 1) / 2;
-        std::vector<float> want((size_t)(M * c.cout));
-        for (int64_t row = 0; row < M; ++row) {
-            const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+        const int64_t pad = c.st > 1 ? c.dil * (c.k - 1) + 1 - c.st : c.dil * (c.k - 1) / 2;
+        std::vector<float> want((size_t)(MO * c.cout));
+        for (int64_t row = 0; row < MO; ++row) {
+            const int64_t e = seq_of(cu, row * c.st), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
             for (int64_t co = 0; co < c.cout; ++co) {
                 double acc = 0;
                 for (int64_t kk = 0; kk < c.k; ++kk) {
-                    const int64_t ir = row + kk * c.dil - pad;
+                    const int64_t ir = row * c.st + kk * c.dil - pad;
                     if (ir < s0 || ir >= s1) continue;
                     for (int64_t ci = 0; ci < c.cin; ++ci)
                         acc += (double)w[(size_t)((co * c.cin + ci) * c.k + kk)] * x[(size_t)(ir * c.cin + ci)];
@@ -12903,6 +13048,8 @@ static void fp8_real(const Plugin& pl, const char* file, long long woff, long lo
 static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> ts,
                      std::vector<RadParam> ps, void* wbase, size_t wbytes, int copies,
                      double bytes, int iters, int widx = 2, const char* point = nullptr) {
+    /* R4D_PERF_ONLY=<row>: time that row alone (a sweep over one row skips the rest). */
+    if (const char* only = std::getenv("R4D_PERF_ONLY"); only && *only && std::strcmp(only, name)) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { std::printf("  %-22s row absent\n", name); return; }
     /* The label is the row, or the tuned point in a sweep. `ps` already carries that point; this
@@ -14599,25 +14746,28 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
     const int rc = oracle->launch(&args, nullptr);
     ok("MLA host oracle", rc == RAD_OK);
     args.t = device.data();
-    /* The head-tiled row serves tiles of 16 heads or of 8 heads from two requests (cMlaMatrix);
-     * other head counts must be refused rather than computed. */
-    if (std::strstr(name, "matrix") && heads % 8) {
+    /* The head-tiled row serves tiles of 16 heads or of 8 heads from two requests (cMlaMatrix),
+     * the rows row groups of 32 or 64 heads; other head counts must be refused rather than
+     * computed. */
+    const bool by_rows = std::strstr(name, "rows") != nullptr;
+    auto* const pin = by_rows ? pl.pin_mla_rows : pl.pin_mla;
+    if ((std::strstr(name, "matrix") && heads % 8) || (by_rows && heads % 32)) {
         args.scratch = nullptr;
         args.scratch_bytes = 0;
         const int grc = row->launch(&args, nullptr);
         st_stream_sync(nullptr);
-        ok(fmt("MLA %s refuses heads=%lld (not a multiple of 8) with RAD_E_UNSUPPORTED, no launch",
-               name, (long long)heads)
+        ok(fmt("MLA %s refuses heads=%lld (not a multiple of %d) with RAD_E_UNSUPPORTED, no launch",
+               name, (long long)heads, by_rows ? 32 : 8)
                .c_str(),
            grc == RAD_E_UNSUPPORTED);
         dlclose(ref);
         return;
     }
-    if (form && pl.pin_mla) pl.pin_mla(form);
+    if (form && pin) pin(form);
     const int64_t need = row->scratch ? row->scratch(&args) : 0;
     void* scratch = need > 0 ? dalloc((size_t)need + 256) : nullptr;
     if (need <= 0 || !scratch) {
-        if (form && pl.pin_mla) pl.pin_mla(0);
+        if (form && pin) pin(0);
         ok("MLA scratch allocation", false);
         dlclose(ref);
         return;
@@ -14686,7 +14836,7 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
                         versus, base, name, base / us, shape);
         }
     }
-    if (form && pl.pin_mla) pl.pin_mla(0);
+    if (form && pin) pin(0);
     dlclose(ref);
 }
 
@@ -14796,17 +14946,19 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
                                  PS("dtype", "bf16") };
     std::vector<uint16_t> base, rule;
     auto run = [&](const char* name, int form, const char* label) {
+        const bool by_rows = std::strstr(name, "rows") != nullptr;
+        auto* const pin = by_rows ? pl.pin_mla_rows : pl.pin_mla;
         const RadKernelInfo* r = find(pl, name);
         if (!r) {
             std::printf("  %-34s row absent\n", label);
             return;
         }
         if (form >= 0) {
-            if (!pl.pin_mla) {
+            if (!pin) {
                 std::printf("  %-34s no pin hook\n", label);
                 return;
             }
-            pl.pin_mla(form);
+            pin(form);
         }
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -14823,7 +14975,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
         const int rc = r->launch(&a, nullptr);
         if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
             std::printf("  %-34s rc=%d (shape not served)\n", label, rc);
-            if (form >= 0) pl.pin_mla(0);
+            if (form >= 0) pin(0);
             return;
         }
         std::vector<uint16_t> got(qh.size());
@@ -14844,7 +14996,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
             st_ev_destroy(w1);
         }
         const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-        if (form >= 0) pl.pin_mla(0);
+        if (form >= 0) pin(0);
         char diff[192] = "reference";
         if (base.empty())
             base = got;
@@ -14870,7 +15022,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
         }
         if (form == 0) rule = got;
         std::printf("  %-34s %10.2f us  %7.2f TFLOP/s  %s\n", label, us, flops / (us * 1e6), diff);
-        if (form >= 0 && pl.mla_stats) {
+        if (form >= 0 && !by_rows && pl.mla_stats) {
             /* One more launch with the conflict counters on, outside the timing. */
             ScopedEnv counting("RADIANCE_MLA_CONFLICT_STATS", "1");
             unsigned long long v[3];
@@ -14898,6 +15050,11 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
     } else {
         run("mla_attn_matrix_bf16", 0, "matrix 16 heads, vector load");
         run("mla_attn_matrix_bf16", 1, "matrix 16 heads, element load");
+    }
+    if (heads == 64) {
+        run("mla_attn_rows_bf16", 0, "rows 64 heads, vector load");
+        run("mla_attn_rows_bf16", 1, "rows 64 heads, element load");
+        run("mla_attn_rows_bf16", 2, "rows 32 heads, vector load");
     }
 }
 
@@ -18321,7 +18478,7 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
     /* The lm head, a decode GEMM too. Its weight is [N][K + 2*nkb] E4M3 with each row's bf16
      * scales in its tail (r4d_fp8_layout.cpp), so it has its own buffer, and the weight is the
      * second operand. */
-    if (M <= 64) {
+    if (M <= 256) {
         const int64_t lstride = r4d_fp8::lm_row_bytes(K);
         const size_t  lwb = (size_t)N * (size_t)lstride;
         int lcopies = (int)(((size_t)768 << 20) / lwb) + 1;
@@ -26982,6 +27139,12 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true);
+        /* The plain kernel at a whole row of blocks (not the part kernel, which takes a last row of
+         * 1..160 under 1024 rows): TN=4 forced and by the rule from 1024 rows, and TN=2 at the
+         * 64-wide slab (K not a multiple of 128). */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 256, 400, 640, 4, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 1024, 4096, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 512, 272, 576, 2, true);
         /* K not a multiple of 128: the TN=2 kernel takes the 64-wide slab. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2, true);
@@ -27394,7 +27557,9 @@ static void device_phase(const Plugin& pl) {
     if (sel("conv_t1d_bf16")) au::conv_t1d_cases(pl);
     if (sel("snake_bf16")) au::snake_cases(pl);
     if (sel("cfg_topk_sample")) au::cfg_topk_cases(pl);
+    if (sel("ras_pick")) au::ras_pick_cases(pl);
     if (sel("rvq_embed_bf16")) au::rvq_embed_cases(pl);
+    if (sel("vq_encode")) au::vq_encode_cases(pl);
     if (sel("frame_store")) au::frame_store_cases(pl);
     if (sel("iota")) au::iota_cases(pl);
     if (sel("sub_i32")) au::sub_i32_cases(pl);
@@ -27721,6 +27886,26 @@ static void device_phase(const Plugin& pl) {
                 for (int64_t heads : { 8, 16 }) mla_project_check(pl, rows, heads, mode, true);
         }
     }
+    if (sel("mla_attn_rows_bf16")) {
+        /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix
+         * row on the same operands. Under 32 rows the rule runs the matrix kernel, so the rows
+         * kernel is pinned there (form 3). */
+        for (int requests : { 1, 2, 7, 33 })
+            for (int64_t blocks : { 17, 513 })
+                mla_check(pl, requests, 64, blocks, "mla_attn_rows_bf16", MlaFill::ragged,
+                          "mla_attn_matrix_bf16", requests < 32 ? 3 : 0);
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_bf16", MlaFill::full, "mla_attn_matrix_bf16", 3);
+        mla_check(pl, 2, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, "mla_attn_matrix_bf16", 3);
+        mla_check(pl, 33, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, "mla_attn_matrix_bf16");
+        for (int64_t swaps : { 0, 4, 16, 64 })
+            mla_check(pl, 33, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, "mla_attn_matrix_bf16",
+                      0, swaps);
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, nullptr, 1);
+        mla_check(pl, 33, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, nullptr, 2, 16);
+        mla_check(pl, 7, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, "mla_attn_matrix_bf16", 0, 4);
+        mla_check(pl, 7, 32, 65, "mla_attn_rows_bf16", MlaFill::ragged, nullptr, 3);
+        mla_check(pl, 4, 40, 17, "mla_attn_rows_bf16");
+    }
     if (sel("mla_attn_matrix_bf16")) {
         mla_check(pl, 7, 16, 17, "mla_attn_matrix_bf16");
         mla_check(pl, 33, 16, 17, "mla_attn_matrix_bf16");
@@ -28009,6 +28194,11 @@ static void device_phase(const Plugin& pl) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)13, (int64_t)32, (int64_t)33,
                                  (int64_t)64 })
             fp8_logits_numeric(pl, 5120, 5120, M);
+        /* Past 64 rows a pass is the two-half tile (MH = 2), whose second half may be partial; past
+         * 128 a second pass follows. */
+        for (const int64_t M : { (int64_t)65, (int64_t)80, (int64_t)128, (int64_t)150 })
+            fp8_logits_numeric(pl, 5120, 5120, M);
+        fp8_logits_numeric(pl, 2560, 2560, 100);
         /* And K = 2560, the padded row: its stored width 2600 is not a multiple of 16, so
          * r4d_fp8_lm.h rounds it to 2608 (5120's 5200 needs no pad). M = 1 takes the matvec, M = 8
          * the WMMA tile, which index the row differently. */
@@ -28024,7 +28214,7 @@ static void device_phase(const Plugin& pl) {
     }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
-        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64 })
+        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);

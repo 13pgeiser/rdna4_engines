@@ -202,6 +202,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         free_cards_[(size_t)c] = (int32_t)(cfg.max_seqs - 1 - c);   /* 0 is taken first */
     reqs_.reserve((size_t)cfg.max_seqs);
     completed_.reserve((size_t)cfg.max_seqs);
+    committed_.reserve((size_t)cfg.max_seqs);
     by_id_.reserve((size_t)cfg.max_seqs * 2);
     hit_blocks_.resize(prog.kv_groups.size());
     for (auto& v : hit_blocks_) v.reserve(64);
@@ -325,6 +326,25 @@ Request* Scheduler::find(uint64_t id) {
     return it == by_id_.end() ? nullptr : reqs_[(size_t)it->second]->req.get();
 }
 
+bool Scheduler::running(uint64_t id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = by_id_.find(id);
+    if (it == by_id_.end()) return false;
+    const SchedReq& s = *reqs_[(size_t)it->second];
+    return s.req && s.req->state == ReqState::Running;
+}
+
+bool Scheduler::committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const CommittedSeq& c : committed_)
+        if (c.seq == seq) {
+            if (n_out) *n_out = c.n_out;
+            if (live) *live = c.live;
+            return true;
+        }
+    return false;
+}
+
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
@@ -401,6 +421,40 @@ int64_t Scheduler::reset_prefix_cache() {
     const int64_t dropped = pc_->reset();
     RAD_INFO("prefix cache: reset, %lld entries dropped", (long long)dropped);
     return dropped;
+}
+
+int Scheduler::release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                               SessionRelease* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
+    if (label.empty() && id == 0) return RAD_E_INVAL;
+    for (const auto& p : reqs_) {
+        if (!p || !p->req) continue;
+        const Request& r = *p->req;
+        if (r.state == ReqState::Finished || r.state == ReqState::Failed ||
+            r.state == ReqState::Cancelled)
+            continue;
+        if ((id != 0 && r.id == id) || (!label.empty() && r.session_label == label))
+            return RAD_E_STATE;
+    }
+    const int rc = pc_->release_session(label, id, keep_tokens, out);
+    if (rc == RAD_OK && out) {
+        if (label.empty())
+            RAD_INFO("prefix cache: session %llu released: %lld entries (%lld tokens), %lld "
+                     "snapshots; kept %lld tokens as asked, %lld blocks shared, %lld live",
+                     (unsigned long long)id, (long long)out->entries, (long long)out->tokens,
+                     (long long)out->snapshots, (long long)out->kept_tokens,
+                     (long long)out->kept_shared, (long long)out->kept_live);
+        else
+            RAD_INFO("prefix cache: session '%s' released (%lld rows): %lld entries (%lld "
+                     "tokens), %lld snapshots; kept %lld tokens as asked, %lld blocks shared, "
+                     "%lld live",
+                     label.c_str(), (long long)out->sessions, (long long)out->entries,
+                     (long long)out->tokens, (long long)out->snapshots,
+                     (long long)out->kept_tokens, (long long)out->kept_shared,
+                     (long long)out->kept_live);
+    }
+    return rc;
 }
 
 void Scheduler::trim_prefix_cache() {
@@ -751,7 +805,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
-        if (geo_.window_ckpt && cfg_.checkpoint_policy == "tip-only") {
+        if (geo_.window_ckpt && !geo_.window_periodic) {
             /* An explicit tail-only policy should not pay for intermediate
              * window copies or chunk splits just to retire those snapshots. */
             next = INT64_MAX;
@@ -1882,6 +1936,10 @@ int Scheduler::commit(const StepResult& res) {
     }
     step_open_ = false;
 
+    /* What the serial bind reads after commit, copied here while the Requests are still held:
+     * reap() may release a finished one before finish_serial_drafter runs. */
+    committed_.clear();
+
     const int32_t W = conv_window();
 
     /* A mixed step leaves decode rows the same replay factors as a decode step (recurrent path
@@ -1904,6 +1962,7 @@ int Scheduler::commit(const StepResult& res) {
                 s.pending_free = false;
                 --n_deferred_;
             }
+            committed_.push_back({e.seq, (uint64_t)r.output.size(), false});
             continue;
         }
 
@@ -2060,6 +2119,7 @@ int Scheduler::commit(const StepResult& res) {
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
         }
+        committed_.push_back({e.seq, (uint64_t)r.output.size(), r.state == ReqState::Running});
     }
 
     m_.prefill_tokens += step_prefill_tok_;
@@ -2386,8 +2446,12 @@ void Scheduler::serial_end(int rounds_done) {
  * also propose. Called while plan() still describes that step, because the context pass mirrors
  * it exactly, rejected suffix included: the drafter reads hidden states positionally from its
  * own buffer, so batch row i must be buffer row i. The rejected positions lie in [n_computed,
- * n_computed + block), which the query pass overwrites before anything reads them, and the
- * ensure() below covers them since n_computed + block reaches the trunk step's own end.
+ * n_computed + the trunk step's block), which a query pass overwrites before anything reads them.
+ * The ensure() below covers n_computed + `block`; with the block the trunk step verified that
+ * reaches its end. A short block (rad_drafter_short_block) after a long one does not: rejected
+ * rows past it fall on pages the commit's rollback freed, whose slot is -1, and every kv_store
+ * drops a negative slot. That rule is what keeps such a step from writing into another
+ * sequence's pages.
  *
  * On the card the step has not committed yet. The step began at n_computed (a row issued ahead
  * was staged at its furthest reach; it really continued from the committed end, as commit()
@@ -2501,6 +2565,17 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         block_.push_back(d);
     }
     return n_draft_rows;
+}
+
+int Scheduler::decoded_seqs() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (const StepEntry& e : plan_.e) {
+        if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (s.req && s.req->state == ReqState::Running && s.running) ++n;
+    }
+    return n;
 }
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
@@ -2712,6 +2787,8 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_ckpt_refused = cc.refused;
                m.prefix_expired = pc_->expired();
                m.prefix_ckpt_expired = pc_->ckpt_expired();
+               m.prefix_released = pc_->released();
+               m.prefix_ckpt_released = pc_->ckpt_released();
                m.prefix_held_tokens = pc_->held_tokens(); }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;

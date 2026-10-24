@@ -21,7 +21,6 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_block_dflash2.h>
-#include <arch/rad_prefill_pipe.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -769,7 +768,7 @@ struct G3Junction {
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        if (res && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+        if (res && g.world == 2 && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
@@ -796,8 +795,11 @@ struct G3Junction {
  * embedding stream. */
 struct G3JunctionFP8 {
     rad_op     op = 0;
-    /* At two ranks on the exact wire: the branch's all-reduce and post-norm folded in front
-     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. */
+    /* At two ranks: the branch's all-reduce and post-norm folded in front
+     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. The kernel
+     * sends the exact wire only, so under --tp-wire it is declared all the same and taken by the
+     * steps whose message goes out exact anyway (ar_wire_is_exact: a decode step of a few rows,
+     * under --tp-wire-min-kb); a wider step keeps the lossy all-reduce, unfused. */
     rad_op     op_ar = 0;
     rad_buf    x = 0, res = 0, q = 0, s = 0;
     rad_weight w = 0, wp = 0;
@@ -818,7 +820,7 @@ struct G3JunctionFP8 {
         const rad_buf wr[3] = { q, s, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        if (res && wp && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_post_quant_fp8")) {
+        if (res && wp && g.world == 2 && rad_op_declared(b, "ar_rmsnorm_post_quant_fp8")) {
             const rad_weight ws[2] = { w, wp };
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_F64("eps", g.eps),
                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("world_size", g.world),
@@ -938,6 +940,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "gemma3 DFlash2"));
 
     Dflash2::Config dc{};
+    dc.short_block = 1;   /* rad_drafter_short_block below */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -1049,6 +1052,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_FORMAT;
     }
     RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.df.block_lo > 0) RAD_ARCH_TRY(rad_drafter_short_block(b, m.df.block_lo));
     rad_note(b, "DFlash2 drafter: %lld layers at absolute %d.., %lld heads / %lld kv x %lld, ffn %lld, "
                 "%s attention with a %lld-token window, %d trunk taps, embedding x %g, %s head",
              (long long)dg.n_layer, base_layer, (long long)dg.n_head, (long long)dg.n_head_kv,
@@ -1192,17 +1196,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
 
-    /* The pipelined prefill (step_pipelined) wherever a step can be wide enough, on an MXFP4 trunk
-     * with fused junctions (decided below), at the rank counts RADIANCE_PREFILL_PIPELINE allows
-     * (rad_prefill_pipe.h: two by default). Its second lane touches the stream, the branch
-     * output, the shared input pair and the bounds, so those leave the sharing pool (the drafter
-     * taps are copied on the first lane: pipe_taps)
-     * (Ctx::lane1_); the pair is one for every block so that this costs one pair, not one a
+    /* The pipelined prefill (step_pipelined), at two ranks wherever a step can be wide enough, on
+     * an MXFP4 trunk with fused junctions (decided below); two ranks only, as in qwen35_fp8. Its
+     * second lane touches the stream, the branch output, the shared input pair and the bounds, so
+     * those leave the sharing pool (Ctx::lane1_; the drafter taps are copied on the first lane,
+     * pipe_taps). The pair is one for every block so that this costs one pair, not one a
      * linear. */
-    {
-        m.pipe_on = g.max_tok >= kPipeMinRows && !calib_dir() &&
-                    rad::arch::prefill_pipeline(b, (int)g.world, "gemma3");
-    }
+    m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows && !calib_dir();
     if (m.pipe_on) {
         m.pipe_in.mx = true;
         m.pipe_in.K  = g.n_embd;
@@ -1509,8 +1509,7 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
         rad_memcpy_async(d, m.pipe_tbl + 4 * T, 4 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
             RAD_OK) {
         rad_step_fail(c, "gemma3: the pipelined prefill's piece bounds could not be put on the card "
-                         "(no pinned host memory, or the copy failed); RADIANCE_PREFILL_PIPELINE=off "
-                         "runs prefill serially");
+                         "(no pinned host memory, or the copy failed)");
         *failed = true;
         return nullptr;
     }
@@ -1617,7 +1616,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         for (size_t li = 0; li < m.layers.size(); ++li) {
             const Layer& l = m.layers[li];
             const bool last = li + 1 == m.layers.size();
-            const bool far = m.fuse_mx_ar;
+            /* Per step: the fused junction sends the exact wire only (G3JunctionFP8::op_ar). */
+            const bool far = m.fuse_mx_ar && ar_wire_is_exact(m.g, T);
             l.attn.step(c, batch, true, true, far);
             if (!far) l.attn.post(c, T);
             l.jf_am.step(c, T, far);
@@ -1633,10 +1633,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     for (size_t li = 0; !m.fuse_mx && li < m.layers.size(); ++li) {
         const Layer& l = m.layers[li];
         const bool last = li + 1 == m.layers.size();
-        l.attn.step(c, batch, m.fuse, m.fuse, m.fuse_ar);
-        if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
-        if (m.fuse && !last) l.j_ma.step(c, T, m.fuse_ar);
+        const bool ar = m.fuse_ar && ar_wire_is_exact(m.g, T);   /* exact wire only, as above */
+        l.attn.step(c, batch, m.fuse, m.fuse, ar);
+        if (m.fuse) l.j_am.step(c, T, ar);
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last, ar);
+        if (m.fuse && !last) l.j_ma.step(c, T, ar);
         tap(li);
     }
     /* With fused junctions the last layer's tail ran unfused (tail_fused false), so the stream is

@@ -489,6 +489,30 @@ typedef struct RadAudioGenBatch {
     /* VOCODE with RadAudioGenDecl::voc_chunk: the lane's first frame the pass reads, counted
      * from the first kept frame. 64 bits so that it starts past the struct's ABI 18 end. */
     int64_t         voc_frame0;
+
+    /* ---- appended in ABI 27 (a frame head at the previous row, references) */
+    /* FRAME, one value per entry ([n_seq]): the row before the frame's own row -- the one whose
+     * hidden state the frame is sampled from -- as its KV slot, its position, and the context
+     * through it (position + 1). A model whose frame head attends at that row (Fish Audio
+     * drama-3's codebook tower, layers bound to the language model's full-attention group) issues
+     * those layers there, before the language model runs at the frame's own row. */
+    const int32_t*  prev_slot;
+    const int32_t*  prev_pos;
+    const int32_t*  prev_used;
+
+    /* PROMPT of a request with references (RadAudioGenDecl::tmpl_ref; n_ref 0 without): its
+     * clips' samples end to end (`ref_samples` f32 on the device), the clips' bounds in samples
+     * ([n_ref + 1], each a whole number of RadAudioGenDecl::ref_hop), and for every row of the
+     * pass the frame of the clips it is or -1 for a token row ([n_tok]), frames counted over the
+     * clips in order, frame f the samples [f ref_hop, (f + 1) ref_hop). A frame's row stages
+     * token 0; the plugin embeds the frame there instead. */
+    int64_t         n_ref;
+    int64_t         ref_samples;
+    const float*    ref_audio;
+    const int32_t*  ref_cu;
+    const int32_t*  ref_cu_h;
+    const int32_t*  ref_frame;
+    const int32_t*  ref_frame_h;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear

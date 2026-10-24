@@ -189,6 +189,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_prefix_ckpt_evict_.advance_to(m.prefix_ckpt_evictions);
     c_prefix_expired_.advance_to(m.prefix_expired);
     c_prefix_ckpt_expired_.advance_to(m.prefix_ckpt_expired);
+    c_prefix_released_.advance_to(m.prefix_released);
+    c_prefix_ckpt_released_.advance_to(m.prefix_ckpt_released);
     c_ckpt_retired_.advance_to(m.prefix_ckpt_retired);
     c_ckpt_lru_.advance_to(m.prefix_ckpt_lru);
     c_ckpt_refused_.advance_to(m.prefix_ckpt_refused);
@@ -438,6 +440,13 @@ std::string Metrics::render() const {
                  c_ckpt_retired_.get());
         labelled("radiance:prefix_cache_ckpt_evictions_by_reason_total", "reason", "store_full",
                  c_ckpt_lru_.get());
+        w.help("radiance:prefix_cache_released_total",
+               "Prefix-cache entries and linear-state snapshots a client released on purpose "
+               "(DELETE /sessions).", "counter");
+        labelled("radiance:prefix_cache_released_total", "what", "entries",
+                 c_prefix_released_.get());
+        labelled("radiance:prefix_cache_released_total", "what", "snapshots",
+                 c_prefix_ckpt_released_.get());
         w.counter("radiance:prefix_cache_ckpt_refused_total",
                   "Checkpoints not written because every snapshot slot was in use by a restore "
                   "in the same step.", L, c_ckpt_refused_.get());

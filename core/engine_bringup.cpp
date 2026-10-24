@@ -905,6 +905,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
     bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
+    bc.tp_attn_rows = cfg_.tp_attn_rows;
+    bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
+    bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -1028,6 +1031,40 @@ int Engine::declare() {
                     "(fp8 does)", cfg_.kv_cache_dtype.c_str(), plugins_.arch_plugin.c_str());
             return RAD_E_UNSUPPORTED;
         }
+    }
+    /* The row split is a graph only the plugin can declare, and it splits over ranks. A plugin
+     * that does not say it serves it (RadArchProbe::tp_attn_rows_ok), or a single rank, would
+     * serve the head split under a name that promised the other, so the flag is refused rather
+     * than ignored. */
+    if (cfg_.tp_attn_rows) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (!pb.tp_attn_rows_ok) {
+            RAD_ERR("--tp-attn-split rows: the '%s' plugin does not split attention by rows for "
+                    "this model (heads does)", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg_.tp < 2) {
+            RAD_ERR("--tp-attn-split rows splits a prefill's attention over tensor-parallel ranks, "
+                    "and --tp %d has none to split over (heads does)", cfg_.tp);
+            return RAD_E_INVAL;
+        }
+        RAD_WARN("attention: a prefill-sized step splits by rows over the %d ranks "
+                 "(--tp-attn-split rows): every card holds the attention's projections at full "
+                 "width, and the result is not bit-identical to the head split", cfg_.tp);
+    }
+    /* Likewise an f16 recurrent state: a plugin that does not say it declares one would keep f32
+     * under a flag that promised half the state memory. */
+    if (cfg_.state_cache_dtype == "f16") {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (!pb.state_f16_ok) {
+            RAD_ERR("--state-cache-dtype f16: the '%s' plugin does not declare its recurrent state "
+                    "at f16 for this model (f32 does)", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_INFO("recurrent state cache: f16 (--state-cache-dtype), half the state memory; lossy, "
+                 "the generated text differs from f32");
     }
     /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is
      * selected only once the container is open. Every consumer of `n_spec` (buffer sizing, kernel
@@ -1303,6 +1340,24 @@ int Engine::declare() {
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
+    drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
+                   ? p0.drafter_short_block : 0;
+    if (cfg_.draft_short_from > 0 && drafter_.kind == RAD_DRAFT_NONE)
+        RAD_WARN("--draft-short-from %lld: this deployment runs no drafter, so there is no block "
+                 "to shorten", (long long)cfg_.draft_short_from);
+    else if (cfg_.draft_short_from > 0 && !drafter_short_)
+        RAD_WARN("--draft-short-from %lld: '%s' %s", (long long)cfg_.draft_short_from,
+                 drafter_name_.c_str(),
+                 drafter_.kind == RAD_DRAFT_BLOCK ? "declares no shorter block, so it keeps its own"
+                                                  : "is a serial head, which proposes no block");
+    if (drafter_short_)
+        RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
+                 "row(s), %lld token(s)", (long long)cfg_.draft_short_from,
+                 drafter_name_.c_str(),
+                 (long long)drafter_short_,
+                 (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
+                                                                   : drafter_.depth + 1) -
+                                               drafter_.depth)));
     if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */

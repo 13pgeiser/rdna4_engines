@@ -202,6 +202,16 @@ struct IPrefixCache {
     /* Entries expired by --prefix-cache-ttl; not counted as evictions. */
     virtual int64_t expired() const { return 0; }
     virtual int64_t ckpt_expired() const { return 0; }
+    /* Entries and snapshots a client released on purpose (release_session). */
+    virtual int64_t released() const { return 0; }
+    virtual int64_t ckpt_released() const { return 0; }
+
+    /* Forget one stored conversation now, by the client's label or the engine's session id
+     * (PrefixCache::release_session). RAD_E_UNSUPPORTED from a cache without a session table. */
+    virtual int release_session(const std::string& /*label*/, uint64_t /*id*/,
+                                int64_t /*keep_tokens*/, SessionRelease* /*out*/) {
+        return RAD_E_UNSUPPORTED;
+    }
 
     /* Tokens of context held only by the cache right now. Blocks a running sequence also reads
      * are excluded. Separates a working cache from a leak in the pool figures. */
@@ -488,6 +498,12 @@ struct PCBinding final : IPrefixCache {
     }
     int64_t expired() const override { return m->stats().expired; }
     int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
+    int64_t released() const override { return m->stats().released; }
+    int64_t ckpt_released() const override { return m->stats().ckpt_released; }
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionRelease* out) override {
+        return m->release_session(label, id, keep_tokens, out);
+    }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 
     int64_t next_checkpoint_after(int64_t p) const override { return m->next_checkpoint_after(p); }

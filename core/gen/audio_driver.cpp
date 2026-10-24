@@ -66,7 +66,22 @@ constexpr int64_t kAlign = 256;
 
 struct Sizes {
     int64_t T = 0, S = 0, L = 0, NB = 0;
+    int64_t NG = 0;    /* stateful KV groups */
+    int64_t RS = 0, RN = 0;   /* references: samples and clips a request */
 };
+
+/* The paged full-attention group, and how many stateful groups sit beside it. */
+int32_t full_group(const Program& prog, int64_t* n_state) {
+    int32_t full = 0;
+    int64_t ns = 0;
+    for (size_t g = 1; g < prog.kv_groups.size(); ++g) {
+        const int kind = prog.kv_groups[g].decl.kind;
+        if (kind == RAD_KV_FULL && !full) full = (int32_t)g;
+        else if (kind == RAD_KV_LINEAR || kind == RAD_KV_CONV) ++ns;
+    }
+    if (n_state) *n_state = ns;
+    return full;
+}
 
 Sizes sizes_of(const Program& prog, int64_t block_size) {
     const RadAudioGenDecl& d = prog.audio_gen;
@@ -75,6 +90,9 @@ Sizes sizes_of(const Program& prog, int64_t block_size) {
     z.S  = prog.ctx.max_seqs;
     z.L  = d.max_lanes;
     z.NB = block_size > 0 ? (AudioDriver::max_seq_rows(d) + block_size - 1) / block_size : 0;
+    full_group(prog, &z.NG);
+    z.RS = d.ref_max_samples;
+    z.RN = d.ref_max;
     return z;
 }
 
@@ -108,6 +126,16 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
         z.S * I,             /* R_ESLOT */
         z.S * I,             /* R_LROW */
         z.S * I,             /* R_PREFIX */
+        z.S * I,             /* R_CTX */
+        z.S * I,             /* R_ACC */
+        z.NG * z.S * I,      /* R_SBT */
+        z.NG * z.S * AudioDriver::kMaxStateWidth * I,   /* R_SIDX */
+        z.S * I,             /* R_PSLOT */
+        z.S * I,             /* R_PPOS */
+        z.S * I,             /* R_PUSED */
+        z.RS * 4,            /* R_RAUD */
+        z.RN > 0 ? (z.RN + 1) * I : 0,   /* R_RCU */
+        z.RN > 0 ? z.T * I : 0,          /* R_RFRM */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -121,8 +149,10 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
 }  /* namespace */
 
 int64_t AudioDriver::device_bytes(const Program& prog) {
-    if (!prog.is_audio_generator() || prog.kv_groups.size() < 2) return 0;
-    const Sizes z = sizes_of(prog, prog.kv_groups[1].block_size);
+    if (!prog.is_audio_generator()) return 0;
+    const int32_t fg = full_group(prog, nullptr);
+    if (!fg) return 0;
+    const Sizes z = sizes_of(prog, prog.kv_groups[(size_t)fg].block_size);
     int64_t b[R_N][2];
     return carve(z, b, R_N);
 }
@@ -134,15 +164,39 @@ int AudioDriver::init(const Program& prog, IKVManager* kv, const std::vector<Ran
     name_  = prog.agen_str.name;
     kv_    = kv;
     ranks_ = ranks;
-    /* The language model's KV, both branches of every lane: one paged full-attention group. */
-    if (prog.kv_groups.size() != 2 || prog.kv_groups[1].decl.kind != RAD_KV_FULL ||
-        prog.kv_groups[1].block_size <= 0) {
-        RAD_ERR("audio generator: the program declares %zu KV group(s); the driver stages exactly "
-                "one full-attention group, the language model's", prog.kv_groups.size() - 1);
+    /* The language model's KV, every branch of every lane: one paged full-attention group, and
+     * a hybrid model's linear-attention state and convolution groups beside it. */
+    state_groups_.clear();
+    int n_full = 0;
+    for (size_t g = 1; g < prog.kv_groups.size(); ++g) {
+        const int kind = prog.kv_groups[g].decl.kind;
+        if (kind == RAD_KV_FULL) {
+            ++n_full;
+        } else if (kind == RAD_KV_LINEAR || kind == RAD_KV_CONV) {
+            StateGroup sg;
+            sg.g = (int32_t)g;
+            sg.width = std::max<int64_t>(1, kv->state_index_width((int32_t)g));
+            if (sg.width > kMaxStateWidth) {
+                RAD_ERR("audio generator: KV group %zu asks for %lld state slots a sequence; the "
+                        "driver stages at most %lld", g, (long long)sg.width,
+                        (long long)kMaxStateWidth);
+                return RAD_E_UNSUPPORTED;
+            }
+            state_groups_.push_back(sg);
+        } else {
+            n_full = -1;
+            break;
+        }
+    }
+    kv_group_ = full_group(prog, nullptr);
+    if (n_full != 1 || !kv_group_ || prog.kv_groups[(size_t)kv_group_].block_size <= 0) {
+        RAD_ERR("audio generator: the program declares %zu KV group(s); the driver stages one "
+                "paged full-attention group, the language model's, and the state and "
+                "convolution groups of a hybrid one beside it", prog.kv_groups.size() - 1);
         return RAD_E_UNSUPPORTED;
     }
-    kv_group_   = 1;
-    block_size_ = prog.kv_groups[1].block_size;
+    block_size_ = prog.kv_groups[(size_t)kv_group_].block_size;
+    nb_ = decl_.branches == 1 ? 1 : 2;
     const Sizes z = sizes_of(prog, block_size_);
     max_tok_    = z.T;
     max_seqs_   = z.S;
@@ -152,13 +206,13 @@ int AudioDriver::init(const Program& prog, IKVManager* kv, const std::vector<Ran
      * chunk's vocode its frames and their context, and a whole prompt both its branches. */
     const int64_t step_rows = chunked() ? decl_.voc_context + decl_.voc_chunk
                                         : 2 * (decl_.win_lead + win_latents(decl_.win_frames));
-    const int64_t prompt_rows = decl_.prompt_whole ? 2 * decl_.max_prompt : 2;
-    if (max_seqs_ < 2 * decl_.max_lanes || max_tok_ < 2 * decl_.max_lanes ||
+    const int64_t prompt_rows = decl_.prompt_whole ? nb_ * decl_.max_prompt : nb_;
+    if (max_seqs_ < nb_ * decl_.max_lanes || max_tok_ < nb_ * decl_.max_lanes ||
         max_tok_ < step_rows || max_tok_ < prompt_rows) {
         RAD_ERR("audio generator: a pass carries %lld rows of %lld sequences; '%s' needs %lld "
                 "sequences for its %lld lanes, %lld rows for a %s and %lld for a whole prompt",
                 (long long)max_tok_, (long long)max_seqs_, name_.c_str(),
-                (long long)(2 * decl_.max_lanes), (long long)decl_.max_lanes,
+                (long long)(nb_ * decl_.max_lanes), (long long)decl_.max_lanes,
                 (long long)step_rows, chunked() ? "chunk's vocode" : "window's step",
                 (long long)prompt_rows);
         return RAD_E_UNSUPPORTED;
@@ -191,7 +245,7 @@ int AudioDriver::init(const Program& prog, IKVManager* kv, const std::vector<Ran
     if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0].device));
     out_.assign(ranks_.size(), RadBatch{});
     aout_.assign(ranks_.size(), RadAudioGenBatch{});
-    kout_.assign(ranks_.size(), RadKVGroupBatch{});
+    kout_.assign(ranks_.size() * (1 + state_groups_.size()), RadKVGroupBatch{});
     free_lanes_.clear();
     for (int64_t i = decl_.max_lanes - 1; i >= 0; --i) free_lanes_.push_back((int32_t)i);
     return RAD_OK;
@@ -222,7 +276,9 @@ int AudioDriver::submit(std::unique_ptr<AudioRequest> r, std::string* why) {
         return RAD_E_INVAL;
     };
     const int64_t T = (int64_t)r->tokens.size(), Tn = (int64_t)r->neg_tokens.size();
-    if (!neg_own_ && T <= d.neg_keep_head + d.neg_keep_tail)
+    if (nb_ == 1 && r->cfg != 0.0f && r->cfg != 1.0f)
+        return no("this model runs without guidance; guidance_scale must be 1");
+    if (nb_ == 2 && !neg_own_ && T <= d.neg_keep_head + d.neg_keep_tail)
         return no("the prompt is " + std::to_string(T) + " tokens, too short to hold its own "
                   "markers");
     if (T < 1 || std::max(T, Tn) > d.max_prompt)
@@ -234,6 +290,25 @@ int AudioDriver::submit(std::unique_ptr<AudioRequest> r, std::string* why) {
                   " seconds)");
     if (r->steps < 0 || r->steps > 1000) return no("num_inference_steps must be 1..1000");
     if (r->cfg != 0.0f && !(r->cfg >= 1.0f)) return no("guidance_scale must be >= 1");
+    /* References: the clips the declaration allows, each a whole number of frames, and a frame
+     * for every row that names one. */
+    if (!r->ref_cu.empty() || !r->ref_frame.empty() || !r->ref_audio.empty()) {
+        const int64_t n_ref = (int64_t)r->ref_cu.size() - 1, hop = d.ref_hop;
+        bool ok = d.ref_max > 0 && n_ref >= 1 && n_ref <= d.ref_max && r->ref_cu[0] == 0 &&
+                  r->ref_cu.back() == (int64_t)r->ref_audio.size() &&
+                  (int64_t)r->ref_audio.size() <= d.ref_max_samples &&
+                  (int64_t)r->ref_frame.size() == T;
+        for (int64_t i = 0; ok && i < n_ref; ++i)
+            ok = r->ref_cu[(size_t)i + 1] > r->ref_cu[(size_t)i] && r->ref_cu[(size_t)i + 1] % hop == 0;
+        const int64_t frames = ok ? r->ref_cu.back() / hop : 0;
+        for (int64_t t = 0; ok && t < T; ++t)
+            ok = r->ref_frame[(size_t)t] >= -1 && r->ref_frame[(size_t)t] < frames;
+        if (!ok)
+            return no(d.ref_max > 0 ? "the references do not fit this model: at most " +
+                                          std::to_string(d.ref_max) + " clips of whole frames, " +
+                                          std::to_string(d.ref_max_samples) + " samples together"
+                                    : std::string("this model takes no reference audio"));
+    }
     if (!kv_->can_ever_fit(std::max(T, Tn) + r->max_frames + 1))
         return no("a piece of " + std::to_string(r->max_frames) + " frames after a " +
                   std::to_string(T) + "-token prompt does not fit the KV cache even when it is "
@@ -307,16 +382,19 @@ int AudioDriver::admit_locked() {
         const float cfg = r.cfg > 0.0f ? r.cfg : (float)decl_.default_cfg;
         /* The unconditional prompt: the request's own (the conditional one at guidance 1, which
          * makes the guided logits the conditional ones), or derived from the conditional one. */
-        std::vector<int32_t> neg = r.tokens;
-        if (neg_own_ && cfg != 1.0f && !r.neg_tokens.empty()) {
-            neg = r.neg_tokens;
-        } else if (!neg_own_) {
-            for (int64_t i = decl_.neg_keep_head; i < j.T - decl_.neg_keep_tail; ++i)
-                neg[(size_t)i] = decl_.neg_token;
+        std::vector<int32_t> neg;
+        if (nb_ > 1) {
+            neg = r.tokens;
+            if (neg_own_ && cfg != 1.0f && !r.neg_tokens.empty()) {
+                neg = r.neg_tokens;
+            } else if (!neg_own_) {
+                for (int64_t i = decl_.neg_keep_head; i < j.T - decl_.neg_keep_tail; ++i)
+                    neg[(size_t)i] = decl_.neg_token;
+            }
         }
-        /* Both branches for the whole piece, so nothing in flight ever waits for KV. */
+        /* Every branch for the whole piece, so nothing in flight ever waits for KV. */
         bool ok = true;
-        for (int b = 0; b < 2 && ok; ++b) {
+        for (int b = 0; b < nb_ && ok; ++b) {
             const int64_t rows = (b ? (int64_t)neg.size() : j.T) + r.max_frames + 1;
             j.seq[b] = ((uint64_t)1 << 61) | next_seq_++;
             if (kv_->add_sequence(j.seq[b]) < 0 || kv_->ensure(j.seq[b], rows) < 0) ok = false;
@@ -388,7 +466,7 @@ void AudioDriver::base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int3
     for (size_t r = 0; r < ranks_.size(); ++r) {
         RadBatch& B = out_[r];
         RadAudioGenBatch& A = aout_[r];
-        RadKVGroupBatch& K = kout_[r];
+        RadKVGroupBatch& K = kout_[r * (1 + state_groups_.size())];
         const int ri = (int)r;
         B = RadBatch{};
         B.step = step;
@@ -410,8 +488,23 @@ void AudioDriver::base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int3
             K.seqused = dptr<int32_t>(ri, R_USED);
             K.block_size = block_size_;
             K.max_blocks = max_blocks_;
-            B.n_kv_groups = 1;
+            /* A stateful group's block-table row is the sequence's slot, as the text scheduler
+             * stages it, so a kernel reading tables needs no second path. */
+            for (size_t gi = 0; gi < state_groups_.size(); ++gi) {
+                RadKVGroupBatch& Ks = (&K)[1 + gi];
+                Ks = RadKVGroupBatch{};
+                Ks.group = (rad_kvgroup)state_groups_[gi].g;
+                Ks.block_table = dptr<int32_t>(ri, R_SBT) + gi * max_seqs_;
+                Ks.block_table_pitch = 1;
+                Ks.seqused = dptr<int32_t>(ri, R_USED);
+                Ks.state_index = dptr<int32_t>(ri, R_SIDX) + gi * max_seqs_ * kMaxStateWidth;
+                Ks.state_index_pitch = state_groups_[gi].width;
+                Ks.max_blocks = 1;
+            }
+            B.n_kv_groups = (int)(1 + state_groups_.size());
             B.kv = &K;
+            B.ctx_lens = dptr<int32_t>(ri, R_CTX);
+            B.num_accepted = dptr<int32_t>(ri, R_ACC);
         }
         A = RadAudioGenBatch{};
         A.lane = dptr<int32_t>(ri, R_LANE);
@@ -432,7 +525,35 @@ void AudioDriver::base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int3
         A.slot = dptr<int32_t>(ri, R_ESLOT);
         A.last_row = dptr<int32_t>(ri, R_LROW);
         A.prefix = dptr<int32_t>(ri, R_PREFIX);
+        A.prev_slot = dptr<int32_t>(ri, R_PSLOT);
+        A.prev_pos = dptr<int32_t>(ri, R_PPOS);
+        A.prev_used = dptr<int32_t>(ri, R_PUSED);
         B.agen_b = &A;
+    }
+}
+
+void AudioDriver::stage_state(const std::vector<uint64_t>& seqs, const std::vector<int32_t>& ctx) {
+    const int64_t n = (int64_t)seqs.size();
+    int32_t* cl = hptr<int32_t>(R_CTX);
+    int32_t* acc = hptr<int32_t>(R_ACC);
+    for (int64_t e = 0; e < n; ++e) {
+        cl[e] = ctx[(size_t)e];
+        /* One-based, as num_accepted always is: a pass commits every row it runs. */
+        acc[e] = 1;
+    }
+    reg_[R_CTX].used = reg_[R_ACC].used = n * 4;
+    for (size_t gi = 0; gi < state_groups_.size(); ++gi) {
+        const StateGroup& sg = state_groups_[gi];
+        int32_t* bt = hptr<int32_t>(R_SBT) + gi * max_seqs_;
+        int32_t* si = hptr<int32_t>(R_SIDX) + gi * max_seqs_ * kMaxStateWidth;
+        for (int64_t e = 0; e < n; ++e) {
+            bt[e] = kv_->state_slot(seqs[(size_t)e], sg.g);
+            kv_->state_index_row(seqs[(size_t)e], sg.g, si + e * sg.width, (int)sg.width);
+        }
+    }
+    if (!state_groups_.empty()) {
+        reg_[R_SBT].used = (int64_t)state_groups_.size() * max_seqs_ * 4;
+        reg_[R_SIDX].used = (int64_t)state_groups_.size() * max_seqs_ * kMaxStateWidth * 4;
     }
 }
 
@@ -515,12 +636,13 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     /* Each branch's rows: both whole, or the same chunk of both (their lengths are then equal). */
     const int64_t p0 = j.prompt_done;
-    int64_t cb[2];
+    int64_t cb[2] = { 0, 0 };
     if (decl_.prompt_whole) {
         cb[0] = j.T;
-        cb[1] = j.Tn;
+        cb[1] = nb_ > 1 ? j.Tn : 0;
     } else {
-        cb[0] = cb[1] = std::min<int64_t>(j.T - j.prompt_done, max_tok_ / 2);
+        cb[0] = std::min<int64_t>(j.T - j.prompt_done, max_tok_ / nb_);
+        cb[1] = nb_ > 1 ? cb[0] : 0;
     }
     const int64_t cmax = std::max(cb[0], cb[1]);
     int32_t* tok = hptr<int32_t>(R_TOK);
@@ -528,12 +650,12 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
     int32_t* slot = hptr<int32_t>(R_SLOT);
     int32_t* cu = hptr<int32_t>(R_CU);
     int64_t pitch = 1;
-    for (int b = 0; b < 2; ++b)
+    for (int b = 0; b < nb_; ++b)
         pitch = std::max<int64_t>(pitch, (int64_t)kv_->block_table(j.seq[b], kv_group_).size());
     int32_t* btab = hptr<int32_t>(R_BT);
     int32_t* used = hptr<int32_t>(R_USED);
     cu[0] = 0;
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < nb_; ++b) {
         const std::vector<int32_t>& src = b ? j.neg : j.req->tokens;
         const std::vector<int32_t>& bt = kv_->block_table(j.seq[b], kv_group_);
         for (int64_t i = 0; i < cb[b]; ++i) {
@@ -547,26 +669,47 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
             btab[b * pitch + k] = k < (int64_t)bt.size() ? bt[(size_t)k] : -1;
         used[b] = (int32_t)(p0 + cb[b]);
     }
-    const int64_t rows = cu[2];
+    const int64_t rows = cu[nb_];
     const bool last = p0 + cb[0] == j.T;
-    for (int b = 0; b < 2; ++b) {
-        hptr<int32_t>(R_ESLOT)[b] = 2 * j.lane + b;
+    std::vector<uint64_t> seqs;
+    std::vector<int32_t> ctx;
+    for (int b = 0; b < nb_; ++b) {
+        hptr<int32_t>(R_ESLOT)[b] = nb_ * j.lane + b;
         hptr<int32_t>(R_LROW)[b] = cu[b + 1] - 1;
         hptr<int32_t>(R_PREFIX)[b] = (int32_t)p0;
+        seqs.push_back(j.seq[b]);
+        ctx.push_back((int32_t)p0);
     }
-    reg_[R_ESLOT].used = reg_[R_LROW].used = reg_[R_PREFIX].used = 2 * 4;
+    stage_state(seqs, ctx);
+    reg_[R_ESLOT].used = reg_[R_LROW].used = reg_[R_PREFIX].used = nb_ * 4;
     hptr<int32_t>(R_LANE)[0] = j.lane;
     hptr<int32_t>(R_LAST)[0] = last ? 1 : 0;
     hptr<uint32_t>(R_SEED)[0] = (uint32_t)(j.req->seed & 0xffffffffu);
     hptr<uint32_t>(R_SEED)[1] = (uint32_t)(j.req->seed >> 32);
     reg_[R_TOK].used = reg_[R_POS].used = reg_[R_SLOT].used = rows * 4;
-    reg_[R_CU].used = 3 * 4;
-    reg_[R_BT].used = 2 * pitch * 4;
-    reg_[R_USED].used = 2 * 4;
+    reg_[R_CU].used = (nb_ + 1) * 4;
+    reg_[R_BT].used = nb_ * pitch * 4;
+    reg_[R_USED].used = nb_ * 4;
     reg_[R_LANE].used = reg_[R_LAST].used = 4;
     reg_[R_SEED].used = 8;
+    /* The references: their clips, bounds and each row's frame (a whole prompt, so the rows are
+     * the prompt's own). */
+    const AudioRequest& q = *j.req;
+    const int64_t n_ref = q.ref_cu.empty() ? 0 : (int64_t)q.ref_cu.size() - 1;
+    h_rcu_.clear();
+    h_rfrm_.clear();
+    if (n_ref > 0) {
+        std::memcpy(hptr<float>(R_RAUD), q.ref_audio.data(), q.ref_audio.size() * 4);
+        std::memcpy(hptr<int32_t>(R_RCU), q.ref_cu.data(), q.ref_cu.size() * 4);
+        std::memcpy(hptr<int32_t>(R_RFRM), q.ref_frame.data() + p0, (size_t)cb[0] * 4);
+        reg_[R_RAUD].used = (int64_t)q.ref_audio.size() * 4;
+        reg_[R_RCU].used = (int64_t)q.ref_cu.size() * 4;
+        reg_[R_RFRM].used = cb[0] * 4;
+        h_rcu_ = q.ref_cu;
+        h_rfrm_.assign(q.ref_frame.begin() + p0, q.ref_frame.begin() + p0 + cb[0]);
+    }
     if (upload() < 0) return nullptr;
-    base_batches(rows, 2, (int32_t)cmax, (int32_t)(p0 + cmax), step, true, pitch);
+    base_batches(rows, nb_, (int32_t)cmax, (int32_t)(p0 + cmax), step, true, pitch);
     h_lane_.assign(1, j.lane);
     h_last_.assign(1, last ? 1 : 0);
     for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -575,6 +718,16 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
         A.n_lane = 1;
         A.lane_h = h_lane_.data();
         A.last_h = h_last_.data();
+        if (n_ref > 0) {
+            const int ri = (int)r;
+            A.n_ref = n_ref;
+            A.ref_samples = (int64_t)q.ref_audio.size();
+            A.ref_audio = dptr<float>(ri, R_RAUD);
+            A.ref_cu = dptr<int32_t>(ri, R_RCU);
+            A.ref_cu_h = h_rcu_.data();
+            A.ref_frame = dptr<int32_t>(ri, R_RFRM);
+            A.ref_frame_h = h_rfrm_.data();
+        }
     }
     pass_.kind = RAD_GEN_PASS_PROMPT;
     pass_.jobs.assign(1, j.id);
@@ -584,7 +737,7 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
 
 const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
-    const int64_t L = (int64_t)js.size(), S = 2 * L;
+    const int64_t L = (int64_t)js.size(), S = nb_ * L;
     int32_t* tok = hptr<int32_t>(R_TOK);
     int32_t* pos = hptr<int32_t>(R_POS);
     int32_t* slot = hptr<int32_t>(R_SLOT);
@@ -597,17 +750,19 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
     int64_t pitch = 1;
     int32_t max_ctx = 0;
     for (const Job* j : js)
-        for (int b = 0; b < 2; ++b)
+        for (int b = 0; b < nb_; ++b)
             pitch = std::max<int64_t>(pitch, (int64_t)kv_->block_table(j->seq[b], kv_group_).size());
     h_lane_.assign((size_t)L, 0);
     h_frame_.assign((size_t)L, 0);
     pass_.jobs.clear();
+    std::vector<uint64_t> seqs;
+    std::vector<int32_t> ctx;
     for (int64_t i = 0; i < L; ++i) {
         const Job& j = *js[(size_t)i];
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < nb_; ++b) {
             /* The frame's row follows the branch's prompt and its earlier frames. */
             const int64_t p = (b ? j.Tn : j.T) + j.frame;
-            const int64_t e = 2 * i + b;
+            const int64_t e = nb_ * i + b;
             const std::vector<int32_t>& bt = kv_->block_table(j.seq[b], kv_group_);
             tok[e] = 0;
             pos[e] = (int32_t)p;
@@ -616,9 +771,16 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
             for (int64_t k = 0; k < pitch; ++k)
                 btab[e * pitch + k] = k < (int64_t)bt.size() ? bt[(size_t)k] : -1;
             used[e] = (int32_t)(p + 1);
-            hptr<int32_t>(R_ESLOT)[e] = 2 * j.lane + b;
+            /* The row before, whose hidden state the frame is sampled from: the prompt's last
+             * row for the first frame. */
+            hptr<int32_t>(R_PSLOT)[e] = slot_of(bt, p - 1, block_size_);
+            hptr<int32_t>(R_PPOS)[e] = (int32_t)(p - 1);
+            hptr<int32_t>(R_PUSED)[e] = (int32_t)p;
+            hptr<int32_t>(R_ESLOT)[e] = nb_ * j.lane + b;
             hptr<int32_t>(R_LROW)[e] = (int32_t)e;
             max_ctx = std::max<int32_t>(max_ctx, (int32_t)(p + 1));
+            seqs.push_back(j.seq[b]);
+            ctx.push_back((int32_t)p);
         }
         hptr<float>(R_CFG)[i] = j.cfg;
         lane[i] = h_lane_[(size_t)i] = j.lane;
@@ -628,6 +790,7 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
         pass_.jobs.push_back(j.id);
     }
     cu[S] = (int32_t)S;
+    stage_state(seqs, ctx);
     reg_[R_TOK].used = reg_[R_POS].used = reg_[R_SLOT].used = S * 4;
     reg_[R_CU].used = (S + 1) * 4;
     reg_[R_BT].used = S * pitch * 4;
@@ -635,6 +798,7 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
     reg_[R_LANE].used = reg_[R_FRAME].used = reg_[R_CFG].used = L * 4;
     reg_[R_SEED].used = 2 * L * 4;
     reg_[R_ESLOT].used = reg_[R_LROW].used = S * 4;
+    reg_[R_PSLOT].used = reg_[R_PPOS].used = reg_[R_PUSED].used = S * 4;
     if (upload() < 0) return nullptr;
     base_batches(S, S, 1, max_ctx, step, true, pitch);
     for (size_t r = 0; r < ranks_.size(); ++r) {

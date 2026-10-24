@@ -48,6 +48,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
 | Unlimited-OCR bf16: document parsing with the DeepEncoder tower | `unlimited-ocr-bf16.rad` (6.2 GiB) | [download](https://huggingface.co/Aijuus/unlimited-ocr-bf16) | `unlimited-ocr-bf16.yaml` |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
+| Fish Audio drama-3: speech with speaker tags and inline direction, voices cloned from reference clips, whole, streamed or live; block-FP8 experts, two cards | `drama3-fp8.rad` (36 GiB) | [convert](#convert-a-checkpoint) | `drama3.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
 | GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, vision, eight cards | `glm53-flash-mxfp4.rad` (172 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
@@ -120,7 +121,12 @@ from lyrics and a description, 44.1 kHz stereo, made at about the speed it plays
 speech in a voice the request describes, made in 0.6 of its playing time on one card, its first
 streamed audio 0.21 s after the request. Breeze-TTS-2 also speaks text while it is being written,
 over the `/v1/audio/speech/stream` WebSocket; it is licensed for research and non-commercial use
-only.
+only. Fish Audio's drama-3 speaks a script whose speakers and direction are written in it
+(`<|speaker:1|>`, `[laughs]`), each speaker in the model's voice or one cloned from a reference
+clip and its transcript, at 0.3 of its playing time on two cards, its first streamed audio
+0.23 s after the request; under the Fish Audio Community License a service that lets others
+generate speech with it needs a licence from Fish Audio, and imitating a real person's voice needs
+their consent.
 
 ## Run with Docker
 
@@ -205,6 +211,7 @@ four-rank rows have no compose file. The other models' flags are in their compos
 | MiniMax-H3 and FastH3 | `--tp 2 --vision-tower-placement ram` |
 | MiniMax-Music3 | `--tp 2` |
 | Breeze-TTS-2 | `--tp 1` |
+| Fish Audio drama-3 | `--tp 2` |
 
 Every model here runs at up to 32 sequences a step. The Flash-Next rows (except the bf16 reference)
 and the 27B in bf16 keep 8: on a hybrid model each sequence holds its own recurrent state, and 32 of

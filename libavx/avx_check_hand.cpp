@@ -4060,6 +4060,22 @@ void audio_cases(std::vector<Hand>& hs) {
              .pi("causal", 1).ps("dtype", dn);
             hs.push_back(std::move(h));
         }
+        for (const int64_t s : { 2, 4 }) {
+            /* A codec encoder's downsampling: kernel 2 stride, causal, the bounds in samples
+             * (cu_div 8 input rows), two clips of 4 and 2 strides from input row 2 s. */
+            const int64_t cin = 12, cout = 9, M = 8 * s;
+            Hand h(("stride " + std::to_string(s) + ", bounds in units of 8 rows" + sfx).c_str(),
+                   "conv1d", norm_tol);
+            h.dense(dt, { M, cin }, hfill(330 + s))
+             .dense(dt, { cout, cin, 2 * s }, hfill(334, 0.3f))
+             .idx({ (int32_t)(16 * s), (int32_t)(48 * s), (int32_t)(64 * s) })
+             .none()
+             .dense(dt, { M / s, cout }, hfill(335), true)
+             .dense(dt, { cout }, hfill(336, 0.5f))
+             .pi("M", M).pi("cin", cin).pi("cout", cout).pi("k", 2 * s).pi("dil", 1)
+             .pi("causal", 1).pi("stride", s).pi("cu_div", 8).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
         for (const int64_t s : { 5, 3 }) {
             /* A codec's odd strides at kernel 2 stride, causal, over sequences of 3, 1 and 5 rows
              * from row 1. */

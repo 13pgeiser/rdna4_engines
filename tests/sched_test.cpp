@@ -4,6 +4,7 @@
 #include "rad_test.h"
 
 #include "mm/processor.h"
+#include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -358,6 +359,7 @@ TEST(window_prefill_writes_interval_snapshots_before_the_tail) {
         f.cfg.checkpoint_policy = policy;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK(f.sch.geometry().window_ckpt);
+        CHECK(f.sch.geometry().window_periodic);
 
         int64_t pos = 0;
         std::vector<int64_t> snapshots;
@@ -400,6 +402,7 @@ TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     f.cfg.checkpoint_policy = "tip-only";
     REQUIRE_EQ(f.start(), RAD_OK);
     CHECK(f.sch.geometry().window_ckpt);
+    CHECK(!f.sch.geometry().window_periodic);
 
     int64_t ckpt = -1;
     CHECK_EQ(f.sch.plan_chunk(0, 1100, 512, &ckpt), 512ll);
@@ -1380,6 +1383,49 @@ TEST(cancellation_frees_blocks_immediately) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Cancelled);
 }
 
+/* A release of a conversation with a request of it in flight is refused, whether that request
+ * is queued or running: the cache would skip its blocks as live and the request's close would
+ * publish the whole chain again, so the client would have been told of a release that did not
+ * happen. Once the request is gone the release reaches the cache with what the client asked. */
+TEST(a_session_release_waits_for_the_conversations_own_request) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64);
+    CHECK_OK(f.start());
+
+    auto r = f.request(160, 64);
+    r->session_label = "chat-7";
+    const uint64_t a = f.add(std::move(r));
+    CHECK(a != 0);
+
+    SessionRelease out;
+    /* Queued, not yet admitted. */
+    CHECK_EQ(f.sch.release_session("chat-7", 0, 0, &out), RAD_E_STATE);
+    CHECK_EQ(f.sch.release_session("", a, 0, &out), RAD_E_STATE);
+    CHECK_EQ(f.pc.released_calls.size(), 0u);
+
+    /* Running. */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.release_session("chat-7", 0, 32, &out), RAD_E_STATE);
+    /* Another conversation is not in its way. */
+    CHECK_OK(f.sch.release_session("chat-8", 0, 0, &out));
+    REQUIRE_EQ(f.pc.released_calls.size(), 1u);
+    CHECK(f.pc.released_calls[0].label == "chat-8");
+
+    /* Finished: the release goes through with label, id and the kept prefix as given. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    CHECK_OK(f.sch.release_session("chat-7", 0, 48, &out));
+    REQUIRE_EQ(f.pc.released_calls.size(), 2u);
+    CHECK(f.pc.released_calls[1].label == "chat-7");
+    CHECK_EQ(f.pc.released_calls[1].keep_tokens, 48ll);
+    CHECK_EQ(out.entries, 5ll);
+
+    /* Nothing named is a bad request, not a cache call. */
+    CHECK_EQ(f.sch.release_session("", 0, 0, &out), RAD_E_INVAL);
+    CHECK_EQ(f.pc.released_calls.size(), 2u);
+}
+
 /* A reap while the step is still on the device. Common: the server reaps as soon as a sink
  * finishes, and cancelling finishes it, so every mid-decode disconnect lands here. Releasing the
  * Request now would destroy it under commit(); returning its slot now would let a newly admitted
@@ -1584,6 +1630,204 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     CHECK(b2 != nullptr);
     int32_t W = 4 - 1 + 4 + 1;
     CHECK_EQ(f.sch.plan().e[0].conv_cursor, (cursor_before + 3) % W);
+}
+
+/* THE COUPLED BIND AFTER A REAL COMMIT.
+ *
+ * Engine::finish_serial_drafter binds each round at the request's committed output length, read
+ * from the plan after commit -- the value the next Sampler::build_step stages that row at. This
+ * drives the same rule (sched/mtp_couple_bind.h) against the real Scheduler::commit: a live
+ * commit, a max_tokens cut, and a card reused by a new request afterwards.
+ *
+ * The old engine formula (the draw's pre-commit base + the slot's one-based n_acc) agrees on every
+ * commit of a request that is still running, and drifts by exactly the tokens a cut withheld. A
+ * commit that emits fewer than the card accepted has closed the request; its plan entry is carried
+ * for the bind, but the request will never sample again. Binding it would put a coupled verify on
+ * a terminal row, which reads as a live round in the log without being one. */
+TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    const int64_t vocab = f.prog.meta.n_vocab;
+
+    int32_t draft[3] = { 21, 22, 23 };
+    auto readback = [&](uint64_t seq, uint64_t base, int rounds) {
+        RadMtpCoupleDraw d{};
+        d.seq  = seq;
+        d.base = base;
+        d.mode = 1;
+        std::vector<RadMtpCoupleState> rb((size_t)rounds);
+        for (int rd = 1; rd <= rounds; ++rd) {
+            RadMtpCoupleState& s = rb[(size_t)(rd - 1)];
+            s.draw   = d;
+            s.round  = rd;
+            s.status = 1;
+            s.count  = 1;
+            s.x      = draft[rd - 1];       /* what the card holds for that round */
+            for (int i = 0; i < 8; ++i) s.ids[i] = -1;
+            s.ids[0] = s.x;
+            s.q[0]   = 1.0;
+        }
+        return rb;
+    };
+    auto slot = [&]() {
+        StepSlot S{};
+        S.acc = 3;
+        S.n_acc = 4;
+        for (int rd = 1; rd <= 3; ++rd) S.tok[rd] = draft[rd - 1];
+        return S;
+    };
+
+    /* ---- a live commit: three drafts accepted, the request keeps running. */
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t a_base = f.sch.find(a)->output.size();   /* the draw's pre-commit coordinate */
+    CHECK_OK(f.commit(9, 0, [](const StepEntry&) { return 3; }));
+    REQUIRE(f.sch.find(a) != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), (int)a_base + 4);
+
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
+    CHECK(pa.found);
+    CHECK(pa.live);
+    CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
+
+    const std::vector<RadMtpCoupleState> rba = readback(a, a_base, 3);
+    const StepSlot Sa = slot();
+    RadMtpCoupleState bound[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_rounds(pa, rba[0].draw, rba.data(), 1, 3, Sa, vocab, bound,
+                                    &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 3);
+    for (int k = 0; k < 3; ++k) {
+        /* The next build stages row k at n_out + k. */
+        CHECK_EQ(bound[k].pos, pa.n_out + (uint64_t)k);
+        CHECK(rad_mtp_couple_binds(bound[k], a, rba[0].draw.seed, pa.n_out, k, draft[k], vocab));
+    }
+    /* The old formula on the same data: identical, because this commit emitted its whole
+     * acceptance. */
+    for (int k = 0; k < 3; ++k)
+        CHECK_EQ(a_base + 4 + (uint64_t)k, pa.n_out + (uint64_t)k);
+
+    /* ---- a cut commit: the card accepted three drafts, the budget lets two through. */
+    const uint64_t b = f.submit(160, /*max_tokens=*/3);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);                                     /* b's first output token */
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t b_base = f.sch.find(b)->output.size();
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? 3 : 0; }));
+    REQUIRE(f.sch.find(b) != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->output.size(), 3);          /* 1 + 2, not 1 + 4 */
+
+    /* The commit snapshot still names b -- the terminal step is carried into the bind -- but it is
+     * not live: nothing binds, so no coupled verify is staged for a request that is gone. */
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
+    CHECK(pb.found);
+    CHECK(!pb.live);
+    CHECK_EQ(pb.n_out, (uint64_t)f.sch.find(b)->output.size());
+
+    const std::vector<RadMtpCoupleState> rbb = readback(b, b_base, 3);
+    const StepSlot Sb = slot();
+    CHECK_EQ(mtp_couple_bind_rounds(pb, rbb[0].draw, rbb.data(), 1, 3, Sb, vocab, bound,
+                                    &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
+    /* THE OLD FORMULA would have bound b's rounds at base + n_acc + k -- two past the length it
+     * actually committed, on a row no build will stage. */
+    for (int k = 0; k < 3; ++k) {
+        const uint64_t old_pos = b_base + 4 + (uint64_t)k;
+        CHECK(old_pos != pb.n_out + (uint64_t)k);
+        RadMtpCoupleState stale = rbb[(size_t)k];
+        stale.pos = old_pos;
+        CHECK(!rad_mtp_couple_binds(stale, b, rbb[0].draw.seed, pb.n_out, k, draft[k], vocab));
+    }
+
+    /* ---- reuse: the next request on a card binds at its own length, and the closed request's
+     * rounds are not accepted by it. */
+    const uint64_t c = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(c, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t c_base = f.sch.find(c)->output.size();
+    CHECK_OK(f.commit(9, 0, [](const StepEntry&) { return 3; }));
+    MtpCoupleBindPoint pc;
+    pc.found = f.sch.committed_seq(c, &pc.n_out, &pc.live);
+    CHECK(pc.found);
+    CHECK(pc.live);
+    CHECK_EQ(pc.n_out, (uint64_t)f.sch.find(c)->output.size());
+    CHECK_EQ(pc.n_out, c_base + 4);
+    CHECK(!rad_mtp_couple_binds(rbb[0], c, rbb[0].draw.seed, pc.n_out, 0, draft[0], vocab));
+    RadMtpCoupleState own = readback(c, c_base, 1)[0];
+    own.pos = rad_mtp_couple_verify_pos(pc.n_out, 1);
+    CHECK(rad_mtp_couple_binds(own, c, own.draw.seed, pc.n_out, 0, draft[0], vocab));
+}
+
+/* THE BIND POINT OUTLIVES A REAP.
+ *
+ * commit() retires the step, and a request it finished that the next step does not carry is pinned
+ * by nothing any more. The server calls reap() from an HTTP thread as soon as it sees the finish,
+ * and reap() destroys the Request -- while Engine::finish_serial_drafter still has to bind that
+ * row. The bind point is therefore copied by commit under the scheduler lock
+ * (Scheduler::committed_seq), not read off the plan's StepEntry::req, which is dangling by then.
+ * This reaps a non-carried terminal request between commit and bind: the plan-pointer version
+ * could only answer by reading freed memory, and the snapshot answers from the copy.
+ */
+TEST(the_committed_bind_point_outlives_a_reap) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    const int64_t vocab = f.prog.meta.n_vocab;
+
+    int32_t draft[3] = { 21, 22, 23 };
+    const uint64_t a = f.submit(160, 64);                  /* live through the commit */
+    const uint64_t b = f.submit(160, /*max_tokens=*/3);    /* closed on it by the cut */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? 3 : 0; }));
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    /* The server's reap lands between commit and bind: b's Request is destroyed here. */
+    CHECK_OK(f.sch.reap(b));
+    CHECK(f.sch.find(b) == nullptr);
+
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
+    CHECK(pb.found);
+    CHECK(!pb.live);                                       /* terminal: nothing binds */
+    CHECK_EQ(pb.n_out, (uint64_t)3);
+
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
+    CHECK(pa.found);
+    CHECK(pa.live);
+    CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
+
+    RadMtpCoupleState rb[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    RadMtpCoupleState out[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    StepSlot S{};
+    S.acc = 3;
+    S.n_acc = 4;
+    for (int rd = 1; rd <= 3; ++rd) S.tok[rd] = draft[rd - 1];
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_rounds(pb, RadMtpCoupleDraw{}, rb, 1, 3, S, vocab, out, &n_bound,
+                                    &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
 }
 
 /* A decode benchmark needs the request to last as long as asked, not as long as the model
@@ -3327,6 +3571,33 @@ TEST(every_row_names_one_of_the_cards_step_slots) {
 /* The context pass mirrors the trunk step row for row: the drafter reads hidden states
  * positionally, so a sequence the commit finished keeps its rows (as padding that stores nothing),
  * or every later sequence would draft from its neighbour's states. */
+/* The load a block drafter's short block is chosen by counts the running sequences the step just
+ * run produced a token for, not one it finished; the choice switches on at the threshold and off
+ * only two below it. */
+TEST(a_block_drafters_short_block_follows_the_decoded_sequences_with_hysteresis) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(160, /*max_tokens=*/1);
+    f.submit(160, 64);
+    f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 3);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.decoded_seqs(), 2);
+
+    bool on = false;
+    const int64_t from = 16;
+    const int64_t load[] = { 15, 16, 15, 14, 15, 13, 14, 16 };
+    const bool want[]    = { 0,  1,  1,  0,  0,  0,  0,  1 };
+    for (size_t i = 0; i < sizeof load / sizeof load[0]; ++i) {
+        on = Scheduler::short_block_on(on, load[i], from);
+        CHECK_EQ(on, want[i]);
+    }
+}
+
 TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     Fixture f;
     f.build();
@@ -4176,7 +4447,7 @@ constexpr int kBlk = 8, kBlkDepth = 7;
 constexpr int32_t kBlkMask = 99;
 
 /* The host's driver: both passes built after the commit, from the committed sequence. */
-BlockRun block_reference(int steps) {
+BlockRun block_reference(int steps, int blk = kBlk, int depth = kBlkDepth) {
     Fixture f;
     std::vector<uint64_t> ids;
     ahead_setup(f, kBlkDepth, ids);
@@ -4187,7 +4458,7 @@ BlockRun block_reference(int steps) {
     Scheduler::BlockRow rows[4];
     for (int t = 0; t < steps; ++t) {
         CHECK_OK(ahead_commit(f, t));
-        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4), 3);
+        CHECK_EQ(f.sch.block_begin(blk, depth, 0, kBlkMask, rows, 4), 3);
         const RadBatch* cb = f.sch.block_context(t + 1);
         if (!cb) { CHECK(cb != nullptr); return run; }
         run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
@@ -4198,7 +4469,7 @@ BlockRun block_reference(int steps) {
         for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
         run.query.push_back(read_rows(qb, qp, f.kv));
         f.sch.block_end();
-        ahead_publish(f, ids, kBlkDepth, t + 1);
+        ahead_publish(f, ids, depth, t + 1);
         b = f.sch.step();
         if (!b) break;
         run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
@@ -4211,7 +4482,7 @@ BlockRun block_reference(int steps) {
  * passes built before the commit with the query rows placed by ADV_BLOCK, the proposals into the
  * slots (ADV_BTAKE), expect_draft and step_next with ADV_TRUNK, then the commit, block_end, the
  * drafts published and promote_next. */
-BlockRun block_pipelined(int steps) {
+BlockRun block_pipelined(int steps, int blk = kBlk, int depth = kBlkDepth) {
     Fixture f;
     std::vector<uint64_t> ids;
     ahead_setup(f, kBlkDepth, ids);
@@ -4241,7 +4512,7 @@ BlockRun block_pipelined(int steps) {
                 ++run.card_host_disagree;
         }
 
-        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4, /*on_card=*/true), 3);
+        CHECK_EQ(f.sch.block_begin(blk, depth, 0, kBlkMask, rows, 4, /*on_card=*/true), 3);
         const RadBatch* cb = f.sch.block_context(t + 1);
         if (!cb) { CHECK(cb != nullptr); return run; }
         run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
@@ -4254,19 +4525,20 @@ BlockRun block_pipelined(int steps) {
         StepPlan qp;
         for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
         run.query.push_back(read_rows(qb, qp, f.kv));
-        /* The block's proposals for step t + 1, taken behind the anchor. */
+        /* The block's proposals for step t + 1, taken behind the anchor, at the drafter's pitch
+         * (its own block's depth): a short block fills a row's front. */
         std::vector<int32_t> prop((size_t)3 * kBlkDepth);
         for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < kBlkDepth; ++j)
+            for (int j = 0; j < depth; ++j)
                 prop[(size_t)(i * kBlkDepth + j)] = ahead_draft(rows[i].seq, t + 1, j);
         AdvanceArgs tk = f.sch.advance_args(0);
         tk.mode = ADV_BTAKE;
-        tk.round = kBlkDepth;
+        tk.round = depth;
         tk.src = prop.data();
         tk.src_pitch = kBlkDepth;
         tk.st = slots.data();
         for (int i = 0; i < tk.n_seq; ++i) adv_row(tk, i);
-        for (int i = 0; i < 3; ++i) f.sch.expect_draft(rows[i].seq, kBlkDepth);
+        for (int i = 0; i < 3; ++i) f.sch.expect_draft(rows[i].seq, depth);
 
         const RadBatch* nb = f.sch.step_next();
         if (nb) {
@@ -4277,7 +4549,7 @@ BlockRun block_pipelined(int steps) {
         }
         CHECK_OK(ahead_commit(f, t));
         f.sch.block_end();
-        ahead_publish(f, ids, kBlkDepth, t + 1);
+        ahead_publish(f, ids, depth, t + 1);
         if (nb) {
             f.sch.promote_next();
             b = nb;
@@ -4307,6 +4579,42 @@ TEST(a_block_drafter_on_the_card_runs_the_passes_the_hosts_driver_runs) {
     const int T = 24;
     const BlockRun a = block_reference(T);
     const BlockRun b = block_pipelined(T);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+    REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+    REQUIRE_EQ(a.context.size(), b.context.size());
+    REQUIRE_EQ(a.query.size(), b.query.size());
+    for (size_t t = 0; t < a.trunk.size(); ++t) {
+        CHECK(a.trunk[t] == b.trunk[t]);
+        CHECK_EQ(b.trunk[t].bad_slots, 0);
+    }
+    for (size_t t = 0; t < a.context.size(); ++t) {
+        BatchRows ca = a.context[t], cb = b.context[t];
+        ca.tok.clear();
+        cb.tok.clear();
+        const bool same_c = ca == cb, same_q = a.query[t] == b.query[t];
+        CHECK(same_c);
+        CHECK(same_q);
+        if (!same_c || !same_q)
+            std::fprintf(stderr, "    step %zu: context %s, query %s\n", t,
+                         same_c ? "same" : "differs", same_q ? "same" : "differs");
+        CHECK_EQ(a.context[t].bad_slots, 0);
+        CHECK_EQ(b.context[t].bad_slots, 0);
+        CHECK_EQ(a.query[t].bad_slots, 0);
+        CHECK_EQ(b.query[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+}
+
+/* The same at DFlash2's short block (--draft-short-from: 4 rows, 3 proposals), which the card's driver
+ * runs once enough sequences decode (Engine::block_shape): the query pass of the short block, its
+ * proposals taken from the front of each row at the drafter's pitch, and the step issued ahead
+ * verifying 3 of them. */
+TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    const BlockRun a = block_reference(T, 4, 3);
+    const BlockRun b = block_pipelined(T, 4, 3);
     CHECK_EQ(b.ahead, T);
     CHECK_EQ(b.card_host_disagree, 0);
     REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);

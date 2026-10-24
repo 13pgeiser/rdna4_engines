@@ -65,6 +65,12 @@ struct AudioRequest {
      * conditional prompt as the declaration says (neg_token), and `neg_tokens` is empty. */
     std::vector<int32_t> tokens;
     std::vector<int32_t> neg_tokens;
+    /* References (RadAudioGenDecl::tmpl_ref): the clips' samples end to end, each padded to whole
+     * frames; their bounds in samples, [clips + 1]; and for each row of `tokens` the frame of the
+     * clips it is, -1 for a token. All empty without references. */
+    std::vector<float>   ref_audio;
+    std::vector<int32_t> ref_cu;
+    std::vector<int32_t> ref_frame;
     int64_t  max_frames = 0;       /* the most frames to make, >= 1 */
     int32_t  steps = 0;            /* 0: the model's default */
     float    cfg = 0.0f;           /* 0: the model's default */

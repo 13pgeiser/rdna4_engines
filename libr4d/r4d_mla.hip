@@ -537,6 +537,178 @@ __global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const ui
         atomicAdd(&g_mla_stats[2], (unsigned long long)(raster + 15) / 16);
     }
 }
+/* ROWS gives a workgroup one query row and HG groups of sixteen heads, four waves a group, so a
+ * key chunk is loaded once for 16*HG heads instead of the head-tiled row's sixteen. GLM's prefill
+ * splits attention by rows, one rank holding all 64 heads of its rows; that is what this serves.
+ *
+ * Scores are S^T = K Q^T: tokens are the matrix rows and heads the columns, so a head is a lane
+ * and its running maximum and denominator stay in registers. Each wave of a group takes a quarter
+ * of the latent dimension; the four partial dot products meet in LDS and every wave of the group
+ * adds them in the same order, so all four hold identical scores and statistics. The
+ * probabilities become the second product's B operand with one permlanex16 swap, and each wave
+ * accumulates O^T for its quarter of the latent columns, the keys read transposed from the tile.
+ * The next chunk's keys are fetched into registers while the current one is multiplied, so a
+ * chunk costs two barriers. */
+constexpr int kRowsPitch = 520;
+template <int HG, bool WIDE>
+__global__ __launch_bounds__(HG * 128) void attend_rows(const uint16_t* q, const uint16_t* kv,
+                                                        const int* bt, const int* len,
+                                                        uint16_t* out, float* scratch, Meta m) {
+    constexpr int NT = HG * 128, LOADS = 16 * 64 / NT;
+    static_assert(LOADS * NT == 16 * 64 && LOADS <= 32, "a chunk's 16-byte pieces over the group");
+    __shared__ __align__(16) uint16_t keys[2][16 * kRowsPitch];
+    __shared__ __align__(32) float partial[HG * 4][32 * 8];
+    __shared__ int visible[2][16];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, quarter = wave & 3,
+              group = wave >> 2, r = blockIdx.x, split = blockIdx.z;
+    const int head = blockIdx.y * 16 * HG + group * 16 + (lane & 15);
+    const int live = min(max(len[(long)r * m.lp], 0), m.blocks * m.bs);
+    const int begin = (int)((long)live * split / m.splits),
+              end = (int)((long)live * (split + 1) / m.splits);
+    v8bf query[8];
+    {
+        const uint16_t* qp =
+            q + (long)r * m.qr + (long)head * m.qh + quarter * 128 + 4 * (lane >> 4);
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            union {
+                uint16_t h[8];
+                v8bf f;
+            } u;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                u.h[e] = qp[s * 16 + e];
+                u.h[4 + e] = qp[s * 16 + 8 + e];
+            }
+            query[s] = u.f;
+        }
+    }
+    uint4 staged[LOADS];
+    unsigned staged_ok = 0;
+    auto fetch = [&](int start) {
+#pragma unroll
+        for (int j = 0; j < LOADS; ++j) {
+            const int flat = tid + j * NT, token = start + (flat >> 6), piece = flat & 63;
+            const int page = token < end ? bt[(long)r * m.bp + (token / m.bs) * m.bc] : -1;
+            const bool ok = page >= 0 && page < m.pages;
+            const long at = ok ? (long)page * m.kp + (token % m.bs) * m.kt + piece * 8 : 0;
+            if constexpr (WIDE) {
+                staged[j] = *(const uint4*)(kv + at);
+                if (!ok) staged[j] = make_uint4(0, 0, 0, 0);
+            } else {
+                uint32_t w[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    w[i] = ok ? (uint32_t)kv[at + 2 * i] | (uint32_t)kv[at + 2 * i + 1] << 16 : 0u;
+                staged[j] = make_uint4(w[0], w[1], w[2], w[3]);
+            }
+            staged_ok = ok ? staged_ok | 1u << j : staged_ok & ~(1u << j);
+        }
+    };
+    auto stash = [&](int b) {
+#pragma unroll
+        for (int j = 0; j < LOADS; ++j) {
+            const int flat = tid + j * NT, token = flat >> 6, piece = flat & 63;
+            *(uint4*)(keys[b] + token * kRowsPitch + piece * 8) = staged[j];
+            if (!piece) visible[b][token] = (int)(staged_ok >> j & 1u);
+        }
+    };
+    v8f value[8];
+#pragma unroll
+    for (int mt = 0; mt < 8; ++mt) value[mt] = (v8f){ 0 };
+    float run_max = -INFINITY, run_den = 0;
+    fetch(begin);
+    stash(0);
+    __syncthreads();
+    int buf = 0;
+    for (int start = begin; start < end; start += 16) {
+        const bool more = start + 16 < end;
+        if (more) fetch(start + 16);
+        const uint16_t* tile = keys[buf];
+        v8f dot = { 0 };
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+            dot = mma(frag(tile, kRowsPitch, 0, quarter * 128 + s * 16, lane), query[s], dot);
+        *(v8f*)&partial[wave][lane * 8] = dot;
+        __syncthreads();
+        v8f score = *(const v8f*)&partial[group * 4][lane * 8];
+#pragma unroll
+        for (int k = 1; k < 4; ++k) score += *(const v8f*)&partial[group * 4 + k][lane * 8];
+        float chunk_max = -INFINITY;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            score[e] = visible[buf][8 * (lane >> 4) + e] ? score[e] * m.scale : -INFINITY;
+            chunk_max = fmaxf(chunk_max, score[e]);
+        }
+        chunk_max = fmaxf(chunk_max, swap16(chunk_max));
+        const float next_max = fmaxf(run_max, chunk_max);
+        const float alpha = isfinite(next_max) ? expf(run_max - next_max) : 1;
+        float p[8], sum = 0;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            p[e] = isfinite(score[e]) ? expf(score[e] - next_max) : 0;
+            sum += p[e];
+        }
+        /* Both halves add tokens 0-7 before 8-15, so the sixteen lanes of a head agree. */
+        const float other = swap16(sum);
+        run_den = run_den * alpha + (lane < 16 ? sum + other : other + sum);
+        run_max = next_max;
+        /* A B fragment's lane holds its head's tokens 0-3 and 8-11 (lanes 0-15) or 4-7 and 12-15
+         * (16-31); a score lane holds 0-7 or 8-15. Each half sends the other the four it needs. */
+        uint32_t hi[4], lo[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint16_t h0 = f32_to_bf16(p[2 * i]), h1 = f32_to_bf16(p[2 * i + 1]);
+            hi[i] = (uint32_t)h0 | (uint32_t)h1 << 16;
+            lo[i] = (uint32_t)f32_to_bf16(p[2 * i] - bf16_to_f32(h0)) |
+                    (uint32_t)f32_to_bf16(p[2 * i + 1] - bf16_to_f32(h1)) << 16;
+        }
+        const bool low = lane < 16;
+        const uint32_t hx0 = r4d_xor_lane_u32<16>(low ? hi[2] : hi[0]),
+                       hx1 = r4d_xor_lane_u32<16>(low ? hi[3] : hi[1]),
+                       lx0 = r4d_xor_lane_u32<16>(low ? lo[2] : lo[0]),
+                       lx1 = r4d_xor_lane_u32<16>(low ? lo[3] : lo[1]);
+        union {
+            uint32_t w[4];
+            v8bf f;
+        } ph, pl;
+        ph.w[0] = low ? hi[0] : hx0;
+        ph.w[1] = low ? hi[1] : hx1;
+        ph.w[2] = low ? hx0 : hi[2];
+        ph.w[3] = low ? hx1 : hi[3];
+        pl.w[0] = low ? lo[0] : lx0;
+        pl.w[1] = low ? lo[1] : lx1;
+        pl.w[2] = low ? lx0 : lo[2];
+        pl.w[3] = low ? lx1 : lo[3];
+#pragma unroll
+        for (int mt = 0; mt < 8; ++mt) {
+            const auto v = fragT(tile, kRowsPitch, quarter * 128 + mt * 16, 0, lane);
+            value[mt] *= alpha;
+            value[mt] = mma(v, ph.f, value[mt]);
+            value[mt] = mma(v, pl.f, value[mt]);
+        }
+        if (more) stash(buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+#pragma unroll
+    for (int mt = 0; mt < 8; ++mt)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int col = quarter * 128 + mt * 16 + 8 * (lane >> 4) + e;
+            if (m.splits == 1)
+                out[(long)r * m.orr + (long)head * m.oh + col] =
+                    f32_to_bf16(run_den > 0 ? value[mt][e] / run_den : 0);
+            else
+                scratch[(((long)r * m.heads + head) * m.splits + split) * PART + col] =
+                    value[mt][e];
+        }
+    if (m.splits > 1 && !quarter && lane < 16) {
+        float* dst = scratch + (((long)r * m.heads + head) * m.splits + split) * PART;
+        dst[D] = run_max;
+        dst[D + 1] = run_den;
+    }
+}
 /* Read once: the launch path asks on every matrix launch. */
 bool stats_on() {
     static const bool on = [] {
@@ -647,6 +819,70 @@ int body(const RadArgs* a, RadStream stream) {
     if (rc == RAD_OK && stats) report_stats(stream);
     return rc;
 }
+/* r4d_mla_rows_pin_form: 0 is the launcher's rule (64 heads a workgroup, vector key loads where
+ * the cache is aligned, the matrix row's kernel under kRowsMin rows), 1 the element-wise key load,
+ * 2 thirty-two heads a workgroup, 3 the rule's rows kernel at any row count, 4 the matrix row's
+ * kernel at every row count. The pin is a test hook (r4d_selftest, r4d_emu); nothing else sets
+ * it. */
+int g_mla_rows_form = 0;
+/* Under it, a decode step's rows at one rank, a workgroup a row leaves the card mostly idle, and
+ * the matrix row's four tiles a row and its splits are faster (r4d_selftest --case
+ * mla_attn_rows_bf16, M 7: 0.5x). */
+constexpr long kRowsMin = 32;
+int rows_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 5) return RAD_E_INVAL;
+    const auto &q = a->t[0], &kv = a->t[1], &bt = a->t[2], &len = a->t[3], &o = a->t[4];
+    if (q.dtype != RAD_BF16 || kv.dtype != RAD_BF16 || o.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
+        len.dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    for (int i = 0; i < 5; ++i)
+        if (!a->t[i].data) return RAD_E_INVAL;
+    const long heads = r4d_geti_or(a, "heads", 0), bs = r4d_geti_or(a, "block_size", 0);
+    const float scale = (float)r4d_getf(a, "scale", 0);
+    if (r4d_geti_or(a, "latent_dim", 0) != D || heads < 1 || heads > 64 || bs < 1 || bs > 256 ||
+        !std::isfinite(scale) || scale <= 0 || q.rank != 3 || q.shape[0] < 1 ||
+        q.shape[0] > 65535 || q.shape[1] != heads || q.shape[2] != D || q.stride[2] != 1 ||
+        q.stride[1] < D || q.stride[0] < heads * q.stride[1] || kv.rank != 4 || kv.shape[0] < 1 ||
+        kv.shape[0] > INT_MAX || kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] != D ||
+        kv.stride[3] != 1 || kv.stride[2] < D || kv.stride[0] < bs * kv.stride[2] || bt.rank != 2 ||
+        bt.shape[0] != q.shape[0] || bt.shape[1] < 1 || bt.shape[1] > INT_MAX / bs ||
+        bt.stride[1] < 1 || bt.stride[0] < bt.shape[1] * bt.stride[1] || len.rank != 1 ||
+        len.shape[0] != q.shape[0] || len.stride[0] < 1 || o.rank != 3 ||
+        o.shape[0] != q.shape[0] || o.shape[1] != heads || o.shape[2] != D || o.stride[2] != 1 ||
+        o.stride[1] < D || o.stride[0] < heads * o.stride[1])
+        return RAD_E_SHAPE;
+    if (heads % 32) return RAD_E_UNSUPPORTED;
+    const int form = g_mla_rows_form;
+    if (form == 4 || (!form && q.shape[0] < kRowsMin)) return body<true>(a, stream);
+    const int group_heads = heads % 64 || form == 2 ? 32 : 64;
+    const long rows = q.shape[0], groups = heads / group_heads, jobs = rows * groups;
+    /* Short batches split the history until 64 workgroups run, two to each of the R9700's 32
+     * WGPs, as far as 16-token chunks and the scratch's 2048 partials allow. */
+    int splits = (int)std::min(64l, (64 + jobs - 1) / jobs);
+    splits = (int)std::max(1l, std::min((long)splits, (bt.shape[1] * bs + 15) / 16));
+    splits = (int)std::max(1l, std::min((long)splits, 2048 / (rows * heads)));
+    if (!a->scratch || a->scratch_bytes < matrix_scratch_bytes) splits = 1;
+    const bool wide = form != 1 && !((uintptr_t)kv.data & 15) && !(kv.stride[0] % 8) &&
+                      !(kv.stride[2] % 8);
+    Meta m{ q.stride[0],  q.stride[1],      kv.stride[0],  kv.stride[2],
+            bt.stride[0], bt.stride[1],     len.stride[0], o.stride[0],
+            o.stride[1],  (int)q.shape[0],  (int)heads,    (int)bt.shape[1],
+            (int)bs,      (int)kv.shape[0], splits,        scale };
+#define ROWS_EMIT(HG, W)                                                                           \
+    R4D_EMIT(stream, (attend_rows<HG, W>), dim3(m.rows, (unsigned)groups, m.splits),             \
+             dim3(HG * 128), 0, (const uint16_t*)q.data, (const uint16_t*)kv.data,               \
+             (const int*)bt.data, (const int*)len.data, (uint16_t*)o.data, (float*)a->scratch, m)
+    int rc;
+    if (group_heads == 64)
+        rc = wide ? ROWS_EMIT(4, true) : ROWS_EMIT(4, false);
+    else
+        rc = wide ? ROWS_EMIT(2, true) : ROWS_EMIT(2, false);
+#undef ROWS_EMIT
+    if (rc == RAD_OK && splits > 1)
+        rc = R4D_EMIT(stream, merge, dim3(m.rows, (m.heads + 3) / 4), dim3(128), 0,
+                      (const float*)a->scratch, (uint16_t*)o.data, m);
+    return rc;
+}
 }
 extern "C" int r4d_rad_mla_attn(const RadArgs* a, RadStream stream) {
     return body<false>(a, stream);
@@ -654,12 +890,16 @@ extern "C" int r4d_rad_mla_attn(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_mla_attn_matrix(const RadArgs* a, RadStream stream) {
     return body<true>(a, stream);
 }
+extern "C" int r4d_rad_mla_attn_rows(const RadArgs* a, RadStream stream) {
+    return rows_body(a, stream);
+}
 extern "C" int r4d_rad_mla_project(const RadArgs* a, RadStream stream) {
     return project_body(a, stream);
 }
 extern "C" int64_t r4d_rad_mla_attn_scratch(const RadArgs*) { return scratch_bytes; }
 extern "C" int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*) { return matrix_scratch_bytes; }
 extern "C" void r4d_mla_matrix_pin_form(int form) { g_mla_matrix_form = form; }
+extern "C" void r4d_mla_rows_pin_form(int form) { g_mla_rows_form = form; }
 /* Test hook: the current device's RADIANCE_MLA_CONFLICT_STATS counters since the last call (passes,
  * second passes, raster chunks), then zeroed. */
 extern "C" void r4d_mla_matrix_stats(unsigned long long* out) {

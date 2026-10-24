@@ -260,8 +260,10 @@ AVX_QB_TARGET static void qb_codes(const QbTab& q, const uint8_t* src, int64_t n
  * first code), as code - zero in bf16 into dst[0, npad), the words past n zero. zr[j] is the zero
  * of the j-th 32 codes. A code minus its zero lies in [-31, 31], exact in bf16: `t` holds bf16(i -
  * 32) for i < 64, which one vpermt2w indexes by code - zero + 32. u5 codes are 40 bits for each
- * eight, deposited into bytes by pdep (BMI2, which the caller checked). */
-AVX_QB_TARGET __attribute__((target("bmi2"))) static void qb_codes_zp(
+ * eight, deposited into bytes by pdep (BMI2, which the caller checked). BMI2 is named in the one
+ * target attribute with the level's features: clang keeps only one of two stacked target
+ * attributes and then refuses to inline _pdep_u64. */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16,bmi2"))) static void qb_codes_zp(
         const uint8_t* row, int bits, int64_t n, int64_t npad, uint16_t* dst, const int32_t* zr,
         const __m512i* t) {
     for (int64_t i = 0; i < npad; i += 32) {

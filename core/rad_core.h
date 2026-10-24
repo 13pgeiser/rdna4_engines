@@ -392,6 +392,8 @@ public:
      * for drafters that did not ask. */
     bool           drafter_shared_kv = false;
     int32_t        drafter_pos_offset = 0;
+    /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
+    int64_t        drafter_short_block = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -416,7 +418,8 @@ public:
      * strings point at `agen_str`, as the image generator's do at `gen_str`. */
     RadAudioGenDecl audio_gen{};
     struct AudioGenStrings {
-        std::string name, tmpl, tmpl_plain, neg_tmpl;   /* "" for an absent template */
+        /* "" for an absent template; tmpl_ref and ref_item RadAudioGenDecl's references */
+        std::string name, tmpl, tmpl_plain, neg_tmpl, tmpl_ref, ref_item;
     } agen_str;
     bool is_audio_generator() const { return audio_gen.max_lanes != 0; }
     /* The declared video generator (rad_declare_video_generator); `max_lanes` 0 when none. */
@@ -762,6 +765,9 @@ struct Config {
      * element plus a bf16 scale per 64) instead of 16 bits per element, 2.4x fewer bytes over
      * PCIe. The received sum then differs undetectably, hence a named flag, not a heuristic. */
     int   tp_wire_exact = 1;          /* --tp-wire exact|wht6 */
+    /* --tp-attn-split heads|rows: 1 runs a prefill-sized step's attention by rows over the ranks
+     * (RadBuildCtx::tp_attn_rows). Not bit-identical to the head split, so heads is the default. */
+    int   tp_attn_rows = 0;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -808,6 +814,7 @@ struct Config {
      * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
      * another name. */
     std::string kv_cache_dtype = "bf16";
+    std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
     /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */
@@ -906,6 +913,14 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
+     * the step just run; 0 never. Ignored without a drafter that declares one. */
+    int64_t draft_short_from = 0;       /* --draft-short-from */
+
+    /* --draft-coupling off|on: a linear serial drafter samples its proposals and the sampler
+     * applies the maximal coupling at the verify (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
+     * Off by default; on changes which tokens a fixed seed yields, not their law. */
+    bool        draft_coupling = false;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

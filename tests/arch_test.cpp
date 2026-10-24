@@ -3308,6 +3308,88 @@ TEST(gemma4_declares_two_kv_groups_and_binds_the_schedule) {
     }
 }
 
+/* The E2B/E4B form on the same twelve layers: the last four share KV (no cache of their own),
+ * per-layer embeddings 64 wide, a global class with its own v (attention_k_eq_v 0) and no
+ * num_global_key_value_heads, so the global layers take num_key_value_heads. */
+const char* k_gem4e_keys[] = {
+    "sliding_window", "global_head_dim", "num_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "full_attention_interval", "attention_k_eq_v",
+    "hidden_size_per_layer_input",
+};
+const char* k_gem4e_vals[] = { "1024", "512", "16", "10000", "1000000", "0.25", "4", "30", "6", "0",
+                               "64" };
+
+RadModelMeta gemma4_e4b_meta() {
+    RadModelMeta m = gemma4_meta();
+    m.name   = "test-gemma4-e4b-form";
+    m.n_kv   = (int)(sizeof(k_gem4e_keys) / sizeof(k_gem4e_keys[0]));
+    m.kv_key = k_gem4e_keys;
+    m.kv_val = k_gem4e_vals;
+    return m;
+}
+
+/* Layers 8..11 keep no cache: only 0..7 are bound, and each shared layer's attention reads the last
+ * earlier layer of its class that keeps one (sliding 8..10 -> 7, global 11 -> 5). Every layer runs
+ * the per-layer branch (gate, gelu times its slice, projection, norm, add), and the step lints
+ * clean in bf16 and in w4a8, where the junction closes the branch instead of the feed-forward. */
+TEST(a_gemma4_e4b_form_shares_kv_and_runs_the_per_layer_branch) {
+    for (bool w4 : { false, true }) {
+        RadBuilder b;
+        if (w4) {
+            const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+            b.encs = { { "attn_q.", e }, { "attn_k.", e }, { "attn_v.", e }, { "attn_o.", e },
+                       { "ffn_gate_up.", e }, { "ffn_down.", e } };
+        }
+        RadModelMeta meta = gemma4_e4b_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+        CHECK_EQ((int)b.binds.size(), 8);
+        for (const auto& bd : b.binds) CHECK((int)bd.first < 8);
+        CHECK_EQ(b.kv_groups[1].d.n_head_kv, 16);   /* num_key_value_heads, the global key absent */
+        CHECK_EQ(count_op(b, "attn_paged"), 12);
+        CHECK_EQ(count_op(b, "act_mul"), 12);
+        CHECK_EQ(count_op(b, "embed_lookup"), 2);   /* the token table and the per-layer table */
+
+        RadBatch batch = decode_batch();
+        RadCtx c{ .b = &b, .batch = &batch, .world = 1 };
+        gemma4_bf16::step(&c, &batch);
+        CHECK_LINT(b, &c);
+        std::vector<int64_t> src;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (o && o->op == "attn_paged") {
+                CHECK_EQ(i.opd[1].kind, (uint8_t)RAD_OPK_KV);
+                src.push_back(i.opd[1].offset);
+            }
+        }
+        const std::vector<int64_t> want = { 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 5 };
+        CHECK(src == want);
+    }
+}
+
+/* The per-layer branch is not split across ranks, and a model whose every layer shares KV has no
+ * cache to read. */
+TEST(the_gemma4_e4b_form_is_refused_where_it_cannot_run) {
+    {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_e4b_meta();
+        RadBuildCtx  ctx  = build_ctx(0, 2);
+        CHECK_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+    }
+    {
+        const char* vals[] = { "1024", "512", "16", "10000", "1000000", "0.25", "12", "30", "6", "0",
+                               "64" };
+        RadBuilder b;
+        RadModelMeta meta = gemma4_e4b_meta();
+        meta.kv_val = vals;
+        RadBuildCtx ctx = build_ctx();
+        CHECK_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_E_INVAL);
+    }
+}
+
 TEST(gemma4_attention_shapes_for_both_classes) {
     RadBuilder b;
     RadModelMeta meta = gemma4_meta();
@@ -6149,10 +6231,54 @@ void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, i
             const auto v = run_passes(b, step, all, rank, world);
             CHECK_PASSES(b, v);
             for (size_t i = 1; i < v.size(); ++i) CHECK(each_gemm_nt_once(b, *v[i]));
+            if (!block_drafter || block <= 4) continue;
+            /* The short block (rad_drafter_short_block): a query pass staged at 4 rows a sequence
+             * runs the short ops, its selector proposing 3; a block with no ops fails the step. */
+            CHECK_EQ(b.drafter_short, 4);
+            const auto ctx2 = context_pass(b, *ver);
+            const auto qs = query_pass(b, 4, b.drafter_short, b.drafter_short - 1);
+            const auto vs = run_passes(b, step, { ver.get(), ctx2.get(), qs.get() }, rank, world);
+            CHECK_PASSES(b, vs);
+            CHECK(vs[2]->step_fail.empty());
+            int64_t sel_steps = -1, sel_stride = -1;
+            for (const RecIssue& i : vs[2]->issues)
+                if (const RecOp* o = b.op_of(i.op); o && o->op == "dflash_select") {
+                    sel_steps = pint(o, "steps");
+                    sel_stride = pint(o, "anchor_stride");
+                }
+            CHECK_EQ(sel_steps, 3);
+            CHECK_EQ(sel_stride, 4);
+            const auto qbad = query_pass(b, 4, 6, 5);
+            const auto vb = run_passes(b, step, { qbad.get() }, rank, world);
+            CHECK(!vb[0]->step_fail.empty());
         }
 }
 
 }  /* namespace */
+
+/* The GDN state cache's width is a deployment's choice: f32 by default, f16 under
+ * RadBuildCtx::state_dtype (--state-cache-dtype f16), which the probe says the plugin serves. */
+TEST(qwen35_fp8_gdn_state_is_f32_unless_the_deployment_asks_f16) {
+    MetaKV mk = q35fp8_meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.state_f16_ok, 1);
+    for (uint32_t want : { (uint32_t)0, (uint32_t)RAD_F16 }) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        ctx.state_dtype = want;
+        const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); });
+        REQUIRE_EQ(rc, RAD_OK);
+        int n = 0;
+        for (const RecKV& g : b.kv_groups)
+            if (g.name == "kv_gdn_state") {
+                ++n;
+                CHECK_EQ(g.d.dtype, want == RAD_F16 ? RAD_F16 : RAD_F32);
+            }
+        CHECK_EQ(n, 1);
+        CHECK_EQ(noted(b, "GDN state cache f16"), want == RAD_F16);
+    }
+}
 
 /* The fp8 sibling of qwen35_bf16: the same layers with every large linear a block-fp8 gemm_nt_q
  * read at fp8a8, one quantiser per activation, and the attention's output gate, multiply and
@@ -6559,65 +6685,56 @@ TEST(gemma3_steps_lint_clean_at_one_and_two_ranks) {
  * pieces of 1024; every collective is on the second lane, the layers' all-reduces a piece at a time
  * at `overlap` 1 (two blocks a layer, two pieces a block) and the embedding's whole; the attention and
  * the DFlash2 taps run a piece at a time; q|k|v and gate|up read one shared input pair. A prompt's
- * first chunk and a later one alike. RADIANCE_PREFILL_PIPELINE=off runs the same step serially. */
+ * first chunk and a later one alike. */
 TEST(gemma3_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_lane) {
     MetaKV mk = gemma3_dflash2_meta();
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
-    for (int off : { 0, 1 })
-        for (int rank = 0; rank < 2; ++rank)
-            for (int32_t pctx : { 0, 4096 }) {
-                if (off) setenv("RADIANCE_PREFILL_PIPELINE", "off", 1);
-                RadBuilder b;
-                b.encs = { { "blk.", mx } };
-                RadBuildCtx ctx = spec_ctx(rank, 2, 7);
-                ctx.max_tok = 2048;
-                const int rc = stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); });
-                if (off) unsetenv("RADIANCE_PREFILL_PIPELINE");
-                REQUIRE_EQ(rc, RAD_OK);
-                const gemma3::Model& m = gemma3::g_model[rank];
-                CHECK(m.fuse_mx);
-                CHECK_EQ(m.pipe_on, !off);
-                CHECK(m.n_taps > 0);
-                const auto pf = kit(b, {}, { 2048 }, pctx);
-                const auto v = run_passes(b, gemma3::step, { pf.get() }, rank, 2);
-                CHECK_PASSES(b, v);
-                const RadCtx& c = *v[0];
-                CHECK(c.step_fail.empty());
-                const int64_t E = m.g.n_embd, L = (int64_t)m.layers.size();
-                int ar = 0, ar_lane0 = 0, ar_piece = 0, ar_overlap = 0;
-                int attn = 0, wide_attn = 0, taps = 0, wide_taps = 0;
-                for (const RecIssue& i : c.issues) {
-                    const RecOp* o = b.op_of(i.op);
-                    if (!o) continue;
-                    if (o->op == "all_reduce") {
-                        ++ar;
-                        ar_lane0 += i.lane == 0;
-                        ar_piece += i.n == 1024 * E;
-                        ar_overlap += pint(o, "overlap") == 1;
-                    }
-                    if (o->op == "attn_paged") { ++attn; wide_attn += i.n > 1024; }
-                    if (o->op == "cast") { ++taps; wide_taps += i.n > 1024; }
+    for (int rank = 0; rank < 2; ++rank)
+        for (int32_t pctx : { 0, 4096 }) {
+            RadBuilder b;
+            b.encs = { { "blk.", mx } };
+            RadBuildCtx ctx = spec_ctx(rank, 2, 7);
+            ctx.max_tok = 2048;
+            const int rc = stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); });
+            REQUIRE_EQ(rc, RAD_OK);
+            const gemma3::Model& m = gemma3::g_model[rank];
+            CHECK(m.fuse_mx);
+            CHECK(m.pipe_on);
+            CHECK(m.n_taps > 0);
+            const auto pf = kit(b, {}, { 2048 }, pctx);
+            const auto v = run_passes(b, gemma3::step, { pf.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            const int64_t E = m.g.n_embd, L = (int64_t)m.layers.size();
+            int ar = 0, ar_lane0 = 0, ar_piece = 0, ar_overlap = 0;
+            int attn = 0, wide_attn = 0, taps = 0, wide_taps = 0;
+            for (const RecIssue& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                if (o->op == "all_reduce") {
+                    ++ar;
+                    ar_lane0 += i.lane == 0;
+                    ar_piece += i.n == 1024 * E;
+                    ar_overlap += pint(o, "overlap") == 1;
                 }
-                if (off) {
-                    CHECK(c.joins.empty());
-                    CHECK_EQ(ar_lane0, ar);
-                    CHECK_EQ(attn, (int)L);
-                    continue;
-                }
-                CHECK_EQ(ar_lane0, 0);
-                CHECK_EQ(ar, 4 * (int)L + 1);
-                CHECK_EQ(ar_piece, 4 * (int)L);
-                CHECK_EQ(ar_overlap, 4 * (int)L);
-                CHECK_EQ(attn, 2 * (int)L);
-                CHECK_EQ(wide_attn, 0);
-                CHECK_EQ(taps, 2 * m.n_taps);
-                CHECK_EQ(wide_taps, 0);
-                CHECK(!c.joins.empty());
-                for (const gemma3::Layer& l : m.layers) {
-                    CHECK(l.attn.ln_q.q8 == m.pipe_in.q8 && !l.attn.ln_q.shared_in && l.attn.ln_q.op_q);
-                    CHECK(l.mlp.ln_gu.q8 == m.pipe_in.q8 && !l.mlp.ln_gu.shared_in && l.mlp.ln_gu.op_q);
-                }
+                if (o->op == "attn_paged") { ++attn; wide_attn += i.n > 1024; }
+                if (o->op == "cast") { ++taps; wide_taps += i.n > 1024; }
             }
+            CHECK_EQ(ar_lane0, 0);
+            CHECK_EQ(ar, 4 * (int)L + 1);
+            CHECK_EQ(ar_piece, 4 * (int)L);
+            CHECK_EQ(ar_overlap, 4 * (int)L);
+            CHECK_EQ(attn, 2 * (int)L);
+            CHECK_EQ(wide_attn, 0);
+            CHECK_EQ(taps, 2 * m.n_taps);
+            CHECK_EQ(wide_taps, 0);
+            CHECK(!c.joins.empty());
+            for (const gemma3::Layer& l : m.layers) {
+                CHECK(l.attn.ln_q.q8 == m.pipe_in.q8 && !l.attn.ln_q.shared_in && l.attn.ln_q.op_q);
+                CHECK(l.mlp.ln_gu.q8 == m.pipe_in.q8 && !l.mlp.ln_gu.shared_in && l.mlp.ln_gu.op_q);
+            }
+        }
 }
 
 /* Where the fused fp8 junctions do not resolve, a pipelined deployment falls back to the unfused
@@ -6646,6 +6763,46 @@ TEST(gemma3_without_fused_junctions_every_linear_quantises_into_what_it_reads) {
     for (const RecIssue& i : v[0]->issues)
         if (const RecOp* o = b.op_of(i.op); o && o->op == "quant_act_fp8") ++quant;
     CHECK(quant >= 2 * (int)m.layers.size());
+}
+
+/* Under a lossy --tp-wire the fused all-reduce junctions, which send the exact wire only, still
+ * serve the steps whose message goes out exact anyway: a decode step's few rows fold every
+ * junction's all-reduce in, while a prefill chunk above --tp-wire-min-kb keeps the lossy
+ * all-reduce, unfused. Both families: the MXFP4 trunk's fp8 junction and a w4a8 trunk's int8 one. */
+TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
+    MetaKV mk = gemma3_meta();
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+    for (bool is_mx : { true, false })
+        for (int rank = 0; rank < 2; ++rank) {
+            RadBuilder b;
+            const RadEncoding& e = is_mx ? mx : w4;
+            b.encs = { { "attn_", e }, { "ffn_", e } };
+            RadBuildCtx ctx = build_ctx(rank, 2);
+            ctx.tp_wire_lossy = 1;
+            ctx.tp_wire_min_bytes = 128 * 1024;
+            REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+            const gemma3::Model& m = gemma3::g_model[rank];
+            if (is_mx) CHECK(m.fuse_mx && m.fuse_mx_ar);
+            else       CHECK(!m.fuse_mx && m.fuse && m.fuse_ar);
+            auto issued = [&](const RadCtx& c, std::initializer_list<const char*> names) {
+                int n = 0;
+                for (const RecIssue& i : c.issues)
+                    if (const RecOp* o = b.op_of(i.op))
+                        for (const char* nm : names) n += o->op == nm;
+                return n;
+            };
+            const auto dec = kit(b, { 1 }, {});
+            const auto pre = kit(b, {}, { 64 });           /* 64 x 5376 x 2 bytes, above the floor */
+            const auto v = run_passes(b, gemma3::step, { dec.get(), pre.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+            const int fused_dec = issued(*v[0], { "ar_rmsnorm_quant_i8", "ar_rmsnorm_post_quant_fp8" });
+            const int fused_pre = issued(*v[1], { "ar_rmsnorm_quant_i8", "ar_rmsnorm_post_quant_fp8" });
+            CHECK(fused_dec > 0);
+            CHECK_EQ(fused_pre, 0);
+            /* Every junction the decode step fused is an all-reduce the prefill step issues alone. */
+            CHECK_EQ(issued(*v[1], { "all_reduce" }), issued(*v[0], { "all_reduce" }) + fused_dec);
+        }
 }
 
 /* The DFlash2 drafter: a block of 8 (depth 7, fixed), taps copied out after the named layers into
@@ -8475,13 +8632,13 @@ struct ArchCases {
             nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x1c28909125c12f52ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0x76bc2f92b452df49ull);
+            qwen35_fp8::step, 7, {}, 0x5eaef1ee37575caeull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x5570932de623edcaull);
+            qwen35_w8a8::step, 7, {}, 0x5a4f256c6fda0e87ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xec1ca3ad670311bbull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xb825b9d264795b8eull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
@@ -9215,30 +9372,12 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
     }
 }
 
-/* RADIANCE_PREFILL_PIPELINE=off turns the pipelined prefill off: the two-rank build is then the serial
- * one, graph and steps, as pinned before the pipeline existed. */
-TEST(qwen35_pipe_off_is_the_serial_graph_and_steps) {
-    MetaKV q35 = q35fp8_meta();
-    setenv("RADIANCE_PREFILL_PIPELINE", "off", 1);
-    RadBuilder b;
-    RadBuildCtx ctx = spec_ctx(1, 2, 3);
-    ctx.max_tok = 4096;
-    ctx.max_seqs = 8;
-    ctx.max_ctx = 200000;
-    const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, q35.meta(), &ctx); });
-    unsetenv("RADIANCE_PREFILL_PIPELINE");
-    REQUIRE_EQ(rc, RAD_OK);
-    CHECK(!qwen35_fp8::g_model[1].pipe_on);
-    CHECK_EQ(graph_hash(b), 0x36da8d762194e24eull);
-    CHECK_EQ(pinned_steps(b, qwen35_fp8::step, 1, 2), 0xe4022daff02ec8bdull);
-}
-
 /* qwen35_w8a8 at two ranks where libr4d serves the `_had_quant_i8g` norms (a_h.q8_fed): the norms write
  * rotated int8 codes, which the pipelined prefill's boundary norms (NormQuantFP8::step_plain) do not issue,
  * so the prefill stays serial there: the step whole, nothing on the second lane, no step failure. Where
  * the forms are not served each projection quantises its own input and the pipeline runs as on
- * qwen35_fp8. (Before the fix the pipeline ran with q8_fed and libr4d refused the boundary norm's E4M3
- * codes for the int8 op, failing every one-sequence prefill step of 1024 rows or more.) */
+ * qwen35_fp8. A pipeline over the int8 codes would hand the int8 op the boundary norm's E4M3 codes,
+ * which libr4d refuses, failing every such step. */
 TEST(qwen35_w8a8_with_int8_codes_from_the_norms_prefills_serially) {
     MetaKV mk = with_dflash2(q35w8a8_meta());
     for (bool fused : { true, false })
@@ -9332,75 +9471,35 @@ TEST(qwen35_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_
             }
 }
 
-/* Past two ranks the pipelined prefill is opt-in (RADIANCE_PREFILL_PIPELINE=on, or 1, or true): unset,
- * auto or an unknown value, the step is serial; asked, a 2048-row step of one sequence runs in two
- * pieces with every collective on the second lane, the layers' all-reduces a piece at a time at
- * `overlap` 1 (libr4d's narrow lane rows), the embedding's whole, on every rank. At four and eight
- * ranks: neither test model's heads split three ways (nor do Qwen3.8's 4 or TranslateGemma's 16 KV
- * heads); plugin_test checks that the three-rank lane rows resolve. */
-static void n_rank_pipe_case(int world, bool gemma) {
-    const char* env = "RADIANCE_PREFILL_PIPELINE";
-    const char* vals[] = { nullptr, "auto", "maybe", "on", "1", "true" };
-    for (const char* val : vals)
-        for (int rank = 0; rank < world; ++rank) {
-            const int ask = val && (!strcmp(val, "on") || !strcmp(val, "1") || !strcmp(val, "true"));
-            if (val) setenv(env, val, 1);
-            RadBuilder b;
-            RadBuildCtx ctx = spec_ctx(rank, world, 7);
-            ctx.max_tok = 2048;
-            MetaKV mk = gemma ? gemma3_dflash2_meta() : with_dflash2(q35fp8_meta());
-            if (gemma) b.encs = { { "blk.", rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP) } };
-            const int rc = stderr_of_rc([&] {
-                return gemma ? gemma3::declare(&b, mk.meta(), &ctx) : qwen35_fp8::declare(&b, mk.meta(), &ctx);
-            });
-            if (val) unsetenv(env);
-            REQUIRE_EQ(rc, RAD_OK);
-            const bool on = gemma ? gemma3::g_model[rank].pipe_on : qwen35_fp8::g_model[rank].pipe_on;
-            const int64_t L = gemma ? (int64_t)gemma3::g_model[rank].layers.size()
-                                    : (int64_t)qwen35_fp8::g_model[rank].layers.size();
-            CHECK_EQ(on, ask == 1);
-            const auto pf = kit(b, {}, { 2048 }, 0);
-            const auto v = run_passes(b, gemma ? gemma3::step : qwen35_fp8::step, { pf.get() }, rank, world);
-            CHECK_PASSES(b, v);
-            const RadCtx& c = *v[0];
-            CHECK(c.step_fail.empty());
-            int ar = 0, ar_lane0 = 0, ar_overlap = 0, arn = 0;
-            for (const RecIssue& i : c.issues) {
-                const RecOp* o = b.op_of(i.op);
-                if (!o) continue;
-                if (o->op == "all_reduce") { ++ar; ar_lane0 += i.lane == 0; ar_overlap += pint(o, "overlap") == 1; }
-                if (o->op.rfind("ar_", 0) == 0) { ++arn; ar_lane0 += i.lane == 0; }
-            }
-            if (!ask) {
-                CHECK(c.joins.empty());
-                continue;
-            }
-            CHECK_EQ(ar_lane0, 0);
-            CHECK_EQ(ar + arn, 4 * (int)L + 1);
-            CHECK_EQ(ar_overlap, 4 * (int)L);
-            CHECK(!c.joins.empty());
-        }
-}
-TEST(qwen35_four_ranks_pipeline_only_when_asked) { n_rank_pipe_case(4, false); }
-TEST(gemma3_four_ranks_pipeline_only_when_asked) { n_rank_pipe_case(4, true); }
-TEST(qwen35_eight_ranks_pipeline_only_when_asked) { n_rank_pipe_case(8, false); }
-TEST(gemma3_eight_ranks_pipeline_only_when_asked) { n_rank_pipe_case(8, true); }
-
-/* At two ranks "off", "0" and "false" all run the pipelined prefill's step serially (the old switches
- * took 0 for off; such a value must not leave it on). */
-TEST(two_ranks_pipeline_off_in_every_spelling) {
-    MetaKV mk = with_dflash2(q35fp8_meta());
-    for (const char* v : { "off", "0", "false" }) {
-        setenv("RADIANCE_PREFILL_PIPELINE", v, 1);
+/* Past two ranks the pipelined prefill is off: a 2048-row step of one sequence at four and eight
+ * ranks runs whole, with nothing on the second lane. */
+static void n_rank_serial_case(int world, bool gemma) {
+    for (int rank = 0; rank < world; ++rank) {
         RadBuilder b;
-        RadBuildCtx ctx = spec_ctx(0, 2, 7);
+        RadBuildCtx ctx = spec_ctx(rank, world, 7);
         ctx.max_tok = 2048;
-        const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); });
-        unsetenv("RADIANCE_PREFILL_PIPELINE");
+        MetaKV mk = gemma ? gemma3_dflash2_meta() : with_dflash2(q35fp8_meta());
+        if (gemma) b.encs = { { "blk.", rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP) } };
+        const int rc = stderr_of_rc([&] {
+            return gemma ? gemma3::declare(&b, mk.meta(), &ctx) : qwen35_fp8::declare(&b, mk.meta(), &ctx);
+        });
         REQUIRE_EQ(rc, RAD_OK);
-        CHECK(!qwen35_fp8::g_model[0].pipe_on);
+        CHECK(!(gemma ? gemma3::g_model[rank].pipe_on : qwen35_fp8::g_model[rank].pipe_on));
+        const auto pf = kit(b, {}, { 2048 }, 0);
+        const auto v = run_passes(b, gemma ? gemma3::step : qwen35_fp8::step, { pf.get() }, rank, world);
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        CHECK(c.step_fail.empty());
+        CHECK(c.joins.empty());
+        int lane1 = 0;
+        for (const RecIssue& i : c.issues) lane1 += i.lane == 1;
+        CHECK_EQ(lane1, 0);
     }
 }
+TEST(qwen35_four_ranks_prefill_serially) { n_rank_serial_case(4, false); }
+TEST(gemma3_four_ranks_prefill_serially) { n_rank_serial_case(4, true); }
+TEST(qwen35_eight_ranks_prefill_serially) { n_rank_serial_case(8, false); }
+TEST(gemma3_eight_ranks_prefill_serially) { n_rank_serial_case(8, true); }
 
 /* Under a span a Flash-Next prefill of two intervals runs a pass at a time. At every world its
  * connection reads take a pass each and the indexer scores its pass-tall plane in windows, the MTP

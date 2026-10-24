@@ -2497,7 +2497,8 @@ static const RadOperandSpec oAttnPS[] = {
 /* ---- audio generation (r4d_audio.hip); the same specs as libref's (ref_registry.cpp). */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 }, { "b", RAD_OPD_WEIGHT, 1 },
@@ -2516,7 +2517,8 @@ static const RadOperandSpec oSnake[] = {
 static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
                                          P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
                                          P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
-                                         P_INTO("sup_hi"), P_F64O("penalty") };
+                                         P_INTO("sup_hi"), P_F64O("penalty"),
+                                         P_F64O("top_p") };
 static const RadOperandSpec oCfgTopk[] = {
     { "logits", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 },
     { "ids", RAD_OPD_OUT, 0 }, { "cfg", RAD_OPD_IN, 1 }, { "lane", RAD_OPD_IN, 1 },
@@ -2524,10 +2526,17 @@ static const RadOperandSpec oCfgTopk[] = {
 };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
-                                          P_STR("dtype"), P_INTO("round") };
+                                          P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = {
     { "codes", RAD_OPD_IN, 0 }, { "t0", RAD_OPD_WEIGHT, 0 }, { "t1", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "in_w", RAD_OPD_WEIGHT, 0 }, { "in_b", RAD_OPD_WEIGHT, 0 },
+    { "cb", RAD_OPD_WEIGHT, 0 }, { "out_w", RAD_OPD_WEIGHT, 0 }, { "out_b", RAD_OPD_WEIGHT, 0 },
+    { "codes", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
@@ -2539,6 +2548,12 @@ static const RadOperandSpec oFrameMix[] = {
 static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
 static const RadOperandSpec oEndStatus[] = {
     { "ids", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "status", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pRasPick[] = { P_INT("M"), P_INT("win"), P_INT("lo"), P_INT("hi"),
+                                         P_INTO("rep"), P_INTO("clear") };
+static const RadOperandSpec oRasPick[] = {
+    { "first", RAD_OPD_IN, 0 }, { "alt", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "hist", RAD_OPD_INOUT, 0 }, { "ids", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
                                             P_INTO("rep"), P_INTO("skip") };
@@ -3507,10 +3522,16 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rvq_embed", pRvqEmbed, oRvqEmbed,
            "a frame's embedding from code-major residual codes, the first codebook's table and the "
            "others' stacked one, times `scale`; `round` 1 rounds the f32 sum once."),
+    SCHEMA("vq_encode", pVqEncode, oVqEncode,
+           "one residual vector quantiser step: the code of greatest cosine with in_w x + in_b "
+           "(the lower index on a tie), then x -= out_w cb[code] + out_b."),
     SCHEMA("frame_mix_store", pFrameMix, oFrameMix,
            "a frame's conditioning row (softmax-weighted planes times scale) into its lane."),
     SCHEMA("end_status", pEndStatus, oEndStatus,
            "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]."),
+    SCHEMA("ras_pick", pRasPick, oRasPick,
+           "repetition-aware sampling: the alternative draw where the first is in [lo, hi) and in "
+           "the lane's window of its last picks, else the first; the pick enters the window."),
     SCHEMA("frame_store", pFrameStore, oFrameStore,
            "a frame's codes into its lane's history: dst[(lane n_codes + k) stride + frame - skip] "
            "= codes[k, rep i] when frame >= skip and status[lane] >= 0."),
@@ -4205,20 +4226,6 @@ static const RadConstraint cArTsExact8[] = {
     C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
     C_P2P,
 };
-/* The three- and eight-rank two-shots at `overlap` 1, as cArTsExact4Lane: a pipelined prefill's
- * all-reduce beside the other piece's compute. They launch as the wide rows unless R4D_AR_LANE_3_8=1
- * (tArTs38Lane); neither launch has been measured on three or eight cards. */
-static const RadConstraint cArTsExact3Lane[] = {
-    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
-    C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
-    C_EQ("overlap", 1), C_P2P,
-};
-static const RadConstraint cArTsExact8Lane[] = {
-    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
-    C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
-    C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
-    C_EQ("overlap", 1), C_P2P,
-};
 static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
     C_P2P,
@@ -4236,11 +4243,6 @@ static const RadConstraint cArWht6Lane[] = {
 static const RadConstraint cArTi8Ts3[] = {
     C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
     C_P2P,
-};
-/* The same at `overlap` 1 (tArTs38Lane: the wide launch unless R4D_AR_LANE_3_8=1). */
-static const RadConstraint cArTi8Ts3Lane[] = {
-    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
-    C_EQ("overlap", 1), C_P2P,
 };
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
@@ -4398,6 +4400,16 @@ static const RadConstraint cMlaMatrix[] = { C_GE("M", 1),
                                             C_GE("blocks", 1),
                                             C_EQ("block_size", 4),
                                             C_IN("dtype", "bf16") };
+/* GLM's prefill splits MLA by rows, a rank holding every head of its rows: the rows row loads a
+ * key chunk once for a workgroup of 64 heads and outranks the matrix row there. Measured on gfx1201
+ * (r4d_selftest --perfmla 512 513 64 20 topk:16:16000), a rank's run of 512 rows takes 3.9 ms
+ * against 12.3 ms on the matrix row, and the 4096 rows x 8 heads it replaces 14.0 ms on the paired
+ * matrix row. Under 32 rows its launcher runs the matrix row's kernel (r4d_mla.hip); a bound on M
+ * here would cut every mla_attn band at 32, the eight-head ones too. */
+static const RadConstraint cMlaRows[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                          C_EQ("latent_dim", 512), C_EQ("heads", 64),
+                                          C_GE("blocks", 1),       C_EQ("block_size", 4),
+                                          C_IN("dtype", "bf16") };
 /* `n` is bounded by LDS: nh (hc*n) and ne (n) are both bf16 and live through the second phase;
  * 28672 elements is that budget at hc 4. */
 static const RadConstraint cMtpEnter[] = {
@@ -4846,10 +4858,8 @@ static const RadConstraint cGemmMxfp4A8GemvWide[] = {
 /* gemm_mxfp4a8_decode_shortk: the decode entry at 33..64 rows of a wide, short weight, above
  * gemv_wide by priority. There gemv_wide's blocks hold three or four row tiles over a short K each,
  * so the cross-wave reduction of a block weighs more than its WMMAs, and the decode kernel's split
- * wins (R9700, each row alone, ours' gemv_wide / decode / upstream's decode, us: 19456 x 2560 at 64
- * rows 131.8 / 93.3 / 104.5, 16384 x 2048 92.8 / 68.6 / 76.1, 9728 x 2560 74.1 / 52.5 / 67.4).
- * Narrower N stays with gemv_wide (5120 x 2176 at 40 rows 39.2 against the decode kernel's 52.8),
- * as does K past 2560 (17408 x 5120 at 40 rows 119.3 against 129.0). */
+ * wins on gfx1201 (19456 x 2560 at 64 rows: 93.3 us against gemv_wide's 131.8). Narrower N and K
+ * past 2560 stay with gemv_wide. */
 static const RadConstraint cGemmMxfp4A8DecodeShortK[] = {
     C_GE("M", 33), C_LE("M", 64), C_GE("N", 8192), C_LE("N", 36864), C_LE("K", 2560), C_DIV("K", 64),
     C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
@@ -4956,11 +4966,11 @@ static const RadTunable tGemmPrefill[] = {
 };
 
 /* The MXFP4 tiled GEMM's one axis: compiled arms of one template. 0 is the M crossover (TN=4 from
- * M >= 1024), which needs M. */
+ * M >= 2048), which needs M. */
 static const int64_t kMxTn[] = { 0, 2, 4 };
 static const RadTunable tGemmMxfp4Tiled[] = {
   { "tn", kMxTn, NELEM(kMxTn), 0,
-    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 1024" },
+    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
 };
 
 /* The MXFP4 decode GEMM's axes. 0 on each is the kernel's own rule (r4d_gemm_mxfp4a8_decode.hip);
@@ -5039,25 +5049,6 @@ static const RadTunable tArQ84[] = {
 static const int64_t kArNblocksLane4[] = { 0, 4, 8, 16, 24 };
 static const RadTunable tArTs4Lane[] = {
   { "nblocks",  kArNblocksLane4, NELEM(kArNblocksLane4), 4, "blocks in the grid. 0 = scale with the message and clamp" },
-  { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
-  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
-  { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
-  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
-};
-
-/* The three- and eight-rank two-shots at `overlap` 1 (cArTsExact3Lane, cArTsExact8Lane, cArTi8Ts3Lane). The
- * four-rank lane's narrow launch was measured at four ranks; at three and eight it is not, and a narrow
- * grid can also lose there: where the all-reduce is the longer of the two (a large message, slow or shared
- * links, seven peers to feed at eight ranks) the step waits on a slower collective. So by default these
- * rows launch as the wide rows do (tAr's defaults: the same grid, the same bits, the same time) and the
- * narrow launch is a deployment's choice, read once at load: R4D_AR_LANE_3_8=1 gives them the four-rank
- * lane's four blocks of 1024. Any other value, or unset, is the default. */
-static int64_t ar_lane38_nblocks() {
-  const char* e = std::getenv("R4D_AR_LANE_3_8");
-  return e && e[0] == '1' && !e[1] ? 4 : 0;
-}
-static const RadTunable tArTs38Lane[] = {
-  { "nblocks",  kArNblocks,  NELEM(kArNblocks),  ar_lane38_nblocks(), "blocks in the grid. 0 = scale with the message and clamp (the wide rows' launch, the default); 4 under R4D_AR_LANE_3_8=1" },
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
@@ -5201,6 +5192,8 @@ static const RadConstraint cRmsMod[] = { C_IN("dtype", "bf16"), C_DIV("n", 8), C
 static const RadConstraint cRmsModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
                                           C_EQ("group", 128) };
 static const RadConstraint cGenF32[] = { C_IN("dtype", "f32") };
+/* vq_encode: e's sums staged in LDS, a codebook dimension of 32 at most. */
+static const RadConstraint cVqEncode[] = { C_IN("dtype", "bf16 f32"), C_LE("dim", 32) };
 static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64) };
 static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
 static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
@@ -5708,6 +5701,12 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r4d_rad_scale, nullptr, nullptr, nullptr,
    r4d_shape_scale },
 
+{ "mla_attn_rows_bf16", "mla_attn", "attn", "row-tiled WMMA latent attention, one key load for 64 heads",
+  "latent_dim=512, heads=64, block_size=4",
+  "bf16 operands; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 2, ROW(cMlaRows), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_rows, r4d_rad_mla_attn_matrix_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
 { "mla_attn_matrix_bf16", "mla_attn", "attn", "head-tiled WMMA latent attention with FP32 softmax",
   "latent_dim=512, heads a multiple of 8 (heads%16==8 pairs two requests a tile), block_size=4",
   "bf16 operands; FP32 probabilities via high/low BF16",
@@ -5866,7 +5865,8 @@ static const RadKernelInfo kKernels[] = {
   "the lm_head projection over an fp8 head: C[M, n_vocab] f32 = x[M, n_embd] @ dequant(W)^T, "
   "one wave a vocabulary row, the row's own scales in its tail",
   "any M -- one pass to 32 rows, instantiated exactly to 8 and rounded up to a multiple of 4 above "
-  "it, then chunked; n_embd a multiple of 128, which is the group the scales are taken over. The "
+  "it, to 64 rows in four tiles a wave, to 128 in two M halves of four that share the staged head "
+  "tile, then chunked by 128; n_embd a multiple of 128, which is the group the scales are taken over. The "
   "stored row is padded to 16 bytes so the uint4 load stays aligned at any such n_embd",
   "bf16 x, E4M3 head with a bf16 scale per 128x128 tile stored PER ROW, F32 LOGITS OUT, fp32 "
   "accumulate",
@@ -7131,21 +7131,6 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
-/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
- * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on three cards). */
-{ "ar_twoshot_3rank_exact_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, beside compute; the wide "
-  "launch unless R4D_AR_LANE_3_8=1 makes it narrow",
-  "exactly 3 ranks, all peer-accessible, overlap 1; messages above "
-  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; shards as even as the word count allows; "
-  "in place; cudagraph-safe",
-  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
-  "and to the wide row",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
-  ROW(cArTsExact3Lane), ROW(tArTs38Lane), nullptr,
-  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
-  r4d_shape_all_reduce },
-
 { "ar_twoshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
@@ -7182,21 +7167,6 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
   ROW(cArTsExact8), ROW(tAr), nullptr,
-  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
-  r4d_shape_all_reduce },
-
-/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
- * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on eight cards). */
-{ "ar_twoshot_8rank_exact_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, beside compute; the wide "
-  "launch unless R4D_AR_LANE_3_8=1 makes it narrow",
-  "exactly 8 ranks, all peer-accessible, overlap 1; messages above "
-  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; message must shard evenly over the ranks; "
-  "in place; cudagraph-safe",
-  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
-  "and to the wide row",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
-  ROW(cArTsExact8Lane), ROW(tArTs38Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
@@ -7324,20 +7294,6 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArTi8Ts3), ROW(tAr), nullptr,
-  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
-  r4d_shape_all_reduce },
-
-/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
- * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on three cards). */
-{ "ar_twoshot_3rank_ti8_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather on the tiered-int8 wire -- lossy, beside compute; "
-  "the wide launch unless R4D_AR_LANE_3_8=1 makes it narrow",
-  "exactly 3 ranks, all peer-accessible, overlap 1; groups of 32, split over the shards as evenly as "
-  "they divide; under min_bytes the exact one-shot; cudagraph-safe",
-  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
-  "ascending rank order, bit-identical across ranks and to the wide row",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
-  ROW(cArTi8Ts3Lane), ROW(tArTs38Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
@@ -9092,6 +9048,13 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_rvq_embed },
 
+{ "vq_encode", "vq_encode", "elem",
+  "a residual quantiser's step: the nearest code by cosine", "a workgroup a row, dim <= 32",
+  "bf16 or f32 rows and weights, f32 arithmetic, the row rounded once",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cVqEncode), NOTUNE,
+  nullptr, nullptr, r4d_rad_vq_encode },
+
 { "frame_mix_store_bf16", "frame_mix_store", "elem",
   "a frame's conditioning row into its lane", "a workgroup a lane, L <= 16",
   "bf16 planes and rows, f32 logits and scale",
@@ -9104,6 +9067,12 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_end_status },
+
+{ "ras_pick", "ras_pick", "elem",
+  "a repetition-aware choice between two draws a lane", "a thread a lane", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_ras_pick },
 
 { "frame_store", "frame_store", "elem",
   "a frame's codes into its lane's history", "a thread a (lane, code); dst contiguous", "i32",

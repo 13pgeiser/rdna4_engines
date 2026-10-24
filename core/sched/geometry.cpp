@@ -133,6 +133,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     else
         g.checkpoint_interval = 0;
     g.window_ckpt = !has_linear && g.checkpoint_interval > 0;
+    g.window_periodic = g.window_ckpt && cfg.checkpoint_policy != "tip-only";
     /* Window checkpoints do not support skipping snapshots inside a prefill span. */
     g.span = (g.checkpoint_interval > 0 && !g.window_ckpt && cfg.prefill_span > 1)
            ? cfg.prefill_span : 1;
@@ -156,7 +157,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * chunk; the log line makes that visible. tip-only window snapshots do not
      * split at the interval, so their chunk is bounded by the token budget. */
     const int64_t span_tok = g.checkpoint_interval * g.span;
-    const bool periodic = !g.window_ckpt || cfg.checkpoint_policy != "tip-only";
+    const bool periodic = !g.window_ckpt || g.window_periodic;
     const int64_t eff = (g.checkpoint_interval > 0 && periodic && span_tok < cfg.max_tok)
                       ? span_tok : cfg.max_tok;
     RAD_INFO("chunk geometry: quantum %lld (attn block %lld, state chunk %lld), checkpoint "

@@ -7,7 +7,9 @@
 #include "rad_test.h"
 
 #include "plugin/registry.h"
+#include "rad_builder.h"
 
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -88,8 +90,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         CHECK(keys.emplace(std::make_pair(p.arch_id, p.arch_quant), p.name).second);
     }
     const std::set<std::pair<std::string, std::string>> want = {
-        { "anima", "" }, { "breeze", "" }, { "embeddinggemma2", "" }, { "flux3", "" },
-        { "flux3distilled", "" },
+        { "anima", "" }, { "breeze", "" }, { "embeddinggemma2", "" },
+        { "fishomni", "bsgemm-moe" }, { "flux3", "" }, { "flux3distilled", "" },
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" }, { "lfm2", "" }, { "llama", "" },
         { "llama", "fp8_e4m3" }, { "qwen35", "" },
@@ -132,6 +134,111 @@ TEST(every_shipped_family_has_at_most_one_plugin_for_an_imported_checkpoint) {
     const Plugin* w8 = r.plugin("qwen35_w8a8");
     REQUIRE(w8 != nullptr);
     CHECK(!w8->arch_serves_imports);
+}
+
+/* drama-3's input as fish-speech's server writes it (chunking.py, generate.py): each speaker's turn
+ * tagged and stripped, turns on lines of their own, untagged text speaker 0's; refused when empty,
+ * when it holds a token only the prompt builder writes, or when it names a speaker other than 0..15
+ * the canonical way. A refusal leaves its reason in the output. */
+TEST(fishomni_writes_the_input_as_the_reference_server_does) {
+    Registry r;
+    const int st = r.load_dir(dir_of("architectures"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the architecture plugins under " + dir_of("architectures"));
+    CHECK_OK(st);
+    const Plugin* p = r.plugin("fishomni");
+    REQUIRE(p != nullptr);
+    REQUIRE(p->arch_text_prepare != nullptr);
+    auto prep = [&](const char* in, std::string* out) {
+        char buf[512] = {};
+        const int64_t n = p->arch_text_prepare(RAD_TEXT_INPUT, in, buf, sizeof buf);
+        *out = buf;
+        return n;
+    };
+    const struct { const char* in; const char* want; } ok[] = {
+        { "Hello there.", "<|speaker:0|> Hello there." },
+        { "  Hello there. \n", "<|speaker:0|> Hello there." },
+        { "\xe3\x80\x80Hello\xc2\xa0", "<|speaker:0|> Hello" },          /* U+3000, U+00A0 */
+        { "<|speaker:0|> Are you ready? <|speaker:1|> Always.",
+          "<|speaker:0|> Are you ready?\n<|speaker:1|> Always." },
+        { "Hi <|speaker:12|>Hey  <|speaker:3|>   ", "<|speaker:0|> Hi\n<|speaker:12|> Hey" },
+        { "<|speaker:2|>[laughs] Fine.", "<|speaker:2|> [laughs] Fine." },
+    };
+    for (const auto& c : ok) {
+        std::string got;
+        const int64_t n = prep(c.in, &got);
+        if (got != c.want) fprintf(stderr, "    '%s' -> '%s'\n", c.in, got.c_str());
+        CHECK_EQ(n, (int64_t)std::strlen(c.want));
+        CHECK_EQ(got, std::string(c.want));
+    }
+    const struct { const char* in; const char* why; } refused[] = {
+        { "   \t", "empty" },
+        { "<|speaker:1|>  ", "empty" },
+        { "Say <|im_end|> now", "<|im_end|>" },
+        { "<|voice|>", "<|voice|>" },
+        { "a <|semantic:12|> b", "<|semantic:" },
+        { "<|speaker:16|> hi", "speaker tags" },
+        { "<|speaker:01|> hi", "speaker tags" },
+        { "<|speaker_change|> hi", "speaker tags" },
+    };
+    for (const auto& c : refused) {
+        std::string why;
+        CHECK(prep(c.in, &why) < 0);
+        if (why.find(c.why) == std::string::npos) fprintf(stderr, "    '%s': %s\n", c.in, why.c_str());
+        CHECK(why.find(c.why) != std::string::npos);
+    }
+    /* A short buffer still gets the length to retry with, and the instructions (which the model
+     * refuses before they get here) pass as written. */
+    char tiny[4] = {};
+    CHECK_EQ(p->arch_text_prepare(RAD_TEXT_INPUT, "Hello", tiny, sizeof tiny),
+             (int64_t)std::strlen("<|speaker:0|> Hello"));
+    char buf[64] = {};
+    CHECK_EQ(p->arch_text_prepare(RAD_TEXT_INSTRUCTIONS, " calm ", buf, sizeof buf), 6);
+    CHECK_EQ(std::string(buf), std::string(" calm "));
+}
+
+/* A reference's transcript as generate.py's build_drama3_prompt writes it after "Text: ": speaker
+ * 0's tag and a space before untagged text, which is otherwise kept as given; white space before a
+ * leading tag moved behind it. The input's rules refuse the same tokens. */
+TEST(fishomni_tags_a_reference_transcript_as_the_prompt_builder_does) {
+    Registry r;
+    const int st = r.load_dir(dir_of("architectures"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the architecture plugins under " + dir_of("architectures"));
+    CHECK_OK(st);
+    const Plugin* p = r.plugin("fishomni");
+    REQUIRE(p != nullptr);
+    REQUIRE(p->arch_text_prepare != nullptr);
+    auto prep = [&](const char* in, std::string* out) {
+        char buf[512] = {};
+        const int64_t n = p->arch_text_prepare(RAD_TEXT_REFERENCE, in, buf, sizeof buf);
+        *out = buf;
+        return n;
+    };
+    const struct { const char* in; const char* want; } ok[] = {
+        { "We asked over twenty people.", "<|speaker:0|> We asked over twenty people." },
+        { " Two spaces  kept. ", "<|speaker:0|>  Two spaces  kept. " },
+        { "  <|speaker:1|>Hi there", "<|speaker:1|>  Hi there" },
+        { "<|speaker:3|> Hello. <|speaker:4|> Hi.", "<|speaker:3|> Hello. <|speaker:4|> Hi." },
+    };
+    for (const auto& c : ok) {
+        std::string got;
+        const int64_t n = prep(c.in, &got);
+        if (got != c.want) fprintf(stderr, "    '%s' -> '%s'\n", c.in, got.c_str());
+        CHECK_EQ(n, (int64_t)std::strlen(c.want));
+        CHECK_EQ(got, std::string(c.want));
+    }
+    const struct { const char* in; const char* why; } refused[] = {
+        { " \n ", "empty" },
+        { "Then <|im_start|> came", "<|im_start|>" },
+        { "<|speaker:20|> hi", "speaker tags" },
+    };
+    for (const auto& c : refused) {
+        std::string why;
+        CHECK(prep(c.in, &why) < 0);
+        if (why.find(c.why) == std::string::npos) fprintf(stderr, "    '%s': %s\n", c.in, why.c_str());
+        CHECK(why.find(c.why) != std::string::npos);
+    }
 }
 
 RAD_TEST_MAIN()

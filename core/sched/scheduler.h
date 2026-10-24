@@ -139,6 +139,15 @@ public:
         const int32_t*       first_row = nullptr;  /* [n_seq] */
     };
 
+    /* What commit left a sequence at: its committed length and whether it is still Running.
+     * Copied under the lock in commit because reap() may free the Request before the serial bind
+     * reads it. */
+    struct CommittedSeq {
+        uint64_t seq = 0;
+        uint64_t n_out = 0;
+        bool     live = false;
+    };
+
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
      * PrefixCache::configure runs first and needs its checkpoint interval; pass nullptr to
      * resolve one here. */
@@ -167,6 +176,11 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* Whether the request is still admitted and Running, read under the lock. */
+    bool     running(uint64_t id) const;
+    /* What the step just committed left for `seq`, copied by commit under the lock. False when
+     * that step carried no such sequence. */
+    bool     committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const;
 
     /* Requests that reached a terminal state since the last call, oldest first, swapped into
      * `out` under the lock (old contents discarded). Only the engine consumes it, to drop
@@ -260,6 +274,13 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
+     * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
+     * conversation is queued or running: its blocks would be skipped as live and its close
+     * would publish the chain again, so the release would be half done and undone at once.
+     * Takes the step lock like reset_prefix_cache. */
+    int      release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                             SessionRelease* out);
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
@@ -361,6 +382,17 @@ public:
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
                     bool on_card = false);
+    /* How many running sequences the step just run decoded (produced a token for), the load a
+     * block drafter's block length is chosen by. Read before block_begin(). */
+    int decoded_seqs() const;
+    /* Whether a block drafter runs its short block (--draft-short-from `from`), given whether it
+     * ran it last step and this step's decoded_seqs(): on from `from`, off again only at two
+     * below, so a load wavering at the threshold does not switch the pass shape every step. */
+    static bool short_block_on(bool was_on, int64_t decoded, int64_t from) {
+        if (decoded >= from) return true;
+        if (decoded + 2 <= from) return false;
+        return was_on;
+    }
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
@@ -637,6 +669,8 @@ private:
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
     bool    step_open_ = false;
+    /* The step just committed: its sequences' committed length and liveness, in plan order. */
+    std::vector<CommittedSeq> committed_;
     /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
     DecodeFloor decode_floor_;
 

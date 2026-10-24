@@ -99,8 +99,8 @@ transient buffer counts. `Arena::init` takes both sizes, `arena_plan_bytes` char
 budget, and startup prints them (`arena: ... device + ... scratch + ... for the second lane = ...`).
 A lane-1 request larger than region 1 comes from an op that breaks rule 3 in its buffers too, so
 `Ctx::issue` fails the step naming the kernel (`RAD_E_SCRATCH`) rather than let it overrun the
-region. On Qwen3.8-27B with its DFlash2 drafter region 1 is 0 B, where it used to be a copy of region
-0: 50 MiB a card at speculation 7, 17 MiB without speculation.
+region. On Qwen3.8-27B with its DFlash2 drafter region 1 is 0 B against region 0's 50 MiB a card
+at speculation 7 (17 MiB without speculation).
 
 **`rad_memset_async` refuses `RAD_MEM_HOST` on a card; the host backend cannot reproduce that.**
 `RAD_MEM_HOST` is pageable memory the GPU has never been shown, so the device backend returns

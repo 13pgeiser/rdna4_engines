@@ -368,14 +368,16 @@ int PrefixCache::insert(uint64_t session,
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
-        /* A snapshot-backed prefix keeps its first bytes even in the host tier: a short
-         * recompute can round the KV differently, while older conversations' recurrent snapshots
-         * still depend on the original attention KV. Non-stateful caches may rebind below. */
-        if (it != map_.end() && (it->second.in_lru || has_linear_)) continue; /* touched below */
+        /* With snapshots (recurrent state or a sliding window) an existing entry keeps the bytes
+         * it was published with, wherever it is held: a snapshot deeper in the chain was computed
+         * from them, and a recompute in another step shape can round the KV differently. The
+         * recomputed blocks go with the request's sequence; a later hit restores the tier copy. */
+        if (it != map_.end() && (it->second.in_lru || has_linear_)) continue;   /* touched below */
         if (it != map_.end()) {
-            /* An off-device entry this request recomputed (a restore that did not fit, or a chain
-             * cut short). Its blocks become the entry's device copy and the tier copy goes
-             * (IdleTiers::rebound). An entry with a promotion in flight is left alone. */
+            /* Without snapshots, an off-device entry this request recomputed (a restore that did
+             * not fit, or a chain cut short): its blocks become the entry's device copy and the
+             * tier copy goes (IdleTiers::rebound). An entry with a promotion in flight is left
+             * alone. */
             if (!tiers_ || !tiers_->resident_off_device(h)) continue;
             std::vector<int32_t> mine(groups_.size(), -1);
             size_t held = 0;
@@ -988,5 +990,84 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
     stats_.expired += n;
     stats_.ckpt_expired += (int64_t)gone.size();
     return n;
+}
+
+/* ------------------------------------------------------------------ release on request */
+
+int PrefixCache::release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                                 SessionRelease* out) {
+    if (!out) return RAD_E_INVAL;
+    *out = SessionRelease{};
+    if (!enabled_ || !tiers_ || block_size_ <= 0) return RAD_E_UNSUPPORTED;
+    if (label.empty() && id == 0) return RAD_E_INVAL;
+    if (keep_tokens < 0) return RAD_E_INVAL;
+
+    std::vector<IdleTiers::SessionChain> rows;
+    tiers_->find_sessions(label, id, &rows);
+    if (rows.empty()) return RAD_E_NOTFOUND;
+    std::vector<uint64_t> ids;
+    for (const IdleTiers::SessionChain& r : rows) ids.push_back(r.id);
+
+    /* A kept token keeps its whole block: the block holding it is what the next turn hits. */
+    const int64_t keep_blocks = (keep_tokens + block_size_ - 1) / block_size_;
+    int64_t entry_bytes = 0;
+    for (int32_t g : groups_) {
+        const KVGroupPlan* p = kv_->plan(g);
+        if (p) entry_bytes += p->bytes_per_block;
+    }
+
+    for (const IdleTiers::SessionChain& row : rows) {
+        const int64_t n = (int64_t)row.chain.size();
+        const int64_t shared = tiers_->shared_prefix_blocks(row.chain, ids);
+        const int64_t floor = std::max(keep_blocks, shared);
+        ++out->sessions;
+        out->kept_tokens += std::min(keep_blocks, n) * block_size_;
+        out->kept_shared += std::max<int64_t>(0, std::min(shared, n) - keep_blocks);
+
+        /* Tip inwards, as expire() and the host tier's pressure do: what is left is still a
+         * prefix a lookup reaches. `live_upto` is one past the deepest block a request kept:
+         * the row is cut there, not at the kept prefix, so a later release reaches it. */
+        int64_t live_upto = 0;
+        for (int64_t b = n - 1; b >= floor; --b) {
+            const BlockHash& h = row.chain[(size_t)b];
+            auto it = map_.find(h);
+            if (it != map_.end()) {
+                Entry& e = it->second;
+                /* A sequence reads it, or a waiting request restored it and holds it against
+                 * drop_clean: releasing would free nothing and lose the entry under them. Its
+                 * snapshot stays with it; that request most likely resumes from it. */
+                if (e.in_lru && (shared_with_live(e) || held_.count(h) > 0)) {
+                    ++out->kept_live;
+                    if (live_upto == 0) live_upto = b + 1;
+                    continue;
+                }
+                if (e.in_lru) {
+                    lru_.erase(e.lru);
+                    e.in_lru = false;
+                    release_blocks(e);
+                    out->device_bytes += entry_bytes;
+                }
+                /* The host copy goes with the entry (forget), so count it before. */
+                if (tiers_->resident_off_device(h) || tiers_->droppable(h))
+                    out->host_bytes += tiers_->entry_bytes();
+                tiers_->forget(h);
+                map_.erase(it);
+                ++out->entries;
+            }
+            auto ck = ck_by_prefix_.find(h);
+            if (ck != ck_by_prefix_.end() && ck->second.valid && !handed(h) && !reserved(h)) {
+                const uint64_t session = ck->second.session;
+                retire_ckpt(ck);
+                unindex_ckpt(session, h);
+                ++out->snapshots;
+            }
+        }
+        const int64_t cut = std::min(n, std::max(keep_blocks, live_upto));
+        tiers_->cut_session(row.id, cut, cut * block_size_);
+    }
+    out->tokens = out->entries * block_size_;
+    stats_.released += out->entries;
+    stats_.ckpt_released += out->snapshots;
+    return RAD_OK;
 }
 }  /* namespace rad */

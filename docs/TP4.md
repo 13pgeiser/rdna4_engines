@@ -75,13 +75,9 @@ promotion truth; quick concurrency ladders within windows.
 5. Draft-pass graph capture — only if low-concurrency latency ever matters.
 6. **The dense pipelined prefill at TP4** (`qwen35_fp8`, `qwen35_w8a8`, `gemma3`; GUIDE §4.5): a
    prefill step of one sequence in two pieces, every block boundary's all-reduce on the second lane
-   at `overlap` 1, so on this table's `*_4rank_*_lane` rows (row 1). Off by default above two
-   ranks; `RADIANCE_PREFILL_PIPELINE=on` allows it and startup notes that it is unmeasured. Measured
-   only at TP2 (2×R9700, PCIe Gen5 x8, 265 W): Qwen3.8-27B MXFP4 41k prefill 9.00 → 8.41 s,
-   TranslateGemma 27B 6k 1.27 → 1.21 s at a 2048 chunk; bit for bit the serial step by construction,
-   checked by KL recordings at TP2 (arch_test checks the pieces and lanes a four- and an eight-rank
-   step declares, not their output). One boot-flag arm, `on` against `off`, at 18K-64K
-   prompts and the chunk served, settles whether it ships on by default here.
+   at `overlap` 1, which at four ranks would take this table's `*_4rank_*_lane` rows (row 1). It
+   runs at two ranks only; enabling it here (`g.world == 2` in both plugins' declare) needs a
+   timing against the serial step at 18K-64K prompts and the chunk served.
 
 ## Interaction diagram
 

@@ -270,7 +270,12 @@ int rad_tools_text_prepare(const LoadedPlugins& lp, int field, const std::string
     std::string buf(in.size() * 2 + 64, '\0');
     for (int tries = 0; tries < 2; ++tries) {
         const int64_t n = ap->arch_text_prepare(field, in.c_str(), &buf[0], (int64_t)buf.size());
-        if (n < 0) return (int)n;
+        if (n < 0) {
+            /* The plugin's reason, when it left one in the (zeroed) buffer. */
+            buf.resize(std::strlen(buf.c_str()));
+            *out = std::move(buf);
+            return (int)n;
+        }
         if (n < (int64_t)buf.size()) {
             buf.resize((size_t)n);
             *out = std::move(buf);

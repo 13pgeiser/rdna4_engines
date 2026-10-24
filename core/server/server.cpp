@@ -210,6 +210,12 @@ void Server::register_routes() {
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     router_.post("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
+    /* Forget one stored conversation: by its client label in the path (or `?label=`, for a
+     * label the path cannot carry), or by engine id with `?id=`. */
+    router_.add ("DELETE", "/sessions/:label",
+                 [this](const HttpRequest& q) { return handle_session_release(q); });
+    router_.add ("DELETE", "/sessions",
+                 [this](const HttpRequest& q) { return handle_session_release(q); });
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole

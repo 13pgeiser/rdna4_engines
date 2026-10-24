@@ -855,7 +855,10 @@ int Checkpoint::open_safetensors(const std::string& path) {
     RAD_TRY(meta_merge_generation_config(md, &meta_));
     RAD_TRY(meta_merge_preprocessor_configs(md, &meta_));
     if (!meta_dir_.empty() && !path_exists(dir_ + "/tokenizer.json")) tok_dir_ = meta_dir_;
-    if (!is_file && !is_index) RAD_TRY(add_companions());
+    if (!is_file && !is_index) {
+        RAD_TRY(add_companions());
+        RAD_TRY(add_torch_files());
+    }
     /* FP8's block, where the checkpoint states one. */
     if (const char* bs = meta_.get("quantization_config.weight_block_size")) {
         long long r = 0, c = 0;
@@ -894,6 +897,55 @@ int Checkpoint::add_companions() {
         for (const auto& sh : shards)
             RAD_TRY(add_shard(sh, c + ".", owner.empty() ? nullptr : &owner));
         RAD_TRY(meta_merge_config_json(d, c, &meta_));
+    }
+    return RAD_OK;
+}
+
+/* PyTorch checkpoints beside the safetensors (torch_zip.h): a model whose part ships only as a
+ * torch.save file, such as Fish Audio drama-3's codec.pth, read as data, never unpickled. Each is
+ * read under `<stem>.`, in name order. A file the weights-only reader refuses (a pickled training
+ * state, an optimiser) is not an error of the checkpoint, only of a plugin that maps its tensors,
+ * which then finds them absent; the warning says why. A torch copy of the model's own weights
+ * (`pytorch_model*.pth`, `consolidated*.pth`) is passed over, as the safetensors are read. */
+int Checkpoint::add_torch_files() {
+    std::vector<std::string> files;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(dir_, ec)) {
+        if (!de.is_regular_file(ec)) continue;
+        const std::string f = de.path().filename().string();
+        if (f.size() <= 4 || f.compare(f.size() - 4, 4, ".pth") != 0) continue;
+        if (f.rfind("pytorch_model", 0) == 0 || f.rfind("consolidated", 0) == 0) continue;
+        files.push_back(f);
+    }
+    std::sort(files.begin(), files.end());
+    for (const std::string& f : files) {
+        auto tz = std::make_unique<TorchZipFile>();
+        std::string why;
+        const std::string path = dir_ + "/" + f;
+        if (tz->open(path, &why) < 0) {
+            RAD_WARN("%s: not read (%s); a plugin that maps its tensors will not find them",
+                     path.c_str(), why.c_str());
+            continue;
+        }
+        const std::string prefix = f.substr(0, f.size() - 4) + ".";
+        for (const TorchTensor& t : tz->tensors()) {
+            if (index_.count(prefix + t.name)) {
+                RAD_ERR("%s: '%s%s' is already in the checkpoint", path.c_str(), prefix.c_str(),
+                        t.name.c_str());
+                return RAD_E_FORMAT;
+            }
+            SrcTensor s;
+            s.name      = prefix + t.name;
+            s.rad_dtype = t.dtype;
+            s.shape     = t.shape;
+            s.data      = t.data;
+            s.bytes     = (int64_t)t.bytes;
+            index_.emplace(s.name, tensors_.size());
+            tensors_.push_back(std::move(s));
+        }
+        RAD_INFO("%s: %zu tensors under '%s', read from the pickle as data", path.c_str(),
+                 tz->tensors().size(), prefix.c_str());
+        torch_.push_back(std::move(tz));
     }
     return RAD_OK;
 }

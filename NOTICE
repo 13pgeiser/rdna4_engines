@@ -15,10 +15,12 @@ Written by Deadcode, with contributions from:
   adaptive draft window, the MoE prefill forms, the sorted operand's decode kernel, two K blocks a
   pass for up to 80 routed rows, --prefill-span, the towers' lookup tables counted once, and for
   Gemma 4 its assistant head as a drafter that reads the trunk's cache, bf16 checkpoints, the fused
-  w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume, and the
-  Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files
+  w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume, the
+  Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files, and Gemma 4's E2B/E4B form (KV-shared
+  layers, per-layer embeddings, clipped vision linears) with NVIDIA-Nemotron-3.5-Bolt-E4B
 - mechkbfan: the token embedding in the pinned host pool
-- Code000: the n-gram gather on the card and the MTP head's history-pass skip
+- Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
+  coupling with its cooperative verify (--draft-coupling)
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
@@ -44,12 +46,17 @@ Written by Deadcode, with contributions from:
 - sfjes: Gemma 4 31B dense -- its plugin, its two attention classes and their kernels, and prefix
   reuse that leaves a windowed group alone -- and --host-headroom-mib
 - zivius: LiquidAI's LFM2 and LFM2-VL and d1's /v1/systemone, after the design of their Codeberg
-  PR 50, and Qwen3-ASR with /v1/audio/transcriptions and /v1/realtime
+  PR 50, Qwen3-ASR with /v1/audio/transcriptions and /v1/realtime, and Fish Audio drama-3 -- its
+  plugin, its codec encoder and decoder, voice cloning from reference clips, and the torch.save
+  reader
 - mici81: Gemma 3 dense (TranslateGemma 27B) -- its plugin, the windowed h128 attention, the
   sandwich junction's all-reduce and its DFlash2 drafter -- the fp8_v4 and k6_v4 KV caches, GPTQ's
   factorisations through LAPACK and a column-split linear's Hessian from per-rank parts,
-  R4D_AR_MAX_BLOCKS for two engines on one set of cards, and added tokens decoded as HuggingFace
-  decodes them
+  R4D_AR_MAX_BLOCKS for two engines on one set of cards, added tokens decoded as HuggingFace
+  decodes them, the MXFP4 GEMM rows for one to 64 rows and the tiled prefill GEMM's TN=4 form, the
+  fp8 and int8 heads read once up to 128 rows, the pipelined prefill of one sequence on a second
+  lane, Gemma 3's junctions under a lossy wire, the block drafter's short block
+  (--draft-short-from) and the f16 delta-net state cache
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -59,7 +66,8 @@ Written by Deadcode, with contributions from:
   exclusions, jinja's dotted integer index, GLM-5.3-Flash's kernels in libr4d and tool calls whose
   name the opener opens, GLM-5.3-Flash's vision tower and processor, its decode at a few rows and
   its DSA indexer split over the ranks, a host-tier restore that makes room as pressure does, KV
-  groups every rank holds kept once a host slot, and the eight-rank two-shot in ring order
+  groups every rank holds kept once a host slot, the eight-rank two-shot in ring order, the MLA
+  row form (--tp-attn-split rows) and DELETE /sessions
 - John McDonough: GLM-5.3-Flash -- its plugin, its blocks (mHC streams, KDA, the DSA indexer and
   sparse latent attention, f32-scaled FP8 and MXFP4 experts under sigmoid routing) and their
   reference and AVX ops -- a Quark export's block-FP8 layers, the signed QSA ranking, the
@@ -73,6 +81,8 @@ Written by Deadcode, with contributions from:
 - thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8)
 - lortht: Krea 2's rebalance of the text taps
 - Quackster: cards with a small PCI BAR, their kernel arguments kept in host memory
+- farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
+- gostar: snapshot-backed prefix KV kept across recomputes
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

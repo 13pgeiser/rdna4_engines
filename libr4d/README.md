@@ -71,7 +71,6 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gdn_gated_norm_had_quant_i8` | the GDN gated norm with the rotation and quantiser fused onto it |
 | `qk_norm_rope_gate` | q/k RMS norm, rope and the attention gate in one kernel |
 | `ar_oneshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4}rank_ti8`, `ar_gather_3rank` | the wider-world collectives (TP3/TP4/TP8), exact and int8-wire |
-| `ar_twoshot_{3,4,8}rank_exact_lane`, `ar_twoshot_{3,4}rank_ti8_lane` | the same two-shots at `overlap` 1, beside compute: the wide rows' entry points, the same bits; at four ranks a narrow launch (4 blocks of 1024 threads), at three and eight the wide launch unless `R4D_AR_LANE_3_8=1` gives them the narrow one (unmeasured on such cards) |
 | `p2p_copy2d`, `p2p_copy2d_kernel`, `p2p_fence` | strided peer device-to-device copy, through the copy engines or a kernel |
 
 ## Constraints as data
@@ -189,13 +188,51 @@ this kernel: the 128-wide slab always, and a split only while every split keeps 
 48-block grid or, at K ≥ 8192, regardless, up to ks·M = 1024 split rows. At 80 / 96 / 128 rows:
 17408 × 5120 161 / 187 / 215 → 161 / 175 / 197 µs, 5120 × 3072 71 / 79 / 67 → 55 / 60 / 69, 21504 ×
 5376 192 / 207 / 228 → 187 / 200 / 217. A different split sums a row in a different order, so at
-65..128 rows the re-tuned rule moves output bits within the selftest's bound: the one change in
-this family that is not bit for bit. Up to 64 rows the rule is as it was.
+65..128 rows the re-tuned rule moves output bits within the selftest's bound. Up to 64 rows the
+decode kernel's bits are as they were.
+
+**Bits against the rows these replace.** `gemv` and `gemv_wide` sum a row in their own order (the
+K split over eight waves and 128-wide chunks), not the decode kernel's split-K order, so at 1..64
+rows their outputs differ from the decode row's in the last bf16 place on a few elements in ten
+thousand (within the selftest's bound). A greedy text can therefore differ from one produced
+with the decode row at those rows. Within the family a row's bits do not depend on M, as above.
 
 **Tunables.** `gemv` and `gemv_wide` have none, so a `RADIANCE_TUNE` pin on `gemm_nt_q` passes
 them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of
 those reaches both. A pin applies to every row serving the op, and an axis a serving row lacks
 stops startup by name.
+
+## The OCP-MXFP4 tiled GEMM (prefill)
+
+**`gemm_mxfp4a8_tiled`** (`gemm_nt_q` at `mxfp4a8`, the rows past the decode band). TN = 4 (256 ×
+128 blocks) from 1024 rows (it was 2048), unless its blocks would number under 128: at the
+crossover Qwen3.8-27B's gate_up -2 %, down -3 %, TranslateGemma 27B's gate_up -9 %, its down +1 %,
+and at 1536 rows all four better; TranslateGemma's 1024-row chunks run there. The weight words a
+thread stages are loaded into registers a slab ahead, right after the staging barrier, so their
+DRAM round trip runs under the slab's WMMAs (+1 VGPR at TN = 4, no spills). At 1024 rows Qwen
+gate_up 804 → 768 µs, down 443 → 417, ssm_in 396 → 384, ssm_out 249 → 231, q|gate 306 → 318;
+TranslateGemma gate_up 1063 → 1029, down 651 → 617; at 2048 rows 0..-4 %; a 41k-token Qwen3.8-27B
+prefill on two cards 8.57 → 8.28 s. A thin last row of blocks (1..160 rows, M under 1024) runs a
+second kernel whose blocks of that row skip the WMMAs of fragments past M, where the plain kernel
+computes them on clamped copies (half the only block's math at 129 rows); every other M runs the
+plain kernel, whose code is instruction for instruction the single kernel's from before the split
+(a guard inside the one kernel cost full blocks 1..15 %). Same-session A/B over 12 shapes: M
+129..160 -8..-20 %, 320..384 -2..-16 % (Qwen gate_up at 320 rows 402 → 339 µs, TranslateGemma's 513
+→ 441). Each of the three keeps the fold, the WMMAs and their order per output byte. Times are one
+rank's weight at TP2 on an R9700, the row alone, clocks warmed; over 20 shapes, M 129..2048: median
+-7.4 % over 140 cells, none slower beyond run-to-run noise.
+
+`tn` (0 the rule, 2, 4) pins the TN choice through `RADIANCE_TUNE`.
+
+## The fp8 and int8 heads past 64 rows
+
+**`logits_gemm_fp8`, `logits_gemm_i8`** took passes of 64 rows and read the head again for each.
+With `MH` = 2 a workgroup's eight waves split into two M halves of four 16-row tiles over 64 weight
+rows that share one staged tile, so a pass takes 128 rows and reads the head once. Qwen3.8's
+per-rank head (124160 × 5120) at 128 rows 3059 → 1984 µs, TranslateGemma's (131072 × 5376) 3242 →
+2036; 65..128 rows -33..-39 %, 160..256 -26..-37 %, 64 and fewer unchanged; about 1 ms a step at 16
+streams with speculation. Same scale blocks, WMMAs and K order per output: the same bytes (the
+numeric cases at 65..150 rows for the fp8 head, 100 for the int8 head).
 
 ## Notes on the kernels
 

@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
 #include "cvec.h"
 #include <map>
 #include <set>
@@ -338,6 +339,10 @@ private:
      * string because RadDrafterDecl::name points into the Program. */
     RadDrafterDecl       drafter_{};
     std::string          drafter_name_;
+    /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or
+     * --draft-short-from is 0. */
+    int64_t              drafter_short_ = 0;
+    bool                 short_on_ = false;     /* the short block runs now (block_shape) */
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
@@ -373,6 +378,9 @@ private:
     gen::AudioDriver*                 aud_gen_ = nullptr;
     gen::VideoDriver*                 vid_gen_ = nullptr;
     int  gen_loop();
+    /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
+     * before the step or pass that first reads them. */
+    void clear_fresh_states();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
@@ -395,6 +403,25 @@ private:
     void step_state_fini();
     StepSlot*            slots_host_ = nullptr;
 
+    /* --draft-coupling (engine_draft.cpp). The head declares `mtp_couple_draws` and
+     * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
+     * reads the states back once, then binds each to the verify row it will be coupled at. */
+    bool     mtp_couple_ = false;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
+    RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
+    RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
+    std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
+    RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
+    bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
+    bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
+    int  stage_couple_draws(int n);
+    /* One INFO line at the first coupled verify that completed: the step, the live requests whose
+     * rows carried a bound state, the kernel and its domain. Read from the sampler's build
+     * snapshot after collect_step's wait, so it reports a finished verify, not an enqueue. */
+    void couple_verify_evidence(int step);
+
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
      * The nine phases sum to the whole step, including the readback, commit and drafter after the
      * join. */
@@ -413,10 +440,16 @@ private:
     int  block_pass(const RadBatch* db, const char* what, int step);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
+    /* The block and proposal count this step's query pass runs at: the drafter's own, or its short
+     * block once --draft-short-from sequences decode, back to its own only two below. */
+    void block_shape(int* block, int* steps);
     /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,
      * in the query pass's order, and how many there are (0 when no query pass ran). */
     std::vector<Scheduler::BlockRow> block_row_;
     int  block_rows_ = 0;
+    /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
+     * issue_ahead's expect_draft. */
+    int  block_steps_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */
