@@ -618,11 +618,8 @@ in the ring; a raised ring that does not fit is the budget's refusal, by name an
 ### 5.2 There is no streaming switch
 
 `--kv-resident N` *is* the feature: absent (or 0) and nothing streams, present and the ring is N
-tokens. There is no `--kv-streaming` to understand (it is refused by name), no `auto` to
-second-guess, and no mode where an operator can ask for streaming that cannot help. A removed
-`--kv-stream-threshold` is refused by name too: the base path for a live set that fits the ring
-measured 2.6-2.9 % slower a step on the post-tape-fix tree (record §74), so the streamed path is
-the cheap one at every depth. And when the ring covers the group's context it does not stream at
+tokens. There is no second switch, no `auto` to second-guess, and no mode where an operator can ask
+for streaming that cannot help. When the ring covers the group's context it does not stream at
 all (§3.1): a configuration whose context fits pays *nothing* — the same code path, not a cheap
 one.
 
