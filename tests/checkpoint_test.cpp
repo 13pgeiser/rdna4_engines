@@ -1931,6 +1931,38 @@ TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
     }
 }
 
+/* Nomic BERT names its dimensions n_layer, n_embd, n_head, n_inner and n_positions, its expert
+ * count num_experts and its top-k moe_top_k, and its norm epsilon layer_norm_epsilon. Without the
+ * fallbacks the engine refuses the checkpoint at startup and rad-convert sizes nothing. */
+TEST(a_nomic_config_fills_the_meta_from_its_own_spellings) {
+    const char* cfg =
+        R"({"model_type":"nomic_bert","n_layer":12,"n_embd":768,"n_head":12,
+            "n_inner":3072,"n_positions":2048,"vocab_size":250048,
+            "layer_norm_epsilon":1e-05,"num_experts":8,"moe_top_k":2,
+            "moe_every_n_layers":2,"rotary_emb_base":10000,"prenorm":false})";
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, cfg);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const MetaOwn& m = ck.meta();
+    CHECK_EQ(m.arch, std::string("nomicbert"));
+    CHECK_EQ(m.m.n_layers, (int64_t)12);
+    CHECK_EQ(m.m.n_embd, (int64_t)768);
+    CHECK_EQ(m.m.n_head, (int64_t)12);
+    CHECK_EQ(m.m.n_head_kv, (int64_t)12);
+    CHECK_EQ(m.m.head_dim, (int64_t)64);
+    CHECK_EQ(m.m.n_ff, (int64_t)3072);
+    CHECK_EQ(m.m.n_vocab, (int64_t)250048);
+    CHECK_EQ(m.m.n_ctx_train, (int64_t)2048);
+    CHECK_EQ(m.m.n_expert, (int64_t)8);
+    CHECK_EQ(m.m.n_expert_used, (int64_t)2);
+    CHECK_EQ(m.m.rms_eps, 1e-5f);
+    CHECK_EQ(m.m.rope_theta, 1e4f);
+    CHECK_EQ(m.get("moe_every_n_layers"), std::string("2"));
+    CHECK_EQ(m.get("num_experts"), std::string("8"));
+    CHECK_EQ(m.get("rotary_emb_base"), std::string("10000"));
+    CHECK_EQ(m.get("prenorm"), std::string("0"));
+}
+
 /* ================================================================== a table declared in pieces
  *
  * A table shipped as many shards is declared as several CONCAT maps under one name (each map holds
@@ -2996,6 +3028,92 @@ TEST(a_transposed_weight_swaps_its_last_two_dimensions_in_each_slice) {
         for (int j = 0; j < 4; ++j)
             for (int i = 0; i < 3; ++i)
                 CHECK_EQ(f[(size_t)(s * 12 + j * 3 + i)], (float)(s * 12 + i * 4 + j));
+}
+
+/* An expert's w2 is a dim-0 sub-tensor of a stacked [n_expert, in, out] tensor, transposed into
+ * the [out, in] table a grouped GEMM reads. Ignoring src_index would give every expert the whole
+ * stack, and transposing before slicing would mix experts. */
+TEST(a_transposed_expert_slice_takes_its_dim0_sub_tensor_then_transposes) {
+    std::vector<float> v(8 * 4 * 3);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float)i;
+    const std::string dir = write_checkpoint({ f32("w2", { 8, 4, 3 }, v) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    std::vector<std::string> names;
+    names.reserve(8);
+    for (int e = 0; e < 8; ++e) names.push_back("w2." + std::to_string(e));
+    for (int e = 0; e < 8; ++e)
+        prog.name_map.push_back(map(names[(size_t)e].c_str(), RAD_MAP_TRANSPOSE, { "w2" }, { e }));
+    prog.name_map.push_back(map("w2.bad", RAD_MAP_TRANSPOSE, { "w2" }, { 8 }));
+    CkptWeight w;
+    std::string why;
+    for (int e = 0; e < 8; ++e) {
+        const std::string& name = names[(size_t)e];
+        REQUIRE_EQ(ckpt_resolve(ck, prog, name, false, &w, &why), RAD_OK);
+        CHECK(!w.trivial);
+        REQUIRE_EQ(w.rank, (uint32_t)2);
+        CHECK_EQ(w.shape[0], (int64_t)3);
+        CHECK_EQ(w.shape[1], (int64_t)4);
+        std::vector<float> f(3 * 4);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 3, f.data(), &why), RAD_OK);
+        /* Element (j, i) is the source's (e, i, j). */
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 4; ++i)
+                CHECK_EQ(f[(size_t)(j * 4 + i)], (float)(e * 12 + i * 3 + j));
+    }
+    CHECK(ckpt_resolve(ck, prog, "w2.bad", false, &w, &why) < 0);
+}
+
+/* A stack flattened over the rows of a rank-2 tensor (Nomic's experts.mlp.w1 and w2 are
+ * [n_expert * n_ff, n_embd]) takes src_rows as one expert's row count. w1 is a copy of the block,
+ * w2 the same block transposed. */
+TEST(a_flat_expert_stack_is_one_blocks_rows_before_transposing) {
+    std::vector<float> v(8 * 4 * 3);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float)i;
+    const std::string dir = write_checkpoint({ f32("w", { 8 * 4, 3 }, v) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    std::vector<std::string> names;
+    names.reserve(16);
+    for (int e = 0; e < 8; ++e) names.push_back("w1." + std::to_string(e));
+    for (int e = 0; e < 8; ++e) names.push_back("w2." + std::to_string(e));
+    for (int e = 0; e < 8; ++e) {
+        RadNameMap a = map(names[(size_t)e].c_str(), RAD_MAP_COPY, { "w" }, { e });
+        a.src_rows[0] = 4;
+        prog.name_map.push_back(a);
+        RadNameMap t = map(names[(size_t)(8 + e)].c_str(), RAD_MAP_TRANSPOSE, { "w" }, { e });
+        t.src_rows[0] = 4;
+        prog.name_map.push_back(t);
+    }
+    CkptWeight w1, w2;
+    std::string why;
+    for (int e = 0; e < 8; ++e) {
+        REQUIRE_EQ(ckpt_resolve(ck, prog, names[(size_t)e], false, &w1, &why), RAD_OK);
+        REQUIRE_EQ(w1.rank, (uint32_t)2);
+        CHECK_EQ(w1.shape[0], (int64_t)4);
+        CHECK_EQ(w1.shape[1], (int64_t)3);
+        std::vector<float> f1(4 * 3);
+        REQUIRE_EQ(ckpt_rows_f32(w1, 0, 4, f1.data(), &why), RAD_OK);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                CHECK_EQ(f1[(size_t)(i * 3 + j)], (float)(e * 12 + i * 3 + j));
+
+        REQUIRE_EQ(ckpt_resolve(ck, prog, names[(size_t)(8 + e)], false, &w2, &why), RAD_OK);
+        REQUIRE_EQ(w2.rank, (uint32_t)2);
+        CHECK_EQ(w2.shape[0], (int64_t)3);
+        CHECK_EQ(w2.shape[1], (int64_t)4);
+        std::vector<float> f2(3 * 4);
+        REQUIRE_EQ(ckpt_rows_f32(w2, 0, 3, f2.data(), &why), RAD_OK);
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 4; ++i)
+                CHECK_EQ(f2[(size_t)(j * 4 + i)], (float)(e * 12 + i * 3 + j));
+    }
+    RadNameMap bad = map("w1.bad", RAD_MAP_COPY, { "w" }, { 8 });
+    bad.src_rows[0] = 4;
+    prog.name_map.push_back(bad);
+    CHECK(ckpt_resolve(ck, prog, "w1.bad", false, &w1, &why) < 0);
 }
 
 /* An EMA codebook is its sums over max(usage, 1e-5), row by row; codebooks declared in pieces

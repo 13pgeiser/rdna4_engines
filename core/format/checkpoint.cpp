@@ -234,28 +234,33 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
     RadModelMeta& m = out->m;
-    m.n_layers    = gi("num_hidden_layers", 0);
-    m.n_embd      = gi("hidden_size", 0);
-    m.n_head      = gi("num_attention_heads", 0);
+    /* Nomic BERT states its geometry with n_layer, n_embd, n_head, n_inner, n_positions and
+     * moe_top_k. They are fallbacks in the same chain, so a config carrying both spellings keeps
+     * the HuggingFace one and every existing checkpoint reads byte for byte as before. */
+    m.n_layers    = gi("num_hidden_layers", gi("n_layer", 0));
+    m.n_embd      = gi("hidden_size", gi("n_embd", 0));
+    m.n_head      = gi("num_attention_heads", gi("n_head", 0));
     m.n_head_kv   = gi("num_key_value_heads", m.n_head);
     /* Read head_dim; derive it only as a fallback. On qwen35 it is 256 while
      * hidden_size/num_attention_heads is 213. */
     m.head_dim    = gi("head_dim", m.n_head ? m.n_embd / m.n_head : 0);
     /* A routed config has no `intermediate_size`, only `moe_intermediate_size` (one expert's
      * width, which is what a GEMM sees and what n_ff means) and
-     * `shared_expert_intermediate_size` (read by the plugin from the free-form table). */
-    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", 0));
+     * `shared_expert_intermediate_size` (read by the plugin from the free-form table). Nomic
+     * spells the same width n_inner. */
+    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", gi("n_inner", 0)));
     m.n_vocab     = gi("vocab_size", 0);
-    m.n_ctx_train = gi("max_position_embeddings", 0);
+    m.n_ctx_train = gi("max_position_embeddings", gi("n_positions", 0));
     /* The DeepSeek spelling: Unlimited-OCR's decoder is a DeepSeek-V2 MoE and states its expert
      * count as `n_routed_experts`; a routed config names the count under one of the three and
      * never under more than one, so the chain is a rename, not a guess. */
     m.n_expert        = gi("num_experts", gi("num_local_experts", gi("n_routed_experts", 0)));
-    m.n_expert_used   = gi("num_experts_per_tok", 0);
+    m.n_expert_used   = gi("num_experts_per_tok", gi("moe_top_k", 0));
     m.n_expert_shared = gi("n_shared_experts", gi("num_shared_experts",
                            gi("shared_expert_intermediate_size", 0) ? 1 : 0));
-    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", 1e-6));   /* LFM2: norm_eps */
-    m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
+    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", gf("layer_norm_epsilon", 1e-6)));
+    m.rope_theta  = (float)gf("rope_parameters.rope_theta",
+                              gf("rope_theta", gf("rotary_emb_base", 10000.0)));
     /* Rotary scaling stays in the free-form keys with its type (arch/common/rad_arch.h,
      * yarn_from); a bare factor here would wrongly mean linear scaling. */
     m.rope_scale  = 1.0f;
@@ -2245,6 +2250,19 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
                                                                   "'") +
                                       ", not all in " + ck.path());
     }
+    /* A transposed expert table is one sub-tensor of a stack, transposed. A stack kept as a
+     * rank-3 tensor takes src_index[0] as its dim-0 index. A stack flattened into the rows of a
+     * rank-2 tensor takes src_rows[0] as the sub-tensor's row count, with src_index[0] selecting
+     * the block: Nomic's experts.mlp.w2 is [n_expert * n_ff, n_embd]. */
+    if (m.mode == RAD_MAP_TRANSPOSE && m.src_index[0] >= 0) {
+        if (m.src_rows[0] > 0 && a->shape.size() == 2) {
+            const int64_t r0 = (int64_t)m.src_index[0] * m.src_rows[0];
+            a = ck.rows(*a, r0, m.src_rows[0], out->name.c_str());
+        } else {
+            a = ck.slice(*a, m.src_index[0], out->name.c_str());
+        }
+        if (!a) return refuse(RAD_E_SHAPE, "a sub-tensor it names is not there");
+    }
     const size_t rank = a->shape.size();
     if (rank < 2 || rank > RAD_MAX_RANK)
         return refuse(RAD_E_SHAPE, "'" + a->name + "' has rank " + std::to_string(rank) +
@@ -2356,7 +2374,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     const bool row_pieces = maps.front()->mode == RAD_MAP_ROWS;
     for (const RadNameMap* pm : maps)
         for (int k = 0; k < pm->n_src; ++k)
-            srcs.push_back({ pm->src[k], pm->src_index[k], row_pieces ? pm->src_rows[k] : 0 });
+            srcs.push_back({ pm->src[k], pm->src_index[k], pm->src_rows[k] });
     out->concat_dim = row_pieces ? 0 : maps.front()->concat_dim;
 
     /* The mode decides what several sources mean:
@@ -2399,9 +2417,13 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             if (!st) return refuse(RAD_E_SHAPE, "the rows it names are not there");
         }
         /* A sub-tensor index is always applied (ignoring it would give every expert the whole
-         * stack). Its scale plane is sliced at the same index. */
+         * stack). Its scale plane is sliced at the same index. A stack flattened into the rows of
+         * a rank-2 tensor takes src_rows as the sub-tensor's row count. */
         else if (st && s1.index >= 0) {
-            st = ck.slice(*st, s1.index, name.c_str());
+            if (s1.rows > 0 && st->shape.size() == 2)
+                st = ck.rows(*st, (int64_t)s1.index * s1.rows, s1.rows, name.c_str());
+            else
+                st = ck.slice(*st, s1.index, name.c_str());
             if (!st) return refuse(RAD_E_SHAPE, "a sub-tensor it names is not there");
             if (sc && !(sc = ck.slice(*sc, s1.index, name.c_str())))
                 return refuse(RAD_E_SHAPE, "its scale plane cannot be sliced at the same index");
