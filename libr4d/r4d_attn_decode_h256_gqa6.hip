@@ -958,11 +958,23 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // head_dim f16, written once and read once): at eight requests 12.8 MB at splits 32 vs 3.2 MB at
 // 8, 19% of a 16K step's KV but 1.2% at 128K. The effect fades with depth, never enough to need a
 // context term.
+//
+// The target is 256 workgroups where a workgroup has one or two waves (q_len * gqa <= 32: a plain decode,
+// or a 4-row verify of the DFlash2 short block), 128 otherwise. A one- or two-wave workgroup keeps too
+// few KV bytes in flight for the card's DRAM at 128 (about one a CU); twice as many reach it. Qwen3.8-27B
+// at TP2 on the R9700, k6_v4: r4d_selftest --perfdecattn (2 rounds) 4 x 1 row over 100k 582 -> 464 us,
+// 1 x 1 row over 100k 264 -> 175, 16 x 4 rows over 41k 985 -> 801 (x4 and x8 the target were worse
+// than x2); the server's decode step at speculation 7 (three rounds, medians, the steps carrying every
+// sequence) 8 x 41k 34.01 -> 32.48 ms, 16 x 25k 44.65 -> 43.19. At three waves (an 8-row verify) more
+// workgroups only add contention: 4 x 8 rows over 100k +9 % at x2, so those keep 128. The split
+// count already moves with the batch (8 sequences at 256 split like 4 at 128), so this adds no
+// partition the merge did not already see.
 static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
     if (a->splits > 0) return a->splits;
     const int tiles = (a->max_ctx + tile - 1) / tile;
     const int units = std::max(1, a->kv_heads * a->num_seqs);
-    int s = 128 / units;
+    const int gqa = a->kv_heads > 0 ? std::max(1, a->q_heads / a->kv_heads) : 1;
+    int s = (a->q_len * gqa <= 32 ? 256 : 128) / units;
     const int cap = tiles / 2;
     if (s > cap) s = cap;
     if (s > tiles) s = tiles;
