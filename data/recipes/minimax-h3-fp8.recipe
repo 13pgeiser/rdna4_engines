@@ -34,6 +34,17 @@
 # them when the checkpoint ships them: the audio encoder's f32 chain convs are weight-normalised
 # and stored folded; the video encoder's 3x3x3 convs are cast to bf16, which is how the implicit-
 # GEMM kernel stores them (conv_in and the k=1 convs read f32 as declared and need no rule).
+# The heads are the checkpoint's own: the ref2va encoders are the encoders of the vae/ and
+# audio_vae/ folders, shipped in every pipeline directory since the ref2va release. What was
+# missing from a T2VA-era container was the plugin's declare, not the weights, so upgrading
+# such a container is a reuse with nothing marked changed: every weight it holds copies where
+# it is and only the head weights it never declared get converted.
+#
+#   rad-convert <the directory the old container was converted from> \
+#       --recipe data/recipes/minimax-h3-fp8.recipe --reuse <the old container> \
+#       -o <the upgraded container>
+#
+# Serve the result with the minimaxh3 plugin that declares the encoders.
 
 te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
 te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
