@@ -540,20 +540,7 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
-        else if (S("--kv-streaming")) {
-            RAD_ERR("--kv-streaming was removed: --kv-resident N is the whole switch. It is the "
-                    "tokens of the sparse attention group's KV its VRAM ring holds, and leaving it "
-                    "off keeps every block on the card; there is no mode to choose past it");
-            return RAD_E_INVAL;
-        }
         else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
-        else if (S("--kv-stream-threshold")) {
-            RAD_ERR("--kv-stream-threshold was removed: the streamed path is the cheap one. The "
-                    "base path for a live set that fits the ring measured 2.6-2.9%% slower a step "
-                    "(record §74), so --kv-resident N is the whole switch and there is no path to "
-                    "choose");
-            return RAD_E_INVAL;
-        }
         else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
             const bool emb = S("--embedding-placement");
