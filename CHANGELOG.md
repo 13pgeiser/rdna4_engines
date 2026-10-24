@@ -2,6 +2,7 @@
 
 ## v0.4.3.1
 
+- **Fixed: Qwen3.8-27B native MTP on gfx1201 refused the MQ4 sidecar's fused kernels as outside the planned route.** The typed MTP layer program uses plain RMSNorm/SwiGLU rotation, fused QKV/gate-up and residual GEMV kernels independently of the trunk's AWQ scales; the sealed 27B native-MTP plan now includes that head closure. AR routing and the seal's rejection of unplanned kernels are unchanged.
 - **A3B `qwen3.6:35b-a3b-mq4rs` decodes on retained Redline PM4 by default on gfx1201.** The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) ran the HIP graph at 156 tok/s because `retained_redline_default` admitted only `.mq4r` and Qwen3.5 dense; it now takes the same retained PM4 default as `.mq4r` on exact gfx1201 with pp=tp=1 and no drafter (MTP-loaded requests, CPU offload, and `replay.backend = "hip"` are unchanged). Greedy ids are identical to the HIP route; tg128 ~232 tok/s at ctx 128, ~217 at 8K. Selection is by file extension, marked deprecated since 0.4.0 / removal 0.5.0 like the `.mq4r` route.
 - **Registry: `qwen3.6:35b-a3b-mq4rs` now declares the `qwen3.6-35b-a3b.mtp` sidecar** every other `qwen3.6:35b-a3b*` entry carries, so `--spec mtp` finds the head. `speculation.mtp=auto` still resolves to AR for Qwen3.5.
 
