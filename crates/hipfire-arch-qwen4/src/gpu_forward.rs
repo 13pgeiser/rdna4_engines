@@ -3199,6 +3199,32 @@ impl Qwen4MoeLayerRuntime {
             .filter(|codec| *codec != crate::expert_arena::CODEC_MQ4)
     }
 
+    /// The BorrowPrefill runtime of a decode-share load: the same layer built
+    /// from the lease's BorrowPrefill view (donors at their pinned host mirror).
+    /// Serves only prompt tiles of at least the resident bank's rows; never
+    /// arms a CPU splice or D2 split.
+    pub(crate) fn from_moe_borrow(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        d2_default: bool,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Single,
+            None,
+            true,
+            d2_default,
+            crate::expert_tier_owners::ExpertReadView::BorrowPrefill,
+        )
+    }
+
     /// Single-device runtime: the layer's resident tensors hold every expert.
     pub(crate) fn from_moe(
         gpu: &mut Gpu,
@@ -3218,6 +3244,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             true,
             d2_default,
+            crate::expert_tier_owners::ExpertReadView::Resident,
         )
     }
 
@@ -3239,6 +3266,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             false,
             false,
+            crate::expert_tier_owners::ExpertReadView::Resident,
         )
     }
 
@@ -3281,6 +3309,7 @@ impl Qwen4MoeLayerRuntime {
             Some(dummy),
             true,
             false,
+            crate::expert_tier_owners::ExpertReadView::Resident,
         )
     }
 
@@ -3309,6 +3338,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             true,
             false,
+            crate::expert_tier_owners::ExpertReadView::Resident,
         )
     }
 
@@ -3326,6 +3356,7 @@ impl Qwen4MoeLayerRuntime {
         dummy: Option<&Qwen4EpDummyExpert>,
         allow_tiers: bool,
         d2_default: bool,
+        read_view: crate::expert_tier_owners::ExpertReadView,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -3352,10 +3383,17 @@ impl Qwen4MoeLayerRuntime {
         );
 
         let tier_layer = if allow_tiers {
-            weights.expert_tier_layer(layer_label)
+            weights.expert_tier_layer_view(layer_label, read_view)
         } else {
             None
         };
+        let borrow_view = read_view == crate::expert_tier_owners::ExpertReadView::BorrowPrefill;
+        if borrow_view && tier_layer.is_none() {
+            return Err(invalid(format!(
+                "layer {layer_label}: no BorrowPrefill expert view (the load carries no decode-share \
+                 binding for this layer)"
+            )));
+        }
         if tier_layer.is_some()
             && (!matches!(layout, Qwen4ExpertTableLayout::Single)
                 || moe.expert_arena.is_some()
@@ -3783,7 +3821,9 @@ impl Qwen4MoeLayerRuntime {
                     .collect();
                 hipfire_dispatch::families::moe::ExpertTierIdentity::new(
                     lease.generation(),
-                    lease.logical_digest(),
+                    // The view's own digest: the logical digest for Resident
+                    // (byte-identical to before), the BorrowPrefill digest otherwise.
+                    view.view_digest(),
                     &placement,
                     view.codec_table(),
                     view.gate_up_ptrs(),
@@ -3909,7 +3949,19 @@ impl Qwen4MoeLayerRuntime {
                     .as_deref(),
             ),
         };
-        if let Some(refusal) = split_admission.refusal() {
+        if borrow_view {
+            // A BorrowPrefill runtime serves only wide prompt tiles over host
+            // mirrors of the donors; it never carries a CPU splice or D2 split
+            // (admission refuses them; the measured D2 default is decided only
+            // per load, so it is checked here).
+            if split_admission.armed() {
+                return Err(invalid(format!(
+                    "layer {layer_label}: decode-share BorrowPrefill runtime cannot arm a CPU \
+                     expert split (set memory.offload_exec=pcie / HIPFIRE_QWEN4_D2_DEFAULT=0 to \
+                     load with decode-share)"
+                )));
+            }
+        } else if let Some(refusal) = split_admission.refusal() {
             cpu_splice::log_split_refusal_once(refusal, &gpu.arch);
         }
         // The owner is a set of borrowed views over memory the loader already
@@ -8065,6 +8117,28 @@ impl MoeStepHooks for LayerCaptureHooks<'_> {
     }
 }
 
+/// Whether a call is a decode-share prompt tile: at least
+/// [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows and none of a device-argmax decode
+/// forward, a lane step or a mesh segment. The one predicate scratch-bank and
+/// BorrowPrefill-runtime selection share.
+pub(crate) fn decode_share_prefill_tile(
+    rows: usize,
+    argmax_forward: bool,
+    lane_scope: bool,
+    mesh_segment: bool,
+) -> bool {
+    rows >= QWEN4_DECODE_SHARE_RESIDENT_ROWS && !argmax_forward && !lane_scope && !mesh_segment
+}
+
+/// The per-layer runtimes a tile reads ([`Qwen4GpuForward::tile_moe`]).
+fn tile_moe_of<'a, T>(borrow_active: bool, resident: &'a [T], borrowed: &'a [T]) -> &'a [T] {
+    if borrow_active {
+        borrowed
+    } else {
+        resident
+    }
+}
+
 /// Whether the decode-share `bank` mode (owned test backing) is requested.
 fn decode_share_bank_requested() -> bool {
     crate::decode_share::DecodeShareMode::from_env() == crate::decode_share::DecodeShareMode::Bank
@@ -8329,6 +8403,13 @@ pub struct Qwen4GpuForward {
     npu_trunk: Option<npu_forward::NpuForward>,
     /// `Some` on a decode-share load: the prefill banks and bank-swap state.
     share: Option<DecodeShareBanks>,
+    /// BorrowPrefill twins of `moe` (same layer order; empty unless the tier
+    /// lease carries a decode-share binding and the mode uses it).
+    moe_borrow: Vec<Option<Qwen4MoeLayerRuntime>>,
+    /// Set only by the decode-share path ([`Self::forward_chunk_inner`]) for
+    /// the duration of one prompt tile: [`Self::tile_moe`] then reads
+    /// `moe_borrow`.
+    borrow_runtimes_active: bool,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -9342,6 +9423,10 @@ impl Qwen4GpuForward {
         };
         let mut moe: Vec<Option<Qwen4MoeLayerRuntime>> =
             (0..bundle.config.num_hidden_layers).map(|_| None).collect();
+        // BorrowPrefill runtimes of a decode-share binding (empty otherwise):
+        // the per-layer MoE runtimes a prompt tile of at least the resident
+        // bank's rows reads ([`Self::tile_moe`]).
+        let mut moe_borrow: Vec<Option<Qwen4MoeLayerRuntime>> = Vec::new();
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut cut_layers: Option<CutLayers> = None;
@@ -9385,6 +9470,34 @@ impl Qwen4GpuForward {
                         d2_default,
                     )
                 })?;
+                if bundle
+                    .weights
+                    .expert_tiers()
+                    .is_some_and(|lease| lease.decode_share().is_some())
+                    && matches!(
+                        crate::decode_share::DecodeShareMode::from_env(),
+                        crate::decode_share::DecodeShareMode::Bind
+                            | crate::decode_share::DecodeShareMode::Fixed
+                            | crate::decode_share::DecodeShareMode::On
+                    )
+                {
+                    moe_borrow = (0..bundle.config.num_hidden_layers).map(|_| None).collect();
+                    populate_moe_runtimes(
+                        &mut moe_borrow,
+                        &bundle.weights.layer_refs,
+                        |layer, weights| {
+                            Qwen4MoeLayerRuntime::from_moe_borrow(
+                                gpu,
+                                &bundle.weights,
+                                weights,
+                                layer,
+                                &bundle.config,
+                                d2_default,
+                            )
+                        },
+                    )?;
+                    Self::check_borrow_runtimes(bundle, &moe, &moe_borrow)?;
+                }
             }
             let moe_count = moe.iter().flatten().count();
             // A band keeps every routed expert resident (packed aggregates or
@@ -9715,6 +9828,16 @@ impl Qwen4GpuForward {
                 crate::slowlink_admission::check_sym_iu4_final_headers(route, verified, total)
                     .map_err(invalid)?;
             }
+            // A BorrowPrefill runtime inherits its Resident twin's symmetric
+            // verdict: `verify_symmetric` proved the IU4 header grid on payloads
+            // the donors' mirror reproduces byte for byte
+            // (`ExpertTierLease::verify_donor_tail` under the verify knob), so
+            // the second device check would only re-read the same bytes.
+            for (borrowed, resident) in moe_borrow.iter_mut().zip(&moe) {
+                if let (Some(borrowed), Some(resident)) = (borrowed, resident) {
+                    borrowed.symmetric = resident.symmetric;
+                }
+            }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
                 if ep.is_none()
@@ -9833,6 +9956,9 @@ impl Qwen4GpuForward {
             if let Some(stage) = expert_stage {
                 let _ = stage.free_gpu(gpu);
             }
+            for layer in moe_borrow.into_iter().flatten() {
+                let _ = layer.free_gpu(gpu);
+            }
             for layer in moe.into_iter().flatten() {
                 let _ = layer.free_gpu(gpu);
             }
@@ -9882,6 +10008,8 @@ impl Qwen4GpuForward {
             cpu_split_explicit: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
                 && !hipfire_dispatch::cpu_exec::passback_enabled(),
             moe,
+            moe_borrow,
+            borrow_runtimes_active: false,
             decode_q8,
             route_trace,
             cut_layers,
@@ -10501,6 +10629,82 @@ impl Qwen4GpuForward {
             })
     }
 
+    /// Whether the call is a decode-share prompt tile: the single predicate
+    /// behind both scratch-bank selection (`share` banks) and BorrowPrefill
+    /// runtime selection (`moe_borrow`). See [`decode_share_prefill_tile`].
+    fn share_prefill_tile(&self, tokens: &[u32], argmax_of: Option<&GpuTensor>) -> bool {
+        (self.share.is_some() || !self.moe_borrow.is_empty())
+            && decode_share_prefill_tile(
+                tokens.len(),
+                argmax_of.is_some(),
+                self.lane_scope,
+                self.mesh_route_rows.is_some(),
+            )
+    }
+
+    /// The per-layer MoE runtimes the running tile reads: the BorrowPrefill
+    /// twins during a decode-share prompt tile, the Resident runtimes in every
+    /// other forward (decode, verify, lanes, EP, mesh, small tiles, attach).
+    pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
+        tile_moe_of(self.borrow_runtimes_active, &self.moe, &self.moe_borrow)
+    }
+
+    /// `moe_borrow` must mirror `moe` layer for layer and report the same
+    /// `host_mapped` bit (verdict change 3: layers without a host expert never
+    /// donate, so the layer bit that selects the stage and the host wait is
+    /// view independent). Logs the BorrowPrefill runtime census.
+    fn check_borrow_runtimes(
+        bundle: &Qwen4Bundle,
+        moe: &[Option<Qwen4MoeLayerRuntime>],
+        borrow: &[Option<Qwen4MoeLayerRuntime>],
+    ) -> Result<(), Qwen4GpuForwardError> {
+        use crate::expert_tier_owners::ExpertReadView;
+        use crate::expert_tier_plan::Placement;
+        let lease = bundle
+            .weights
+            .expert_tiers()
+            .ok_or_else(|| invalid("decode-share runtimes without a tier lease"))?;
+        let (mut layers, mut donor_layers) = (0usize, 0usize);
+        for (layer, (resident, borrowed)) in moe.iter().zip(borrow).enumerate() {
+            let (resident, borrowed) = match (resident, borrowed) {
+                (Some(resident), Some(borrowed)) => (resident, borrowed),
+                (None, None) => continue,
+                _ => {
+                    return Err(invalid(format!(
+                        "decode-share: layer {layer} has a runtime in one read view only"
+                    )))
+                }
+            };
+            if resident.host_mapped() != borrowed.host_mapped() {
+                return Err(invalid(format!(
+                    "decode-share: layer {layer} host_mapped is {} in the Resident view and {} in \
+                     the BorrowPrefill view (a layer without a host expert must not donate)",
+                    resident.host_mapped(),
+                    borrowed.host_mapped()
+                )));
+            }
+            layers += 1;
+            let (Some(res_view), Some(bor_view)) = (
+                lease.layer_view(layer, ExpertReadView::Resident),
+                lease.layer_view(layer, ExpertReadView::BorrowPrefill),
+            ) else {
+                return Err(invalid(format!(
+                    "decode-share: layer {layer} lacks a tier view"
+                )));
+            };
+            if (0..bundle.config.num_experts).any(|eid| {
+                res_view.placement(eid) == Some(Placement::Device)
+                    && bor_view.placement(eid) == Some(Placement::HostMapped)
+            }) {
+                donor_layers += 1;
+            }
+        }
+        eprintln!(
+            "  qwen4 decode-share: BorrowPrefill runtimes for {layers} tier layers (donors in {donor_layers} layers)"
+        );
+        Ok(())
+    }
+
     /// Before a prompt tile swaps prefill class `class` in. S4: nothing to
     /// acquire (the test backing is owned); S5 implements the donor loan state
     /// machine here.
@@ -10690,6 +10894,7 @@ impl Qwen4GpuForward {
             mesh_tokens,
             lane_tokens,
             moe,
+            moe_borrow,
             expert_stage,
             ep,
             token_readback,
@@ -10786,6 +10991,11 @@ impl Qwen4GpuForward {
                 if first.is_none() {
                     first = Some(error);
                 }
+            }
+        }
+        for layer in moe_borrow.into_iter().flatten() {
+            if let Some(error) = layer.free_gpu(gpu) {
+                first.get_or_insert(error);
             }
         }
         if let Some(ep) = ep {
@@ -11817,18 +12027,22 @@ impl Qwen4GpuForward {
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
     }
 
-    /// Bank selection, the only place decode-share banks change. Every tile of
-    /// every route that reaches [`Self::forward_chunk_scoped`] passes here.
+    /// Bank and runtime selection, the only place decode-share state changes.
+    /// Every tile of every route that reaches [`Self::forward_chunk_scoped`]
+    /// passes here.
     ///
-    /// Prompt-tile predicate: the call is a prefill tile when it is not a
-    /// device-argmax decode forward (`argmax_of`), not a lane step
-    /// (`lane_scope`) and not a mesh segment (`mesh_route_rows`), and carries
-    /// at least [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows. A verify window
+    /// Prompt-tile predicate ([`decode_share_prefill_tile`]): the call is a
+    /// prefill tile when it is not a device-argmax decode forward
+    /// (`argmax_of`), not a lane step (`lane_scope`) and not a mesh segment
+    /// (`mesh_route_rows`), and carries at least
+    /// [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows. A verify window
     /// (`!prefill_scope`, at most `QWEN4_VERIFY_MAX_ROWS` rows) is therefore
     /// never a prefill tile, and every other call (decode, verify, lanes,
-    /// tiles below the resident rows) runs on the resident bank. A prefill
-    /// tile swaps the smallest class holding its rows into `scratch` and
-    /// swaps the resident bank back on every return path.
+    /// tiles below the resident rows) runs on the resident bank and the
+    /// Resident runtimes. A prefill tile swaps the smallest class holding its
+    /// rows into `scratch` (banks present) and reads the BorrowPrefill
+    /// runtimes (`moe_borrow` present) for the tile, restoring both on every
+    /// return path. `bind` mode has runtimes but no banks.
     #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
         &mut self,
@@ -11841,7 +12055,7 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
-        if self.share.is_none() {
+        if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,
                 gpu,
@@ -11853,8 +12067,7 @@ impl Qwen4GpuForward {
                 output_policy,
             );
         }
-        let prefill_tile =
-            argmax_of.is_none() && !self.lane_scope && self.mesh_route_rows.is_none();
+        let prefill_tile = self.share_prefill_tile(tokens, argmax_of);
         let class = if prefill_tile {
             self.share_class_for_tile(tokens.len())?
         } else {
@@ -11867,8 +12080,10 @@ impl Qwen4GpuForward {
                     share.swap_in(&mut self.scratch, class);
                 }
             }
-            None => self.share_require_resident(gpu)?,
+            None if !prefill_tile && self.share.is_some() => self.share_require_resident(gpu)?,
+            None => {}
         }
+        self.borrow_runtimes_active = prefill_tile && !self.moe_borrow.is_empty();
         let result = self.forward_chunk_tile(
             bundle,
             gpu,
@@ -11879,8 +12094,12 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_policy,
         );
+        self.borrow_runtimes_active = false;
         if let Some(share) = self.share.as_mut() {
             share.swap_out(&mut self.scratch);
+        }
+        if self.share.is_none() {
+            return result;
         }
         let after = self.share_after_tile(gpu, result.is_ok());
         result.and(after)
@@ -12370,8 +12589,12 @@ impl Qwen4GpuForward {
         if let Some(stage) = expert_stage {
             // Slab stage: the first two host layers copy while the resident
             // layers compute (the legacy donors refill from their own MoE).
-            stage.slab_prime(gpu, self.moe.len())?;
+            stage.slab_prime(gpu, self.tile_moe().len())?;
         }
+        // The runtimes this tile reads, as a slice borrowed from the two
+        // runtime fields only (`Self::tile_moe` would borrow all of `self`
+        // across the program build and its closures).
+        let tile_moe = tile_moe_of(self.borrow_runtimes_active, &self.moe, &self.moe_borrow);
         // The MoE seal reads this call's canonical route rows from the
         // dispatch context (`batch_size = route_rows`): a short tail of a long
         // prefill keeps `rows != route_rows` and the GPU route, while a whole
@@ -12477,7 +12700,7 @@ impl Qwen4GpuForward {
                 ep.map(|ep| ep.moe_full.get(layer_index)),
                 route_n > 1 && !ep_few_rows,
                 tile_route.is_some(),
-                self.moe.get(layer_index).and_then(Option::as_ref),
+                tile_moe.get(layer_index).and_then(Option::as_ref),
             );
             if let Some(stage) = expert_stage {
                 stage.prepare_runtime(gpu, layer_index, layer_moe)?;
@@ -12925,6 +13148,13 @@ impl Qwen4GpuForward {
                 && self.cut_layers.is_none()
                 && self.layer_capture.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+            // A BorrowPrefill tile is never retained-eligible: it has at least
+            // `QWEN4_DECODE_SHARE_RESIDENT_ROWS` (512) rows, so `n > 1`, and the
+            // predicate above requires `n == 1`.
+            debug_assert!(
+                !(eligible && self.borrow_runtimes_active),
+                "a BorrowPrefill tile can never be retained-eligible"
+            );
             // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
             // every route that would execute the program some other way.
             if cut_layers.is_some() {
@@ -13001,7 +13231,7 @@ impl Qwen4GpuForward {
                 // oracle) never runs the HIP body's per-call identity notes:
                 // validate the complete captured binding (tables, codec digests,
                 // arena generations) here, before any retained submit.
-                let moe = &self.moe;
+                let moe = tile_moe;
                 if let Err(reason) = gpu.replay.validate_route_identities(|key| {
                     moe.iter().flatten()
                         .flat_map(|layer| layer.retained_identities.iter())
@@ -13156,7 +13386,7 @@ impl Qwen4GpuForward {
                     let mut hooks = StagedMoeHooks {
                         stage,
                         bundle,
-                        moe: &self.moe,
+                        moe: tile_moe,
                         layer: 0,
                         error: None,
                         capture: capture_hooks
@@ -15019,6 +15249,50 @@ mod tests {
         assert!(refuse("gfx1201", fn_mode, 513, true, false, false, false).is_none());
         assert!(refuse("gfx1201", fn_mode, 16384, true, true, false, false).is_some());
         assert!(refuse("gfx1201", fn_mode, 16384, true, false, false, true).is_some());
+    }
+
+    #[test]
+    fn decode_share_prefill_tile_predicate_table() {
+        use super::decode_share_prefill_tile as tile;
+        let resident = super::QWEN4_DECODE_SHARE_RESIDENT_ROWS;
+        // (rows, argmax forward, lane step, mesh segment) -> prompt tile.
+        assert!(tile(resident, false, false, false));
+        assert!(tile(16384, false, false, false));
+        assert!(!tile(resident - 1, false, false, false));
+        assert!(!tile(1, false, false, false));
+        // A verify window / decode never reaches the resident rows; the
+        // device-argmax decode forward, lane steps and mesh segments never are.
+        assert!(!tile(4096, true, false, false));
+        assert!(!tile(4096, false, true, false));
+        assert!(!tile(4096, false, false, true));
+        assert!(resident > hipfire_config::QWEN4_VERIFY_MAX_ROWS);
+        assert!(!tile(
+            hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn decode_share_tile_moe_selects_the_borrow_twins_only_while_active() {
+        use super::tile_moe_of;
+        let resident = [Some(1u8), None, Some(3)];
+        let borrowed = [Some(11u8), None, Some(13)];
+        assert!(std::ptr::eq(
+            tile_moe_of(false, &resident, &borrowed),
+            &resident[..]
+        ));
+        assert!(std::ptr::eq(
+            tile_moe_of(true, &resident, &borrowed),
+            &borrowed[..]
+        ));
+        // No borrow twins: an inactive selector can only name the resident set.
+        let none: [Option<u8>; 0] = [];
+        assert!(std::ptr::eq(
+            tile_moe_of(false, &resident, &none),
+            &resident[..]
+        ));
     }
 
     /// The reference census: what `allocate` would hand out, built with the same
