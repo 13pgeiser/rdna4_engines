@@ -38,8 +38,12 @@ path on the **server's** filesystem (loopback-only unless `--api-key` is set).
   `detailed_description`, `<Picture N>` / `<Subject N>` / `<Setting N>` /
   `<Style N>` tags, timed shots, `<d>[English] …</d>` dialogue) is the format
   the model was trained on; short one-line prompts garble the audio.
-- **negative_prompt** — advanced/collapsed: only live when `guidance_scale > 1`,
-  inert at the CFG=1 these models usually run at.
+- **there is no negative_prompt** — deliberately. MiniMax-H3 is
+  guidance-distilled: CFG is baked into the weights and every step is a single
+  forward pass, so the model has no negative branch to steer. The server says so
+  too — a request that names `negative_prompt` on this model is *refused*
+  ("this model takes no guidance"), never silently ignored. Negative concepts
+  belong in the prompt's own wording.
 - **loras / lora 2** — **two dropdown slots** of the server-side adapters,
   `none` = off, either slot able to stand alone — the pair mirrors the
   server's `--max-loras 2`. The list is fetched from the box in `server_url`

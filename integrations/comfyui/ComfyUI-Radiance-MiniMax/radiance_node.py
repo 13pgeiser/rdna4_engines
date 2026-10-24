@@ -89,7 +89,11 @@ the typed text. The model was trained on the MiniMax format
 detailed_description, <Picture N> <Subject N> <Setting N> <Style N>
 tags, timed shots, <d>[English] ...</d> dialogue). Short one-line
 prompts garble the audio.
-negative_prompt: only live when guidance_scale > 1; inert at CFG=1.
+There is NO negative prompt: H3 is guidance-distilled (CFG is
+baked into the weights, one forward a step) and the server
+REFUSES a negative_prompt ("this model takes no guidance"),
+so a "negative" here could only ever fail the job. Negative
+concepts belong in the prompt's own wording.
 loras / lora 2: TWO server-side adapters, picked from
 dropdowns ('none' = off) -- the pair mirrors the server's
 --max-loras 2 slots; either may stand alone. The list is
@@ -370,8 +374,10 @@ class RadianceMiniMax(io.ComfyNode):
                 "  `detailed_description`, `<Picture N>`/`<Subject N>`/`<Setting N>`/`<Style N>` "
                 "tags, timed shots, `<d>[English] …</d>` dialogue); short one-liners garble "
                 "the audio.\n"
-                "- **negative_prompt** — advanced; only live when `guidance_scale > 1`, inert "
-                "at the CFG=1 these models run at.\n"
+                "- **no negative_prompt** — MiniMax-H3 is guidance-distilled (CFG is baked "
+                "into the weights, one forward per step); the server *refuses* a "
+                "`negative_prompt` (\"this model takes no guidance\") rather than ignoring "
+                "it, so negative concepts belong in the prompt's own wording.\n"
                 "- **loras / lora 2** — TWO server-side adapters in dropdown slots "
                 "(`none` = off; either may stand alone) — the pair mirrors the server's "
                 "`--max-loras 2`. The dropdowns list what the box in `server_url` serves "
@@ -466,9 +472,6 @@ class RadianceMiniMax(io.ComfyNode):
                                         "retention_analysis / detailed_description with "
                                         "<d>[lang] ...</d> dialogue) is what the model was "
                                         "trained on -- short prompts garble the audio"),
-                io.String.Input("negative_prompt", default="", optional=True, advanced=True,
-                                tooltip="only matters when guidance_scale > 1; inert at the "
-                                        "CFG=1 these models are usually run at"),
                 io.DynamicCombo.Input("resolution", tooltip=  # no default kwarg here --
                     # DynamicCombo.Input has none; the frontend shows the first option and
                     # web/radiance_size.js nudges fresh nodes to 480p (a loaded workflow
@@ -560,7 +563,7 @@ class RadianceMiniMax(io.ComfyNode):
     @classmethod
     def execute(cls, server_url, model, task, prompt, resolution, aspect, seconds, seed,
                 num_inference_steps, sampler, shift, audio_shift, custom_size="",
-                negative_prompt="", timeout=1800, show_help="off", docs="",
+                timeout=1800, show_help="off", docs="",
                 latent_upscale="off", loras="none", lora_strength=1.0,
                 lora2="none", lora2_strength=1.0, **media):
         size = _resolve_size(resolution, aspect, custom_size)
@@ -635,8 +638,6 @@ class RadianceMiniMax(io.ComfyNode):
             "num_inference_steps": str(num_inference_steps), "sampler": sampler,
             "shift": str(shift), "audio_shift": str(audio_shift),
         }
-        if (negative_prompt or "").strip():
-            data["negative_prompt"] = negative_prompt.strip()
         if str(latent_upscale) not in ("off", "", "1"):
             # the driver refuses upscale together with ANY packed conditioning -- references
             # AND endpoint keyframes ride the same table (video_driver.cpp, "does not yet
