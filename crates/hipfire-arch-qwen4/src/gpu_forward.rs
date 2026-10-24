@@ -533,6 +533,99 @@ pub(crate) fn qwen4_forward_allocation_sizes(
     Some(sizes)
 }
 
+/// Rows of the dedicated (resident) scratch bank of a decode-share load: decode, verify,
+/// lanes up to this total, and every prefill tile below it run there (verdict change 2).
+pub const QWEN4_DECODE_SHARE_RESIDENT_ROWS: usize = 512;
+
+/// Alignment of every root start inside a borrowed donor span.
+const DECODE_SHARE_ROOT_ALIGN: u64 = 256;
+
+/// Where one owning scratch root of a borrowed prefill bank lives inside the donor span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchRootPlacement {
+    pub field: ScratchField,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// The donor-span layout of one borrowed prefill bank ([`Qwen4GpuForwardScratch::borrowed_backing`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchBacking {
+    pub capacity_rows: usize,
+    /// [`ScratchField`] order, every owning non-empty slot EXCEPT `TokenIds`.
+    pub roots: Vec<ScratchRootPlacement>,
+    /// End of the last root rounded up to 256.
+    pub span_bytes: u64,
+}
+
+/// Capacity classes of the borrowed prefill bank for a load whose prompt chunk is `max_chunk`:
+/// powers of two from 1024 up to (excluding) `max_chunk`, then `max_chunk` itself; each class must
+/// be > [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`]. A borrow epoch whose largest tile has `r` rows uses the
+/// smallest class `>= r`, so a 1,000-row prompt dirties (and restores) about 1/16 of the tail.
+pub fn qwen4_decode_share_classes(max_chunk: usize) -> Vec<usize> {
+    let mut classes = Vec::new();
+    let mut class = 1024usize;
+    while class < max_chunk {
+        classes.push(class);
+        match class.checked_mul(2) {
+            Some(next) => class = next,
+            None => break,
+        }
+    }
+    if max_chunk > QWEN4_DECODE_SHARE_RESIDENT_ROWS {
+        classes.push(max_chunk);
+    }
+    classes
+}
+
+/// Device bytes a decode-share load charges for its forward instead of
+/// [`qwen4_forward_device_bytes`]`(config, max_chunk, mode)`: the resident bank
+/// (`device_bytes(config, QWEN4_DECODE_SHARE_RESIDENT_ROWS, mode)`), plus a persistent
+/// `TokenIds` owner for `max_chunk` rows if the resident plan's `TokenIds` is smaller (charged
+/// whole, so the sum never undercounts), plus the speculative buffers of `max_chunk` rows.
+pub fn qwen4_decode_share_dedicated_bytes(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<u64> {
+    let resident =
+        Qwen4GpuForwardScratch::device_bytes(config, QWEN4_DECODE_SHARE_RESIDENT_ROWS, mode)
+            .ok()?;
+    let token_ids = |rows: usize| -> Option<u64> {
+        let (slots, _) = Qwen4GpuForwardScratch::plan(config, rows, mode).ok()?;
+        u64::try_from(slots[ScratchField::TokenIds as usize].bytes().ok()?).ok()
+    };
+    let persistent_ids = {
+        let chunk = token_ids(max_chunk)?;
+        if token_ids(QWEN4_DECODE_SHARE_RESIDENT_ROWS)? < chunk {
+            chunk
+        } else {
+            0
+        }
+    };
+    let [logits, argmax] = qwen4_spec_buffer_bytes(config, max_chunk)?;
+    resident
+        .checked_add(persistent_ids)?
+        .checked_add(logits)?
+        .checked_add(argmax)
+}
+
+/// Bytes of the donor span: `borrowed_backing(config, max_chunk, ..).span_bytes`.
+pub fn qwen4_decode_share_borrow_bytes(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<u64> {
+    Qwen4GpuForwardScratch::borrowed_backing(
+        config,
+        max_chunk,
+        mode,
+        &Qwen4BandScope::single(config),
+    )
+    .ok()
+    .map(|backing| backing.span_bytes)
+}
+
 /// Free device memory a chunk rung must leave beside its chunk-sized
 /// resources for the kernels' lazily sized workspaces (333-347 MiB at
 /// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
@@ -6617,6 +6710,50 @@ impl Qwen4GpuForwardScratch {
             .filter(|slot| slot.owner.is_none())
             .map(|slot| slot.bytes().map(|bytes| bytes as u64))
             .filter(|bytes| !matches!(bytes, Ok(0)))
+    }
+
+    /// CPU-only: pack the owning roots of `plan_scoped(config, rows, mode, scope)` into one span,
+    /// each root start aligned to 256 bytes, in [`ScratchField`] order. `TokenIds` is excluded
+    /// (it stays a persistent owner shared by both banks: `uploaded_token_ids` outlives the
+    /// forward). Borrowed alias views (`owner.is_some()`) lie inside their owner's root by
+    /// construction, so the span holds every byte any view can address.
+    pub(crate) fn borrowed_backing(
+        config: &Qwen4Config,
+        rows: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+    ) -> Result<ScratchBacking, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan_scoped(config, rows, mode, scope)?;
+        let overflow = || invalid("borrowed scratch backing overflows");
+        let align = |x: u64| -> Result<u64, Qwen4GpuForwardError> {
+            x.checked_add(DECODE_SHARE_ROOT_ALIGN - 1)
+                .map(|x| x & !(DECODE_SHARE_ROOT_ALIGN - 1))
+                .ok_or_else(overflow)
+        };
+        let mut roots = Vec::with_capacity(slots.len());
+        let mut cursor = 0u64;
+        for (index, slot) in slots.iter().enumerate() {
+            let field = ScratchField::ALL[index];
+            if field == ScratchField::TokenIds || slot.owner.is_some() {
+                continue;
+            }
+            let bytes = u64::try_from(slot.bytes()?).map_err(|_| overflow())?;
+            if bytes == 0 {
+                continue;
+            }
+            let offset = align(cursor)?;
+            cursor = offset.checked_add(bytes).ok_or_else(overflow)?;
+            roots.push(ScratchRootPlacement {
+                field,
+                offset,
+                bytes,
+            });
+        }
+        Ok(ScratchBacking {
+            capacity_rows: rows,
+            roots,
+            span_bytes: align(cursor)?,
+        })
     }
 
     pub fn new(
@@ -13880,6 +14017,147 @@ mod tests {
             .filter(|slot| slot.owner.is_none())
             .map(|slot| slot.bytes().expect("slot bytes") as u64)
             .sum()
+    }
+
+    #[test]
+    fn decode_share_capacity_classes() {
+        use super::qwen4_decode_share_classes as classes;
+        assert_eq!(classes(16384), vec![1024, 2048, 4096, 8192, 16384]);
+        assert_eq!(classes(4096), vec![1024, 2048, 4096]);
+        assert_eq!(classes(3000), vec![1024, 2048, 3000]);
+        assert_eq!(classes(1024), vec![1024]);
+        assert_eq!(classes(600), vec![600]);
+        assert!(classes(512).is_empty());
+        assert!(classes(1).is_empty());
+        assert!(classes(0).is_empty());
+        for max_chunk in [600, 1024, 1536, 4096, 16384, 20000] {
+            let list = classes(max_chunk);
+            assert_eq!(list.last(), Some(&max_chunk));
+            assert!(list
+                .iter()
+                .all(|&c| c > super::QWEN4_DECODE_SHARE_RESIDENT_ROWS && c <= max_chunk));
+            assert!(list.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    #[test]
+    fn decode_share_borrowed_backing_holds_every_root_and_view() {
+        let config = fn_config();
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        for mode in [Mode::FnSymGfx1201, Mode::Full] {
+            let mut last_span = 0u64;
+            for rows in super::qwen4_decode_share_classes(16384) {
+                let (slots, _) = Scratch::plan_scoped(&config, rows, mode, &scope).unwrap();
+                let backing = Scratch::borrowed_backing(&config, rows, mode, &scope).unwrap();
+                assert_eq!(backing.capacity_rows, rows);
+                assert!(!backing.roots.is_empty());
+                // Sorted by field, 256-aligned, non-overlapping, TokenIds absent, sizes exact.
+                let mut end = 0u64;
+                let mut previous: Option<usize> = None;
+                for root in &backing.roots {
+                    assert_ne!(root.field, F::TokenIds);
+                    let index = root.field as usize;
+                    assert!(previous.map_or(true, |p| p < index), "{rows}: field order");
+                    previous = Some(index);
+                    assert_eq!(root.offset % 256, 0);
+                    assert!(root.offset >= end, "{rows}: {:?} overlaps", root.field);
+                    let slot = slots[index];
+                    assert!(slot.owner.is_none());
+                    assert_eq!(root.bytes, slot.bytes().unwrap() as u64);
+                    assert!(root.bytes > 0);
+                    end = root.offset + root.bytes;
+                }
+                assert_eq!(backing.span_bytes % 256, 0);
+                assert!(backing.span_bytes >= end && backing.span_bytes - end < 256);
+                // Every owning non-empty slot except TokenIds has a root, nothing else does.
+                let expected: Vec<F> = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        s.owner.is_none() && s.elements > 0 && F::ALL[*i] != F::TokenIds
+                    })
+                    .map(|(i, _)| F::ALL[i])
+                    .collect();
+                assert_eq!(
+                    backing.roots.iter().map(|r| r.field).collect::<Vec<_>>(),
+                    expected
+                );
+                // Every view slot lies inside its owner's root.
+                for (index, slot) in slots.iter().enumerate() {
+                    let Some(owner) = slot.owner else { continue };
+                    if slot.elements == 0 {
+                        continue;
+                    }
+                    let root = backing
+                        .roots
+                        .iter()
+                        .find(|r| r.field == owner)
+                        .unwrap_or_else(|| panic!("{rows}: view {index} owner {owner:?} unbacked"));
+                    // `slot.offset` and `pitch` count elements of the OWNER's dtype
+                    // (`allocate`); a Raw view (`QsaSelected`) is byte elements over an
+                    // F32-covered region.
+                    let owner_size = slots[owner as usize].dtype.size() as u64;
+                    let view_size = slot.dtype.size() as u64;
+                    if slot.dtype != slots[owner as usize].dtype {
+                        assert_eq!(slot.dtype, rdna_compute::DType::Raw);
+                    }
+                    let first = slot.offset as u64 * owner_size;
+                    assert!(
+                        first + slot.elements as u64 * view_size <= root.bytes,
+                        "{rows}: view {:?} overruns {owner:?}",
+                        F::ALL[index]
+                    );
+                    // Pitched views address `rows * pitch` elements from their offset
+                    // (`segment_view`).
+                    if let Some(pitch) = slot.pitch {
+                        assert!(
+                            first + rows as u64 * pitch as u64 * owner_size <= root.bytes,
+                            "{rows}: pitched view {:?} overruns {owner:?}",
+                            F::ALL[index]
+                        );
+                    }
+                }
+                assert!(backing.span_bytes >= last_span, "{rows}: span not monotone");
+                last_span = backing.span_bytes;
+                // The charge helper reads the same plan.
+                if rows == 16384 {
+                    assert_eq!(
+                        super::qwen4_decode_share_borrow_bytes(&config, rows, mode),
+                        Some(backing.span_bytes)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_share_dedicated_bytes_undercut_the_full_forward() {
+        let config = fn_config();
+        for mode in [Mode::FnSymGfx1201, Mode::Full] {
+            for max_chunk in [1024usize, 4096, 16384] {
+                let forward = qwen4_forward_device_bytes(&config, max_chunk, mode).unwrap();
+                let dedicated =
+                    super::qwen4_decode_share_dedicated_bytes(&config, max_chunk, mode).unwrap();
+                assert!(
+                    dedicated < forward,
+                    "{mode:?} {max_chunk}: {dedicated} >= {forward}"
+                );
+                let resident = scratch_bytes(super::QWEN4_DECODE_SHARE_RESIDENT_ROWS, mode);
+                let [logits, argmax] = super::qwen4_spec_buffer_bytes(&config, max_chunk).unwrap();
+                let ids = plan(max_chunk, mode)[F::TokenIds as usize].bytes().unwrap() as u64;
+                assert_eq!(dedicated, resident + ids + logits + argmax);
+                // The borrowed bank plus the TokenIds owner is the rest of the forward
+                // (the resident bank is a strict subset at 512 rows).
+                let backing = Scratch::borrowed_backing(
+                    &config,
+                    max_chunk,
+                    mode,
+                    &crate::weights::Qwen4BandScope::single(&config),
+                )
+                .unwrap();
+                assert!(backing.span_bytes + ids >= scratch_bytes(max_chunk, mode));
+            }
+        }
     }
 
     /// `G(r)`: tile-padded grouped rows of `r` rows, top-10 of 512 experts.
