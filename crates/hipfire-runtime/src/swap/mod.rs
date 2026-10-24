@@ -47,7 +47,15 @@ impl std::error::Error for SwapError {}
 /// allocated on demand and freed on take. 30 sessions averaging 8K tokens is
 /// ~4 GB, so this absorbs a realistic pool while leaving a 125 GiB box room
 /// for the model and everything else. Beyond it, snapshots go to disk.
+///
+/// Deployment policy: the serve process config sets this from
+/// `serve.swap_host_bytes` (default 16 GiB, 0 disables the host tier).
 pub const DEFAULT_HOST_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Default disk-tier budget for spill files. The disk tier is a bounded cache,
+/// not an unbounded tail: when it fills, the least-recently-used snapshot is
+/// evicted and its session re-prefills on the next turn.
+pub const DEFAULT_DISK_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Ties the store to the session table: capture on eviction, restore on
 /// resume, and mark the session `Cold` on any failure.
@@ -63,9 +71,13 @@ pub struct SwapManager {
 }
 
 impl SwapManager {
-    pub fn new(dir: std::path::PathBuf, host_budget_bytes: u64) -> Result<Self, SwapError> {
+    pub fn new(
+        dir: std::path::PathBuf,
+        host_budget_bytes: u64,
+        disk_budget_bytes: u64,
+    ) -> Result<Self, SwapError> {
         Ok(SwapManager {
-            store: store::SwapStore::new(dir, host_budget_bytes)?,
+            store: store::SwapStore::new(dir, host_budget_bytes, disk_budget_bytes)?,
             evictions: 0,
             restores: 0,
             failures: 0,
@@ -128,6 +140,7 @@ mod manager_tests {
         SlotSnapshot {
             stamp: SnapshotStamp {
                 model_hash: 1,
+                instance_id: 1,
                 kv_dtype_tag: 1,
                 per_pos_bytes: 4,
                 per_pos_v_bytes: 4,
@@ -151,7 +164,7 @@ mod manager_tests {
 
     #[test]
     fn park_then_unpark_returns_the_snapshot_and_counts_both() {
-        let mut m = SwapManager::new(dir("rt"), 1 << 20).unwrap();
+        let mut m = SwapManager::new(dir("rt"), 1 << 20, 1 << 30).unwrap();
         m.park(7, snap(64)).unwrap();
         assert_eq!(m.stats().0, 1);
         let back = m.unpark(7).unwrap();
@@ -161,14 +174,14 @@ mod manager_tests {
 
     #[test]
     fn unparking_an_unknown_key_fails_and_is_counted_not_panicked() {
-        let mut m = SwapManager::new(dir("miss"), 1 << 20).unwrap();
+        let mut m = SwapManager::new(dir("miss"), 1 << 20, 1 << 30).unwrap();
         assert!(m.unpark(99).is_err());
         assert_eq!(m.stats().2, 1, "the failure must be visible in stats");
     }
 
     #[test]
     fn a_failed_unpark_drops_the_key_so_it_is_not_retried_forever() {
-        let mut m = SwapManager::new(dir("drop"), 1 << 20).unwrap();
+        let mut m = SwapManager::new(dir("drop"), 1 << 20, 1 << 30).unwrap();
         m.park(1, snap(64)).unwrap();
         let _ = m.unpark(1);
         assert!(m.unpark(1).is_err());
