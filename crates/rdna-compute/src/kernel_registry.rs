@@ -3637,6 +3637,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemv_mq4g256v2_residual_sigmoid_scaled_k512",]
         );
         add!(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
+            kernels::GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_R2_SRC,
+            ["gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2"]
+        );
+        add!(
             "repeat_interleave_qk_batched",
             kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC,
             ["repeat_interleave_qk_f32_batched"]
@@ -4055,6 +4060,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_hfq4g256_moe_ninepath_d4",
             kernels::GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC,
             ["gemv_hfq4g256_moe_ninepath_d4"]
+        );
+        // qt53 (MQ4G128V2) routed-down nine-path (`moe_program.rs`
+        // ninepath_mq4g128v2): fused silu*up + FWHT128 + down + combine.
+        add!(
+            "gemv_mq4g128v2_moe_ninepath_d4",
+            kernels::GEMV_MQ4G128V2_MOE_NINEPATH_D4_SRC,
+            ["gemv_mq4g128v2_moe_ninepath_d4"]
         );
         add!(
             "gemv_mq6g256v2_moe_ninepath_d4",
@@ -9955,6 +9967,24 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The 0.4.4 mq4rs (A3B MQ4G128V2) decode kernels: the fused qt53
+        // nine-path down and the two-row shared-expert k512 GEMV.
+        const MQ4RS_DECODE_ADDED_MODULES: [&str; 2] = [
+            "gemv_mq4g128v2_moe_ninepath_d4",
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
+        ];
+        for module in MQ4RS_DECODE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing mq4rs decode module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -9967,7 +9997,8 @@ mod tests {
                 + SHARED_I8_ADDED_MODULES.len()
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
-                + MOE_FRONT_ADDED_MODULES.len(),
+                + MOE_FRONT_ADDED_MODULES.len()
+                + MQ4RS_DECODE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

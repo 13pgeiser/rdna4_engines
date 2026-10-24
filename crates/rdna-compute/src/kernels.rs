@@ -2699,6 +2699,12 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
+/// Two-row-per-wave twin of [`GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC`]
+/// (geometry of `gemv_hfq4g256_residual_sigmoid_scaled_gpu`), byte-exact with
+/// it. Same 40-byte ABI, grid `M / 2`. Launcher-gated to exact gfx1201 / M=2048
+/// / K=512. Symbol `gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2`.
+pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_R2_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2.hip");
 /// Generic-K x-batched MQ4G256V2 GEMV (`y[b] = A . x[b]`, B <= 4): each weight
 /// row is decoded once per launch and every row keeps the scalar kernel's
 /// accumulation order. The batched path on GPUs without WMMA.
@@ -3047,6 +3053,17 @@ pub const GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC: &str =
 /// sole route-weight application.
 pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip");
+
+/// qt=53 (MQ4G128V2) nine-path fused decode down for qwen35 MoE layers
+/// (T=1, k=8, down_k=512): silu(gate)*up, the qt53 FWHT128 rotation, the eight
+/// routed MQ4G128V2 down GEMVs, the ordered weighted combine and the residual
+/// accumulate in one launch. Byte-exact with the four-kernel sequence it
+/// replaces (`silu_mul_f32`, `mq_rotate_x_128_v2`,
+/// `gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded`,
+/// `moe_down_combine_k8_batched`). Default export:
+/// `gemv_mq4g128v2_moe_ninepath_d4`.
+pub const GEMV_MQ4G128V2_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_ninepath_d4.hip");
 
 /// Portable F32 parity consumer for qt53 grouped down.  It preserves the
 /// indexed decode kernel's 32-lane reduction association while reusing one

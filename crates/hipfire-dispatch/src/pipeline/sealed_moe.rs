@@ -7985,6 +7985,7 @@ mod tests {
             ninepath_d4: false,
             ninepath_mq3l: false,
             ninepath_mq4v2: false,
+            ninepath_mq4g128v2: false,
             ninepath_mq6v2: false,
             cpu_deferred_experts: false,
             cpu_split: false,

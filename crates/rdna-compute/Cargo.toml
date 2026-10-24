@@ -1141,3 +1141,7 @@ required-features = ["lab"]
 [[example]]
 name = "lane_rows_pm_gfx1201_h0"
 required-features = ["lab"]
+
+[[example]]
+name = "gate_up_tiles_oracle"
+required-features = ["lab"]
