@@ -825,6 +825,116 @@ pub(crate) fn ptr_add_bytes(ptr: *mut c_void, bytes: usize) -> *mut c_void {
     (ptr as *mut u8).wrapping_add(bytes) as *mut c_void
 }
 
+/// `(W, S)` stream-split geometry (weight rows per workgroup, waves per
+/// workgroup) of the MQ6G256V2 few-row verify kernels
+/// (`gemm_mq6g256v2_f32_rows[_x4]_split_r{rows}_w{W}_s{S}`) for `rows`
+/// activation rows and `m_total` output rows (summed over the x4 slots), or
+/// `None` to keep the incumbent one-warp-per-row kernels. Measured table;
+/// exact gfx1201 / gfx1100 only, 3..=8 rows.
+pub(crate) fn mq6_rows_split_config(
+    arch: &str,
+    rows: usize,
+    m_total: usize,
+) -> Option<(usize, usize)> {
+    if !(3..=8).contains(&rows) {
+        return None;
+    }
+    match arch {
+        "gfx1201" => Some(if m_total <= 8192 {
+            (4, 4)
+        } else if rows <= 4 {
+            (8, 4)
+        } else {
+            (4, 1)
+        }),
+        "gfx1100" => Some(if m_total <= 8192 {
+            if rows <= 4 {
+                (8, 4)
+            } else {
+                (4, 4)
+            }
+        } else if m_total <= 65536 {
+            (4, 4)
+        } else if rows <= 5 {
+            (8, 4)
+        } else if rows <= 7 {
+            (4, 1)
+        } else {
+            (4, 4)
+        }),
+        _ => None,
+    }
+}
+
+/// Export name of the stream-split MQ6 kernel (`x4` selects the four-matrix
+/// form); `(rows, w, s)` must come from [`mq6_rows_split_config`].
+pub(crate) fn mq6_split_name(x4: bool, rows: usize, w: usize, s: usize) -> &'static str {
+    macro_rules! names {
+        ($($r:literal)*) => {
+            match (x4, rows, w, s) {
+                $(
+                    (false, $r, 8, 4) => concat!("gemm_mq6g256v2_f32_rows_split_r", $r, "_w8_s4"),
+                    (false, $r, 4, 4) => concat!("gemm_mq6g256v2_f32_rows_split_r", $r, "_w4_s4"),
+                    (false, $r, 4, 1) => concat!("gemm_mq6g256v2_f32_rows_split_r", $r, "_w4_s1"),
+                    (true, $r, 8, 4) => concat!("gemm_mq6g256v2_f32_rows_x4_split_r", $r, "_w8_s4"),
+                    (true, $r, 4, 4) => concat!("gemm_mq6g256v2_f32_rows_x4_split_r", $r, "_w4_s4"),
+                    (true, $r, 4, 1) => concat!("gemm_mq6g256v2_f32_rows_x4_split_r", $r, "_w4_s1"),
+                )*
+                _ => unreachable!("mq6 split config comes from mq6_rows_split_config"),
+            }
+        };
+    }
+    names!(3 4 5 6 7 8)
+}
+
+#[cfg(test)]
+mod mq6_rows_split_tests {
+    use super::*;
+
+    #[test]
+    fn config_table() {
+        assert_eq!(mq6_rows_split_config("gfx1201", 3, 8192), Some((4, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1201", 8, 8192), Some((4, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1201", 3, 8193), Some((8, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1201", 4, 248320), Some((8, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1201", 5, 8193), Some((4, 1)));
+        assert_eq!(mq6_rows_split_config("gfx1201", 8, 248320), Some((4, 1)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 4, 8192), Some((8, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 5, 8192), Some((4, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 3, 8193), Some((4, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 8, 65536), Some((4, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 3, 65537), Some((8, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 5, 65537), Some((8, 4)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 6, 65537), Some((4, 1)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 7, 248320), Some((4, 1)));
+        assert_eq!(mq6_rows_split_config("gfx1100", 8, 248320), Some((4, 4)));
+    }
+
+    #[test]
+    fn config_none_cases() {
+        for rows in [0, 1, 2, 9, 16, 64] {
+            assert_eq!(mq6_rows_split_config("gfx1201", rows, 1000), None);
+            assert_eq!(mq6_rows_split_config("gfx1100", rows, 1000), None);
+        }
+        for arch in ["gfx1151", "gfx1150", "gfx906", "gfx1030", ""] {
+            assert_eq!(mq6_rows_split_config(arch, 4, 1000), None);
+        }
+    }
+
+    #[test]
+    fn names_cover_every_config() {
+        for x4 in [false, true] {
+            for r in 3..=8 {
+                for (w, s) in [(8, 4), (4, 4), (4, 1)] {
+                    let n = mq6_split_name(x4, r, w, s);
+                    assert!(n.ends_with(&format!("_split_r{r}_w{w}_s{s}")));
+                    assert_eq!(n.contains("_x4_"), x4);
+                }
+            }
+        }
+    }
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -22660,6 +22770,58 @@ impl Gpu {
         {
             return self.gemv_mq6g256v2_x4_xbatch_pm(parts, x, k, rows);
         }
+        if self.flags.mq6_rows_split_enabled() {
+            let m_total: usize = parts.iter().map(|(_, _, m)| m).sum();
+            if let Some((w, s)) = mq6_rows_split_config(&self.arch, rows, m_total) {
+                let name = mq6_split_name(true, rows, w, s);
+                self.bind_thread()?;
+                self.ensure_kernel(
+                    "gemm_mq6g256v2_f32_rows",
+                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                    name,
+                )?;
+                let a = parts.map(|(wt, _, _)| wt.buf.as_ptr());
+                let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+                let m = parts.map(|(_, _, m)| m as i32);
+                let x_ptr = x.buf.as_ptr();
+                let k_val = k as i32;
+                let blocks: usize = parts.iter().map(|(_, _, mi)| mi.div_ceil(w)).sum();
+                let mut params: Vec<*mut c_void> = Vec::with_capacity(14);
+                for p in &a {
+                    params.push(p as *const _ as *mut c_void);
+                }
+                params.push(&x_ptr as *const _ as *mut c_void);
+                for p in &y {
+                    params.push(p as *const _ as *mut c_void);
+                }
+                for v in &m {
+                    params.push(v as *const _ as *mut c_void);
+                }
+                params.push(&k_val as *const _ as *mut c_void);
+                return self.launch_maybe_blob(
+                    name,
+                    [blocks as u32, 1, 1],
+                    [(32 * s) as u32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        for p in a {
+                            b.push_ptr(p);
+                        }
+                        b.push_ptr(x_ptr);
+                        for p in y {
+                            b.push_ptr(p);
+                        }
+                        for v in m {
+                            b.push_i32(v);
+                        }
+                        b.push_i32(k_val);
+                        b
+                    },
+                );
+            }
+        }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
         self.ensure_kernel(
@@ -24905,6 +25067,51 @@ impl Gpu {
         let name = NAMES[rows - 2];
         if self.lane_rows_pm_enabled() && crate::lane_rows_pm::mq6_admits(m, k, rows) {
             return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
+        }
+        if self.flags.mq6_rows_split_enabled() {
+            if let Some((w, s)) = mq6_rows_split_config(&self.arch, rows, m) {
+                let name = mq6_split_name(false, rows, w, s);
+                self.bind_thread()?;
+                self.ensure_kernel(
+                    "gemm_mq6g256v2_f32_rows",
+                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                    name,
+                )?;
+                let a_ptr = a_raw.buf.as_ptr();
+                let x_ptr = x.buf.as_ptr();
+                let y_ptr = y.buf.as_ptr();
+                let m_val = m as i32;
+                let k_val = k as i32;
+                let mut params: [*mut c_void; 5] = [
+                    &a_ptr as *const _ as *mut c_void,
+                    &x_ptr as *const _ as *mut c_void,
+                    &y_ptr as *const _ as *mut c_void,
+                    &m_val as *const _ as *mut c_void,
+                    &k_val as *const _ as *mut c_void,
+                ];
+                let bytes = sizes.iter().fold(0usize, |acc, &n| acc.saturating_add(n));
+                let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+                let result = self.launch_maybe_blob(
+                    name,
+                    [m.div_ceil(w) as u32, 1, 1],
+                    [(32 * s) as u32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr);
+                        b.push_ptr(x_ptr);
+                        b.push_ptr(y_ptr);
+                        b.push_i32(m_val);
+                        b.push_i32(k_val);
+                        b
+                    },
+                );
+                if let Some(t) = timer {
+                    t.finish(&self.hip);
+                }
+                return result;
+            }
         }
         self.bind_thread()?;
         self.ensure_kernel(

@@ -1034,6 +1034,10 @@ name = "mq6_lm_head_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_rows_split_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "bf16_rows_pm_oracle"
 required-features = ["lab"]
 

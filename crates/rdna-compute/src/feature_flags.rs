@@ -771,6 +771,10 @@ pub struct FeatureFlags {
     /// for gfx1151 (`0` is the kill switch); exact gfx1151, the lane step and
     /// the Qwen4 speculative verify only.
     pub fn_lane_pm_rows: bool,
+    /// Stream-split MQ6G256V2 few-row verify kernels (`HIPFIRE_MQ6_ROWS_SPLIT`),
+    /// 3..=8 rows, byte-identical to the incumbent rows kernels. Default on for
+    /// exact gfx1201 and gfx1100; `0` restores the incumbent kernels.
+    pub mq6_rows_split: bool,
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
     /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
     /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
@@ -1388,6 +1392,8 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
+            mq6_rows_split: parse_bool("HIPFIRE_MQ6_ROWS_SPLIT")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1100")),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref()
                 != Some("0"),
             qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
@@ -1479,6 +1485,12 @@ impl FeatureFlags {
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
+    }
+
+    /// MQ6 stream-split few-row verify kernels (`HIPFIRE_MQ6_ROWS_SPLIT`, exact
+    /// gfx1201 / gfx1100: on unless `0`).
+    pub fn mq6_rows_split_enabled(&self) -> bool {
+        self.mq6_rows_split && matches!(self.arch.as_str(), "gfx1201" | "gfx1100")
     }
 
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
@@ -1926,6 +1938,7 @@ impl FeatureFlags {
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
+            mq6_rows_split: false,
             qwen4_qsa_decode_splitk: false,
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
@@ -2222,6 +2235,27 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
+    }
+
+    /// The MQ6 split rows kernels default on for exact gfx1201 / gfx1100: `0`
+    /// is the kill switch and no other arch admits them.
+    #[test]
+    fn mq6_rows_split_defaults_on_gfx1201_gfx1100_and_zero_kills() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_MQ6_ROWS_SPLIT" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let on = matches!(arch, "gfx1201" | "gfx1100");
+            assert_eq!(flags(None).mq6_rows_split_enabled(), on, "{arch}: unset");
+            assert!(!flags(Some("0")).mq6_rows_split_enabled(), "{arch}: 0");
+            assert_eq!(flags(Some("1")).mq6_rows_split_enabled(), on, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").mq6_rows_split_enabled());
     }
 
     /// The QSA split decode knob is default on and only the exact value `0`
