@@ -325,6 +325,11 @@ pub(crate) struct LoadedInfo {
     pub(crate) kv_backend: Option<String>,
     /// `max_seq` the daemon reported in the ack (not the requested value).
     pub(crate) max_seq: Option<u64>,
+    /// Live multi-slot swap-tier snapshot from the daemon's load ack / `done`
+    /// events (tier, counters, usage, budgets). `null` on the standard route
+    /// or before the first load ack. Published through `/health` without
+    /// taking the runtime lock.
+    pub(crate) swap: serde_json::Value,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -456,6 +461,44 @@ pub(crate) struct ServeShared {
     /// (no API key configured) leaves every route open, as before. Never
     /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
     pub(crate) api_key: Option<BearerToken>,
+}
+
+/// Initial `/health` swap snapshot from the resolved process policy. The
+/// daemon's first `done` replaces it: the effective disk budget can differ
+/// when the swap directory is read-only or already locked.
+fn configured_swap_json(
+    process: &hipfire_config::ProcessConfig,
+    multi_slot: bool,
+) -> serde_json::Value {
+    if !multi_slot {
+        return serde_json::Value::Null;
+    }
+    let config_u64 = |key: &str| {
+        process.values.get(key).and_then(|value| match value {
+            hipfire_config::ConfigValue::Integer(i) => u64::try_from(*i).ok(),
+            _ => None,
+        })
+    };
+    let host = config_u64("serve.swap_host_bytes")
+        .unwrap_or(hipfire_runtime::swap::DEFAULT_HOST_BUDGET_BYTES);
+    let disk = config_u64("serve.swap_disk_bytes")
+        .unwrap_or(hipfire_runtime::swap::DEFAULT_DISK_BUDGET_BYTES);
+    let tier = match (host > 0, disk > 0) {
+        (true, true) => "host+disk",
+        (true, false) => "host",
+        (false, true) => "disk",
+        (false, false) => "none",
+    };
+    serde_json::json!({
+        "tier": tier,
+        "evictions": 0,
+        "restores": 0,
+        "failures": 0,
+        "host_budget": host,
+        "host_used": 0,
+        "disk_budget": disk,
+        "disk_used": 0,
+    })
 }
 
 /// Build the route capability advertisement from the resolved serve
@@ -1400,6 +1443,15 @@ pub(crate) fn parse_bind(
     Ok((address.to_owned(), port.unwrap_or(default_port)))
 }
 
+/// Swap policy is resolved by the daemon at load; a live server's policy
+/// cannot be changed by re-running `serve -d`. Say so instead of silently
+/// accepting flags that were not applied.
+const UNAPPLIED_SWAP_FLAGS: &str = "hipfire: serve is already running; --swap-host-bytes, --swap-disk-bytes and --swap-dir were not applied. Run `hipfire stop` and start serve again to change the swap policy.";
+
+fn has_swap_flags(args: &ServeArgs) -> bool {
+    args.swap_host_bytes.is_some() || args.swap_disk_bytes.is_some() || args.swap_dir.is_some()
+}
+
 /// Builds the detached child's argv. `--open` stays a parent-only action; the
 /// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
 fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port: u16) -> Command {
@@ -1432,6 +1484,15 @@ fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port:
     }
     if let Some(max_seq) = args.max_seq {
         command.arg("--max-seq").arg(max_seq.to_string());
+    }
+    if let Some(bytes) = args.swap_host_bytes {
+        command.arg("--swap-host-bytes").arg(bytes.to_string());
+    }
+    if let Some(bytes) = args.swap_disk_bytes {
+        command.arg("--swap-disk-bytes").arg(bytes.to_string());
+    }
+    if let Some(dir) = &args.swap_dir {
+        command.arg("--swap-dir").arg(dir);
     }
     if let Some(seconds) = args.idle_timeout {
         command.arg("--idle-timeout").arg(seconds.to_string());
@@ -1482,6 +1543,9 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                     record.pid,
                     log_path.display()
                 );
+                if has_swap_flags(args) {
+                    eprintln!("{UNAPPLIED_SWAP_FLAGS}");
+                }
                 return Ok(());
             }
             bail!(
@@ -1650,9 +1714,29 @@ pub(crate) fn serve_foreground(
 ) -> Result<()> {
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let registry = load_registry(&paths.registry).registry;
+    // Swap budgets are deployment policy resolved by the daemon from the
+    // process config. Apply the CLI overrides there rather than in the load
+    // request, so a direct `--swap-*` and the matching schema key cannot
+    // diverge and the values survive every respawn.
+    let mut process_config = hipfire_config::ProcessConfig::from_resolved(&global)?;
+    if let Some(bytes) = args.swap_host_bytes {
+        process_config
+            .values
+            .set_cli("serve.swap_host_bytes", &bytes.to_string())?;
+    }
+    if let Some(bytes) = args.swap_disk_bytes {
+        process_config
+            .values
+            .set_cli("serve.swap_disk_bytes", &bytes.to_string())?;
+    }
+    if let Some(dir) = &args.swap_dir {
+        process_config
+            .values
+            .set_cli("serve.swap_dir", &dir.display().to_string())?;
+    }
     let spawner = EngineSpawner {
         daemon,
-        process_config: hipfire_config::ProcessConfig::from_resolved(&global)?,
+        process_config,
         attempts: ENGINE_RESPAWN_ATTEMPTS,
         backoff: ENGINE_RESPAWN_BACKOFF,
     };
@@ -2379,6 +2463,9 @@ impl ServeRuntime {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
                 max_seq: loaded.get("max_seq").and_then(serde_json::Value::as_u64),
+                swap: loaded.get("swap").cloned().unwrap_or_else(|| {
+                    configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled)
+                }),
             };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
@@ -2463,6 +2550,7 @@ impl ServeRuntime {
         // read the same at /health, not two spellings of "no reasoning".
         let mut loaded = LoadedInfo::default();
         loaded.reasoning_contract = "unsupported".to_owned();
+        loaded.swap = configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled);
         meta.loaded = loaded;
         meta.engine_stats = None;
     }
@@ -3210,6 +3298,12 @@ mod tests {
             "mtp",
             "--max-seq",
             "8192",
+            "--swap-host-bytes",
+            "1048576",
+            "--swap-disk-bytes",
+            "2097152",
+            "--swap-dir",
+            "/tmp/hipfire swap dir",
             "--continuous-batch-size",
             "4",
             "--open",
@@ -3239,6 +3333,9 @@ mod tests {
             "--kv-backend",
             "--idle-timeout",
             "--tp",
+            "--swap-host-bytes",
+            "--swap-disk-bytes",
+            "--swap-dir",
             "--continuous-batch-size",
             "--spec",
             "--ui",
@@ -3266,11 +3363,34 @@ mod tests {
         assert_eq!(child.tp, args.tp);
         assert_eq!(child.speculation, args.speculation);
         assert_eq!(child.max_seq, Some(8192));
+        assert_eq!(child.swap_host_bytes, Some(1_048_576));
+        assert_eq!(child.swap_disk_bytes, Some(2_097_152));
+        assert_eq!(child.swap_dir, Some(PathBuf::from("/tmp/hipfire swap dir")));
         assert_eq!(child.continuous_batch_size, args.continuous_batch_size);
         assert!(child.foreground_child);
         assert!(!child.detach);
         assert!(!child.open);
         assert!(child.ui);
+    }
+
+    #[test]
+    fn an_existing_server_notes_unapplied_swap_flags() {
+        let with_flags = parse_serve_args(&[
+            "hipfire",
+            "serve",
+            "--swap-host-bytes",
+            "0",
+            "--swap-disk-bytes",
+            "0",
+            "--swap-dir",
+            "/tmp/swap",
+        ]);
+        assert!(has_swap_flags(&with_flags));
+        let without = parse_serve_args(&["hipfire", "serve"]);
+        assert!(!has_swap_flags(&without));
+        for flag in ["--swap-host-bytes", "--swap-disk-bytes", "--swap-dir"] {
+            assert!(UNAPPLIED_SWAP_FLAGS.contains(flag), "{flag}");
+        }
     }
 
     #[test]
@@ -3996,6 +4116,7 @@ mod tests {
                 kv_mode: Some("asym3".into()),
                 kv_backend: Some("paged".into()),
                 max_seq: Some(32768),
+                ..LoadedInfo::default()
             },
             ..ServeMeta::new("test".to_owned())
         });

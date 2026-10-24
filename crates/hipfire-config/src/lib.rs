@@ -1496,6 +1496,66 @@ pub static FIELDS: &[ConfigField] = &[
         "Experimental: retained shared-prefix cache ceiling including hybrid snapshots; 0 means no retained cache, never unlimited (spec §4.4, §9.1)."
     ),
     field!(
+        "serve.swap_host_bytes",
+        "swap_host_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(17179869184),
+        ValueRule::Integer { min: 0, max: 1099511627776 },
+        true,
+        true,
+        Some("HIPFIRE_SWAP_HOST_BYTES"),
+        "Multi-slot serve: host-RAM ceiling for parked session swap snapshots, in bytes; 0 disables the host tier so snapshots spill to disk."
+    ),
+    field!(
+        "serve.swap_disk_bytes",
+        "swap_disk_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(8589934592),
+        ValueRule::Integer { min: 0, max: 1099511627776 },
+        true,
+        true,
+        Some("HIPFIRE_SWAP_DISK_BYTES"),
+        "Multi-slot serve: disk ceiling for parked session swap snapshots, in bytes; 0 disables disk spill. A snapshot larger than the ceiling is refused without evicting the cache; otherwise the least-recently-used snapshot is evicted and its session re-prefills."
+    ),
+    field!(
+        "serve.swap_dir",
+        "swap_dir",
+        Serve,
+        Process,
+        DefaultValue::String(""),
+        ValueRule::String,
+        true,
+        true,
+        Some("HIPFIRE_SWAP_DIR"),
+        "Multi-slot serve: directory for swap spill files. Empty uses $XDG_RUNTIME_DIR/hipfire/swap/<pid>, falling back to $TMPDIR/hipfire-swap-<pid>. The directory is created 0700, must be owned by this user, is locked to one daemon, and may not be a symlink; stale *.snap files are removed at start and other files are left untouched."
+    ),
+    field!(
+        "serve.multi_slot_session_ttl_secs",
+        "multi_slot_session_ttl_secs",
+        Serve,
+        Process,
+        DefaultValue::Integer(3600),
+        ValueRule::Integer { min: 0, max: 86400 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS"),
+        "Multi-slot route: close a parked (swapped or cold) session after this many seconds idle; 0 disables the idle sweep (the hard session cap still applies)."
+    ),
+    field!(
+        "serve.multi_slot_max_sessions",
+        "multi_slot_max_sessions",
+        Serve,
+        Process,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 4096 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_MAX_SESSIONS"),
+        "Multi-slot route: hard cap on session-table entries; 0 means auto max(64, 16 x serve.multi_slot_slots). Only parked sessions are closed to enforce it."
+    ),
+    field!(
         "serve.max_batch_tokens",
         "max_batch_tokens",
         Serve,

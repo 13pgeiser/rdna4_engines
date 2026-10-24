@@ -134,7 +134,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_ONLINE_TUNE` | **unset / off**; `stats` or `on` | Developer-only online draft tuning (`crates/hipfire-runtime/src/dflash_online.rs`). Covers Qwen3.5 chain DFlash on the greedy batched LM-head path, and the generic (llama-family) DFlash chain at greedy and temp>0. Takes the draft's top-16 per row on device and re-ranks it on the host with a per-request model trained from tokens the target already verified. Features: chain n-grams, suffix match, stutter, neighbour-row tokens. Verify is unchanged. `stats` keeps argmax proposals and prints acceptance-ceiling stats. `sweep` drafts a token the target never picks, so a dump records the draft's top-K at every position for `--simulate`. Learner weights carry across requests; session text statistics reset per request. `HIPFIRE_DFLASH_ONLINE_HP=lr=..,acc0=..,margin=..,inject=..,carry=0|1` overrides learner settings. `HIPFIRE_DFLASH_ONLINE_DUMP=<file>` writes records for `examples/dflash_online_replay.rs`. |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
-| `HIPFIRE_SPEC_RETIRE` | **unset → `1.5`**; `off`/`0` disables; `<base>[,<per_1k_ctx>]` sets the break-even line | Per-request spec → AR retirement (`crates/hipfire-runtime/src/spec_retire.rs`) for greedy requests on Qwen3.5-family DFlash and generic (llama-family) DFlash. Every 16 spec cycles the request's mean committed tokens per cycle is compared with `base + per_1k_ctx × position / 1024`; two failing windows in a row switch the rest of the request to target-only AR tokens (draft context kept in sync). Token counts only, so a greedy request retires at the same cycle on every run. The default retires drafters that commit under 1.5 tokens per cycle, below the smallest measured cycle/AR cost ratio (gfx1151 Qwen3.8-27B: 1.53–1.73 up to 32K). `done` carries `spec_retired`, `spec_retired_at` and `ar_tokens` when a request retired; serve exports `hipfire_spec_retired_total`. Malformed values turn retirement off with a log line. |
+| `HIPFIRE_SPEC_RETIRE` | **unset → `1.5`**; `off`/`0` disables; `<base>[,<per_1k_ctx>]` sets the break-even line | Per-request spec → AR retirement (`crates/hipfire-runtime/src/spec_retire.rs`) for greedy requests on Qwen3.5-family DFlash and generic (llama-family) DFlash. Every 16 spec cycles the request's mean committed tokens per cycle (accepted τ + 1, not `done.tau`) is compared with `base + per_1k_ctx × position / 1024`; two failing windows in a row switch the rest of the request to target-only AR tokens (draft context kept in sync). Token counts only, so a greedy request retires at the same cycle on every run. The default retires drafters that commit under 1.5 tokens per cycle, below the smallest measured cycle/AR cost ratio (gfx1151 Qwen3.8-27B: 1.53–1.73 up to 32K). `done` carries `spec_retired`, `spec_retired_at` and `ar_tokens` when a request retired; serve exports `hipfire_spec_retired_total`. Malformed values turn retirement off with a log line. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
 | `HIPFIRE_GFX1151_XLDS` | **on** for exact gfx1151; `0` opts out (developer) | Exact-gfx1151 1..=16-row MQ4G256V2 WMMA GEMMs (gate_up, qkvza, qkv, residual, including the verify lm_head; K % 256 == 0) launch `gemm_*_mq4g256v2_wmma_gfx1151_xlds` (4 waves x 16 rows per block, X slab staged in LDS once per block) instead of the one-wave base kernels; the Q8_0 `gemm_q8_0_wmma` (DFlash draft/verify lm_head of Q8-head models such as `qwen3.8-27b.mq4`; 16 B aligned weights) likewise launches `gemm_q8_0_wmma_gfx1151_xlds`. Per-output WMMA chain, K order, dequant values and epilogue are the base kernels', so outputs are byte-identical. Eager and HipGraph capture (DFlash verify graph) take the route; Redline replay recording keeps the base kernels. Other arches are unchanged. `0` restores the base kernels. Oracles: `rdna-compute/examples/test_mq4v2_xlds_gfx1151` and `bench_q8_lmhead_rows` (`--features lab`). |
 | `HIPFIRE_CB_VERIFY_CHUNK128` | **unset / off**; `1` opts in (developer) | VMM continuous-batching DFlash verify only (not MTP): admits exact 64..=128-row aggregated verify chunks on exact gfx1201, dense MQ4G256V2 targets, through the explicit `gemm_*_verify_exact` kernels (128 rows per chunk instead of 63). Needs `HIPFIRE_WMMA_BATCH_TILES`. Byte-identical to the 63-row route. Unset/`0` keeps every existing route. Oracles: `cb_verify_gemm_oracle` (kernel bytes) and `cb_vmm_state_oracle` (state). |
@@ -867,7 +867,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1739
+**Count:** 1745
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2155,13 +2155,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_GDN_PREFILL` | crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs, crates/rdna-compute/examples/gdn_wy_repeat_check.rs | developer |
 | `HIPFIRE_QWEN4_GDN_Q8_INLINE` | crates/hipfire-arch-qwen4/src/state.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_QKV_BF16` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_HC_DOWN_FUSED` | crates/rdna-compute/examples/hc_down_fused_bench.rs, crates/rdna-compute/examples/hc_down_fused_oracle.rs | developer |
+| `HIPFIRE_QWEN4_HC_DOWN_FUSED` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/examples/hc_down_fused_bench.rs | developer |
 | `HIPFIRE_QWEN4_HC_DOWN_TILE` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TWIN` | crates/rdna-compute/src/tensor_ops.rs | developer |
-| `HIPFIRE_QWEN4_HC_UP_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
+| `HIPFIRE_QWEN4_HC_UP_V2` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_R4` | crates/peacemaker-isa/tests/legacy_mq4_rowtiles.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
@@ -2446,7 +2446,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_MAX_QUEUE_BYTES` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT` | crates/hipfire-config/src/lib.rs, scripts/serve_concurrency_gate.sh | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_CTX` | crates/hipfire-config/src/lib.rs, scripts/scs_suite.py | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_MAX_SESSIONS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_PREFILL_MIN_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_PREFIX_CACHE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
@@ -2495,6 +2497,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
 | `HIPFIRE_STATE_QUANT` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs | stable |
+| `HIPFIRE_SWAP_DIR` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SWAP_DISK_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SWAP_HOST_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh | harness |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh | harness |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh | harness |
