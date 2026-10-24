@@ -1355,15 +1355,14 @@ impl Qwen4Bundle {
         }
         let block_size = block_size.max(1);
         let max_chunk = match ops {
-            Qwen4Ops::Single(_) => {
-                self.execution
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "Qwen4 spec scratch requires attached forward resources".to_string()
-                    })?
-                    .scratch
-                    .max_chunk
-            }
+            // The block is the prompt tile the spec hidden capture holds: the
+            // prompt schedule capacity, not the resident bank of a
+            // decode-share load (S4-MAXCHUNK class a).
+            Qwen4Ops::Single(_) => self
+                .execution
+                .as_ref()
+                .ok_or_else(|| "Qwen4 spec scratch requires attached forward resources".to_string())?
+                .prompt_chunk_rows(),
             Qwen4Ops::Mesh(_) => self
                 .pp_chunk_rows()
                 .ok_or_else(|| "Qwen4 spec scratch requires an attached mesh".to_string())?,
