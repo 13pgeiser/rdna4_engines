@@ -918,6 +918,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
     }
+    if kernel == "gemv_mq4g128v2_moe_ninepath_d4" {
+        // expert_ptrs, topk_indices, topk_weights, gate, up, signs1, signs2
+        // (read); out is RMW.
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            write(56),
+        ]);
+    }
     if matches!(
         kernel,
         "gemm_mq4g256v2_moe_grouped_wmma_k2"
@@ -1377,7 +1391,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
-        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512" => {
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -1737,6 +1752,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     ) {
         return Some(64);
     }
+    if kernel == "gemv_mq4g128v2_moe_ninepath_d4" {
+        // 8 ptr + down_m,down_k,n_experts = 76 explicit bytes, padded to 16 B.
+        return Some(80);
+    }
     if matches!(
         kernel,
         "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
@@ -1901,6 +1920,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"

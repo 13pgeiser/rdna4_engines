@@ -126,6 +126,7 @@
     "kernels/src/gemv_mq3g256_lloyd_moe_ninepath_d4.hip",
     "kernels/src/gemv_mq3g256gl_moe_down_indexed.hip",
     "kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_mq4g128v2_moe_ninepath_d4.hip",
     "kernels/src/gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip",
     "kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip",
     "kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip",
