@@ -5655,10 +5655,10 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.hip");
-/// Exact-gfx1151 small-batch (1..=16 rows) MQ4V2 WMMA GEMMs: one module, four
-/// symbols (`gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma_gfx1151_xlds`,
-/// `gemm_mq4g256v2_residual_wmma_gfx1151_xlds`) with the base kernels' ABIs and
-/// byte-identical outputs. 4 waves x 16 rows per block, X slab staged in LDS.
+/// Exact-gfx1151 small-batch (1..=16 rows) 4-bit G256 WMMA GEMMs: one module,
+/// eight symbols (`gemm_{gate_up,qkvza,qkv}_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds`,
+/// `gemm_{mq4g256v2,hfq4g256}_residual_wmma_gfx1151_xlds`) with the base kernels'
+/// ABIs and byte-identical outputs. 4 waves x 16 rows per block, X slab staged in LDS.
 pub const GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx1151_xlds.hip");
 /// gfx11 (exact gfx1100 candidate) MQ4V2 gate_up batch-tiled WMMA.
