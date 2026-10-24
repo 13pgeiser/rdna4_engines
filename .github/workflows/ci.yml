@@ -126,6 +126,8 @@ jobs:
         run: cargo build --release --locked -p hipfire-cli -p hipfire-daemon
       - name: Test control-plane libraries (no GPU)
         run: cargo test --locked --lib -p hipfire-config -p hipfire-registry -p hipfire-client
+      - name: Test unsupported-platform loaded-code registration (no GPU)
+        run: cargo test --locked --lib -p rdna-compute loaded_code_check::tests::non_linux_hsa_registration_is_unavailable_and_unregisters -- --exact
       - name: Smoke version and JSON diagnostics without HIP
         run: |
           $ErrorActionPreference = 'Stop'
