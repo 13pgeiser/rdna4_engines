@@ -959,6 +959,108 @@ speculation f16 also changes which drafts the greedy text accepts, so one and fo
 down; whether that is the text or the step was not separated. Use it for many concurrent sequences
 where the KL above is acceptable, and measure your own load.
 
+### 4.4.1 Streaming KV: context bigger than the card
+
+```sh
+radiance --model flashnext.rad --tp 2 --max-model-len 262144 --max-num-seqs 2 --kv-resident 32768
+```
+
+`--kv-resident N` keeps the whole KV cache of the model's sparse attention group in pinned host
+RAM and only a window of N tokens on the cards. A decode step turns the blocks it selected into
+window slots, copies in the ones that are missing, and evicts the block whose use counter has decayed
+most; an evicted block is
+already safe in the host copy. The window is a fixed size at any context length, so context stops
+being bounded by VRAM: on two 16 GB cards, holding two 262k-token conversations, the cache went
+from 3.84 GB of VRAM a card to 0.74 GB of VRAM and 3.22 GB of host RAM. The VRAM the cache gives
+up goes to the expert slab.
+
+**How to enable it.** N is tokens of the resident window, rounded up to whole blocks (4 tokens on
+this family). Absent or `0`, nothing streams.
+
+- At or above the group's context — `--max-num-seqs` x `--max-model-len` — nothing streams
+  either: the group stays a plain resident pool and the engine takes its ordinary path, with no
+  host copy, no window and no per-step copy.
+- A ring under one decode step's selection — `n_seq x (1 + n_spec) x 513` blocks, **16 416
+  tokens** at two sequences with 3 speculative tokens — is raised to it at startup, with one
+  warning naming both numbers. **The recommendation is 32 768**; pressure comes from a longer
+  context, never from a smaller ring.
+- What it takes: the window at the cache's per-token bytes for every layer (6.00 KiB a rank at
+  fp8 on two ranks, so 24 576 tokens is 144 MiB), and the host copy of the whole context at the
+  same per-token bytes, per rank, sized `max_seqs x --max-model-len`. VRAM also holds the
+  prefill stage, one layer of the retained context (512 B a retained token a rank, 200 MiB at
+  2 x 204 800); the pool is the larger of the two, never their sum.
+- Models: the sparse-selection ones — Qwen3.8-Flash-Next (`qwen4exp_fp8`) and GLM-5.3-Flash
+  (`glm5next`). Anywhere else the flag is **ignored at startup with one warning** and the server
+  runs exactly as without it, every block on the card. A packed cache (`--kv-cache-dtype fp8_v4`
+  or `k6_v4`) has no streamed writer and is warned about the same way.
+- The startup receipt's `kv streaming:` lines name the window, the stage and the host tier;
+  `/metrics` carries `kv_resident_blocks`, `kv_stream_misses_total` and
+  `kv_stream_bytes_total`.
+
+**Measured.** One model, fp8 cache, one machine (2x16 GB, gfx1201), one request, two cold starts a
+configuration, 2 048 tokens decoded:
+
+| configuration | prompt | decoded | prefill tok/s | tok/step | decode tok/s |
+|---|---|---|---|---|---|
+| streaming off | 61 971 | 2 048 | 2 722 | 1.00 | 39.89 |
+| **streaming on** | 61 971 | 2 048 | **2 783** | 1.00 | 39.78 |
+| streaming off + MTP | 61 971 | 2 048 | 2 600 | 2.87–3.23 | 62.3 (56.8–67.7) |
+| **streaming on + MTP** | 61 971 | 2 048 | **2 671** | 3.02–3.45 | 64.8 (53.2–76.5) |
+| streaming off | 249 939 | 2 048 | 2 635 | 1.00 | 38.60 |
+| **streaming on** | 249 939 | 2 048 | **2 669** | 1.00 | 39.07 |
+| streaming off + MTP | 249 939 | 2 048 | 2 577 | 3.10 | 50.56 |
+| **streaming on + MTP** | 249 939 | 2 048 | **2 623** | 3.10 | 50.86 |
+
+Speculation's `tok/step` is a property of the text (how predictable the continuation is), so the
+MTP rows' tok/s moves with it — the 61k pair spans 53-77 tok/s between starts, all of it text and
+step-time, not configuration. Compare MTP configurations on `tok/step` and ms/step, and read the
+250k pair, which is stable, when the question is about the engine.
+
+Decode is unchanged, with and without MTP; prefill is 1.8 % faster at 61k and 1.3 % at 250k,
+because the VRAM the cache gives up is taken by routed experts. The model those arms ran has a
+dense cache, which this build refuses the flag on: read the table as what a carved window costs in
+time, not as a deployment to copy.
+
+Memory, sized for the same number of tokens on both sides:
+
+| conversations held | configuration | VRAM a card | host RAM a card |
+|---|---|---|---|
+| 2 x 262k (524 288 tokens) | streaming off | 3.84 GB | -- |
+| 2 x 262k | **streaming on** | **0.74 GB** | **3.22 GB** |
+
+Measured at TP2 on two 16 GB cards, from the engine's own startup report. Per card the host copy
+is *smaller* than the VRAM it displaces (3.22 against 3.58 GiB), because each rank keeps only its
+own slice of the cache.
+
+**What it costs, and when not to use it.**
+
+- Per token the two cost the same bytes; the difference is where they live. Streaming is not a
+  way to save memory — at one conversation it costs more than it saves — it is the way to keep
+  the cache when VRAM cannot hold it.
+- The host copy is per rank and sized `max_seqs x --max-model-len`, so a short request pays the
+  whole reservation.
+- At `--tp 1` the mirror does not fit beside the weights (6.00 GiB for 2 x 262k): the
+  configuration **refuses to start**. The feature holds conversations a card cannot; it does not
+  shrink one that already fits.
+- With streaming off the pool cannot fund two 262k sessions (1.79 GiB funds one). That, not
+  throughput, is what it buys.
+- It is budgeted beside the prefix cache's host tier: at four conversations the two want 9.38 GiB
+  and 4 GiB on a box with 8.2 GiB spare, so the start is refused short by ~1.2 GiB. Lower
+  `--prefix-cache-mib` (4096 today, 2048 is a fine floor); never delete the tier.
+- Streaming's copies cost about 3% of decode at `--tp 2` with a small context, and 0% at
+  `--tp 1`, where the longer step hides them.
+- Quality: perplexity 3.994 streaming off, 4.015 with a window covering the context, 4.014 with a
+  window a fraction of it, against a cold-start floor of 0.021 KL — no difference the engine can
+  resolve.
+
+**Check it on your own machine.** `scripts/kv-parity.sh` proves the covering case: a ring at the
+group's context streams nothing, issues no resolve and produces byte-identical completions to the
+same server without the flag. `scripts/kv-stage-parity-64k.sh` proves the streaming case: with
+the ring at its 32 768-token floor and a ~64k document, every prefill chunk past the ring is
+staged one layer at a time, in layer order, and the completions are byte-identical to streaming
+off. Both build nothing, run one server per arm, compare the completions, and need the cards and
+the toolchain container.
+
 ### 4.5 Prefill chunk size
 
 A long prompt is prefilled in chunks of at most `--max-num-batched-tokens`. On a mixture-of-experts
@@ -1799,6 +1901,7 @@ by 0.002-0.003 nats.
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+| `--kv-resident N` | 0 (off) | tokens of the sparse attention group's KV kept on the card; the rest lives in pinned host memory and is copied in on demand. **The whole switch** — absent or 0 keeps every block on the card, and at or above the group's context it streams nothing either. A value below one decode step's selection — `n_seq x (1 + n_spec) x blocks`, 16 416 tokens at 2 sequences with 3 speculative tokens — is raised to it at startup, so a ring asked for under the floor is not the ring measured. **The recommendation is 32 768**, and eviction pressure is made by a longer context, not by shrinking the ring. Ignored with a warning on an architecture that cannot stream, decided at startup (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |

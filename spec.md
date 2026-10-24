@@ -906,6 +906,7 @@ utilisation fraction:
 | `--host-headroom-mib` | host RAM left free for the system at startup (default 4096) |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
+| `--kv-resident` | tokens of the sparse attention group's KV kept on the card, the rest in pinned host memory; off by default, at or above the group's context nothing streams, a value below one decode step's selection is raised to it (16 416 tokens at 2 sequences with 3 speculative tokens, so a ring requested under that is not the ring measured), and ignored with a warning on an architecture that cannot stream (decided at startup). The recommended ring is 32 768; pressure is made by a longer context, not a smaller ring |
 
 Nothing is inferred from the free VRAM at startup, which would size pools differently depending on
 what else is open. Each term is a fixed property, a computed quantity, or a measurement printed on
