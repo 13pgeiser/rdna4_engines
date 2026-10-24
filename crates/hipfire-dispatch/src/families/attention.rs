@@ -566,6 +566,21 @@ fn dispatch_full_attention(
         // ── Non-causal, F32 K/V ──
         TileImpl::DflashN64 => {
             debug_assert_eq!(key, AttnFullF32);
+            // gfx1151: key-split twin (the N64 grid is one 2-wave workgroup
+            // per head there, ~5x slower at a 2K context).
+            if hip!(gpu.try_attention_dflash_wmma_kvsplit(
+                io.q,
+                io.k,
+                io.v,
+                io.out,
+                io.n,
+                io.seq_len,
+                io.n_heads,
+                io.n_kv_heads,
+                io.head_dim,
+            ))? {
+                return Ok(());
+            }
             hip!(gpu.attention_dflash_wmma_n64_f32(
                 io.q,
                 io.k,

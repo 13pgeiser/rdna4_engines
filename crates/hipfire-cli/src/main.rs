@@ -984,6 +984,19 @@ pub(crate) struct ServeArgs {
     /// `memory.max_seq` bounds; overrides the configured/automatic context.
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
+    /// Multi-slot serve: host-RAM ceiling for parked swap snapshots, in
+    /// bytes; zero disables the host tier so snapshots spill to disk.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_host_bytes: Option<u64>,
+    /// Multi-slot serve: disk ceiling for parked swap snapshots, in bytes;
+    /// zero disables disk spill. LRU snapshots are evicted at the ceiling.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_disk_bytes: Option<u64>,
+    /// Multi-slot serve: directory for swap spill files; empty uses
+    /// `$XDG_RUNTIME_DIR/hipfire/swap/<pid>`, falling back to
+    /// `$TMPDIR/hipfire-swap-<pid>`.
+    #[arg(long, value_name = "DIR")]
+    swap_dir: Option<PathBuf>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
@@ -2057,13 +2070,20 @@ fn pull_with_sidecar_pins(
     });
     let identity = served_identity.as_ref().unwrap_or(entry);
     if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, overlay_pins) {
-        fetch_registry_sidecar(
-            "Trunk overlay",
-            overlay.repo,
-            &overlay.sidecar,
-            &hipfire_config::memory::trunk_overlay_sidecar_path(&model_path),
-            args.force,
-        );
+        if pull_select::trunk_overlay_wanted(&ple::local_gpu_arches()) {
+            fetch_registry_sidecar(
+                "Trunk overlay",
+                overlay.repo,
+                &overlay.sidecar,
+                &hipfire_config::memory::trunk_overlay_sidecar_path(&model_path),
+                args.force,
+            );
+        } else {
+            eprintln!(
+                "  Skipping Trunk overlay sidecar (no gfx1151 GPU detected; the loader applies it only on gfx1151, or anywhere with HIPFIRE_QWEN4_TRUNK_OVERLAY=1): {}",
+                overlay.sidecar.file
+            );
+        }
     }
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
@@ -3787,6 +3807,9 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             tp: None,
             speculation: None,
             max_seq: None,
+            swap_host_bytes: None,
+            swap_disk_bytes: None,
+            swap_dir: None,
             continuous_batch_size: None,
             foreground_child: false,
             ui: false,
@@ -22425,14 +22448,19 @@ effort = "high"
                     .collect();
                 // The base downloads only with nothing local; the overlay and hot
                 // set are the ones bound to whichever artifact serves the tags.
+                // The overlay is fetched only where the loader applies it
+                // (gfx1151, or no detected GPU).
+                let overlay_fetched = arches.is_empty() || arches.contains(&"gfx1151");
                 if mono_present {
-                    expected.extend([overlay_mono.to_owned(), hotset_mono.to_owned()]);
+                    expected.push(hotset_mono.to_owned());
+                    if overlay_fetched {
+                        expected.push(overlay_mono.to_owned());
+                    }
                 } else {
-                    expected.extend([
-                        SHARED_FILE_A.to_owned(),
-                        overlay_base.to_owned(),
-                        hotset_base.to_owned(),
-                    ]);
+                    expected.extend([SHARED_FILE_A.to_owned(), hotset_base.to_owned()]);
+                    if overlay_fetched {
+                        expected.push(overlay_base.to_owned());
+                    }
                 }
                 expected.sort();
                 assert_eq!(seen, expected, "{case}");
@@ -22926,7 +22954,9 @@ effort = "high"
         }]
     }
 
-    fn pull_overlay_model(paths: &Paths, force: bool) {
+    /// `PullArgs::defaults("overlay-model")` on a host with the given GPU arches.
+    fn pull_overlay_model_on(paths: &Paths, force: bool, arches: &[&str]) {
+        let _arch = ple::GpuArchOverride::set(arches);
         pull_with_sidecar_pins(
             paths,
             PullArgs {
@@ -22938,6 +22968,52 @@ effort = "high"
             &grandfather_table(),
         )
         .unwrap();
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_overlay_model_on(paths, force, &["gfx1151"]);
+    }
+
+    #[test]
+    fn pull_skips_the_trunk_overlay_where_no_gpu_applies_it() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        for (arches, fetched) in [
+            (&["gfx1201"][..], false),
+            (&["gfx1100"][..], false),
+            (&["gfx1100", "gfx1201"][..], false),
+            (&["gfx1151"][..], true),
+            (&["gfx1100", "gfx1151"][..], true),
+            (&[][..], true),
+        ] {
+            let paths = test_paths("overlay-arch");
+            write_test_registry_cache(&paths, &overlay_registry_raw());
+            let mut files = std::collections::HashMap::new();
+            files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+            if fetched {
+                files.insert(
+                    "overlay-model.mq4.trunk-overlay".to_owned(),
+                    OVERLAY_BYTES.to_vec(),
+                );
+            }
+            // The server holds only what the pull should fetch; the download
+            // counter below proves a skipped overlay was never requested.
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            pull_overlay_model_on(&paths, false, arches);
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1 + usize::from(fetched)));
+            assert_eq!(
+                paths
+                    .models
+                    .join("overlay-model.mq4.trunk-overlay")
+                    .exists(),
+                fetched,
+                "{arches:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
     }
 
     #[test]

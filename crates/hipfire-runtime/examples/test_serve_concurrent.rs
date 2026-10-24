@@ -68,6 +68,7 @@ fn main() {
         prefill_chunk: 1024,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-sp7-swap"),
+        swap_disk_bytes: 1 << 30,
         is_vl: false,
         vl_path: None,
         mtp_k: 0,

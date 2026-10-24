@@ -5298,7 +5298,7 @@ pub fn generate_spec(
         let keep = consumed.min(committed_tail.len());
         let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp) {
+        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp, ar_step) {
             // Must run right after the window is observed and before any
             // further step / forced advance / prefill / reset on the
             // speculator: the retained pre-window snapshot is only valid until
@@ -7785,7 +7785,19 @@ pub fn spec_strict_prefix_action(
 /// non-terminal one (`Realign`, a forced intervention inside the window) tries
 /// only on native Qwen4 MTP, which restores its retained pre-window target and
 /// head and replays the consumed prefix instead of re-prefilling history.
-pub fn spec_window_repair_attempt(action: SpecStrictPrefixAction, native_qwen4_mtp: bool) -> bool {
+///
+/// A retired request's AR step is not a speculative window and leaves none
+/// retained (DFlash clears it), so it never tries: asking would fail the
+/// request as a retryable GPU error, where the reset path lets a grammar
+/// violation on the AR token end as the validation error it is.
+pub fn spec_window_repair_attempt(
+    action: SpecStrictPrefixAction,
+    native_qwen4_mtp: bool,
+    ar_step: bool,
+) -> bool {
+    if ar_step {
+        return false;
+    }
     match action {
         SpecStrictPrefixAction::None => false,
         SpecStrictPrefixAction::RepairForTerminal => true,
@@ -7829,18 +7841,31 @@ mod spec_window_repair_tests {
     fn window_repair_precedes_reset_and_realign_on_native_qwen4() {
         // Full window: nothing to repair.
         let full = spec_strict_prefix_action(4, 4, true);
-        assert!(!spec_window_repair_attempt(full, true));
+        assert!(!spec_window_repair_attempt(full, true, false));
         // Terminal strict prefix: every speculator is asked.
         let terminal = spec_strict_prefix_action(2, 4, true);
         assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
-        assert!(spec_window_repair_attempt(terminal, false));
-        assert!(spec_window_repair_attempt(terminal, true));
+        assert!(spec_window_repair_attempt(terminal, false, false));
+        assert!(spec_window_repair_attempt(terminal, true, false));
         // Non-terminal strict prefix (forced intervention): only native Qwen4
         // skips the full re-prefill; others keep Realign.
         let forced = spec_strict_prefix_action(2, 4, false);
         assert_eq!(forced, SpecStrictPrefixAction::Realign);
-        assert!(spec_window_repair_attempt(forced, true));
-        assert!(!spec_window_repair_attempt(forced, false));
+        assert!(spec_window_repair_attempt(forced, true, false));
+        assert!(!spec_window_repair_attempt(forced, false, false));
+    }
+
+    #[test]
+    fn retired_ar_step_never_attempts_window_repair() {
+        // A grammar violation on a retired request's single AR token is a
+        // terminal strict prefix (0 of 1 consumed); there is no speculative
+        // window to repair, so the caller must take the reset path.
+        let terminal = spec_strict_prefix_action(0, 1, true);
+        assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
+        assert!(!spec_window_repair_attempt(terminal, false, true));
+        assert!(!spec_window_repair_attempt(terminal, true, true));
+        let forced = spec_strict_prefix_action(0, 1, false);
+        assert!(!spec_window_repair_attempt(forced, true, true));
     }
 }
 

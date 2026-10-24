@@ -8009,6 +8009,7 @@ impl Carrier for Qwen35Carrier {
             prefill_chunk: cfg.prefill_chunk,
             host_budget_bytes: cfg.host_budget_bytes,
             swap_dir: cfg.swap_dir,
+            swap_disk_bytes: cfg.swap_disk_bytes,
             is_vl: cfg.is_vl,
             vl_path: cfg.vl_path,
             mtp_k: cfg.mtp_k,
