@@ -61,6 +61,7 @@ fn main() {
         prefill_chunk: 256,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-e4-repro-swap"),
+        swap_disk_bytes: 1 << 30,
         is_vl: false,
         vl_path: None,
         mtp_k: 0, // isolate from MTP entirely

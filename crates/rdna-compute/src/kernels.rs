@@ -5655,10 +5655,10 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.hip");
-/// Exact-gfx1151 small-batch (1..=16 rows) MQ4V2 WMMA GEMMs: one module, four
-/// symbols (`gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma_gfx1151_xlds`,
-/// `gemm_mq4g256v2_residual_wmma_gfx1151_xlds`) with the base kernels' ABIs and
-/// byte-identical outputs. 4 waves x 16 rows per block, X slab staged in LDS.
+/// Exact-gfx1151 small-batch (1..=16 rows) 4-bit G256 WMMA GEMMs: one module,
+/// eight symbols (`gemm_{gate_up,qkvza,qkv}_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds`,
+/// `gemm_{mq4g256v2,hfq4g256}_residual_wmma_gfx1151_xlds`) with the base kernels'
+/// ABIs and byte-identical outputs. 4 waves x 16 rows per block, X slab staged in LDS.
 pub const GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx1151_xlds.hip");
 /// gfx11 (exact gfx1100 candidate) MQ4V2 gate_up batch-tiled WMMA.
@@ -8765,7 +8765,7 @@ pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str =
 /// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online
 /// softmax + P.V walk), the byte-identical parallel twin of
 /// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256,
-/// GQA 6) that every gfx1151 speculative verify runs.
+/// GQA 4 or 6) that every gfx1151 speculative verify runs.
 pub const ATTENTION_VERIFY_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_wmma.gfx1151.hip");
 
@@ -9092,6 +9092,12 @@ pub const ATTENTION_DFLASH_WMMA_M32_GFX12_SRC: &str =
 /// investigation in `docs/plans/dots-ocr.perf-investigation.md`.
 pub const ATTENTION_DFLASH_WMMA_N64_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma_n64.hip");
+
+/// DFlash draft full attention on gfx1151 (`attention_dflash_wmma_kvsplit_gfx1151`):
+/// head_dim 128, one 8-wave workgroup per (head, 16-row query tile), keys
+/// split across the waves and merged once. Replaces the N64 tile there.
+pub const ATTENTION_DFLASH_WMMA_KVSPLIT_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_kvsplit.gfx1151.hip");
 
 /// N=64 variant that consumes K and V already stored as **f16 in DRAM**
 /// (Q and output stay f32). Halves the attention DRAM traffic for K and
