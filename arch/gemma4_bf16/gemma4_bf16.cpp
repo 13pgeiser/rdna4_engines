@@ -116,6 +116,13 @@ struct G4Linear {
      * over the same per-(row, 128) int8 activation as i8g. */
     bool       a4 = false;
     bool       grouped() const { return i8g || a4; }
+    /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
+     * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
+     * which at one row does 16 times the matrix work and reads its weight a quarter as fast. */
+    static constexpr int64_t kA4Split = 64;
+    int64_t    a4_split = 0;      /* rows up to which op_dec serves; 0: no decode band */
+    rad_buf    a16 = 0;
+    rad_op     op_a16 = 0, op_dec = 0;
     /* Reads another linear's int8 pair. q, k and v quantise the same norm output on the same
      * per-row grid, so with `in_from` set at declare this linear reads that linear's pair and
      * declares no quantiser of its own: one dispatch instead of three. */
@@ -212,7 +219,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                            RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         }
         if (!w || !ws) return RAD_E_INVAL;
-        if (in_from && in_from->grouped() && in_from->q8 && in_from->K == K) {
+        /* not an a4 linear's pair: below its decode band it writes none */
+        if (in_from && in_from->grouped() && !in_from->a4 && in_from->q8 && in_from->K == K) {
             q8 = in_from->q8;
             s8 = in_from->s8;
             shared_in = true;
@@ -233,7 +241,24 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                                RAD_STR("dtype", a4 ? "w4a8i8_asym" : "i8a8")),
                     RAD_WEIGHTS(w, ws)),
                 { q8, s8 }, { y });
-        return op ? RAD_OK : RAD_E_INVAL;
+        if (!op) return RAD_E_INVAL;
+        if (a4) {
+            a4_split = std::min<int64_t>(kA4Split, g.max_tok);
+            a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { a4_split, K });
+            if (!a16) return RAD_E_INVAL;
+            op_a16 = rw(b, RAD_OP(b, "cast",
+                           RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("n", K),
+                                      RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
+                           RAD_NOWEIGHTS),
+                        { a }, { a16 });
+            op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
+                            RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
+                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a16_asym")),
+                            RAD_WEIGHTS(w, ws)),
+                        { a16 }, { y });
+            if (!op_a16 || !op_dec) return RAD_E_INVAL;
+        }
+        return RAD_OK;
     }
     if (known && g4_grid_w4(enc)) {
         if (N % 16 || K % 128) {
@@ -289,6 +314,11 @@ inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
+    } else if (a4 && T <= a4_split) {
+        /* the decode band: f16 copy of the input, the skinny kernel; operands as LinearFP8's w4 */
+        RAD_ISSUE_N(c, op_a16, T, brows(a, T), brows(a16, T));
+        RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
+                    RAD_NONE, RAD_NONE);
     } else if (grouped()) {
         /* quant_act_i8g takes x, q, scale: no optional `asum`. */
         if (!shared_in)
@@ -304,6 +334,12 @@ inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
 }
 
 inline void G4Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const {
+    if (a4 && n <= a4_split) {
+        RAD_ISSUE_N(c, op_a16, n, brow_slice(a, r0, n, K), brows(a16, n));
+        RAD_ISSUE_N(c, op_dec, n, brows(a16, n), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+        return;
+    }
     if (!quant && !grouped()) {
         RAD_ISSUE_N(c, op, n, brow_slice(a, r0, n, K), RAD_W(w), brow_slice(y, r0, n, N));
         return;
