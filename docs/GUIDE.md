@@ -281,6 +281,7 @@ and runs.
 | `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
+| `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -2233,9 +2234,16 @@ token ids mixed, with its `add_special` and `parse_special` and their defaults);
 returns `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`. `/detokenize`
 returns the text as both `prompt` (vLLM) and `content` (llama-server).
 
-**An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` only; completions and chat answer
-501. One input is one vector and must fit one step (`--max-num-batched-tokens`); a longer one is
-refused with `context_length_exceeded`.
+**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe) serves `/v1/embeddings` only;
+completions and chat answer 501. One input is one vector and must fit one step
+(`--max-num-batched-tokens`); a longer one is refused with `context_length_exceeded`.
+
+nomic-embed-text-v2-moe is converted from its f32 checkpoint with `rad-convert <checkpoint dir>
+--recipe data/recipes/nomic-embed-v2-moe-bf16.recipe -o nomic-embed-v2-moe-bf16.rad` (959 MB);
+the directory must contain `tokenizer.json`. The `search_query: ` and `search_document: ` prefixes
+are the client's text and the engine adds neither; the checkpoint's prompt names work through
+`prompt_name`. The checkpoint's shared `experts.bias` tensors are not applied and stay in the
+checkpoint.
 
 ```sh
 # text, a batch of texts, or token ids

@@ -62,6 +62,8 @@
 #include "../arch/llama_dense_fp8/llama_dense_fp8.cpp"
 /* EmbeddingGemma 2: a pooled encoder with no logits. */
 #include "../arch/embgemma2/embgemma2.cpp"
+/* Nomic BERT: a pooled encoder with dense and routed post-norm layers. */
+#include "../arch/nomicbert/nomicbert.cpp"
 /* Qwen-Image 2.1: a generator conditioned by Qwen3-VL. */
 #include "../arch/qwenimage21/qwenimage21.cpp"
 /* Anima: a cross-attention generator conditioned through two tokenizers. */
@@ -9609,6 +9611,182 @@ TEST(gemma4_e4b_declares_its_audio_encoder) {
     CHECK_EQ(pr.audio_frames, 3000);
 }
 
+/* ==================================================================== nomicbert */
+
+namespace {
+
+/* Nomic BERT cut to two layers: one dense and one routed at moe_every_n_layers 2, two heads of
+ * 32, ffn 128, four experts top 2, vocab 128. Its config spells the dimensions n_* and reads
+ * post-norm. */
+MetaKV nb_meta() {
+    RadModelMeta m{};
+    m.arch_id = "nomicbert"; m.name = "test-nomicbert"; m.quant = "";
+    m.n_layers = 2; m.n_embd = 64; m.n_head = 2; m.n_head_kv = 2; m.head_dim = 32;
+    m.n_ff = 128; m.n_vocab = 128; m.n_ctx_train = 2048;
+    m.rms_eps = 1e-5f; m.rope_theta = 1e4f; m.rope_scale = 1.0f;
+    m.n_expert = 4; m.n_expert_used = 2;
+    MetaKV k(m);
+    k.set("model_type", "nomic_bert")
+     .set("moe_every_n_layers", "2")
+     .set("moe_normalize_expert_weights", "0")
+     .set("num_shared_experts", "0")
+     .set("prenorm", "0")
+     .set("causal", "0")
+     .set("activation_function", "gelu")
+     .set("rotary_emb_interleaved", "0")
+     .set("rotary_emb_fraction", "1.0")
+     .set("type_vocab_size", "1");
+    return k;
+}
+
+}  /* namespace */
+
+/* A post-norm encoder: word and token-type embeddings, emb_ln, then two layers, one dense and one
+ * with a top-2 router over four experts, each layer's attention bidirectional at 1/sqrt(64) over
+ * NeoX rotary, and a mean pool cast into the f32 pooled buffer. No logits and no lm_head. */
+TEST(nomicbert_declares_a_pooled_post_norm_encoder) {
+    MetaKV mk = nb_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(nomicbert::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.logits, (rad_buf)0);
+    REQUIRE(b.pooled != 0);
+    const RadBufDecl& p = b.bufs[b.pooled - 1].d;
+    CHECK_EQ(p.dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(p.shape[0], ctx.max_seqs);
+    CHECK_EQ(p.shape[1], (int64_t)64);
+
+    CHECK_EQ(count_op(b, "logits_gemm"), 0);
+    CHECK_EQ(count_op(b, "embed_lookup"), 1);
+    CHECK_EQ(count_op(b, "table_add"), 1);          /* the token-type table only */
+    CHECK_EQ(count_op(b, "layernorm"), 5);          /* emb_ln and two norms on each of two layers */
+    CHECK_EQ(count_op(b, "gemm_nt_bias"), 6);       /* qkv and out twice, fc1 and fc2 once */
+    CHECK_EQ(count_op(b, "gemm_nt"), 1);            /* the router */
+    CHECK_EQ(count_op(b, "rope"), 2);
+    CHECK_EQ(count_op(b, "attn_dense"), 2);
+    CHECK_EQ(count_op(b, "router_topk"), 1);
+    CHECK_EQ(count_op(b, "moe_scatter"), 1);
+    CHECK_EQ(count_op(b, "moe_gemm"), 2);
+    CHECK_EQ(count_op(b, "gelu"), 1);
+    CHECK_EQ(count_op(b, "moe_gather"), 1);
+    CHECK_EQ(count_op(b, "add"), 1);                /* the routed residual */
+    CHECK_EQ(count_op(b, "seg_mean"), 1);
+    CHECK_EQ(count_op(b, "cast"), 1);
+
+    std::vector<std::string> orders;
+    for (const auto& o : b.ops) {
+        if (o.op == "attn_dense") {
+            CHECK_EQ(pint(&o, "head_dim"), 32);
+            CHECK_EQ(pint(&o, "gqa"), 1);
+            CHECK_EQ(pint(&o, "causal"), 0);
+            CHECK_EQ(pint(&o, "max_seqlen"), (long long)ctx.max_tok);
+            CHECK_NEAR(pflt(&o, "scale"), 0.125, 0.0);
+        }
+        if (o.op == "router_topk") {
+            CHECK_EQ(pint(&o, "norm"), 0);
+            CHECK_EQ(pint(&o, "n_expert"), 4);
+            CHECK_EQ(pint(&o, "top_k"), 2);
+        }
+        if (o.op == "moe_gemm") {
+            CHECK_EQ(pint(&o, "n_expert"), 4);
+            CHECK_EQ(pint(&o, "top_k"), 2);
+            orders.push_back(pstr(&o, "a_order"));
+        }
+        if (o.op == "table_add") {
+            CHECK_EQ(pint(&o, "n"), 64);
+            CHECK_EQ(pint(&o, "L"), 1);
+            CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+            REQUIRE_EQ(o.w.size(), (size_t)1);
+            CHECK_EQ(b.weights[o.w[0] - 1].name, std::string("token_type.weight"));
+            CHECK_EQ(b.weights[o.w[0] - 1].d.dtype, (uint32_t)RAD_BF16);
+        }
+    }
+    CHECK(orders == (std::vector<std::string>{ "token", "sorted" }));
+
+    /* Every declared weight has a name map, and each projection's expert handles are one
+     * consecutive run with a slot per projection. */
+    for (const auto& w : b.weights) CHECK(find_map(b, w.name) != nullptr);
+    /* The dtypes the device rows require. table_add_bf16 reads a bf16 table, so the token-type
+     * table is bf16; every linear and the token table are bf16. layernorm and gemm_nt_bias take
+     * an f32 gain or bias, so norms and biases stay f32. */
+    const RecWeight* tt = find_w(b, "token_type.weight");
+    REQUIRE(tt != nullptr);
+    CHECK_EQ(tt->d.dtype, (uint32_t)RAD_BF16);
+    const RecWeight* tw = find_w(b, "token_embd.weight");
+    REQUIRE(tw != nullptr);
+    CHECK_EQ(tw->d.dtype, (uint32_t)RAD_BF16);
+    for (const char* n : { "emb_ln.weight", "emb_ln.bias", "blk.0.attn_norm.weight",
+                           "blk.0.attn_norm.bias", "blk.0.attn_qkv.bias",
+                           "blk.0.attn_out.bias", "blk.0.ffn_norm.weight",
+                           "blk.0.ffn_norm.bias", "blk.0.ffn_fc1.bias",
+                           "blk.0.ffn_fc2.bias", "blk.1.ffn_norm.weight",
+                           "blk.1.ffn_norm.bias" }) {
+        const RecWeight* w = find_w(b, n);
+        REQUIRE(w != nullptr);
+        CHECK_EQ(w->d.dtype, (uint32_t)RAD_F32);
+    }
+    for (const char* n : { "blk.0.attn_qkv.weight", "blk.0.attn_out.weight",
+                           "blk.0.ffn_fc1.weight", "blk.0.ffn_fc2.weight",
+                           "blk.1.attn_qkv.weight", "blk.1.attn_out.weight",
+                           "blk.1.ffn_router.weight", "blk.1.ffn_exp_w1.0.weight",
+                           "blk.1.ffn_exp_w2.0.weight" }) {
+        const RecWeight* w = find_w(b, n);
+        REQUIRE(w != nullptr);
+        CHECK_EQ(w->d.dtype, (uint32_t)RAD_BF16);
+    }
+    auto index_of = [&](const std::string& name) {
+        for (size_t i = 0; i < b.weights.size(); ++i) if (b.weights[i].name == name) return (int)i;
+        return -1;
+    };
+    const int w10 = index_of("blk.1.ffn_exp_w1.0.weight");
+    REQUIRE(w10 >= 0);
+    for (int e = 0; e < 4; ++e) {
+        const std::string n1 = "blk.1.ffn_exp_w1." + std::to_string(e) + ".weight";
+        const std::string n2 = "blk.1.ffn_exp_w2." + std::to_string(e) + ".weight";
+        const RecWeight* a = find_w(b, n1);
+        const RecWeight* c = find_w(b, n2);
+        REQUIRE(a != nullptr && c != nullptr);
+        CHECK_EQ(index_of(n1), w10 + e);
+        CHECK_EQ(index_of(n2), w10 + 4 + e);
+        CHECK_EQ(a->d.group.expert, e);
+        CHECK_EQ(a->d.group.slot, 0);
+        CHECK_EQ(c->d.group.expert, e);
+        CHECK_EQ(c->d.group.slot, 1);
+        CHECK_EQ(a->d.shape[0], (int64_t)128);
+        CHECK_EQ(a->d.shape[1], (int64_t)64);
+        CHECK_EQ(c->d.shape[0], (int64_t)64);
+        CHECK_EQ(c->d.shape[1], (int64_t)128);
+    }
+}
+
+/* The text pass over three whole inputs lints clean and its last issue writes the pooled rows. */
+TEST(nomicbert_text_pass_lints_clean_and_ends_at_the_pooled_buffer) {
+    MetaKV mk = nb_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(nomicbert::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto text = kit(b, {}, { 12, 7, 30 });
+    RadCtx c{ .b = &b, .batch = &text->b };
+    nomicbert::step(&c, &text->b);
+    CHECK(c.step_fail.empty());
+    CHECK(!c.issues.empty());
+    CHECK_LINT(b, &c);
+    const RecIssue& last = c.issues.back();
+    CHECK_EQ(last.n, (int64_t)3);
+    CHECK_EQ(last.opd.back().handle, b.pooled);
+    for (const auto& op : issued_ops(b, c)) CHECK(op != std::string("logits_gemm"));
+}
+
+/* The probe accepts the config's model_type spelling and refuses another architecture. */
+TEST(nomicbert_probe_reads_the_model_type) {
+    MetaKV mk = nb_meta();
+    RadArchProbe p{};
+    CHECK_OK(nomicbert::probe(mk.meta(), &p));
+    MetaKV other = nb_meta().set("model_type", "bert");
+    CHECK_EQ(stderr_of_rc([&] { return nomicbert::probe(other.meta(), &p); }),
+             RAD_E_UNSUPPORTED);
+}
+
 /* ==================================================================== qwenimage21 */
 
 namespace {
@@ -10191,6 +10369,23 @@ const std::set<std::string>& libref_vocab() {
         for (int i = 0; i < count(); ++i)
             if (const RadOpSchema* s = at(i); s && s->op) v.insert(s->op);
     return v;
+}
+
+/* Nomic BERT declares only ops libref serves, so a CPU-only engine can start it. */
+TEST(nomicbert_declares_on_librefs_vocabulary) {
+    const std::set<std::string>& vocab = libref_vocab();
+    if (vocab.empty()) {
+        fprintf(stderr, "    SKIP: libref.so not found under $RADIANCE_HOME/kernels\n");
+        return;
+    }
+    MetaKV mk = nb_meta();
+    RadBuilder b;
+    b.vocab = &vocab;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(stderr_of_rc([&] { return nomicbert::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+    for (const auto& op : b.asked_undeclared)
+        fprintf(stderr, "    nomicbert asks for '%s'\n", op.c_str());
+    CHECK(b.asked_undeclared.empty());
 }
 
 /* One architecture and configuration. `pinned` lists the device-only ops it may still ask for on

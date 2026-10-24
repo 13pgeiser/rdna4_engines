@@ -20,6 +20,7 @@ plugin claims.
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
+| `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
@@ -849,6 +850,79 @@ Traps:
 - **An audio clip's tokens are ceil(real frames / 4)**, real frames being those whose last sample
   is real; the processor stages exactly those plus zero frames to whole rows, which reproduces
   every row the reference keeps.
+
+---
+
+# `nomicbert`: an embedding model
+
+`arch/nomicbert` declares a pooled output (`rad_declare_pooled`) and no logits, so it is an
+embedding program like `embgemma2`: no sampler, no KV cache, one step per input, and the pooled
+row on `/v1/embeddings` ([GUIDE §5.6](GUIDE.md)). One card (`--tp 1`).
+
+```
+text      12 layers, hidden 768, ffn 3072, vocab 250048, 12 heads of 64, type vocab 1
+          trained to 2048 positions; 475M parameters
+          post-norm block: a = out_proj(attn(rope(Wqkv h + b))) + b_out; h = LN1(h + a)
+          even layers: dense MLP, fc2(gelu(fc1 h + b1)) + b2, exact gelu
+          odd layers (1, 3, 5, 7, 9, 11): 8 experts at top 2, softmax weights,
+          no renormalisation, no shared expert
+          fused Wqkv [q|k|v], no GQA, non-causal, scale 1/sqrt(64) = 0.125
+          NeoX rotary over all 64 dimensions, theta 1e4, on q and k only, no position table
+          embeddings: word + token_type, then emb_ln; no final norm
+          mean over every real token, cast to the f32 pooled buffer; the server L2-normalises
+```
+
+The block order is the one the verified variant uses: attention on the raw stream, then LN1, the
+feed-forward on LN1's output, then LN2 over that output plus the feed-forward's. The checkpoint's
+shared `experts.bias` is not applied, and the plugin does not map it. A container that sets
+`prenorm`, `causal`, interleaved, partial or scaled rotary, a gelu variant, renormalised routing
+or a shared expert is refused at declare.
+
+**Tensor names.** `N` is a layer; even layers are dense and odd layers are routed. `E` is an
+expert. Norms and biases stay f32; the token-type table is bf16 because `table_add`'s device row
+reads a bf16 table. The token embedding, linears, router and expert tables are bf16.
+
+| container | checkpoint | shape | map |
+|---|---|---|---|
+| `token_embd.weight` | `embeddings.word_embeddings.weight` | [250048, 768] | copy |
+| `token_type.weight` | `embeddings.token_type_embeddings.weight` | [1, 768] | copy |
+| `emb_ln.*` | `emb_ln.*` | [768] | copy |
+| `blk.N.attn_norm.*`, `blk.N.ffn_norm.*` | `encoder.layers.N.norm1.*`, `encoder.layers.N.norm2.*` | [768] | copy |
+| `blk.N.attn_qkv.*`, `blk.N.attn_out.*` | `encoder.layers.N.attn.Wqkv.*`, `encoder.layers.N.attn.out_proj.*` | [2304, 768]/[2304], [768, 768]/[768] | copy |
+| `blk.N.ffn_fc1.*`, `blk.N.ffn_fc2.*` (even N) | `encoder.layers.N.mlp.fc1.*`, `encoder.layers.N.mlp.fc2.*` | [3072, 768]/[3072], [768, 3072]/[768] | copy |
+| `blk.N.ffn_router.weight` (odd N) | `encoder.layers.N.mlp.router.layer.weight` | [8, 768] | copy |
+| `blk.N.ffn_exp_w1.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w1` | [3072, 768] | slice E |
+| `blk.N.ffn_exp_w2.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w2` | [768, 3072] | slice E, transpose |
+| not declared (odd N) | `encoder.layers.N.mlp.experts.bias` | [768] | not mapped |
+
+The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; `E` takes the
+expert's dim-0 slice, and `w2` is transposed to `[768, 3072]` for the grouped GEMM. Every expert
+has two group slots, one for each projection. Nothing else is mapped: there is no final norm, no
+pooler, no position table and no output head.
+
+**The recipe.** The checkpoint is f32 (1.9 GB).
+
+```sh
+rad-convert <checkpoint dir> --recipe data/recipes/nomic-embed-v2-moe-bf16.recipe \
+    -o nomic-embed-v2-moe-bf16.rad
+```
+
+It takes 3.5 s and writes a 959 MB container (907 MiB of weights). The checkpoint directory must
+contain `tokenizer.json`. The recipe casts the token embedding, the token-type table, the
+attention, dense MLP and expert weights to bf16 and leaves the norms and biases f32.
+
+**Verified.** 20 texts against a pure-float32 reference: mean cosine 0.99995, min 0.99983 on a
+gfx1201 card, with libavx and libref the same to 4 decimals. Against a Q6_K quantisation of the
+same model the mean is 0.9944 (min 0.990); the Q8_0 one agrees with the reference at 0.9994, so
+the Q6_K quantisation is the outlier, about 0.006 off the true model, and stored vectors from a
+Q6_K server drift by about that much.
+
+**Measured.** On one gfx1201 card, short texts take 2 ms a request at one client, 3854 requests/s
+at 64 concurrent clients and 4400 texts/s for a batch of 32 in one request; a 1354-character text
+takes 3 ms; about 1.2 GB of VRAM. On 24 CPU cores libavx has a median 18 ms a text.
+
+**Not verified.** Inputs above 512 tokens against a device reference, other precisions, and tensor
+parallel (the model is served on one card).
 
 ---
 
