@@ -2092,22 +2092,24 @@ fn digest_hex16(digest: &[u8; 32]) -> String {
         .collect()
 }
 
-/// Bytes of the second (BorrowPrefill) device pointer tables a decode-share
-/// plan owns: gate/up and down, two `u64` pointers per expert (`24,576 x 2 x
-/// 8`); 0 for a plan without donors. The codec table is shared.
+/// Bytes of the BorrowPrefill device pointer tables a decode-share plan owns:
+/// per prefill class view, gate/up and down, two `u64` pointers per expert
+/// (`24,576 x 2 x 8`); 0 for a plan without donors. The codec table is shared.
 fn qwen4_decode_share_table_bytes(
     plan: &hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
     (layers, experts, _): (usize, usize, bool),
 ) -> Result<u64, String> {
-    if plan
+    let Some(tail) = plan
         .decode_share_tail()
-        .map_or(true, |tail| tail.donors.is_empty())
-    {
+        .filter(|tail| !tail.donors.is_empty())
+    else {
         return Ok(0);
-    }
+    };
+    let views = tail.class_donors.len().max(1) as u64;
     (layers as u64)
         .checked_mul(experts as u64)
         .and_then(|entries| entries.checked_mul(2 * 8))
+        .and_then(|bytes| bytes.checked_mul(views))
         .ok_or_else(|| "decode-share table bytes overflow".to_string())
 }
 
@@ -2129,6 +2131,7 @@ fn qwen4_plan_hotset_placement(
     stage_enabled: bool,
     table_geometry: (usize, usize, bool),
     decode_share_need: Option<u64>,
+    decode_share_class_spans: &[u64],
 ) -> Result<
     (
         hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
@@ -2167,26 +2170,37 @@ fn qwen4_plan_hotset_placement(
         hotsets::require_experts(plain.device_experts()).map_err(|skip| skip.to_string())?;
         let mut overhead = 0u64;
         let plan = match share {
-            Some(need) => match plain.clone().with_decode_share(rank, need) {
-                Ok((shared, _)) => {
-                    overhead = shared
-                        .owner_bytes(Placement::Device)
-                        .checked_sub(plain.owner_bytes(Placement::Device))
-                        .ok_or("decode-share layout shrank the device owner")?;
-                    shared
-                }
-                Err(error) => {
-                    eprintln!("  qwen4 decode-share: ineligible: {error}; plain placement");
-                    share = None;
-                    if share_overhead != 0 {
-                        // The earlier iterations reserved room for the donor
-                        // layout; re-plan without it.
-                        share_overhead = 0;
-                        continue;
+            Some(need) => {
+                match plain
+                    .clone()
+                    .with_decode_share(rank, need)
+                    .and_then(|(shared, _)| {
+                        if decode_share_class_spans.is_empty() {
+                            Ok(shared)
+                        } else {
+                            shared.with_decode_share_classes(decode_share_class_spans)
+                        }
+                    }) {
+                    Ok(shared) => {
+                        overhead = shared
+                            .owner_bytes(Placement::Device)
+                            .checked_sub(plain.owner_bytes(Placement::Device))
+                            .ok_or("decode-share layout shrank the device owner")?;
+                        shared
                     }
-                    plain
+                    Err(error) => {
+                        eprintln!("  qwen4 decode-share: ineligible: {error}; plain placement");
+                        share = None;
+                        if share_overhead != 0 {
+                            // The earlier iterations reserved room for the donor
+                            // layout; re-plan without it.
+                            share_overhead = 0;
+                            continue;
+                        }
+                        plain
+                    }
                 }
-            },
+            }
             None => plain,
         };
         // new_tier allocates no stage without a host owner; the byte helper
@@ -3142,6 +3156,7 @@ pub fn qwen4_preload_resource_plan(
                         // (its scratch mode is not decided yet), which decode-share
                         // refuses, so it never predicts a donor tail.
                         None,
+                        &[],
                     )
                     .map_err(|error| format!("qwen4 preload plan: hotset plan: {error}"))?;
                     plan.check_executable(&gpu.arch)
@@ -4995,6 +5010,20 @@ fn load_qwen4_rank_scoped(
             }
         }
     };
+    // The donor-tail bytes each prefill class dirties: the plan builds one
+    // BorrowPrefill view per class (donors a class can overwrite read their
+    // mirror, the rest stay in VRAM). Empty (one all-donors view) only if the
+    // spans cannot be sized.
+    let decode_share_class_spans: Vec<u64> = if decode_share_need.is_some() {
+        hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_class_spans(
+            &config,
+            placement_chunk,
+            scratch_mode,
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     // `on` grows the hot budget from the dedicated reserve; `bind` / `fixed`
     // keep the plain budget (controls).
     let decode_share_grow = decode_share_need.is_some()
@@ -5054,6 +5083,7 @@ fn load_qwen4_rank_scoped(
                 stage_enabled,
                 table_geometry,
                 need,
+                &decode_share_class_spans,
             )?;
             let growth = if grow && plan.decode_share_tail().is_some() {
                 // What the plain reserve would have placed, for the load log.
@@ -5071,6 +5101,7 @@ fn load_qwen4_rank_scoped(
                     stage_enabled,
                     table_geometry,
                     None,
+                    &[],
                 )?;
                 Some((
                     total.saturating_sub(plain_total),
@@ -5975,9 +6006,26 @@ fn load_qwen4_rank_scoped(
                 tail.donor_offset + tail.donor_bytes,
                 tail.donor_bytes / MIB,
                 tail.donor_offset - tail.guard_offset,
-                share_digest(hipfire_arch_qwen4::expert_tier_owners::ExpertReadView::BorrowPrefill),
+                share_digest(hipfire_arch_qwen4::expert_tier_owners::ExpertReadView::BorrowPrefill(
+                    lease.borrow_classes().saturating_sub(1)
+                )),
                 share_digest(hipfire_arch_qwen4::expert_tier_owners::ExpertReadView::Resident),
             );
+            {
+                let rows =
+                    hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_classes(placement_chunk);
+                let donors = lease.borrow_class_donors();
+                let classes = if rows.len() == donors.len() {
+                    rows.iter()
+                        .zip(&donors)
+                        .map(|(rows, donors)| format!("{rows}:{donors}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    format!("all:{}", donors.last().copied().unwrap_or(0))
+                };
+                eprintln!("  qwen4 decode-share: classes [{classes}] donors dirty");
+            }
             if let Some((grown_bytes, plain_experts, experts, _)) = decode_share_growth {
                 let dedicated =
                     hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_dedicated_bytes(
@@ -11080,6 +11128,7 @@ mod qwen4_admission_tests {
                     stage_enabled,
                     (48, 512, false),
                     need,
+                    &[],
                 )
                 .unwrap()
             };
@@ -11135,6 +11184,7 @@ mod qwen4_admission_tests {
                     stage_enabled,
                     (48, 512, false),
                     need,
+                    &[],
                 )
                 .unwrap()
             };
@@ -11233,6 +11283,7 @@ mod qwen4_admission_tests {
                 true,
                 (48, 512, false),
                 need,
+                &[],
             )
             .unwrap()
         };
@@ -11242,6 +11293,75 @@ mod qwen4_admission_tests {
         assert!(kept.decode_share_tail().is_none());
         assert_eq!(kept.logical_digest(), plain.logical_digest());
         assert_eq!((budget, stage), (plain_budget, plain_stage));
+    }
+
+    /// One BorrowPrefill table set per prefill class: the fixed point charges
+    /// every set, a class-less plan still owns exactly one.
+    #[test]
+    fn decode_share_table_charge_counts_every_class_set() {
+        use hipfire_arch_qwen4::{
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_tier_plan::{plan_expert_tiers_from_slabs, Placement},
+        };
+        const PADDED: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let need = 1u64 << 20;
+        let spans = [need / 4, need / 2, need];
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (24u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        let run = |spans: &[u64]| {
+            super::qwen4_plan_hotset_placement(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(None).unwrap(),
+                total,
+                true,
+                (48, 512, false),
+                Some(need),
+                spans,
+            )
+            .unwrap()
+        };
+        let one_set = (48 * 512 * 2 * 8) as u64;
+        let (single, single_budget, _) = run(&[]);
+        let (three, budget, stage) = run(&spans);
+        let tail = three.decode_share_tail().unwrap();
+        assert_eq!(tail.class_spans, spans);
+        // Donors start every PADDED bytes: a class dirties ceil(span / PADDED).
+        assert_eq!(
+            tail.class_donors,
+            spans
+                .iter()
+                .map(|span| span.div_ceil(PADDED) as usize)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*tail.class_donors.last().unwrap(), tail.donors.len());
+        assert_eq!(single.decode_share_tail().unwrap().class_donors.len(), 1);
+        let geometry = (48, 512, false);
+        assert_eq!(
+            super::qwen4_decode_share_table_bytes(&single, geometry).unwrap(),
+            one_set
+        );
+        assert_eq!(
+            super::qwen4_decode_share_table_bytes(&three, geometry).unwrap(),
+            3 * one_set
+        );
+        // The fixed point pays for the two extra sets out of the hot budget.
+        assert!(
+            budget + 2 * one_set <= single_budget + PADDED,
+            "{budget} vs {single_budget}"
+        );
+        assert!(budget < single_budget);
+        let staged = three.owner_bytes(Placement::HostMapped) > 0;
+        let same_budget = plan_expert_tiers_from_slabs(&slabs, &rank, budget).unwrap();
+        let overhead =
+            three.owner_bytes(Placement::Device) - same_budget.owner_bytes(Placement::Device);
+        let tables = super::qwen4_expert_table_bytes(staged, geometry).unwrap() + 3 * one_set;
+        assert_eq!(
+            budget + overhead + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+            free
+        );
     }
 
     /// `on` against the real Flash-Next expert size (2,611,200 B padded) and the
@@ -11289,6 +11409,7 @@ mod qwen4_admission_tests {
                 true,
                 (48, 512, false),
                 need,
+                &[],
             )
             .unwrap()
         };
@@ -11359,6 +11480,7 @@ mod qwen4_admission_tests {
                 stage_enabled,
                 (48, 512, keep),
                 None,
+                &[],
             )
             .unwrap();
             let host = plan.owner_bytes(Placement::HostMapped) > 0;
@@ -12962,6 +13084,7 @@ mod qwen4_preload_plan_tests {
                 stage_enabled,
                 (48, 512, keep),
                 None,
+                &[],
             )
             .unwrap();
             // Match actual stage construction: two F32[2 * experts] pointer

@@ -938,13 +938,15 @@ impl Qwen4ExpertStage {
             ));
         }
         let config = &bundle.config;
-        // A decode-share lease stages from its BorrowPrefill view: the stage
-        // is only used by tiles of at least `min_rows` (>= 512) rows, which
-        // always read the BorrowPrefill runtimes.
-        let read_view = if lease.decode_share().is_some() {
-            ExpertReadView::BorrowPrefill
-        } else {
-            ExpertReadView::Resident
+        // A decode-share lease stages from its largest BorrowPrefill class view
+        // (every donor at its mirror, a superset of any smaller class's host
+        // entries): the stage is only used by tiles of at least `min_rows`
+        // (>= 512) rows, which always read a BorrowPrefill runtime, and a
+        // staged donor is a copy of its mirror, correct whether or not the
+        // tile's own class dirtied it.
+        let read_view = match lease.borrow_classes() {
+            0 => ExpertReadView::Resident,
+            classes => ExpertReadView::BorrowPrefill(classes - 1),
         };
         let mut slots = Vec::with_capacity(moe.len());
         let mut layouts: Vec<(usize, TierStageLayout)> = Vec::new();
@@ -1144,7 +1146,7 @@ impl Qwen4ExpertStage {
         // Under decode-share the stage tables come from the BorrowPrefill view:
         // the lease's donors are staged copies of their pinned mirror, so the
         // stage never points at a donor's canonical (scratch-borrowed) address.
-        let view_note = if read_view == ExpertReadView::BorrowPrefill {
+        let view_note = if matches!(read_view, ExpertReadView::BorrowPrefill(_)) {
             let donors = layouts
                 .iter()
                 .map(|(layer, layout)| {

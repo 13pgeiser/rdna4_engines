@@ -626,6 +626,22 @@ pub fn qwen4_decode_share_borrow_bytes(
     .map(|backing| backing.span_bytes)
 }
 
+/// The donor-tail byte prefix each prefill class dirties:
+/// [`qwen4_decode_share_borrow_bytes`] of every [`qwen4_decode_share_classes`]
+/// entry for the chunk, in class order (ascending). The loader plans the
+/// donor tail's BorrowPrefill class views from these, the forward checks its
+/// banks against them.
+pub fn qwen4_decode_share_class_spans(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<Vec<u64>> {
+    qwen4_decode_share_classes(max_chunk)
+        .into_iter()
+        .map(|rows| qwen4_decode_share_borrow_bytes(config, rows, mode))
+        .collect()
+}
+
 /// Free device memory a chunk rung must leave beside its chunk-sized
 /// resources for the kernels' lazily sized workspaces (333-347 MiB at
 /// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
@@ -3199,10 +3215,11 @@ impl Qwen4MoeLayerRuntime {
             .filter(|codec| *codec != crate::expert_arena::CODEC_MQ4)
     }
 
-    /// The BorrowPrefill runtime of a decode-share load: the same layer built
-    /// from the lease's BorrowPrefill view (donors at their pinned host mirror).
-    /// Serves only prompt tiles of at least the resident bank's rows; never
-    /// arms a CPU splice or D2 split.
+    /// The BorrowPrefill runtime of a decode-share load for prefill capacity
+    /// class `class`: the same layer built from the lease's class view (the
+    /// donors that class can overwrite at their pinned host mirror, the rest
+    /// at their device bytes). Serves only prompt tiles of at least the
+    /// resident bank's rows; never arms a CPU splice or D2 split.
     pub(crate) fn from_moe_borrow(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -3210,6 +3227,7 @@ impl Qwen4MoeLayerRuntime {
         layer_label: usize,
         config: &Qwen4Config,
         d2_default: bool,
+        class: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::build(
             gpu,
@@ -3221,7 +3239,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             true,
             d2_default,
-            crate::expert_tier_owners::ExpertReadView::BorrowPrefill,
+            crate::expert_tier_owners::ExpertReadView::BorrowPrefill(class),
         )
     }
 
@@ -3387,7 +3405,10 @@ impl Qwen4MoeLayerRuntime {
         } else {
             None
         };
-        let borrow_view = read_view == crate::expert_tier_owners::ExpertReadView::BorrowPrefill;
+        let borrow_view = matches!(
+            read_view,
+            crate::expert_tier_owners::ExpertReadView::BorrowPrefill(_)
+        );
         if borrow_view && tier_layer.is_none() {
             return Err(invalid(format!(
                 "layer {layer_label}: no BorrowPrefill expert view (the load carries no decode-share \
@@ -8130,13 +8151,39 @@ pub(crate) fn decode_share_prefill_tile(
     rows >= QWEN4_DECODE_SHARE_RESIDENT_ROWS && !argmax_forward && !lane_scope && !mesh_segment
 }
 
-/// The per-layer runtimes a tile reads ([`Qwen4GpuForward::tile_moe`]).
-fn tile_moe_of<'a, T>(borrow_active: bool, resident: &'a [T], borrowed: &'a [T]) -> &'a [T] {
-    if borrow_active {
-        borrowed
-    } else {
-        resident
+/// The per-layer runtimes a tile reads ([`Qwen4GpuForward::tile_moe`]): the
+/// BorrowPrefill runtimes of class view `view` while a prompt tile borrows,
+/// the Resident ones otherwise.
+fn tile_moe_of<'a, T>(
+    borrow_active: bool,
+    view: usize,
+    resident: &'a [T],
+    borrowed: &'a [Vec<T>],
+) -> &'a [T] {
+    match borrowed.get(view) {
+        Some(runtimes) if borrow_active => runtimes,
+        _ => resident,
     }
+}
+
+/// The BorrowPrefill class view a prompt tile reads: the epoch's dirty class,
+/// i.e. the largest class any tile of the current borrow epoch (this one
+/// included) ran on. `dirty_extent` is the loan's dirty byte prefix after this
+/// tile acquired (`None` without a loan: `bind`, no epoch carries over, so the
+/// tile's own class). A lease with a single (all-donors) view always reads it.
+pub(crate) fn borrow_view_class(
+    views: usize,
+    tile_class: usize,
+    class_spans: &[u64],
+    dirty_extent: Option<u64>,
+) -> usize {
+    if views <= 1 {
+        return 0;
+    }
+    let epoch_class = dirty_extent
+        .and_then(|extent| class_spans.iter().position(|&span| span >= extent))
+        .unwrap_or(0);
+    tile_class.max(epoch_class).min(views - 1)
 }
 
 /// Whether the mode runs scratch banks: `bank` over an owned test backing,
@@ -8646,13 +8693,20 @@ pub struct Qwen4GpuForward {
     npu_trunk: Option<npu_forward::NpuForward>,
     /// `Some` on a decode-share load: the prefill banks and bank-swap state.
     share: Option<DecodeShareBanks>,
-    /// BorrowPrefill twins of `moe` (same layer order; empty unless the tier
-    /// lease carries a decode-share binding and the mode uses it).
-    moe_borrow: Vec<Option<Qwen4MoeLayerRuntime>>,
+    /// BorrowPrefill twins of `moe` per prefill capacity class (each in the
+    /// same layer order; empty unless the tier lease carries a decode-share
+    /// binding and the mode uses it). Class `c` reads the donors its scratch
+    /// can overwrite at their pinned mirror and every other donor in VRAM.
+    moe_borrow: Vec<Vec<Option<Qwen4MoeLayerRuntime>>>,
+    /// Row capacity of each class ([`qwen4_decode_share_classes`]) the
+    /// BorrowPrefill views were built for (empty without them).
+    borrow_class_rows: Vec<usize>,
     /// Set only by the decode-share path ([`Self::forward_chunk_inner`]) for
     /// the duration of one prompt tile: [`Self::tile_moe`] then reads
-    /// `moe_borrow`.
+    /// `moe_borrow[borrow_view]`.
     borrow_runtimes_active: bool,
+    /// The class view of the running prompt tile.
+    borrow_view: usize,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -9771,7 +9825,8 @@ impl Qwen4GpuForward {
         // BorrowPrefill runtimes of a decode-share binding (empty otherwise):
         // the per-layer MoE runtimes a prompt tile of at least the resident
         // bank's rows reads ([`Self::tile_moe`]).
-        let mut moe_borrow: Vec<Option<Qwen4MoeLayerRuntime>> = Vec::new();
+        let mut moe_borrow: Vec<Vec<Option<Qwen4MoeLayerRuntime>>> = Vec::new();
+        let mut borrow_class_rows: Vec<usize> = Vec::new();
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut cut_layers: Option<CutLayers> = None;
@@ -9837,22 +9892,49 @@ impl Qwen4GpuForward {
                             | crate::decode_share::DecodeShareMode::On
                     )
                 {
-                    moe_borrow = (0..bundle.config.num_hidden_layers).map(|_| None).collect();
-                    populate_moe_runtimes(
-                        &mut moe_borrow,
-                        &bundle.weights.layer_refs,
-                        |layer, weights| {
-                            Qwen4MoeLayerRuntime::from_moe_borrow(
-                                gpu,
-                                &bundle.weights,
-                                weights,
-                                layer,
-                                &bundle.config,
-                                d2_default,
-                            )
-                        },
+                    let lease = bundle
+                        .weights
+                        .expert_tiers()
+                        .expect("a decode-share binding implies a tier lease");
+                    borrow_class_rows = qwen4_decode_share_classes(max_chunk);
+                    // One view per prefill class (the loader sized them from the
+                    // same chunk), or the single all-donors view of a plan whose
+                    // classes were never set.
+                    let views = lease.borrow_classes();
+                    if views != 1 && views != borrow_class_rows.len() {
+                        return Err(invalid(format!(
+                            "decode-share: the lease carries {views} BorrowPrefill class views but \
+                             the {max_chunk}-row chunk has {} prefill classes",
+                            borrow_class_rows.len()
+                        )));
+                    }
+                    for class in 0..views {
+                        // Owned by the forward before it is populated: an error
+                        // below frees whatever was built.
+                        moe_borrow
+                            .push((0..bundle.config.num_hidden_layers).map(|_| None).collect());
+                        populate_moe_runtimes(
+                            moe_borrow.last_mut().expect("pushed above"),
+                            &bundle.weights.layer_refs,
+                            |layer, weights| {
+                                Qwen4MoeLayerRuntime::from_moe_borrow(
+                                    gpu,
+                                    &bundle.weights,
+                                    weights,
+                                    layer,
+                                    &bundle.config,
+                                    d2_default,
+                                    class,
+                                )
+                            },
+                        )?;
+                    }
+                    Self::check_borrow_runtimes(
+                        bundle,
+                        &moe,
+                        &moe_borrow,
+                        share.as_ref().map(|share| share.class_spans.as_slice()),
                     )?;
-                    Self::check_borrow_runtimes(bundle, &moe, &moe_borrow)?;
                 }
             }
             let moe_count = moe.iter().flatten().count();
@@ -10189,9 +10271,11 @@ impl Qwen4GpuForward {
             // the donors' mirror reproduces byte for byte
             // (`ExpertTierLease::verify_donor_tail` under the verify knob), so
             // the second device check would only re-read the same bytes.
-            for (borrowed, resident) in moe_borrow.iter_mut().zip(&moe) {
-                if let (Some(borrowed), Some(resident)) = (borrowed, resident) {
-                    borrowed.symmetric = resident.symmetric;
+            for runtimes in moe_borrow.iter_mut() {
+                for (borrowed, resident) in runtimes.iter_mut().zip(&moe) {
+                    if let (Some(borrowed), Some(resident)) = (borrowed, resident) {
+                        borrowed.symmetric = resident.symmetric;
+                    }
                 }
             }
             if flash_next {
@@ -10312,7 +10396,7 @@ impl Qwen4GpuForward {
             if let Some(stage) = expert_stage {
                 let _ = stage.free_gpu(gpu);
             }
-            for layer in moe_borrow.into_iter().flatten() {
+            for layer in moe_borrow.into_iter().flatten().flatten() {
                 let _ = layer.free_gpu(gpu);
             }
             for layer in moe.into_iter().flatten() {
@@ -10365,7 +10449,9 @@ impl Qwen4GpuForward {
                 && !hipfire_dispatch::cpu_exec::passback_enabled(),
             moe,
             moe_borrow,
+            borrow_class_rows,
             borrow_runtimes_active: false,
+            borrow_view: 0,
             decode_q8,
             route_trace,
             cut_layers,
@@ -10998,21 +11084,53 @@ impl Qwen4GpuForward {
             )
     }
 
+    /// The BorrowPrefill class view the prompt tile about to run reads
+    /// ([`borrow_view_class`]): after `share_acquire`, the loan's dirty extent
+    /// holds the largest class span of the epoch, this tile included. `bind`
+    /// (no loan) reads the tile's own class view. `tile_class` is the bank
+    /// class of a decode-share load, `None` for `bind`.
+    fn borrow_view_for_tile(&self, tile_class: Option<usize>, rows: usize) -> usize {
+        let views = self.moe_borrow.len();
+        let tile_class = tile_class
+            .or_else(|| decode_share_class_for_rows(&self.borrow_class_rows, rows))
+            .unwrap_or(views.saturating_sub(1));
+        let (spans, extent) = match self.share.as_ref() {
+            Some(share) => (
+                share.class_spans.as_slice(),
+                share
+                    .loan
+                    .as_ref()
+                    .and_then(|loan| loan.controller.dirty_extent()),
+            ),
+            None => (&[][..], None),
+        };
+        borrow_view_class(views, tile_class, spans, extent)
+    }
+
     /// The per-layer MoE runtimes the running tile reads: the BorrowPrefill
     /// twins during a decode-share prompt tile, the Resident runtimes in every
     /// other forward (decode, verify, lanes, EP, mesh, small tiles, attach).
     pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
-        tile_moe_of(self.borrow_runtimes_active, &self.moe, &self.moe_borrow)
+        tile_moe_of(
+            self.borrow_runtimes_active,
+            self.borrow_view,
+            &self.moe,
+            &self.moe_borrow,
+        )
     }
 
-    /// `moe_borrow` must mirror `moe` layer for layer and report the same
-    /// `host_mapped` bit (verdict change 3: layers without a host expert never
-    /// donate, so the layer bit that selects the stage and the host wait is
-    /// view independent). Logs the BorrowPrefill runtime census.
+    /// Every class set of `moe_borrow` must mirror `moe` layer for layer and
+    /// report the same `host_mapped` bit (verdict change 3: layers without a
+    /// host expert never donate, so the layer bit that selects the stage and
+    /// the host wait is view independent). A lease with several class views
+    /// must carry the spans the forward's banks dirty (`share_spans`, absent for
+    /// `bind`). Logs the BorrowPrefill runtime census and the donors each class
+    /// dirties.
     fn check_borrow_runtimes(
         bundle: &Qwen4Bundle,
         moe: &[Option<Qwen4MoeLayerRuntime>],
-        borrow: &[Option<Qwen4MoeLayerRuntime>],
+        borrow: &[Vec<Option<Qwen4MoeLayerRuntime>>],
+        share_spans: Option<&[u64]>,
     ) -> Result<(), Qwen4GpuForwardError> {
         use crate::expert_tier_owners::ExpertReadView;
         use crate::expert_tier_plan::Placement;
@@ -11020,43 +11138,65 @@ impl Qwen4GpuForward {
             .weights
             .expert_tiers()
             .ok_or_else(|| invalid("decode-share runtimes without a tier lease"))?;
-        let (mut layers, mut donor_layers) = (0usize, 0usize);
-        for (layer, (resident, borrowed)) in moe.iter().zip(borrow).enumerate() {
-            let (resident, borrowed) = match (resident, borrowed) {
-                (Some(resident), Some(borrowed)) => (resident, borrowed),
-                (None, None) => continue,
-                _ => {
-                    return Err(invalid(format!(
-                        "decode-share: layer {layer} has a runtime in one read view only"
-                    )))
-                }
-            };
-            if resident.host_mapped() != borrowed.host_mapped() {
+        if borrow.len() != lease.borrow_classes() {
+            return Err(invalid(format!(
+                "decode-share: {} BorrowPrefill runtime sets for {} lease class views",
+                borrow.len(),
+                lease.borrow_classes()
+            )));
+        }
+        if let Some(spans) = share_spans {
+            if borrow.len() > 1 && lease.borrow_class_spans() != spans {
                 return Err(invalid(format!(
-                    "decode-share: layer {layer} host_mapped is {} in the Resident view and {} in \
-                     the BorrowPrefill view (a layer without a host expert must not donate)",
-                    resident.host_mapped(),
-                    borrowed.host_mapped()
+                    "decode-share: the lease's class spans {:?} differ from the scratch banks' {spans:?}",
+                    lease.borrow_class_spans()
                 )));
             }
-            layers += 1;
-            let (Some(res_view), Some(bor_view)) = (
-                lease.layer_view(layer, ExpertReadView::Resident),
-                lease.layer_view(layer, ExpertReadView::BorrowPrefill),
-            ) else {
-                return Err(invalid(format!(
-                    "decode-share: layer {layer} lacks a tier view"
-                )));
-            };
-            if (0..bundle.config.num_experts).any(|eid| {
-                res_view.placement(eid) == Some(Placement::Device)
-                    && bor_view.placement(eid) == Some(Placement::HostMapped)
-            }) {
-                donor_layers += 1;
+        }
+        let (mut layers, mut donor_layers) = (0usize, 0usize);
+        for (class, runtimes) in borrow.iter().enumerate() {
+            let last = class + 1 == borrow.len();
+            for (layer, (resident, borrowed)) in moe.iter().zip(runtimes).enumerate() {
+                let (resident, borrowed) = match (resident, borrowed) {
+                    (Some(resident), Some(borrowed)) => (resident, borrowed),
+                    (None, None) => continue,
+                    _ => {
+                        return Err(invalid(format!(
+                            "decode-share: layer {layer} has a runtime in one read view only"
+                        )))
+                    }
+                };
+                if resident.host_mapped() != borrowed.host_mapped() {
+                    return Err(invalid(format!(
+                        "decode-share: layer {layer} host_mapped is {} in the Resident view and {} in \
+                         the BorrowPrefill class {class} view (a layer without a host expert must not donate)",
+                        resident.host_mapped(),
+                        borrowed.host_mapped()
+                    )));
+                }
+                if !last {
+                    continue;
+                }
+                layers += 1;
+                let (Some(res_view), Some(bor_view)) = (
+                    lease.layer_view(layer, ExpertReadView::Resident),
+                    lease.layer_view(layer, ExpertReadView::BorrowPrefill(class)),
+                ) else {
+                    return Err(invalid(format!(
+                        "decode-share: layer {layer} lacks a tier view"
+                    )));
+                };
+                if (0..bundle.config.num_experts).any(|eid| {
+                    res_view.placement(eid) == Some(Placement::Device)
+                        && bor_view.placement(eid) == Some(Placement::HostMapped)
+                }) {
+                    donor_layers += 1;
+                }
             }
         }
         eprintln!(
-            "  qwen4 decode-share: BorrowPrefill runtimes for {layers} tier layers (donors in {donor_layers} layers)"
+            "  qwen4 decode-share: BorrowPrefill runtimes for {layers} tier layers (donors in {donor_layers} layers), {} class views",
+            borrow.len()
         );
         Ok(())
     }
@@ -11421,7 +11561,7 @@ impl Qwen4GpuForward {
                 }
             }
         }
-        for layer in moe_borrow.into_iter().flatten() {
+        for layer in moe_borrow.into_iter().flatten().flatten() {
             if let Some(error) = layer.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
@@ -12513,6 +12653,9 @@ impl Qwen4GpuForward {
             None => {}
         }
         self.borrow_runtimes_active = prefill_tile && !self.moe_borrow.is_empty();
+        if self.borrow_runtimes_active {
+            self.borrow_view = self.borrow_view_for_tile(class, tokens.len());
+        }
         let result = self.forward_chunk_tile(
             bundle,
             gpu,
@@ -13023,7 +13166,12 @@ impl Qwen4GpuForward {
         // The runtimes this tile reads, as a slice borrowed from the two
         // runtime fields only (`Self::tile_moe` would borrow all of `self`
         // across the program build and its closures).
-        let tile_moe = tile_moe_of(self.borrow_runtimes_active, &self.moe, &self.moe_borrow);
+        let tile_moe = tile_moe_of(
+            self.borrow_runtimes_active,
+            self.borrow_view,
+            &self.moe,
+            &self.moe_borrow,
+        );
         // Whether the donor tail is whole for this call (read once, before the
         // program closures borrow `self`; the loan state cannot change inside a tile).
         let donor_resident = self.share_state_resident();
@@ -15719,21 +15867,48 @@ mod tests {
     fn decode_share_tile_moe_selects_the_borrow_twins_only_while_active() {
         use super::tile_moe_of;
         let resident = [Some(1u8), None, Some(3)];
-        let borrowed = [Some(11u8), None, Some(13)];
+        let classes = [
+            vec![Some(11u8), None, Some(13)],
+            vec![Some(21u8), None, Some(23)],
+        ];
         assert!(std::ptr::eq(
-            tile_moe_of(false, &resident, &borrowed),
+            tile_moe_of(false, 1, &resident, &classes),
             &resident[..]
         ));
         assert!(std::ptr::eq(
-            tile_moe_of(true, &resident, &borrowed),
-            &borrowed[..]
+            tile_moe_of(true, 0, &resident, &classes),
+            &classes[0][..]
+        ));
+        assert!(std::ptr::eq(
+            tile_moe_of(true, 1, &resident, &classes),
+            &classes[1][..]
         ));
         // No borrow twins: an inactive selector can only name the resident set.
-        let none: [Option<u8>; 0] = [];
+        let none: [Vec<Option<u8>>; 0] = [];
         assert!(std::ptr::eq(
-            tile_moe_of(false, &resident, &none),
+            tile_moe_of(false, 0, &resident, &none),
             &resident[..]
         ));
+    }
+
+    #[test]
+    fn decode_share_borrow_view_class_is_the_epochs_dirty_class() {
+        use super::borrow_view_class;
+        let spans = [458u64 << 20, 632 << 20, 1200 << 20, 2400 << 20, 4700 << 20];
+        // Without a loan (`bind`): the tile's own class, clamped to the views.
+        for class in 0..5 {
+            assert_eq!(borrow_view_class(5, class, &spans, None), class);
+        }
+        assert_eq!(borrow_view_class(5, 9, &spans, None), 4);
+        // With a loan the dirty extent (largest span of the epoch) wins over a
+        // smaller tile, and equals the tile's class for the epoch's first tile.
+        assert_eq!(borrow_view_class(5, 0, &spans, Some(spans[0])), 0);
+        assert_eq!(borrow_view_class(5, 0, &spans, Some(spans[4])), 4);
+        assert_eq!(borrow_view_class(5, 2, &spans, Some(spans[1])), 2);
+        assert_eq!(borrow_view_class(5, 1, &spans, Some(spans[3])), 3);
+        // A single all-donors view is always read.
+        assert_eq!(borrow_view_class(1, 3, &spans, Some(spans[4])), 0);
+        assert_eq!(borrow_view_class(0, 0, &spans, None), 0);
     }
 
     /// The reference census: what `allocate` would hand out, built with the same

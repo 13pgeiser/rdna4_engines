@@ -4779,6 +4779,78 @@ mod tests {
         );
     }
 
+    /// S3b: the donors each prefill class dirties on the real Flash-Next
+    /// plan sizes at the R9700 chunk (16384 rows), printed as the
+    /// `classes [rows:donors, ...]` load log reads them.
+    #[test]
+    fn decode_share_r9700_class_donor_table() {
+        use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+        use crate::expert_slabs::ExpertFormat;
+        use crate::expert_tier_plan::plan_expert_tiers_from_slabs;
+
+        const MIB: u64 = 1 << 20;
+        const EXPERT: u64 = 2_611_200;
+        let (chunk, mode) = (16384usize, FnSymGfx1201);
+        let config = crate::config::compact_test_config();
+        let rows = crate::gpu_forward::qwen4_decode_share_classes(chunk);
+        let spans =
+            crate::gpu_forward::qwen4_decode_share_class_spans(&config, chunk, mode).unwrap();
+        assert_eq!(rows.len(), spans.len());
+        assert_eq!(
+            spans.last().copied(),
+            crate::gpu_forward::qwen4_decode_share_borrow_bytes(&config, chunk, mode)
+        );
+        assert!(spans.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let slabs: Vec<ExpertSlab> = (0..24_576usize)
+            .map(|i| {
+                let base = i * EXPERT as usize;
+                ExpertSlab {
+                    format: ExpertFormat::Mq4Xts,
+                    gate_up: ExpertSlabSpan {
+                        offset: base,
+                        len: 1_740_800,
+                    },
+                    down: ExpertSlabSpan {
+                        offset: base + 1_740_800,
+                        len: 870_400,
+                    },
+                }
+            })
+            .collect();
+        let rank: Vec<u32> = (0..24_576u64)
+            .map(|k| ((k * 7919 + 13) % 24_576) as u32)
+            .collect();
+        let plan = plan_expert_tiers_from_slabs(&slabs, &rank, 7_600 * EXPERT + (1 << 20)).unwrap();
+        let need = *spans.last().unwrap();
+        let (shared, tail) = plan.with_decode_share(&rank, need).unwrap();
+        let k = tail.donors.len();
+        assert_eq!(k as u64, need.div_ceil(EXPERT));
+        let classed = shared.with_decode_share_classes(&spans).unwrap();
+        let tail = classed.decode_share_tail().unwrap();
+        // Uniform experts laid back to back from the tail start: class c dirties
+        // ceil(span / EXPERT) donors, a partly overlapped donor included.
+        for (class, &span) in spans.iter().enumerate() {
+            assert_eq!(
+                tail.class_donors[class] as u64,
+                span.div_ceil(EXPERT),
+                "class {} rows",
+                rows[class]
+            );
+        }
+        assert!(tail.class_donors.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(*tail.class_donors.last().unwrap(), k);
+        let table: Vec<String> = rows
+            .iter()
+            .zip(&spans)
+            .zip(&tail.class_donors)
+            .map(|((rows, span), donors)| {
+                format!("{rows}:{donors} ({:.0} MiB)", *span as f64 / MIB as f64)
+            })
+            .collect();
+        eprintln!("classes [{}] donors dirty, K = {k}", table.join(", "));
+    }
+
     /// Placement of the reproduction card with the real census: the layers
     /// the unfixed planner kept (`historical` alone), what stage and margin
     /// on the historical floor leave, and what the census-backed reserve

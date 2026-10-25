@@ -123,6 +123,15 @@ impl LoanController {
         self.state == LoanState::Resident
     }
 
+    /// Bytes of the donor tail the current borrow epoch has dirtied (the
+    /// largest class span of its tiles so far); `None` outside an epoch.
+    pub(crate) fn dirty_extent(&self) -> Option<u64> {
+        match self.state {
+            LoanState::Dirty { dirty_bytes, .. } => Some(dirty_bytes),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn counters(&self) -> LoanCounters {
         self.counters
@@ -536,6 +545,38 @@ mod tests {
         assert_eq!(ctl.counters().tiles, 3);
         assert_eq!(ctl.counters().zeroed_bytes, 2500);
         assert_eq!(ctl.counters().epochs, 1, "one epoch for three tiles");
+    }
+
+    /// Epoch class selection: a big tile followed by a small one in the same
+    /// epoch keeps reading the big class view; after the restore a fresh epoch
+    /// starts from its own tile's class.
+    #[test]
+    fn the_borrow_view_class_follows_the_epoch_and_restarts_after_a_restore() {
+        use crate::gpu_forward::borrow_view_class;
+        let spans = [100u64, 200, 400, 800, 1600];
+        let mut ctl = controller();
+        let mut fake = Fake::default();
+        let view = |ctl: &LoanController, tile: usize| {
+            borrow_view_class(5, tile, &spans, ctl.dirty_extent())
+        };
+        assert_eq!(ctl.dirty_extent(), None);
+        // A 16384-row tile (class 4), then a 600-row tile (class 0).
+        ctl.acquire(&mut fake, spans[4]).unwrap();
+        assert_eq!(view(&ctl, 4), 4);
+        ctl.acquire(&mut fake, spans[0]).unwrap();
+        assert_eq!(ctl.dirty_extent(), Some(spans[4]));
+        assert_eq!(view(&ctl, 0), 4, "the small tile still reads the max view");
+        // The prompt ends: restore enqueued, no epoch is dirty.
+        ctl.finish_prompt(&mut fake, true).unwrap();
+        assert_eq!(ctl.dirty_extent(), None);
+        // A fresh epoch starts from its first tile's class and grows with it.
+        ctl.acquire(&mut fake, spans[0]).unwrap();
+        assert_eq!(view(&ctl, 0), 0);
+        ctl.acquire(&mut fake, spans[2]).unwrap();
+        assert_eq!(view(&ctl, 2), 2);
+        ctl.acquire(&mut fake, spans[1]).unwrap();
+        assert_eq!(view(&ctl, 1), 2);
+        assert_eq!(ctl.counters().epochs, 2);
     }
 
     #[test]
