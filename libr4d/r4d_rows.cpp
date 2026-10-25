@@ -8155,8 +8155,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_shape_moe_gemm_q },
 
 { "moe_gemm_w4a8", "moe_gemm_q", "moe",
-  "the same grouped GEMM with the expert weight at FOUR BITS: row-major packed nibbles expanded to "
-  "E4M3 on the way into LDS, so the WMMA inner loop is the fp8 kernel's untouched",
+  "grouped FOUR-BIT GEMM: signed I4 in 16-column/64-K fragment tiles, loaded directly into "
+  "WMMA registers for one-token routing or staged through LDS otherwise; codebook formats keep "
+  "row-major packed nibbles expanded to E4M3, with the fp8 kernel's WMMA arithmetic",
   "N a multiple of 64, K a multiple of 128, group 128; the same 16-row/32-row band, and the same "
   "argument for it",
   "E4M3 activation with an f32 scale per 128 of K, symmetric int4 weight (codes -8..7) with a "

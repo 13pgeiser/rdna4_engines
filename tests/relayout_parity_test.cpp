@@ -3,10 +3,10 @@
  *
  * A container holds a quantiser's canonical planes; the kernel only arranges them at load
  * (spec.md §4.3). For every stored format, libquant's planes passed through the kernel's relayout
- * are pinned to a recorded FNV-1a hash of the stored bytes. The hashes match the containers in
- * service, so a recipe reconverts one without moving a served bit, and a relayout or quantiser
- * edit that changes a format fails here instead of as a quality drift no downstream test can
- * see. Where the kernel has an inverse, it must give the planes back exactly.
+ * are pinned to a recorded FNV-1a hash of the load-time bytes. A deliberate kernel packing change
+ * updates those hashes, not the container: its canonical codes must still round-trip exactly.
+ * Fragment-tiled MoE I4 also checks every nibble's address independently of the packing hooks,
+ * so updating a golden cannot hide a matching forward/inverse permutation error.
  *
  * libr4d needs a HIP toolchain to build but its layouts do not, so their host sources are compiled
  * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin. One
@@ -105,6 +105,24 @@ uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
             CHECK_EQ(nf.relayout(kp.data(), kp.n(), op.operand, &q.enc, s.sel.data(), s.t.data(),
                                  (int)s.t.size(), got.data(), L.bytes), RAD_OK);
         }
+        if (lrc == RAD_OK && L.tag && std::strstr(L.tag, ".w.t16k64.g128")) {
+            /* Kernel meaning, not the relayout algorithm: lane%16 owns output column n, the
+             * lane's half owns eight K values, byte j holds k+j low and k+j+4 high. */
+            CHECK_EQ(got.size(), (size_t)(R * C / 2));
+            if (got.size() != (size_t)(R * C / 2)) return 0;
+            const auto& codes = q.planes[(size_t)s.sel[0]];
+            int64_t bad = 0;
+            for (int64_t n = 0; n < R; ++n)
+                for (int64_t k = 0; k < C; ++k) {
+                    const int64_t lane = n % 16 + ((k % 16) / 8) * 16;
+                    const size_t at = (size_t)(((n / 16 * (C / 64) + k / 64) * 32 + lane)
+                                               * 16 + (k % 64 / 16) * 4 + k % 4);
+                    const int a = (got[at] >> ((k % 8 / 4) * 4)) & 15;
+                    const int b = (codes[(size_t)(n * (C / 2) + k / 2)] >> ((k % 2) * 4)) & 15;
+                    bad += a != b;
+                }
+            CHECK_EQ(bad, 0LL);
+        }
         h = fnv(got, h);
 
         /* ...and back, where the kernel can be read back at all */
@@ -122,7 +140,7 @@ uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
     return h;
 }
 
-/* A golden: the hash of the stored bytes as the containers in service hold them. */
+/* A golden of the kernel's load-time bytes, not the container's canonical planes. */
 void golden(const char* label, uint64_t got, uint64_t want) {
     if (got != want)
         std::fprintf(stderr, "    %s: stored hash 0x%016llxull, recorded 0x%016llxull\n", label,
@@ -446,7 +464,7 @@ TEST(moe_int4_experts_plain_and_rotated_both_classes) {
                    { { B, { "codes" } }, { BSCALE, { "scale" } } }),
             stored(dt, nMoeW4, kp, "rtn", g, "blk.0.ffn_down_exps.1.weight", N1, K1, w1,
                    { { 6, { "codes" } }, { 7, { "scale" } } }));
-        golden(dt, h, rot ? 0xcc329df22f1f6c40ull : 0x15a0093ea83a5a90ull);
+        golden(dt, h, rot ? 0x4acff22a616a9476ull : 0x565ae6cfe9b94a6aull);
     }
 }
 
@@ -467,12 +485,12 @@ TEST(moe_codebook_experts_both_classes) {
                { { B, { "codes", "table" } }, { BSCALE, { "scale" } } }),
         stored("w4nla8h", nMoeW4, kp, "rtn", g, "blk.0.ffn_down_exps.1.weight", N1, K1, w1,
                { { 6, { "codes", "table" } }, { 7, { "scale" } } }));
-    golden("w4nla8h", h, 0xbb9b202196aef720ull);
+    golden("w4nla8h", h, 0x874c1a30937ee1d3ull);
 }
 
 TEST(moe_codebook_experts_at_e4m3_scales_a_64) {
     NEED_LIBQUANT();
-    /* w4nl64a8h: the codebook's codes, stored as w4nla8h stores them, and an E4M3 scale per
+    /* w4nl64a8h: the codebook's codes keep their row-major nibble order, and an E4M3 scale per
      * (row, 64 of K) under one fixed f32. The scale view selects both; the relayout checks the
      * second is the kernel's constant and stores the E4M3 plane as is; the inverse gives back
      * both. A second level of any other value is refused when its bytes are relaid. */
@@ -769,7 +787,7 @@ TEST(moe_int4_gptq_against_a_calibration_hessian) {
         CHECK(qg.planes[0] != qr.planes[0]);           /* the Hessian moved codes */
         CHECK(qg.planes[1] == qr.planes[1]);           /* and not the scales: static groups */
         golden(rot ? "gptq w4a8h" : "gptq w4a8", hg,
-               rot ? 0x761cbdd0aff4adedull : 0x4a4db9378ca02303ull);
+               rot ? 0x2006e855d8d09225ull : 0x041995f37ab68a83ull);
     }
 }
 

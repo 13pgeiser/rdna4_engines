@@ -21492,8 +21492,9 @@ static const MoeDnShape kMoeDnShapes[] = {
  *
  * A checker reads `moe_gemm_w4a8`'s weight through the row's inverse, so the inverse must return
  * exactly the planes the relayout was given. The arrangement is checked against r4d_layout.cpp's
- * statement, not either hook: byte b of a packed dword holds element b low and b+4 high, two's
- * complement. The scale plane is stored as is, so its hook must answer RAD_E_UNSUPPORTED
+ * statement, not either hook: signed-I4 tiles are [N/16][K/64][lane=32][step=4] dwords;
+ * a lane owns column lane%16 and eight K elements at step*16+(lane/16)*8. Within a dword,
+ * byte b holds element b low and b+4 high. The scale plane is stored as is, so its hook must answer RAD_E_UNSUPPORTED
  * ("nothing to arrange"). */
 static void moe_w4_unlayout(const Plugin& pl) {
     const char* what = "moe_gemm_w4a8's arranged plane, vs the stated format and its inverse";
@@ -21524,7 +21525,10 @@ static void moe_w4_unlayout(const Plugin& pl) {
     for (int64_t n = 0; n < N; ++n)
         for (int64_t k = 0; k < K; ++k) {
             const int64_t pos  = k & 7;
-            const int64_t byte = n * (K / 2) + (k >> 3) * 4 + (pos & 3);
+            const int64_t lane = n % 16 + ((k % 16) / 8) * 16;
+            const int64_t step = (k % 64) / 16;
+            const int64_t word = (((n / 16) * (K / 64) + k / 64) * 32 + lane) * 4 + step;
+            const int64_t byte = word * 4 + (pos & 3);
             const int nib  = (wq[(size_t)byte] >> (pos >= 4 ? 4 : 0)) & 15;
             const int code = nib >= 8 ? nib - 16 : nib;
             if (code != code_at(p, n, k)) ++bad_code;
@@ -21535,8 +21539,8 @@ static void moe_w4_unlayout(const Plugin& pl) {
        std::to_string(bad_code) + " code(s) not where the format puts them" +
        (back ? std::string() : "; inverse: " + why));
 
-    /* w5nl64a8h's row against the same statement: the low four bits of every code where w4a8's
-     * nibble would be, in a K/2 + K/8-byte row, and the high bit (the sign) of element 4m+b of a
+    /* w5nl64a8h keeps the same within-dword nibble permutation in a row-major K/2 + K/8-byte
+     * row (not the signed-I4 fragment tiles), and the high bit (the sign) of element 4m+b of a
      * 32 at bit 7-m of byte b of that 32's dword, from byte K/2 on. The table is the kernel's, and
      * the inverse restores both planes. */
     const char* what5 = "moe_gemm_w4a8's five-bit arranged plane, vs the stated format and its "

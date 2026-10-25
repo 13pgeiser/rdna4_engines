@@ -1096,10 +1096,11 @@ extern "C" int r4d_rad_relayout_m2xfp4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-/* ---- the MoE experts. The weight is staged through LDS, so it is not permuted: the int4 plane is
- * the canonical one with each dword's nibbles reordered for the expansion (byte b holds element b
- * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same
- * plane with the weight Hadamard-rotated per group, accepted only from an encoding that says so. */
+/* ---- the MoE experts. I4 at BF16 scales per 128 K uses 16-column/64-K fragment tiles,
+ * coalescing a wave's register loads without another copy of the weight. The staged prefill
+ * kernels read the same tiles back in row segments. Subgroup-scaled codebooks keep their
+ * row-major nibble permutation, and FP8 is unchanged. `w4a8h` has the same packing with the weight Hadamard-rotated per group,
+ * accepted only from an encoding that says so. */
 namespace {
 int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
@@ -1137,12 +1138,14 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
            : !selects(enc, sel, n, "codes"))
         return RAD_E_SHAPE;
     if (!dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+    if (!g64 && (g.N % 16 || g.K % 64)) return RAD_E_SHAPE;
     if (w5) {
         fill(out, "r4d.moew5nh64.w", R4D_DT_MOEW5, g.N, g.K, g.N * (g.K / 8) * 5);
         return RAD_OK;
     }
-    fill(out, g64 == 4 ? "r4d.moew4nh32.w" : g64 ? "r4d.moew4nh64.w" : nl ? "r4d.moew4nh.w.g128"
-                    : moe_w4_rot(p, n_p) ? "r4d.moew4h.w.g128" : "r4d.moew4.w.g128",
+    fill(out, g64 == 4 ? "r4d.moew4nh32.w" : g64 ? "r4d.moew4nh64.w"
+                    : nl ? "r4d.moew4nh.w.t16k64.g128"
+                    : moe_w4_rot(p, n_p) ? "r4d.moew4h.w.t16k64.g128" : "r4d.moew4.w.t16k64.g128",
          R4D_DT_MOEW4, g.N, g.K, g.N * g.K / 2);
     return RAD_OK;
 }
@@ -1196,10 +1199,39 @@ void moew4_permute(const uint8_t* s, uint8_t* d, int64_t bytes, bool forward) {
         std::memcpy(d + i, &w, 4);
     }
 }
+/* Signed-I4 fragment tiles: [N/16][K/64][lane=32][step=4] dwords. A lane owns column
+ * lane%16 and K bytes step*16 + (lane/16)*8 .. +7, in the nibble order above. Two adjacent
+ * canonical dwords supply the low/high lane halves; the inverse restores the exact source codes.
+ * No precision or byte-count change, and no second resident weight plane. */
+void moew4_frag_permute(const uint8_t* src, uint8_t* dst, int64_t N, int64_t K, bool forward) {
+    for (int64_t nt = 0; nt < N / 16; ++nt)
+        for (int64_t kb = 0; kb < K / 64; ++kb)
+            for (int64_t n = 0; n < 16; ++n)
+                for (int64_t s = 0; s < 4; ++s) {
+                    const size_t canonical = (size_t)((nt * 16 + n) * (K / 2) + kb * 32 + s * 8);
+                    const size_t packed = (size_t)(((nt * (K / 64) + kb) * 32 + n) * 16 + s * 4);
+                    uint64_t x;
+                    if (forward) {
+                        std::memcpy(&x, src + canonical, sizeof x);
+                        x = moew4_nibbles(moew4_bytes(x));
+                        const uint32_t lo = (uint32_t)x, hi = (uint32_t)(x >> 32);
+                        std::memcpy(dst + packed, &lo, sizeof lo);
+                        std::memcpy(dst + packed + 256, &hi, sizeof hi);
+                    } else {
+                        uint32_t lo, hi;
+                        std::memcpy(&lo, src + packed, sizeof lo);
+                        std::memcpy(&hi, src + packed + 256, sizeof hi);
+                        x = moew4_bytes(moew4_nibbles((uint64_t)lo | ((uint64_t)hi << 32)));
+                        std::memcpy(dst + canonical, &x, sizeof x);
+                    }
+                }
+}
+
 /* One w5nl64a8h row between container and kernel. Stored, a row is K five-bit codes, LSB first
  * (rad_plugin.h packing), so every eight codes are five bytes. Served, it is the codes' low nibbles
- * in canonical 4-bit order (two per byte, element 2i low) put through moew4_permute as w4nla8h's
- * are, then their high bits, one dword per 32 elements: K/2 + K/8 bytes, the same count.
+ * in canonical 4-bit order (two per byte, element 2i low) put through moew4_permute, then their
+ * high bits, one dword per 32 elements: K/2 + K/8 bytes, the same count. w4nla8h does not use this
+ * row: per-128 BF16-scale I4, including that codebook, uses the 16-column/64-K fragment tiles.
  *
  * The sign dword is transposed for the kernel's merge: element 4m+b of a 32 (byte b of the
  * expansion's output dword m) is bit 7-m of byte b, so `sg << m` aligns dword m's four signs with
@@ -1285,7 +1317,8 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         return RAD_OK;
     }
     if (moe_w4_nl(v.p, v.n) && !moew4_table_is_kernels(pl[1])) return RAD_E_DTYPE;
-    moew4_permute(pdata(pl[0]), (uint8_t*)dst, g.N * (g.K / 2), true);
+    if (moe_w4_g64(v.p, v.n)) moew4_permute(pdata(pl[0]), (uint8_t*)dst, g.N * (g.K / 2), true);
+    else moew4_frag_permute(pdata(pl[0]), (uint8_t*)dst, g.N, g.K, true);
     return RAD_OK;
 }
 
@@ -1313,7 +1346,9 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         std::memcpy(pl[1].data, kW5nlTable, sizeof kW5nlTable);
         return RAD_OK;
     }
-    moew4_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N * (g.K / 2), false);
+    if (moe_w4_g64(v.p, v.n))
+        moew4_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N * (g.K / 2), false);
+    else moew4_frag_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N, g.K, false);
     /* The table the stored codes index is the kernel's: the relayout refused any other. */
     if (moe_w4_nl(v.p, v.n)) std::memcpy(pl[1].data, kW4nlTable, sizeof kW4nlTable);
     return RAD_OK;

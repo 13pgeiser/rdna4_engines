@@ -249,13 +249,13 @@ enum {
     R4D_DT_W2_FRAG    = RAD_DT_PLUGIN_BASE + 4,
     R4D_DT_MXFP4_FRAG = RAD_DT_PLUGIN_BASE + 5,
     R4D_DT_E8M0       = RAD_DT_PLUGIN_BASE + 6,  /* [K/32][N] shared exponents, and Wref[N]  */
-    /* The grouped MoE GEMM's 4-bit expert weight: row-major packed nibbles, each a code into a
-     * sixteen-entry table, expanded to E4M3 on the way into LDS. Not R4D_DT_W4_FRAG, which is a
-     * WMMA fragment permutation for a kernel loading its weight from global; this one stages
-     * through LDS because its rows are gathered. See r4d_layout.cpp. */
+    /* The grouped MoE GEMM's 4-bit expert weight. I4 at per-128 BF16 scales uses 16-column/64-K
+     * fragment tiles for coalesced register loads and the staged kernels' row-segment gather.
+     * Subgroup-scaled codebooks keep row-major packed nibbles. Both use an exact E4M3 table; the layout
+     * tag distinguishes their storage from each other and R4D_DT_W4_FRAG. See r4d_layout.cpp. */
     R4D_DT_MOEW4      = RAD_DT_PLUGIN_BASE + 7,
-    /* The same GEMM's 5-bit expert weight: per row, R4D_DT_MOEW4's nibble plane of the codes' low
-     * four bits (the magnitude), then the sign bits, one dword per 32 elements in the order the
+    /* The same GEMM's 5-bit expert weight: per row, the codebook layout's nibble plane of the
+     * codes' low four bits (the magnitude), then the sign bits, one dword per 32 elements in the order the
      * kernel merges them (r4d_layout.cpp, moew5_row). A row is 5K/8 bytes. */
     R4D_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
     /* The M2XFP4 GEMMs' stored weight: R4D_DT_MXFP4_FRAG's fragment-order e2m1 codes, then the
