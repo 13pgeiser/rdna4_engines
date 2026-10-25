@@ -3984,14 +3984,94 @@ TEST(the_gemma4_e4b_form_writes_image_pad_rows_after_the_per_layer_all_reduce) {
     }
 }
 
-/* The per-layer branch is served at one or two ranks, and a model whose every layer shares KV has
- * no cache to read. */
+/* E4B's attention width: 8 q heads over 2 KV heads in both classes, so four ranks replicate each
+ * KV head over two. Each rank's k and v rows are its head's (rows (rank / 2) * head_dim on), as one
+ * span or as the k and v parts of a fused q|k|v with the scale plane alongside; q stays an even
+ * share. Every attention junction that runs keeps every row, since the per-layer branch follows
+ * the feed-forward, and a step still reduces the two lookups and two a layer. */
+TEST(the_gemma4_e4b_form_replicates_kv_heads_at_four_ranks) {
+    std::vector<const char*> vals(std::begin(k_gem4e_vals), std::end(k_gem4e_vals));
+    vals[2] = "2";   /* num_key_value_heads */
+    const int64_t L = 12, hs = 256, hg = 512;
+    for (bool fused : { false, true }) {
+        for (int rank = 0; rank < 4; ++rank) {
+            RadBuilder b;
+            if (fused) {
+                const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                /* attn_q for the KV-shared layers, which have no q|k|v row */
+                b.encs = { { "attn_qkv.", e }, { "attn_q.", e }, { "attn_o.", e },
+                           { "ffn_gate_up.", e }, { "ffn_down.", e } };
+            }
+            RadModelMeta meta = gemma4_e4b_meta();
+            meta.n_head = 8; meta.n_head_kv = 2; meta.kv_val = vals.data();
+            RadBuildCtx ctx = build_ctx(rank, 4);
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            CHECK_EQ(b.kv_groups[0].d.n_head_kv, 1);
+            CHECK_EQ(b.kv_groups[1].d.n_head_kv, 1);
+            const RecOp* at = find_op(b, "attn_paged", 0);
+            REQUIRE(at != nullptr);
+            CHECK_EQ(pint(at, "n_head"), 2);
+            CHECK_EQ(pint(at, "gqa"), 2);
+            /* layer 0 sliding, layer 5 full; both keep a cache of their own */
+            const std::initializer_list<std::pair<int, int64_t>> own = { { 0, hs }, { 5, hg } };
+            for (const auto& [l, hd] : own) {
+                const int64_t kv0 = (rank / 2) * hd;
+                if (fused) {
+                    for (const char* v : { "weight", "scale" }) {
+                        const RecWeight* w =
+                            find_w(b, "blk." + std::to_string(l) + ".attn_qkv." + v);
+                        REQUIRE(w != nullptr);
+                        REQUIRE_EQ(w->n_part_spans, 3);
+                        CHECK_EQ(w->part_lo[0], rank * 2 * hd);
+                        CHECK_EQ(w->part_total[0], 8 * hd);
+                        for (int p : { 1, 2 }) {
+                            CHECK_EQ(w->part_lo[p], kv0);
+                            CHECK_EQ(w->part_hi[p], kv0 + hd);
+                            CHECK_EQ(w->part_total[p], 2 * hd);
+                        }
+                    }
+                } else {
+                    for (const char* kv : { "attn_k", "attn_v" }) {
+                        const RecWeight* w =
+                            find_w(b, "blk." + std::to_string(l) + "." + kv + ".weight");
+                        REQUIRE(w != nullptr);
+                        CHECK(w->span_set);
+                        CHECK_EQ(w->span_lo, kv0);
+                        CHECK_EQ(w->span_hi, kv0 + hd);
+                    }
+                }
+            }
+            CHECK_EQ(gemma4_bf16::g_model[rank].fuse, fused);
+
+            RadBatch batch = decode_batch();
+            RadCtx c; c.b = &b; c.rank = rank; c.world = 4; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK_LINT(b, &c);
+            CHECK(c.step_fail.empty());
+            /* a 4-row step takes the split form: every one keeps all rows */
+            int split = 0;
+            for (const auto& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (o && o->op == "ar_rmsnorm_quant_i8" && param(o, "sp")) {
+                    CHECK_EQ(pint(o, "sp"), 2);
+                    ++split;
+                }
+            }
+            CHECK_EQ(split, fused ? (int)L : 0);
+            const std::vector<std::string> ops = issued_ops(b, c);
+            CHECK_EQ(count_issued(ops, "all_reduce") + count_issued(ops, "ar_rmsnorm_quant_i8"),
+                     (int)(2 + 2 * L));
+        }
+    }
+}
+
+/* A world the heads do not divide over, and a model whose every layer shares KV, are refused. */
 TEST(the_gemma4_e4b_form_is_refused_where_it_cannot_run) {
     {
         RadBuilder b;
         RadModelMeta meta = gemma4_e4b_meta();
-        RadBuildCtx  ctx  = build_ctx(0, 4);
-        CHECK_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+        RadBuildCtx  ctx  = build_ctx(0, 3);
+        CHECK(stderr_of_rc([&] { return gemma4_bf16::declare(&b, &meta, &ctx); }) != RAD_OK);
     }
     {
         const char* vals[] = { "1024", "512", "16", "10000", "1000000", "0.25", "12", "30", "6", "0",

@@ -86,6 +86,10 @@ struct ClassGeom {
     float   scale  = 1.0f;
     bool    head_ladder = false;   /* true: proportional over head_dim (global) */
     bool    has_v       = true;    /* false: k == v (global) */
+    /* Fewer KV heads than ranks: each rank keeps the one at row `kv_off` of the n_head_kv_all,
+     * shared with the other world / n_head_kv_all ranks of its group. */
+    bool    kv_rep      = false;
+    int64_t kv_off = 0, n_head_kv_all = 0;
     int64_t q_dim()  const { return n_head * head_dim; }
     int64_t kv_dim() const { return n_head_kv * head_dim; }
     int64_t gqa()    const { return n_head / n_head_kv; }
@@ -142,6 +146,17 @@ struct G4Linear {
      * whole step's (see "the prefill overlap" below). */
     void step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const;
     void gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const;
+    /* This rank's rows of each row part where they are not an even share (a replicated KV head),
+     * on the weight and on its scale plane: every grid here keeps one scale row a weight row. */
+    int  span_parts(RadBuilder* b, const int64_t* lo, const int64_t* hi, const int64_t* total,
+                    int n) const {
+        for (rad_weight x : { w, ws }) {
+            if (!x) continue;
+            RAD_ARCH_TRY(n == 1 ? rad_weight_shard_span(b, x, lo[0], hi[0])
+                                : rad_weight_shard_span_parts(b, x, lo, hi, total, n));
+        }
+        return RAD_OK;
+    }
 };
 
 /* A weight on the w4a8 / w8a8 grid: i4 or i8 codes with an f16 scale per [1 x 128], the encoding
@@ -515,6 +530,22 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
                               { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
                               g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
+
+    /* A replicated KV head: this rank's k and v rows are its head's, not an even share. q stays
+     * an even share; a rank's q heads all read that head. */
+    if (cls.kv_rep) {
+        const int64_t kv_all = cls.n_head_kv_all * cls.head_dim, q0 = (int64_t)g.rank * qd;
+        if (fused) {
+            const int64_t lo[3]  = { q0, cls.kv_off, cls.kv_off };
+            const int64_t hi[3]  = { q0 + qd, cls.kv_off + kvd, cls.kv_off + kvd };
+            const int64_t tot[3] = { qd * g.world, kv_all, kv_all };
+            RAD_ARCH_TRY(ln_qkv.span_parts(b, lo, hi, tot, cls.has_v ? 3 : 2));
+        } else {
+            const int64_t lo = cls.kv_off, hi = cls.kv_off + kvd;
+            RAD_ARCH_TRY(ln_k.span_parts(b, &lo, &hi, &kv_all, 1));
+            if (cls.has_v) RAD_ARCH_TRY(ln_v.span_parts(b, &lo, &hi, &kv_all, 1));
+        }
+    }
 
     /* input norm: x_hat * w over the residual stream. */
     op_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -2032,13 +2063,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.n_ple < 0) { fprintf(stderr, "radiance: gemma4: hidden_size_per_layer_input %lld is negative\n", (long long)m.n_ple); return RAD_E_INVAL; }
     if (m.n_ple > 0) {
         const int64_t v_ple = meta_text_geti(meta, "vocab_size_per_layer_input", g.n_vocab_all);
-        if (g.world > 2) {
-            fprintf(stderr, "radiance: gemma4: per-layer embeddings (hidden_size_per_layer_input %lld) "
-                            "are served at one or two ranks, not %d: the four-rank junctions keep "
-                            "a rank's rows only, and the per-layer branch reads every row\n",
-                    (long long)m.n_ple, g.world);
-            return RAD_E_UNSUPPORTED;
-        }
         if (v_ple != g.n_vocab_all) {
             fprintf(stderr, "radiance: gemma4: vocab_size_per_layer_input %lld differs from the "
                             "vocabulary (%lld)\n", (long long)v_ple, (long long)g.n_vocab_all);
@@ -2053,8 +2077,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
-    int64_t kv_g = 0;
-    if (divide_or_fail(kv_g_all, g.world, "num_global_key_value_heads", &kv_g) < 0) return RAD_E_INVAL;
+    /* The global class's KV heads, replicated like the sliding class's when there are fewer than
+     * ranks (geom_from): each rank keeps one, at row kv_off_g. */
+    int64_t kv_g = 0, kv_off_g = 0;
+    if (g.world > kv_g_all) {
+        if (g.world % kv_g_all) {
+            fprintf(stderr, "radiance: gemma4: %d ranks cannot replicate %lld global KV heads; the "
+                            "world must be a multiple of the KV head count\n",
+                    g.world, (long long)kv_g_all);
+            return RAD_E_INVAL;
+        }
+        kv_g = 1;
+        kv_off_g = (int64_t)(g.rank / (g.world / kv_g_all)) * head_g;
+    } else if (divide_or_fail(kv_g_all, g.world, "num_global_key_value_heads", &kv_g) < 0) {
+        return RAD_E_INVAL;
+    }
 
     /* Plain RMSNorm, x_hat * w, on every norm including the post-projection ones. Unlike
      * Gemma 2/3, Gemma 4 does not use the (1 + w) form: vLLM's stock RMSNorm, HF's Gemma4RMSNorm
@@ -2097,6 +2134,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.cg.n_head = g.n_head;      m.cg.n_head_kv = kv_g;        m.cg.head_dim = head_g;
     m.cg.n_rot  = n_rot_g;       m.cg.window = 0;              m.cg.theta = theta_g;
     m.cg.scale  = g.rope_scale;  m.cg.head_ladder = true;      m.cg.has_v = k_eq_v == 0;
+    m.cs.kv_rep = g.world > g.n_head_kv_all;  m.cs.kv_off = g.kv_off;
+    m.cs.n_head_kv_all = g.n_head_kv_all;
+    m.cg.kv_rep = g.world > kv_g_all;         m.cg.kv_off = kv_off_g;
+    m.cg.n_head_kv_all = kv_g_all;
 
     /* ---- the two KV groups. */
     const uint32_t kvdt = rad_kv_cache_dtype(ctx, RAD_BF16);
@@ -2374,8 +2415,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * taps the stream */
                 bool tapped = false;
                 for (int t = 0; t < m.n_taps; ++t) tapped = tapped || m.tap_layer[t] == (int)l;
+                /* every row also where the per-layer branch follows: the feed-forward then closes
+                 * with its own all-reduce, post-norm and add */
                 RAD_ARCH_TRY(lay.j_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.attn.w_post, 0,
-                                              lay.mlp.ln_gu, l + 1 == m.n_main));
+                                              lay.mlp.ln_gu, l + 1 == m.n_main || m.n_ple > 0));
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
