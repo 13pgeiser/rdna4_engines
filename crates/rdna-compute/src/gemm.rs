@@ -279,7 +279,7 @@ pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
         hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
 /// `HIPFIRE_QWEN4_MOE_FRONT_FUSE` (default on, `0` restores the unfused chain): the
-/// sealed grouped MoE prefill on exact gfx1201's symmetric IU4 route reads the HC `mixed`
+/// sealed grouped MoE prefill on exact gfx1201's or exact gfx1151's symmetric IU4 route reads the HC `mixed`
 /// rows once in `mq_rotate_x_i4_f16out`, which emits both the router / shared-expert F16 X
 /// (the bytes of `convert_f32_to_f16`) and the routed gate/up IU4 sidecar (the bytes of
 /// `mq_rotate_x_i4`), and skips the F32 `mq_rotate_x` whose output no reader on that route
@@ -29457,7 +29457,10 @@ impl Gpu {
     /// exactly as [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`] launches them), then
     /// [`Gpu::qwen4_shared_gu_pm_launch`] over that conversion in place of the gate and up
     /// GEMMs, the activation and the hidden's conversion. `hidden` is the F16 `[batch_size, m]`
-    /// destination (the shared down reads it as its F16 input). Returns `false` with nothing
+    /// destination (the shared down reads it as its F16 input). `x16`, when given, is the F16
+    /// conversion of `x` the fused MoE front already left in the shared F16 scratch
+    /// ([`Gpu::qwen4_moe_front_producer`]): no `convert_f32_to_f16` is launched, and nothing may
+    /// have converted into that scratch since. Returns `false` with nothing
     /// launched unless the route applies ([`Gpu::qwen4_shared_gu_pm_applies`] and the groups'
     /// own conditions).
     #[allow(clippy::too_many_arguments)]
@@ -29469,21 +29472,24 @@ impl Gpu {
         up: &GpuTensor,
         hidden: &GpuTensor,
         x: &GpuTensor,
+        x16: Option<&GpuTensor>,
         m: usize,
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
         if !self.qwen4_shared_gu_pm_applies(gate, up, m, k, batch_size)
-            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups(
+            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(
                 &[&[router][..], &[selector][..]],
                 x,
+                x16,
                 k,
                 batch_size,
             )?
         {
             return Ok(false);
         }
-        // Nothing since the groups' conversion wrote the F16 scratch: the view is the same bytes.
+        // Nothing since the groups' conversion (or the front producer's store) wrote the F16
+        // scratch: the view is the same bytes.
         let x16 = self.qwen4_f16_x_scratch(batch_size * k)?;
         self.qwen4_shared_gu_pm_launch(
             QWEN4_SHARED_GU_PM_WAVES,
@@ -51178,12 +51184,12 @@ impl Gpu {
 
     /// Whether the Qwen4 MoE front producer ([`Gpu::qwen4_moe_front_producer`]) may replace
     /// the sealed grouped prefill's `convert_f32_to_f16` + `mq_rotate_x_i4` (and the dead
-    /// F32 `mq_rotate_x`): exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not `0`, the
-    /// aggregate symmetric IU4 descriptor present, and no recorder or graph capture (the F16
-    /// scratch is written by a fresh producer launch, not a recorded conversion).
+    /// F32 `mq_rotate_x`): exact gfx1201 or exact gfx1151, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not
+    /// `0`, the aggregate symmetric IU4 descriptor present, and no recorder or graph capture
+    /// (the F16 scratch is written by a fresh producer launch, not a recorded conversion).
     pub fn qwen4_moe_front_fuse_applies(&self) -> bool {
         *QWEN4_MOE_FRONT_FUSE
-            && self.arch_caps.is_gfx1201()
+            && (self.arch_caps.is_gfx1201() || self.arch == "gfx1151")
             && self.qwen4_moe_sym_kernel().is_some()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode

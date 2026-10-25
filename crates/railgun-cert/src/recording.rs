@@ -1313,6 +1313,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-flash-next-gfx1151-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: exact gfx1201 or exact gfx1151, symmetric IU4 descriptor present; on gfx1151 the producer also feeds the fused shared gate/up PeaceMaker launch's router + selector groups)",
+        effect: KernelSelection,
+        switches: "eager: convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer mq_rotate_x_i4_f16out; recorded/captured: the incumbent unfused launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracle on Halo (gfx1151, examples/qwen4_moe_front_oracle.rs, receipt halo-prefill-044/a-front/ORACLE.md): 55/55 cases, 0 differing bytes, over rows 1..16384 with ragged tails and random/wide/tie/special/mixed adversarial rows, comparing the F16 X and IU4 sidecar against convert_f32_to_f16 + mq_rotate_x_i4 and the router/selector/gate/up and shared gate/up PM outputs against the chain's own conversion. Eager exact-gfx1151 prefill arm; the recorded body keeps the unfused launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-shared-int8-prefill",
         predicates: &[IsRecording, CaptureMode],
         condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
@@ -3589,7 +3600,10 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_moe_front_fuse_applies",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/hc_row_fold.rs",
