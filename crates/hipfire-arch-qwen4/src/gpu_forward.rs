@@ -11051,15 +11051,31 @@ impl Qwen4GpuForward {
         prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
     }
 
+    /// Whether this call continues a dirty borrow epoch inside a whole-prompt
+    /// entry: once a prompt has dirtied the donor tail, every later tile of
+    /// the same prompt (a tail below the resident rows included) stays on a
+    /// borrowed bank and the BorrowPrefill runtimes, so the restore happens
+    /// once, after the prompt, never mid-prompt (design 5.2).
+    fn share_continues_epoch(&self) -> bool {
+        self.share.as_ref().is_some_and(|share| {
+            share.prompt_depth > 0
+                && share
+                    .loan
+                    .as_ref()
+                    .is_some_and(|loan| loan.controller.dirty_extent().is_some())
+        })
+    }
+
     /// The prefill class a tile of `rows` rows borrows; `None` runs the
-    /// resident bank (every tile below the resident rows, and any call on a
-    /// load without decode-share).
+    /// resident bank (every tile below the resident rows outside a dirty
+    /// prompt epoch, and any call on a load without decode-share). A small
+    /// continuation tile of a dirty epoch takes the smallest class.
     fn share_class_for_tile(&self, rows: usize) -> Result<Option<usize>, Qwen4GpuForwardError> {
         let Some(share) = self.share.as_ref() else {
             return Ok(None);
         };
         if rows < QWEN4_DECODE_SHARE_RESIDENT_ROWS {
-            return Ok(None);
+            return Ok(self.share_continues_epoch().then_some(0));
         }
         decode_share_class_for_rows(&share.classes, rows)
             .map(Some)
@@ -11075,8 +11091,16 @@ impl Qwen4GpuForward {
     /// behind both scratch-bank selection (`share` banks) and BorrowPrefill
     /// runtime selection (`moe_borrow`). See [`decode_share_prefill_tile`].
     fn share_prefill_tile(&self, tokens: &[u32], argmax_of: Option<&GpuTensor>) -> bool {
-        (self.share.is_some() || !self.moe_borrow.is_empty())
-            && decode_share_prefill_tile(
+        if self.share.is_none() && self.moe_borrow.is_empty() {
+            return false;
+        }
+        let continuation = !tokens.is_empty()
+            && argmax_of.is_none()
+            && !self.lane_scope
+            && self.mesh_route_rows.is_none()
+            && self.share_continues_epoch();
+        continuation
+            || decode_share_prefill_tile(
                 tokens.len(),
                 argmax_of.is_some(),
                 self.lane_scope,
@@ -13727,14 +13751,11 @@ impl Qwen4GpuForward {
                 && !mesh_run
                 && self.cut_layers.is_none()
                 && self.layer_capture.is_none()
-                && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
-            // A BorrowPrefill tile is never retained-eligible: it has at least
-            // `QWEN4_DECODE_SHARE_RESIDENT_ROWS` (512) rows, so `n > 1`, and the
-            // predicate above requires `n == 1`.
-            debug_assert!(
-                !(eligible && self.borrow_runtimes_active),
-                "a BorrowPrefill tile can never be retained-eligible"
-            );
+                && !hipfire_dispatch::pipeline::qsa_projection_hook_installed()
+                // A BorrowPrefill tile (a one-row prompt tail continuing a
+                // dirty epoch included) never replays or records a decode
+                // body: its tape names canonical donor addresses.
+                && !self.borrow_runtimes_active;
             // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
             // every route that would execute the program some other way.
             if cut_layers.is_some() {
