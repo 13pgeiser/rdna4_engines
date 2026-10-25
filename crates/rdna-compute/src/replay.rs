@@ -722,24 +722,6 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
-    // Native Qwen4 MQ6 narrow PM twins. Direct weights/X only; no hidden
-    // pointer tables or state. The outputs are fully overwritten, not RMW.
-    if kernel == "gemv_mq6g256v2_xbatch_pm" {
-        return Some(vec![read(0), read(8), write(16)]);
-    }
-    if kernel == "gemv_mq6g256v2_x4_xbatch_pm" {
-        return Some(vec![
-            read(0),
-            read(8),
-            read(16),
-            read(24),
-            read(32),
-            write(40),
-            write(48),
-            write(56),
-            write(64),
-        ]);
-    }
     // The repacker completely overwrites all three planes on each launch.
     // ADD is a read-modify-write of Y0, represented conservatively as Write.
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
@@ -1530,14 +1512,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
-    // launch_maybe_blob pads its captured/recorded blob to 16 bytes:
-    // single: A/X/Y + M/K/B = 36 explicit bytes -> 48 recorded;
-    // x4: A[4]/X/Y[4] + M[4]/K/B = 96 bytes, already aligned.
-    match kernel {
-        "gemv_mq6g256v2_xbatch_pm" => return Some(48),
-        "gemv_mq6g256v2_x4_xbatch_pm" => return Some(96),
-        _ => {}
-    }
     if kernel == "fused_rmsnorm_mq_rotate_f16" {
         return Some(48);
     }
@@ -10254,69 +10228,6 @@ mod tests {
         assert_ne!("gemm_mq4g256v2_residual_wmma", "gemm_mq4g256_residual_wmma");
         assert!(pointer_effects("gemv_mq4g256v2").is_some());
         assert!(pointer_effects("gemv_mq6g256v2").is_some());
-    }
-
-    #[test]
-    fn native_mq6_pm_narrow_contracts_use_exact_padded_abi_and_pointer_modes() {
-        for (name, pointers, scalars, raw_bytes, recorded_bytes, want) in [
-            (
-                "gemv_mq6g256v2_xbatch_pm",
-                3,
-                3,
-                36,
-                48,
-                vec![read(0), read(8), write(16)],
-            ),
-            (
-                "gemv_mq6g256v2_x4_xbatch_pm",
-                9,
-                6,
-                96,
-                96,
-                vec![
-                    read(0),
-                    read(8),
-                    read(16),
-                    read(24),
-                    read(32),
-                    write(40),
-                    write(48),
-                    write(56),
-                    write(64),
-                ],
-            ),
-        ] {
-            let mut blob = hip_bridge::KernargBlob::new();
-            for _ in 0..pointers {
-                blob.push_ptr(std::ptr::null());
-            }
-            for _ in 0..scalars {
-                blob.push_i32(0);
-            }
-            assert_eq!(blob.len(), raw_bytes, "{name} explicit ABI");
-            blob.pad_to(16);
-            assert_eq!(blob.len(), recorded_bytes, "{name} launch funnel padding");
-            assert_eq!(expected_kernarg_bytes(name), Some(blob.len()));
-            let got = pointer_effects(name).expect("exact native MQ6 PM symbol");
-            assert_eq!(got.len(), want.len());
-            for (got, want) in got.iter().zip(&want) {
-                assert_eq!(got.offset, want.offset, "{name}");
-                assert_eq!(got.mode, want.mode, "{name}");
-                assert!(
-                    got.offset + 8 <= raw_bytes,
-                    "{name} effect points into padding"
-                );
-            }
-        }
-        // Do not admit arbitrary PM-looking suffixes or another family.
-        for unknown in [
-            "gemv_mq6g256v2_xbatch_pm_unknown",
-            "gemv_mq6g256v2_x4_xbatch_pm_unknown",
-            "gemv_q8_0_k320_xbatch_pm_unknown",
-        ] {
-            assert!(pointer_effects(unknown).is_none());
-            assert!(expected_kernarg_bytes(unknown).is_none());
-        }
     }
 
     #[test]

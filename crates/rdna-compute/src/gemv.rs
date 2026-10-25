@@ -22920,28 +22920,12 @@ impl Gpu {
     /// output retains its architecture's singleton DAG. Admitted wide verify
     /// uses one fixed8 PM launch; otherwise groups of eight and the singleton
     /// remainder remain unchanged.
-    /// On gfx1151, native Qwen4 calls with actual rows 2..=8 can use the
-    /// exact MQ6 PM entry, including recording/capture. The lane-only PM
-    /// policy and larger-row fallback groups keep their existing admission.
     pub fn gemm_mq6g256v2_f32_rows_x4(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
         x: &GpuTensor,
         k: usize,
         rows: usize,
-    ) -> HipResult<()> {
-        // Native MQ6 policy is only for the caller's actual 2..=8 rows.
-        // Larger-row fallback groups retain their original dispatch policy.
-        self.gemm_mq6g256v2_f32_rows_x4_impl(parts, x, k, rows, true)
-    }
-
-    fn gemm_mq6g256v2_f32_rows_x4_impl(
-        &mut self,
-        parts: [(&GpuTensor, &GpuTensor, usize); 4],
-        x: &GpuTensor,
-        k: usize,
-        rows: usize,
-        allow_native_pm: bool,
     ) -> HipResult<()> {
         const FUNCS: [&str; 7] = [
             "gemm_mq6g256v2_f32_rows_x4_r2",
@@ -22975,13 +22959,12 @@ impl Gpu {
                 if n == 1 {
                     self.gemv_mq6g256v2_x4(pg, &xg, k)?;
                 } else {
-                    self.gemm_mq6g256v2_f32_rows_x4_impl(pg, &xg, k, n, false)?;
+                    self.gemm_mq6g256v2_f32_rows_x4(pg, &xg, k, n)?;
                 }
             }
             return Ok(());
         }
-        if (self.lane_rows_pm_enabled()
-            || (allow_native_pm && self.mq6_native_rows_pm_enabled(rows)))
+        if self.lane_rows_pm_enabled()
             && crate::lane_rows_pm::mq6_x4_admits(parts.map(|(_, _, m)| m), k, rows)
         {
             return self.gemv_mq6g256v2_x4_xbatch_pm(parts, x, k, rows);
@@ -25228,9 +25211,6 @@ impl Gpu {
     /// Up to eight rows are one launch; more rows loop that launch over groups
     /// of eight (remainder last; a one-row remainder is [`Gpu::gemv_mq6g256v2`],
     /// the AR decode launch).
-    /// On gfx1151, native Qwen4 calls with actual rows 2..=8 can use the
-    /// exact MQ6 PM entry, including recording/capture. The lane-only PM
-    /// policy and larger-row fallback groups keep their existing admission.
     pub fn gemm_mq6g256v2_f32_rows(
         &mut self,
         a_raw: &GpuTensor,
@@ -25239,22 +25219,6 @@ impl Gpu {
         m: usize,
         k: usize,
         rows: usize,
-    ) -> HipResult<()> {
-        // Native MQ6 policy is only for the caller's actual 2..=8 rows.
-        // Larger-row fallback groups retain their original dispatch policy.
-        self.gemm_mq6g256v2_f32_rows_impl(a_raw, x, y, m, k, rows, true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_mq6g256v2_f32_rows_impl(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        rows: usize,
-        allow_native_pm: bool,
     ) -> HipResult<()> {
         const NAMES: [&str; 7] = [
             "gemm_mq6g256v2_f32_rows_r2",
@@ -25299,16 +25263,13 @@ impl Gpu {
                 if n == 1 {
                     self.gemv_mq6g256v2(a_raw, &xg, &yg, m, k)?;
                 } else {
-                    self.gemm_mq6g256v2_f32_rows_impl(a_raw, &xg, &yg, m, k, n, false)?;
+                    self.gemm_mq6g256v2_f32_rows(a_raw, &xg, &yg, m, k, n)?;
                 }
             }
             return Ok(());
         }
         let name = NAMES[rows - 2];
-        if (self.lane_rows_pm_enabled()
-            || (allow_native_pm && self.mq6_native_rows_pm_enabled(rows)))
-            && crate::lane_rows_pm::mq6_admits(m, k, rows)
-        {
+        if self.lane_rows_pm_enabled() && crate::lane_rows_pm::mq6_admits(m, k, rows) {
             return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
         }
         if self.flags.mq6_rows_split_enabled() {

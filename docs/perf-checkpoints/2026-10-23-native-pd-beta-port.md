@@ -8,9 +8,12 @@
   route in this port.
 - Preserve beta's fixed-eight and wide MQ6 routes, grouped-position down image
   selection, runtime `k_top` ABI, and existing route planner/certification logic.
-- Retain narrow native MQ6 PM capture contracts, the small-batch inverse GU
-  selector, streamed prefill GU, scalar MQ6 specializations, and prepared-bank
-  completion reuse where their admission predicates apply.
+- Retain the small-batch inverse GU selector, streamed prefill GU, scalar MQ6
+  specializations, and prepared-bank completion reuse where their admission
+  predicates apply. The beta integration deliberately excludes the new native
+  MQ6 PM recording/capture admission, constructor preload and replay contracts.
+  Existing lane PM and Redline defaults remain unchanged; new native capture
+  coverage is reserved for a railgun program follow-up.
 - Keep gfx1201-only HC x8 out of gfx11 registry entries. Keep the existing
   gfx1201 implementation and its fixed module-count guard.
 - Adapt the stream8 emitter to beta's GP/blocks interface. The source/image
