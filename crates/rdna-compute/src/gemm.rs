@@ -52366,7 +52366,15 @@ mod tests {
         let min1151 = HC_DOWN_FUSED_GFX1151_MIN_ROWS;
         assert_eq!(min1151, 1024);
         assert!(ok("gfx1151", true, 320, 10240, min1151, false, false));
-        assert!(ok("gfx1151", true, 320, 10240, HC_DOWN_FUSED_MIN_ROWS, false, false));
+        assert!(ok(
+            "gfx1151",
+            true,
+            320,
+            10240,
+            HC_DOWN_FUSED_MIN_ROWS,
+            false,
+            false
+        ));
         assert!(ok("gfx1151", true, 320, 10240, 8192, false, false));
         assert!(ok("gfx1151", true, 320, 10240, 16384, false, false));
         assert!(!ok("gfx1151", true, 320, 10240, min1151 - 1, false, false));

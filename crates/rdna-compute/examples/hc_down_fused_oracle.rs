@@ -276,7 +276,16 @@ fn main() {
     writeln!(receipt, "date {date}").unwrap();
     writeln!(receipt, "git {}", git_sha()).unwrap();
     writeln!(receipt, "arch {arch}").unwrap();
-    writeln!(receipt, "kernel {} vs chain gemm_bf16_xf16_f16_wmma + hc_activation_fused_f32(bf16_out)", if arch == "gfx1151" { "qwen4_hc_down_fused_gfx1151" } else { "qwen4_hc_down_fused_b64_k32" }).unwrap();
+    writeln!(
+        receipt,
+        "kernel {} vs chain gemm_bf16_xf16_f16_wmma + hc_activation_fused_f32(bf16_out)",
+        if arch == "gfx1151" {
+            "qwen4_hc_down_fused_gfx1151"
+        } else {
+            "qwen4_hc_down_fused_b64_k32"
+        }
+    )
+    .unwrap();
     writeln!(
         receipt,
         "switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} scale={SCALE} m={M} k={K}"

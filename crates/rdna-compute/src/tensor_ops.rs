@@ -2822,7 +2822,10 @@ fn hyper_read_up_wmma_launch(
         ([column_grid, row_grid, 1], [256, 1, 1], lds)
     };
     let (module, source) = if v2 && is_1151 {
-        ("hyper_read_up_wmma_gfx1151_v2", HYPER_READ_UP_WMMA_GFX1151_V2_SRC)
+        (
+            "hyper_read_up_wmma_gfx1151_v2",
+            HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
+        )
     } else {
         (module, source)
     };
