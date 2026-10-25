@@ -5192,7 +5192,8 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
  * dtype `zdt`), an f16 activation, the weight stored through the row's hooks. `pb1`/`pb2` give a
  * partitioned weight. M past 64 runs the dispatcher's 64-row chunks. */
 static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                          int64_t pb2 = 0, int bits = 5, uint32_t zdt = RAD_U8) {
+                          int64_t pb2 = 0, int bits = 5, uint32_t zdt = RAD_U8,
+                          bool one_row_exact = false) {
     const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
     const char* dtype = bits == 5 ? "w5a16" : "w4a16_asym";
     if (!sel(row)) return;
@@ -5229,7 +5230,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     void* d_a = dalloc(ha.size() * 2);
     void* d_w = dalloc(wq.size());
     void* d_s = dalloc(ws.size());
-    void* d_y = dalloc(hy.size() * 2);
+    void* d_y = dalloc((hy.size() + 16) * 2);
     if (!d_a || !d_w || !d_s || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
     st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
@@ -5252,7 +5253,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     const int rc = r->launch(&a, (RadStream) nullptr);
     if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc=" + std::to_string(rc)); return; }
     st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
-    const int64_t nstep = N > 96 ? N / 96 : 1;
+    const int64_t nstep = !one_row_exact && N > 96 ? N / 96 : 1;
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; ++i)
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
@@ -5273,6 +5274,48 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     char d[64];
     std::snprintf(d, sizeof d, "rel_l2 %.3e", rel);
     ok(nm, rel < 1e-2, d);
+    if (!one_row_exact) return;
+    if (M != 1) { ok(nm, false, "one-row comparison needs M=1"); return; }
+
+    // MB=1 selects the compact one-row epilogue; MB=2 retains the original 16-row reduction.
+    // Compare every byte at each legal point, not only the default split, including an end guard.
+    std::vector<uint16_t> compact(hy.size() + 16), full(compact.size());
+    int checked = 0;
+    for (int wv : { 1, 2, 4 })
+        for (int sk : { 1, 2, 4, 8, 16 })
+            for (int npw : { 1, 4 })
+                for (int nt : { 0, 1 }) {
+                    if (K % (sk * 128) || wv * sk > 32 || wv * npw * sk > 64) continue;
+                    std::vector<RadParam> cp = ps;
+                    const size_t mb = cp.size() + 2;
+                    cp.insert(cp.end(), { PI("wv", wv), PI("sk", sk), PI("mb", 1),
+                                          PI("npw", npw), PI("nt", nt) });
+                    a.p = cp.data(); a.n_p = (int)cp.size();
+                    bool ran = true;
+                    for (int pass = 0; pass < 2; ++pass) {
+                        cp[mb] = PI("mb", pass + 1);
+                        auto& out = pass ? full : compact;
+                        if (st_memset(d_y, 0xa5, out.size() * 2) != hipSuccess ||
+                            r->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess ||
+                            st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+                            ran = false;
+                            break;
+                        }
+                    }
+                    const bool guard = std::all_of(compact.end() - 16, compact.end(),
+                                                   [](uint16_t v) { return v == 0xa5a5; }) &&
+                                       std::all_of(full.end() - 16, full.end(),
+                                                   [](uint16_t v) { return v == 0xa5a5; });
+                    char point[256];
+                    std::snprintf(point, sizeof point, "%s one-row bytes N=%lld K=%lld parts=%d "
+                                  "wv=%d sk=%d npw=%d nt=%d", row, (long long)N, (long long)K,
+                                  parts, wv, sk, npw, nt);
+                    ok(point, ran && guard && compact == full,
+                       !ran ? "launch/copy failed" : !guard ? "output guard overwritten" : "");
+                    if (!ran) return;
+                    ++checked;
+                }
+    ok(nm, checked > 0, "one-row tuning points checked: " + std::to_string(checked));
 }
 
 
@@ -30457,6 +30500,12 @@ static void device_phase(const Plugin& pl) {
         /* z-lab's ParoQuant int4 (u8 zero, parts) and an int4 W4A16 release imported with a u4
          * zero plane: five groups a row (a pad nibble ends each zero row), then decode and verify
          * rows at the 27B's shapes. */
+        // HYV3 decode geometries, plus column tails and two/three partitioned activation copies.
+        for (const auto& nk : { std::pair<int64_t, int64_t>{4096, 2048}, {512, 2048},
+                               {2048, 4096}, {13824, 2048}, {2048, 6912}, {48, 640} })
+            w5a16_numeric(pl, 1, nk.first, nk.second, 0, 0, 4, RAD_U8, true);
+        w5a16_numeric(pl, 1, 400, 640, 144, 0, 4, RAD_U8, true);
+        w5a16_numeric(pl, 1, 512, 2560, 128, 384, 4, RAD_U4, true);
         w5a16_numeric(pl, 8, 272, 640, 0, 0, 4);
         w5a16_numeric(pl, 5, 400, 640, 144, 0, 4);
         w5a16_numeric(pl, 40, 512, 2560, 128, 384, 4);
@@ -30472,6 +30521,8 @@ static void device_phase(const Plugin& pl) {
 
     if (sel("gemm_w5a16_nt_m64")) {
         if (!g_case) std::printf("\nParoQuant's 5-bit GEMM, against the planes' meaning\n");
+        w5a16_numeric(pl, 1, 272, 640, 0, 0, 5, RAD_U8, true);
+        w5a16_numeric(pl, 1, 400, 640, 144, 0, 5, RAD_U8, true);
         w5a16_numeric(pl, 8, 272, 640);
         w5a16_numeric(pl, 64, 400, 2560);
         w5a16_numeric(pl, 5, 400, 640, 144);
