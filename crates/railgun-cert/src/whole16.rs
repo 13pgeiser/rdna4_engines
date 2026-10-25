@@ -1034,6 +1034,7 @@ mod tests {
             indexed_effects: vec![],
             required_witnesses: vec![],
             case_digest: String::new(),
+            guard_flag: None,
         }
     }
 

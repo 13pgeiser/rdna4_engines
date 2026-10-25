@@ -78,6 +78,11 @@ pub(super) fn emit_segment(
             }
             Pm4Op::Dispatch(i) => dispatch(&mut commands, i)?,
             Pm4Op::Exit => commands.trailing_release()?,
+            // Recorded tapes and DFlash windows author no conditionals, and
+            // gfx12 has no COND_EXEC receipt (`rp::cp_skip_admitted`).
+            Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                return Err("railgun M1 lowers no CP-skip conditionals".into())
+            }
         }
     }
     Ok(commands)

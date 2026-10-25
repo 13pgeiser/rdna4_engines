@@ -745,6 +745,9 @@ fn lower_executable(
                     .map_err(|e| format!("{}: {e}", node.symbol))?;
             }
             Pm4Op::Exit => commands.trailing_release()?,
+            Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                return Err("railgun M1 lowers no CP-skip conditionals".into())
+            }
         }
     }
     let ours = commands

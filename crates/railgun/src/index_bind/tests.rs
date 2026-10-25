@@ -194,6 +194,7 @@ pub(crate) fn writer_facts() -> Arc<NodeFacts> {
             hidden: Vec::new(),
             hidden_grid_live: Vec::new(),
             differential: "pass".into(),
+            guard_flag: None,
         },
     })
 }

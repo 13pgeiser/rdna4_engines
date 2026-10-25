@@ -2692,6 +2692,7 @@ mod tests {
             ],
             words: Vec::new(),
             nodes: Vec::new(),
+            conditionals: Vec::new(),
         };
         let got: Vec<String> = bound_slots(&live, &program)
             .into_iter()
@@ -2774,6 +2775,7 @@ mod tests {
                 },
             ],
             nodes: vec![],
+            conditionals: Vec::new(),
         };
         assert_eq!(gdn_words(&program), [(WordId(1), 2), (WordId(2), 1)]);
     }

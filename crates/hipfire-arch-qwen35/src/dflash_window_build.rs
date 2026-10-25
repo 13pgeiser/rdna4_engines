@@ -1268,6 +1268,7 @@ mod tests {
                 hidden: Vec::new(),
                 hidden_grid_live: Vec::new(),
                 differential: "pass".into(),
+                guard_flag: None,
             },
         })
     }
