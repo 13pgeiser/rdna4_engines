@@ -22,6 +22,9 @@ struct PassStage {
     int      phase = -1;
 };
 thread_local PassStage g_pass;
+/* Drains a handed-over stage list, if one is still in flight (definition below, near g_pipe). */
+static void stage_pipe_drain(Ctx* c);
+
 bool trace_stage() {
     static const bool on = std::getenv("RADIANCE_KV_STAGE_TRACE") != nullptr;
     return on;
@@ -77,8 +80,9 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
          * Drop the map when the view returns to the ring. The first ring pass then resolves every
          * live block out of the mirror -- exactly the cold-map behaviour the first request gets --
          * and the ring is self-consistent again for the decode steps that follow. A stream whose
-         * ring covers its id space is the identity case and is left alone: there the staged bytes
-         * and the ring's bytes are the same bytes at the same offsets.
+         * ring covers its context never streams at all (bringup: no mirror, no resolve, no stage),
+         * so `slots < blocks` here is the invariant that a stage exists, not an identity claim:
+         * the stage row is per layer and always starts at offset 0.
          *
          * The alternative -- capping the stage copy so it cannot reach a resident slot -- cannot
          * work: the stage must hold the whole history one layer reads (stage.h, VOLUME), and the
@@ -90,6 +94,9 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
             const int64_t layers = st->host_layer_stride > 0
                                        ? st->host_bytes / st->host_layer_stride : 0;
             if (blocks > 0 && layers > 0 && st->slots > 0 && st->slots < blocks) {
+                /* A list from the pass that just ended may still be writing base + 0 (the ring's
+                 * layer 0). It must land before the refill, not after it. */
+                stage_pipe_drain(c);
                 (void)rad_memset_async(st->res, 0xff,
                                        layers * blocks * (int64_t)sizeof(int32_t), c->stream());
                 (void)rad_memset_async(st->slot_block, 0xff,
@@ -179,6 +186,22 @@ struct StagePipe {
 };
 thread_local StagePipe g_pipe;
 thread_local bool g_warned_ride = false;
+
+/* A list handed over by arm_and_submit() is normally waited for by the next kvstage_wait or
+ * consumed by kvstage_next. A pass can end before either: on the transition back to the ring, a
+ * copy still writing base + 0 would land on the ring's layer-0 stripe after the refill that the
+ * map clear causes, and `res` would then call another layer's bytes resident. Wait it out before
+ * the clear; normally this finds nothing in flight. */
+static void stage_pipe_drain(Ctx* c) {
+    if (g_pipe.inflight < 0) return;
+    (void)rad_event_wait(c->stream(), g_pipe.done);
+    g_pipe.inflight = -1;
+    g_pipe.group    = -1;
+    g_pipe.bytes    = 0;
+    rad_ride_release(g_pipe.mark, nullptr, 0);
+    g_pipe.mark = nullptr;
+}
+
 
 /* Arm the completion word, mark the compute stream and hand the list over.
  *
