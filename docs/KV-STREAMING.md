@@ -418,23 +418,26 @@ cache:
     cache evicts it
     --prefix-cache-mib    0 (off)
 
-"Streaming" here is the engine's answer, not the flag's (`kvstream_prefix_host_off`,
-`kvstream/plan.cpp`; `cfg.kv_streams`): the ring must be under the group's context and the
-architecture must declare the streamed path.
+### When it is on, and when it is off. `--prefix-cache-mib` vs `--kv-resident` are EXCLUSIVE
+
+In short: with streaming on, the prefix cache keeps serving hits from VRAM, but its host-RAM
+overflow tier is switched off (and its memory not reserved), because a streamed group's KV is
+addressed by block id and can never be moved to a host slot.
 
 | `--kv-resident` | model | `--prefix-cache-mib` | result |
 |---|---|---|---|
 | absent or `0` | any | any | nothing streams; host tier exactly as configured |
-| at/above the group's context (131 072 on the reference model) | streams | any | ring covers the context, nothing streams; host tier as configured |
+| at/above the group's context (131 072 here) | streams | any | ring covers the context, **nothing streams**; host tier as configured |
 | under the context | no `kv_resolve` / no streamed store row | any | flag ignored with one sentence; host tier as configured |
 | under the context | streams | `0` | host tier off by choice: the prefix cache is VRAM-only |
-| under the context | streams | `> 0` | **host tier switched off at startup, its MiB not reserved**; the flag reports `0 (off)` |
+| under the context | streams | `> 0` | **host tier switched off at startup, its MiB not reserved**, and the flag reports `0 (off)` |
 
-The rows that keep the tier are the pre-existing behaviour, unchanged: a flag absent or `0`, a ring
-that covers the context, and a model with no `kv_resolve` all leave `--prefix-cache-mib` exactly as
-configured. The price of the last row is that a conversation whose VRAM the loan or a request took is
-prefilled again instead of restored; the levers for cache depth are then `--kv-resident` and
-`--max-num-seqs`.
+"Streaming" here is the engine's answer, not the flag's (`kvstream_prefix_host_off`,
+`kvstream/plan.cpp`; `cfg.kv_streams`): the ring must be under the group's context and the
+architecture must declare the streamed path. The rows that keep the tier are the pre-existing
+behaviour, unchanged. The price of the last row is that a conversation whose VRAM the loan or a
+request took is prefilled again instead of restored; the levers for cache depth are then
+`--kv-resident` and `--max-num-seqs`.
 
 Measured on 2×16 GB gfx1201 with `qwen3.8-next-flash-fp8-iq4r-moe`, three 44 220-token
 conversations and a replay of the first after the third displaced it: with `--kv-resident 32768` the
