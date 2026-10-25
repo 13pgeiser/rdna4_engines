@@ -8322,7 +8322,7 @@ pub(crate) struct DecodeShareBanks {
     backing: DecodeShareBacking,
     /// The donor-tail loan (`fixed` / `on`); `None` over an owned test backing.
     loan: Option<DonorLoan>,
-    /// Largest span of the classes used since the last restore (S5 restores
+    /// Largest span of the classes used since the last restore (a resident call restores
     /// this prefix of the donor tail).
     dirty_bytes: u64,
     stats: DecodeShareStats,
@@ -11014,7 +11014,8 @@ impl Qwen4GpuForward {
     /// entry: once a prompt has dirtied the donor tail, every later tile of
     /// the same prompt (a tail below the resident rows included) stays on a
     /// borrowed bank and the BorrowPrefill runtimes, so the restore happens
-    /// once, after the prompt, never mid-prompt (design 5.2).
+    /// once, at the next resident call after the prompts, never mid-prompt
+    /// (design 5.2).
     fn share_continues_epoch(&self) -> bool {
         self.share.as_ref().is_some_and(|share| {
             share.prompt_depth > 0
@@ -11202,9 +11203,11 @@ impl Qwen4GpuForward {
     }
 
     /// Before a call that runs on the resident bank and the Resident runtimes
-    /// (decode, verify, lanes, every tile below the resident rows): the donor
-    /// tail must be whole, so a dirty tail is restored (enqueued and waited)
-    /// and a pending restore is waited. Runs before the retained-eligibility
+    /// (decode, verify, lanes, every tile below the resident rows outside a
+    /// prompt): the donor tail must be whole, so a dirty tail (a prompt that
+    /// ended `Ok` leaves it dirty) is restored, whole dirtied prefix enqueued
+    /// and host-waited, and a pending restore is waited. This is where the
+    /// second-token latency after a long prompt pays the restore. Runs before the retained-eligibility
     /// predicate and any replay submit.
     pub(crate) fn share_require_resident(
         &mut self,
@@ -11277,11 +11280,11 @@ impl Qwen4GpuForward {
     }
 
     /// The last scratch consumer of a whole prompt has run. A dirty tail of a
-    /// prompt that ended `Ok` gets its restore enqueued on the compute stream
-    /// (the host wait is deferred to the next call that needs
-    /// the donors, so it overlaps sampling and emission and is not part of
-    /// TTFT; `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` waits here). A prompt that
-    /// ended with an error takes the blocking recovery.
+    /// prompt that ended `Ok` stays dirty with nothing enqueued (the first
+    /// token came from the prefill head; a following prompt continues the same
+    /// borrow, and the next [`Self::share_require_resident`] restores it;
+    /// `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` enqueues and waits here). A prompt
+    /// that ended with an error takes the blocking recovery.
     pub(crate) fn share_finish_prompt(
         &mut self,
         gpu: &mut Gpu,

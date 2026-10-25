@@ -10,9 +10,19 @@
 //! they must be whole again:
 //!
 //! ```text
-//!   Resident --acquire--> Dirty --finish_prompt / require_resident--> Restoring --wait--> Resident
+//!   Resident --acquire--> Dirty --require_resident / teardown / (SYNC=1) finish_prompt--> Restoring --wait--> Resident
 //!        any state --(error)--> recovery (device drain + blocking copy) --> Resident | Poisoned
 //! ```
+//!
+//! A prompt that ends `Ok` leaves the tail `Dirty` and enqueues nothing: the
+//! first token has already come from the prefill head, and a following prompt
+//! tile continues the same borrow (back-to-back prefills share one epoch, no
+//! restore between them). The next decode / verify / lane / sub-512-row call
+//! outside a prompt (or teardown) enqueues the whole restore and host-waits
+//! for it, so the second-token latency after a 16K prompt includes the full
+//! restore (~88 ms on R9700: 4.8 GB at ~57 GB/s). With
+//! `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` the restore is enqueued and waited at
+//! prompt end instead.
 //!
 //! It is pure: every device effect goes through [`LoanOps`], so each
 //! transition is unit-tested on the CPU with a recording fake. The forward's
@@ -364,9 +374,10 @@ impl LoanController {
     }
 
     /// The outermost whole-prompt entry ended (`ok`: it returned `Ok`). A dirty
-    /// tail is restored asynchronously (the host wait is deferred to the next
-    /// call that needs the donors, so it overlaps sampling and emission); an
-    /// abandoned prompt takes the blocking recovery.
+    /// tail stays dirty (nothing is enqueued): the next prompt tile continues
+    /// the same borrow, and the next resident call restores it. With
+    /// `sync_restore` the restore is enqueued and waited here. An abandoned
+    /// prompt takes the blocking recovery.
     pub(crate) fn finish_prompt(&mut self, ops: &mut dyn LoanOps, ok: bool) -> Result<(), String> {
         let LoanState::Dirty {
             dirty_bytes,
@@ -392,8 +403,14 @@ impl LoanController {
                 ))
             }
         }
-        self.enqueue(ops, dirty_bytes, zeroed_bytes)?;
+        // A prompt that ends well leaves the tail dirty: the first token comes
+        // from the prompt's head before any restore, the next prompt tile
+        // continues the same borrow (no restore between back-to-back
+        // prefills), and the next decode, verify, lane or sub-512-row call
+        // enqueues and waits for the restore (`require_resident`). The sync
+        // knob restores here instead, for A/B measurement.
         if self.sync_restore {
+            self.enqueue(ops, dirty_bytes, zeroed_bytes)?;
             self.wait(ops)?;
         }
         Ok(())
@@ -565,8 +582,10 @@ mod tests {
         ctl.acquire(&mut fake, spans[0]).unwrap();
         assert_eq!(ctl.dirty_extent(), Some(spans[4]));
         assert_eq!(view(&ctl, 0), 4, "the small tile still reads the max view");
-        // The prompt ends: restore enqueued, no epoch is dirty.
+        // The prompt ends: the tail stays dirty (lazy restore) until a resident call.
         ctl.finish_prompt(&mut fake, true).unwrap();
+        assert_eq!(ctl.dirty_extent(), Some(spans[4]));
+        ctl.require_resident(&mut fake).unwrap();
         assert_eq!(ctl.dirty_extent(), None);
         // A fresh epoch starts from its first tile's class and grows with it.
         ctl.acquire(&mut fake, spans[0]).unwrap();
@@ -579,27 +598,46 @@ mod tests {
     }
 
     #[test]
-    fn finish_prompt_enqueues_the_dirty_prefix_and_defers_the_host_wait() {
+    fn finish_prompt_leaves_the_tail_dirty_until_the_next_resident_call() {
         let mut ctl = controller();
         let mut fake = Fake::default();
         ctl.acquire(&mut fake, 4096).unwrap();
+        fake.log.clear();
         ctl.finish_prompt(&mut fake, true).unwrap();
         assert_eq!(
             *ctl.state(),
-            LoanState::Restoring {
+            LoanState::Dirty {
                 epoch: 1,
-                bytes: 4096,
+                dirty_bytes: 4096,
                 zeroed_bytes: 4096
             }
         );
-        assert!(!fake.log.contains(&"wait".to_string()), "no host wait yet");
-        assert_eq!(ctl.counters().restores, 1);
-        assert_eq!(ctl.counters().restored_bytes, 4096);
-        // The next resident call waits, then runs.
+        assert!(writes(&fake).is_empty(), "no enqueue at prompt end");
+        assert!(!fake.log.contains(&"wait".to_string()), "no wait either");
+        assert_eq!(ctl.counters().restores, 0);
+        // The next resident call enqueues the whole restore and waits for it.
+        fake.log.clear();
         ctl.require_resident(&mut fake).unwrap();
         assert!(ctl.is_resident());
-        assert_eq!(fake.log.last().map(String::as_str), Some("verify 4096"));
-        assert!(fake.log.contains(&"wait".to_string()));
+        assert_eq!(
+            fake.log,
+            vec!["capturing", "enqueue 4096", "wait", "verify 4096"]
+        );
+        assert_eq!(ctl.counters().restores, 1);
+        assert_eq!(ctl.counters().restored_bytes, 4096);
+    }
+
+    #[test]
+    fn finish_prompt_under_capture_with_a_dirty_tail_poisons() {
+        let mut ctl = controller();
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 100).unwrap();
+        fake.capturing = true;
+        fake.log.clear();
+        let error = ctl.finish_prompt(&mut fake, true).unwrap_err();
+        assert!(error.contains("poisoned"), "{error}");
+        assert!(matches!(ctl.state(), LoanState::Poisoned(_)));
+        assert!(writes(&fake).is_empty());
     }
 
     #[test]
@@ -612,6 +650,7 @@ mod tests {
         let enqueue = fake.log.iter().position(|l| l == "enqueue 64").unwrap();
         let wait = fake.log.iter().position(|l| l == "wait").unwrap();
         assert!(enqueue < wait);
+        assert_eq!(ctl.counters().restores, 1);
     }
 
     #[test]
@@ -631,8 +670,11 @@ mod tests {
             vec!["capturing", "enqueue 512", "wait", "verify 512"]
         );
         // Restoring: wait only.
-        ctl.acquire(&mut fake, 512).unwrap();
-        ctl.finish_prompt(&mut fake, true).unwrap();
+        ctl.state = LoanState::Restoring {
+            epoch: 1,
+            bytes: 512,
+            zeroed_bytes: 512,
+        };
         fake.log.clear();
         ctl.require_resident(&mut fake).unwrap();
         assert_eq!(fake.log, vec!["wait", "verify 512"]);
@@ -641,10 +683,16 @@ mod tests {
 
     #[test]
     fn acquire_from_restoring_waits_first_and_starts_a_new_epoch() {
-        let mut ctl = controller();
+        // Restoring is reached through a resident call or the sync knob; a
+        // following tile waits, then opens epoch 2.
+        let mut ctl = LoanController::new(true, false);
         let mut fake = Fake::default();
         ctl.acquire(&mut fake, 100).unwrap();
-        ctl.finish_prompt(&mut fake, true).unwrap();
+        ctl.state = LoanState::Restoring {
+            epoch: 1,
+            bytes: 100,
+            zeroed_bytes: 100,
+        };
         fake.log.clear();
         ctl.acquire(&mut fake, 100).unwrap();
         assert_eq!(
@@ -660,6 +708,39 @@ mod tests {
             }
         );
         assert_eq!(ctl.counters().epochs, 2);
+    }
+
+    #[test]
+    fn back_to_back_prompts_share_one_epoch_and_never_enqueue() {
+        let mut ctl = controller();
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        ctl.finish_prompt(&mut fake, true).unwrap();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        ctl.finish_prompt(&mut fake, true).unwrap();
+        assert!(writes(&fake).iter().all(|l| l.starts_with("memset")));
+        assert!(!fake.log.contains(&"wait".to_string()));
+        assert_eq!(ctl.counters().epochs, 1);
+        assert_eq!(ctl.counters().restores, 0);
+        assert!(matches!(ctl.state(), LoanState::Dirty { epoch: 1, .. }));
+    }
+
+    #[test]
+    fn class_growth_in_the_second_prompt_zeroes_only_the_delta() {
+        let mut ctl = controller();
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        ctl.finish_prompt(&mut fake, true).unwrap();
+        ctl.acquire(&mut fake, 2500).unwrap();
+        ctl.finish_prompt(&mut fake, true).unwrap();
+        let memsets: Vec<_> = fake
+            .log
+            .iter()
+            .filter(|line| line.starts_with("memset"))
+            .collect();
+        assert_eq!(memsets, ["memset 0+1000", "memset 1000+1500"]);
+        assert_eq!(ctl.counters().zeroed_bytes, 2500);
+        assert_eq!(ctl.dirty_extent(), Some(2500));
     }
 
     #[test]
@@ -765,8 +846,9 @@ mod tests {
         let mut ctl = controller();
         let mut fake = Fake::default();
         ctl.acquire(&mut fake, 300).unwrap();
+        ctl.finish_prompt(&mut fake, true).unwrap();
         fake.fail = Some("enqueue");
-        let error = ctl.finish_prompt(&mut fake, true).unwrap_err();
+        let error = ctl.require_resident(&mut fake).unwrap_err();
         assert!(error.contains("enqueue donor restore"), "{error}");
         assert!(ctl.is_resident());
         assert!(fake.log.contains(&"blocking 300".to_string()));
