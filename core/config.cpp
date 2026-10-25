@@ -118,7 +118,9 @@ static const Flag g_flags[] = {
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
-    "                                    recently used entries. 0 is off" },
+    "                                    recently used entries. 0 is off. Ignored, and not\n"
+    "                                    reserved, when a group streams (--kv-resident): such an\n"
+    "                                    entry cannot be demoted, its mirror is its cold copy" },
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },

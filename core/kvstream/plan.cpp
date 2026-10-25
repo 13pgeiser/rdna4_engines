@@ -182,8 +182,22 @@ void kvstream_ring(const Config& cfg, int64_t ctx, int64_t block_size, int64_t s
     }
 }
 
-int kvstream_cap_probe(KVManager& probe, Config& cfg, const Program& prog, int64_t ctx) {
-    cfg.kv_streams = false;
+/* The prefix cache's host tier cannot hold an entry that contains a streamed group: its rows are
+ * addressed by the block id a sequence used, so they cannot be copied into a slot and their ids
+ * cannot be given up for one (PrefixCache::demotable, docs/KV-STREAMING.md §4.1). A host tier
+ * configured beside a streamed group would only be pinned and never used, so it is turned off
+ * before anything is sized. `cfg.kv_streams` is what kvstream_cap_probe sets when the flag asks,
+ * the architecture serves it and the ring is under the context -- a flag alone, a model with no
+ * streamed path and a ring that covers the context all leave it false, and the tier stays on.
+ * Returns the MiB taken off, for the caller's one line; 0 when nothing changed. */
+int64_t kvstream_prefix_host_off(Config& cfg) {
+    if (!cfg.kv_streams || cfg.prefix_cache_mib <= 0) return 0;
+    const int64_t was = cfg.prefix_cache_mib;
+    cfg.prefix_cache_mib = 0;
+    return was;
+}
+
+int kvstream_cap_probe(KVManager& probe, Config& cfg, const Program& prog, int64_t ctx) {    cfg.kv_streams = false;
     if (cfg.kv_resident <= 0) return RAD_OK;
     const int32_t g = kv_stream_group(probe, &prog);
     if (g < 0) return RAD_OK;
