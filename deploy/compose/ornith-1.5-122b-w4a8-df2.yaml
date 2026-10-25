@@ -1,0 +1,16 @@
+# Ornith-1.5-122B w4a8 (the weights of ornith-1.5-122b-w4a8.yaml) with incoai's DFlash2 drafter in
+# place of the MTP head, every weight in VRAM on four cards. The drafter proposes 15 tokens in one
+# pass, the depth radiance reads from the container. On four R9700s: 279 tok/s combined
+# (BetterBench) against 217 with MTP, 556 against 256 on JSON, but 108 against 157 on prose; for
+# chat, prose and many users take the MTP file. Sampling as ornith-1.5-35b-a3b.yaml.
+name: radiance-ornith-1.5-122b-w4a8-df2
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ornith-1.5-122b-w4a8-df2
+    command: >
+      --model /models/ornith-1.5-122b-w4a8-dflash2.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 4 --max-num-seqs 8 --max-model-len 262144 --kv-cache-dtype fp8
+      --max-num-batched-tokens 2048
+      --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5

@@ -176,6 +176,12 @@ foreach(t ${RAD_TESTS})
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d)
     target_compile_options(${n} PRIVATE -ffp-contract=off)
+    # relayout_parity_test also holds tools/opshapes.cpp's fallback table to these hooks' byte
+    # totals, so it needs the table's source too.
+    if(n STREQUAL relayout_parity_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools/opshapes.cpp)
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+    endif()
   elseif(n IN_LIST RAD_TESTS_WHOLE_CORE)
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")

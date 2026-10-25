@@ -8629,7 +8629,7 @@ struct ArchCases {
             qwen35_fp8::step, 3, {}, 0x74fd4495028c1525ull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x1c28909125c12f52ull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x7c11e3c8243c955full);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
             qwen35_fp8::step, 7, {}, 0x5eaef1ee37575caeull);
@@ -8638,20 +8638,20 @@ struct ArchCases {
             qwen35_w8a8::step, 7, {}, 0x5a4f256c6fda0e87ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xb825b9d264795b8eull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xdc5540151b0d6684ull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0xbe74d476c7fd04b8ull);
+            qwen4exp_fp8::step, 3, {}, 0x43048d3448778280ull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0x9d7df7914590d6d8ull);
+            nullptr, 3, { "ar_hc_write" }, 0x43d3be2b6d76e470ull);
         add("qwen4exp_fp8, four-bit experts", [this](RadBuilder* b) {
                 b->encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0xb308d06b168a61f1ull);
+            qwen4exp_fp8::step, 3, {}, 0x08d082fcbef37889ull);
         add("llama_fp8 + DSpark", [this](RadBuilder* b) {
                 auto c = dspark_ctx(0, 1); return llama_fp8::declare(b, lla.meta(), &c); },
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
@@ -9333,13 +9333,13 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x14b9cab0bea2591full, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xc9bcbf1b538b597full, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x8b2f1786a4ac12b8ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0x23ec76c443e2cb6full, 0x26a9e2c23cf85696ull },
+        { "qwen4exp_fp8", 2, 0, 0x88290524cfd7714full, 0x889c6b36c014609full },
+        { "qwen4exp_fp8", 2, 1, 0xa4268bda72739be8ull, 0x959ef6b7c6f57d8bull },
+        { "qwen4exp_fp8", 4, 0, 0xaa5abead708b106full, 0xfbe74f2b9d7020bfull },
+        { "qwen4exp_fp8", 4, 3, 0x9ffc4cf1b074a153ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
-        { "qwen35_fp8", 2, 1, 0x5085b8c443c59f7cull, 0xb297654cef04bf08ull },
+        { "qwen35_fp8", 2, 1, 0xcaf28466af9e917dull, 0x0bcf5833fce11a86ull },
         { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
         { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
     };

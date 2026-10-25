@@ -504,6 +504,13 @@ public:
         Geometry             geom;
         std::string          geom_key;
         const RadKernelInfo* info = nullptr;
+        /* The instance init() produced for this instantiation, null for a kernel with no init.
+         * A collective's launch cannot be formed without it: the peer bundle -- the scratch, the
+         * flags and the sequence counters, published to every rank and made peer-accessible at
+         * init -- is what makes the exchange addressable, and RadArgs carries no other route to
+         * it. The instance belongs to the rank this Program was declared for (Program::ctx), and
+         * the Registry that made it must outlive the launch (spec §1, §15). */
+        void*                instance = nullptr;
     };
     std::vector<TuneRequest> tune_requests;
 

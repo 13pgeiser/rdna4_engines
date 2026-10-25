@@ -324,7 +324,13 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     /* push my rows into the peer's slot; `x` is a tight [M][n] of bf16 */
     const int wpr = (int)(n >> 3);
     const int4* const in4 = (const int4*)x;
-    for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR) ps[k] = in4[k];
+    unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
+    for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR) {
+        const int4 v = in4[k];
+        ps[k] = v;
+        hck += r4d_archk_u4(v, 4u * (unsigned)k);
+    }
+    r4d_archk_put(hck, peer_flags, nbw, s_slot, (unsigned)b, sq);
     if (drain == 1) __threadfence_system();
     else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
     __syncthreads();
@@ -338,6 +344,10 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     }
     __syncthreads();
     if (acq) __threadfence_system();
+    r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, sq, [&](unsigned int& h) {
+        for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR)
+            h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    });
 
     const uint16_t* __restrict__ P = (const uint16_t*)ms;   /* the peer's rows, in my scratch */
     const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
