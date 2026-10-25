@@ -123,9 +123,10 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
      * plain MXFP4 one at one to eight rows. bf16, f32-scaled, rotated MXFP4, rotated 5-bit, 4-bit
      * and int8 gate_up weights take the pair, and so does a clamped (swiglu_limit) product, which
      * neither fold computes. Declared over int8 codes, only a host kernel would take it, and that
-     * would pin the layer's weights to the host. */
+     * would pin the layer's weights to the host. An M2XFP4 gate_up takes the pair too. */
     const bool fold_ok = swiglu_limit <= 0 && !gate_up.f32_scale;
-    if (fold_ok && !gate_up.bf16 && !gate_up.mx && !gate_up.paro5 && !gate_up.w4 && !gate_up.i8)
+    if (fold_ok && !gate_up.bf16 && !gate_up.mx && !gate_up.m2x && !gate_up.paro5 && !gate_up.w4 &&
+        !gate_up.i8)
         op_gated = decl_gated_fold(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                    { w.h.q, w.h.s },
                                    gq_ffn.want_x
