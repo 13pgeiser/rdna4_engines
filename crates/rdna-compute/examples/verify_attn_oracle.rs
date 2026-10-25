@@ -44,7 +44,8 @@
 //                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
 //   sweep                     (gfx1151) candidate wall-clock per launch geometry.
 // VA_NH=16 runs every mode at 16 q heads / 4 kv heads (GQA 4, Qwen3.5-9B;
-// gfx1151 WMMA twin only); default 24.
+// gfx1151 WMMA twin only); default 24. VA_HD=128 (default 256) sets head_dim
+// (gfx1151 WMMA twin only; VA_NH=16 VA_HD=128 = Qwen3-8B).
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::{VerifyKv, VerifyWmmaGeometry, VerifyWmmaPv};
@@ -63,11 +64,22 @@ fn nh() -> usize {
     *NH
 }
 const NKV: usize = 4;
-const HD: usize = 256;
+/// head_dim: `VA_HD` (default 256; 128 = Qwen3-8B, gfx1151 only).
+static HD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VA_HD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+});
+fn hd() -> usize {
+    *HD
+}
 const TILE: usize = 128;
-const STRIDE: usize = 2 + HD;
+fn stride() -> usize {
+    2 + hd()
+}
 fn qdim() -> usize {
-    nh() * HD
+    nh() * hd()
 }
 /// Guard elements on each side of the output view and after the partials view.
 const GUARD: usize = 4096;
@@ -135,8 +147,8 @@ fn half_from_f32(x: f32) -> u16 {
 
 fn row_bytes(kv: VerifyKv) -> usize {
     match kv {
-        VerifyKv::Q8 => NKV * (HD / 32) * 34,
-        VerifyKv::Fp8 => NKV * (HD + 2),
+        VerifyKv::Q8 => NKV * (hd() / 32) * 34,
+        VerifyKv::Fp8 => NKV * (hd() + 2),
     }
 }
 
@@ -161,7 +173,7 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
         let poison = t >= valid;
         match kv {
             VerifyKv::Q8 => {
-                for blk in 0..NKV * (HD / 32) {
+                for blk in 0..NKV * (hd() / 32) {
                     let o = blk * 34;
                     let s = if poison { 0x7e00 } else { scale_f16(rng) };
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
@@ -177,7 +189,7 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
                 }
             }
             VerifyKv::Fp8 => {
-                for i in 0..NKV * HD {
+                for i in 0..NKV * hd() {
                     row[i] = if poison {
                         0x7f
                     } else {
@@ -191,7 +203,7 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
                 }
                 for h in 0..NKV {
                     let s = if poison { 0x7e00 } else { scale_f16(rng) };
-                    let o = NKV * HD + 2 * h;
+                    let o = NKV * hd() + 2 * h;
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
                 }
             }
@@ -238,7 +250,7 @@ impl Case {
         if self.wmma.is_some() {
             self.wmma_scratch_bytes() / 4
         } else {
-            self.partial_rows * nh() * self.max_tiles() * STRIDE
+            self.partial_rows * nh() * self.max_tiles() * stride()
         }
     }
     /// f16 S tiles of the gfx1151 twin: row groups x kv heads x 6 x key tiles x 512 B.
@@ -364,7 +376,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.max_ctx_len(),
                     c.b,
                     &bf.part,
@@ -381,7 +393,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 None,
@@ -403,7 +415,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -419,7 +431,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -443,7 +455,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -463,7 +475,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -482,7 +494,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -548,8 +560,8 @@ fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
             let seq = c.start() + off + last + 1;
             let nt = seq.div_ceil(TILE).min(mt);
             for h in 0..nh() {
-                let base = ((lr * nh() + h) * mt) * STRIDE * 4;
-                r.push((base, base + nt * STRIDE * 4));
+                let base = ((lr * nh() + h) * mt) * stride() * 4;
+                r.push((base, base + nt * stride() * 4));
             }
         }
         off += chunk;
@@ -812,8 +824,8 @@ fn describe_out(what: &str, a: &[u8], b: &[u8]) -> String {
             let want = f32::from_ne_bytes(b[e * 4..e * 4 + 4].try_into().unwrap());
             format!(
                 "{what}={n}B first(row={row} head={} dim={} got={got:e} want={want:e})",
-                rem / HD,
-                rem % HD
+                rem / hd(),
+                rem % hd()
             )
         }
     }
@@ -1279,7 +1291,7 @@ fn bench_rows(gpu: &mut Gpu) {
                                 &bf.pos,
                                 nh(),
                                 NKV,
-                                HD,
+                                hd(),
                                 c.max_ctx_len(),
                                 c.b,
                                 &bf.part,

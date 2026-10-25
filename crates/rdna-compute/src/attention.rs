@@ -803,6 +803,12 @@ fn verify_gqa_splits(
 struct VerifyWmmaKernels {
     module: &'static str,
     src: &'static str,
+    /// Entries per admitted head_dim.
+    hds: [VerifyWmmaHd; 2],
+}
+
+struct VerifyWmmaHd {
+    head_dim: usize,
     qk: &'static str,
     /// P.V walkers, indexed by [`VerifyWmmaPv`].
     pv: [&'static str; 2],
@@ -811,10 +817,23 @@ struct VerifyWmmaKernels {
 const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
-    qk: "attention_verify_wmma_qk_gfx1151",
-    pv: [
-        "attention_verify_wmma_pv1s_d4_gfx1151",
-        "attention_verify_wmma_pv2_d2_gfx1151",
+    hds: [
+        VerifyWmmaHd {
+            head_dim: 256,
+            qk: "attention_verify_wmma_qk_gfx1151",
+            pv: [
+                "attention_verify_wmma_pv1s_d4_gfx1151",
+                "attention_verify_wmma_pv2_d2_gfx1151",
+            ],
+        },
+        VerifyWmmaHd {
+            head_dim: 128,
+            qk: "attention_verify_wmma_qk_hd128_gfx1151",
+            pv: [
+                "attention_verify_wmma_pv1s_d4_hd128_gfx1151",
+                "attention_verify_wmma_pv2_d2_hd128_gfx1151",
+            ],
+        },
     ],
 };
 
@@ -10163,20 +10182,22 @@ impl Gpu {
         let Some(set) = verify_wmma_kernels(self) else {
             return Ok(false);
         };
-        // The reference module must be the default gfx11 hd256 WMMA body:
-        // split-Q changes its arithmetic, and the dynamic-head_dim build is
-        // not the one this twin was proven against.
+        // The reference module must be the default gfx11 fixed-head_dim WMMA
+        // body: split-Q changes its arithmetic, and the dynamic-head_dim build
+        // is not the one this twin was proven against.
         let dev = |name: &str| hipfire_config::developer_var(name).ok();
         if dev("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() == Some("1")
             || dev("HIPFIRE_FLASH_PREFILL_FIXED_HD").as_deref() == Some("0")
         {
             return Ok(false);
         }
-        // GQA 6 (27B, Flash-Next) and GQA 4 (Qwen3.5-9B); the kernel's
-        // `group` only indexes heads, so the arithmetic is the same.
+        // GQA 6 (27B, Flash-Next) and GQA 4 (Qwen3.5-9B, Qwen3-8B); the
+        // kernel's `group` only indexes heads, so the arithmetic is the same.
         let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-        if head_dim != 256
-            || n_heads != group * n_kv_heads
+        let Some(hd) = set.hds.iter().find(|e| e.head_dim == head_dim) else {
+            return Ok(false);
+        };
+        if n_heads != group * n_kv_heads
             || !matches!(group, 4 | 6)
             || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
             || max_ctx_len == 0
@@ -10211,9 +10232,9 @@ impl Gpu {
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
-        let pv_func = set.pv[pv as usize];
+        let pv_func = hd.pv[pv as usize];
 
-        self.ensure_kernel(set.module, set.src, set.qk)?;
+        self.ensure_kernel(set.module, set.src, hd.qk)?;
         self.ensure_kernel(set.module, set.src, pv_func)?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10243,7 +10264,7 @@ impl Gpu {
                 &scale as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                set.qk,
+                hd.qk,
                 [grid_x, qk_splits as u32, 1],
                 [qk_block, 1, 1],
                 0,
@@ -10278,7 +10299,7 @@ impl Gpu {
             ];
             self.launch_maybe_blob(
                 pv_func,
-                [grid_x, (16 / pv_chunks) as u32, 1],
+                [grid_x, (head_dim / 16 / pv_chunks) as u32, 1],
                 [pv_block, 1, 1],
                 0,
                 &mut params,
