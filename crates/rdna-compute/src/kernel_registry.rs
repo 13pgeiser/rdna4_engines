@@ -3521,6 +3521,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MQ_ROTATE_X_I4_SRC,
             ["mq_rotate_x_i4"]
         );
+        // Qwen4 MoE front producer (HIPFIRE_QWEN4_MOE_FRONT_FUSE): the F16-output twin.
+        add!(
+            "mq_rotate_x_i4_f16out",
+            kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
+            ["mq_rotate_x_i4_f16out"]
+        );
         add!(
             "qwen4_gemv_q8_0_wide",
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
