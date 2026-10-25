@@ -917,8 +917,14 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
     /* --kv-resident, in tokens: the ring a streamed group carves. Declared geometry states it where
-     * an op needs a ring depth (kv_resolve), so the report is the ring and not the context. */
-    bc.kv_resident_blocks = cfg_.kv_resident;
+     * an op needs a ring depth (kv_resolve), so the report is the ring and not the context. Raised
+     * to the shipped floor here, before the declare: the arch states the residency table's depth
+     * from this number (kv_resolve's `slots`), and a carve deeper than the declared table is
+     * refused by the kernel. The floor is the same one kvstream_ring_shape applies, so the two
+     * cannot disagree. */
+    bc.kv_resident_blocks = cfg_.kv_resident > 0 && cfg_.kv_resident < kStreamFloorTokens
+                                ? kStreamFloorTokens
+                                : cfg_.kv_resident;
     /* The probe's answer, so a streamed-only op is declared only for an architecture that serves
      * one AND a deployment that asked (core/kvstream/bringup.cpp, kvstream_op_gated). */
     bc.kv_stream_ok = arch_probe_.kv_stream_ok;
