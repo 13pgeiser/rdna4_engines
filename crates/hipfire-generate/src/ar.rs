@@ -6067,9 +6067,8 @@ pub fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = request_seed;
-        let batched_prefill = llama::llama_qwen3_batched_prefill_eligible(
+        let batched_prefill = llama::llama_batched_prefill_eligible(
             &gpu.arch,
-            config.arch,
             hipfire_runtime::config::get().prefill_batched,
             kv.quant_q8,
             has_eviction,
