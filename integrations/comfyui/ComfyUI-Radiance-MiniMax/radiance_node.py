@@ -767,33 +767,44 @@ class RadianceMiniMax(io.ComfyNode):
 
 
 def _fmt_secs(s):
-    s = max(0.0, float(s))
-    return f"{s:.0f}s" if s < 90 else f"{s / 60:.0f}m {s % 60:02.0f}s"
+    # Round to WHOLE seconds first, then split with integer ops: `.0f`/`.0f`
+    # each round INDEPENDENTLY, so 175 s once printed "3m 55s" (2.92m rounded
+    # to 3, its seconds left over) and 119.5 s printed "1m 60s".
+    s = int(max(0.0, float(s)) + 0.5)
+    return f"{s}s" if s < 90 else f"{s // 60}m {s % 60:02d}s"
 
 
 class _PaceTracker:
     """Measured sec/step for the console heartbeat -- the client-side mirror of
-    the server's per-step RAD_INFO log. Polls are ~3 s apart, so each poll pair
-    contributes the average over the steps completed in between, and a light
-    EMA (~40% new) lets the number FOLLOW the pace instead of averaging the
-    job's whole life into it -- important when a latent-upscaled job switches
-    grids mid-run (draft steps are cheaper than refine steps). Needs a
-    post-Oct-2026 server (the `steps_done` counter); reports None otherwise."""
+    the server's per-step RAD_INFO log. Polls are ~3 s apart, so ONE step
+    cannot be timed directly: a 12.7 s step sampled every 3 s appears as a
+    single increment between two adjacent polls, and per-increment deltas read
+    as the POLL interval -- a constant "3.0 s/step" no matter the real pace
+    (the bug this replaces). The rate is therefore measured over a WINDOW: the
+    anchor observation is held until at least two more steps are visible, then
+    rate = elapsed / steps-in-between, and the anchor moves on. A light EMA
+    (~40% new) still follows pace changes -- a latent-upscaled job's
+    draft->refine grid switch re-prices the steps within a couple of windows.
+    Needs a post-Oct-2026 server (the `steps_done` counter); reports None
+    otherwise."""
 
     def __init__(self):
-        self.prev_t = None
-        self.prev_done = None
+        self.anchor_t = None
+        self.anchor_done = None
         self.sps = None
 
     def update(self, job, now):
         done = job.get("steps_done")
         if not isinstance(done, int):
             return self.sps
-        if self.prev_done is not None and done > self.prev_done and self.prev_t is not None:
-            inst = (now - self.prev_t) / (done - self.prev_done)
+        if self.anchor_t is None:
+            if done > 0:  # anchor on LIVE steps only -- the encode warm-up
+                self.anchor_t, self.anchor_done = now, done  # must not ride in
+        elif done - self.anchor_done >= 2:                   # the first rate
+            inst = (now - self.anchor_t) / (done - self.anchor_done)
             if inst > 0:
                 self.sps = inst if self.sps is None else 0.4 * inst + 0.6 * self.sps
-        self.prev_t, self.prev_done = now, done
+            self.anchor_t, self.anchor_done = now, done
         return self.sps
 
 
