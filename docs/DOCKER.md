@@ -149,6 +149,7 @@ the cards the engine runs on.
 | `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
 | `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
 | `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
+| `nemotron-3.5-bolt-e4b-a4.yaml` | `nemotron-3.5-bolt-e4b-a4.rad` | The same with the feed-forward at four bits (GPTQ), attention and layers 19-23 at i8a8 |
 | `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
 | `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
