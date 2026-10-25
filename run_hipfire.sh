@@ -62,6 +62,8 @@ echo "serving $TAG with EXTRA_FLAGS=$EXTRA_FLAGS"
 # -------------------------------
 IMAGE="local/hipfire"
 MODELS_DIR=/models/hipfire
+# the image's runtime stage sets HOME=/home/hipfire and HIPFIRE_HOME=/home/hipfire/.hipfire
+HIPFIRE_HOME_DIR=/home/hipfire/.hipfire
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     (
 	cd "$CURDIR/hipfire" || exit
@@ -75,7 +77,7 @@ fi
 # model (pulled into host /models)
 # -------------------------------
 if [ ! -f "$MODELS_DIR/$FILE" ]; then
-    docker run --rm -v "$MODELS_DIR":/root/.hipfire/models "$IMAGE" pull "$TAG"
+    docker run --rm -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" "$IMAGE" pull "$TAG"
 fi
 
 # -------------------------------
@@ -84,15 +86,15 @@ fi
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 HOME_VOLUME=hipfire-home
 echo "setting reasoning_effort=$REASONING_EFFORT in $HOME_VOLUME"
-docker run --rm -v "$HOME_VOLUME":/root/.hipfire "$IMAGE" config set reasoning_effort "$REASONING_EFFORT"
+docker run --rm -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT"
 
 # -------------------------------
 # run
 # -------------------------------
 sudo bash -c "echo "210000000" > $(echo /sys/class/drm/card0/device/hwmon/hwmon*/)power1_cap"
 docker rm -f hipfire_server
-docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v "$HOME_VOLUME":/root/.hipfire -v "$MODELS_DIR":/root/.hipfire/models -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931 $EXTRA_FLAGS
-# docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/root/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" run qwen3.8:27b-mq4-xts "Explain FFT in one line"
+docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931 $EXTRA_FLAGS
+# docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/home/hipfire/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" run qwen3.8:27b-mq4-xts "Explain FFT in one line"
 
 
 # qwen3.8:27b-mq4-xts
