@@ -626,19 +626,23 @@ pub fn qwen4_decode_share_borrow_bytes(
     .map(|backing| backing.span_bytes)
 }
 
-/// The donor-tail byte prefix each prefill class dirties:
-/// [`qwen4_decode_share_borrow_bytes`] of every [`qwen4_decode_share_classes`]
-/// entry for the chunk, in class order (ascending). The loader plans the
-/// donor tail's BorrowPrefill class views from these, the forward checks its
-/// banks against them.
+/// The donor-tail byte prefix each prefill class dirties, in class order
+/// (ascending): `shadow_bytes` (the borrowed weight-shadow region at the START
+/// of the donor tail, [`crate::decode_share_shadows`]; 0 when the shadows stay
+/// resident) plus [`qwen4_decode_share_borrow_bytes`] of every
+/// [`qwen4_decode_share_classes`] entry for the chunk (the scratch backing that
+/// follows the region). The single authority: the loader sizes the donor tail
+/// (`S` of `with_decode_share`) and plans the BorrowPrefill class views from
+/// these, the forward checks its banks and the loan's dirty extents against them.
 pub fn qwen4_decode_share_class_spans(
     config: &Qwen4Config,
     max_chunk: usize,
     mode: Qwen4ForwardScratchMode,
+    shadow_bytes: u64,
 ) -> Option<Vec<u64>> {
     qwen4_decode_share_classes(max_chunk)
         .into_iter()
-        .map(|rows| qwen4_decode_share_borrow_bytes(config, rows, mode))
+        .map(|rows| qwen4_decode_share_borrow_bytes(config, rows, mode)?.checked_add(shadow_bytes))
         .collect()
 }
 
@@ -8322,7 +8326,7 @@ pub(crate) struct DecodeShareBanks {
     backing: DecodeShareBacking,
     /// The donor-tail loan (`fixed` / `on`); `None` over an owned test backing.
     loan: Option<DonorLoan>,
-    /// Largest span of the classes used since the last restore (S5 restores
+    /// Largest span of the classes used since the last restore (a resident call restores
     /// this prefix of the donor tail).
     dirty_bytes: u64,
     stats: DecodeShareStats,
@@ -8389,6 +8393,10 @@ impl DecodeShareBanks {
 /// wait for the copy until the next forward needs the donor tail.
 struct LoanHw {
     done: hip_bridge::Event,
+    /// Timing events around the epoch's weight-shadow rebuild (only with
+    /// borrowed shadows under `HIPFIRE_QWEN4_DECODE_SHARE_LOG=1`): read after
+    /// the restore completed.
+    rebuild: Option<(hip_bridge::Event, hip_bridge::Event)>,
 }
 
 /// The donor-tail loan of a `fixed` / `on` load: the exclusive lease claim, the
@@ -8401,6 +8409,12 @@ pub(crate) struct DonorLoan {
     /// Device base of the donor tail and its byte extent.
     base: usize,
     bytes: usize,
+    /// The donor tail starts with a borrowed weight-shadow region
+    /// ([`crate::decode_share_shadows`]) that every epoch's first acquire
+    /// rebuilds; the shadow borrow is installed on the `Gpu`.
+    shadows: bool,
+    /// The byte oracle of the rebuilt shadows already ran for this load.
+    shadow_oracle_done: std::cell::Cell<bool>,
     /// Pinned CPU address of the tail's mirror.
     mirror_cpu: usize,
     /// `HIPFIRE_QWEN4_DECODE_SHARE_VERIFY=1`: re-verify the tail after every restore.
@@ -8412,6 +8426,8 @@ struct GpuLoanOps<'a> {
     gpu: &'a mut Gpu,
     claim: &'a crate::expert_tier_owners::DecodeShareClaim,
     hw: &'a LoanHw,
+    shadows: bool,
+    shadow_oracle_done: &'a std::cell::Cell<bool>,
     base: usize,
     bytes: usize,
     mirror_cpu: usize,
@@ -8484,6 +8500,10 @@ impl crate::decode_share_loan::LoanOps for GpuLoanOps<'_> {
     }
 
     fn enqueue_restore(&mut self, bytes: u64) -> Result<(), String> {
+        // The restore overwrites the weight-shadow region: host-side reads of
+        // a borrowed shadow are refused from here until the next rebuild.
+        // (Stream order keeps every already-enqueued reader ahead of the copy.)
+        self.gpu.shadow_borrow_set_ready(false);
         let dst = self.tail(0, bytes)?;
         let src = self.mirror(bytes)?;
         let compute = self.compute()?;
@@ -8514,12 +8534,64 @@ impl crate::decode_share_loan::LoanOps for GpuLoanOps<'_> {
     }
 
     fn blocking_restore(&mut self, bytes: u64) -> Result<(), String> {
+        self.gpu.shadow_borrow_set_ready(false);
         let dst = self.tail(0, bytes)?;
         let src = self.mirror(bytes)?;
         self.gpu
             .hip
             .memcpy_htod(&dst, src)
             .map_err(|error| error.to_string())
+    }
+
+    fn rebuild_shadows(&mut self) -> Result<(), String> {
+        if !self.shadows {
+            return Ok(());
+        }
+        if let Some((start, _)) = self.hw.rebuild.as_ref() {
+            let compute = self.compute()?;
+            self.gpu
+                .hip
+                .event_record(start, Some(compute))
+                .map_err(|error| error.to_string())?;
+        }
+        self.gpu
+            .rebuild_borrowed_shadows()
+            .map_err(|error| error.to_string())?;
+        if let Some((_, end)) = self.hw.rebuild.as_ref() {
+            let compute = self.compute()?;
+            self.gpu
+                .hip
+                .event_record(end, Some(compute))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn verify_shadows(&mut self) -> Result<(), String> {
+        if !self.shadows || !self.verify || self.shadow_oracle_done.get() {
+            return Ok(());
+        }
+        self.shadow_oracle_done.set(true);
+        match self.gpu.verify_borrowed_shadows() {
+            Ok(Ok(())) => {
+                eprintln!(
+                    "  qwen4 decode-share: borrowed weight shadows verified (F16 + INT8) against \
+                     an ordinary rebuild into a temporary allocation"
+                );
+                Ok(())
+            }
+            Ok(Err(mismatch)) => Err(mismatch),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn rebuild_ms(&mut self) -> Option<f64> {
+        let (start, end) = self.hw.rebuild.as_ref()?;
+        self.gpu
+            .hip
+            .event_elapsed_ms(start, end)
+            .ok()
+            .map(f64::from)
     }
 
     fn verify(&mut self, bytes: u64) -> Result<(), String> {
@@ -8549,6 +8621,8 @@ impl DonorLoan {
             bytes: self.bytes,
             mirror_cpu: self.mirror_cpu,
             verify: self.verify,
+            shadows: self.shadows,
+            shadow_oracle_done: &self.shadow_oracle_done,
         };
         f(&mut self.controller, &mut ops)
     }
@@ -8556,7 +8630,22 @@ impl DonorLoan {
     /// Destroy the restore event, then release the claim. Call only after a
     /// successful teardown restore (the event has completed).
     fn release(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
-        gpu.hip.event_destroy(self.hw.done).err()
+        let mut first = None;
+        if let Some((start, end)) = self.hw.rebuild {
+            for event in [start, end] {
+                if let Err(error) = gpu.hip.event_destroy(event) {
+                    first.get_or_insert(error);
+                }
+            }
+        }
+        if self.shadows {
+            // Never frees the region: the donor tail belongs to the lease.
+            gpu.clear_shadow_borrow();
+        }
+        if let Err(error) = gpu.hip.event_destroy(self.hw.done) {
+            first.get_or_insert(error);
+        }
+        first
     }
 }
 
@@ -9544,14 +9633,122 @@ impl Qwen4GpuForward {
         npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay, rows, mode)
     }
 
+    /// Register the weight shadows of a decode-share load as non-owning views
+    /// into the donor tail's shadow region ([`crate::decode_share_shadows`]):
+    /// no allocation and no conversion here (every epoch's first acquire
+    /// rebuilds them in place), and from now on neither shadow cache can ever
+    /// allocate a shadow elsewhere on this `Gpu`. The region is re-planned
+    /// from the manifest with the loader's flags and must equal the bytes the
+    /// plan reserved.
+    fn install_borrowed_shadows(
+        gpu: &mut Gpu,
+        weights: &crate::weights::Qwen4Weights,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        ranges: &crate::expert_tier_owners::DecodeShareRanges,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        use rdna_compute::shadow_borrow::{F16ShadowSpan, ShadowBorrowPlan, SharedI8ShadowSpan};
+        let (f16, shared_i8) = crate::decode_share_shadows::shadow_flags(
+            &gpu.arch,
+            gpu.qwen4_f16_shadow_capable(),
+            gpu.qwen4_shared_i8_enabled(),
+            max_chunk,
+        )
+        .map_err(|reason| invalid(format!("decode-share borrowed shadows: {reason}")))?;
+        let region = crate::decode_share_shadows::plan_shadow_region(
+            &weights.manifest.weights,
+            config.num_hidden_layers,
+            f16,
+            shared_i8,
+        )
+        .map_err(invalid)?;
+        if usize::try_from(region.total_bytes).ok() != Some(ranges.shadow_bytes) {
+            return Err(invalid(format!(
+                "decode-share borrowed shadows: the plan reserved {} B of donor tail but the \
+                 manifest's shadow region is {} B (F16 {f16}, INT8 {shared_i8})",
+                ranges.shadow_bytes, region.total_bytes
+            )));
+        }
+        let base = ranges.donor_device.0;
+        let at = |offset: u64| -> Result<usize, Qwen4GpuForwardError> {
+            usize::try_from(offset)
+                .ok()
+                .and_then(|offset| base.checked_add(offset))
+                .ok_or_else(|| invalid("decode-share shadow address overflows"))
+        };
+        let resident = |name: &str, layer: Option<usize>| {
+            weights
+                .resident_by_name(name, layer)
+                .map_err(|error| invalid(format!("decode-share shadow source '{name}': {error}")))
+        };
+        let mut f16_spans = Vec::with_capacity(region.f16.len());
+        for member in &region.f16 {
+            let tensor = resident(&member.name, member.layer)?;
+            if tensor.dtype != DType::BF16 || tensor.numel() != member.rows * member.cols {
+                return Err(invalid(format!(
+                    "decode-share shadow source '{}' is not its planned BF16 [{}, {}] matrix",
+                    member.name, member.rows, member.cols
+                )));
+            }
+            f16_spans.push(F16ShadowSpan {
+                name: member.name.clone(),
+                src_ptr: tensor.buf.as_ptr() as usize,
+                dst_ptr: at(member.offset)?,
+                rows: member.rows,
+                cols: member.cols,
+            });
+        }
+        let mut i8_spans = Vec::with_capacity(region.shared_i8.len());
+        for member in &region.shared_i8 {
+            let name = |proj: &str| {
+                format!(
+                    "model.language_model.layers.{}.mlp.shared_expert.{proj}.weight",
+                    member.layer
+                )
+            };
+            let ptr = |proj: &str| -> Result<usize, Qwen4GpuForwardError> {
+                Ok(resident(&name(proj), Some(member.layer))?.buf.as_ptr() as usize)
+            };
+            i8_spans.push(SharedI8ShadowSpan {
+                layer: member.layer,
+                gate_ptr: ptr("gate_proj")?,
+                up_ptr: ptr("up_proj")?,
+                down_ptr: ptr("down_proj")?,
+                intermediate: member.intermediate,
+                hidden: member.hidden,
+                down_rows: member.down_rows,
+                gate_up_dst: at(member.gate_up_offset)?,
+                down_dst: at(member.down_offset)?,
+            });
+        }
+        gpu.install_shadow_borrow(ShadowBorrowPlan {
+            region_ptr: base,
+            region_bytes: ranges.shadow_bytes,
+            f16: f16_spans,
+            shared_i8: i8_spans,
+        })?;
+        eprintln!(
+            "  qwen4 decode-share: {} F16 + {} INT8 weight shadows ({} MiB) live in the donor tail \
+             (rebuilt per borrow epoch)",
+            region.f16.len(),
+            region.shared_i8.len(),
+            ranges.shadow_bytes >> 20
+        );
+        Ok(())
+    }
+
     /// Attach the donor-tail loan of a `fixed` / `on` load: claim the lease,
-    /// check the largest class fits the donor span, ensure the compute stream
-    /// exists, and create the restore completion event. Writes nothing into
-    /// the donor tail.
+    /// check the largest class fits the donor span, install the borrowed
+    /// weight shadows (when the plan reserved a shadow region), ensure the
+    /// compute stream exists, and create the restore completion event. Writes
+    /// nothing into the donor tail.
     fn attach_donor_loan(
         gpu: &mut Gpu,
         lease: &crate::expert_tier_owners::ExpertTierLease,
         span_bytes: u64,
+        weights: &crate::weights::Qwen4Weights,
+        config: &Qwen4Config,
+        max_chunk: usize,
     ) -> Result<(DecodeShareBacking, DonorLoan), Qwen4GpuForwardError> {
         let ranges = lease
             .decode_share()
@@ -9566,20 +9763,51 @@ impl Qwen4GpuForward {
         }
         let claim = lease.claim_decode_share().map_err(invalid)?;
         gpu.ensure_capture_stream()?;
-        let done = gpu
-            .hip
-            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
+        let shadows = ranges.shadow_bytes > 0;
+        if shadows {
+            Self::install_borrowed_shadows(gpu, weights, config, max_chunk, &ranges)?;
+        }
+        let events = (|| -> Result<_, hip_bridge::HipError> {
+            let done = gpu
+                .hip
+                .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
+            // Timing events around the rebuild, only for the epoch log.
+            let rebuild = if shadows && crate::decode_share::decode_share_log_enabled() {
+                match (gpu.hip.event_create(), gpu.hip.event_create()) {
+                    (Ok(start), Ok(end)) => Some((start, end)),
+                    (Err(error), _) | (_, Err(error)) => {
+                        let _ = gpu.hip.event_destroy(done);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            Ok((done, rebuild))
+        })();
+        let (done, rebuild) = match events {
+            Ok(events) => events,
+            Err(error) => {
+                if shadows {
+                    gpu.clear_shadow_borrow();
+                }
+                return Err(error.into());
+            }
+        };
         Ok((
             DecodeShareBacking::Donor { base, bytes },
             DonorLoan {
                 controller: crate::decode_share_loan::LoanController::new(
                     crate::decode_share::decode_share_sync_enabled(),
                     crate::decode_share::decode_share_log_enabled(),
-                ),
+                )
+                .with_shadow_bytes(ranges.shadow_bytes as u64),
                 claim,
-                hw: LoanHw { done },
+                hw: LoanHw { done, rebuild },
                 base,
                 bytes,
+                shadows,
+                shadow_oracle_done: std::cell::Cell::new(false),
                 mirror_cpu,
                 verify: crate::decode_share::decode_share_verify_enabled(),
             },
@@ -9600,6 +9828,7 @@ impl Qwen4GpuForward {
         mode: Qwen4ForwardScratchMode,
         scope: &Qwen4BandScope,
         donor: Option<&crate::expert_tier_owners::ExpertTierLease>,
+        weights: &crate::weights::Qwen4Weights,
     ) -> Result<(Qwen4GpuForwardScratch, DecodeShareBanks, Vec<u8>, Vec<u8>), Qwen4GpuForwardError>
     {
         let classes = qwen4_decode_share_classes(max_chunk);
@@ -9621,12 +9850,27 @@ impl Qwen4GpuForward {
                 return Err(error);
             }
         };
+        // The borrowed weight-shadow region (donor tail start; 0 over an owned
+        // test backing or when the shadows stay resident): every class dirties it.
+        let shadow_bytes = donor
+            .and_then(|lease| lease.decode_share())
+            .map_or(0u64, |ranges| ranges.shadow_bytes as u64);
         let backings = classes
             .iter()
             .map(|&rows| Qwen4GpuForwardScratch::borrowed_backing(config, rows, mode, scope))
             .collect::<Result<Vec<_>, _>>();
-        let class_spans: Vec<u64> = match backings {
-            Ok(backings) => backings.iter().map(|backing| backing.span_bytes).collect(),
+        let class_spans: Vec<u64> = match backings.and_then(|backings| {
+            backings
+                .iter()
+                .map(|backing| {
+                    backing
+                        .span_bytes
+                        .checked_add(shadow_bytes)
+                        .ok_or_else(|| invalid("decode-share class span overflows"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        }) {
+            Ok(spans) => spans,
             Err(error) => {
                 let _ = resident.free_gpu(gpu);
                 let _ = gpu.free_tensor(token_ids);
@@ -9635,8 +9879,10 @@ impl Qwen4GpuForward {
         };
         let span_bytes = class_spans.iter().copied().max().unwrap_or(0);
         let backing = match donor {
-            Some(lease) => Self::attach_donor_loan(gpu, lease, span_bytes)
-                .map(|(backing, loan)| (backing, Some(loan))),
+            Some(lease) => {
+                Self::attach_donor_loan(gpu, lease, span_bytes, weights, config, max_chunk)
+                    .map(|(backing, loan)| (backing, Some(loan)))
+            }
             None => usize::try_from(span_bytes)
                 .map_err(|_| invalid("decode-share backing bytes overflow"))
                 .and_then(|span| gpu.zeros(&[span], DType::Raw).map_err(Into::into))
@@ -9665,7 +9911,12 @@ impl Qwen4GpuForward {
             prompt_depth: 0,
         };
         let mut host_token_bytes = vec![0u8; ids_bytes];
-        let (base, span) = (share.backing.base(), share.backing.bytes());
+        // The scratch backing starts right after the borrowed weight shadows.
+        let shadow = usize::try_from(shadow_bytes).unwrap_or(usize::MAX);
+        let (base, span) = (
+            share.backing.base().saturating_add(shadow),
+            share.backing.bytes().saturating_sub(shadow),
+        );
         let mut failure = None;
         for &rows in &share.classes.clone() {
             match Qwen4GpuForwardScratch::new_borrowed(
@@ -9758,8 +10009,15 @@ impl Qwen4GpuForward {
         };
         let (scratch, host_token_bytes, host_ple_bytes, share) = if share_classes {
             let donor = donor_lease.filter(|_| share_mode.uses_donor_backing());
-            let (scratch, share, host_token_bytes, host_ple_bytes) =
-                Self::build_decode_share(gpu, &bundle.config, max_chunk, mode, &scope, donor)?;
+            let (scratch, share, host_token_bytes, host_ple_bytes) = Self::build_decode_share(
+                gpu,
+                &bundle.config,
+                max_chunk,
+                mode,
+                &scope,
+                donor,
+                &bundle.weights,
+            )?;
             eprintln!(
                 "  qwen4 decode-share[{}]: {}-row resident bank + prefill banks {:?} over {} of {} \
                  MiB (prompt chunk {max_chunk})",
@@ -11014,7 +11272,8 @@ impl Qwen4GpuForward {
     /// entry: once a prompt has dirtied the donor tail, every later tile of
     /// the same prompt (a tail below the resident rows included) stays on a
     /// borrowed bank and the BorrowPrefill runtimes, so the restore happens
-    /// once, after the prompt, never mid-prompt (design 5.2).
+    /// once, at the next resident call after the prompts, never mid-prompt
+    /// (design 5.2).
     fn share_continues_epoch(&self) -> bool {
         self.share.as_ref().is_some_and(|share| {
             share.prompt_depth > 0
@@ -11202,9 +11461,11 @@ impl Qwen4GpuForward {
     }
 
     /// Before a call that runs on the resident bank and the Resident runtimes
-    /// (decode, verify, lanes, every tile below the resident rows): the donor
-    /// tail must be whole, so a dirty tail is restored (enqueued and waited)
-    /// and a pending restore is waited. Runs before the retained-eligibility
+    /// (decode, verify, lanes, every tile below the resident rows outside a
+    /// prompt): the donor tail must be whole, so a dirty tail (a prompt that
+    /// ended `Ok` leaves it dirty) is restored, whole dirtied prefix enqueued
+    /// and host-waited, and a pending restore is waited. This is where the
+    /// second-token latency after a long prompt pays the restore. Runs before the retained-eligibility
     /// predicate and any replay submit.
     pub(crate) fn share_require_resident(
         &mut self,
@@ -11277,11 +11538,11 @@ impl Qwen4GpuForward {
     }
 
     /// The last scratch consumer of a whole prompt has run. A dirty tail of a
-    /// prompt that ended `Ok` gets its restore enqueued on the compute stream
-    /// (the host wait is deferred to the next call that needs
-    /// the donors, so it overlaps sampling and emission and is not part of
-    /// TTFT; `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` waits here). A prompt that
-    /// ended with an error takes the blocking recovery.
+    /// prompt that ended `Ok` stays dirty with nothing enqueued (the first
+    /// token came from the prefill head; a following prompt continues the same
+    /// borrow, and the next [`Self::share_require_resident`] restores it;
+    /// `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` enqueues and waits here). A prompt
+    /// that ended with an error takes the blocking recovery.
     pub(crate) fn share_finish_prompt(
         &mut self,
         gpu: &mut Gpu,

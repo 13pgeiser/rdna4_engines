@@ -7266,9 +7266,12 @@ pub fn download_hidden_block(
 /// Returns `true` when the fast path ran. Returns `false` — leaving every
 /// buffer untouched — when the route predicates fail, in which case the
 /// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
-/// exact gfx1100, `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, `1 <= b <=
-/// max_block_size`. The batched kernel dequantizes each row with the same
-/// per-element math as the scalar loop, so the plane is bit-identical.
+/// `1 <= b <= max_block_size`, and either exact gfx1100 with
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset or the gfx1201 batched noise lookup
+/// ([`noise_embed_batch_admitted`], kill switch
+/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0`) that the lane-batched draft already
+/// uses. The batched kernel dequantizes each row with the same per-element
+/// math as the scalar loop, so the plane is bit-identical.
 ///
 /// Weights-based core shared with the dense-TP mesh (which owns rank shards,
 /// not a `ModelSlot`).
@@ -7285,11 +7288,13 @@ pub fn build_dflash_noise_embeddings_weights(
     ) {
         return Ok(false);
     }
-    if !gpu.draft_collapse_fused_enabled() {
-        return Ok(false);
-    }
     let b = block.len();
     if b == 0 || b > draft_scratch.max_block_size {
+        return Ok(false);
+    }
+    if !gpu.draft_collapse_fused_enabled()
+        && !noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b)
+    {
         return Ok(false);
     }
     let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
@@ -11834,13 +11839,20 @@ fn ddtree_commit_row_runs(accepted_node_indices: &[usize]) -> Vec<(usize, usize,
 /// `s' >= d' > d` — every source is read before anything overwrites it. Distinct
 /// block rows map to distinct physical rows, so this also holds when the caller
 /// maps through a ring modulus.
+///
+/// That argument is about separate moves. Within one coalesced run the ranges
+/// overlap whenever `src - dst < n` (e.g. `(1, 2, 3)`), and a D2D memcpy over
+/// overlapping ranges is undefined: the blit copies chunks in parallel, so which
+/// bytes win varies run to run (HIPF-136, greedy DDTree nondeterminism). Each run
+/// is therefore issued as ascending chunks of at most `src - dst` rows; chunk k
+/// overwrites only rows chunk k-1 already read.
 fn move_rows_in_place(
     gpu: &Gpu,
     buf: &GpuTensor,
     row_bytes: usize,
     moves: &[(usize, usize, usize)],
 ) -> HipResult<()> {
-    for &(dst, src, n) in moves {
+    for (dst, src, n) in moves.iter().flat_map(|&m| non_overlapping_chunks(m)) {
         let (dst_off, src_off, size) = (dst * row_bytes, src * row_bytes, n * row_bytes);
         match gpu.active_stream.as_ref() {
             // Stream-ordered: the moves serialize against each other and against
@@ -11854,6 +11866,18 @@ fn move_rows_in_place(
         }
     }
     Ok(())
+}
+
+/// Split a `(dst, src, n)` move with `src > dst` into ascending sub-moves whose
+/// source and destination ranges are disjoint.
+fn non_overlapping_chunks(
+    (dst, src, n): (usize, usize, usize),
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    debug_assert!(src > dst, "in-place row moves only shift rows down");
+    let step = src - dst;
+    (0..n)
+        .step_by(step)
+        .map(move |k| (dst + k, src + k, step.min(n - k)))
 }
 
 /// DDTree post-accept gather: relocate the accepted chain's rows from their
@@ -13849,6 +13873,37 @@ mod tests {
             ddtree_commit_row_runs(&[1, 2, 4]),
             vec![(1, 2, 2), (3, 5, 1)]
         );
+    }
+
+    /// A coalesced run overlaps itself when its shift is shorter than the run
+    /// (HIPF-136). The issued copies must be pairwise source/destination
+    /// disjoint and, executed in order, must equal the per-row move.
+    #[test]
+    fn move_chunks_never_overlap_and_match_per_row_moves() {
+        assert_eq!(
+            non_overlapping_chunks((1, 2, 3)).collect::<Vec<_>>(),
+            vec![(1, 2, 1), (2, 3, 1), (3, 4, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 3, 5)).collect::<Vec<_>>(),
+            vec![(1, 3, 2), (3, 5, 2), (5, 7, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 9, 4)).collect::<Vec<_>>(),
+            vec![(1, 9, 4)]
+        );
+        for n in 1..12 {
+            for step in 1..12 {
+                let (dst, src) = (1, 1 + step);
+                let mut rows: Vec<usize> = (0..dst + step + n).collect();
+                for (d, s, m) in non_overlapping_chunks((dst, src, n)) {
+                    assert!(s >= d + m, "chunk ({d}, {s}, {m}) overlaps itself");
+                    rows.copy_within(s..s + m, d);
+                }
+                let want: Vec<usize> = (src..src + n).collect();
+                assert_eq!(rows[dst..dst + n], want[..], "n={n} step={step}");
+            }
+        }
     }
 
     /// The in-place, scratch-free move is only sound because every move reads a

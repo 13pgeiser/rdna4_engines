@@ -18667,7 +18667,11 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // The kernel advances 16 tokens per `blockIdx.y` (macro default of one
+        // tile).  Dividing by 64 left every token past the first 16 of each 64
+        // unwritten: stale scratch read back as the projection (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 16;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -18736,7 +18740,10 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // Two 16-token tiles per `blockIdx.y`: dividing by 64 left tokens 32..63
+        // of every 64 unwritten (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 32;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -18809,7 +18816,10 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // The kernel advances 16 tokens per `blockIdx.y`; dividing by 64 left
+        // every token past the first 16 of each 64 unwritten (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 16;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -29133,8 +29143,12 @@ impl Gpu {
         let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
             hip_bridge::HipError::new(1, "F32 GEMM dimensions or byte extents overflow")
         })?;
-        if a.dtype != DType::F32
-            || b.dtype != DType::F32
+        // Either input may be a loaded weight (A for the PARO/DeltaNet alpha/beta
+        // projections, B for the DFlash fc). Loaded weights are untyped `Raw`
+        // byte buffers whose logical F32 dtype the caller has already matched.
+        let f32_view = |t: &GpuTensor| matches!(t.dtype, DType::F32 | DType::Raw);
+        if !f32_view(a)
+            || !f32_view(b)
             || y.dtype != DType::F32
             || a.buf.size() < bytes[0]
             || b.buf.size() < bytes[1]

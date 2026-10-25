@@ -9841,6 +9841,18 @@ pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_atten
 pub const VIT_ATTENTION_QTILED_SRC: &str =
     include_str!("../../../kernels/src/vit_attention_qtiled.hip");
 
+/// WMMA flash ViT attention for head_dim <= 80 (`Gpu::vit_attention_wmma_f32`),
+/// gfx11 fragment mapping. Derived from the FLUX vt kernel; see
+/// kernels/src/vit_attention_wmma.hip.
+pub const VIT_ATTENTION_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_wmma.hip");
+/// gfx12 fragment-mapping sibling of [`VIT_ATTENTION_WMMA_SRC`].
+pub const VIT_ATTENTION_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_wmma.gfx12.hip");
+/// F32 QKV -> three zero-padded F16 `[N, heads, 80]` buffers feeding the
+/// WMMA ViT attention kernels.
+pub const VIT_QKV_PACK_F16_SRC: &str = include_str!("../../../kernels/src/vit_qkv_pack_f16.hip");
+
 /// Q-tiled bidirectional attention for the qwen3.5 embedding encoder
 /// (arch 17): flash-style online softmax, no mask, GQA, head_dim up to 256.
 /// Separate Q/K/V buffers. See `kernels/src/attention_encoder_qtiled.hip`.
