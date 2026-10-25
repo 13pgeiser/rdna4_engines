@@ -180,6 +180,13 @@ pub struct DecodeShareTail {
     /// (a partially overlapped donor counts). Nested ascending; the last is
     /// `donors.len()`.
     pub class_donors: Vec<usize>,
+    /// Bytes at the START of the donor tail (`donor_offset ..`) that hold the
+    /// borrowed F16 / INT8 weight shadows, rebuilt at the first acquire of
+    /// every borrow epoch ([`ExpertTierPlan::with_decode_share_shadows`]); the
+    /// scratch backing starts right after them. 0 when the shadows stay
+    /// resident. Every class span includes these bytes (the shadow region is
+    /// dirtied by every class).
+    pub shadow_bytes: u64,
 }
 
 impl DecodeShareTail {
@@ -484,6 +491,7 @@ impl ExpertTierPlan {
                 borrow_entries: self.entries.clone(),
                 class_spans: Vec::new(),
                 class_donors: Vec::new(),
+                shadow_bytes: 0,
             };
             return Ok((self, tail));
         }
@@ -606,6 +614,7 @@ impl ExpertTierPlan {
             borrow_entries,
             class_spans: vec![donor_bytes],
             class_donors: vec![donors_len],
+            shadow_bytes: 0,
         };
         plan.decode_share = Some(tail.clone());
         Ok((plan, tail))
@@ -643,6 +652,46 @@ impl ExpertTierPlan {
         }
         tail.class_spans = spans.to_vec();
         tail.class_donors = class_donors;
+        Ok(self)
+    }
+
+    /// Declare the first `shadow_bytes` of this plan's donor tail to be the
+    /// borrowed shadow region (every class span already includes it, so
+    /// `class_spans[0] >= shadow_bytes`; the region is 256-aligned). A plan
+    /// without donors is returned unchanged (and `shadow_bytes` must be 0).
+    pub fn with_decode_share_shadows(
+        mut self,
+        shadow_bytes: u64,
+    ) -> Result<Self, DecodeShareError> {
+        let Some(tail) = self.decode_share.as_mut() else {
+            return if shadow_bytes == 0 {
+                Ok(self)
+            } else {
+                Err(DecodeShareError::BadClasses(
+                    "shadow bytes without a donor tail".to_string(),
+                ))
+            };
+        };
+        if shadow_bytes % 256 != 0 {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region is not 256-aligned".to_string(),
+            ));
+        }
+        if tail
+            .class_spans
+            .first()
+            .is_some_and(|&first| first < shadow_bytes)
+        {
+            return Err(DecodeShareError::BadClasses(
+                "a class span is smaller than the shadow region".to_string(),
+            ));
+        }
+        if shadow_bytes > tail.donor_bytes {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region exceeds the donor tail".to_string(),
+            ));
+        }
+        tail.shadow_bytes = shadow_bytes;
         Ok(self)
     }
 
