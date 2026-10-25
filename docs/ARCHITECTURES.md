@@ -344,6 +344,9 @@ Architecture tests cover geometry, GGUF tensor maps, dense-to-MoE scheduling, TP
 and FP32 combine order; checkpoint tests cover Q4_K/Q6_K block decoding. Numerical parity against Tencent/llama.cpp
 remains untested.
 
+See [HYV3 W4 decode optimizations](benchmarks/hyv3-w4-decode.md) for affected paths,
+historical measurements, validation limits and the remaining benchmark/quality gates.
+
 ## `qwen35_w8a8`
 
 The dense build again, behind `#if QWEN35_W8A8`, for a container `data/recipes/q38-27b-w8a8-df2.recipe`
