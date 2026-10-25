@@ -551,7 +551,7 @@ struct Model {
     rad_weight ve_cinw = 0, ve_cinb = 0, ve_now = 0, ve_nob = 0, ve_coutw = 0, ve_coutb = 0;
     rad_weight ve_qw = 0, ve_qb = 0;
     rad_op  op_ve_pix = 0, op_ve_pcast = 0, op_ve_cin = 0, op_ve_nout = 0, op_ve_cout = 0;
-    rad_op  op_ve_q = 0, op_ve_fold = 0;
+    rad_op  op_ve_q = 0, op_ve_fold = 0, op_eaug = 0;
     std::string ve_pix_mul, ve_pix_add, ve_fold_mul, ve_fold_add;   /* pixel and latent norms */
     rad_buf b_epix32 = 0, b_epix = 0, b_eq48 = 0, b_eq2 = 0, b_egn = 0;
     rad_buf b_evc = 0;               /* [kEncSlotsV * kEncSlotRowsV, kPatchVals] f32 PERSIST */
@@ -2719,7 +2719,23 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                            RAD_STR("dtype", "f32")),
                                 RAD_NOWEIGHTS),
                       { m.b_eq2 }, { m.b_evc });
-    if (!m.op_ve_nout || !m.op_ve_cout || !m.op_ve_q || !m.op_ve_fold) return RAD_E_INVAL;
+    /* Condition-noise augmentation: the reference blends every visual condition's patchified
+     * latents with fresh noise before they become condition rows, `r = a r + (1 - a) z` with
+     * a = VISUAL_COND_TIMESTEP = 0.999 (`_cond_video_rows`, comfy/ldm/minimax/model.py); the
+     * audio twin's aug defaults to 1.0 -- disabled -- so no audio-side port exists. `aug` is a
+     * recipe constant, not a per-request value, hence a declared parameter and no staged sigma
+     * tensor. z is the request seed's stream 2 (0 is randn's per-entry lanes, 1 the upscaler's
+     * re-noise), restarted per media item at issue -- the reference's per-item restart. The
+     * reference redraws the same blend every forward, so applying it once to the encoded rows
+     * is exactly equivalent. */
+    m.op_eaug = rw(b, RAD_OP(b, "cond_aug",
+                             RAD_PARAMS(RAD_RANGE("M", 1, kEncSlotRowsV), RAD_INT("n", kPatchVals),
+                                        RAD_INT("stream", 2), RAD_F64("aug", 0.999),
+                                        RAD_STR("dtype", "f32")),
+                             RAD_NOWEIGHTS),
+                   { m.b_evc }, { m.b_evc });
+    if (!m.op_ve_nout || !m.op_ve_cout || !m.op_ve_q || !m.op_ve_fold || !m.op_eaug)
+        return RAD_E_INVAL;
     /* Debug-only f32 shadow of the raw (pre-fold) quant_conv output, so the generator can read the
      * encoder's latent BEFORE the fixed-norm fold and tell whether a latent-scale gap enters above
      * the fold (encoder convs) or is introduced by the fold itself. A cast, not a math change. */
@@ -4373,6 +4389,14 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
                     brow_slice(m.b_evc, frow, flat * ppc, kPatchVals));
         frow += flat * ppc;
     }
+    /* The reference's condition-noise augmentation over this item's condition rows: the issue
+     * spans [row0, frow) -- the whole item, its clips' fold outputs included -- so element e is
+     * numbered from 0 at the item's first row, the reference's per-latent `manual_seed(seed)`
+     * restart. b_evc is PERSIST and every kind issued here is a visual condition (the audio
+     * path is step_aenc, whose reference aug defaults to off), so once per encode is exact. */
+    if (frow > row0)
+        RAD_ISSUE_N(c, m.op_eaug, frow - row0, praw(V->seed, RAD_U32, 2),
+                    brow_slice(m.b_evc, row0, frow - row0, kPatchVals));
 }
 
 /* The audio VAE encoder over one media item: `enc_samples`, channel-major and zero-padded, each

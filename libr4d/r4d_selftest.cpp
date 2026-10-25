@@ -9709,6 +9709,52 @@ void flow_renoise_cases(const Plugin& pl) {
     }
 }
 
+/* ------------------------------------------------------------------ cond_aug */
+void cond_aug_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "cond_aug_f32");
+    if (!r) { ok("cond_aug_f32", false, "row absent"); return; }
+    struct C { const char* what; int64_t M, n, ld, extra; double aug; uint64_t seed; };
+    for (const C& c : { C{ "the video's condition rows", 900, 96, 96, 0, 0.999, 0x123456789abcdefull },
+                        C{ "pitched rows, half kept", 1152, 32, 40, 3, 0.5, 42ull } }) {
+        const std::string nm = fmt("cond_aug_f32 %s: %lld x %lld, aug %.3f", c.what,
+                                   (long long)c.M, (long long)c.n, c.aug);
+        const int64_t rows = c.M + c.extra;
+        g_seed = 0x5eedull + (uint64_t)c.M;
+        const std::vector<float> x = randv((size_t)(rows * c.ld), 1.5f);
+        void* dx = up_f32(x);
+        void* dk = dalloc(8);
+        const uint32_t words[2] = { (uint32_t)c.seed, (uint32_t)(c.seed >> 32) };
+        if (!dx || !dk) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        st_memcpy(dk, words, 8, hipMemcpyHostToDevice);
+        /* x is a view of the buffer's first M rows; the rows after it are not x's. */
+        const int rc = launch(r, { T(dk, RAD_U32, { 2 }), pitched(dx, RAD_F32, c.M, c.n, c.ld) },
+                              { PI("M", c.M), PI("n", c.n), PI("stream", 2), PF("aug", c.aug),
+                                PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<float> got = down_f32(dx, x.size());
+        const float av = (float)c.aug, omv = (float)(1.0 - c.aug);
+        double e = 0, q = 0, worst = 0;
+        int64_t moved = 0;
+        for (int64_t k = 0; k < rows; ++k)
+            for (int64_t ch = 0; ch < c.ld; ++ch) {
+                const size_t i = (size_t)(k * c.ld + ch);
+                if (k >= c.M || ch >= c.n) { moved += got[i] != x[i]; continue; }
+                const float z = rad_philox_normal_s(c.seed, 2, (uint64_t)(k * c.n + ch));
+                const float a = av * x[i];
+                const float bz = omv * z;
+                const float want = a + bz;
+                e += (double)(got[i] - want) * (got[i] - want);
+                q += (double)want * want;
+                worst = std::max(worst, (double)std::fabs(got[i] - want));
+            }
+        const double rl = std::sqrt(e / q);
+        ok(fmt("%s (rel_l2 %.3g, worst %.3g; bounds 1e-6, 1e-5), the rest untouched", nm.c_str(),
+               rl, worst).c_str(),
+           rl <= 1e-6 && worst <= 1e-5 && moved == 0,
+           fmt("%lld values outside written", (long long)moved));
+    }
+}
+
 }  /* namespace ups */
 
 /* ---- a video generator's f32 forms, its biased GEMMs and its rotary, against libref's arithmetic
@@ -18534,6 +18580,11 @@ static void video_perf(const Plugin& pl, int iters, const char* only) {
                  E{ "flow_renoise, 96-wide f32 rows", "flow_renoise_f32",
                     { T(dsig, RAD_F32, { 1 }), T(dseed, RAD_U32, { 2 }), T(dp, RAD_F32, { Ms, 96 }) },
                     { PI("M", Ms), PI("n", 96), PI("stream", 1), PS("dtype", "f32") },
+                    (double)Ms * 96 * 8 },
+                 E{ "cond_aug, 96-wide f32 rows", "cond_aug_f32",
+                    { T(dseed, RAD_U32, { 2 }), T(dp, RAD_F32, { Ms, 96 }) },
+                    { PI("M", Ms), PI("n", 96), PI("stream", 2), PF("aug", 0.999),
+                      PS("dtype", "f32") },
                     (double)Ms * 96 * 8 } }) {
             const RadKernelInfo* r = find(pl, e.row);
             if (!r) { std::printf("  %s: row absent\n", e.row); continue; }
@@ -27854,6 +27905,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("resize_bilinear")) ups::resize_bilinear_cases(pl);
     if (sel("patch_fold_f32")) ups::patch_fold_cases(pl);
     if (sel("flow_renoise_f32")) ups::flow_renoise_cases(pl);
+    if (sel("cond_aug_f32")) ups::cond_aug_cases(pl);
     /* The joint image generators' ops. */
     if (sel("table_add_bf16")) g3::table_add_cases(pl);
     if (sel("mix_rows_bf16")) g3::mix_rows_cases(pl);

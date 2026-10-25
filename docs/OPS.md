@@ -1729,6 +1729,29 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   first, `stream` the parameter. `x` f32 `[M, n]` at its row pitch. MiniMax-H3: `n` 96 (the video's
   patch rows) and 32 (the soundtrack's), `stream` 1.
 
+### Condition-noise augmentation
+
+MiniMax-H3's reference blends every visual condition's patchified latents with fresh noise before
+they condition the transformer (`_cond_video_rows`, `comfy/ldm/minimax/model.py`: the blend weight
+is `VISUAL_COND_TIMESTEP` 0.999 and every condition intentionally restarts the same RNG stream).
+The arch applies the blend once, per media item, over the item's encoded rows after the VAE
+encoder's fold. Unlike `flow_renoise`'s staged `sigma` the weight is a declared parameter: it is a
+constant of the recipe, not a value the request carries. The audio twin's aug defaults to 1.0 —
+disabled — so no audio-side form exists.
+
+| op | params | operands |
+|---|---|---|
+| `cond_aug` | `M`(range) `n` `stream` `aug`:f64 `dtype` | `seed`, `x`:inout |
+
+- `cond_aug` blends condition rows with fresh noise, over `x`'s rows:
+  `x[k, c] = f32(f32(a x[k, c]) + f32(oma z(k n + c)))`, `a` = `aug` in `[0, 1)`, `oma` the f32 of
+  the f64 `1 - aug` computed in double (the reference subtracts that scalar in python),
+  `z(e) = rad_philox_normal_s(seed, stream, e)` (`abi/rad_philox.h`), `seed` u32 `[2]` low word
+  first, `stream` the parameter. `x` f32 `[M, n]` at its row pitch. The caller issues one media
+  item's rows at a time with the same `(seed, stream)`, so every item's draws restart at `e = 0`
+  as the reference's per-latent generator does. MiniMax-H3: `n` 96 (the video's patch rows),
+  `stream` 2, `aug` 0.999.
+
 ## LTX-2
 
 The ops LTX-2's audio-video transformer adds (`libref/ref_ltx.cpp`): its rotary over fractional

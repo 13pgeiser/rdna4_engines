@@ -833,3 +833,37 @@ AVX_KERNEL(flow_renoise) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ cond_aug */
+/* x = f32(f32(a x) + f32(oma z)) over x's rows, a the `aug` parameter, oma the f32 of the f64
+ * 1 - aug, z the (seed, stream) normal stream at k n + c (libref's, bit for bit): a visual
+ * condition's rows with the reference's condition-noise augmentation. */
+AVX_KERNEL(cond_aug) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *SD = &a->t[0], *X = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), sm = p_int(a, "stream", 0);
+    const RadParam* ap = p_find(a, "aug");
+    if (!ap || ap->kind != RAD_P_F64) return RAD_E_SHAPE;
+    const double aug = ap->dval;
+    if (n <= 0 || sm < 0 || !(aug >= 0.0 && aug < 1.0) || numel(SD) < 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float av = (float)aug, omv = (float)(1.0 - aug);
+    const uint64_t sd = (uint64_t)(uint32_t)at(SD, 0) | ((uint64_t)(uint32_t)at(SD, 1) << 32);
+
+    AVX_PARALLEL_FOR_IF(rows * n * 8 >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(3 * n + 48));
+        float *xs = buf, *z = xs + n + 16, *o = z + n + 16;
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        philox_normals_s(sd, (uint64_t)sm, (uint64_t)(k * n), n, z);
+        const vf va = vf_set1(av), vo = vf_set1(omv);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N)
+            vf_storeu(o + c, vf_add(keep(vf_mul(va, vf_loadu(x + c))),
+                                    keep(vf_mul(vo, vf_loadu(z + c)))));
+        for (; c < n; ++c) o[c] = keep(av * x[c]) + keep(omv * z[c]);
+        out_row(X, rowoff(X, k, n), n, o);
+    }
+    return RAD_OK;
+}

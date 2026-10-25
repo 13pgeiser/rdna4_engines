@@ -1033,7 +1033,7 @@ TEST(op_vocabulary) {
         /* Its latent upscaler: the 3-D and temporal convolutions, the group norm, the resize,
          * the fold back into patch rows and the re-noising. */
         "conv3d_ndhwc", "group_norm", "tconv_dw", "resize_bilinear", "patch_fold",
-        "flow_renoise",
+        "flow_renoise", "cond_aug",
         /* The joint image generators' (Krea 2, FLUX.3): attention over separate key bounds, a
          * per-layer table added to every row, a learned mix of consecutive rows, and the VAE's
          * channel statistics. */
@@ -7207,6 +7207,48 @@ TEST(flow_renoise_draws_its_own_stream_by_element) {
     CHECK(differs);
 }
 
+/* cond_aug: x = f32(f32(a x) + f32(oma z(k n + c))) with a = 0.999 the f64 parameter and oma
+ * the f32 of the f64 1 - a -- NOT the f32 difference 1.0f - 0.999f, whose low bits differ; the
+ * reference subtracts that scalar in python double -- and z the (seed, 2) normal stream. x is
+ * [2, 3] at a pitch of 5, last two columns not written. The second call is the caller's
+ * per-item restart: item B issued alone with the same (seed, stream) draws from e = 0 again,
+ * which a single joined call would not (its row 1 reads k n + c). aug 1 -- the audio twin's
+ * disabled spelling -- and a missing aug are refused, not approximated. */
+TEST(cond_aug_blends_conditions_with_a_restarted_stream) {
+    const uint64_t seed = 0x0000f00dbeef000dull;
+    T sd(RAD_U32, {2}); sd.n({(int64_t)(seed & 0xffffffffu), (int64_t)(seed >> 32)});
+    const float av = 0.999f, omv = (float)(1.0 - 0.999);
+    const float xa[3] = { 1, -2, 3 }, xb[3] = { 0.5f, 0, -4 };
+    T x(RAD_F32, {2, 5});
+    x.f({ xa[0], xa[1], xa[2], -9, -9, xb[0], xb[1], xb[2], -9, -9 });
+    x.t.shape[1] = 3;
+    A a1; a1.t(sd).t(x).i("M", 2).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_OK(run("cond_aug", a1));
+    for (int k = 0; k < 2; ++k) {
+        for (int c = 0; c < 3; ++c) {
+            const float z = rad_philox_normal_s(seed, 2, (uint64_t)(k * 3 + c));
+            CHECK_EQ(x.at(k * 5 + c), av * (k ? xb[c] : xa[c]) + omv * z);
+        }
+        CHECK_EQ(x.at(k * 5 + 3), -9.0f);
+        CHECK_EQ(x.at(k * 5 + 4), -9.0f);
+    }
+    T y(RAD_F32, {1, 3});
+    y.f({ xb[0], xb[1], xb[2] });
+    A a2; a2.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_OK(run("cond_aug", a2));
+    for (int c = 0; c < 3; ++c) {
+        const float restarted = av * xb[c] + omv * rad_philox_normal_s(seed, 2, (uint64_t)c);
+        CHECK_EQ(y.at(c), restarted);
+        CHECK(restarted != x.at(5 + c));   // joined, row 1 read element 3 + c instead
+    }
+    A a3; a3.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 1.0).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a3), RAD_E_SHAPE);
+    A a4; a4.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a4), RAD_E_SHAPE);
+    A a5; a5.t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a5), RAD_E_INVAL);
+}
+
 /* ================================================================== video sparse attention
  * docs/OPS.md "Video sparse attention": the tiles over a packed sequence of dense segments and a
  * video grid, vsa_select's top-k of pooled scores and its coarse branch, attn_vsa's block-sparse
@@ -8920,6 +8962,8 @@ std::vector<Geo> geometries() {
         G("patch_fold", "M", 8, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                 .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("flow_renoise", "M", 3, a.i("M", R).i("n", 8).i("stream", 1).s("dtype", "f32")),
+        G("cond_aug", "M", 3, a.i("M", R).i("n", 8).i("stream", 2).d("aug", 0.999)
+                             .s("dtype", "f32")),
         G("attn_cross", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
                                 .s("dtype", "f32").i("n_head", 2)),
         G("table_add", "M", 3, a.i("M", R).i("n", 8).i("L", 3).s("dtype", "f32")),

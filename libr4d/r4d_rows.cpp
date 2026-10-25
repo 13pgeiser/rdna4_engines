@@ -2693,6 +2693,11 @@ static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stre
 static const RadOperandSpec oFlowRenoise[] = {
     { "sigma", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
+static const RadParamSpec pCondAug[] = { P_INT("M"), P_INT("n"), P_INT("stream"), P_F64("aug"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oCondAug[] = {
+    { "seed", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
 
 /* ---- LTX-2 (r4d_ltx.hip); the same specs as libref's. */
 static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
@@ -3620,6 +3625,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_renoise", pFlowRenoise, oFlowRenoise,
            "x = (1 - sigma) x + sigma z, z the (seed, stream) normal stream at element k n + c, "
            "each step one f32 rounding."),
+    SCHEMA("cond_aug", pCondAug, oCondAug,
+           "x = a x + oma z, a the `aug` parameter, oma the f32 of the f64 1 - aug, z the "
+           "(seed, stream) normal stream at element k n + c, each step one f32 rounding: the "
+           "reference's condition-noise augmentation."),
     SCHEMA("rope_split", pRopeSplit, oRopeSplit,
            "LTX-2's split rotary over fractional coordinates: the pairs of all heads on one "
            "ladder, the first `pad` unrotated, the axes interleaved; each head's halves turned "
@@ -9367,6 +9376,13 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenF32), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_renoise },
+
+{ "cond_aug_f32", "cond_aug", "elem",
+  "condition rows blended with fresh noise at the declared aug: a thread a value",
+  "any M and n, row pitches honoured", "f32 rows, u32 seed words",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_cond_aug },
 
 { "rope_split", "rope_split", "elem",
   "LTX-2's rotary: a workgroup a (head, 64 rows), the head's ladder in LDS, sincosf a pair",

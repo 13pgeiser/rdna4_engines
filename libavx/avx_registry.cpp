@@ -671,6 +671,9 @@ static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
+static const RadParamSpec pCondAug[] = { P_INT("M"), P_INT("n"), P_INT("stream"), P_F64("aug"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oCondAug[] = { OPD("seed"), INOUT("x") };
 
 /* ---- LTX-2 (avx_ltx.cpp) */
 static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
@@ -1212,6 +1215,9 @@ static const RadOpSchema kSchemas[] = {
 { "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
   "x = f32(f32(1 - s) x) + f32(s z), z the (seed, stream) normal stream at k n + c, bit for bit "
   "libref's." },
+{ "cond_aug", ARR(pCondAug), ARR(oCondAug),
+  "x = f32(f32(a x) + f32(oma z)) with a the `aug` parameter and oma the f32 of the f64 1 - aug, "
+  "z the (seed, stream) normal stream at k n + c, bit for bit libref's." },
 { "rope_split", ARR(pRopeSplit), ARR(oRopeSplit),
   "LTX-2's split rotary over fractional coordinates, libref's arithmetic element by element." },
 { "head_gate", ARR(pHeadGate), ARR(oHeadGate),
@@ -1779,6 +1785,8 @@ SIMPLE("avx_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch r
        L(patch_fold)),
 SIMPLE("avx_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma",
        DT_FLOAT, L(flow_renoise)),
+SIMPLE("avx_cond_aug", "cond_aug", "elem", "condition rows blended with fresh noise at a fixed aug",
+       DT_FLOAT, L(cond_aug)),
 SIMPLE("avx_rope_split", "rope_split", "elem", "LTX-2's split rotary over coordinates", DT_FLOAT,
        L(rope_split)),
 SIMPLE("avx_head_gate", "head_gate", "elem", "each head times 2 sigmoid of its logit", DT_FLOAT,

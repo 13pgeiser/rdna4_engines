@@ -774,6 +774,24 @@ __global__ __launch_bounds__(kT) void flow_renoise_kernel(
     *p = a + bz;
 }
 
+// ---------------------------------------------------------------------------- cond_aug
+// x = a x + oma z, a the aug parameter, oma the f32 of the f64 1 - a, z element k n + c of the
+// (seed, stream) normal stream: a thread a value, each product and the sum one f32 rounding.
+__global__ __launch_bounds__(kT) void cond_aug_kernel(
+    const uint32_t* __restrict__ seed, float* __restrict__ x, float a, float oma,
+    int n, int ldx, long long total, unsigned long long stream) {
+    const long long id = (long long)blockIdx.x * kT + threadIdx.x;
+    if (id >= total) return;
+    const long long k = id / n;
+    const int c = (int)(id % n);
+    const uint64_t sd = (uint64_t)seed[0] | ((uint64_t)seed[1] << 32);
+    const float z = rad_philox_normal_s(sd, stream, (uint64_t)id);
+    float* p = x + k * ldx + c;
+    const float av = a * *p;
+    const float bz = oma * z;
+    *p = av + bz;
+}
+
 inline bool is_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
 inline bool is_f32(const RadTensor* t) { return t && t->dtype == RAD_F32; }
 inline bool is_i32(const RadTensor* t) { return t && t->dtype == RAD_I32; }
@@ -1086,5 +1104,30 @@ extern "C" int r4d_rad_flow_renoise(const RadArgs* a, RadStream stream) {
     const long long total = M * n;
     return R4D_EMIT(stream, flow_renoise_kernel, dim3((unsigned)((total + kT - 1) / kT)), dim3(kT),
                     0, (const float*)r4d_p(sg), (const uint32_t*)r4d_p(seed), (float*)r4d_wp(x),
+                    (int)n, (int)ldx, total, (unsigned long long)sm);
+}
+
+/* ------------------------------------------------------------------ cond_aug */
+enum { CA_SEED = 0, CA_X };
+
+extern "C" int r4d_rad_cond_aug(const RadArgs* a, RadStream stream) {
+    const RadTensor *seed = r4d_opt(a, CA_SEED), *x = r4d_opt(a, CA_X);
+    if (!seed || !x) return R4D_NO(RAD_E_INVAL);
+    if (!is_f32(x) || (seed->dtype != RAD_U32 && seed->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), sm = r4d_geti_or(a, "stream", 0);
+    const double aug = r4d_getf(a, "aug", -1.0);
+    if (n <= 0 || sm < 0 || !(aug >= 0.0 && aug < 1.0) || r4d_numel(seed) < 2)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0;
+    const long long ldx = r4d_rows_pitch(x, n, &rx);
+    if (ldx < 0 || !r4d_contig(seed)) return R4D_NO(RAD_E_STRIDE);
+    /* Every row of x, as libref's; M is not read. */
+    const long long M = rx;
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const long long total = M * n;
+    const float av = (float)aug, omv = (float)(1.0 - aug);
+    return R4D_EMIT(stream, cond_aug_kernel, dim3((unsigned)((total + kT - 1) / kT)), dim3(kT),
+                    0, (const uint32_t*)r4d_p(seed), (float*)r4d_wp(x), av, omv,
                     (int)n, (int)ldx, total, (unsigned long long)sm);
 }

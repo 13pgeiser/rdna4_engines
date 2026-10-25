@@ -270,6 +270,7 @@ int     r4d_rad_tconv_dw              (const RadArgs*, RadStream);
 int     r4d_rad_resize_bilinear       (const RadArgs*, RadStream);
 int     r4d_rad_patch_fold            (const RadArgs*, RadStream);
 int     r4d_rad_flow_renoise          (const RadArgs*, RadStream);
+int     r4d_rad_cond_aug              (const RadArgs*, RadStream);
 int     r4d_rad_rope_split            (const RadArgs*, RadStream);
 int     r4d_rad_head_gate             (const RadArgs*, RadStream);
 int     r4d_rad_ltx_guide             (const RadArgs*, RadStream);

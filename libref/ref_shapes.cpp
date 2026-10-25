@@ -3143,6 +3143,17 @@ int ref_flow_renoise_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("flow_renoise", operand, out);
 }
 
+/* aug in [0, 1); the condition rows f32. */
+int ref_cond_aug_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const double aug = rad_param_getf(p, n_p, "aug", -1.0);
+    if (M <= 0 || n <= 0 || !(aug >= 0.0 && aug < 1.0)) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ 2 }, (int64_t)1 << 30, -1, 0);                  /* seed: two words */
+    o.t((uint32_t)RAD_F32, { M, n });                         /* x, INOUT */
+    return o.finish("cond_aug", operand, out);
+}
+
 /* ================================================================== video sparse attention
  *
  * The tiles come from the values of `segs` and `geom`, which a description draws only as

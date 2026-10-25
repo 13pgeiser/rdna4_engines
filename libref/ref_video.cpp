@@ -656,3 +656,42 @@ int ref_flow_renoise(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ cond_aug */
+/* A visual condition's patchified rows with the reference's condition-noise augmentation, its
+ * `_cond_video_rows` (comfy/ldm/minimax/model.py): every condition latent is blended with fresh
+ * noise before it becomes a condition row, and every condition intentionally restarts the same
+ * RNG stream, so element e = k n + c of row k is
+ *
+ *   x[k, c] = f32(f32(a x[k, c]) + f32(oma z(k n + c)))
+ *
+ * a = `aug` (the reference's VISUAL_COND_TIMESTEP, 0.999), oma the one cast to f32 of the f64
+ * 1 - aug (the reference subtracts that scalar in python double and casts per tensor op),
+ * z(e) = rad_philox_normal_s(seed, stream, e) (abi/rad_philox.h), `seed` two u32 words low first
+ * -- the request's seed -- and `stream` the parameter. x is f32 [M, n] at its row pitch.
+ * The reference redraws the same seed every forward, so the blend is a fixed function of the
+ * request; the arch applies it once to the encoded condition rows, per media item, which is
+ * exactly the reference's per-item restart. */
+int ref_cond_aug(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *seed = &a->t[0], *x = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), stream = p_int(a, "stream", 0);
+    const RadParam* ap = p_find(a, "aug");
+    if (!ap || ap->kind != RAD_P_F64) return RAD_E_SHAPE;
+    const double aug = ap->dval;
+    if (n <= 0 || stream < 0 || !(aug >= 0.0 && aug < 1.0) || numel(seed) < 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float av = (float)aug, omv = (float)(1.0 - aug);
+    const uint64_t sd = (uint64_t)(uint32_t)ldi(seed, 0) | ((uint64_t)(uint32_t)ldi(seed, 1) << 32);
+    const int64_t xs = laststride(x);
+    REF_PAR_FOR(rows * n * 8)
+    for (int64_t k = 0; k < rows; ++k) {
+        const int64_t xb = rowoff(x, k, n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float z = rad_philox_normal_s(sd, (uint64_t)stream, (uint64_t)(k * n + c));
+            stt(x, xb + c * xs, av * ldt(x, xb + c * xs) + omv * z);
+        }
+    }
+    return RAD_OK;
+}

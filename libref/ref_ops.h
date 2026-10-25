@@ -184,6 +184,7 @@ int ref_group_norm(const RadArgs*, RadStream);
 int ref_tconv_dw(const RadArgs*, RadStream);
 int ref_resize_bilinear(const RadArgs*, RadStream);
 int ref_flow_renoise(const RadArgs*, RadStream);
+int ref_cond_aug(const RadArgs*, RadStream);
 /* ref_ltx.cpp */
 int ref_rope_split(const RadArgs*, RadStream);
 int ref_head_gate(const RadArgs*, RadStream);
@@ -437,6 +438,7 @@ REF_SHAPE_FN(ref_group_norm);
 REF_SHAPE_FN(ref_tconv_dw);
 REF_SHAPE_FN(ref_resize_bilinear);
 REF_SHAPE_FN(ref_flow_renoise);
+REF_SHAPE_FN(ref_cond_aug);
 REF_SHAPE_FN(ref_rope_split);
 REF_SHAPE_FN(ref_head_gate);
 REF_SHAPE_FN(ref_ltx_guide);

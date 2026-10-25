@@ -891,6 +891,11 @@ static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
+/* `aug` is the condition's kept fraction (the reference's VISUAL_COND_TIMESTEP, 0.999); unlike
+ * `flow_renoise` the blend weight is a declared recipe constant, not a staged tensor. */
+static const RadParamSpec pCondAug[] = { P_INT("M"), P_INT("n"), P_INT("stream"), P_F64("aug"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oCondAug[] = { OPD("seed"), INOUT("x") };
 
 /* ---- LTX-2 (ref_ltx.cpp) */
 static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
@@ -1807,6 +1812,11 @@ static const RadOpSchema kSchemas[] = {
 { "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
   "a clean latent re-noised to sigma s: x = f32(f32(f32(1 - s) x) + f32(s z)), z element "
   "k n + c of the normal stream (seed, `stream`) (abi/rad_philox.h)." },
+{ "cond_aug", ARR(pCondAug), ARR(oCondAug),
+  "a visual condition's rows blended with fresh noise, the reference's condition augmentation: "
+  "x = f32(f32(a x) + f32(oma z)) with a = `aug` and oma the f32 of the f64 1 - aug, z element "
+  "k n + c of the normal stream (seed, `stream`); the caller issues one media item's rows so "
+  "every item restarts the same stream, as the reference does." },
 { "rope_split", ARR(pRopeSplit), ARR(oRopeSplit),
   "LTX-2's rotary over fractional coordinates: dim/2 pairs over all heads, the first `pad` "
   "unrotated, then freq[k] = f32(theta^linspace(0,1,steps)[k] pi/2) with the n_dims coordinates "
@@ -2450,6 +2460,8 @@ SIMPLE("ref_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch r
        ref_patch_fold),
 SIMPLE("ref_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma", DT_FLOAT,
        ref_flow_renoise),
+SIMPLE("ref_cond_aug", "cond_aug", "elem", "condition rows blended with fresh noise at a fixed aug",
+       DT_FLOAT, ref_cond_aug),
 SIMPLE("ref_rope_split", "rope_split", "elem", "LTX-2's split rotary over coordinates", DT_FLOAT,
        ref_rope_split),
 SIMPLE("ref_head_gate", "head_gate", "elem", "each head times 2 sigmoid of its logit", DT_FLOAT,

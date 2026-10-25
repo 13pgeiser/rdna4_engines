@@ -1733,6 +1733,9 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     if (enc_dbg_)
         enc_dbg_dump_file("encg_" + std::to_string((int)it.kind) + "_" +
                           std::to_string((int)it.slot), gd, 25 * 4);
+    /* The video encoder's condition-noise blend draws from the request seed (step_venc), and a
+     * reused lane's R_SEED still holds the previous request's -- stage it like build_step does. */
+    stage_seed(j);
     stage_geom(j, j.geom, j.rows, 0);
     if (upload() < 0) return nullptr;
     base_batches(j, j.geom, 0, step);

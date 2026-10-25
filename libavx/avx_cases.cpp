@@ -935,6 +935,10 @@ std::vector<Case> build_cases() {
             0, 2.0 * 27 * v.cin * v.cout * 27);
     add("flow_renoise", { HI("M", 9), HI("n", 96), HI("stream", 1), HS("dtype", "f32") });
     add("flow_renoise", { HI("M", 5), HI("n", 645), HI("stream", 7), HS("dtype", "f32") });
+    add("cond_aug", { HI("M", 9), HI("n", 96), HI("stream", 2), HF("aug", 0.999),
+                      HS("dtype", "f32") });
+    add("cond_aug", { HI("M", 5), HI("n", 645), HI("stream", 7), HF("aug", 0.5),
+                      HS("dtype", "f32") });
 
     /* LTX-2: the video's 3-axis rotary (two padded pairs, a rank's second head), the cross
      * attentions' 1-axis one, the per-head gate and the guided step. */
