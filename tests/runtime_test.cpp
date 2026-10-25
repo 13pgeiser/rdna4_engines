@@ -996,6 +996,26 @@ TEST(an_op_outside_the_window_on_lane_0_joins_the_second_lane_first) {
     }));
 }
 
+/* An op that names no buffer -- a weight read into the cache (prefetch_beside) -- touches nothing the
+ * window keeps live, so on lane 1 it runs outside the window too (a drafter's reads beside its
+ * all-reduces come after the trunk's window). */
+TEST(an_op_naming_no_buffer_runs_on_the_second_lane_outside_its_window) {
+    Fixture f;
+    f.P.scratch_regions = 2;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    rad_op a1 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" }, nullptr, { w });
+    f.P.lane1_w0 = f.P.lane1_w1 = (int32_t)a0;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_W(w) };
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+    }));
+}
+
 /* Operands are positional (spec §2.3), so a miscount is silent numerical garbage at the kernel,
  * not a diagnosable failure. The runtime checks the given arity against the schema. */
 TEST(operand_arity_is_checked_against_the_schema) {

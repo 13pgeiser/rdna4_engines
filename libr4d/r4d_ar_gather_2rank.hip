@@ -72,6 +72,7 @@ __global__ void r4d_ar_gather_2rank_kernel(
   const int w = (n16 + nb - 1) / nb;
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
 
   // Push the chunk to the peer slot and place this rank's own slice (a local store, no handshake)
   // while the push is in flight.
@@ -82,6 +83,8 @@ __global__ void r4d_ar_gather_2rank_kernel(
            v2 = in4[r4d_g_src(k + 2 * nt, row16, n16, sp16)],
            v3 = in4[r4d_g_src(k + 3 * nt, row16, n16, sp16)];
       ps[k] = v0; ps[k + nt] = v1; ps[k + 2 * nt] = v2; ps[k + 3 * nt] = v3;
+      hck += r4d_archk_u4(v0, 4u * (unsigned)k) + r4d_archk_u4(v1, 4u * (unsigned)(k + nt)) +
+             r4d_archk_u4(v2, 4u * (unsigned)(k + 2 * nt)) + r4d_archk_u4(v3, 4u * (unsigned)(k + 3 * nt));
       out4[r4d_g_dst(k,          row16, n16, rank, dp16)] = v0;
       out4[r4d_g_dst(k + nt,     row16, n16, rank, dp16)] = v1;
       out4[r4d_g_dst(k + 2 * nt, row16, n16, rank, dp16)] = v2;
@@ -90,11 +93,13 @@ __global__ void r4d_ar_gather_2rank_kernel(
     for (; k < end; k += nt) {
       int4 v = in4[r4d_g_src(k, row16, n16, sp16)];
       ps[k] = v;
+      hck += r4d_archk_u4(v, 4u * (unsigned)k);
       out4[r4d_g_dst(k, row16, n16, rank, dp16)] = v;
     }
   }
   // Drain modes, as in the all-reduce: order the pushes before the release flag so the peer cannot
   // see the flag before the data.
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -110,6 +115,9 @@ __global__ void r4d_ar_gather_2rank_kernel(
   }
   __syncthreads();
   if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+  });
 
   // Place the peer's slice, now staged in this rank's scratch.
   {
@@ -165,6 +173,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
+  nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
   r4d_ar_gather_2rank_kernel<<<nb, nt, 0, st>>>(
       (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
       (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,

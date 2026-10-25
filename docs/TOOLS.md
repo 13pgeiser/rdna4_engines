@@ -655,6 +655,16 @@ Declare at the shapes you serve:
 At `--tp > 1` every rank declares at once, each on its own thread and device, as the engine does:
 a collective's `init` is a rendezvous, so declaring rank 0 alone at world size 2 hangs.
 
+A collective is then measured as the exchange, not as one rank's copy of it. Each rank gets its own
+operands -- drawn with its own seed, so a fold of two identical halves cannot pass a correctness
+check -- its own scratch, its own stream, and the instance its own declare made: `init` is what
+publishes the peer bundle (scratch, flags, sequence counters) and a launch with no instance is
+refused before it starts. The candidate's launches are fired on every rank at once and the clock
+stops when the last stream drains, so the reported time is the round trip through the peer, which
+is what the served step pays; timing rank 0 alone would time a local copy. Candidates are still
+judged against the defaults on rank 0's output. A row that is not collective runs on rank 0 alone,
+as it always did.
+
 Before trusting a cache, check that the tuned variants beat the defaults. `RADIANCE_TUNE` pins a
 kernel's axes for such a comparison; it is a measurement aid, not a deployment setting.
 
@@ -743,7 +753,7 @@ The `--perf*` modes time rows at one shape on a card. Two that cover the dense G
 | | |
 |---|---|
 | `--perf N K M [iters]` | the fp8 decode GEMMs, and the fp8 head (`logits_gemm_fp8`) |
-| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches |
+| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches; at a gate_up shape (N a multiple of 256, K of 128) also `gated_quant_fp8` and the fold that replaces the pair, `gemm_mxfp4a8_gated_gemv` |
 
 `--perfmx` is the MXFP4 expert GEMM (`M`, experts, `top_k`, skew), not the dense rows. `--cold MIB`
 times each launch alone behind a cache flush instead of back to back.

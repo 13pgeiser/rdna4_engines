@@ -501,6 +501,7 @@ void Builder::record_tune_request(const Resolved& r) {
     req.geom       = r.geom;
     req.geom_key   = r.geom_key;
     req.info       = r.row->info;
+    req.instance   = r.instance;
     prog_.tune_requests.push_back(std::move(req));
 }
 
@@ -611,6 +612,29 @@ void Builder::finish_instances() {
         }
     }
 }
+
+/* The instances are made in finish_instances(), after record_tune_request ran, so the requests
+ * now carry the instance their kernel will launch with. A collective's launch cannot be formed
+ * without it -- the peer bundle (scratch, flags, sequence counters) is what init() builds and
+ * RadArgs reaches the exchange through nothing else -- so the tuner forms its launches from this.
+ * Keyed exactly as record_tune_request keyed. */
+void Builder::fill_tune_instances() {
+    for (size_t i = 1; i < prog_.ops.size(); ++i) {
+        const OpInfo& oi = prog_.ops[i];
+        for (const Band& b : oi.bands)
+            for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                const Resolved& r = b.dom[d];
+                if (!r || !r.row || !r.row->info) continue;
+                const std::string key = r.row->info->name + std::string("\x1f") + r.row->plugin +
+                                        std::string("\x1f") + r.geom_key;
+                for (auto& t : prog_.tune_requests)
+                    if (t.kernel + std::string("\x1f") + t.plugin + std::string("\x1f") +
+                        t.geom_key == key)
+                        t.instance = r.instance;
+            }
+    }
+}
+
 rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                         const rad_weight* w, int n_w) {
     if (finished_) return err(RAD_E_STATE, "decl_op('%s') after declare finished", opname ? opname : "");
@@ -2410,6 +2434,7 @@ int Builder::finish() {
         }
 
     if (instances_) finish_instances();
+    fill_tune_instances();
     finish_weight_uses();
     finish_layouts();
     finish_kv_groups();

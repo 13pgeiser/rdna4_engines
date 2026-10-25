@@ -13,6 +13,13 @@
 
 namespace rad {
 
+/* How many steps of the following prompt the PLE read-ahead queue stages (RadBatch::n_ahead):
+ * the arch's reader thread drains the queue at disk speed, off the step path, so a prefill
+ * chunk's table rows are already cached when its gather runs. Keep in step with rad_block_ple.h
+ * (kAheadChunks), which clamps to the buffer it declared; a mismatch degrades to a smaller queue,
+ * never an overflow. */
+static constexpr int64_t k_ahead_chunks = 8;
+
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
  * allocations at init instead of two dozen, with every array sharing one mapping. */
 static const int64_t k_carve_align = 256;
@@ -98,9 +105,10 @@ void BatchBuilder::carve(Set& s, char* h) {
         *ph = ::rad::carve<int32_t>(h, oh, n);
         *pd = ::rad::carve<int32_t>(d, od, n);
     };
-    /* Twice the step: its own tokens, then up to a step of the following prompt
-     * (RadBatch::n_ahead). */
-    pair(&s.h_tok,    &s.d_tok,    2 * T);
+    /* The step's tokens, then the PLE read-ahead queue -- k_ahead_chunks steps of the following
+     * prompt (RadBatch::n_ahead), which the arch's reader thread prefetches off the step path
+     * (rad_block_ple.h, which clamps to the same count). */
+    pair(&s.h_tok,    &s.d_tok,    (1 + k_ahead_chunks) * T);
     pair(&s.h_pos,    &s.d_pos,    T);
     pair(&s.h_parent, &s.d_parent, T);
     pair(&s.h_cu,     &s.d_cu,     S + 1);
@@ -1052,17 +1060,18 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
-    /* Up to a step of the last sequence's following tokens, after this step's own
-     * (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk, bounded by
-     * the tokens the request has; like token_at, a re-prefill after preemption continues into its
-     * own output. */
+    /* Up to the read-ahead queue's worth of the last sequence's following tokens, after this
+     * step's own (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk,
+     * bounded by the tokens the request has; like token_at, a re-prefill after preemption
+     * continues into its own output. The arch clamps to the rows it declared. */
     int64_t n_ahead = 0;
     if (n_seq > 0 && plan.draft_pass == 0 && plan.tok_shift == 0) {
         const StepEntry& e = plan.e[(size_t)(n_seq - 1)];
         if (e.req && e.is_prefill) {
             const int64_t next = (int64_t)e.ctx_len + e.n_tokens;
             const int64_t have = (int64_t)e.req->prompt.size() + (int64_t)e.req->output.size();
-            n_ahead = std::min<int64_t>(std::max<int64_t>(have - next, 0), max_tok_);
+            n_ahead = std::min<int64_t>(std::max<int64_t>(have - next, 0),
+                                        k_ahead_chunks * max_tok_);
             for (int64_t j = 0; j < n_ahead; ++j) s.h_tok[n_tok + j] = token_at(e, next + j);
         }
     }
