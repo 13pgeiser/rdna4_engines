@@ -130,9 +130,12 @@ digits but past 2^53 the engine rounds the seed and past
 bigger values are clamped here rather than silently
 changing the run.
 latent_upscale (advanced): the container's built-in latent
-upscaler -- early steps at size/2, refine at full size. t2va
-ONLY (the server refuses it with refs or keyframes); the
-output still stays within the canvas, so it buys speed and
+upscaler -- early steps at size/2, refine at full size.
+Works with t2va and ref2va (references carry their own
+grids); REFUSED with i2va/l2va/fl2va keyframes -- a pin
+sits at the exact output frame on the exact target grid
+and a draft canvas leaves it nowhere to sit. The output
+still stays within the canvas, so it buys speed and
 detail, not 1080p. off by default.
 server_url: http://<box>:8133. LAN needs the server on
 --host 0.0.0.0; NO auth -- trusted LAN only.
@@ -414,9 +417,11 @@ class RadianceMiniMax(io.ComfyNode):
                 "- **latent_upscale** — advanced, **off** by default: a container converted with "
                 "the latent-upscaler weights (DaSiWa's companion — the server log names it at "
                 "boot) runs the early steps at size/2 or /4, enlarges the clean latent, and "
-                "refines at full size in the last steps. **t2va only** — the server refuses it "
-                "combined with references or keyframes — and the output stays within the canvas, "
-                "so it buys speed/detail, not 1080p.\n"
+                "refines at full size in the last steps. Works with **t2va and ref2va** — "
+                "references carry their own grids, so they condition both stages identically — "
+                "and is **refused with i2va/l2va/fl2va keyframes**: a pin sits AT the exact "
+                "output frame on the exact target grid, and a draft canvas leaves it nowhere to "
+                "sit. The output stays within the canvas, so it buys speed/detail, not 1080p.\n"
                 "- **server_url / model** — which box (`http://<host>:8133`; LAN needs the "
                 "server on `--host 0.0.0.0`, no auth — trusted LAN only) and which served "
                 "model id (`GET /v1/models`).\n\n"
@@ -521,8 +526,9 @@ class RadianceMiniMax(io.ComfyNode):
                     "the container's built-in latent upscaler (the DaSiWa companion weights, "
                     "baked into the .rad at convert time -- the server log names it at boot): "
                     "the early steps run at size/2 (or /4), the clean latent is enlarged, "
-                    "re-noised, and the last steps refine at the FULL size. t2va only -- the "
-                    "server refuses it with references or keyframes. The OUTPUT stays within "
+                    "re-noised, and the last steps refine at the FULL size. Works with t2va and "
+                    "ref2va (references carry their own grids); refused with i2va/l2va/fl2va "
+                    "keyframes (a pin needs the exact target grid). The OUTPUT stays within "
                     "the canvas (the refine steps run full size): this buys speed and detail, "
                     "not 1080p -- sizes stay multiples of 32 and under 1344x768 either way"),
                 *images, *videos, *vauds, *adus,
@@ -640,13 +646,16 @@ class RadianceMiniMax(io.ComfyNode):
             "shift": str(shift), "audio_shift": str(audio_shift),
         }
         if str(latent_upscale) not in ("off", "", "1"):
-            # the driver refuses upscale together with ANY packed conditioning -- references
-            # AND endpoint keyframes ride the same table (video_driver.cpp, "does not yet
-            # combine") -- so say it here instead of eating a round trip
-            if task != "t2va":
-                raise ValueError(f"latent_upscale {latent_upscale} with task {task}: the server "
-                                 "refuses latent upscale combined with references or keyframes "
-                                 "(text-to-video only for now)")
+            # the draft/refine split re-lays the reference pack per stage -- refs carry their own
+            # grids, so ref2va rides an upscale fine. A KEYFRAME pin sits AT the output frame's row
+            # on the exact target grid, and two canvases leave it nowhere to sit -- the driver
+            # refuses those by name (video_driver.cpp), so say it here instead of eating a round trip
+            if task in ("i2va", "l2va", "fl2va"):
+                raise ValueError(f"latent_upscale {latent_upscale} with task {task}: a keyframe "
+                                 "pins an exact output frame on the exact target grid, and latent "
+                                 "upscale drafts at a smaller grid first -- run the keyframe "
+                                 "request without latent_upscale, or send the frame as a "
+                                 "reference image (ref2va supports the upscale)")
             data["latent_upscale"] = str(latent_upscale)
         # The two dropdown slots become the server's adapter list IN ORDER;
         # 'none' is off and either slot may stand alone. A slot holding

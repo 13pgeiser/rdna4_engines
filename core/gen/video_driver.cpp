@@ -640,9 +640,19 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
                   "this server cannot run");
     j.dec_rows = nd;
     if (d.ref_rows && !j.ref_tab.empty()) {
-        if (r.upscale > 1.0)
-            return no("reference conditioning does not yet combine with latent upscale; ask for "
-                      "the size you want without latent_upscale");
+        /* References combine with latent upscale: their rows carry the references' OWN grids and
+         * never depend on the target canvas, so the draft and full phases condition identically --
+         * only the pack's video target segment changes size, laid out twice below. Endpoint
+         * keyframes do not survive two canvases: a pin is the keyframe latent sitting AT the output
+         * frame's row on the target grid itself, and a draft grid plus a full grid leaves it with
+         * no single frame to pin -- every repair would alter the run towards the pinned frame.
+         * A keyframe request never carries references, so a table with any key word is refused by
+         * name, pointing at the reference route for those who want the upscale anyway. */
+        if (r.upscale > 1.0 && j.ref_tab[1] > 0)
+            return no("a keyframe pins an exact output frame on the exact target grid, and latent "
+                      "upscale denoises a smaller draft grid first -- the pin would sit between "
+                      "two grids and the video could drift off your frame; run the keyframe "
+                      "request without latent_upscale, or send the frame as a reference image");
         if (!pack_)
             return no("the generator says it conditions on references but exports no "
                       "rad_arch_video_pack");
@@ -701,6 +711,56 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         j.lat_v = pr - j.seg[(size_t)(nseg - 2)];
         j.lat_a = decl_.audio_channels * (int64_t)j.geom.n_audio;
         j.ref_wide = true;
+        /* An upscale's draft steps run at the small grid: pack the SAME references again over it.
+         * The reference and audio segments are grid-independent, so their rows and boundaries are
+         * identical; the video target shrinks and every boundary at or after it shifts with it.
+         * The modulation groups count the same (a cell is fixed by segment kind, not size), so
+         * the `max_ref_segs` check above covers both phases. The small grid's own legality was
+         * already refused below at the upscale's validation if the factor cannot leave a smaller
+         * size; an over-tall pack here is refused the same way the full one is. */
+        if (r.upscale > 1.0) {
+            int32_t sw = 0, sh = 0;
+            video_small_size(d, r.width, r.height, r.upscale, &sw, &sh);
+            const VideoShape ss = video_shape(d, sw, sh, chunks);
+            RadVideoGeom gs = j.geom;
+            gs.lat_h = ss.lat_h;
+            gs.lat_w = ss.lat_w;
+            const int64_t ps = pack_(&gs, j.ref_tab.data(), nullptr, 0, nullptr, 0);
+            if (ps <= 0)
+                return no("the model refused the reference conditioning layout at the draft "
+                          "size " + std::to_string(sw) + "x" + std::to_string(sh));
+            if (ps > max_tok_)
+                return no("a conditioned draft step is " + std::to_string(ps) + " rows and a pass "
+                          "carries " + std::to_string(max_tok_) + "; ask for a shorter or smaller "
+                          "video, or fewer references");
+            std::vector<int32_t> segs((size_t)kSegCap, 0);
+            j.pos_small.assign((size_t)(3 * ps), 0.0f);
+            if (pack_(&gs, j.ref_tab.data(), segs.data(), kSegCap, j.pos_small.data(), 3 * ps) != ps)
+                return no("the model could not lay the reference conditioning out at the draft size");
+            int nseg_s = -1;
+            for (int k = 0; k < kSegCap; ++k)
+                if (segs[(size_t)k] == (int32_t)ps) { nseg_s = k + 1; break; }
+            if (nseg_s < 1)
+                return no("the draft-size reference conditioning layout has no closing segment "
+                          "boundary");
+            j.seg_s.assign(segs.begin(), segs.begin() + nseg_s);
+            j.nseg_s = nseg_s;
+            if (mod_segs_) {
+                j.mod_seg_s.assign((size_t)kSegCap, 0);
+                const int n = (int)mod_segs_(&gs, j.ref_tab.data(), j.mod_seg_s.data(), kSegCap);
+                if (n < 1 || n > kSegCap)
+                    return no("the model could not merge the draft-size reference conditioning "
+                              "into its modulation groups");
+                j.mod_seg_s.resize((size_t)n);
+                j.nmod_s = n;
+            } else {
+                j.nmod_s = nseg_s;             /* nothing merges: the groups are the fine segments */
+                j.mod_seg_s = j.seg_s;
+            }
+            j.step_rows_s = ps;
+            j.lat_v_s = ps - j.seg_s[(size_t)(nseg_s - 2)];
+            j.ref_wide_small = true;
+        }
     } else {
         j.rows = j.geom.n_text + s.audio_rows + s.video_rows;
         if (j.rows > max_tok_)
@@ -765,14 +825,19 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         j.geom_small.lat_h = ss.lat_h;
         j.geom_small.lat_w = ss.lat_w;
         j.rows_small = j.geom.n_text + ss.audio_rows + ss.video_rows;
-        const int64_t ns = positions_(RAD_VPOS_STEP, &j.geom_small, nullptr, 0);
-        if (ns != j.rows_small)
-            return no("the model lays the small size " + std::to_string(sw) + "x" +
-                      std::to_string(sh) + " out in " + std::to_string(ns) + " step rows, which "
-                      "this server cannot run");
-        j.pos_small.assign((size_t)(3 * ns), 0.0f);
-        if (positions_(RAD_VPOS_STEP, &j.geom_small, j.pos_small.data(), ns) != ns)
-            return no("the model could not lay the small size out");
+        /* A reference-conditioned job already laid the draft steps out -- twice -- at the pack
+         * above (seg_s/mod_seg_s/step_rows_s, positions in pos_small); the plain small layout
+         * below is only what a step WITHOUT references stages. */
+        if (!j.ref_wide) {
+            const int64_t ns = positions_(RAD_VPOS_STEP, &j.geom_small, nullptr, 0);
+            if (ns != j.rows_small)
+                return no("the model lays the small size " + std::to_string(sw) + "x" +
+                          std::to_string(sh) + " out in " + std::to_string(ns) + " step rows, which "
+                          "this server cannot run");
+            j.pos_small.assign((size_t)(3 * ns), 0.0f);
+            if (positions_(RAD_VPOS_STEP, &j.geom_small, j.pos_small.data(), ns) != ns)
+                return no("the model could not lay the small size out");
+        }
         j.split = evals - refine;
         j.factor = (float)(((double)r.width / sw + (double)r.height / sh) / 2.0);
         r.ticket->small_width = sw;
@@ -1041,12 +1106,16 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
     g[RAD_VGEOM_FIRST_CU + 2] = ppf * g0.lat_frames;
     reg_[R_GEOM].used = RAD_VGEOM_N * 4;
     const bool wide = j.ref_wide && ref_step;
+    /* On a widened step, which phase's pack is staged: the draft phase (an upscale that has not
+     * run yet) laid the references over the small grid; every later wide step uses the full one. */
+    const bool wsmall = wide && small_now(j);
     const int64_t audio_rows =
         (decl_.audio_streams > 0 ? decl_.audio_streams : decl_.audio_channels) * (int64_t)g0.n_audio;
     /* With references riding, the sampler owns only the target video rows -- not the reference
      * rows the pack placed ahead of them -- so the target count is the pack's, not the plain
      * rows-minus-text-minus-audio. The audio target is the whole soundtrack either way. */
-    const int64_t video_rows = wide ? j.lat_v : rows - g0.n_text - audio_rows;
+    const int64_t video_rows =
+        wide ? (wsmall ? j.lat_v_s : j.lat_v) : rows - g0.n_text - audio_rows;
     *hptr<int32_t>(R_LANE) = j.lane;
     *hptr<int32_t>(R_FIRST) = j.step == 0;
     int32_t* seg = hptr<int32_t>(R_SEG);
@@ -1054,9 +1123,12 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
         /* The pack laid the reference rows out ahead of the target streams, video grid last. Stage
          * its boundaries verbatim: the VSA derives its segment count from the operand length, so
          * every reference becomes a dense prefix sink with no kernel change. Only the step pass
-         * stages this table; the decode, encode and upscale passes stage the plain layout below. */
-        std::memcpy(seg, j.seg.data(), j.seg.size() * sizeof(int32_t));
-        reg_[R_SEG].used = (int64_t)j.seg.size() * 4;
+         * stages this table; the decode, encode and upscale passes stage the plain layout below.
+         * An upscaling job switches tables at the upscale: the draft phase's steps read the
+         * small-grid pack, the refine steps the full-grid one. */
+        const std::vector<int32_t>& tab = wsmall ? j.seg_s : j.seg;
+        std::memcpy(seg, tab.data(), tab.size() * sizeof(int32_t));
+        reg_[R_SEG].used = (int64_t)tab.size() * 4;
     } else {
         /* The pack lays the segments out (rad_arch_video_segs, or the reference-aware
          * rad_arch_video_pack once refs ride); for a plain request its table is the one computed
@@ -1087,9 +1159,10 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
      * is the fine table verbatim -- nothing merges there, so the norm reads the same bytes as the
      * attention and the generated output is exactly what it was before this operand split. */
     int32_t* mod = hptr<int32_t>(R_MOD);
-    if (wide && j.nmod > 0) {
-        std::memcpy(mod, j.mod_seg.data(), j.mod_seg.size() * sizeof(int32_t));
-        reg_[R_MOD].used = (int64_t)j.mod_seg.size() * 4;
+    if (wide && (wsmall ? j.nmod_s : j.nmod) > 0) {
+        const std::vector<int32_t>& tab = wsmall ? j.mod_seg_s : j.mod_seg;
+        std::memcpy(mod, tab.data(), tab.size() * sizeof(int32_t));
+        reg_[R_MOD].used = (int64_t)tab.size() * 4;
     } else {
         std::memcpy(mod, seg, reg_[R_SEG].used);
         reg_[R_MOD].used = reg_[R_SEG].used;
@@ -1413,7 +1486,11 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const bool small = small_now(j);
     const RadVideoGeom& g = small ? j.geom_small : j.geom;
-    const int64_t rows = small ? j.rows_small : j.step_rows;   /* widened by references when they ride */
+    /* Each phase runs at ITS pack when references ride: the draft at the small-grid pack, the
+     * refine at the full one; plain requests at the plain rows. `pos_small` is the pack's
+     * positions on a reference-conditioned job and the plain layout's otherwise -- either way
+     * it is the draft phase's. */
+    const int64_t rows = small ? (j.ref_wide_small ? j.step_rows_s : j.rows_small) : j.step_rows;
     const std::vector<float>& pos = small ? j.pos_small : j.pos;
     stage_sched(j, j.step, small && j.step == j.split - 1);
     std::memcpy(hptr<float>(R_ROPE), pos.data(), pos.size() * 4);
@@ -1424,9 +1501,9 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     cu[0] = 0;
     cu[1] = (int32_t)rows;
     reg_[R_CU].used = 2 * 4;
-    /* A reference-conditioned step stages the pack's reference-aware segment table; the plain and
-     * small (pre-upscale) steps stage the plain four-boundary table. ref_wide never coincides with
-     * small -- submit refuses upscale together with references. */
+    /* A reference-conditioned step stages the pack's reference-aware segment table -- the draft
+     * phase's own small-grid one while the draft runs, the full grid's after the upscale; plain
+     * steps stage the plain four-boundary table. */
     stage_geom(j, g, rows, 0, j.ref_wide);
     if (upload() < 0) return nullptr;
     base_batches(j, g, rows, step);

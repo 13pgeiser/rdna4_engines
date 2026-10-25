@@ -1467,6 +1467,127 @@ TEST(a_keyframe_completion_needs_no_vision_tower) {
     CHECK_OK(f.drv.submit(std::move(r), &why));   /* the pin-only path admits without a tower */
 }
 
+/* References ride an upscale: their rows carry the references' OWN grids, so the conditioning
+ * survives the two canvases -- but the pack must be laid out PER PHASE, because the video target
+ * shrinks in the draft and every boundary at or after it moves with it. The draft steps therefore
+ * run on the small-grid pack (reference block identical, video target the small one, positions the
+ * pack's own), the upscale pass and every non-step pass keep their ref-less layout, and the refine
+ * step returns to the full-grid pack. */
+TEST(references_reride_the_draft_phase_of_an_upscaled_request) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(1, 4);
+    r->tokens = { 1, 700, 701, 2, 3 };   /* 5 text tokens */
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    gen::VideoRefMedia m = ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1);
+    m.enc_frames = 1;
+    m.enc_h = 16;
+    m.enc_w = 16;
+    m.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(m);
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    /* Draft: 5 text + 4 reference + 60 audio + 2 small-video = 71 rows, boundaries
+     * [0|5|9|69|71]. Refine: the video target grows to 8 -- 77 rows, [0|5|9|73|77]. */
+    const int64_t n_text = 5, rper = 4, audio = 60, v_small = 2, v_full = 8;
+    const int64_t draft_rows = n_text + rper + audio + v_small;
+    const int64_t full_rows = n_text + rper + audio + v_full;
+
+    std::string kinds;
+    int steps_seen = 0, enc_seen = 0;
+    bool saw_upscale = false;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        REQUIRE(V != nullptr);
+        if (b->gen == RAD_GEN_PASS_VENCODE) { ++enc_seen; kinds += "E"; }
+        else kinds += kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            const bool small = steps_seen < 2;
+            const int64_t rows = small ? draft_rows : full_rows, v = small ? v_small : v_full;
+            CHECK(V->ref_tab != nullptr);
+            CHECK_EQ(b->n_tok, rows);                    /* the phase's own pack width */
+            CHECK_EQ(V->geom.lat_h, small ? 2 : 4);      /* the draft grid, then the full one */
+            CHECK_EQ(V->geom_d[RAD_VGEOM_LAT_H], small ? 2 : 4);
+            CHECK_EQ(V->seg_cu[0], 0);
+            CHECK_EQ(V->seg_cu[1], (int32_t)n_text);     /* the reference block is grid-independent */
+            CHECK_EQ(V->seg_cu[2], (int32_t)(n_text + rper));
+            CHECK_EQ(V->seg_cu[3], (int32_t)(n_text + rper + audio));
+            CHECK_EQ(V->seg_cu[4], (int32_t)rows);       /* every boundary from the video on shifts */
+            CHECK_EQ(V->mod_cu[4], V->seg_cu[4]);        /* no mod_segs export: groups == segments */
+            CHECK_EQ(V->lat_cu[1], (int32_t)v);          /* the sampler owns the phase's target */
+            CHECK_EQ(V->lat_cu[3], (int32_t)audio);
+            /* The positions are the PHASE's pack's: channel c's row i is 1000c + i, so its last
+             * written word is 2000 + rows - 1 -- beyond the plain draft layout's 3*rows_small. */
+            CHECK_EQ(V->pos[rows - 1], (float)(rows - 1));
+            CHECK_EQ(V->pos[3 * rows - 1], (float)(2000 + rows - 1));
+            ++steps_seen;
+        } else if (b->gen == RAD_GEN_PASS_VUPSCALE) {
+            saw_upscale = true;
+            CHECK_EQ(V->geom.lat_h, 4);
+            CHECK_EQ(V->geom_from.lat_h, 2);
+            CHECK_EQ(V->upscale[0], 2.0f);
+            CHECK_EQ(V->seg_cu[3], (int32_t)(n_text + audio + v_full));  /* the ref-less layout */
+        } else if (b->gen == RAD_GEN_PASS_VCOND) {
+            CHECK_EQ(V->seg_cu[3], (int32_t)(n_text + audio + v_small)); /* ref-less, draft size */
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(steps_seen, 3);
+    CHECK(saw_upscale);
+    CHECK_EQ(enc_seen, 1);
+    CHECK_EQ(kinds, std::string("ECSSUSAD"));
+}
+
+/* Keyframes and latent upscale stay refused -- on semantics, not plumbing. A pin is the keyframe's
+ * latent AT the output frame's own row on the exact target grid; a draft grid and a full grid in one
+ * job leave it with no single row to sit on, and every repair would move the video away from the
+ * frame the caller asked for. The refusal names the knob and points at the reference route. */
+TEST(keyframes_and_latent_upscale_are_refused_by_name) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(1, 4);
+    r->tokens = { 1, 2, 3 };
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    gen::VideoRefMedia first = ref_part(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1);
+    first.enc_frames = 1;
+    first.enc_h = 16;
+    first.enc_w = 16;
+    first.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(first);
+    CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "keyframe"));
+    CHECK(has(why, "latent_upscale"));
+}
+
 /* What the container cannot consume is refused at submit, naming the part or the budget it breaks —
  * never silently dropped into a weaker video. A reference video, soundtrack or audio needs the VAE
  * encoders; on a container converted without them (encodes 0) they are refused by name here, and on

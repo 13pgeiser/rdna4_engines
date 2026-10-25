@@ -108,6 +108,18 @@ private:
         std::vector<int32_t> mod_seg;
         int32_t              nmod = 0;
         int64_t              lat_v = 0, lat_a = 0;
+        /* A step that is BOTH reference-conditioned and in an upscale's small (draft) phase needs
+         * the pack laid out AGAIN at the small grid: the video target shrinks, so every boundary
+         * after it shifts. These mirror the fields above for that one phase -- `seg_s`/`mod_seg_s`
+         * its boundary tables, `nseg_s`/`nmod_s` their counts, `step_rows_s` its row total, and
+         * `lat_v_s` the small video target's rows (the audio target is the grid-independent
+         * soundtrack, so it needs no small twin). `pos_small` carries the pack's positions here,
+         * where on the plain path it carries the plain layout's. `ref_wide_small` is false for
+         * every plain job and for every wide step of a job that does not upscale. */
+        bool                 ref_wide_small = false;
+        int32_t              nseg_s = 0, nmod_s = 0;
+        std::vector<int32_t> seg_s, mod_seg_s;
+        int64_t              step_rows_s = 0, lat_v_s = 0;
         /* The denoising step's row count: the widened total once references ride, otherwise equal
          * to `rows`. Only build_step uses it -- the encode, decode, audio and upscale passes keep
          * staging against the plain `rows` (their segment table and target counts are their own,

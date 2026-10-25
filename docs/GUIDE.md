@@ -2998,7 +2998,11 @@ upscaler, re-noised, and the last **`upscale_refine_steps`** run at the full siz
 and 12 of the base model's 49 by default). The steps at the small size cost a fraction of a
 full-size step's, so most of the time goes to the refinement. The video object of an upscaled
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
-size.
+size. REF2VA takes it too — a reference row carries the *reference's own* latent grid, so the
+draft and the refine stage condition identically and the pack is simply laid out again at the
+draft size. The keyframe tasks refuse it (`i2va`/`l2va`/`fl2va`): a pin sits AT the output frame's
+own row on the exact target grid, and a smaller draft canvas leaves the pin between two grids —
+run those without `latent_upscale`, or send the frame as a reference image.
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{

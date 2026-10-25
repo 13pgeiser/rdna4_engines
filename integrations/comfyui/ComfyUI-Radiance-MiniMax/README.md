@@ -94,9 +94,12 @@ path on the **server's** filesystem (loopback-only unless `--api-key` is set).
   the latent-upscaler weights (the DaSiWa companion folder; `minimax-h3-dasiwa-*.rad`
   has them — the server log names the upscaler at boot) diffuses the early
   steps at size/2 (or /4), enlarges the clean latent, then refines at full
-  size in the last steps. **`t2va` only** — the server refuses latent upscale
-  combined with references *or keyframes* — and the output still stays within
-  the canvas, so it buys speed and detail, not 1080p.
+  size in the last steps. Works with **`t2va` and `ref2va`** — reference rows
+  carry their own grids, so they condition the draft and the refine stage
+  identically — and is **refused with `i2va`/`l2va`/`fl2va` keyframes**: a pin
+  sits AT the exact output frame on the exact target grid, and a draft canvas
+  leaves it nowhere to sit (send the frame as a reference image instead). The
+  output still stays within the canvas, so it buys speed and detail, not 1080p.
 
 ### Media sockets — purely wire-driven, task-sensitive
 

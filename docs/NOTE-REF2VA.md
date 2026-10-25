@@ -334,10 +334,18 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
      budget (point 2) and the interleaving mod-group ceiling (point 1) remain the true binding limits
      at high resolution, and now bind for real, since videos reopen the video-conditioned cell.
 
-5. **References and latent upscaling are mutually exclusive.** Combining the widened reference
-   layout with the small-size-then-upscale denoise is not unified; a request asking for both is
-   refused at submit (*"reference conditioning does not yet combine with latent upscale"*). Ask for
-   the target size directly.
+5. **References combine with latent upscaling; keyframes do not.** The pack is laid out **twice**
+   for an upscaled reference job — once over the draft geometry and once over the full one — because
+   the video target segment changes size between the stages and every boundary at or after it moves
+   with it (the reference and audio segments are grid-independent, so their rows are identical in
+   both). The driver stages the draft phase's table while `small_now` holds and the full one after
+   the upscale pass; the plugin needs no change — it re-derives the pack from the staged
+   `RadVideoGenBatch::geom`, which already switches per phase. Endpoint keyframes stay refused with
+   `latent_upscale` *on semantics*: a pin is the keyframe latent at the output frame's own row on
+   the exact target grid, two canvases leave it with no single row to sit on, and every repair
+   (re-encode per stage, pin one stage only) alters the trajectory toward the pinned endpoint with
+   no reference workflow to verify against. The refusal names the knob and points at the reference
+   route.
 
 6. **Numeric parity with the reference denoiser for the *conditioned* step is not yet published.**
    A per-tensor / perceptual match to ComfyUI's outputs for the wide step remains an open parity task
