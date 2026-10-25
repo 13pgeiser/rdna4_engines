@@ -7352,9 +7352,12 @@ pub fn download_hidden_block(
 /// Returns `true` when the fast path ran. Returns `false` — leaving every
 /// buffer untouched — when the route predicates fail, in which case the
 /// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
-/// exact gfx1100, `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, `1 <= b <=
-/// max_block_size`. The batched kernel dequantizes each row with the same
-/// per-element math as the scalar loop, so the plane is bit-identical.
+/// `1 <= b <= max_block_size`, and either exact gfx1100 with
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset or the gfx1201 batched noise lookup
+/// ([`noise_embed_batch_admitted`], kill switch
+/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0`) that the lane-batched draft already
+/// uses. The batched kernel dequantizes each row with the same per-element
+/// math as the scalar loop, so the plane is bit-identical.
 ///
 /// Weights-based core shared with the dense-TP mesh (which owns rank shards,
 /// not a `ModelSlot`).
@@ -7371,11 +7374,13 @@ pub fn build_dflash_noise_embeddings_weights(
     ) {
         return Ok(false);
     }
-    if !gpu.draft_collapse_fused_enabled() {
-        return Ok(false);
-    }
     let b = block.len();
     if b == 0 || b > draft_scratch.max_block_size {
+        return Ok(false);
+    }
+    if !gpu.draft_collapse_fused_enabled()
+        && !noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b)
+    {
         return Ok(false);
     }
     let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
