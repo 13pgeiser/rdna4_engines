@@ -164,14 +164,16 @@ int ref_ln_mod_quant_fp8(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
 /* The checks both forms share: `s` holds [shift | scale] in each of its n_seq rows, `g` a gate
- * row per sequence when `gated`, and every row operand at least `rows` rows. */
+ * row per sequence when `gated`, and every row operand at least `rows` rows. With `mapped` the
+ * column map is bound -- sequences address TABLE COLUMNS through it, so `s` (and `g`) may hold
+ * fewer rows than there are sequences, and the map's own bound is the caller's. */
 static int rms_mod_check(const RadTensor* y, const RadTensor* g, const RadTensor* s,
                          const RadTensor* w, const RadTensor* x, int64_t n, int64_t n_seq,
-                         int64_t rows, bool gated) {
+                         int64_t rows, bool gated, bool mapped) {
     if (rows <= 0 || n_seq <= 0 || rows_of(x, n) < rows || (w && numel(w) < n) ||
-        numel(s) < n_seq * 2 * n)
+        (!mapped && numel(s) < n_seq * 2 * n))
         return RAD_E_SHAPE;
-    if (gated && (rows_of(y, n) < rows || numel(g) < n_seq * n)) return RAD_E_SHAPE;
+    if (gated && (rows_of(y, n) < rows || (!mapped && numel(g) < n_seq * n))) return RAD_E_SHAPE;
     return RAD_OK;
 }
 
@@ -230,11 +232,15 @@ static void rms_mod_row(const RadTensor* y, const RadTensor* g, const RadTensor*
 
 /* A diffusion transformer's adaptive RMS norm with a shift (MiniMax-H3's
  * `norm(h) * (1 + scale) + shift`), the gated residual of the branch before it optionally first;
- * the norm chain rounds to z's dtype. */
+ * the norm chain rounds to z's dtype.
+ *
+ * The optional trailing `colmap` (slot 7 bf16, slot 9 quant -- see rad_runtime.h) maps each
+ * sequence to a TABLE COLUMN, so sequences that share a modulation cell can address one table row
+ * through non-contiguous boundaries; the map indexes sequences, one i32 each. */
 int ref_rms_mod(const RadArgs* a, RadStream) {
     if (a->n_t < 7) return RAD_E_INVAL;
     const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = t_in(a, 3);
-    const RadTensor *cu = &a->t[4], *x = &a->t[5], *z = &a->t[6];
+    const RadTensor *cu = &a->t[4], *x = &a->t[5], *z = &a->t[6], *cm = t_in(a, 7);
     const int64_t n = p_int(a, "n", 0);
     const bool gated = p_int(a, "gated", 0) != 0;
     const float eps = p_f32(a, "eps", 1e-6f);
@@ -246,11 +252,14 @@ int ref_rms_mod(const RadArgs* a, RadStream) {
     if (none && t_in(a, 3)) return RAD_E_INVAL;
     if (n <= 0 || (gated && (!y || !g))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(z, n), n_seq = numel(cu) - 1;
-    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated, cm != nullptr));
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> o((size_t)n);
-        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
+        int64_t e = seq_of(cu, n_seq, r);
+        if (cm) e = (int64_t)ldt(cm, e);
+        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
         const int64_t zb = rowoff(z, r, n), zs = laststride(z);
         for (int64_t i = 0; i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
     }
@@ -264,6 +273,7 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
     if (a->n_t < 9) return RAD_E_INVAL;
     const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = t_in(a, 3);
     const RadTensor *cu = &a->t[4], *x = &a->t[5], *q = &a->t[6], *sc = &a->t[7], *z = t_in(a, 8);
+    const RadTensor *cm = t_in(a, 9);
     const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
     const bool gated = p_int(a, "gated", 0) != 0;
     const float eps = p_f32(a, "eps", 1e-6f);
@@ -275,12 +285,15 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
     if (none && t_in(a, 3)) return RAD_E_INVAL;
     if (n <= 0 || grp <= 0 || n % grp || (gated && (!y || !g))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated, cm != nullptr));
     if (numel(sc) < rows * ngrp || (z && rows_of(z, n) < rows)) return RAD_E_SHAPE;
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> o((size_t)n);
-        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, RAD_BF16, o.data(), wadd, once, layer, none);
+        int64_t e = seq_of(cu, n_seq, r);
+        if (cm) e = (int64_t)ldt(cm, e);
+        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, RAD_BF16, o.data(), wadd, once, layer, none);
         const int64_t zb = z ? rowoff(z, r, n) : 0, zs = z ? laststride(z) : 0;
         for (int64_t i = 0; z && i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
         const int64_t qb = rowoff(q, r, n), qs = laststride(q);

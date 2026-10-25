@@ -6544,6 +6544,72 @@ TEST(rms_mod_rounds_each_step_and_reads_shift_then_scale) {
     CHECK_EQ(run("rms_mod", c), RAD_E_SHAPE);
 }
 
+/* The optional column map (rad_runtime.h, ABI 28): sequences address TABLE COLUMNS through it,
+ * so sequences that share a modulation cell read one table row through boundaries that do not
+ * merge -- and the gate and table may hold fewer rows than there are sequences. A mapped run
+ * must equal the same computation with the columns shuffled into sequence order and no map. */
+TEST(rms_mod_column_map_redirects_sequences_to_table_columns) {
+    const std::vector<float> yv = { 2, -4, 2, -4, 2, -4 };
+    T w(RAD_BF16, {2}); w.f({1.5f, 0.75f});
+    T cu(RAD_I32, {3}); cu.n({0, 1, 3});         /* row 0 is sequence 0, rows 1-2 sequence 1 */
+    /* Mapped: columns {B, A} read by sequences {1, 0} -- A's shift/scale/gate land on sequence 0,
+     * B's on the rest, exactly the identity run's pairing with the table rows swapped. */
+    T sA(RAD_BF16, {2, 4}); sA.f({0, 0.5f, 0.00390625f, 0,   0.125f, 1, 0.5f, 0.25f});
+    T gA(RAD_BF16, {2, 2}); gA.f({0, 0,  0.5f, 0.25f});
+    T cm(RAD_I32, {2}); cm.n({1, 0});
+    T y(RAD_BF16, {3, 2}); y.f(yv);
+    T x1(RAD_BF16, {3, 2}); x1.f({1, -1, 1, -1, 1, -1});
+    T z1(RAD_BF16, {3, 2});
+    A a; a.t(y).t(gA).t(sA).t(w).t(cu).t(x1).t(z1).t(cm).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", a));
+    CHECK_EQ(x1.at(0), 2.0f); CHECK_EQ(x1.at(1), -2.0f);          /* sequence 0: A's gate */
+    CHECK_EQ(z1.at(0), 2.375f); CHECK_EQ(z1.at(1), 0.0625f);      /* sequence 0: A's row */
+    CHECK_EQ(z1.at(2), 1.5f);   CHECK_EQ(z1.at(3), -0.25f);       /* rows 1-2: B, ungated */
+    CHECK_EQ(z1.at(4), 1.5f);   CHECK_EQ(z1.at(5), -0.25f);
+
+    /* The same output with no map, columns in sequence order. */
+    T sB(RAD_BF16, {2, 4}); sB.f({0.125f, 1, 0.5f, 0.25f,  0, 0.5f, 0.00390625f, 0});
+    T gB(RAD_BF16, {2, 2}); gB.f({0.5f, 0.25f,  0, 0});
+    T x2(RAD_BF16, {3, 2}); x2.f({1, -1, 1, -1, 1, -1});
+    T z2(RAD_BF16, {3, 2});
+    A b; b.t(y).t(gB).t(sB).t(w).t(cu).t(x2).t(z2).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", b));
+    CHECK(x1.mem == x2.mem);
+    CHECK(z1.mem == z2.mem);
+
+    /* One column for two sequences: the map makes a smaller-than-sequences gate and table legal,
+     * and without the map the same call is refused. */
+    T s1(RAD_BF16, {1, 4}); s1.f({0.125f, 1, 0.5f, 0.25f});
+    T g1(RAD_BF16, {1, 2}); g1.f({0.5f, 0.25f});
+    T cm1(RAD_I32, {2}); cm1.n({0, 0});
+    T x3(RAD_BF16, {3, 2}); x3.f({1, -1, 1, -1, 1, -1});
+    T z3(RAD_BF16, {3, 2});
+    A d; d.t(y).t(g1).t(s1).t(w).t(cu).t(x3).t(z3).t(cm1).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", d));
+    for (int64_t r = 0; r < 3; ++r) {
+        CHECK_EQ(z3.at(2 * r), 2.375f);
+        CHECK_EQ(z3.at(2 * r + 1), 0.0625f);
+    }
+    A e; e.t(y).t(g1).t(s1).t(w).t(cu).t(x3).t(z3).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", e), RAD_E_SHAPE);
+
+    /* A map that is not i32, or shorter than the sequence count, is refused. */
+    T cmf(RAD_F32, {2}); cmf.f({1, 0});
+    T x4(RAD_BF16, {3, 2}); x4.f({1, -1, 1, -1, 1, -1});
+    T z4(RAD_BF16, {3, 2});
+    A f; f.t(y).t(gA).t(sA).t(w).t(cu).t(x4).t(z4).t(cmf).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", f), RAD_E_SHAPE);
+    T cms(RAD_I32, {1}); cms.n({1});
+    A g; g.t(y).t(gA).t(sA).t(w).t(cu).t(x4).t(z4).t(cms).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", g), RAD_E_SHAPE);
+}
+
 /* rms_mod_quant_fp8 is rms_mod with its chain in bf16 and quant_act_fp8 over that row: the same
  * bytes in x, z, the codes and the scales as the pair. */
 TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
@@ -6572,6 +6638,43 @@ TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
     T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2});
     A d; d.t(z2).t(q2).t(sc2).i("M", 2).i("n", n).i("group", 2).s("dtype", "bf16");
     CHECK_OK(run("quant_act_fp8", d));
+    CHECK(x1.mem == x2.mem);
+    CHECK(z1.mem == z2.mem);
+    CHECK(q1.mem == q2.mem);
+    CHECK(sc1.mem == sc2.mem);
+}
+
+/* The quant form takes the column map at its own trailing slot (9): the same run, both per-column
+ * operands' rows swapped, the sequences redirected to each other's column, matches byte for byte. */
+TEST(rms_mod_quant_fp8_takes_the_column_map_too) {
+    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
+    const std::vector<float> gv = { 0, 0.5f, 2, -1, 0.5f, 1, -1, 2 };
+    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
+    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2,
+                                    0, 1, -1, 0.5f, 0.125f, 0.25f, 0.5f, 1 };
+    const int64_t n = 4;
+    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
+    T y(RAD_BF16, {2, n}); y.f(yv);
+    T g(RAD_BF16, {2, n}); g.f(gv);
+    T s(RAD_BF16, {2, 2 * n}); s.f(sv);
+    T w(RAD_BF16, {n}); w.f({1, 0.5f, 2, 0.75f});
+    T x1(RAD_BF16, {2, n}); x1.f(xv);
+    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
+    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x1).t(q1).t(sc1).t(z1)
+          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod_quant_fp8", a));
+
+    T gs(RAD_BF16, {2, n});
+    gs.f({ gv[4], gv[5], gv[6], gv[7], gv[0], gv[1], gv[2], gv[3] });
+    T ss(RAD_BF16, {2, 2 * n});
+    ss.f({ sv[8], sv[9], sv[10], sv[11], sv[12], sv[13], sv[14], sv[15],
+           sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7] });
+    T cm(RAD_I32, {2}); cm.n({1, 0});
+    T x2(RAD_BF16, {2, n}); x2.f(xv);
+    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2}), z2(RAD_BF16, {2, n});
+    A b; b.t(y).t(gs).t(ss).t(w).t(cu).t(x2).t(q2).t(sc2).t(z2).t(cm)
+          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod_quant_fp8", b));
     CHECK(x1.mem == x2.mem);
     CHECK(z1.mem == z2.mem);
     CHECK(q1.mem == q2.mem);

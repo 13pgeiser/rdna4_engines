@@ -276,7 +276,7 @@ TEST(pack_mod_groups_images_collapse_to_four) {
 
     const int64_t S = 24;
     Ref2VAModGroups grp;
-    ref2va_mod_groups(p, S, &grp);
+    ref2va_mod_groups(p, S, {}, &grp);
     CHECK_EQ(grp.md.size(), 4u);
     CHECK(grp.md == std::vector<int>({ 1, 0, 2, 0 }));        /* text, photos, audio, video */
     /* Cells: text and the video target read the video schedule (r0 = 0); the photos read the
@@ -302,8 +302,8 @@ TEST(pack_mod_groups_invariants_over_the_goldens) {
     for (const char* name : { "t2va", "fl2va", "ref2va_all", "chain", "no_text" }) {
         const Ref2VAPack p = build_case(golden()[name]);
         Ref2VAModGroups a, b;
-        ref2va_mod_groups(p, 1, &a);
-        ref2va_mod_groups(p, 64, &b);
+        ref2va_mod_groups(p, 1, {}, &a);
+        ref2va_mod_groups(p, 64, {}, &b);
         CHECK(a.bound == b.bound);
         CHECK(!a.bound.empty());
         CHECK_EQ(a.bound.front(), 0);
@@ -322,11 +322,42 @@ TEST(pack_mod_groups_invariants_over_the_goldens) {
             size_t g = 0;
             while (g + 1 < a.bound.size() && a.bound[g + 1] <= s.start) ++g;
             CHECK(a.bound[g] <= s.start && s.end <= a.bound[g + 1]);
-            CHECK_EQ(a.md[g], ref2va_seg_tag(s.kind));
+            CHECK_EQ(a.md[a.col[g]], ref2va_seg_tag(s.kind));
         }
-        /* adjacent groups differ in (md, r0) -- merging left no mergeable neighbours */
-        for (size_t i = 0; i + 1 < a.md.size(); ++i)
-            CHECK(a.md[i] != a.md[i + 1] || a.r0[i] != a.r0[i + 1]);
+        /* adjacent groups differ in cell -- merging left no mergeable neighbours -- and two groups
+         * share a column EXACTLY when they read the same cell: a cond photo and a ref photo carry
+         * one cell, and separated by a soundtrack they stay two groups on one column, so the map
+         * is not the identity. Mirrors the pack's cell_of_kind at a's S. */
+        const int64_t S = 1;
+        auto cell = [S](int kind) -> std::pair<int, int64_t> {
+            switch (kind) {
+                case kR2VAudio:     return { 2, S };       break;  /* audio schedule */
+                case kR2VCondAudio:
+                case kR2VRefAudio:  return { 2, 2 * S };   break;  /* audio-pinned block */
+                case kR2VText:      return { 1, 0 };       break;  /* video schedule */
+                case kR2VCond:
+                case kR2VRefImg:    return { 0, 2 * S };   break;  /* video-pinned block */
+                default:            return { 0, 0 };       break;  /* video target */
+            }
+        };
+        auto kind_at = [&p](int64_t row) {
+            for (const Ref2VASeg& s : p.segs)
+                if (s.start <= row && row < s.end) return s.kind;
+            return -1;
+        };
+        for (size_t i = 0; i + 1 < a.col.size(); ++i) CHECK(a.col[i] != a.col[i + 1]);
+        std::vector<char> used(a.md.size(), 0);
+        for (size_t i = 0; i < a.col.size(); ++i) {
+            CHECK(a.col[i] >= 0 && (size_t)a.col[i] < a.md.size());
+            used[a.col[i]] = 1;
+            const std::pair<int, int64_t> c = cell(kind_at(a.bound[i]));
+            CHECK_EQ(a.md[a.col[i]], c.first);
+            CHECK_EQ(a.r0[a.col[i]], c.second);
+            for (size_t j = 0; j < i; ++j)
+                CHECK_EQ((int)(a.col[i] == a.col[j]),
+                         (int)(cell(kind_at(a.bound[i])) == cell(kind_at(a.bound[j]))));
+        }
+        for (char u : used) CHECK(u);                     /* every column is addressed */
     }
 }
 
@@ -339,12 +370,99 @@ TEST(pack_mod_groups_plain_equals_the_fine_table) {
     Ref2VAGeom g{ 3, 8, 10, 4 };
     CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
     Ref2VAModGroups grp;
-    ref2va_mod_groups(p, 32, &grp);
+    ref2va_mod_groups(p, 32, {}, &grp);
     CHECK_EQ(grp.md.size(), 3u);
     CHECK(grp.md == std::vector<int>({ 1, 2, 0 }));              /* text, audio, video */
     CHECK(grp.r0 == std::vector<int64_t>({ 0, 32, 0 }));         /* video sched, audio sched, video */
     CHECK_EQ(grp.bound.size(), 4u);
     CHECK(grp.bound == std::vector<int64_t>({ 0, 5, 13, 5 + 8 + 60 }));
+}
+
+TEST(pack_mod_groups_pad_run_cuts_the_prompt) {
+    /* One vision-pad run inside the prompt: the reference tags those rows VIDEO, so they get a
+     * group of their own reading the video ada projection on the VIDEO-SCHEDULE block (the prompt
+     * keeps its own timestep row -- only the projection changes). The cell deduplication is the
+     * whole point: the text pieces before and after the pad share ONE column, and the pad shares
+     * its column with the video target -- three distinct cells for five groups. */
+    Ref2VAPack p;
+    Ref2VAGeom g{ 3, 8, 10, 4 };
+    CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
+    const int64_t S = 32;
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, S, { Ref2VATagRun{ 1, 3, 0 } }, &grp);
+    CHECK(grp.bound == std::vector<int64_t>({ 0, 1, 3, 5, 13, 5 + 8 + 60 }));
+    CHECK(grp.col == std::vector<int>({ 0, 1, 0, 2, 1 }));   /* text, pad, text, audio, video */
+    CHECK(grp.md == std::vector<int>({ 1, 0, 2 }));
+    CHECK(grp.r0 == std::vector<int64_t>({ 0, 0, S }));      /* pad on the video schedule */
+}
+
+TEST(pack_mod_groups_many_pads_stay_few_cells) {
+    /* Nine reference photos, each with its pad run and prompt text between: the groups multiply
+     * (text and pad alternate), the DISTINCT CELLS do not -- four: text, pad/video, the photos'
+     * pinned video cell, the soundtrack. This is the merge the fixed modulation table rides. */
+    Ref2VAGeom g{ 2, 8, 8, 3 };
+    std::vector<Ref2VARef> refs(9, Ref2VARef{ kR2VRefImage, 6, 6, 1, 0 });
+    Ref2VAPack p;
+    CHECK_EQ(ref2va_build(100, g, {}, refs, &p), 0);
+    std::vector<Ref2VATagRun> runs;
+    for (int i = 0; i < 9; ++i) runs.push_back({ (int64_t)i * 10 + 1, (int64_t)i * 10 + 3, 0 });
+    const int64_t S = 24;
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, S, runs, &grp);
+    CHECK_EQ(grp.col.size(), 22u);          /* 19 prompt pieces + photos + soundtrack + video */
+    CHECK_EQ(grp.md.size(), 4u);            /* ... over four cells */
+    CHECK(grp.md == std::vector<int>({ 1, 0, 0, 2 }));      /* text, pad, photo-pinned, audio */
+    CHECK(grp.r0 == std::vector<int64_t>({ 0, 0, 2 * S, S }));
+    /* The video target shares the pad's cell and column; the photo group shares the pad's
+     * projection but not its block. */
+    CHECK_EQ(grp.col.front(), 0);
+    CHECK_EQ(grp.col[1], 1);
+    CHECK_EQ(grp.col.back(), 1);
+    CHECK_EQ(grp.bound.front(), 0);
+    CHECK_EQ(grp.bound.back(), p.rows);
+}
+
+TEST(pack_mod_groups_runs_are_normalised) {
+    /* Runs arrive as the driver staged them: unsorted, partly outside the prompt, even empty. The
+     * merge clamps each to the text segment, drops what falls outside, and the result is the same
+     * cut as hand-placed in-range runs. A run covering the whole prompt leaves one pad group and
+     * NO text group; an out-of-range run cuts nothing at all. */
+    Ref2VAPack p;
+    Ref2VAGeom g{ 3, 8, 10, 4 };
+    CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
+    const int64_t S = 32;
+    Ref2VAModGroups one, a, b;
+    ref2va_mod_groups(p, S, { Ref2VATagRun{ 1, 5, 0 } }, &one);
+    /* Same cut: out-of-range tails, an empty run, a run starting before the prompt and one ending
+     * at its start, in scrambled order. The two in-range fragments meet and merge into one pad
+     * group [1,5), exactly the single-run table. */
+    ref2va_mod_groups(p, S,
+                      { Ref2VATagRun{ 4, 9, 0 }, Ref2VATagRun{ 3, 6, 0 }, Ref2VATagRun{ 1, 3, 0 },
+                        Ref2VATagRun{ 2, 2, 0 }, Ref2VATagRun{ -4, 0, 0 } },
+                      &a);
+    CHECK(a.bound == one.bound);
+    CHECK(a.col == one.col);
+    ref2va_mod_groups(p, S, { Ref2VATagRun{ 5, 9, 0 } }, &b);   /* starts at the segment end */
+    CHECK_EQ(b.col.size(), 3u);              /* untouched: the plain three groups */
+    CHECK(b.col == std::vector<int>({ 0, 1, 2 }));
+}
+
+TEST(pack_mod_groups_pad_tag_audio_reads_the_audio_projection) {
+    /* The run struct carries its tag, so a tag-2 run (the audio modality) on the prompt's rows
+     * would open the (2, 0) cell -- a distinct column from both the text piece and the audio
+     * TARGET's (2, S). The reference tags only image pads (tag 0), so nothing emits this today;
+     * the plumbing is tag-generic on purpose. */
+    Ref2VAPack p;
+    Ref2VAGeom g{ 3, 8, 10, 4 };
+    CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, 16, { Ref2VATagRun{ 0, 5, 2 } }, &grp);
+    /* The run covers the whole prompt, so the text group is entirely pad: three groups over three
+     * distinct cells -- (2,0) pad, (2,16) audio target, (0,0) video target. */
+    CHECK(grp.bound == std::vector<int64_t>({ 0, 5, 13, 73 }));
+    CHECK(grp.md == std::vector<int>({ 2, 2, 0 }));
+    CHECK(grp.r0 == std::vector<int64_t>({ 0, 16, 0 }));
+    CHECK(grp.col == std::vector<int>({ 0, 1, 2 }));
 }
 
 RAD_TEST_MAIN()

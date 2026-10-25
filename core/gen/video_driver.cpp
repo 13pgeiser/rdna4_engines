@@ -627,6 +627,28 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
             j.ref_tab.insert(j.ref_tab.end(),
                               {first ? 0 : s.frames - 1, 1 /*one latent frame*/, 0 /*no soundtrack*/});
         }
+        /* The vision-pad tag runs, appended after the keyframes: [n, (start, len) x n] token spans
+         * inside the prompt. The reference implementation tags every image reference's vision block
+         * -- its `vision_start`, tiles and `vision_end` -- with the VIDEO modality, not text, so the
+         * denoiser must modulate those rows with the video ada projection. The spans are the placed
+         * media items' expansions; audio items keep the text tag (the reference tags images only)
+         * and an item placed past the prompt's end belongs to no step. A table without media still
+         * writes the count word, so the plugin's reader never runs past the table. */
+        if (!j.ref_tab.empty()) {
+            std::vector<std::pair<int64_t, int64_t>> pads;
+            if (r.media)
+                for (const mm::Placed& pl : r.media->items) {
+                    if (!pl.item || pl.item->kind == mm::Kind::Audio) continue;
+                    const int64_t a = pl.tok, b = a + (int64_t)pl.item->expand.size();
+                    if (a < 0 || b <= a || b > j.geom.n_text) continue;
+                    pads.push_back({ a, b });
+                }
+            j.ref_tab.push_back((int32_t)pads.size());
+            for (const std::pair<int64_t, int64_t>& p : pads) {
+                j.ref_tab.push_back((int32_t)p.first);
+                j.ref_tab.push_back((int32_t)(p.second - p.first));
+            }
+        }
     }
     /* The step's packed sequence. When the denoiser consumes the reference table the pack is the
      * only source of its rows, segment boundaries and positions -- the reference rows sit between
@@ -674,18 +696,20 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
             return no("the reference conditioning layout has no closing segment boundary");
         j.seg.resize((size_t)nseg);
         j.nseg = nseg;
-        /* The modulation groups. A modulation cell is fixed by a segment's kind, so the denoiser
-         * merges runs of consecutive same-cell segments and pitches its fixed-width table by the
-         * GROUP count, not the reference count -- which is how nine reference photos (four groups:
-         * prompt, all-photos, soundtrack, video) ride a table the fine layout (twelve segments)
-         * would overrun. The plugin merges for us (rad_arch_video_mod_segs); one that exports none
-         * merges nothing, so the group table is the fine one and the older per-segment ceiling
-         * applies. Refuse over-wide merges here, at submit, where a clean answer is still possible. */
+        /* The modulation groups. A modulation cell is fixed by a segment's kind and by the tag of a
+         * vision-pad run, so the denoiser merges runs of consecutive same-cell segments AND
+         * deduplicates the cells: the merged table is the group BOUNDARIES followed by the
+         * group->column MAP, and its width is the DISTINCT-CELL count, not the group or reference
+         * count -- which is how nine reference photos interleaved with prompt text (and their pad
+         * runs, which split it) ride a table the fine layout would overrun. The plugin merges for us
+         * (rad_arch_video_mod_segs); one that exports none merges nothing, so the group table is the
+         * fine one, the map is empty and the older per-segment ceiling applies. Refuse over-wide
+         * merges here, at submit, where a clean answer is still possible. */
         int nmod = -1;
         if (mod_segs_) {
-            j.mod_seg.assign((size_t)kSegCap, 0);
-            nmod = (int)mod_segs_(&j.geom, j.ref_tab.data(), j.mod_seg.data(), kSegCap);
-            if (nmod < 0 || nmod > kSegCap)
+            j.mod_seg.assign((size_t)(2 * kSegCap), 0);
+            nmod = (int)mod_segs_(&j.geom, j.ref_tab.data(), j.mod_seg.data(), 2 * kSegCap);
+            if (nmod < 1 || nmod > 2 * kSegCap)
                 return no("the model could not merge the reference conditioning into its "
                           "modulation groups");
             j.mod_seg.resize((size_t)nmod);
@@ -694,12 +718,23 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
             j.mod_seg = j.seg;
         }
         j.nmod = nmod;
-        const int ngroups = nmod - 1;    /* `mod_seg` is boundaries: one more than the groups */
-        if (d.max_ref_segs > 0 && ngroups > d.max_ref_segs)
-            return no("these references change the conditioning's modulation cell " +
-                      std::to_string(ngroups) + " times, but this deployment's modulation table holds " +
-                      std::to_string(d.max_ref_segs) + " cells -- ask for references that share their "
-                      "modalities and target, or fewer of them");
+        if (d.max_ref_segs > 0) {
+            /* With the map staged the table width is the highest column + 1; without it every
+             * group is its own cell, so the group count is the width. */
+            int ncells = nmod - 1;       /* boundaries: one more than the groups */
+            if (mod_segs_) {
+                const int nb = (nmod + 1) / 2;
+                ncells = 0;
+                for (int k = nb; k < nmod; ++k)
+                    if (j.mod_seg[(size_t)k] + 1 > ncells) ncells = j.mod_seg[(size_t)k] + 1;
+            }
+            if (ncells > d.max_ref_segs)
+                return no("these references and their prompt markers switch the conditioning's "
+                          "modulation cell " + std::to_string(ncells) +
+                          " ways, but this deployment's modulation table holds " +
+                          std::to_string(d.max_ref_segs) + " cells -- ask for references that share "
+                          "their modalities and target, or fewer of them");
+        }
         /* `rows` stays the plain text+audio+video count: every non-step pass (encode, decode,
          * audio, upscale) stages its own segment table and target counts from it and must see the
          * bytes it sees today. Only build_step runs at the widened `step_rows`. */
@@ -746,9 +781,10 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
             j.seg_s.assign(segs.begin(), segs.begin() + nseg_s);
             j.nseg_s = nseg_s;
             if (mod_segs_) {
-                j.mod_seg_s.assign((size_t)kSegCap, 0);
-                const int n = (int)mod_segs_(&gs, j.ref_tab.data(), j.mod_seg_s.data(), kSegCap);
-                if (n < 1 || n > kSegCap)
+                j.mod_seg_s.assign((size_t)(2 * kSegCap), 0);
+                const int n = (int)mod_segs_(&gs, j.ref_tab.data(), j.mod_seg_s.data(),
+                                             2 * kSegCap);
+                if (n < 1 || n > 2 * kSegCap)
                     return no("the model could not merge the draft-size reference conditioning "
                               "into its modulation groups");
                 j.mod_seg_s.resize((size_t)n);
@@ -1154,10 +1190,10 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
         }
         reg_[R_SEG].used = 4 * 4;
     }
-    /* The norm's merged boundaries. On a widened step that is the plugin's merged group table (a
-     * subset of the fine one just staged into R_SEG); on the plain path and every non-step pass it
-     * is the fine table verbatim -- nothing merges there, so the norm reads the same bytes as the
-     * attention and the generated output is exactly what it was before this operand split. */
+    /* The norm's merged groups: boundaries then, since ABI 28, the group->column map (the plugin's
+     * rad_arch_video_mod_segs combined output). On the plain path and every non-step pass it is the
+     * fine table alone -- nothing merges there and the arch reads no map, so the norm reads the
+     * same bytes as the attention and the output is what it was before this operand split. */
     int32_t* mod = hptr<int32_t>(R_MOD);
     if (wide && (wsmall ? j.nmod_s : j.nmod) > 0) {
         const std::vector<int32_t>& tab = wsmall ? j.mod_seg_s : j.mod_seg;

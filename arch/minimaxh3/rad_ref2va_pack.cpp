@@ -287,24 +287,73 @@ static void cell_of_kind(int kind, int64_t S, int* md, int64_t* r0) {
     }
 }
 
-void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, Ref2VAModGroups* out) {
-    out->bound.clear(); out->md.clear(); out->r0.clear();
-    /* Walk the segments in sequence order, opening a new group whenever the cell changes or a gap
-     * would otherwise appear. Empty segments carry no rows: they neither extend nor split a group,
-     * so a run of photos with an empty cond between them still rides one cell. */
-    int cur_md = 0; int64_t cur_r0 = 0; bool open = false;
-    int64_t prev_end = 0;
+void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, const std::vector<Ref2VATagRun>& runs,
+                       Ref2VAModGroups* out) {
+    out->bound.clear(); out->col.clear(); out->md.clear(); out->r0.clear();
+    /* Normalise the tag runs: keep the part of each that falls inside the text segment, drop the
+     * rest, order by start, and trim a run that would overlap its predecessor -- runs describe
+     * disjoint token spans, but the driver's view and this one must never disagree by accident. */
+    std::vector<Ref2VATagRun> norm;
+    for (const Ref2VATagRun& r : runs) {
+        Ref2VATagRun c = r;
+        if (c.end <= c.start) continue;
+        norm.push_back(c);
+    }
+    std::sort(norm.begin(), norm.end(),
+              [](const Ref2VATagRun& a, const Ref2VATagRun& b) { return a.start < b.start; });
+    norm.erase(std::unique(norm.begin(), norm.end(),
+                           [](const Ref2VATagRun& a, const Ref2VATagRun& b) {
+                               return a.start == b.start && a.end == b.end && a.tag == b.tag;
+                           }),
+               norm.end());
+
+    /* Lay the row pieces: each non-empty segment contributes its cell, except the text segment,
+     * which is cut at the (clamped) run edges into prompt pieces (text tag on the text block) and
+     * pad pieces (the run's tag, still on the video-schedule block -- the reference keeps the pad
+     * rows on the prompt's timestep row and changes only the ada projection). */
+    struct Piece { int64_t start, end; int md; int64_t r0; };
+    std::vector<Piece> pieces;
     for (const Ref2VASeg& s : p.segs) {
         if (s.end <= s.start) continue;
-        int md; int64_t r0;
-        cell_of_kind(s.kind, S, &md, &r0);
-        if (!open || md != cur_md || r0 != cur_r0 || s.start != prev_end) {
-            if (open) out->bound.push_back(s.start);   /* close the previous group at this start */
-            else      out->bound.push_back(0);
-            cur_md = md; cur_r0 = r0; open = true;
-            out->md.push_back(md); out->r0.push_back(r0);
+        if (s.kind == kR2VText) {
+            int64_t at = s.start;
+            for (const Ref2VATagRun& r : norm) {
+                const int64_t a = std::max(r.start, s.start), b = std::min(r.end, s.end);
+                if (b <= at) continue;                       /* fully covered already */
+                if (a >= s.end) break;                       /* the rest lies past the prompt */
+                if (a > at) pieces.push_back({ at, a, 1, 0 });
+                if (b > at) pieces.push_back({ std::max(a, at), b, r.tag, 0 });
+                at = std::max(at, b);
+            }
+            if (at < s.end) pieces.push_back({ at, s.end, 1, 0 });
+            continue;
         }
-        prev_end = s.end;
+        Piece pc; pc.start = s.start; pc.end = s.end;
+        cell_of_kind(s.kind, S, &pc.md, &pc.r0);
+        pieces.push_back(pc);
+    }
+
+    /* Merge adjacent pieces that share a cell -- every merge the old segment walk made still
+     * happens (a photo run is one repeated cell), and the new pad pieces merge back into a
+     * prompt/neighbour piece exactly when their cells agree. Cells deduplicate into table
+     * COLUMNS: `md`/`r0` describe the distinct cells, `col` maps each group to its cell. */
+    int cur_col = -1; bool open = false;
+    int64_t prev_end = 0;
+    auto column_of = [&](int md, int64_t r0) {
+        for (size_t c = 0; c < out->md.size(); ++c)
+            if (out->md[c] == md && out->r0[c] == r0) return (int)c;
+        out->md.push_back(md); out->r0.push_back(r0);
+        return (int)out->md.size() - 1;
+    };
+    for (const Piece& pc : pieces) {
+        const int col = column_of(pc.md, pc.r0);
+        if (!open || col != cur_col || pc.start != prev_end) {
+            if (open) out->bound.push_back(pc.start);   /* close the previous group at this start */
+            else      out->bound.push_back(0);
+            cur_col = col; open = true;
+            out->col.push_back(col);
+        }
+        prev_end = pc.end;
     }
     if (open) out->bound.push_back(p.rows);   /* the last group runs to the end of the sequence */
 }

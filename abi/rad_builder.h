@@ -1311,17 +1311,20 @@ typedef struct RadVideoGenDecl {
      * denoiser reads `ref_tab`, so this flag is what makes staging and consumption flip together. */
     int32_t       ref_rows;
 
-    /* The largest MODULATION-GROUP count this generator's modulation table holds -- its denoiser's
-     * `kMaxSegs`. A modulation cell is a pure function of a segment's KIND (its modality and its
-     * timestep-embedding block), so runs of consecutive segments that share a cell collapse into one
-     * group and the table is sized by the GROUP count, not the reference count: nine reference photos
-     * pack into four groups (prompt, all-photos, soundtrack, video). The attention still takes the
-     * FINE per-segment table (which may hold far more segments than this), so this is not a limit on
-     * how many references ride -- only on how many DISTINCT cells the sequence changes through. The
-     * driver refuses a request whose merged group count exceeds it at submit (it lays the pack out and
-     * merges it itself, via `rad_arch_video_mod_segs`, so it knows before dispatch) rather than letting
-     * the arch abort mid-generation. 0 = no reference consumption, so no such limit. Trailing since
-     * ABI 23: an older plugin declares none and keeps the 0 default. */
+    /* The largest number of DISTINCT MODULATION CELLS this generator's modulation table holds --
+     * its denoiser's `kMaxSegs`. A modulation cell is a pure function of a segment's KIND (its
+     * modality and its timestep-embedding block) and, since ABI 28, of a prompt vision-pad run's
+     * tag: runs of consecutive same-cell rows collapse into one GROUP, and groups that share a cell
+     * read it through the column map staged with the group boundaries (`rad_arch_video_mod_segs`),
+     * so the table is sized by the DISTINCT-CELL count -- not the group count and not the reference
+     * count. The attention still takes the FINE per-segment table (which may hold far more segments
+     * than this), so this is not a limit on how many references ride -- only on how many DISTINCT
+     * cells the sequence and its prompt pads change through. The driver refuses a request whose
+     * merged cells exceed it at submit (it lays the pack out and merges it itself, via
+     * `rad_arch_video_mod_segs`, so it knows before dispatch) rather than letting the arch abort
+     * mid-generation. 0 = no reference consumption, so no such limit. Trailing since ABI 23: an
+     * older plugin declares none and keeps the 0 default; its meaning was the merged GROUP count
+     * until ABI 28 made the cells and the groups separate. */
     int32_t       max_ref_segs;
 
     /* Debug introspection of the encoder outputs (diagnostics only, not part of the serving
@@ -1851,7 +1854,9 @@ int64_t rad_arch_encode_geom(int32_t kind, const int64_t* in, int32_t* out, int6
  * of rad_arch_video_segs. `g` is the target's geometry and `ref_tab` the request's keyframes
  * and VAE references -- RadVideoGenBatch::ref_tab, its int32 table verbatim -- or null when the
  * request conditions on no VAE media, which lays out the plain [text | soundtrack | video]
- * sequence. Returns the packed sequence's total rows -- the rows RAD_VPOS_STEP positions -- or
+ * sequence. Since ABI 28 the table may carry a trailing list of prompt vision-pad tag runs; the
+ * PAD LAYOUT is untouched by them (they ride inside the prompt's rows), so this export reads only
+ * the counts, references and keyframes and answers identically with or without the tail. Returns the packed sequence's total rows -- the rows RAD_VPOS_STEP positions -- or
  * a negative status for counts the model cannot present or caps too small to write into. With
  * `seg` non-null it writes the segment boundaries (seg[k] the first row of segment k, of the n
  * it needs) when `cap_seg` int32s hold them; with `pos` non-null the rotary positions (f32

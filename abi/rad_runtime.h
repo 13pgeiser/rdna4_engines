@@ -623,20 +623,30 @@ typedef struct RadVideoGenBatch {
      * reference's `kind` is 0 a picture, 1 a standalone audio, 2 a video, 3 a video's
      * soundtrack; `slot` is its 1-based number within its kind -- the slot its encode pass
      * wrote. The counts are latent units: a reference's own latent grid (height, width), its
-     * latent frames and its audio latents, 0 where the kind carries neither. A batch without
-     * the field laid out is one an older engine built: no references. Trailing since ABI 23. */
+     * latent frames and its audio latents, 0 where the kind carries neither. Since ABI 28 the
+     * table then carries the prompt's VISION-PAD TAG RUNS, which lay out nothing but DO change
+     * the modulation cells the pad rows read: one int32 count, then 2 words per run {start,
+     * length} — token spans inside the prompt where the image pads (the vision_start, tiles and
+     * vision_end of one visual reference) carry the video tag instead of the text tag. A table
+     * written by an ABI 28 driver always has the word count (0 when the prompt has no pads); a
+     * batch without the field laid out is one an older engine built: no references. Trailing
+     * since ABI 23. */
     const int32_t*  ref_tab;
 
-    /* ---- The modulated-norm's segment boundaries, device i32. The denoiser's attention reads the
-     * FINE `seg_cu` -- one segment per reference block, which the block-sparse attention needs to
-     * give each reference its own prefix sink -- but the modulated norm reads a COARSER table:
-     * consecutive segments that share a modulation cell (the same modality and the same
-     * timestep-embedding block) merge into one, because a cell is a pure function of a segment's
-     * kind. This is that merged table's boundaries, a subset of `seg_cu`'s -- every fine boundary
-     * that is also a cell change. Sizing the modulation table by the GROUP count, not the reference
-     * count, is what lets a wide reference request (up to nine photos, which pack into four groups)
-     * ride a fixed table. On a plain request (or one that merges nothing) it is exactly `seg_cu`; a
-     * driver stages the same bytes into both. Trailing since ABI 23. */
+    /* ---- The modulated-norm's group boundaries -- and, since ABI 28, its group->column MAP --
+     * device i32. The denoiser's attention reads the FINE `seg_cu` -- one segment per reference
+     * block, which the block-sparse attention needs to give each reference its own prefix sink --
+     * but the modulated norm reads a COARSER table: runs of consecutive rows that share a
+     * modulation cell merge into one GROUP, a cell being a pure function of a segment's kind and
+     * (since ABI 28) of a prompt vision-pad's tag, so pad runs cut the text group. This operand is
+     * the merged table's boundaries -- every boundary that is also a cell change, a superset of
+     * `seg_cu`'s subset once pads cut -- followed, since ABI 28, by one i32 per group: the
+     * modulation-table COLUMN that group reads. Groups that share a cell share a column, so the
+     * table is sized by the DISTINCT-CELL count however many groups the pads and kinds cut: that
+     * is what lets a wide reference request ride a fixed table. On a plain request it is exactly
+     * `seg_cu` -- boundaries alone, no map -- and the arch reads no map either: a driver stages a
+     * map only for the merged (reference-conditioned) table, and the plain path keeps the
+     * byte-identical pre-ABI-28 bytes. Trailing since ABI 23. */
     const int32_t*  mod_cu;
 
     /* ---- The sampler that advances the latents: RAD_SAMPLER_* above. Trailing since ABI 24. */

@@ -104,10 +104,11 @@ struct Plugin {
      * out and refuses requests that carry VAE references. */
     int64_t (*arch_video_pack)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t, float*,
                                int64_t) = nullptr;
-    /* Optional (rad_builder.h); the merged modulation-group boundaries a conditioned pack collapses
-     * to (rad_arch_video_mod_segs). Null with arch_video_pack present means the driver stages the
-     * fine table into the norm operand too -- correct whenever nothing merges (a plain or a
-     * single-reference sequence), and refused at submit only when a wide pack would need it. */
+    /* Optional (rad_arch_video_mod_segs, documented at the plugin's definition); the merged
+     * modulation groups a conditioned pack collapses to, as boundaries then the group->column map.
+     * Null with arch_video_pack present means the driver stages the fine table into the norm operand
+     * too, boundaries only -- correct whenever nothing merges (a plain or a single-reference
+     * sequence), and refused at submit only when a wide pack would need it. */
     int64_t (*arch_video_mod_segs)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t) =
         nullptr;
     /* Optional (rad_builder.h); null means the driver runs no encode pass. */

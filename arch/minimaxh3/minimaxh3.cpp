@@ -3359,13 +3359,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * consumption all move together behind this one constant; a request with no reference
              * table stays on the byte-identical plain path (step_dit's refc gate is `V->ref_tab`). */
             d.ref_rows = kRefConsume;
-            /* The denoiser's modulation table is one cell per modulation GROUP, `kMaxSegs` columns.
-             * A cell is a pure function of a segment's kind, so a run of consecutive same-cell
-             * segments -- nine reference photos, say -- shares one cell and the table is pitched by
-             * the group count, not the reference count; a pack that MERGES to more groups than this
-             * aborts the step. The driver builds and merges the pack itself (rad_arch_video_mod_segs)
-             * and reads this cap, refusing an over-wide request at submit -- the model's ceilings
-             * (max_ref_images & co.) stay the model's, this is the build's table. */
+            /* The denoiser's modulation table is one column per DISTINCT modulation cell,
+             * `kMaxSegs` columns. A cell is a pure function of a segment's kind and of a prompt
+             * vision-pad's tag, so the groups the norm walks -- prompt pieces, pad runs, reference
+             * blocks, targets -- map onto a handful of columns; the table is pitched by that
+             * DISTINCT-CELL count, not the group or reference count, and a request whose cells
+             * exceed it aborts the step. The driver builds and merges the pack itself
+             * (rad_arch_video_mod_segs) and reads this cap, refusing an over-wide request at submit
+             * -- the model's ceilings (max_ref_images & co.) stay the model's, this is the build's
+             * table. */
             d.max_ref_segs = kRefConsume ? kMaxSegs : 0;
             /* Debug naming of the encoder outputs (R4D_ENC_DEBUG): the driver reads these back and
              * logs a digest so the encoder's numbers can be inspected without a step-side d2h the
@@ -3487,6 +3489,24 @@ static minimaxh3::Ref2VAPack ref_pack_of(const RadVideoGeom* g, const int32_t* r
     Ref2VAPack p;
     ref2va_build((int)g->n_text, pg, keys, refs, &p);
     return p;
+}
+
+/* The vision-pad tag runs the table's tail carries, after the keyframes: [n, (start, len) x n],
+ * each run the `vision_start` / tiles / `vision_end` span of one reference photo inside the prompt.
+ * The reference implementation tags those rows with the VIDEO modality, not text -- the pad run
+ * keeps the prompt's timestep row but swaps its ada projection -- so the merged modulation groups
+ * must cut the text segment at these edges. A table without the tail (the counts word absent or
+ * zero) is the pre-tag-run layout: no runs, groups equal segment kinds. */
+static std::vector<minimaxh3::Ref2VATagRun> ref_pads_of(const int32_t* ref_tab) {
+    std::vector<minimaxh3::Ref2VATagRun> runs;
+    if (!ref_tab) return runs;
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
+    const int32_t* w = ref_tab + 2 + (int64_t)nr * 6 + (int64_t)nk * 3;
+    const int32_t np = *w++;
+    if (np < 0 || np > 4096) return runs;             /* a table from before the tail, or corrupt */
+    for (int32_t i = 0; i < np; ++i, w += 2)
+        if (w[1] > 0) runs.push_back({ w[0], (int64_t)w[0] + w[1], 0 });
+    return runs;
 }
 
 /* A segment's modulation cell -- its modality's ada projection (0 video, 1 text, 2 audio) and the
@@ -3658,14 +3678,16 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     const bool refc = kRefConsume && V->ref_tab;
     std::vector<std::pair<int, int64_t>> cell;
     if (refc) {
-        /* One cell per modulation GROUP, not per fine segment. A cell is fixed by a segment's kind
-         * (its modality's ada projection and its timestep-embedding block), so consecutive
-         * same-cell segments -- every reference photo, say, all video-pinned -- collapse into one.
-         * The table is written at the group's column and the norm is handed the group boundaries
-         * (V->mod_cu), so a wide reference request rides a table pitched by its GROUP count. */
+        /* One cell per DISTINCT modulation cell -- not per group, and not per fine segment. A cell
+         * is fixed by a segment's kind (its modality's ada projection and its timestep-embedding
+         * block), and by the tag of a vision-pad run inside the prompt, so the groups the norm
+         * walks (prompt, pad, photos, soundtrack, video, ...) address a handful of columns through
+         * the map staged with the group boundaries. The table is written once per column and the
+         * norm maps group -> column itself, so a wide reference request rides a table pitched by
+         * its DISTINCT-CELL count however many groups its pads cut. */
         const minimaxh3::Ref2VAPack p = ref_pack_of(&V->geom, V->ref_tab);
         minimaxh3::Ref2VAModGroups grp;
-        minimaxh3::ref2va_mod_groups(p, S, &grp);
+        minimaxh3::ref2va_mod_groups(p, S, ref_pads_of(V->ref_tab), &grp);
         for (size_t i = 0; i < grp.md.size(); ++i) cell.emplace_back(grp.md[i], grp.r0[i]);
     } else {
         for (int e = 0; e < kSegs; ++e)
@@ -3673,8 +3695,8 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     }
     const int64_t ncell = (int64_t)cell.size();
     if (ncell > kMaxSegs) {
-        rad_step_fail(c, "minimaxh3: the reference conditioning lays out more sequence segments than "
-                         "this plugin's modulation table holds");
+        rad_step_fail(c, "minimaxh3: the reference conditioning reads more distinct modulation cells "
+                         "than this plugin's modulation table holds");
         return;
     }
     for (int64_t l = 0; l < L; ++l) {
@@ -3721,23 +3743,28 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
      * segments and lands every offset exactly as before. */
     const bool refc = kRefConsume && V->ref_tab;
     minimaxh3::Ref2VAPack pk;
+    minimaxh3::Ref2VAModGroups grp;
     int64_t ng = kSegs;                          /* modulation groups: the norm table's width */
+    int64_t vcol = ng - 1;                       /* the video target's table COLUMN */
     int64_t vrows, aseg, vseg;
     if (refc) {
         pk = ref_pack_of(&V->geom, V->ref_tab);
-        /* The table is pitched by the merged GROUP count (a cell is fixed by a segment's kind, so
-         * consecutive same-cell segments collapse), while the attention keeps the fine per-segment
-         * layout. Checked against the table width is the merged count, not the reference count. */
-        minimaxh3::Ref2VAModGroups grp;
-        minimaxh3::ref2va_mod_groups(pk, m.S, &grp);
-        ng = (int64_t)grp.md.size();
-        if (ng > kMaxSegs || pk.segs.size() < 2 ||
+        /* The groups the norm walks (segment kinds merged, the prompt cut at its vision-pad runs)
+         * address the table through a column map, so the table is pitched by its DISTINCT-CELL
+         * count while the groups may outnumber it -- and the attention keeps the fine per-segment
+         * layout. Checked against the table width is the distinct-cell count, not the group or
+         * reference count. */
+        minimaxh3::ref2va_mod_groups(pk, m.S, ref_pads_of(V->ref_tab), &grp);
+        ng = (int64_t)grp.bound.size() - 1;
+        if (ng < 1 || grp.col.size() != (size_t)ng || (int64_t)grp.md.size() > kMaxSegs ||
+            pk.segs.size() < 2 ||
             pk.segs.back().kind != minimaxh3::kR2VVideo ||
             pk.segs[pk.segs.size() - 2].kind != minimaxh3::kR2VAudio) {
             rad_step_fail(c, "minimaxh3: the reference conditioning did not merge to a video/audio "
                              "target pair within the modulation table");
             return;
         }
+        vcol = grp.col[(size_t)ng - 1];           /* the video target's own column */
         const minimaxh3::Ref2VASeg& vid = pk.segs.back();
         vrows = vid.end - vid.start;
         aseg = pk.segs[pk.segs.size() - 2].start;   /* the audio target, just before the video */
@@ -3840,6 +3867,12 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
      * selects its per-reference prefix sinks from the fine `segs`, the norm selects its per-cell
      * modulation from `mod_segs`. On the plain path the driver stages identical bytes to both. */
     const RadOperand mod_segs = praw(V->mod_cu, RAD_I32, ng + 1);
+    /* The group->column map: the merged table stages the mod-seg export's combined answer, the
+     * ng+1 boundaries above followed by the ng columns. The norm maps its group index through it,
+     * so groups that share a cell read one table column. Half 1 and every plain path need none:
+     * half 1's slice already starts AT the video target's column, and its two-boundary cu maps to
+     * the slice's single row. */
+    const RadOperand mod_col = refc ? praw(V->mod_cu + ng + 1, RAD_I32, ng) : RAD_NONE;
     const RadOperand geom = praw(V->geom_d, RAD_I32, RAD_VGEOM_N);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
     const RadOperand pos = praw2(V->pos, RAD_F32, 3, R);
@@ -3855,7 +3888,8 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
      * run on lane 1 while lane 0 computes the other half; the attention stays whole. The second
      * half starts at the video target's middle row -- the video target is the pack's last segment,
      * so the half is video alone: the batch's one-sequence cu_seqlens and the video target's
-     * modulation row (the last cell) stand for the segment table. Lane 0 waits for a half's
+     * modulation row (its own table column, sliced to one row) stand for the segment table. Lane 0
+     * waits for a half's
      * all-reduce before its first reader, issued before the next all-reduce goes to lane 1 (a join
      * orders a lane behind everything issued on the other). */
     const bool split = g.world > 1;
@@ -3863,10 +3897,11 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     const int64_t hr0[2] = { 0, cut }, hn[2] = { cut, R - cut };
     const int nh = split ? 2 : 1;
     const RadOperand segh[2] = { mod_segs, cu };
+    const RadOperand colh[2] = { mod_col, RAD_NONE };
     auto modh = [&](int h, int64_t l, int k, int chunks) {
         if (h == 0) return mod(l, k, chunks);
         const int64_t r = k / per;
-        return bcol_at(m.b_modg, r * L * kMaxSegs + l * kMaxSegs + (ng - 1), m.Ws, (k % per) * D,
+        return bcol_at(m.b_modg, r * L * kMaxSegs + l * kMaxSegs + vcol, m.Ws, (k % per) * D,
                        chunks * D, 1);
     };
     /* A half's partial sums across the ranks, kArRows rows a message, on lane 1 when split. */
@@ -3894,7 +3929,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                         l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
                         RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
                         brow_slice(m.a_hm.cq(), r0, n, D), brow_slice(m.a_hm.cs(), r0, n, nD),
-                        RAD_NONE);
+                        RAD_NONE, colh[h]);
             /* The dump's per-block window (R4D_DIT_SEL): block l-1's residual STREAM rows
              * [0, kDbgL). b_ao is not the stream -- it holds block l-1's raw MLP delta until this
              * block's norm folds it -- but op_mq1 writes the folded stream back to b_h, so right
@@ -3937,7 +3972,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
             RAD_ISSUE_N(c, B.op_mq2, n, brow_slice(m.b_ao, r0, n, D), modh(h, l, 2, 1),
                         modh(h, l, 3, 2), RAD_W(B.w_n2), segh[h], brow_slice(m.b_h, r0, n, D),
                         brow_slice(m.a_hm.cq(), r0, n, D), brow_slice(m.a_hm.cs(), r0, n, nD),
-                        RAD_NONE);
+                        RAD_NONE, colh[h]);
             B.gate_up.step(c, m.a_hm, m.b_gu, R, r0, n);
             B.gq.step(c, m.b_gu, R, r0, n);
             B.down.step(c, m.a_ffn, m.b_ao, R, r0, n);
@@ -3952,7 +3987,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                        (lane * m.S + V->step) * (int64_t)kMaxSegs * 2 * D * (int64_t)sizeof(uint16_t);
     RAD_ISSUE_N(c, m.op_nout, R, brows(m.b_ao, R), mod(L - 1, 5, 1),
                 RAD_P_T2(nout, RAD_BF16, ng, 2 * D), RAD_W(m.w_no_n), mod_segs, brows(m.b_h, R),
-                brows(m.b_hn, R));
+                brows(m.b_hn, R), mod_col);
     /* Block 49's stream, slot L-1: only op_nout folds the last MLP delta into b_h (the reference
      * FinalLayer norms the same post-fold stream), so this follows it. Nothing between here and
      * the pass' end writes b_h. */
@@ -4628,17 +4663,22 @@ extern "C" int64_t rad_arch_video_pack(const RadVideoGeom* g, const int32_t* ref
     return p.rows;
 }
 
-/* The merged modulation-group boundaries: a SUBSET of rad_arch_video_pack's segment boundaries,
- * with the boundaries that fall inside a run of consecutive same-cell segments dropped. The
- * denoiser's attention reads the fine pack boundaries (each reference needs its own prefix sink),
- * but the modulated norm reads these coarser ones -- a modulation cell is fixed by a segment's kind,
- * so a run of reference photos shares one cell and one table column, letting nine photos ride the
- * fixed `kMaxSegs`-wide table that the twelve fine segments would overrun. The merge is independent
- * of the sampler's step count (whether two neighbours share a cell depends only on their kinds), so
- * S is passed as 1 here purely to keep the timestep-embedding blocks distinct; the boundaries it
- * yields are the ones step_cond/step_dit derive at the real S. A plain geometry collapses to the
- * fine table: it is the same pack, and the driver then stages identical bytes to both operands. Call
- * with mod = nullptr for the number of int32s needed. */
+/* The merged modulation groups, in the combined form the step stages as one operand: the group
+ * BOUNDARIES followed by the group->table-column MAP. The boundaries are a SUBSET of
+ * rad_arch_video_pack's segment boundaries, with those falling inside a run of consecutive
+ * same-cell segments dropped -- and once the reference table carries vision-pad runs, also cut
+ * inside the prompt wherever the pad tag changes the cell. The denoiser's attention reads the fine
+ * pack boundaries (each reference needs its own prefix sink), but the modulated norm reads these
+ * coarser ones. A modulation cell is fixed by a segment's kind (and a pad run's tag), so groups
+ * REPEAT cells: nine photos share one cell, and the pad groups share the video cell with the target
+ * -- the map sends every group to one of the handful of distinct cells, letting any group count
+ * ride the fixed `kMaxSegs`-wide table. The merge is independent of the sampler's step count
+ * (whether two neighbours share a cell depends only on their kinds and tags), so S is passed as 1
+ * here purely to keep the timestep-embedding blocks distinct; the boundaries and columns it yields
+ * are the ones step_cond/step_dit derive at the real S. A plain geometry collapses to the fine
+ * table with an identity map: it is the same pack, and the norm then reads exactly the pre-map
+ * bytes. `mod` gets `nb` boundaries then `nb - 1` columns, `2 * nb - 1` int32s total. Call with
+ * mod = nullptr for the number of int32s needed. */
 extern "C" int64_t rad_arch_video_mod_segs(const RadVideoGeom* g, const int32_t* ref_tab,
                                            int32_t* mod, int64_t cap) {
     if (!g || g->n_text < 1 || g->n_text > minimaxh3::kMaxText) return RAD_E_INVAL;
@@ -4647,11 +4687,13 @@ extern "C" int64_t rad_arch_video_mod_segs(const RadVideoGeom* g, const int32_t*
         return RAD_E_INVAL;
     const minimaxh3::Ref2VAPack p = minimaxh3::ref_pack_of(g, ref_tab);
     minimaxh3::Ref2VAModGroups grp;
-    minimaxh3::ref2va_mod_groups(p, 1, &grp);
-    const int64_t n = (int64_t)grp.bound.size();
+    minimaxh3::ref2va_mod_groups(p, 1, minimaxh3::ref_pads_of(ref_tab), &grp);
+    const int64_t nb = (int64_t)grp.bound.size();
+    const int64_t n = nb + nb - 1;
     if (!mod) return n;
     if (cap < n) return RAD_E_INVAL;
     for (size_t k = 0; k < grp.bound.size(); ++k) mod[k] = (int32_t)grp.bound[k];
+    for (size_t k = 0; k < grp.col.size(); ++k) mod[nb + k] = (int32_t)grp.col[k];
     return n;
 }
 #endif

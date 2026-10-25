@@ -119,15 +119,33 @@ void ref2va_ada_cell(const Ref2VAPack& p, double t_v, double t_a, std::vector<in
  * fine per-reference segments. The modulation table is then sized by the group count, not the
  * reference count -- which is what lets a wide reference request (up to nine photos) ride a fixed
  * table. Groups cover the whole sequence: boundaries start at 0 and end at `rows`. Empty segments
- * (end <= start) carry no rows and open no boundary. `md`/`r0` are per group, for the table writer. */
+ * (end <= start) carry no rows and open no boundary.
+ *
+ * The reference implementation modulates by a per-token TAG, not by segment: the prompt span's
+ * vision-pad rows -- the `vision_start` / tiles / `vision_end` run that wraps every reference
+ * photo -- carry the video tag (0), not the text tag (1), so they modulate with the video ada
+ * projection while staying on the text segment's timestep row. `runs` replays that: each run cuts
+ * the text segment at its edges, and a run's piece reads (md = tag, r0 = 0). The number of GROUPS
+ * then grows with the media count, but the distinct CELLS never exceed the handful of (md, r0)
+ * pairs -- text, pad, each reference kind's pinned cell, the two target cells -- so the table is
+ * sized by DISTINCT CELLS while the groups address it through `col`. */
+struct Ref2VATagRun {
+    int64_t start, end;   /* rows [start, end) inside the text segment */
+    int tag;              /* the ada projection the run reads (vision pads: 0) */
+};
 struct Ref2VAModGroups {
     std::vector<int64_t> bound;   /* [count + 1]: cumulative row boundaries, [0 .. rows] */
-    std::vector<int> md;          /* [count]: the group's ada projection (0 video, 1 text, 2 audio) */
-    std::vector<int64_t> r0;      /* [count]: the timestep-embedding block the group's cell reads */
+    std::vector<int> col;         /* [count]: which cell (index into md/r0) the group reads */
+    std::vector<int> md;          /* [cells]: the cell's ada projection (0 video, 1 text, 2 audio) */
+    std::vector<int64_t> r0;      /* [cells]: the timestep-embedding block the cell reads */
 };
 /* `S` is the sampler's step count (the embedding's per-schedule row span); it fixes the pinned
- * blocks at [2S,3S) video / [3S,4S) audio, exactly as the arch's ref_cell_of does. */
-void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, Ref2VAModGroups* out);
+ * blocks at [2S,3S) video / [3S,4S) audio, exactly as the arch's ref_cell_of does. `runs` are the
+ * tag runs inside the text segment -- sorted is not required (they are normalised here), anything
+ * outside the text span is dropped. An empty `runs` gives exactly the segment-kind merge: cells
+ * then never repeat, so `col` is the identity and the output matches the pre-tag-run tables. */
+void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, const std::vector<Ref2VATagRun>& runs,
+                       Ref2VAModGroups* out);
 
 /* Lay the sequence out. Returns 0, or -1 on a negative dimension (the driver has already bounded
  * media against the arch's ceilings; this only refuses nonsense). */

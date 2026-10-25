@@ -85,10 +85,14 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
     const uint16_t* __restrict__ w, const int* __restrict__ cu, uint16_t* __restrict__ x,
     uint8_t* __restrict__ q, float* __restrict__ qs, uint16_t* __restrict__ z, int n, int n_seq,
     float eps, int y_ld, int g_ld, int s_ld, int x_ld, int q_ld, int qs_ld, int z_ld, float wadd,
-    int once, int layer, int none) {
+    int once, int layer, int none, const int* __restrict__ colmap) {
     __shared__ float sh[kT / 32];
     const int r = blockIdx.x;
-    const int e = seq_of(cu, n_seq, r);
+    int e = seq_of(cu, n_seq, r);
+    // Optional column indirection: `cu` may bound MORE groups than the modulation table has
+    // columns (groups that share a cell map to one column), so a group index is translated to its
+    // table column here -- null leaves the segment index itself, exactly as before.
+    if (colmap) e = colmap[e];
     uint16_t* xr = x + (size_t)r * x_ld;
     float v[kRmChunks][8];
     float ss = 0.0f;
@@ -489,6 +493,10 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, int qmode) {
     const RadTensor* q = qmode ? r4d_opt(a, 6) : nullptr;
     const RadTensor* qs = qmode ? r4d_opt(a, 7) : nullptr;
     const RadTensor* z = r4d_opt(a, qmode ? 8 : 6);
+    // Optional group->column map, issued after the last operand of either mode (slot 9 with the
+    // quantising chain, slot 7 with the plain one). Absent for every other issuer: the segment
+    // index remains the column.
+    const RadTensor* cm = r4d_opt(a, qmode ? 9 : 7);
     if (!sc || !cu || !x || (qmode ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
     const bool gated = r4d_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return R4D_NO(RAD_E_INVAL);
@@ -513,8 +521,12 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, int qmode) {
         if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return R4D_NO(RAD_E_STRIDE);
     }
     const long long n_seq = r4d_numel(cu) - 1, rows = qmode ? rq : rz;
-    if (rows <= 0 || n_seq <= 0 || rx < rows || rs < n_seq || (w && r4d_numel(w) < n) ||
-        (qmode && rqs < rows) || (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
+    if (cm && (!is_i32(cm) || !r4d_contig(cm) || r4d_numel(cm) < n_seq))
+        return R4D_NO(RAD_E_SHAPE);
+    // With the map the table rows index the COLUMNS, not the groups, so its row count need not
+    // reach n_seq; the issuer (the only one who passes a map) guarantees mapped columns < rows.
+    if (rows <= 0 || n_seq <= 0 || rx < rows || (!cm && rs < n_seq) || (w && r4d_numel(w) < n) ||
+        (qmode && rqs < rows) || (gated && (ry < rows || (!cm && rg < n_seq))) || (z && rz < rows))
         return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
@@ -532,7 +544,7 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, int qmode) {
                        Q ? (uint8_t*)q->data : nullptr, Q ? (float*)qs->data : nullptr,           \
                        z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq, eps, (int)yl,        \
                        (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl, wadd, once, layer, \
-                       none)
+                       none, cm ? (const int*)cm->data : nullptr)
     if (qmode == 2) {
         if (gated) R4D_RMQ(true, 2);
         else       R4D_RMQ(false, 2);
