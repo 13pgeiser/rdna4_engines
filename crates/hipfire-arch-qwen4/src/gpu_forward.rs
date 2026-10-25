@@ -8392,7 +8392,7 @@ struct LoanHw {
 }
 
 /// The donor-tail loan of a `fixed` / `on` load: the exclusive lease claim, the
-/// dedicated restore stream and events (created at attach, destroyed at free)
+/// restore completion event (created at attach, destroyed at free)
 /// and the state machine ([`crate::decode_share_loan::LoanController`]).
 pub(crate) struct DonorLoan {
     controller: crate::decode_share_loan::LoanController,
@@ -9545,8 +9545,9 @@ impl Qwen4GpuForward {
     }
 
     /// Attach the donor-tail loan of a `fixed` / `on` load: claim the lease,
-    /// check the largest class fits the donor span, and create the dedicated
-    /// restore stream and events. Writes nothing into the donor tail.
+    /// check the largest class fits the donor span, ensure the compute stream
+    /// exists, and create the restore completion event. Writes nothing into
+    /// the donor tail.
     fn attach_donor_loan(
         gpu: &mut Gpu,
         lease: &crate::expert_tier_owners::ExpertTierLease,
@@ -11276,8 +11277,8 @@ impl Qwen4GpuForward {
     }
 
     /// The last scratch consumer of a whole prompt has run. A dirty tail of a
-    /// prompt that ended `Ok` gets its restore enqueued on the dedicated
-    /// restore stream (the host wait is deferred to the next call that needs
+    /// prompt that ended `Ok` gets its restore enqueued on the compute stream
+    /// (the host wait is deferred to the next call that needs
     /// the donors, so it overlaps sampling and emission and is not part of
     /// TTFT; `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` waits here). A prompt that
     /// ended with an error takes the blocking recovery.
@@ -11481,7 +11482,7 @@ impl Qwen4GpuForward {
             );
             // The donors must be whole before the lease can go. A restore that
             // cannot be proven complete leaks the loan (claim, lease retention,
-            // restore stream and events) instead of freeing under a pending DMA.
+            // completion event) instead of freeing under a pending DMA.
             if let Some(loan) = share.loan.as_mut() {
                 let torn_down = loan.with_ops(gpu, |controller, ops| controller.teardown(ops));
                 eprintln!(

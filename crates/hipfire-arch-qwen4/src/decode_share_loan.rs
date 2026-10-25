@@ -17,7 +17,7 @@
 //! It is pure: every device effect goes through [`LoanOps`], so each
 //! transition is unit-tested on the CPU with a recording fake. The forward's
 //! `GpuLoanOps` (gpu_forward.rs) is the real implementation: the compute
-//! stream, a dedicated restore stream, two events and the pinned mirror.
+//! stream, one completion event and the pinned mirror.
 //!
 //! Invariants:
 //! * No byte of the donor tail is written before the state is `Dirty`.
@@ -38,9 +38,8 @@ pub(crate) trait LoanOps {
     /// compute stream.
     fn memset_zero(&mut self, offset: u64, bytes: u64) -> Result<(), String>;
     /// Enqueue the restore of the first `bytes` of the tail from its mirror:
-    /// event A on the compute stream, the restore stream waits A, async H2D
-    /// copy, `done` recorded on the restore stream, and the compute stream
-    /// waits `done`.
+    /// an async H2D copy on the compute stream, then `done` recorded on the
+    /// compute stream.
     fn enqueue_restore(&mut self, bytes: u64) -> Result<(), String>;
     /// Host-wait for the enqueued restore's `done` event and check the async
     /// error state.
