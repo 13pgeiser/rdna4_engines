@@ -158,9 +158,20 @@ impl Output {
         (2 * GUARD + MAX_B * self.m) * 4
     }
     fn reset(&self, gpu: &Gpu) -> Result<()> {
-        gpu.hip
-            .memset(&self.owner.buf, i32::from(POISON), self.bytes())
-            .map_err(err)
+        // hipMemset may return before its default-stream work completes.
+        // PreparedMq6Program joins the current HIP producer stream, so the
+        // poison fill must be ordered on that stream too. A pre-fill device
+        // sync does not order this later write against the independent PM4 IB.
+        match gpu.stream_ref() {
+            Some(stream) => {
+                gpu.hip
+                    .memset_async(&self.owner.buf, i32::from(POISON), self.bytes(), stream)
+            }
+            None => gpu
+                .hip
+                .memset(&self.owner.buf, i32::from(POISON), self.bytes()),
+        }
+        .map_err(err)
     }
     fn read(&self, gpu: &Gpu) -> Result<Vec<u8>> {
         let mut bytes = vec![0u8; self.owner.buf.size()];
@@ -205,8 +216,10 @@ impl Output {
         bytes
     }
     fn compare(&self, reference: &[u8], actual: &[u8], n: usize) -> Result<()> {
-        self.active(reference, n)?;
-        self.active(actual, n)?;
+        self.active(reference, n)
+            .map_err(|e| format!("HIP reference: {e}"))?;
+        self.active(actual, n)
+            .map_err(|e| format!("replay output: {e}"))?;
         let expected = self.expected(reference, n);
         if let Some(i) = expected.iter().zip(actual).position(|(a, b)| a != b) {
             return Err(format!(
