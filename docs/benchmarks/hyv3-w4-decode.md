@@ -110,10 +110,22 @@ this experiment.
 - Full `gfx1201` HIP build: passed (809 targets).
 - Focused `arch_test`, `chat_test`, `chatparse_test`, and `checkpoint_test`: 4/4 passed.
 
-This shows the release-based tree plus HYV3 support and PR changes compiles; it does not establish
-GPU execution correctness or model performance. No GPU selftest or Qwen inference was run from this
-temporary tree. Current-main build results above remain separate: its missing `core/kvstream/`
-module still blocks the newer engine target.
+Follow-up validation used only the third R9700 (GPU index 2, UUID
+`GPU-7f082536d27449f3`):
+
+- `gemm_w4a16_asym_nt_m64`: 341 checks passed, zero failures or skips.
+- `moe_gemm_w4a8`: 647 checks passed, zero failures, 12 expected skips for unsupported aligned
+  prefill tiles at 640 experts (the run-map limit is 512); HYV3 top-8 gate/up and down geometries
+  were exercised. The selftest exits 2 when skips are present.
+- The release+PR server loaded the local full-GPTQ W4 HYV3 container at 4096 context on loopback
+  port 18100. `/health` was OK and a chat request asking for 6×7 returned `42`. The process was
+  stopped afterward and the port was confirmed free; no route was changed.
+
+This is focused kernel correctness plus one inference smoke, not a full GPU suite, A/B benchmark,
+or broad quality result. Logs and response are in
+`/mnt/gostar_data/radiance-calib/hyv3-pr-validation-20261025/pr237/` (`release-v112-*-selftest.log`
+and `release-v112-hy-memory-smoke*`). Current-main build results above remain separate: its missing
+`core/kvstream/` module still blocks the newer engine target.
 
 ## Before this PR is ready
 
