@@ -2297,6 +2297,15 @@ impl DflashSpeculator {
         self.df.as_mut().map(|df| &mut df.verify_pm4)
     }
 
+    /// Resolved DeltaNet checkpoint cadence of this speculator.
+    pub fn checkpoint_policy(&self) -> DflashCheckpointPolicy {
+        DflashCheckpointPolicy {
+            resume_enabled: self.resume_enabled,
+            interval: self.ck_interval,
+            cap: self.ck_cap,
+        }
+    }
+
     /// The lane state is currently moved out ([`Self::take_vmm_lane`]); the
     /// next `prefill` ([`Self::ensure_live`]) rebuilds it.
     pub fn is_vacant(&self) -> bool {

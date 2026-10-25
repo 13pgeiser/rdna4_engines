@@ -27,6 +27,14 @@ kept for provenance and are not current recommendations.
   only, with an open NPU and a matching keyed calibration; every other arch is
   effectively `off` with no NPU I/O or allocation. Any auto load refusal logs one
   reason and runs GPU-only. `off` is the kill switch.
+* **Confirmed hardware.** Strix Halo (Ryzen AI Max+ 395) and the Ryzen AI Max+
+  PRO 495 / Radeon 8065S: the latter is not a Strix Halo part but enumerates as
+  gfx1151 on the same PCI ID (`1002:1586`) and carries the same XDNA2 NPU
+  (fw 1.1.2.65). On a 192 GB PRO 495 host the built-in calibration applied with
+  the 5% kernel-release margin, `on` armed (`runtime=open`), pp16384 measured
+  1980.9 -> 2209.9 tok/s over `off` (+11.6%) with `qwen3.8:flash-next`, and a
+  greedy 400-token generation was byte-identical to `emulate`. Numbers are
+  STAPM-throttled chassis numbers; see issue #966 for the full report.
 * **Calibration.** The compiled-in measured Halo records are the normal path: they
   bind on arch, build, model index, epilogue and trunk route only, and apply on any
   Halo kernel, NPU firmware or GPU PCI address at margin 0.0 (see below).
