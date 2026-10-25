@@ -125,7 +125,7 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
          * above, because this model does stream. */
         const int64_t asked_blocks = (out->asked_tokens + bs - 1) / bs;
         const int64_t step = kvstream_ceiling_blocks(cfg, ops.sel_pitch);
-        if (step > asked_blocks && step <= ring.raised_blocks) {
+        if (ring.by_union && step > asked_blocks) {
             RAD_WARN("--kv-resident %lld raised to %lld tokens: a decode step can name %lld blocks "
                      "of %lld blocks each (--max-num-seqs %lld x %lld for speculation x %lld), and "
                      "the ring must hold them all; the ring takes the raised depth and startup "
@@ -148,6 +148,7 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
     out->ring_blocks   = ring.ring_blocks;
     out->ring_tokens   = ring.ring_blocks * bs;
     out->raised_tokens = ring.raised_blocks > 0 ? ring.ring_blocks * bs : 0;
+    out->raised_by_union = ring.raised_blocks > 0 && ring.by_union;
     out->group         = ring.streams() ? g : -1;
     /* Prefill runs on the stage and never resolves: above `qsa_exact_to` one launch's selection is
      * a chunk's union, which no serving ring could hold, so the pass gets the group's context one
@@ -200,11 +201,14 @@ void kvstream_report(const KVStreamSetup& s, const KVStreamHostUse& host, int n_
     const int64_t flag = s.raised_tokens > 0 ? s.raised_tokens : s.asked_tokens;
     if (s.raised_tokens > 0 && s.block_size > 0)
         RAD_INFO("kv streaming: the ring is the raised one, not the flag's: --kv-resident %lld "
-                 "became %lld tokens (%lld -> %lld blocks of %lld tokens each), the fewest blocks "
-                 "one decode step's selection fits in; what was carved below is that ring",
+                 "became %lld tokens (%lld -> %lld blocks of %lld tokens each), %s; what was "
+                 "carved below is that ring",
                  (long long)s.asked_tokens, (long long)s.raised_tokens,
                  (long long)((s.asked_tokens + s.block_size - 1) / s.block_size),
-                 (long long)(s.raised_tokens / s.block_size), (long long)s.block_size);
+                 (long long)(s.raised_tokens / s.block_size), (long long)s.block_size,
+                 s.raised_by_union ? "the fewest blocks one decode step's selection fits in"
+                                   : "the shipped floor, under which the misses cost more than "
+                                     "the VRAM the ring gives back");
     if (host.sum.groups > 0)
         RAD_INFO("kv streaming: %lld group(s) stream (%s): kv_store_streamed writes the host "
                  "mirror and the resident ring slots, kv_resolve rewrites each selection as ring "

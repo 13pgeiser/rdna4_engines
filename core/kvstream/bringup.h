@@ -26,8 +26,10 @@ struct KVStreamSetup {
     int32_t     group = -1;            /* the group that streams; -1 when nothing does */
     std::string group_name;            /* the group that would have: named by the report */
     int64_t     asked_tokens = 0;      /* --kv-resident as given; 0 is no streaming at all */
-    int64_t     raised_tokens = 0;     /* what the flag became when the ring's ceiling raised
-                                        * it; 0 when it was not raised */
+    int64_t     raised_tokens = 0;     /* what the flag became when a floor raised it; 0 when it
+                                        * was not raised */
+    bool        raised_by_union = false; /* the raise was the decode-step union, not the shipped
+                                          * floor (kStreamFloorTokens): the report's wording */
     int64_t     context_tokens = 0;    /* --max-model-len x --max-num-seqs */
     int64_t     ring_tokens = 0;       /* the ring that is carved, in tokens: the raised flag,
                                         * rounded to whole blocks */
