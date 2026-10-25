@@ -1146,7 +1146,8 @@ fn run_grouped_prefill_parity(gpu: &mut Gpu) {
     let soa = aos_to_soa_full(&aos, groups * m, k);
     let row_bytes = soa.len() / (groups * m);
     let group_bytes = row_bytes * m;
-    let weights = gpu.upload_raw(&soa, &[soa.len()]).unwrap();
+    let mut weights = gpu.upload_raw(&soa, &[soa.len()]).unwrap();
+    weights.dtype = DType::MFP4G32E8SOA;
     let x = gpu.alloc_tensor(&[batch * groups * k], DType::F32).unwrap();
     let y_ref = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
     let y_wmma = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
