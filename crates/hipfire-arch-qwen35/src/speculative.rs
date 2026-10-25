@@ -13043,20 +13043,48 @@ pub fn dflash_seed_checkpoint_count(
     interval: usize,
     cap: usize,
 ) -> usize {
+    dflash_seed_checkpoint_positions(prompt_len, ceiling, interval, cap).len()
+}
+
+/// Positions (the ring's final contents, oldest first) of the DeltaNet
+/// checkpoints a cold DFlash prompt seed of `prompt_len` rows takes under
+/// outer-chunk `ceiling`; same simulation of [`take_dn_checkpoint`] as
+/// [`dflash_seed_checkpoint_count`], which is its length.
+pub fn dflash_seed_checkpoint_positions(
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> Vec<usize> {
+    let mut ring = std::collections::VecDeque::new();
     if cap == 0 {
-        return 0;
+        return Vec::new();
     }
-    let (mut pos, mut last, mut len) = (0usize, None::<usize>, 0usize);
+    let (mut pos, mut last) = (0usize, None::<usize>);
     while pos < prompt_len {
         pos += dflash_seed_outer_chunk_len(prompt_len - pos, ceiling);
         if last.is_some_and(|p| pos < p.saturating_add(interval)) {
             continue;
         }
-        len = (len + 1).min(cap);
+        if ring.len() >= cap {
+            ring.pop_front();
+        }
+        ring.push_back(pos);
         last = Some(pos);
     }
-    len
+    ring.into()
 }
+
+/// Outer chunk ceiling of the most recent cold DFlash prompt seed
+/// (`seed_target_hidden_from_prompt_abortable_parts`) in this process; `0`
+/// before any. Read by the state oracle to compare checkpoint positions
+/// between walks that planned the same ceiling.
+pub fn last_dflash_seed_ceiling() -> usize {
+    LAST_DFLASH_SEED_CEILING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LAST_DFLASH_SEED_CEILING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Upper bound on [`dflash_seed_checkpoint_count`] for every outer-chunk
 /// ceiling the seed can take at least `min_ceiling`: the maximum over
@@ -13329,6 +13357,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
         }
     }
     let mut seed = SeedPrefill::plan(gpu, target);
+    LAST_DFLASH_SEED_CEILING.store(seed.ceiling, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> HipResult<bool> {
         let mut seq_pos: usize = 0;
         while seq_pos < prompt_tokens.len() {

@@ -1499,6 +1499,7 @@ dependencies = [
  "libjpeg-turbo-rs",
  "rdna-compute",
  "serde_json",
+ "sha2",
  "va-bridge",
 ]
 

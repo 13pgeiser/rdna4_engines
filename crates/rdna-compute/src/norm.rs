@@ -6739,6 +6739,75 @@ impl Gpu {
         }
     }
 
+    /// Row-pitched f32 → f16 cast: packed `src` `[rows, cols]` F32 into `dst`
+    /// `[rows, pitch]` F16 (`pitch >= cols`). The `pitch - cols` pad columns
+    /// of every row are written as zeros on every launch, so `dst` need not
+    /// be pre-zeroed. Block [256], grid `ceil(rows * pitch / 256)`.
+    pub fn cast_f32_to_f16_pitched(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        rows: usize,
+        cols: usize,
+        pitch: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            src.dtype,
+            DType::F32,
+            "cast_f32_to_f16_pitched: src must be F32"
+        );
+        assert_eq!(
+            dst.dtype,
+            DType::F16,
+            "cast_f32_to_f16_pitched: dst must be F16"
+        );
+        assert!(
+            pitch >= cols,
+            "cast_f32_to_f16_pitched: pitch {pitch} < cols {cols}"
+        );
+        assert!(
+            src.numel() >= rows * cols && dst.numel() >= rows * pitch,
+            "cast_f32_to_f16_pitched: operands too small for [{rows}, {cols}] -> pitch {pitch}"
+        );
+        assert!(
+            rows * pitch <= i32::MAX as usize,
+            "cast_f32_to_f16_pitched: {rows} x {pitch} overflows i32"
+        );
+        if rows == 0 || pitch == 0 {
+            return Ok(());
+        }
+        self.ensure_kernel(
+            "cast_f32_to_f16",
+            kernels::CAST_F32_TO_F16_SRC,
+            "cast_f32_to_f16_pitched",
+        )?;
+        let func = &self.functions["cast_f32_to_f16_pitched"];
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut rows_val = rows as i32;
+        let mut cols_val = cols as i32;
+        let mut pitch_val = pitch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut rows_val as *mut _ as *mut c_void,
+            &mut cols_val as *mut _ as *mut c_void,
+            &mut pitch_val as *mut _ as *mut c_void,
+        ];
+        let grid = (rows * pitch).div_ceil(256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn deepseek4_convert_f32_to_f16(
         &mut self,
         src: &GpuTensor,
