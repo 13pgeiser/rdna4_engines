@@ -18035,7 +18035,8 @@ impl Gpu {
     /// production path for the vision tower — the naive kernel measured
     /// 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid image);
     /// this variant should land two orders under it. Requires
-    /// head_dim % 16 == 0 and head_dim <= 128.
+    /// head_dim <= 128 (any head_dim, not only multiples of 16: the lane
+    /// tail is guarded in the kernel).
     pub fn vit_attention_qtiled_f32(
         &mut self,
         qkv: &GpuTensor,
@@ -18047,14 +18048,14 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Shapes outside the Q-tiled contract (per-lane accumulators are
-        // sized for head_dim <= 128 in 16-lane multiples of 16) fall back
+        // sized for head_dim <= 128) fall back
         // to the naive kernel instead of asserting: an assert here runs on
         // the engine-owning thread, where a panic is a serve hang. The
         // naive kernel is slower but correct for any tower shape.
-        if head_dim % 16 != 0 || head_dim > 128 {
+        if head_dim > 128 {
             eprintln!(
                 "vit_attention_qtiled_f32: head_dim={head_dim} is outside the \
-                 Q-tiled contract (multiple of 16, <= 128); falling back to \
+                 Q-tiled contract (<= 128); falling back to \
                  vit_attention_f32"
             );
             return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim);
@@ -18101,6 +18102,137 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// WMMA flash ViT self-attention for head_dim <= 80 (Qwen3.5/3.8 vision
+    /// tower: head_dim 72 -> padded to 80). Same packed-QKV contract as
+    /// [`Gpu::vit_attention_f32`]. `vit_qkv_pack_f16` first converts QKV to
+    /// three zero-padded F16 `[n, num_heads, 80]` buffers (allocated and freed
+    /// here), then `vit_attention_wmma_f16` (gfx11 or gfx12 fragment mapping)
+    /// runs the non-causal flash kernel.
+    ///
+    /// Pack: grid `[ceil(n*num_heads*80/256)]`, block `[256]`.
+    /// Attention: grid `[num_heads, ceil(n/64)]`, block `[128]`, dynamic LDS
+    /// `(80*40 + 64*72)*2 = 15616` B. Requires wave32 WMMA (gfx11xx / gfx12xx).
+    pub fn vit_attention_wmma_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Must match AV_HD / AV_VT_STRIDE / AV_S_STRIDE / AV_MT in
+        // kernels/src/vit_attention_wmma{,.gfx12}.hip.
+        const HDP: usize = 80;
+        const VT_STRIDE: usize = 40;
+        const S_STRIDE: usize = 72;
+        const MT: usize = 64;
+        if head_dim == 0 || head_dim > HDP || n == 0 || num_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "vit_attention_wmma_f32: head_dim={head_dim} n={n} num_heads={num_heads} \
+                     outside the kernel contract (0 < head_dim <= {HDP}, n > 0, num_heads > 0)"
+                ),
+            ));
+        }
+        let is_gfx12 = self.arch_caps.has_wmma_w32_gfx12();
+        let (kernel_name, kernel_src) = if is_gfx12 {
+            (
+                "vit_attention_wmma_f16_gfx12",
+                kernels::VIT_ATTENTION_WMMA_GFX12_SRC,
+            )
+        } else if self.arch_caps.has_wmma_w32() {
+            ("vit_attention_wmma_f16", kernels::VIT_ATTENTION_WMMA_SRC)
+        } else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "vit_attention_wmma_f32 requires wave32 WMMA; arch={} does not support it.",
+                    self.arch
+                ),
+            ));
+        };
+        self.ensure_kernel(
+            "vit_qkv_pack_f16",
+            kernels::VIT_QKV_PACK_F16_SRC,
+            "vit_qkv_pack_f16",
+        )?;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+
+        let packed = n * num_heads * HDP;
+        let qh = self.alloc_tensor(&[packed], DType::F16)?;
+        let kh = self.alloc_tensor(&[packed], DType::F16)?;
+        let vh = self.alloc_tensor(&[packed], DType::F16)?;
+
+        let mut qkvp = qkv.buf.as_ptr();
+        let mut qhp = qh.buf.as_ptr();
+        let mut khp = kh.buf.as_ptr();
+        let mut vhp = vh.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut hdp = HDP as i32;
+        let mut pack_params: Vec<*mut c_void> = vec![
+            &mut qkvp as *mut _ as *mut c_void,
+            &mut qhp as *mut _ as *mut c_void,
+            &mut khp as *mut _ as *mut c_void,
+            &mut vhp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut hdp as *mut _ as *mut c_void,
+        ];
+        let pack_blocks = (packed as u32).div_ceil(256);
+        let r1 = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["vit_qkv_pack_f16"],
+                [pack_blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut pack_params,
+            )
+        };
+
+        let r2 = if r1.is_ok() {
+            let mut op = out.buf.as_ptr();
+            let mut sc = 1.0f32 / (head_dim as f32).sqrt();
+            let mut attn_params: Vec<*mut c_void> = vec![
+                &mut qhp as *mut _ as *mut c_void,
+                &mut khp as *mut _ as *mut c_void,
+                &mut vhp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut hi as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+            ];
+            let shared_mem = ((HDP * VT_STRIDE + MT * S_STRIDE) * 2) as u32;
+            unsafe {
+                self.hip.launch_kernel(
+                    &self.functions[kernel_name],
+                    [num_heads as u32, n.div_ceil(MT) as u32, 1],
+                    [128, 1, 1],
+                    shared_mem,
+                    self.stream_ref(),
+                    &mut attn_params,
+                )
+            }
+        } else {
+            Ok(())
+        };
+        self.free_tensor(qh)?;
+        self.free_tensor(kh)?;
+        self.free_tensor(vh)?;
+        r1?;
+        r2
     }
 
     /// Multi-slot variant of
