@@ -83,8 +83,8 @@ and retained-replay evidence; it does not measure model quality or speed.
 
 ## Recorded validation (2026-10-25)
 
-Tested implementation: `5a197256c324d3c9571d97f2346ac60708803923`, based on
-beta `9cb35862c400286067b91ef6b5275c40fb571f4c`. The checkout was clean when
+Tested implementation: `3e5f176d71d19e803f7a0a1a7b7cf82906faf689`, based on
+beta `6d81107a55c6a8e7748635edd9d5e0a0529eda8d`. The checkout was clean when
 the hardware binary was built and frozen. Hardware: gfx1151, PCI
 `0000:c5:00.0`, HIP 7.16; both machine GPU locks held.
 
@@ -132,7 +132,7 @@ passed, as did env-docs, lifecycle and named-file rustfmt checks.
 
 `cargo test --release --locked -p railgun-cert --lib` passed 5 tests and failed
 the tree inventory test. Its six missing sites are all in beta's existing
-Qwen4 decode-share code. The frozen parent certifier scanning a `git archive`
+Qwen4 decode-share code. The frozen baseline certifier scanning a `git archive`
 of the exact beta base produced byte-identical errors to the candidate
 certifier scanning the candidate tree. The new explicit-MQ6 refusal site is
 inventoried; this PR does not repair the unrelated baseline omissions.
