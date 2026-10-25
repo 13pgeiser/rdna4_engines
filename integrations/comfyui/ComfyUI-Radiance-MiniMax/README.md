@@ -30,6 +30,24 @@ ComfyUI / PEFT key spellings as they come). New LoRA without a restart:
 `POST /v1/load_lora_adapter {"lora_name": "...", "lora_path": "..."}` with a
 path on the **server's** filesystem (loopback-only unless `--api-key` is set).
 
+**LoRA slots and VRAM — tight on 32 GB cards.** Every adapter slot is *reserved
+at server start* and lives in VRAM whether used or not (the startup log prints
+"N slots of rank R, X a slot on this rank"). A video generator's activation
+arena is sized for its largest legal step and is not shrinkable, so the slots
+compete head-on with the KV cache for whatever slack remains. Measured on this
+node's flagship serve — MiniMax-H3, TP2, 32 GB cards, rank 16 — one slot costs
+**265 MiB per card and exactly one slot of slack remains** after the arena:
+`--max-loras 1` boots by a hair; `--max-loras 2` boots **only if nothing else
+holds VRAM** (stop ComfyUI on the same box — it holds ~1.7 GiB itself — and any
+other GPU process). The failure signature is a boot that stops with
+`the static weights alone want … of the … this card can give` then
+`VRAM pool budgets are empty: … vram_kv resolved to 0 MiB` (exit 1).
+Lowering `--max-num-batched-tokens` to claw room back does NOT work for a
+video generator: its auto value is a floor — the largest denoise step must fit
+the arena — and a lower one is refused at declare. **Recommendation: serve
+with `--max-loras 1` as the default** (this node's `lora 1` keeps working,
+keep `lora 2` at `none`); raise to 2 when the cards are otherwise idle.
+
 ## Inputs
 
 - **server_url / model** — which box, which served model (`GET /v1/models` lists ids).

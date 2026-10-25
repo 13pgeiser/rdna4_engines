@@ -467,12 +467,20 @@ class RadianceMiniMax(io.ComfyNode):
                                tooltip="strength of the loras pick -- sent as NAME:STRENGTH; "
                                        "inert while loras is 'none'"),
                 io.Combo.Input("lora2", options=["none"], default="none", display_name="lora 2",
-                               tooltip="second adapter -- the radiance server holds "
-                                       "--max-loras 2 by default, and this pair mirrors "
-                                       "that exactly. Same dropdown rules as loras "
-                                       "('none' = off); either slot may stand alone. "
-                                       "Beyond two: <lora:name:0.8> prompt tags and a "
-                                       "raised --max-loras on the server"),
+                               tooltip="second adapter -- mirrors the server's second "
+                                       "adapter slot (--max-loras; 2 with --lora-dir "
+                                       "alone). VRAM NOTE: slots are reserved at server "
+                                       "start, and on 32 GB cards a video generator may "
+                                       "only fit ONE -- the second slot can leave the KV "
+                                       "cache nothing and the server refuses to boot. If "
+                                       "the server dies with 'vram_kv resolved to 0 MiB', "
+                                       "free the cards (stop ComfyUI too -- it holds "
+                                       "VRAM) or serve with --max-loras 1 and keep this "
+                                       "slot 'none'. See the README, 'LoRA slots and "
+                                       "VRAM'. Same dropdown rules as loras ('none' = "
+                                       "off); either slot may stand alone. Beyond two: "
+                                       "<lora:name:0.8> prompt tags and a raised "
+                                       "--max-loras on the server"),
                 io.Float.Input("lora2_strength", default=1.0, min=0.0, max=2.0, step=0.05,
                                display_name="lora 2 strength",
                                tooltip="strength of the lora2 pick -- sent as NAME:STRENGTH; "

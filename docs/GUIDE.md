@@ -1612,6 +1612,15 @@ below.
   unload while serving: `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/dir"}` and
   `POST /v1/unload_lora_adapter {"lora_name": "x"}` (vLLM's routes; loopback-only without
   `--api-key`).
+  On a 32 GB card a video generator's slots can be the line between booting and not: the buffer
+  plan's activation arena is fixed by the largest legal step, and whatever elastic VRAM survives it
+  must also hold the KV cache — measured on MiniMax-H3 TP2 at rank 16, one slot is 265 MiB a card
+  and exactly one slot of slack survives, so `--max-loras 2` boots only when the cards are
+  otherwise free (an idle ComfyUI on the same box holds ~1.7 GiB). The failure mode is a startup
+  that stops with `VRAM pool budgets are empty: … vram_kv resolved to 0 MiB`. Lowering
+  `--max-num-batched-tokens` cannot buy the room back on a video generator — the auto value is a
+  floor (the largest denoise step must fit the arena) and a lower one is refused at declare.
+  Default to `--max-loras 1` on tight cards.
 - An unload of an idle adapter answers 200 and frees its slot. An unload of an adapter requests
   are still using **drains** it and answers 202
   `{"action": "draining", "lora_name": "x", "in_flight": N}`: from then on a request naming `x`
