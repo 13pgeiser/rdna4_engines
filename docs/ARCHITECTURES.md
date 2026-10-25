@@ -30,7 +30,7 @@ plugin claims.
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
 | `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
-| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
+| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
 The traps below are readings that are wrong without any error: the model produces fluent output.
@@ -1809,7 +1809,7 @@ denoising step of one request's packed sequence, ADECODE plays the soundtrack, V
 one temporal chunk of frames. A request is a lane; two hold state at once (one denoising, one
 conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 on two
 cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline directory,
-read as one; only workflow t2va is served.
+read as one; the workflows t2va, i2va, l2va, fl2va and ref2va are served.
 
 ```
 text      Qwen3-VL-32B's language model: 64 layers of 5120 (64 q / 8 kv heads of 128, ff 25600,

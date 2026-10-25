@@ -1,7 +1,8 @@
 """Radiance MiniMax: drive a Radiance MiniMax-H3 server (/v1/videos) from ComfyUI.
 
-The node is a pure HTTP client: the ~60 GiB model runs in the radiance server
-process (this box or any TP2 box on the LAN), so it costs ComfyUI no VRAM.
+The node is a pure HTTP client: the ~50-60 GiB model (container-dependent) runs in
+the radiance server process (this box or any TP2 box on the LAN), so it costs
+ComfyUI no VRAM.
 
 Prompt: `prompt` is a widget AND an input socket -- wire your LLM prompt
 enhancer's STRING output straight into it and the wire wins over what is typed.

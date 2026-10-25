@@ -2971,8 +2971,18 @@ curl -s http://localhost:8000/v1/videos/video_.../content -o fox.mp4
   These reshape the noise schedule the driver stages — they reach the kernels as sigmas, not as a new
   batch field — and never change the model's trained look, which is fixed by its VAE decode and
   quantisation, not the schedule.
-- Only text is read: `input_reference` and non-empty `conditions` are refused, as is a `task`
-  other than `t2va`. Fields are JSON or a multipart form (OpenAI's clients send the form).
+- **Conditioning.** A text-only request runs `t2va`. A container that carries the VAE encoders also
+  serves **keyframe completion**: a `first_frame` part (I2VA), a `last_frame` part (L2VA) or both
+  (FL2VA, generative completion between two pinned endpoint frames — at most one part of each). A
+  container that carries the encoders and the token refiner serves **REF2VA**: `ref_image_1 …
+  ref_image_9` pictures, `ref_video_1 … ref_video_3` clips each with its `ref_video_audio_N`
+  soundtrack, and `ref_audio_1 … ref_audio_3`. Keyframes and reference media are mutually
+  exclusive: a request either completes between pinned frames or conditions on references. The
+  media are multipart file parts (`curl -F first_frame=@start.png -F prompt=...`); a named `task`
+  (`t2va`/`i2va`/`l2va`/`fl2va`/`ref2va`) is optional and inferred from the parts, and a named
+  task missing its media is refused. `input_reference` and non-empty `conditions` are refused.
+  Fields are JSON or a multipart form (OpenAI's clients send the form; a request with media
+  parts is multipart by necessity).
 
 **FastH3.** FastVideo's FastH3 8-Step V2 (`FastVideo/FastVideo-FastH3-8-Step-V2`) is the same model
 distilled to eight steps with video sparse attention; it is converted with the same recipe, its text

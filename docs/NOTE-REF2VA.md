@@ -39,7 +39,8 @@ sibling notes (`NOTE-P3-PACK.md`, `NOTE-P2-ENCODE.md`); this one is about capabi
   content-live, not collapsed.
 - **Audio-encoder numeric value-parity — measured and now matched.** Against a device-input-anchored
   fp32 reference, the audio latent used to sit at ~0.25–0.39× the reference spread. The cause was a
-  **pre_block `norm1`/`norm3` swap** (the projection branch read the wrong LayerNorm — see #14 below). After
+  **pre_block `norm1`/`norm3` swap** (the projection branch read the wrong LayerNorm — see the
+  video-encoder parity section below). After
   the fix the pre_block output and the final latent both track the reference (ratio ~0.97 / ~0.93, R² 0.98–
   0.99, no remaining systematic gain); the ~0.10 residual-after-affine is bounded by low-precision
   execution (a full-bf16 reference itself moves 55% from its fp32). **The video / image encoder is a
@@ -48,8 +49,9 @@ sibling notes (`NOTE-P3-PACK.md`, `NOTE-P2-ENCODE.md`); this one is about capabi
   is the previous clip's tail fed back as a `ref_video_N` (+ `ref_video_audio_N`), not a special engine
   mode. Two requests reproduce it: generate clip A, cut its tail, request clip B with `ref_video_1` = the
   tail. A fixed-seed control confirms the tail conditions B (with-tail vs without-tail differ). The
-  pack's exact keyframe-pin rows (`kR2VCond`) remain unimplemented — a separate mechanism for FL2VA-style
-  start/end-frame pinning, which FL2VA itself reaches with two image references (see point 3).
+  pack's exact keyframe-pin rows (`kR2VCond`) are a **distinct mechanism, and they have since
+  shipped**: I2VA/L2VA/FL2VA arrive as `first_frame`/`last_frame` parts whose pins are
+  device-verified (see the keyframe-pin section below), separate from this chaining path.
 - **The modulation-cell merge** that lifts the count ceiling (next section).
 
 ## The reference-count ceiling: how it went from ≤5 to ≤9
@@ -142,8 +144,8 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    merge removes the *table-per-reference* growth, not the *per-reference token* cost. Raise
    `--max-model-len`, or use smaller / fewer references.
 
-3. **Continuity chaining works through the reference paths; the bespoke keyframe-pin mechanism is
-   separate and still pending.** The DaSiWa "3-second lead-in" is *not* a special engine mode: per the
+3. **Continuity chaining works through the reference paths; the keyframe-pin mechanism ships
+   separately.** The DaSiWa "3-second lead-in" is *not* a special engine mode: per the
    source-verified brief (`docs/NOTE-CONTINUITY.md` §1) the director feeds the previous keeper clip's
    last ~3 s back as a **video + audio reference** (`media_mode: video_audio`, `slot 0`, `start: 0`) —
    *conditioning media, not content*; the next scene simply continues from that tail and never replays
@@ -154,18 +156,18 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    engine additionally regenerates a leading overlap window as target rows and then trims it; here the
    reference rows are fixed conditioning held outside the sampler and every output frame is new (no
    overlap to trim), so the net "continues from the tail" semantics match but the seam may differ
-   subtly. What is *not* wired is the **engine consumption** of the pack's *keyframe* rows
-   (`kR2VCond` / `kR2VCondAudio`) — a distinct exact-pin mechanism for FL2VA-style start/end-frame
-   conditioning (which FL2VA itself reaches with two image references — see §2 of the continuity brief).
-   **The pack layer is done and reference-verified**: `ref2va_build` emits `kR2VCond` / `kR2VCondAudio`
+   subtly. The pack's *keyframe* rows (`kR2VCond` / `kR2VCondAudio`) are a **distinct exact-pin
+   mechanism, and it ships**: I2VA/L2VA/FL2VA reach start/end-frame conditioning through the
+   `first_frame`/`last_frame` parts, not through reference images (see the keyframe-pin section
+   below for the shipped mechanism).
+   **The pack layer was reference-verified first**: `ref2va_build` emits `kR2VCond` / `kR2VCondAudio`
    segments, and the golden `fl2va` (two keyframes) and `chain` (one keyframe) cases assert their
    segment order, sizes, positions, `img_pos`/`audio_pos` and modulation rows **bit-exact** against the
-   reference (they re-baked byte-identical here). What remains is three engine pieces, none touching
-   the sampler (cond rows sit ahead of the targets, so the sampler ignores them by construction): the
-   driver never populates a keyframe row (its keyframe count stays 0 today), `step_dit` scatters the
-   reference rows but not the cond rows, and there is no continuation-tail *input* to persist a prior
-   clip's tail. Seam frame-equality is the wrong metric to gate on: the brief states it is imperfect
-   **by construction**, because the first new frame is the tail's temporal *successor*, not a replay of
+   reference (they re-baked byte-identical here). The engine pieces the first pass left open — the
+   driver populating a keyframe row, `step_dit` scattering the cond rows — landed with that section;
+   a prior clip's tail needs no bespoke persistence since it rides in as a `ref_video_N`. Seam
+   frame-equality is the wrong metric to gate on: the brief states it is imperfect **by
+   construction**, because the first new frame is the tail's temporal *successor*, not a replay of
    its last frame.
 
 4. **Reference videos and audios steer the output — through the VAEs, not the text encoder.** A
@@ -382,7 +384,7 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
   (video-ref determinism + content-control), `chain.sh` (tail-as-`ref_video` chaining), `fullshape.sh`
   (this max-shape control) under the build tree.
 
-## #14 video-encoder value-parity — **RESOLVED** (2026-10-19): shortcut-after-norm1 ordering bug
+## Video-encoder value-parity — **RESOLVED** (2026-10-19): shortcut-after-norm1 ordering bug
 
 The video/image VAE encoder was device-live and content-sensitive but its folded latent sat at roughly
 **0.49× the reference's scale** with a large structural residual. Root cause found and **fixed**: in
@@ -430,7 +432,7 @@ but confined to one op-order, and the frame-0 bisection made it golden-verifiabl
 shadows + the full tail now read ratio ~1.0 against the reference. Strict end-to-end numeric parity of the
 whole pipeline (benchmarks, multi-frame) remains #10/P6. #20 stays closed (norm already per-frame).
 
-## #10 / P6 — Radiance TP2 engine-throughput + ComfyUI comparison (2026-10-19)
+## Engine-throughput vs ComfyUI: Radiance TP2 wall-clock and card-seconds (2026-10-19)
 
 FFmpeg is now present on this box (the §6.1 "no libav → encoding_failed at t≈0" blocker is gone — clips
 mux to mp4 and generate to completion). The encoder **value-parity** half of P6 is done (both encoders at the
@@ -519,7 +521,7 @@ before any VRAM was claimed (cards stayed at 61 MB), so no benchmark rows were p
 `--max-num-batched-tokens` might coax it up, but that changes the batch config and is no longer apples-to-apples
 with the 215 W baseline. Log: `build/tmp/ex10/server_vemb.log`.
 
-## #8 kR2VCond keyframe-pin (FL2VA) — disposition: SHIPPED + device-verified (2026-10-19)
+## The kR2VCond keyframe-pin (FL2VA) — SHIPPED + device-verified (2026-10-19)
 
 **Supersedes the earlier "left optional, not wired" disposition.** The user elevated FL2VA from optional to a
 **hard requirement**, so the keyframe path was implemented and shipped (commit `98ecbeb`, placeholder author,
@@ -556,10 +558,11 @@ for debug work on every encode. **Device-verified at 512²:** FL2VA 512×512 com
 survives, no band fault); host geom/video/ref2va/encoding tests green. Core ops are within their declared bands
 (a 1-frame 512 level plane is `0.235×` the 17·256² they're sized for).
 
-**Was a remaining fidelity gap; now CLOSED (2026-10-21, task #52).** The pins-only path used to **skip
+**Was a remaining fidelity gap; now CLOSED (2026-10-21).** The pins-only path used to **skip
 `clip.tokenize` vision tokens** for the keyframe images (the TE-anchor tokens the reference would also feed),
-so a prompt that *contradicts* the pinned image could let the text win, and realistic I2VA/FL2VA output
-over-saturated/posterized (root cause of #37/#50, see memory `dasiwa-reference-ground-truth`). This is now
+so a prompt that *contradicts* the pinned image could let the text win. (The over-saturated/posterized
+look these renders also showed was a **separate** bug — the velocity head's modulation-table staging,
+since fixed; the missing anchors were not its root cause.) This is now
 shipped: an endpoint keyframe is fed the DiT on BOTH channels the reference uses — the VAE-latent pin AND a
 `<Picture k>` vision-tower anchor block interleaved into the text conditioning. Mechanism: `videos.cpp` now
 runs the media/`<Picture N>` block for keyframe requests (first_frame→`<Picture 1>`, last_frame→`<Picture 2>`),
@@ -605,7 +608,7 @@ step·seed 1234, `first`=standing, `last`=riding; `index.tsv` records status/wal
 
 Each has a matching `.thumb.webp`. These are SEQUENCE clips (single generated run), not loops.
 
-## cont.20 (2026-10-21) — per-request `shift`, and the "fried" look localized to decode/quant
+## 2026-10-21 — per-request `shift`, and the "fried" look hunt — **resolved later: the velocity-head modulation table, NOT decode/quant**
 
 The full-resolution frames of a workflow-prompt review batch showed a **blown-highlight / crushed-black
 "watercolor" look** (the user's "fried"). Measured with HSV + Laplacian-variance across time on native-512
@@ -618,7 +621,8 @@ frames, versus the reference clips (same `dasiwaHybridV4` finetune, via ComfyUI)
 | Radiance snow T2VA (old ex10) | 13.7 | 51 |
 
 Key facts established by this pass:
-1. **It is in the text-only T2VA control too** — so it is NOT the keyframe/vision-tower path (#52), and
+1. **It is in the text-only T2VA control too** — so it is NOT the keyframe/vision-tower path (the
+   TE-anchor work below), and
    the old ex10 T2VA has the same clip% → **not a regression**. The earlier "T2VA is clean" read was an
    artifact of judging 256² downscaled strips; at native res it was never clean.
 2. **Sampler is not the lever**: same-seed euler vs res_multistep gives clip 53–61% vs 56–65% — no
@@ -628,9 +632,13 @@ Key facts established by this pass:
    lever either. CFG is not implemented (single conditioning pass = CFG 1), which already matches the
    reference's BasicGuider scale-1.
 4. With sampler, shift and CFG all matched, Radiance still blows ~55% where the reference blows ~4.5% on
-   the same content ⇒ the gap is **downstream of the schedule: the video VAE decode (scale/shift factor
-   value parity) and/or the DiT int8 quant**, i.e. #37/#44/#45 — the deep fidelity work, needing the stock
-   / golden-latent box (#44). Not a schedule, keyframe, downscale or source-compression issue.
+   the same content ⇒ the gap is downstream of the schedule. *(This pass localised it to "the video VAE
+   decode and/or the DiT int8 quant" — **that localisation was wrong.** The cause was the velocity head's
+   modulation table: the norm_out shift/scale row was staged at the staging call's narrow pitch instead of
+   the declared row width, so the table arrived all zeros at t>0 and both heads ran un-modulated. Two
+   lines fixed it and the fried look vanished at every quant; no quantisation was ever implicated, and
+   the decode-vs-denoise framing of this item is kept only as measured history.)* What this pass did
+   establish stands: not a schedule, sampler, keyframe, downscale or source-compression issue.
 
 **Shipped anyway** (the user asked for it, and it is correct and useful for other checkpoints/workflows):
 `shift` (video) and `audio_shift` (soundtrack) are now per-request `/v1/videos` fields, `(0,100]`, each
@@ -638,7 +646,7 @@ defaulting to the model's trained shift; echoed in the video object and advertis
 `video_shift`/`video_audio_shift`. Implementation is **ABI-invisible**: `VideoRequest` carries the two
 doubles, `video_schedule()` re-shifts that stream's sigma grid, and the shifted sigmas are staged through
 `RadVideoGenBatch::sched` — the plugin reads only sigmas/timesteps, never a shift scalar, so
-`RAD_ABI_VERSION` stays 24 and no plugin rebuilds. Files: `core/gen/video.h`, `core/gen/video_driver.cpp`,
+`RAD_ABI_VERSION` stayed 24 then (it is 27 now) and no plugin rebuilt. Files: `core/gen/video.h`, `core/gen/video_driver.cpp`,
 `core/server/iface.h` (`VideoGenInfo` shift), `core/engine.cpp` (populate), `core/server/videos.cpp`
 (allowlist/parse/echo/caps); tests in `videos_test.cpp`, `video_gen_test.cpp` (host, green). Device:
 `shift=4` accepted+echoed+renders.

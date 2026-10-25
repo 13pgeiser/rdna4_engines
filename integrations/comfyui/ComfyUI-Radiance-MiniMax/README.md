@@ -3,8 +3,9 @@
 One node: **Radiance MiniMax**. It calls a Radiance MiniMax-H3 server's
 `POST /v1/videos` over HTTP and hands back the finished clip.
 
-The node is a pure HTTP client — it loads **no model and no VRAM**. The ~60 GiB
-checkpoint lives in the radiance server process, which can be this machine
+The node is a pure HTTP client — it loads **no model and no VRAM**. The ~50–60 GiB
+checkpoint (size depends on the served container) lives in the radiance server process,
+which can be this machine
 (`http://127.0.0.1:8133`) or any TP2 box on the LAN (`http://192.168.1.x:8133`).
 Run three servers, point three copies of the node at them, one ComfyUI
 frontend drives all of them. No contention with radiance's VRAM, even when

@@ -2,13 +2,17 @@
 #
 # This is minimax-h3-fp8.recipe with the DiT's four per-token linears (qkv, output, gate_up, down)
 # quantised to symmetric int8 on a per-row 128-column grid instead of E4M3, and read by the w8a8
-# GEMMs. The point is the denoiser's OUTPUT QUALITY: E4M3 has three mantissa bits and clamps the
-# activation at 448, so the fp8a8 denoiser banded smooth gradients (a watercolour look) and clipped
-# highlights (oversaturated colour). int8 is 126 uniform levels a group with no clamp -- far finer on
-# the smooth per-token activations that carry detail -- at the same one byte a weight, so the
-# container's footprint and the served memory are unchanged. The text encoder, the token refiner and
-# the modulation (ada) projections stay E4M3: they are read once or a few times a step, not on every
-# token, so they are not the fidelity limit. Serve with the minimaxh3 plugin's W8A8 DiT path.
+# GEMMs. The point is the denoiser's OUTPUT FIDELITY: E4M3 has three mantissa bits and clamps the
+# activation at 448, while int8 is 126 uniform levels a group with no clamp -- far finer on the
+# smooth per-token activations that carry detail -- at the same one byte a weight, so the
+# container's footprint and the served memory are unchanged. The uniform int8 grid is also the
+# closest radiance gets to the int8-convrot releases the community's H3 finetunes ship in, so
+# W8A8 is the fidelity pick on that lineage. (Color and contrast artifacts once blamed on the
+# fp8 denoiser were NOT its quantisation: they were a modulation-table staging bug in the
+# velocity head, since fixed -- no quant was ever seen to band once that was repaired.) The text
+# encoder, the token refiner and the modulation (ada) projections stay E4M3: they are read once
+# or a few times a step, not on every token, so they are not the fidelity limit. Serve with the
+# minimaxh3 plugin's W8A8 DiT path.
 #
 #   rad-convert <MiniMax-H3 pipeline directory> --recipe data/recipes/minimax-h3-w8a8.recipe \
 #       -o minimax-h3-w8a8.rad

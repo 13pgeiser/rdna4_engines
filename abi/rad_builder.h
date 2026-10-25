@@ -1412,10 +1412,12 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_dit_hn_bytes;
     rad_buf       dbg_dit_nout;    /* [1, 3 * 2 * D] f32: this step's norm_out shift/scale row */
     int64_t       dbg_dit_nout_bytes;
-    /* #63 video-decoder value parity: f32 PERSIST windows of the ViT decoder's chain, read with the
-     * same R4D_DIT_SEL as the DiT dump (the decoder has no step; chunk 0 of one request carries it).
-     * The decoder is the one stage never parity-harnessed, and a pinned keyframe frame renders fried,
-     * which convicts decode, not denoise. blk/n/pix are PERSIST f32 twins of bf16 sources (the
+    /* #63 video-decoder value parity: f32 PERSIST windows of the video decoder's chain, read with
+     * the same R4D_DIT_SEL as the DiT dump (the decoder has no step; chunk 0 of one request carries
+     * it). The decoder was the one stage never parity-harnessed; this dump closes that gap. (An
+     * early fried-output hunt suspected decode from the keyframe pins -- the true culprit was the
+     * velocity head's modulation table, since fixed; the harness stands as the parity check.)
+     * blk/n/pix are PERSIST f32 twins of bf16 sources (the
      * widening cast); lat/x0 shadow f32 sources through the f32-bf16 narrowing cast (the only cast
      * row that reads f32), so those two files are raw bf16 (read as uint16, viewed as bfloat16) --
      * a few mantissa bits lost, far under the bf16 chain's own noise. lat is the latent window
