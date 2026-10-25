@@ -39,6 +39,7 @@ from comfy_api.latest import io, ui, Types
 from comfy_api.input_impl import VideoFromFile
 
 POLL_SECONDS = 3.0
+KEEPALIVE_SECONDS = 30.0
 LOG = "RadianceMiniMax"
 
 # The size law the minimaxh3 plugin declares (arch/minimaxh3/minimaxh3.cpp):
@@ -144,9 +145,12 @@ model: served id, GET /v1/models lists them.
 OUTPUTS: clip saved to the output folder under radiance/ AND returned
 as VIDEO (preview/chain) + file path + server job id. Progress bar
 tracks the job; `timeout` bounds the wait. The node prints a
-PROGRESS LINE to the ComfyUI console every poll (~3s):
+PROGRESS LINE to the ComfyUI console WHENEVER A STEP COMPLETES
+(it polls the job every 3s but prints only on a new step, phase
+change, or every 30s as a keep-alive -- mirroring the server's
+per-step log):
 "job_x: 45%, step 12/26, 5.2 s/step, eta ~1m 07s (+decode),
-elapsed 55s" -- the s/step is MEASURED from the step counter
+elapsed 55s" -- the s/step is MEASURED over >=2-step windows
 (smoothed, so it tracks a latent-upscale's draft->refine pace
 change), and the eta is remaining-steps x that pace. Real step
 counts come from a server built after Oct 2026; older servers
@@ -432,11 +436,11 @@ class RadianceMiniMax(io.ComfyNode):
                 "The clip is **saved to the output folder** under `radiance/` AND returned as "
                 "a `VIDEO` (preview/chain), plus the saved `file` path and server `job id`. "
                 "The node polls the job, drives its progress bar, and prints a live line to "
-                "the ComfyUI console every ~3 s (`45%, step 12/26, 5.2 s/step, eta ~1m 07s "
-                "(+decode)` — the pace is measured from the step counter and the eta is "
-                "remaining steps × that pace; real steps on a server built after Oct 2026, "
-                "`~step` derived from progress otherwise); `timeout` (advanced) bounds the "
-                "wait."),
+                "the ComfyUI console **per completed step** (keep-alive every 30 s) — "
+                "`45%, step 12/26, 5.2 s/step, eta ~1m 07s (+decode)`, the pace measured "
+                "from the step counter and the eta = remaining steps × that pace; real "
+                "steps on a server built after Oct 2026, `~step` derived from progress "
+                "otherwise); `timeout` (advanced) bounds the wait."),
             inputs=[
                 io.String.Input("server_url", default="http://127.0.0.1:8133",
                                 tooltip="the radiance server: http://<host>:8133 -- point it "
@@ -720,9 +724,11 @@ class RadianceMiniMax(io.ComfyNode):
         deadline = time.time() + timeout
         t0 = time.time()
         pace = _PaceTracker()
-        logging.info(f"[{LOG}] job {job_id} submitted -- progress lines every "
-                     f"{POLL_SECONDS:.0f}s below; `docker logs -f` on the server shows them "
-                     "per STEP too (a server built after Oct 2026)")
+        last_key, last_emit = None, 0.0
+        logging.info(f"[{LOG}] job {job_id} submitted -- one line per completed step "
+                     "below (a slow phase or stall still speaks every "
+                     f"{KEEPALIVE_SECONDS:.0f}s); `docker logs -f` on the server shows the "
+                     "same pace per STEP (a server built after Oct 2026)")
         while True:
             jr = s.get(f"{base}/v1/videos/{job_id}", timeout=30)
             jr.raise_for_status()
@@ -736,10 +742,18 @@ class RadianceMiniMax(io.ComfyNode):
             p = j.get("progress")
             if isinstance(p, (int, float)) and bar is not None:
                 bar.update_absolute(min(max(float(p), 0.0), 100.0))
-            # the heartbeat: ComfyUI's console gets a live line per poll, so a
-            # waiting user sees pace and eta instead of a silent spinner
+            # the heartbeat: polling is the only way a plain HTTP client learns
+            # anything (the server pushes nothing), but the CONSOLE LINE rides
+            # the step counter -- printed when a step completes (or the phase
+            # changes), keep-alive otherwise, so the log mirrors the server's
+            # own per-step line instead of repeating unchanged polls.
             now = time.time()
-            logging.info(f"[{LOG}] {job_id}: {_progress_line(j, num_inference_steps, now - t0, pace.update(j, now))}")
+            sps = pace.update(j, now)
+            done = j.get("steps_done")
+            key = (status, done if isinstance(done, int) else j.get("progress"))
+            if key != last_key or now - last_emit >= KEEPALIVE_SECONDS:
+                logging.info(f"[{LOG}] {job_id}: {_progress_line(j, num_inference_steps, now - t0, sps)}")
+                last_key, last_emit = key, now
             if now > deadline:
                 raise RuntimeError(f"job {job_id} still {status} after {timeout}s")
             time.sleep(POLL_SECONDS)

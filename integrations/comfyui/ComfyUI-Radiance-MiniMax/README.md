@@ -137,15 +137,18 @@ the `input/` folder.
   copy).
 - **job id** — the server-side job id, for `GET /v1/videos/<id>` or curl replay.
 
-While a job runs the node polls every 3 s, drives ComfyUI's node progress bar,
-**and prints a live line to the ComfyUI console** —
+While a job runs the node polls every 3 s and drives ComfyUI's node progress
+bar, and **prints a live line to the ComfyUI console once per completed step**
+(a keep-alive every 30 s covers encoding and any stall) —
 `[RadianceMiniMax] job_x: 45%, step 12/26, 5.2 s/step, eta ~1m 07s (+decode),
-elapsed 55s` — so a waiting user sees pace and progress, not a silent spinner.
-The `s/step` is **measured between polls** from the step counter and lightly
-smoothed, so it tracks the live pace — including the step-price jump when a
-latent-upscaled job switches from draft to refine grid — and the eta is
-remaining steps × that pace (the `+decode` tail is extra, as on the server's
-own log). Real step counts come from a radiance server built after Oct 2026
+elapsed 55s` — mirroring the server's own per-step log, so a waiting user sees
+pace and progress, not a silent spinner and not a poll-spammed wall of nearly
+identical lines. The `s/step` is **measured over ≥2-step windows** from the
+step counter and lightly smoothed, so it tracks the live pace — including the
+step-price jump when a latent-upscaled job switches from draft to refine grid
+— and the eta is remaining steps × that pace (the `+decode` tail is extra, as
+on the server's own log). Polling is unavoidable (the HTTP API pushes nothing);
+*printing* is event-driven off the step counter. Real step counts come from a radiance server built after Oct 2026
 (it added `steps_done`/`steps_total` to the job object); an older server shows
 `~step` derived from the job's `progress` field, which is the steps' share of
 0..90 by design, and extrapolates its eta from that progress. That same new
