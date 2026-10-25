@@ -3601,7 +3601,10 @@ impl HiddenStateRingBuffer {
 
     /// Publish a [`HiddenCommitDelta`] computed against the current head.
     pub fn apply_commit_delta(&mut self, delta: HiddenCommitDelta) {
-        debug_assert_eq!(delta.head_from, self.head, "stale hidden commit delta (head)");
+        debug_assert_eq!(
+            delta.head_from, self.head,
+            "stale hidden commit delta (head)"
+        );
         debug_assert_eq!(
             delta.written_from, self.written,
             "stale hidden commit delta (written)"
@@ -9890,13 +9893,62 @@ pub fn spec_step_dflash_with_railgun(
             argmax_per_pos: rv.argmax_per_pos,
             logits_per_pos: Vec::new(),
         }
-    } else { match verify_pm4 {
-        Some(route) => {
-            let replay_failures_before = route.counters().replay_failures;
-            let hip_windows =
-                |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
-            let hip_windows_before = hip_windows(route);
-            match verify_dflash_block_retained(
+    } else {
+        match verify_pm4 {
+            Some(route) => {
+                let replay_failures_before = route.counters().replay_failures;
+                let hip_windows =
+                    |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
+                let hip_windows_before = hip_windows(route);
+                match verify_dflash_block_retained(
+                    gpu,
+                    target,
+                    &block,
+                    position,
+                    hidden_rb,
+                    gdn_tape_opt.as_deref_mut(),
+                    want_full_logits,
+                    verify_scratch,
+                    route,
+                ) {
+                    Ok(out) => {
+                        same_as_hip_graph = hip_windows(route) == hip_windows_before + 1;
+                        out
+                    }
+                    Err(error) => {
+                        // Fail closed when quiescence was never proven: a PM4 body
+                        // may still be executing against KV, DeltaNet state, and
+                        // hidden staging, so restoring or re-running would race it.
+                        if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
+                            return Err(error);
+                        }
+                        // Not a retained-execution failure — an ordinary model
+                        // error propagates exactly as it does on the HIP path.
+                        if route.counters().replay_failures == replay_failures_before {
+                            return Err(error);
+                        }
+                        // Proven-quiescent replay failure. Rewind the recurrent
+                        // state to the pre-window snapshot and redo the window on
+                        // the ordinary route; KV slots, hidden staging,
+                        // final_hidden, and the GDN tape are all overwritten by the
+                        // retry, and the ring is committed exactly once because the
+                        // failed attempt never committed.
+                        target_snap.restore_to(&mut target.dn_state, gpu)?;
+                        route.note_safe_hip_retry();
+                        verify_dflash_block(
+                            gpu,
+                            target,
+                            &block,
+                            position,
+                            hidden_rb,
+                            gdn_tape_opt.as_deref_mut(),
+                            want_full_logits,
+                            verify_scratch,
+                        )?
+                    }
+                }
+            }
+            None => verify_dflash_block(
                 gpu,
                 target,
                 &block,
@@ -9905,56 +9957,9 @@ pub fn spec_step_dflash_with_railgun(
                 gdn_tape_opt.as_deref_mut(),
                 want_full_logits,
                 verify_scratch,
-                route,
-            ) {
-                Ok(out) => {
-                    same_as_hip_graph = hip_windows(route) == hip_windows_before + 1;
-                    out
-                }
-                Err(error) => {
-                    // Fail closed when quiescence was never proven: a PM4 body
-                    // may still be executing against KV, DeltaNet state, and
-                    // hidden staging, so restoring or re-running would race it.
-                    if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
-                        return Err(error);
-                    }
-                    // Not a retained-execution failure — an ordinary model
-                    // error propagates exactly as it does on the HIP path.
-                    if route.counters().replay_failures == replay_failures_before {
-                        return Err(error);
-                    }
-                    // Proven-quiescent replay failure. Rewind the recurrent
-                    // state to the pre-window snapshot and redo the window on
-                    // the ordinary route; KV slots, hidden staging,
-                    // final_hidden, and the GDN tape are all overwritten by the
-                    // retry, and the ring is committed exactly once because the
-                    // failed attempt never committed.
-                    target_snap.restore_to(&mut target.dn_state, gpu)?;
-                    route.note_safe_hip_retry();
-                    verify_dflash_block(
-                        gpu,
-                        target,
-                        &block,
-                        position,
-                        hidden_rb,
-                        gdn_tape_opt.as_deref_mut(),
-                        want_full_logits,
-                        verify_scratch,
-                    )?
-                }
-            }
+            )?,
         }
-        None => verify_dflash_block(
-            gpu,
-            target,
-            &block,
-            position,
-            hidden_rb,
-            gdn_tape_opt.as_deref_mut(),
-            want_full_logits,
-            verify_scratch,
-        )?,
-    } };
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;

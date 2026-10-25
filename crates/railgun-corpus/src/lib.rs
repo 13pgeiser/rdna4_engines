@@ -448,8 +448,12 @@ impl JitCorpus {
                 receipt.schema, receipt.schema_version, receipt.railgun.section_version)));
         }
         for k in &receipt.railgun.kernels {
-            k.validate_case(&receipt.object_sha256, &receipt.device_elf_sha256, &receipt.arch)
-                .map_err(invalid)?;
+            k.validate_case(
+                &receipt.object_sha256,
+                &receipt.device_elf_sha256,
+                &receipt.arch,
+            )
+            .map_err(invalid)?;
         }
         if receipt.object_sha256 != key.artifact_sha256 || receipt.arch != key.arch {
             return Err(invalid(format!(

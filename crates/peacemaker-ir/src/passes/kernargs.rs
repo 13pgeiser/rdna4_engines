@@ -82,9 +82,7 @@ use crate::metadata::Kernarg;
 use crate::operand::{ImmField, InlineConst, Operand, Special};
 use crate::reg::Kind;
 
-use super::kernarg_ix::{
-    certify, certify_source, load_ext, Interner, Ix, KargKind, CARRY_SCALAR,
-};
+use super::kernarg_ix::{certify, certify_source, load_ext, Interner, Ix, KargKind, CARRY_SCALAR};
 
 /// Kernarg dwords tracked individually (512 bytes). Kernels with a larger
 /// segment fall back to the overflow flags: an overflowing pointer root is
@@ -1053,7 +1051,9 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
                     offset,
                     size,
                     value,
-                } if offset % 4 == 0 && (size == 8 || (size == 4 && value <= u64::from(u32::MAX))) => {
+                } if offset % 4 == 0
+                    && (size == 8 || (size == 4 && value <= u64::from(u32::MAX))) =>
+                {
                     let words = if size == 8 { 2 } else { 1 };
                     (0..words).all(|i| {
                         let word = (value >> (32 * i)) as u32;
@@ -2144,6 +2144,17 @@ impl<'k> Analyzer<'k> {
                 ));
                 return;
             }
+            // gfx12 PC-relative sequence: `s_getpc_b64; s_sext_i32_i16 hi, hi` re-canonicalises the 48-bit PC's
+            // high half. Only a value that is purely PCREL (no kernarg roots, no taint) keeps it.
+            "s_sext_i32_i16" => {
+                if let Some(src) = part.field("SSRC0") {
+                    let v = self.vals(st, src)[0];
+                    if v.src == PCREL && v.roots.is_empty() && v.taint.is_empty() {
+                        writes.push((defs[0].op, smallvec::smallvec![Val::src(PCREL)]));
+                        return;
+                    }
+                }
+            }
             _ => {}
         }
         if is_mov(name) {
@@ -2942,9 +2953,7 @@ impl<'k> Analyzer<'k> {
                 }
             }
             (None, Some(f)) => match f.op {
-                Operand::Reg(r) if r.kind == Kind::V && r.len == 2 => {
-                    pair(it, &self.vals(st, f))
-                }
+                Operand::Reg(r) if r.kind == Kind::V && r.len == 2 => pair(it, &self.vals(st, f)),
                 _ => Ix::NONE,
             },
             (None, None) => Ix::NONE,
@@ -2978,8 +2987,7 @@ impl<'k> Analyzer<'k> {
             return Ix::NONE;
         }
         let mut it = self.ix.borrow_mut();
-        let Ok((src_arg_offset, byte_offset)) =
-            certify_source(&it, addr, &|o| self.karg_kind(o))
+        let Ok((src_arg_offset, byte_offset)) = certify_source(&it, addr, &|o| self.karg_kind(o))
         else {
             return Ix::NONE;
         };
@@ -3433,6 +3441,32 @@ mod tests {
         &[("a", 0, 8, "global_buffer"), ("b", 8, 8, "global_buffer")];
 
     #[test]
+    fn pc_relative_base_survives_the_gfx12_high_half_sext() {
+        // s_getpc_b64 s[4:5]; s_sext_i32_i16 s5, s5; global_load_b32 v1, v0, s[4:5]
+        let f = facts(
+            &[
+                0xbe844700, 0xbe850f05, 0xee050004, 0x00000001, 0x00000000, 0xbfb00000,
+            ],
+            PTRS,
+        );
+        assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+        assert_eq!(f.side.module_global, 1);
+    }
+
+    #[test]
+    fn kernarg_pointer_does_not_survive_a_high_half_sext() {
+        // s_load_b64 s[4:5], s[0:1], 0; s_wait_kmcnt 0; s_sext_i32_i16 s5, s5; global_load_b32 v1, v0, s[4:5]
+        let f = facts(
+            &[
+                0xf4000100, 0xf8000000, 0xbfc70000, 0xbe850f05, 0xee050004, 0x00000001, 0x00000000,
+                0xbfb00000,
+            ],
+            PTRS,
+        );
+        assert_ne!(f.status, KernelStatus::Proven);
+    }
+
+    #[test]
     fn base_saved_and_restored_through_lanes_is_attributed() {
         // s_load_b128 s[4:7], s[0:1]; v_writelane_b32 v40, s6, 0; v_writelane_b32 v40, s7, 1;
         // s_mov_b64 s[6:7], 0; v_readlane_b32 s10, v40, 0; v_readlane_b32 s11, v40, 1;
@@ -3698,9 +3732,19 @@ mod tests {
         let e = &f.indexed[0];
         assert_eq!(
             (e.base_arg_offset, e.mode, e.class, e.path, e.width_bytes),
-            (0, AccessMode::Write, AccessClass::VmemStore, MemPath::Global, 4)
+            (
+                0,
+                AccessMode::Write,
+                AccessClass::VmemStore,
+                MemPath::Global,
+                4
+            )
         );
-        assert_eq!((e.pc, e.cache), (13, CacheBits::default()), "store pc, no cache bits");
+        assert_eq!(
+            (e.pc, e.cache),
+            (13, CacheBits::default()),
+            "store pc, no cache bits"
+        );
         assert_eq!(disp(e), "(mul (sext load:0) (sext karg32:24))");
         let il = &e.index_loads[0];
         assert_eq!(
@@ -3710,7 +3754,10 @@ mod tests {
         assert_eq!(il.byte_offset.to_string(), "c64:4");
         assert_eq!(il.ext, [crate::kernarg::IndexExt::Sext64]);
         // dst write / P read, allocation-wide, scalar-cache read of P.
-        assert_eq!((mode(&f, 0), mode(&f, 8)), (Some(AccessMode::Write), Some(AccessMode::Read)));
+        assert_eq!(
+            (mode(&f, 0), mode(&f, 8)),
+            (Some(AccessMode::Write), Some(AccessMode::Read))
+        );
         assert_eq!(f.arg_at(8).unwrap().read_cache, ReadCacheClass::ScalarOnly);
         assert!(f.guards.is_empty() && e.guards.is_empty());
         // The legacy lattice drops the loaded index through the sign extension
@@ -3781,8 +3828,8 @@ mod tests {
         let f = gfacts(
             &[
                 0xf4004100, 0xf8000000, 0xbfc70000, 0xf4000203, 0xf8000000, 0xbfc70000, 0xbe8a0008,
-                0x80040a04, 0x82058005, 0x7e020280, 0x7e040283, 0xee068004, 0x01000000,
-                0x00000001, 0xbfb00000,
+                0x80040a04, 0x82058005, 0x7e020280, 0x7e040283, 0xee068004, 0x01000000, 0x00000001,
+                0xbfb00000,
             ],
             IDX,
         );
@@ -3814,7 +3861,10 @@ mod tests {
         let f = gfacts(LOAD_NOT_ADDRESS, IDX);
         assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
         assert!(f.indexed.is_empty() && f.guards.is_empty());
-        assert_eq!((mode(&f, 0), mode(&f, 8)), (Some(AccessMode::Write), Some(AccessMode::Read)));
+        assert_eq!(
+            (mode(&f, 0), mode(&f, 8)),
+            (Some(AccessMode::Write), Some(AccessMode::Read))
+        );
     }
 
     #[test]
@@ -3823,9 +3873,18 @@ mod tests {
         let b = gfacts(SEXT_MUL_SWAPPED, IDX);
         assert_eq!(b.status, KernelStatus::Conditional, "{:?}", b.unresolved);
         let (ea, eb) = (&a.indexed[0], &b.indexed[0]);
-        assert_eq!((ea.base_arg_offset, ea.index_loads[0].src_arg_offset), (0, 8));
-        assert_eq!((eb.base_arg_offset, eb.index_loads[0].src_arg_offset), (8, 0));
-        assert_eq!((mode(&b, 0), mode(&b, 8)), (Some(AccessMode::Read), Some(AccessMode::Write)));
+        assert_eq!(
+            (ea.base_arg_offset, ea.index_loads[0].src_arg_offset),
+            (0, 8)
+        );
+        assert_eq!(
+            (eb.base_arg_offset, eb.index_loads[0].src_arg_offset),
+            (8, 0)
+        );
+        assert_eq!(
+            (mode(&b, 0), mode(&b, 8)),
+            (Some(AccessMode::Read), Some(AccessMode::Write))
+        );
         assert_ne!(a.indexed, b.indexed);
     }
 
@@ -3833,7 +3892,12 @@ mod tests {
     fn store_width_and_hidden_grid_dependency_are_reflected() {
         let narrow = gfacts(SEXT_MUL, IDX);
         let wide = gfacts(SEXT_MUL_B64, IDX);
-        assert_eq!(wide.status, KernelStatus::Conditional, "{:?}", wide.unresolved);
+        assert_eq!(
+            wide.status,
+            KernelStatus::Conditional,
+            "{:?}",
+            wide.unresolved
+        );
         assert_eq!(
             (narrow.indexed[0].width_bytes, wide.indexed[0].width_bytes),
             (4, 8)
@@ -3848,8 +3912,16 @@ mod tests {
                 ("bcx", 24, 4, "hidden_block_count_x"),
             ],
         );
-        assert_eq!(hidden.status, KernelStatus::Conditional, "{:?}", hidden.unresolved);
-        assert_eq!(disp(&hidden.indexed[0]), "(mul (sext load:0) (sext karg32:24))");
+        assert_eq!(
+            hidden.status,
+            KernelStatus::Conditional,
+            "{:?}",
+            hidden.unresolved
+        );
+        assert_eq!(
+            disp(&hidden.indexed[0]),
+            "(mul (sext load:0) (sext karg32:24))"
+        );
         assert_eq!(hidden.implicit.hidden_grid_live, ["hidden_block_count_x"]);
         assert!(narrow.implicit.hidden_grid_live.is_empty());
     }
@@ -3858,7 +3930,12 @@ mod tests {
     fn unknown(words: &[u32], why: &str) {
         let f = gfacts(words, IDX);
         assert_eq!(f.status, KernelStatus::Unknown, "{why}");
-        assert_eq!(rules(&f), ["base-memory-derived"], "{why}: {:?}", f.unresolved);
+        assert_eq!(
+            rules(&f),
+            ["base-memory-derived"],
+            "{why}: {:?}",
+            f.unresolved
+        );
         assert!(f.indexed.iter().all(|e| e.index_loads.len() == 1), "{why}");
     }
 
@@ -3867,25 +3944,24 @@ mod tests {
         // s_load_b64 s[8:9], s[6:7]; store through s[8:9].
         unknown(
             &[
-                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4002203, 0xf8000000, 0xbfc70000,
-                0x7e020280, 0x7e040287, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4002203, 0xf8000000, 0xbfc70000, 0x7e020280,
+                0x7e040287, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
             ],
             "loaded 64-bit pointer dereference",
         );
         // s_load_b128 s[8:11], s[6:7]; buffer_store through that V#.
         unknown(
             &[
-                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4004203, 0xf8000000, 0xbfc70000,
-                0x7e020280, 0x7e040287, 0xc406807c, 0x40801002, 0x00000001, 0xbfb00000,
+                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4004203, 0xf8000000, 0xbfc70000, 0x7e020280,
+                0x7e040287, 0xc406807c, 0x40801002, 0x00000001, 0xbfb00000,
             ],
             "descriptor-built pointer base",
         );
         // Two loaded 32-bit halves reassembled as s[8:9].
         unknown(
             &[
-                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4000203, 0xf8000000, 0xf4000243,
-                0xf8000004, 0xbfc70000, 0x7e020280, 0x7e040287, 0xee068008, 0x01000000,
-                0x00000001, 0xbfb00000,
+                0xf4004100, 0xf8000000, 0xbfc70000, 0xf4000203, 0xf8000000, 0xf4000243, 0xf8000004,
+                0xbfc70000, 0x7e020280, 0x7e040287, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
             ],
             "two loaded32 halves as a pointer",
         );

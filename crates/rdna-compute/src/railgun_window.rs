@@ -30,9 +30,8 @@ use railgun::Binding;
 use railgun_corpus::window::{ConditionalWitness, NodeRoute, RuntimeNode, WindowManifest};
 use railgun_corpus::{sha256_hex, JitCorpus};
 
-use crate::replay::railgun_lower::{
-    KernargMismatch, LoweringContext, OwnedWindowLowering, SelfCheckFailure,
-};
+pub use crate::replay::railgun_lower::LowerTiming;
+use crate::replay::railgun_lower::{LoweringContext, OwnedWindowLowering, SelfCheckFailure};
 use crate::replay::railgun_shadow::{arch_lowering, lookup_facts, probe};
 use crate::replay::ReplayQuiescence;
 use crate::Gpu;
@@ -255,8 +254,8 @@ fn mismatch_report(
 }
 
 fn read_manifest(path: &Path) -> Result<WindowManifest, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("window manifest {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("window manifest {}: {e}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("window manifest {}: {e}", path.display()))
 }
 
@@ -313,10 +312,7 @@ fn select_manifest<'m>(
         .map(|(_, m)| m)
         .find(|m| same(m))
         .ok_or_else(|| {
-            let sequence: String = nodes
-                .iter()
-                .map(|(s, a)| format!("{s}\t{a}\n"))
-                .collect();
+            let sequence: String = nodes.iter().map(|(s, a)| format!("{s}\t{a}\n")).collect();
             format!(
                 "no window manifest of the {} loaded covers this window's node sequence \
                  ({} nodes, sequence {}); dump it with HIPFIRE_DFLASH_RAILGUN_SEQUENCE_OUT \
@@ -436,15 +432,44 @@ impl Gpu {
                 }
             )*};
         }
-        tensor!(mq_signs1, mq_signs2, mq_signs1_128, mq_signs2_128, mq_x_rot, argmax_host,
-            gemv_residual_tmp, mq6_fp8_x_rot, paro_x_scratch);
-        buf!(mq_x_rot_fp8, mq_x_q8, mq_x_scales, mq_rmsnorm_wavegrid_scratch, gdn_pair_counters,
-            mq_rmsnorm_awq_wavegrid_scratch, fp16_x_scratch, qsa_select_scores, gdn_state_f32,
-            qsa_gather_f16, fp8_x_scratch, q8_1_mmq_x_scratch, int4_mmq_x_scratch,
-            int4_mmq_down_scratch, int8_mmq_x_scratch, mq4v2_fp8_x_scratch,
-            mq4v2_fp8_half_sums_scratch, mq4v2_fp8_row_scales_scratch, fp8_verify_x8_scratch,
-            fp8_verify_scales_scratch, fp8_f2_weights, ksplit_det_partials, sample_partials,
-            fa2_q16_scratch, fa2_fp8_q_scratch);
+        tensor!(
+            mq_signs1,
+            mq_signs2,
+            mq_signs1_128,
+            mq_signs2_128,
+            mq_x_rot,
+            argmax_host,
+            gemv_residual_tmp,
+            mq6_fp8_x_rot,
+            paro_x_scratch
+        );
+        buf!(
+            mq_x_rot_fp8,
+            mq_x_q8,
+            mq_x_scales,
+            mq_rmsnorm_wavegrid_scratch,
+            gdn_pair_counters,
+            mq_rmsnorm_awq_wavegrid_scratch,
+            fp16_x_scratch,
+            qsa_select_scores,
+            gdn_state_f32,
+            qsa_gather_f16,
+            fp8_x_scratch,
+            q8_1_mmq_x_scratch,
+            int4_mmq_x_scratch,
+            int4_mmq_down_scratch,
+            int8_mmq_x_scratch,
+            mq4v2_fp8_x_scratch,
+            mq4v2_fp8_half_sums_scratch,
+            mq4v2_fp8_row_scales_scratch,
+            fp8_verify_x8_scratch,
+            fp8_verify_scales_scratch,
+            fp8_f2_weights,
+            ksplit_det_partials,
+            sample_partials,
+            fa2_q16_scratch,
+            fa2_fp8_q_scratch
+        );
         out
     }
 
@@ -481,6 +506,19 @@ impl Gpu {
         program: &KernelProgram,
         plan: &Pm4Plan,
     ) -> Result<RailgunWindowQueue, String> {
+        let artifacts = self.railgun_resolve_artifacts(program)?;
+        ctx.lower(&self.arch, program, plan, &artifacts)
+    }
+
+    /// The loaded code object behind every node of `program`, each proven to
+    /// be exactly the object the node's `kref` certifies (a node without a
+    /// `kref`, or whose loaded digest differs, refuses). Host-side and
+    /// quick; the result is what [`RailgunLoweringContext::lower`] needs and
+    /// is `Send`, so the lowering itself can run on another thread.
+    pub fn railgun_resolve_artifacts(
+        &self,
+        program: &KernelProgram,
+    ) -> Result<RailgunArtifacts, String> {
         if program.arch != self.arch {
             return Err(format!(
                 "program arch {} is not the device arch {}",
@@ -504,18 +542,9 @@ impl Gpu {
             }
             artifacts.push(artifact.clone());
         }
-        let lowering = ctx
-            .inner
-            .lower(program, plan, arch_lowering(&self.arch), &artifacts)?;
-        Ok(RailgunWindowQueue {
-            resources: program.resources.iter().map(|r| (r.base, r.bytes)).collect(),
-            resource_names: Vec::new(),
-            symbols: program.nodes.iter().map(|n| n.symbol.clone()).collect(),
-            self_check: false,
-            last: vec![None; program.nodes.len()],
-            grids: program.nodes.iter().map(|n| Some(n.grid)).collect(),
-            lowering,
-            failure: None,
+        Ok(RailgunArtifacts {
+            arch: self.arch.clone(),
+            artifacts,
         })
     }
 }
@@ -532,6 +561,51 @@ impl RailgunLoweringContext {
     pub fn loaded_objects(&self) -> usize {
         self.inner.loaded_objects()
     }
+
+    /// Lower `program` (one single-segment, all-PM4 window) through railgun's
+    /// own gfx12 transport with the code objects `artifacts` resolved on the
+    /// owner thread. Needs no `Gpu`, so it may run on a background thread.
+    /// Nothing is submitted.
+    pub fn lower(
+        &mut self,
+        arch: &str,
+        program: &KernelProgram,
+        plan: &Pm4Plan,
+        artifacts: &RailgunArtifacts,
+    ) -> Result<RailgunWindowQueue, String> {
+        if artifacts.arch != arch || program.arch != arch {
+            return Err(format!(
+                "program arch {}, artifacts for {}, device arch {arch}",
+                program.arch, artifacts.arch
+            ));
+        }
+        let (lowering, timing) =
+            self.inner
+                .lower(program, plan, arch_lowering(arch), &artifacts.artifacts)?;
+        Ok(RailgunWindowQueue {
+            resources: program
+                .resources
+                .iter()
+                .map(|r| (r.base, r.bytes))
+                .collect(),
+            resource_names: Vec::new(),
+            symbols: program.nodes.iter().map(|n| n.symbol.clone()).collect(),
+            self_check: false,
+            last: vec![None; program.nodes.len()],
+            grids: program.nodes.iter().map(|n| Some(n.grid)).collect(),
+            lowering,
+            failure: None,
+            timing,
+        })
+    }
+}
+
+/// The loaded code objects of one program's nodes, resolved by
+/// [`Gpu::railgun_resolve_artifacts`].
+#[derive(Clone)]
+pub struct RailgunArtifacts {
+    arch: String,
+    artifacts: Vec<crate::code_object::RecordedArtifact>,
 }
 
 // SAFETY: the context is owned by one window builder and only used through
@@ -567,6 +641,8 @@ pub struct RailgunWindowQueue {
     grids: Vec<Option<[u32; 3]>>,
     /// The outcome of the last submit when it failed; what `wait` reports.
     failure: Option<QueueFailure>,
+    /// Where lowering this queue spent its time.
+    timing: LowerTiming,
 }
 
 // SAFETY: `RailgunWindowQueue` is only ever driven through `&mut self`, so
@@ -589,6 +665,12 @@ impl RailgunWindowQueue {
     /// Command dwords of the retained indirect buffer.
     pub fn command_dwords(&self) -> u32 {
         self.lowering.command_dwords()
+    }
+
+    /// Where lowering this queue spent its time (code objects loaded vs
+    /// kernarg allocation / IB emission / graph creation).
+    pub fn lowering_timing(&self) -> LowerTiming {
+        self.timing
     }
 
     /// Name the program's resources (index order) for the self-check report.
@@ -686,7 +768,13 @@ impl WindowQueue for RailgunWindowQueue {
             let grids: Vec<[u32; 3]> = nodes.iter().map(|n| n.grid).collect();
             if let Err(f) = self.lowering.verify_state(&self.symbols, &images, &grids) {
                 eprintln!("[dflash-railgun] {LOWERING_SELF_CHECK} FAILED: {}", f.first);
-                for line in mismatch_report(&f, &self.resources, &self.resource_names, &self.lowering.kernarg_ranges(), &images) {
+                for line in mismatch_report(
+                    &f,
+                    &self.resources,
+                    &self.resource_names,
+                    &self.lowering.kernarg_ranges(),
+                    &images,
+                ) {
                     eprintln!("{line}");
                 }
                 *LAST_SELF_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = Some(
@@ -742,6 +830,7 @@ impl WindowQueue for RailgunWindowQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::railgun_lower::KernargMismatch;
     use railgun_corpus::window::{
         sequence_digest, WindowNodeRecord, WHOLE16_SHAPE, WINDOW_MANIFEST_SCHEMA,
         WINDOW_MANIFEST_VERSION,
@@ -759,10 +848,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rdna-railgun-window-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rdna-railgun-window-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -831,19 +918,18 @@ mod tests {
             abi: Vec::new(),
         };
         let path = dir.join("manifest.json");
-        std::fs::write(&path, serde_json::to_vec(&manifest).expect("manifest serialises"))
-            .expect("write manifest");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&manifest).expect("manifest serialises"),
+        )
+        .expect("write manifest");
         path
     }
 
     fn open(dir: &Path) -> WindowCorpus {
         write_corpus(dir, TOOLCHAIN_ID);
-        WindowCorpus::open_pinned(
-            ARCH.to_owned(),
-            sha256_hex(TOOLCHAIN_ID.as_bytes()),
-            dir,
-        )
-        .expect("corpus opens")
+        WindowCorpus::open_pinned(ARCH.to_owned(), sha256_hex(TOOLCHAIN_ID.as_bytes()), dir)
+            .expect("corpus opens")
     }
 
     fn plan(entries: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -885,7 +971,10 @@ mod tests {
             .admit_manifest(&path, &plan(&[("beta", &sha('8')), ("alpha", &sha('7'))]))
             .expect_err("a reordered plan is refused");
         assert!(wrong_order.contains("node 0 beta"), "{wrong_order}");
-        assert!(wrong_order.contains("manifest names alpha"), "{wrong_order}");
+        assert!(
+            wrong_order.contains("manifest names alpha"),
+            "{wrong_order}"
+        );
         let truncated = corpus
             .admit_manifest(&path, &plan(&[("alpha", &sha('7'))]))
             .expect_err("a short plan is refused");
@@ -901,8 +990,7 @@ mod tests {
             .map(|i| record(i, &format!("k{i}"), &sha('7')))
             .collect();
         let path = write_manifest(&dir, records);
-        let wrong: Vec<(String, String)> =
-            (0..12).map(|i| (format!("k{i}"), sha('6'))).collect();
+        let wrong: Vec<(String, String)> = (0..12).map(|i| (format!("k{i}"), sha('6'))).collect();
         let error = corpus
             .admit_manifest(&path, &wrong)
             .expect_err("every node is the wrong object");
@@ -953,15 +1041,30 @@ mod tests {
             ],
         );
         let short = plan(&[("alpha", &sha('7')), ("beta", &sha('8'))]);
-        let long = plan(&[("alpha", &sha('7')), ("alpha", &sha('7')), ("beta", &sha('8'))]);
-        corpus.admit_manifest(&manifests, &short).expect("short family");
-        corpus.admit_manifest(&manifests, &long).expect("long family");
-        corpus.admit_manifest_witnessed(&manifests, &short, &[]).expect("short, witnessed");
-        corpus.admit_manifest_witnessed(&manifests, &long, &[]).expect("long, witnessed");
+        let long = plan(&[
+            ("alpha", &sha('7')),
+            ("alpha", &sha('7')),
+            ("beta", &sha('8')),
+        ]);
+        corpus
+            .admit_manifest(&manifests, &short)
+            .expect("short family");
+        corpus
+            .admit_manifest(&manifests, &long)
+            .expect("long family");
+        corpus
+            .admit_manifest_witnessed(&manifests, &short, &[])
+            .expect("short, witnessed");
+        corpus
+            .admit_manifest_witnessed(&manifests, &long, &[])
+            .expect("long, witnessed");
         // An unknown sequence is one refusal naming the sequence, not a node dump.
         let unknown = plan(&[("alpha", &sha('7')), ("gamma", &sha('9'))]);
         let e = corpus.admit_manifest(&manifests, &unknown).unwrap_err();
-        assert!(e.contains("no window manifest of the 2 loaded covers"), "{e}");
+        assert!(
+            e.contains("no window manifest of the 2 loaded covers"),
+            "{e}"
+        );
         assert!(!e.contains("refusals"), "{e}");
         let e = corpus
             .admit_manifest_witnessed(&manifests, &unknown, &[])
@@ -981,7 +1084,11 @@ mod tests {
 
     #[test]
     fn the_mismatch_report_places_the_buffer_among_the_bound_allocations() {
-        let kernargs = vec![(0x10_0000u64, 280usize, 4096usize), (0x10_1000, 280, 4096), (0x20_0000, 64, 4096)];
+        let kernargs = vec![
+            (0x10_0000u64, 280usize, 4096usize),
+            (0x10_1000, 280, 4096),
+            (0x20_0000, 64, 4096),
+        ];
         let f = SelfCheckFailure {
             first: "node 1 k".into(),
             kernarg: vec![KernargMismatch {
@@ -1000,18 +1107,29 @@ mod tests {
         };
         // r0 ends 0x40 bytes below the buffer, r1 starts 0x100 above its
         // allocation, r2 overlaps it.
-        let resources = [(0x10_0000u64, 0x1000 - 0x40), (0x10_2100, 256), (0x10_1800, 0x100)];
+        let resources = [
+            (0x10_0000u64, 0x1000 - 0x40),
+            (0x10_2100, 256),
+            (0x10_1800, 0x100),
+        ];
         // Node 0's image holds a pointer 8 bytes below the buffer.
         let mut image0 = vec![0u8; 16];
         image0[8..16].copy_from_slice(&(0x10_1000u64 - 8).to_le_bytes());
         let images: Vec<&[u8]> = vec![&image0, &[], &[]];
-        let names = vec!["".to_owned(), "".to_owned(), "fp8_verify_x8_scratch".to_owned()];
+        let names = vec![
+            "".to_owned(),
+            "".to_owned(),
+            "fp8_verify_x8_scratch".to_owned(),
+        ];
         let report = mismatch_report(&f, &resources, &names, &kernargs, &images);
         let all = report.join("\n");
         assert!(report[0].contains("1 of 3 kernarg buffers differ"), "{all}");
         assert!(all.contains("buffer 0x101000+280 (alloc 4096)"), "{all}");
         assert!(all.contains("expected 00006078 actual 27c231be"), "{all}");
-        assert!(all.contains("overlaps program resources: r2(fp8_verify_x8_scratch)[0x101800+256]"), "{all}");
+        assert!(
+            all.contains("overlaps program resources: r2(fp8_verify_x8_scratch)[0x101800+256]"),
+            "{all}"
+        );
         assert!(all.contains("r0 ends 64 B below"), "{all}");
         assert!(all.contains("r1 starts 256 B above"), "{all}");
         assert!(all.contains("node 0 +8=0x100ff8"), "{all}");
@@ -1036,13 +1154,10 @@ mod tests {
     fn open_refuses_a_corpus_from_another_toolchain() {
         let dir = scratch("pin");
         write_corpus(&dir, "AMD clang version other");
-        let error = WindowCorpus::open_pinned(
-            ARCH.to_owned(),
-            sha256_hex(TOOLCHAIN_ID.as_bytes()),
-            &dir,
-        )
-        .err()
-        .expect("a foreign toolchain pin is refused");
+        let error =
+            WindowCorpus::open_pinned(ARCH.to_owned(), sha256_hex(TOOLCHAIN_ID.as_bytes()), &dir)
+                .err()
+                .expect("a foreign toolchain pin is refused");
         assert!(error.contains("is not the corpus pin"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }

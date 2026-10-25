@@ -6,8 +6,8 @@
 //! No link-time dependency — runtime loads the shared library.
 
 use crate::error::{HipError, HipResult};
-use crate::{DeviceBuffer, MemcpyKind};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
+use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
@@ -1584,7 +1584,9 @@ impl HipRuntime {
     #[inline]
     fn plan_deny(&self, api: &str) -> HipResult<()> {
         if self.plan.active() {
-            Err(self.plan.refuse(&format!("HIP API {api} reached in plan mode")))
+            Err(self
+                .plan
+                .refuse(&format!("HIP API {api} reached in plan mode")))
         } else {
             Ok(())
         }
@@ -2533,7 +2535,14 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
-        if let Some(r) = self.plan_copy_at("hipMemcpy D2D at offset", dst, dst_offset, src, src_offset, size) {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpy D2D at offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
             return r;
         }
         assert!(dst_offset + size <= dst.size);
@@ -2768,7 +2777,13 @@ impl HipRuntime {
     #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
         if self.plan.active() {
-            return self.plan.memset_bytes("hipMemset", buf.as_ptr() as u64, buf.size(), value, size);
+            return self.plan.memset_bytes(
+                "hipMemset",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
         }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
@@ -2809,7 +2824,13 @@ impl HipRuntime {
         stream: Option<&Stream>,
     ) -> HipResult<()> {
         if self.plan.active() {
-            return self.plan.memset_words("hipMemsetD32Async", buf.as_ptr() as u64, buf.size(), value, count);
+            return self.plan.memset_words(
+                "hipMemsetD32Async",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                count,
+            );
         }
         assert!(count * 4 <= buf.size);
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
@@ -2832,7 +2853,13 @@ impl HipRuntime {
         stream: &Stream,
     ) -> HipResult<()> {
         if self.plan.active() {
-            return self.plan.memset_bytes("hipMemsetAsync", buf.as_ptr() as u64, buf.size(), value, size);
+            return self.plan.memset_bytes(
+                "hipMemsetAsync",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
         }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
@@ -3024,7 +3051,8 @@ impl HipRuntime {
         }
         if self.plan.witnessing() {
             // kernelParams form: the kernarg bytes are not recoverable here.
-            self.plan.witness_launch(func.0 as usize, grid, block, shared_mem, &[]);
+            self.plan
+                .witness_launch(func.0 as usize, grid, block, shared_mem, &[]);
         }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
@@ -3093,7 +3121,8 @@ impl HipRuntime {
     ) -> HipResult<()> {
         if self.plan.active() {
             self.validate_launch_grid(grid)?;
-            self.plan.launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
+            self.plan
+                .launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
             return Ok(());
         }
         if self.plan.witnessing() {
@@ -3372,7 +3401,14 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
-        if let Some(r) = self.plan_copy_at("hipMemcpyAsync D2D offset", dst, dst_offset, src, src_offset, size) {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
             return r;
         }
         assert!(dst_offset + size <= dst.size);
@@ -3412,7 +3448,14 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
-        if let Some(r) = self.plan_copy_at("hipMemcpyAsync D2D offset default stream", dst, dst_offset, src, src_offset, size) {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset default stream",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
             return r;
         }
         assert!(dst_offset + size <= dst.size);

@@ -446,7 +446,10 @@ pub fn build_with(
         let receipt = match receipt {
             Ok(r) => &*r,
             Err(err) => {
-                refuse(&mut refusals, format!("railgun-cert rejected the object: {err}"));
+                refuse(
+                    &mut refusals,
+                    format!("railgun-cert rejected the object: {err}"),
+                );
                 continue;
             }
         };
@@ -457,7 +460,11 @@ pub fn build_with(
             );
         }
         let (Some(record), Some(identity)) = (
-            receipt.railgun.kernels.iter().find(|k| k.symbol == e.symbol),
+            receipt
+                .railgun
+                .kernels
+                .iter()
+                .find(|k| k.symbol == e.symbol),
             receipt.kernels.iter().find(|k| k.symbol == e.symbol),
         ) else {
             refuse(
@@ -491,10 +498,7 @@ pub fn build_with(
             );
         }
         if record.differential.status == "fail" {
-            refuse(
-                &mut refusals,
-                "G8 metadata differential failed".into(),
-            );
+            refuse(&mut refusals, "G8 metadata differential failed".into());
         }
         if identity.text_sha256.is_empty() || identity.kd_sha256.is_empty() {
             refuse(
@@ -687,7 +691,9 @@ fn find_module_object(
             if hit {
                 let bytes = std::fs::read(entry.path())
                     .map_err(|e| format!("{}: {e}", entry.path().display()))?;
-                found.entry(sha256_hex(&bytes)).or_insert_with(|| entry.path());
+                found
+                    .entry(sha256_hex(&bytes))
+                    .or_insert_with(|| entry.path());
             }
         }
     }
@@ -746,8 +752,8 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
             "--toolchain-id" => pin = Some(sha256_hex(value()?.as_bytes())),
             "--toolchain-pin" => pin = Some(value()?),
             "--corpus" => {
-                let corpus = railgun_corpus::JitCorpus::open(value()?)
-                    .map_err(|e| e.to_string())?;
+                let corpus =
+                    railgun_corpus::JitCorpus::open(value()?).map_err(|e| e.to_string())?;
                 pin = Some(corpus.toolchain_pin().to_owned());
             }
             "--objects" => dirs.push(PathBuf::from(value()?)),
@@ -759,8 +765,8 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
     let sequence = sequence.ok_or("--sequence is required")?;
     let arch = arch.ok_or("--arch is required")?;
     let pin = pin.ok_or("one of --toolchain-id, --toolchain-pin, --corpus is required")?;
-    let text = std::fs::read_to_string(&sequence)
-        .map_err(|e| format!("{}: {e}", sequence.display()))?;
+    let text =
+        std::fs::read_to_string(&sequence).map_err(|e| format!("{}: {e}", sequence.display()))?;
     let mut entries = Vec::new();
     for (n, line) in text.lines().enumerate() {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -775,8 +781,7 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
         };
         let object = match &path {
             Some(p) => {
-                let bytes =
-                    std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+                let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
                 Some(bytes)
             }
             None => None,
@@ -812,7 +817,10 @@ pub fn cli(command: &str, args: &[String]) -> Result<(), String> {
         for r in &refusals {
             eprintln!("REFUSE\t{r}");
         }
-        format!("{} refusal(s): Whole16 plan is not certified", refusals.len())
+        format!(
+            "{} refusal(s): Whole16 plan is not certified",
+            refusals.len()
+        )
     };
     match command {
         "whole16-manifest" => {
@@ -904,7 +912,10 @@ mod tests {
         forged.nodes[1].artifact_sha256 = sha256_hex(b"other");
         forged.sequence_sha256 = sequence_digest(&forged.nodes);
         let e = verify_with(&forged, &good(), "gfx1201", PIN, COPY_CLASS).expect_err("refuses");
-        assert!(e.iter().any(|r| r.reason.contains("object digest")), "{e:?}");
+        assert!(
+            e.iter().any(|r| r.reason.contains("object digest")),
+            "{e:?}"
+        );
         // The plan loads different bytes for node 0.
         let mut flipped = COPY.to_vec();
         *flipped.last_mut().unwrap() ^= 0xff;
@@ -948,8 +959,9 @@ mod tests {
     fn hipdirect_graph_and_missing_class_refuse() {
         for route in [NodeRoute::HipDirect, NodeRoute::Graph] {
             let e = vec![entry("railgun_copy", route, Some(COPY))];
-            assert!(reasons(build_with(&e, "gfx1201", PIN, COPY_CLASS))
-                .contains("not a railgun node"));
+            assert!(
+                reasons(build_with(&e, "gfx1201", PIN, COPY_CLASS)).contains("not a railgun node")
+            );
         }
         // The full design class list is absent from a copy-only sequence.
         let why = reasons(build(&good(), "gfx1201", PIN));
@@ -1038,7 +1050,11 @@ mod tests {
             assert!(check_abi(&bad, spec).unwrap_err()[0].contains("hidden_queue_ptr"));
             // A scalar that is a pointer.
             let mut bad = record_for(spec);
-            let last = bad.args.iter().position(|a| a.value_kind == "by_value").unwrap();
+            let last = bad
+                .args
+                .iter()
+                .position(|a| a.value_kind == "by_value")
+                .unwrap();
             bad.args[last].role = "pointer".into();
             assert!(check_abi(&bad, spec).is_err());
             // A shifted offset and a changed effect.
@@ -1051,10 +1067,17 @@ mod tests {
             // A hidden argument inside the explicit block, an extra explicit
             // argument, and a loader segment too small for the explicit block.
             let mut bad = record_for(spec);
-            bad.args.push(arg(spec.explicit_end() - 4, 4, "hidden_remainder_x", "integer", None));
+            bad.args.push(arg(
+                spec.explicit_end() - 4,
+                4,
+                "hidden_remainder_x",
+                "integer",
+                None,
+            ));
             assert!(check_abi(&bad, spec).is_err());
             let mut bad = record_for(spec);
-            bad.args.push(arg(spec.explicit_end(), 4, "by_value", "integer", None));
+            bad.args
+                .push(arg(spec.explicit_end(), 4, "by_value", "integer", None));
             assert!(check_abi(&bad, spec).is_err());
             let mut bad = record_for(spec);
             bad.kernarg_size = spec.explicit_end() - 1;
@@ -1075,7 +1098,11 @@ mod tests {
             "hidden_dynamic_lds_size".into(),
         ];
         assert!(check_hidden(&r).is_empty());
-        for kind in ["hidden_queue_ptr", "hidden_hostcall_buffer", "hidden_heap_v1"] {
+        for kind in [
+            "hidden_queue_ptr",
+            "hidden_hostcall_buffer",
+            "hidden_heap_v1",
+        ] {
             r.implicit.hidden_loaded = vec![kind.into()];
             assert_eq!(check_hidden(&r).len(), 1, "{kind}");
         }

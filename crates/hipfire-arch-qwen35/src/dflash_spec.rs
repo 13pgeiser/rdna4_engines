@@ -19,9 +19,8 @@ use crate::speculative::{
     seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
     seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
     spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch,
-    RailgunStep,
     DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
+    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -2098,13 +2097,14 @@ mod lookup {
                 b.model_drafts = k;
                 b.lookup_available = offered;
                 match ctl.plan(b, 1000) {
-                    LookupAction::Tail { take } => clamp_tail_take(take, offered, k, 15, &b).is_some(),
+                    LookupAction::Tail { take } => {
+                        clamp_tail_take(take, offered, k, 15, &b).is_some()
+                    }
                     _ => false,
                 }
             };
-            let any_take = |ctl: &LookupController| {
-                (1..15).any(|k| (1..=15 - k).any(|o| decides(ctl, k, o)))
-            };
+            let any_take =
+                |ctl: &LookupController| (1..15).any(|k| (1..=15 - k).any(|o| decides(ctl, k, o)));
             let mut states = vec![s.ctl.clone()];
             for _ in 0..12 {
                 let o = window_outcome(Ran::Native, 16, 1, &a[8..23], &a[8..23], 1000, 40_000.0);
@@ -2112,7 +2112,15 @@ mod lookup {
             }
             states.push(s.ctl.clone());
             for _ in 0..12 {
-                let o = window_outcome(Ran::Tail { k: 3, l: 4 }, 8, 7, &a[8..15], &a[8..15], 1000, 30_000.0);
+                let o = window_outcome(
+                    Ran::Tail { k: 3, l: 4 },
+                    8,
+                    7,
+                    &a[8..15],
+                    &a[8..15],
+                    1000,
+                    30_000.0,
+                );
                 s.ctl.observe(&o);
             }
             states.push(s.ctl.clone());

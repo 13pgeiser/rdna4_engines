@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Typed shape binding for the certified DFlash window (design A, slice A1:
-//! `DESIGN-RAILGUN-WINDOW.md` §2 "Frozen implementation interfaces" and §3
+//! `docs/design/2026-10-25-dflash-railgun-window.md` §2 "Frozen implementation interfaces" and §3
 //! "Shapes: finite topology, explicit patch expressions").
 //!
 //! A [`WindowPlan`] is one railgun [`KernelProgram`] plus the *declared*
@@ -32,12 +32,11 @@ use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::kernel::{
-    Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole,
-};
 use crate::index_bind::{
-    abi as writer_abi, BindInputs, IndexBindError, IndexedBindWitness, SealedPositions, WriterExtent,
+    abi as writer_abi, BindInputs, IndexBindError, IndexedBindWitness, SealedPositions,
+    WriterExtent,
 };
+use crate::kernel::{Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole};
 use crate::plan::Pm4Plan;
 use crate::{Binding, ResourceId, WordId};
 
@@ -71,9 +70,7 @@ pub enum Refusal {
     },
     #[error("{site}: value {value} does not fit u32")]
     DoesNotFit { site: String, value: u64 },
-    #[error(
-        "{site}: bytes [{offset}, {end}) exceed resource {resource} ({bytes} bytes)"
-    )]
+    #[error("{site}: bytes [{offset}, {end}) exceed resource {resource} ({bytes} bytes)")]
     ExtentExceeded {
         site: String,
         resource: u32,
@@ -276,10 +273,8 @@ impl WindowInputs {
     /// The upload bytes: little-endian `seed`, `mask_id`, `q_positions`,
     /// `k_position_suffix`, `verify_positions`, in that order.
     pub fn pack(&self) -> Vec<u8> {
-        let words = 2
-            + self.q_positions.len()
-            + self.k_position_suffix.len()
-            + self.verify_positions.len();
+        let words =
+            2 + self.q_positions.len() + self.k_position_suffix.len() + self.verify_positions.len();
         let mut out = Vec::with_capacity(words * 4);
         for w in [self.seed, self.mask_id]
             .iter()
@@ -410,7 +405,9 @@ pub struct FillStep {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowStep {
     /// Dispatch of program node `node`; kernel steps appear in node order.
-    Kernel { node: usize },
+    Kernel {
+        node: usize,
+    },
     Copy(CopyStep),
     Fill(FillStep),
 }
@@ -530,13 +527,19 @@ impl WindowPlan {
                 WindowStep::Copy(c) => {
                     for r in [&c.src, &c.dst] {
                         if r.resource.0 as usize >= resources {
-                            return malformed(format!("step {i}: unknown resource {}", r.resource.0));
+                            return malformed(format!(
+                                "step {i}: unknown resource {}",
+                                r.resource.0
+                            ));
                         }
                     }
                 }
                 WindowStep::Fill(f) => {
                     if f.dst.resource.0 as usize >= resources {
-                        return malformed(format!("step {i}: unknown resource {}", f.dst.resource.0));
+                        return malformed(format!(
+                            "step {i}: unknown resource {}",
+                            f.dst.resource.0
+                        ));
                     }
                 }
             }
@@ -553,17 +556,15 @@ impl WindowPlan {
         for (i, patch) in patches.iter().enumerate() {
             let mut word_index = None;
             match patch {
-                PatchKind::Scalar32 {
-                    field,
-                    domain,
-                    ..
-                } => {
+                PatchKind::Scalar32 { field, domain, .. } => {
                     if domain.start() > domain.end() {
                         return malformed(format!("patch {i}: empty domain"));
                     }
-                    let Some(index) = program.words.iter().position(|w| {
-                        w.node == field.node && w.offset == field.offset
-                    }) else {
+                    let Some(index) = program
+                        .words
+                        .iter()
+                        .position(|w| w.node == field.node && w.offset == field.offset)
+                    else {
                         return malformed(format!(
                             "patch {i}: node {} +{} is not a declared word",
                             field.node, field.offset
@@ -604,16 +605,15 @@ impl WindowPlan {
                     }
                 }
                 PatchKind::GridAxis {
-                    node,
-                    axis,
-                    domain,
-                    ..
+                    node, axis, domain, ..
                 } => {
                     let Some(n) = program.nodes.get(*node) else {
                         return malformed(format!("patch {i}: no node {node}"));
                     };
                     if n.segment_bytes.is_none() {
-                        return malformed(format!("patch {i}: node {node} has no certified segment"));
+                        return malformed(format!(
+                            "patch {i}: node {node} has no certified segment"
+                        ));
                     }
                     if *domain.start() == 0 || domain.start() > domain.end() {
                         return malformed(format!(
@@ -686,7 +686,9 @@ impl WindowPlan {
                 ));
             }
             let Some(resource) = n.args.iter().find_map(|(offset, arg)| match arg {
-                Arg::Resource { resource, .. } if *offset == writer_abi::POSITIONS => Some(*resource),
+                Arg::Resource { resource, .. } if *offset == writer_abi::POSITIONS => {
+                    Some(*resource)
+                }
                 _ => None,
             }) else {
                 return malformed(format!("node {node}: positions argument is not a resource"));
@@ -798,7 +800,11 @@ pub trait WindowQueue: Send {
     /// Write every node's kernarg image and grid into the queue's retired
     /// storage, run the typed copy/fill steps' emission inputs, and launch.
     /// `Ok` means the work is in flight; `Err` carries what is known.
-    fn submit(&mut self, nodes: &[NodeImage<'_>], steps: &[ResolvedStep]) -> Result<(), QueueFailure>;
+    fn submit(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure>;
 
     /// Prove queue quiescence (blocking).
     fn wait(&mut self) -> Result<(), QueueFailure>;
@@ -1194,12 +1200,15 @@ impl PreparedWindow {
 
         for (index, word) in program.words.iter().enumerate() {
             if let WordRole::GdnFrame { .. } = word.role {
-                let value = inputs.gdn_frames.get(&WordId(index as u32)).ok_or_else(|| {
-                    Refusal::Inputs(format!(
-                        "no GdnFrame value for word {index} (node {} +{})",
-                        word.node, word.offset
-                    ))
-                })?;
+                let value = inputs
+                    .gdn_frames
+                    .get(&WordId(index as u32))
+                    .ok_or_else(|| {
+                        Refusal::Inputs(format!(
+                            "no GdnFrame value for word {index} (node {} +{})",
+                            word.node, word.offset
+                        ))
+                    })?;
                 self.words[index] = *value;
             }
         }
@@ -1269,11 +1278,9 @@ impl PreparedWindow {
 
         let region = |region: &Region, len: u64, site: &str| -> Result<(u64, u64), Refusal> {
             let offset = eval(&region.byte_offset, site)?;
-            let end = offset
-                .checked_add(len)
-                .ok_or_else(|| Refusal::Overflow {
-                    site: site.to_owned(),
-                })?;
+            let end = offset.checked_add(len).ok_or_else(|| Refusal::Overflow {
+                site: site.to_owned(),
+            })?;
             let binding = self.bindings[region.resource.0 as usize];
             if end > binding.bytes {
                 return Err(Refusal::ExtentExceeded {
@@ -1325,17 +1332,18 @@ impl PreparedWindow {
             }
         }
 
-        let delta_of = |spec: &Option<TransitionSpec>, what: &str| -> Result<Option<Transition>, Refusal> {
-            spec.as_ref()
-                .map(|s| {
-                    let site = format!("host delta {what}");
-                    Ok(Transition {
-                        from: eval(&s.from, &site)?,
-                        to: eval(&s.to, &site)?,
+        let delta_of =
+            |spec: &Option<TransitionSpec>, what: &str| -> Result<Option<Transition>, Refusal> {
+                spec.as_ref()
+                    .map(|s| {
+                        let site = format!("host delta {what}");
+                        Ok(Transition {
+                            from: eval(&s.from, &site)?,
+                            to: eval(&s.to, &site)?,
+                        })
                     })
-                })
-                .transpose()
-        };
+                    .transpose()
+            };
         let host_delta = WindowHostDelta {
             projection_watermark: delta_of(&plan.host_delta.projection_watermark, "projection")?,
             upload_watermark: delta_of(&plan.host_delta.upload_watermark, "upload")?,
@@ -1381,7 +1389,10 @@ impl PreparedWindow {
     ) -> Result<(), Refusal> {
         {
             let shared = lock(&self.shared);
-            if bound.prepared != self.id || bound.epoch != shared.epoch || shared.phase != Phase::Bound {
+            if bound.prepared != self.id
+                || bound.epoch != shared.epoch
+                || shared.phase != Phase::Bound
+            {
                 return Err(Refusal::StaleBound);
             }
         }
@@ -1416,13 +1427,22 @@ impl PreparedWindow {
     pub fn certify_exact(&self, bound: &mut BoundWindow) -> Result<(), Refusal> {
         {
             let shared = lock(&self.shared);
-            if bound.prepared != self.id || bound.epoch != shared.epoch || shared.phase != Phase::Bound {
+            if bound.prepared != self.id
+                || bound.epoch != shared.epoch
+                || shared.phase != Phase::Bound
+            {
                 return Err(Refusal::StaleBound);
             }
         }
         if self.plan.indexed_positions.is_some() && bound.indexed.is_none() {
             return Err(Refusal::IndexedWitnessMissing {
-                node: self.plan.program.conditional_nodes().first().copied().unwrap_or(0),
+                node: self
+                    .plan
+                    .program
+                    .conditional_nodes()
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
                 symbol: "certify_exact".into(),
             });
         }
@@ -1586,11 +1606,7 @@ impl WindowCache {
             prepared,
             last_used: tick,
         });
-        Ok(&mut self
-            .entries
-            .last_mut()
-            .expect("entry just pushed")
-            .prepared)
+        Ok(&mut self.entries.last_mut().expect("entry just pushed").prepared)
     }
 
     /// Drop every retired entry whose binding key is not `live` (an
@@ -1609,8 +1625,7 @@ mod tests {
     use super::*;
     use crate::kernel::tests::{launch, ptr};
     use crate::kernel::{
-        author, ArgFact, ArgRole, Axis, DeclaredWord, HiddenArg, HiddenKind, MemClass,
-        ScalarField,
+        author, ArgFact, ArgRole, Axis, DeclaredWord, HiddenArg, HiddenKind, MemClass, ScalarField,
     };
     use crate::plan::{plan, CacheTable, RowPolicy};
 
@@ -1686,12 +1701,18 @@ mod tests {
     fn patches() -> Vec<PatchKind> {
         vec![
             PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 16 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 16,
+                },
                 expr: input("projected_rows"),
                 domain: 1..=16,
             },
             PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 20 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 20,
+                },
                 expr: tiles(),
                 domain: 1..=1024,
             },
@@ -1719,11 +1740,7 @@ mod tests {
             host_delta: HostDeltaSpec {
                 ring_head: Some(TransitionSpec {
                     from: input("ring_head"),
-                    to: Expr::rem(
-                        Expr::add(input("ring_head"), input("verify_rows")),
-                        64,
-                    )
-                    .unwrap(),
+                    to: Expr::rem(Expr::add(input("ring_head"), input("verify_rows")), 64).unwrap(),
                 }),
                 ..HostDeltaSpec::default()
             },
@@ -1878,8 +1895,12 @@ mod tests {
     #[test]
     fn kernarg_image_reconstructs_bytes_including_hidden_grid_fields() {
         let (mut w, _) = prepared();
-        for (position, generation, tiles) in [(0u64, 1u64, 1u32), (127, 2, 1), (128, 3, 2), (300, 4, 3)] {
-            let bound = w.bind(&shape(position, generation), &bindings(), &inputs()).unwrap();
+        for (position, generation, tiles) in
+            [(0u64, 1u64, 1u32), (127, 2, 1), (128, 3, 2), (300, 4, 3)]
+        {
+            let bound = w
+                .bind(&shape(position, generation), &bindings(), &inputs())
+                .unwrap();
             assert_eq!(bound.generation(), generation);
             assert_eq!(
                 w.kernarg_image(0).unwrap(),
@@ -1891,8 +1912,16 @@ mod tests {
             w.submit(bound).unwrap().complete().unwrap();
         }
         // The authored program, without overrides, is unchanged by patching.
-        let authored = w.plan().program().kernarg_image(0, SEGMENT as usize, &w.plan().program().authored_words()).unwrap();
-        assert_eq!(&authored[24..28], &2u32.to_le_bytes(), "authored hidden grid word");
+        let authored = w
+            .plan()
+            .program()
+            .kernarg_image(0, SEGMENT as usize, &w.plan().program().authored_words())
+            .unwrap();
+        assert_eq!(
+            &authored[24..28],
+            &2u32.to_le_bytes(),
+            "authored hidden grid word"
+        );
     }
 
     #[test]
@@ -1903,12 +1932,16 @@ mod tests {
         p.encode_kernarg_into(0, &words, &ImageOverrides::default(), &mut into)
             .unwrap();
         assert_eq!(into, p.kernarg_image(0, SEGMENT as usize, &words).unwrap());
-        assert!(p.encode_kernarg_into(0, &words, &ImageOverrides::default(), &mut [0u8; 8]).is_err());
+        assert!(p
+            .encode_kernarg_into(0, &words, &ImageOverrides::default(), &mut [0u8; 8])
+            .is_err());
         let zero_grid = ImageOverrides {
             grid: Some([0, 1, 1]),
             ..ImageOverrides::default()
         };
-        assert!(p.encode_kernarg_into(0, &words, &zero_grid, &mut into).is_err());
+        assert!(p
+            .encode_kernarg_into(0, &words, &zero_grid, &mut into)
+            .is_err());
     }
 
     #[test]
@@ -1919,7 +1952,10 @@ mod tests {
         let (mut w2, _) = prepared_with({
             let mut p = patches();
             p[0] = PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 16 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 16,
+                },
                 expr: Expr::mul(input("big"), Expr::Const(4)),
                 domain: 0..=u64::MAX,
             };
@@ -1936,7 +1972,17 @@ mod tests {
         let mut s = shape(10, 1);
         s.position = u64::MAX / 4 + 1;
         s.max_position = u64::MAX;
-        let err = w.bind(&s, &bindings(), &WindowInputs { q_positions: vec![0; 16], verify_positions: vec![0; 16], ..inputs() }).unwrap_err();
+        let err = w
+            .bind(
+                &s,
+                &bindings(),
+                &WindowInputs {
+                    q_positions: vec![0; 16],
+                    verify_positions: vec![0; 16],
+                    ..inputs()
+                },
+            )
+            .unwrap_err();
         assert!(
             matches!(err, Refusal::Overflow { .. } | Refusal::OutOfDomain { .. }),
             "{err}"
@@ -1950,7 +1996,10 @@ mod tests {
         let mut s = shape(300, 1);
         s.projected_rows = 17;
         let err = w.bind(&s, &bindings(), &inputs()).unwrap_err();
-        assert!(matches!(err, Refusal::OutOfDomain { value: 17, .. }), "{err}");
+        assert!(
+            matches!(err, Refusal::OutOfDomain { value: 17, .. }),
+            "{err}"
+        );
         s.projected_rows = 0;
         assert!(matches!(
             w.bind(&s, &bindings(), &inputs()).unwrap_err(),
@@ -1958,16 +2007,44 @@ mod tests {
         ));
         // Grid beyond its domain: ceil((8191+1)/128) = 64 is fine, 65 is not.
         let mut s = shape(8191, 1);
-        assert!(w.bind(&s, &bindings(), &WindowInputs { q_positions: vec![8191; 16], verify_positions: vec![8191; 16], k_position_suffix: vec![], ..inputs() }).is_ok());
+        assert!(w
+            .bind(
+                &s,
+                &bindings(),
+                &WindowInputs {
+                    q_positions: vec![8191; 16],
+                    verify_positions: vec![8191; 16],
+                    k_position_suffix: vec![],
+                    ..inputs()
+                }
+            )
+            .is_ok());
         s.position = 8192;
         s.max_position = 9000;
-        let err = w.bind(&s, &bindings(), &WindowInputs { q_positions: vec![8192; 16], verify_positions: vec![8192; 16], k_position_suffix: vec![], ..inputs() }).unwrap_err();
-        assert!(matches!(err, Refusal::OutOfDomain { value: 65, .. }), "{err}");
+        let err = w
+            .bind(
+                &s,
+                &bindings(),
+                &WindowInputs {
+                    q_positions: vec![8192; 16],
+                    verify_positions: vec![8192; 16],
+                    k_position_suffix: vec![],
+                    ..inputs()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Refusal::OutOfDomain { value: 65, .. }),
+            "{err}"
+        );
         // Unknown input names refuse.
         let (mut u, _) = prepared_with({
             let mut p = patches();
             p[0] = PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 16 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 16,
+                },
                 expr: input("nonexistent"),
                 domain: 0..=16,
             };
@@ -1980,16 +2057,28 @@ mod tests {
         // Position beyond max_position, wrong row counts and Whole16 rows.
         let mut s = shape(300, 1);
         s.position = 9000;
-        assert!(matches!(w.bind(&s, &bindings(), &inputs()).unwrap_err(), Refusal::Shape(_)));
+        assert!(matches!(
+            w.bind(&s, &bindings(), &inputs()).unwrap_err(),
+            Refusal::Shape(_)
+        ));
         let mut s = shape(300, 1);
         s.draft_rows = 15;
-        assert!(matches!(w.bind(&s, &bindings(), &inputs()).unwrap_err(), Refusal::Shape(_)));
+        assert!(matches!(
+            w.bind(&s, &bindings(), &inputs()).unwrap_err(),
+            Refusal::Shape(_)
+        ));
         let mut i = inputs();
         i.verify_positions.pop();
-        assert!(matches!(w.bind(&shape(300, 1), &bindings(), &i).unwrap_err(), Refusal::Inputs(_)));
+        assert!(matches!(
+            w.bind(&shape(300, 1), &bindings(), &i).unwrap_err(),
+            Refusal::Inputs(_)
+        ));
         let mut i = inputs();
         i.q_positions[3] = 9000;
-        assert!(matches!(w.bind(&shape(300, 1), &bindings(), &i).unwrap_err(), Refusal::Inputs(_)));
+        assert!(matches!(
+            w.bind(&shape(300, 1), &bindings(), &i).unwrap_err(),
+            Refusal::Inputs(_)
+        ));
         assert_eq!(log.lock().unwrap().submits, 0);
     }
 
@@ -2065,23 +2154,29 @@ mod tests {
         let err = w
             .bind(&shape(300, 1), &WindowBindings { key: reused }, &inputs())
             .unwrap_err();
-        assert_eq!(err, Refusal::BindingKeyMismatch("allocations[1].generation".into()));
+        assert_eq!(
+            err,
+            Refusal::BindingKeyMismatch("allocations[1].generation".into())
+        );
         let mut moved = key();
         moved.allocations[0].base += 0x100000;
         assert!(matches!(
-            w.bind(&shape(300, 1), &WindowBindings { key: moved }, &inputs()).unwrap_err(),
+            w.bind(&shape(300, 1), &WindowBindings { key: moved }, &inputs())
+                .unwrap_err(),
             Refusal::BindingKeyMismatch(_)
         ));
         let mut digest = key();
         digest.object_digests[0] = "bb".into();
         assert_eq!(
-            w.bind(&shape(300, 1), &WindowBindings { key: digest }, &inputs()).unwrap_err(),
+            w.bind(&shape(300, 1), &WindowBindings { key: digest }, &inputs())
+                .unwrap_err(),
             Refusal::BindingKeyMismatch("object_digests".into())
         );
         let mut kv = key();
         kv.kv_mapping_generation += 1;
         assert_eq!(
-            w.bind(&shape(300, 1), &WindowBindings { key: kv }, &inputs()).unwrap_err(),
+            w.bind(&shape(300, 1), &WindowBindings { key: kv }, &inputs())
+                .unwrap_err(),
             Refusal::BindingKeyMismatch("kv_mapping_generation".into())
         );
         // A submitted generation is consumed; the same or an older one is stale.
@@ -2127,7 +2222,10 @@ mod tests {
         let done = submission.complete().unwrap();
         assert_eq!(
             done.host_delta.ring_head,
-            Some(Transition { from: 60, to: (60 + 16) % 64 })
+            Some(Transition {
+                from: 60,
+                to: (60 + 16) % 64
+            })
         );
         assert_eq!(done.generation, 1);
         assert_eq!(
@@ -2174,7 +2272,10 @@ mod tests {
         let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
         assert!(matches!(
             w.submit(bound).err(),
-            Some(Refusal::SubmitFailed { quiescence: Quiescence::Unknown, .. })
+            Some(Refusal::SubmitFailed {
+                quiescence: Quiescence::Unknown,
+                ..
+            })
         ));
         assert_eq!(
             w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap_err(),
@@ -2187,7 +2288,9 @@ mod tests {
         // A Window word without its Scalar32.
         let mut p = patches();
         p.remove(1);
-        assert!(matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(m)) if m.contains("no Scalar32")));
+        assert!(
+            matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(m)) if m.contains("no Scalar32"))
+        );
         // Scalar32 aimed at a pointer.
         let mut p = patches();
         p[0] = PatchKind::Scalar32 {
@@ -2195,7 +2298,10 @@ mod tests {
             expr: Expr::Const(1),
             domain: 0..=1,
         };
-        assert!(matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(_))));
+        assert!(matches!(
+            make_plan(parts_with(p)),
+            Err(Refusal::Malformed(_))
+        ));
         // Interior64 aimed at the wrong resource.
         let mut p = patches();
         p[2] = PatchKind::Interior64 {
@@ -2205,11 +2311,17 @@ mod tests {
             byte_offset: Expr::Const(0),
             required_extent: Expr::Const(1),
         };
-        assert!(matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(_))));
+        assert!(matches!(
+            make_plan(parts_with(p)),
+            Err(Refusal::Malformed(_))
+        ));
         // Duplicate sites and a zero-based grid domain.
         let mut p = patches();
         p.push(p[3].clone());
-        assert!(matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(_))));
+        assert!(matches!(
+            make_plan(parts_with(p)),
+            Err(Refusal::Malformed(_))
+        ));
         let mut p = patches();
         p[3] = PatchKind::GridAxis {
             node: 0,
@@ -2217,7 +2329,10 @@ mod tests {
             expr: tiles(),
             domain: 0..=4,
         };
-        assert!(matches!(make_plan(parts_with(p)), Err(Refusal::Malformed(_))));
+        assert!(matches!(
+            make_plan(parts_with(p)),
+            Err(Refusal::Malformed(_))
+        ));
         // Steps must dispatch every node in order; completion surfaces must be written.
         let mut parts = parts_with(patches());
         parts.steps.clear();
@@ -2227,9 +2342,7 @@ mod tests {
         assert!(matches!(make_plan(parts), Err(Refusal::Malformed(_))));
         // A HipDirect node is not admissible.
         let mut parts = parts_with(patches());
-        parts.program.nodes[0].lowering = crate::kernel::Lowering::HipDirect {
-            reason: "x".into(),
-        };
+        parts.program.nodes[0].lowering = crate::kernel::Lowering::HipDirect { reason: "x".into() };
         assert!(matches!(make_plan(parts), Err(Refusal::NotPm4 { .. })));
         // The plan's closure and family.
         let plan = make_plan(parts_with(patches())).unwrap();
@@ -2241,7 +2354,11 @@ mod tests {
 
     #[test]
     fn gdn_frames_must_be_supplied_for_every_gdn_word() {
-        let mut l = launch(&[(0, BASE_Q + 0x100)], 12, vec![ptr(0, &[MemClass::VmemLoad]), integer(8)]);
+        let mut l = launch(
+            &[(0, BASE_Q + 0x100)],
+            12,
+            vec![ptr(0, &[MemClass::VmemLoad]), integer(8)],
+        );
         l.declared = vec![DeclaredWord {
             offset: 8,
             role: WordRole::GdnFrame { frames: 1 },
@@ -2273,25 +2390,39 @@ mod tests {
             verify_positions: vec![0; 5],
             ..WindowInputs::default()
         };
-        assert!(matches!(w.bind(&s, &b, &i).unwrap_err(), Refusal::Inputs(m) if m.contains("GdnFrame")));
+        assert!(
+            matches!(w.bind(&s, &b, &i).unwrap_err(), Refusal::Inputs(m) if m.contains("GdnFrame"))
+        );
         i.gdn_frames.insert(WordId(0), 41);
         w.bind(&s, &b, &i).unwrap();
         assert_eq!(&w.kernarg_image(0).unwrap()[8..12], &41u32.to_le_bytes());
         i.gdn_frames.insert(WordId(9), 1);
         s.generation = 2;
-        assert!(matches!(w.bind(&s, &b, &i).unwrap_err(), Refusal::Inputs(_)));
+        assert!(matches!(
+            w.bind(&s, &b, &i).unwrap_err(),
+            Refusal::Inputs(_)
+        ));
     }
 
     #[test]
     fn copy_and_fill_steps_are_bounded_aligned_and_disjoint() {
         let mut parts = parts_with(patches());
         parts.steps.push(WindowStep::Copy(CopyStep {
-            src: Region { resource: ResourceId(0), byte_offset: Expr::Const(0) },
-            dst: Region { resource: ResourceId(1), byte_offset: input("compact_offset") },
+            src: Region {
+                resource: ResourceId(0),
+                byte_offset: Expr::Const(0),
+            },
+            dst: Region {
+                resource: ResourceId(1),
+                byte_offset: input("compact_offset"),
+            },
             bytes: Expr::mul(input("projected_rows"), Expr::Const(16)),
         }));
         parts.steps.push(WindowStep::Fill(FillStep {
-            dst: Region { resource: ResourceId(1), byte_offset: Expr::Const(0x8000) },
+            dst: Region {
+                resource: ResourceId(1),
+                byte_offset: Expr::Const(0x8000),
+            },
             value: 0,
             words: Expr::Const(16),
         }));
@@ -2304,8 +2435,16 @@ mod tests {
         assert_eq!(
             w.resolved_steps(),
             &[
-                ResolvedStep::Copy { src: BASE_Q, dst: BASE_OUT + 0x40, bytes: 48 },
-                ResolvedStep::Fill { dst: BASE_OUT + 0x8000, value: 0, words: 16 },
+                ResolvedStep::Copy {
+                    src: BASE_Q,
+                    dst: BASE_OUT + 0x40,
+                    bytes: 48
+                },
+                ResolvedStep::Fill {
+                    dst: BASE_OUT + 0x8000,
+                    value: 0,
+                    words: 16
+                },
             ]
         );
         s.compact_offset = EXTENT - 47; // 48 bytes no longer fit
@@ -2316,12 +2455,19 @@ mod tests {
         // Same-resource overlap is refused (source and destination in resource 0).
         let mut parts = parts_with(patches());
         parts.steps.push(WindowStep::Copy(CopyStep {
-            src: Region { resource: ResourceId(0), byte_offset: Expr::Const(0) },
-            dst: Region { resource: ResourceId(0), byte_offset: Expr::Const(8) },
+            src: Region {
+                resource: ResourceId(0),
+                byte_offset: Expr::Const(0),
+            },
+            dst: Region {
+                resource: ResourceId(0),
+                byte_offset: Expr::Const(8),
+            },
             bytes: Expr::Const(16),
         }));
         let log = Arc::new(Mutex::new(Log::default()));
-        let mut w = PreparedWindow::new(make_plan(parts).unwrap(), key(), Box::new(MockQueue(log))).unwrap();
+        let mut w = PreparedWindow::new(make_plan(parts).unwrap(), key(), Box::new(MockQueue(log)))
+            .unwrap();
         assert!(matches!(
             w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap_err(),
             Refusal::BadStep { .. }
@@ -2353,7 +2499,13 @@ mod tests {
             let t = topo(n);
             let w = cache.get_or_prepare(&t, || build(&t)).unwrap();
             let b = w
-                .bind(&shape(300, 1), &WindowBindings { key: t.binding.clone() }, &inputs())
+                .bind(
+                    &shape(300, 1),
+                    &WindowBindings {
+                        key: t.binding.clone(),
+                    },
+                    &inputs(),
+                )
                 .unwrap();
             subs.push(w.submit(b).unwrap());
         }
@@ -2378,7 +2530,11 @@ mod tests {
         assert_eq!(cache.len(), WINDOW_CACHE_CAPACITY);
         // Stale eviction only drops retired entries of another binding key.
         let live = topo(0).binding;
-        assert_eq!(cache.evict_stale(&live), 1, "only the never-bound extra is retired");
+        assert_eq!(
+            cache.evict_stale(&live),
+            1,
+            "only the never-bound extra is retired"
+        );
         for s in subs {
             s.complete().unwrap();
         }
@@ -2400,14 +2556,24 @@ mod tests {
         assert_eq!(e(Expr::min(input("a"), input("b"))), Ok(3));
         assert_eq!(e(Expr::max(input("a"), input("b"))), Ok(10));
         assert_eq!(e(Expr::ceil_div(input("a"), 3).unwrap()), Ok(4));
-        assert_eq!(e(Expr::ceil_div(input("max"), 2).unwrap()), Ok(u64::MAX / 2 + 1), "no a+c-1 wrap");
+        assert_eq!(
+            e(Expr::ceil_div(input("max"), 2).unwrap()),
+            Ok(u64::MAX / 2 + 1),
+            "no a+c-1 wrap"
+        );
         assert_eq!(e(Expr::div(input("a"), 4).unwrap()), Ok(2));
         assert_eq!(e(Expr::rem(input("a"), 4).unwrap()), Ok(2));
         assert_eq!(Expr::div(input("a"), 0), None);
         assert_eq!(Expr::rem(input("a"), 0), None);
         assert_eq!(Expr::ceil_div(input("a"), 0), None);
-        assert_eq!(e(Expr::add(input("max"), Expr::Const(1))), Err(ExprError::Overflow));
-        assert_eq!(e(Expr::mul(input("max"), Expr::Const(2))), Err(ExprError::Overflow));
+        assert_eq!(
+            e(Expr::add(input("max"), Expr::Const(1))),
+            Err(ExprError::Overflow)
+        );
+        assert_eq!(
+            e(Expr::mul(input("max"), Expr::Const(2))),
+            Err(ExprError::Overflow)
+        );
         assert_eq!(e(input("zzz")), Err(ExprError::UnknownInput("zzz".into())));
         let mut names = Vec::new();
         let expr = Expr::add(input("a"), Expr::mul(input("b"), input("a")));
@@ -2431,7 +2597,11 @@ mod tests {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(words, [1, 2, 3, 4, 5, 6, 7]);
-        let mut shadow = WindowInputs { q_positions: vec![0; 16], verify_positions: vec![0; 16], ..inputs() };
+        let mut shadow = WindowInputs {
+            q_positions: vec![0; 16],
+            verify_positions: vec![0; 16],
+            ..inputs()
+        };
         shadow.scalars.insert("position".into(), 1);
         let (mut w, _) = prepared();
         assert!(matches!(
@@ -2470,15 +2640,20 @@ mod tests {
     fn indexed_window() -> (ib::Fixture, PreparedWindow, Arc<Mutex<Log>>) {
         let fx = ib::Fixture::new(Vec::new());
         let log = Arc::new(Mutex::new(Log::default()));
-        let plan = make_plan(indexed_parts(&fx)).expect("a conditional plan under assumed witnesses");
+        let plan =
+            make_plan(indexed_parts(&fx)).expect("a conditional plan under assumed witnesses");
         assert_eq!(plan.indexed_positions(), Some(fx.p_res));
-        let w = PreparedWindow::new(plan, indexed_key(&fx), Box::new(MockQueue(log.clone()))).expect("prepared");
+        let w = PreparedWindow::new(plan, indexed_key(&fx), Box::new(MockQueue(log.clone())))
+            .expect("prepared");
         (fx, w, log)
     }
 
     fn indexed_bind(w: &mut PreparedWindow, fx: &ib::Fixture, generation: u64) -> BoundWindow {
-        let bindings = WindowBindings { key: indexed_key(fx) };
-        w.bind(&shape(300, generation), &bindings, &inputs()).expect("bind")
+        let bindings = WindowBindings {
+            key: indexed_key(fx),
+        };
+        w.bind(&shape(300, generation), &bindings, &inputs())
+            .expect("bind")
     }
 
     #[test]
@@ -2493,7 +2668,10 @@ mod tests {
             }
             p
         };
-        assert!(matches!(make_plan(parts), Err(Refusal::NotPm4 { node: 0, .. })));
+        assert!(matches!(
+            make_plan(parts),
+            Err(Refusal::NotPm4 { node: 0, .. })
+        ));
 
         let (fx, mut w, log) = indexed_window();
         let bound = indexed_bind(&mut w, &fx, 1);
@@ -2501,7 +2679,11 @@ mod tests {
             w.submit(bound),
             Err(Refusal::IndexedWitnessMissing { node: 0, .. })
         ));
-        assert_eq!(log.lock().unwrap().submits, 0, "the queue was never touched");
+        assert_eq!(
+            log.lock().unwrap().submits,
+            0,
+            "the queue was never touched"
+        );
     }
 
     #[test]
@@ -2509,7 +2691,8 @@ mod tests {
         let (fx, mut w, log) = indexed_window();
         let sealed = ib::ready(&ib::contiguous(300));
         let mut bound = indexed_bind(&mut w, &fx, 1);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap();
         assert_eq!(sealed.state(), PositionsState::SealedReady);
         let submission = w.submit(bound).unwrap();
         assert_eq!(sealed.state(), PositionsState::SubmittedReadOnly);
@@ -2524,9 +2707,15 @@ mod tests {
         let mut bound = indexed_bind(&mut w, &fx, 2);
         assert!(matches!(
             w.attach_indexed_witness(&mut bound, &sealed, &fx.extents),
-            Err(Refusal::Indexed(IndexBindError::State { found: PositionsState::Retired, .. }))
+            Err(Refusal::Indexed(IndexBindError::State {
+                found: PositionsState::Retired,
+                ..
+            }))
         ));
-        assert!(matches!(w.submit(bound), Err(Refusal::IndexedWitnessMissing { .. })));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::IndexedWitnessMissing { .. })
+        ));
     }
 
     #[test]
@@ -2534,35 +2723,47 @@ mod tests {
         let (fx, mut w, log) = indexed_window();
         let sealed = ib::ready(&ib::contiguous(300));
         let mut bound = indexed_bind(&mut w, &fx, 1);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap();
         // Patch the bound kernarg image of the V writer after the bind.
         w.images[1][24] ^= 1;
         assert!(matches!(
             w.submit(bound),
             Err(Refusal::Indexed(IndexBindError::Writer { node: 1, .. }))
         ));
-        assert_eq!(sealed.state(), PositionsState::SealedReady, "nothing was submitted");
+        assert_eq!(
+            sealed.state(),
+            PositionsState::SealedReady,
+            "nothing was submitted"
+        );
         assert_eq!(log.lock().unwrap().submits, 0);
 
         // A shape/grid change after bind.
         let mut bound = indexed_bind(&mut w, &fx, 2);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap();
         w.grids[0] = [ib::H, 16, 2];
-        assert!(matches!(w.submit(bound), Err(Refusal::Indexed(IndexBindError::Writer { node: 0, .. }))));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::Indexed(IndexBindError::Writer { node: 0, .. }))
+        ));
 
         // A later bind supersedes the attached one.
         let mut stale = indexed_bind(&mut w, &fx, 3);
-        w.attach_indexed_witness(&mut stale, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut stale, &sealed, &fx.extents)
+            .unwrap();
         let _fresh = indexed_bind(&mut w, &fx, 4);
         assert!(matches!(w.submit(stale), Err(Refusal::StaleBound)));
         sealed.release_unsubmitted().unwrap();
 
         // A witness bound to another payload/generation: re-seal then submit.
         let mut bound = indexed_bind(&mut w, &fx, 5);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap_err();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap_err();
         ib::seal(&sealed, &ib::contiguous(300));
         let mut bound = indexed_bind(&mut w, &fx, 6);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap();
         w.submit(bound).unwrap().complete().unwrap();
     }
 
@@ -2571,14 +2772,21 @@ mod tests {
         let (fx, mut w, log) = indexed_window();
         let sealed: SealedPositions = ib::ready(&ib::contiguous(300));
         let mut bound = indexed_bind(&mut w, &fx, 1);
-        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+            .unwrap();
         let submission = w.submit(bound).unwrap();
         log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
         assert!(submission.complete().is_err());
         assert_eq!(sealed.state(), PositionsState::Quarantined);
         assert!(sealed.recycle().is_err() && sealed.overwrite().is_err());
         assert!(matches!(
-            w.bind(&shape(300, 2), &WindowBindings { key: indexed_key(&fx) }, &inputs()),
+            w.bind(
+                &shape(300, 2),
+                &WindowBindings {
+                    key: indexed_key(&fx)
+                },
+                &inputs()
+            ),
             Err(Refusal::Quarantined)
         ));
 
@@ -2591,7 +2799,8 @@ mod tests {
             let (fx, mut w, log) = indexed_window();
             let sealed = ib::ready(&ib::contiguous(300));
             let mut bound = indexed_bind(&mut w, &fx, 1);
-            w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+            w.attach_indexed_witness(&mut bound, &sealed, &fx.extents)
+                .unwrap();
             log.lock().unwrap().submit_failure = Some(q);
             assert!(matches!(w.submit(bound), Err(Refusal::SubmitFailed { .. })));
             assert_eq!(sealed.state(), state);
@@ -2612,9 +2821,14 @@ mod tests {
             .unwrap();
         for (o, a) in &mut fx.program.nodes[1].args {
             if *o == 16 {
-                *a = Arg::Resource { resource: alt, interior: 0 };
+                *a = Arg::Resource {
+                    resource: alt,
+                    interior: 0,
+                };
             }
         }
-        assert!(matches!(make_plan(indexed_parts(&fx)), Err(Refusal::Malformed(m)) if m.contains("another conditional node")));
+        assert!(
+            matches!(make_plan(indexed_parts(&fx)), Err(Refusal::Malformed(m)) if m.contains("another conditional node"))
+        );
     }
 }

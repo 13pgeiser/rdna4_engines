@@ -155,7 +155,8 @@ pub fn draft_staged_words(
     let l = abs_positions.len().min(position);
     let live = l.min(full_w);
     let suffix = &abs_positions[abs_positions.len() - live..];
-    let q: Vec<u32> = ((position as i32 + compact_offset)..(position as i32 + b as i32 + compact_offset))
+    let q: Vec<u32> = ((position as i32 + compact_offset)
+        ..(position as i32 + b as i32 + compact_offset))
         .map(|p| p as u32)
         .collect();
     let mut k: Vec<u32> = suffix.iter().map(|&p| p as u32).collect();
@@ -272,8 +273,10 @@ pub struct DraftFamilyKey {
 /// Family of `shape` (all-sliding windowed draft, `swa_w == full_w`).
 pub fn draft_family_key(shape: &WindowShape) -> Result<DraftFamilyKey, String> {
     let w = usize::try_from(shape.swa_w).map_err(|_| "swa_w exceeds usize".to_string())?;
-    let l = usize::try_from(shape.logical_ctx_rows).map_err(|_| "ctx rows exceed usize".to_string())?;
-    let c = usize::try_from(shape.projected_rows).map_err(|_| "projected rows exceed usize".to_string())?;
+    let l =
+        usize::try_from(shape.logical_ctx_rows).map_err(|_| "ctx rows exceed usize".to_string())?;
+    let c = usize::try_from(shape.projected_rows)
+        .map_err(|_| "projected rows exceed usize".to_string())?;
     if w == 0 || c > l {
         return Err(format!("degenerate shape: W={w} C={c} L={l}"));
     }
@@ -381,7 +384,10 @@ impl Registry {
     }
 }
 
-fn tensor_bufs<'a>(s: &'a DflashScratch, vs: &'a VerifyScratch) -> Vec<(String, &'a GpuTensor, bool)> {
+fn tensor_bufs<'a>(
+    s: &'a DflashScratch,
+    vs: &'a VerifyScratch,
+) -> Vec<(String, &'a GpuTensor, bool)> {
     let mut v: Vec<(String, &GpuTensor, bool)> = vec![
         ("x".into(), &s.x, false),
         ("x_norm".into(), &s.x_norm, false),
@@ -467,9 +473,8 @@ fn le_u32(b: &[u8], off: usize) -> Option<u32> {
 }
 
 fn le_u64(b: &[u8], off: usize) -> Option<u64> {
-    b.get(off..off + 8).map(|s| {
-        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-    })
+    b.get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
 }
 
 fn herr(e: HipError) -> String {
@@ -508,13 +513,17 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
         return Err("plan_dflash_draft: already in plan mode".into());
     }
     if gpu.draft_collapse_fused_enabled() {
-        return Err("refused: fused draft-collapse route (exact gfx1100) is not the gfx1201 body".into());
+        return Err(
+            "refused: fused draft-collapse route (exact gfx1100) is not the gfx1201 body".into(),
+        );
     }
     // Mirrors build_dflash_noise_embeddings_weights: batched route when admitted.
     let batched_embed =
         crate::speculative::noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b);
     if !dflash::ordered_draft() {
-        return Err("refused: HIPFIRE_DFLASH_ORDERED_DRAFT=0 uses synchronous null-stream copies".into());
+        return Err(
+            "refused: HIPFIRE_DFLASH_ORDERED_DRAFT=0 uses synchronous null-stream copies".into(),
+        );
     }
     if draft_scratch.online.is_some() {
         return Err("refused: online draft tuner".into());
@@ -532,7 +541,9 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let (w, full_w) = match draft_scratch.ctx_mode {
         DraftCtxMode::Windowed { w, w_full } => (w, w_full),
         DraftCtxMode::Legacy => {
-            return Err("refused: legacy (non-windowed) draft: full-attention route is not declared".into())
+            return Err(
+                "refused: legacy (non-windowed) draft: full-attention route is not declared".into(),
+            )
         }
     };
     if !draft_cfg.all_layers_sliding || w != full_w {
@@ -570,7 +581,10 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     }
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode != selector.is_some() {
-        return Err("selector codebooks/block must be supplied exactly when the draft has a selector".into());
+        return Err(
+            "selector codebooks/block must be supplied exactly when the draft has a selector"
+                .into(),
+        );
     }
     if let Some((books, blk)) = selector {
         if blk.rows != batch {
@@ -586,7 +600,10 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let c = draft_scratch.thlog.proj_cached_rows();
     let f = draft_scratch.thlog.full_cached_rows();
     if l == 0 || c > l || l > draft_scratch.max_ctx_len {
-        return Err(format!("refused: ctx rows L={l} cached C={c} cap {}", draft_scratch.max_ctx_len));
+        return Err(format!(
+            "refused: ctx rows L={l} cached C={c} cap {}",
+            draft_scratch.max_ctx_len
+        ));
     }
     let shape = WindowShape {
         position: position as u64,
@@ -652,16 +669,21 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let pos_base_e = Expr::sub_sat(l_in(), k(full_w));
     let mut cands: Vec<PtrCand> = Vec::new();
     let add_cand = |cands: &mut Vec<PtrCand>,
-                        res: usize,
-                        base: u64,
-                        off: Expr,
-                        extent: Expr|
+                    res: usize,
+                    base: u64,
+                    off: Expr,
+                    extent: Expr|
      -> Result<(), String> {
         let ptr = base + shape_ev(&off)?;
         if let Some(e) = cands.iter_mut().find(|e| e.res == res && e.ptr == ptr) {
             e.extent = Expr::max(e.extent.clone(), extent);
         } else {
-            cands.push(PtrCand { res, ptr, off, extent });
+            cands.push(PtrCand {
+                res,
+                ptr,
+                off,
+                extent,
+            });
         }
         Ok(())
     };
@@ -718,10 +740,10 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let s_e = rem_const(Expr::sub_sat(l_in(), k(w)), w);
     let mut templates: HashMap<(u64, u64, u64), CopyTemplate> = HashMap::new();
     let add_tpl = |t: &mut HashMap<(u64, u64, u64), CopyTemplate>,
-                       key: (u64, u64, u64),
-                       tpl: CopyTemplate,
-                       base_src: u64,
-                       base_dst: u64|
+                   key: (u64, u64, u64),
+                   tpl: CopyTemplate,
+                   base_src: u64,
+                   base_dst: u64|
      -> Result<(), String> {
         // The expressions must reproduce the planned addresses at the plan shape.
         let src = base_src + shape_ev(&tpl.src.1)?;
@@ -740,7 +762,11 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let k_rows = l.min(full_w) + b;
     add_tpl(
         &mut templates,
-        (staging_base + layout.k_off as u64, b_pk, (k_rows * 4) as u64),
+        (
+            staging_base + layout.k_off as u64,
+            b_pk,
+            (k_rows * 4) as u64,
+        ),
         CopyTemplate {
             src: (res_staging, k(layout.k_off)),
             dst: (i_pk, k(0)),
@@ -800,10 +826,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                 &mut templates,
                 (noise_base, cat_base + span_bytes as u64, (b * kvd4) as u64),
                 CopyTemplate {
-                    src: (
-                        if is_k { _i_kn } else { _i_vn },
-                        k(0),
-                    ),
+                    src: (if is_k { _i_kn } else { _i_vn }, k(0)),
                     dst: (cat_res, Expr::mul(span_e.clone(), k(kvd4))),
                     bytes: k(b * kvd4),
                 },
@@ -856,7 +879,13 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
             )?;
             let ids_view = draft_scratch.noise_tokens.sub_offset(0, b);
             let out_view = draft_scratch.x.sub_offset(0, b * h);
-            gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &ids_view, b, h)?;
+            gpu.embedding_lookup_q8_batched(
+                &target_weights.token_embd,
+                &out_view,
+                &ids_view,
+                b,
+                h,
+            )?;
         } else {
             // Scalar noise embeddings: draft_dflash_forward_rank's fallback loop.
             for (i, &tok) in block.iter().enumerate() {
@@ -875,15 +904,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                 }
             }
         }
-        dflash::draft_forward_planned(
-            gpu,
-            draft_weights,
-            draft_cfg,
-            &staged,
-            b,
-            l,
-            draft_scratch,
-        )?;
+        dflash::draft_forward_planned(gpu, draft_weights, draft_cfg, &staged, b, l, draft_scratch)?;
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         draft_lmhead_batched(
@@ -949,7 +970,8 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                     if let Some(v) = le_u64(&kn.kernarg, at) {
                         if let Some(ri) = reg.find(v) {
                             if dyn_parent[ri] {
-                                let Some(cand) = cands.iter().find(|c| c.res == ri && c.ptr == v) else {
+                                let Some(cand) = cands.iter().find(|c| c.res == ri && c.ptr == v)
+                                else {
                                     return Err(format!(
                                         "{}: kernarg+{at} points {:#x} into dynamic allocation {} with no declared window",
                                         kn.symbol, v, reg.items[ri].name
@@ -975,7 +997,9 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                         let tok = le_u32(&kn.kernarg, EMBED_OFF_TOKEN).unwrap_or(u32::MAX);
                         if embed_seen == 0 {
                             if tok != seed_token {
-                                return Err(format!("embedding row 0 token {tok} != seed {seed_token}"));
+                                return Err(format!(
+                                    "embedding row 0 token {tok} != seed {seed_token}"
+                                ));
                             }
                             kn.patches.push(PatchKind::Scalar32 {
                                 field: ScalarField {
@@ -986,7 +1010,9 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                                 domain: 0..=(vocab as u64 - 1),
                             });
                         } else if tok != mask_token {
-                            return Err(format!("embedding row {embed_seen} token {tok} != mask {mask_token}"));
+                            return Err(format!(
+                                "embedding row {embed_seen} token {tok} != mask {mask_token}"
+                            ));
                         }
                         embed_seen += 1;
                     }
@@ -1111,12 +1137,13 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
             "{embed_seen} scalar embedding launches, expected {want_scalar}"
         ));
     }
-    if batched_embed
-        && !kernels.iter().any(|s| s == "embedding_q8_batched")
-    {
+    if batched_embed && !kernels.iter().any(|s| s == "embedding_q8_batched") {
         return Err("batched noise route planned no embedding_q8_batched launch".into());
     }
-    let attn_count = kernels.iter().filter(|s| *s == SLIDING_ATTENTION_SYMBOL).count();
+    let attn_count = kernels
+        .iter()
+        .filter(|s| *s == SLIDING_ATTENTION_SYMBOL)
+        .count();
     if attn_count != n_layers {
         return Err(format!(
             "{attn_count} sliding attention launches for {n_layers} layers (a layer took another attention route)"
@@ -1165,7 +1192,11 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
         concat_segments: fam.concat_segments,
         l_domain: l_domain.unwrap_or(1..=w as u64),
         attention_lds_saturated: lds_saturated,
-        scalars_required: if batched_embed { vec![] } else { vec![SCALAR_DRAFT_SEED] },
+        scalars_required: if batched_embed {
+            vec![]
+        } else {
+            vec![SCALAR_DRAFT_SEED]
+        },
         completion_surfaces,
         shape,
         mask_token,
@@ -1186,7 +1217,8 @@ pub fn bind_draft_ops(
     em.accepts(shape)?;
     let ev = |e: &Expr| eval(e, shape, scalars);
     let base = |r: ResourceId| -> Result<&DraftResource, String> {
-        em.resource(r).ok_or_else(|| format!("unknown resource {r:?}"))
+        em.resource(r)
+            .ok_or_else(|| format!("unknown resource {r:?}"))
     };
     let mut out = Vec::with_capacity(em.ops.len());
     for (op, step) in em.ops.iter().zip(&em.steps) {
@@ -1196,12 +1228,20 @@ pub fn bind_draft_ops(
                 kn.patches.clear();
                 for p in &k0.patches {
                     match p {
-                        PatchKind::Scalar32 { field, expr, domain } => {
+                        PatchKind::Scalar32 {
+                            field,
+                            expr,
+                            domain,
+                        } => {
                             let v = ev(expr)?;
                             if !domain.contains(&v) {
-                                return Err(format!("{}: scalar {v} outside {domain:?}", kn.symbol));
+                                return Err(format!(
+                                    "{}: scalar {v} outside {domain:?}",
+                                    kn.symbol
+                                ));
                             }
-                            let v32 = u32::try_from(v).map_err(|_| "scalar exceeds u32".to_string())?;
+                            let v32 =
+                                u32::try_from(v).map_err(|_| "scalar exceeds u32".to_string())?;
                             let o = field.offset as usize;
                             kn.kernarg[o..o + 4].copy_from_slice(&v32.to_le_bytes());
                         }
@@ -1224,7 +1264,9 @@ pub fn bind_draft_ops(
                             let o = *arg_offset as usize;
                             kn.kernarg[o..o + 8].copy_from_slice(&(r.base + off).to_le_bytes());
                         }
-                        PatchKind::GridAxis { axis, expr, domain, .. } => {
+                        PatchKind::GridAxis {
+                            axis, expr, domain, ..
+                        } => {
                             let v = ev(expr)?;
                             if v == 0 || !domain.contains(&v) {
                                 return Err(format!("{}: grid {v} outside {domain:?}", kn.symbol));
@@ -1238,7 +1280,11 @@ pub fn bind_draft_ops(
             }
             (PlannedOp::Copy { .. }, WindowStep::Copy(cs)) => {
                 let (s, d) = (base(cs.src.resource)?, base(cs.dst.resource)?);
-                let (so, dof, bytes) = (ev(&cs.src.byte_offset)?, ev(&cs.dst.byte_offset)?, ev(&cs.bytes)?);
+                let (so, dof, bytes) = (
+                    ev(&cs.src.byte_offset)?,
+                    ev(&cs.dst.byte_offset)?,
+                    ev(&cs.bytes)?,
+                );
                 if so + bytes > s.bytes || dof + bytes > d.bytes {
                     return Err(format!(
                         "copy {}+{so}->{}+{dof} of {bytes} bytes exceeds an allocation",

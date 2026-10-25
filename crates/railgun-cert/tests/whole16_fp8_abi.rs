@@ -72,9 +72,22 @@ fn explicit_abi_table_matches_the_object_metadata_and_facts() {
     // Hidden arguments start at or after the explicit end.
     for symbol in [TILE, REDUCE] {
         let k = kernel(&r, symbol);
-        let end = FP8_ABI.iter().find(|s| s.symbol == symbol).unwrap().explicit_end();
-        for a in k.args.iter().filter(|a| a.value_kind.starts_with("hidden_")) {
-            assert!(a.offset >= end, "{symbol}: {} at {}", a.value_kind, a.offset);
+        let end = FP8_ABI
+            .iter()
+            .find(|s| s.symbol == symbol)
+            .unwrap()
+            .explicit_end();
+        for a in k
+            .args
+            .iter()
+            .filter(|a| a.value_kind.starts_with("hidden_"))
+        {
+            assert!(
+                a.offset >= end,
+                "{symbol}: {} at {}",
+                a.value_kind,
+                a.offset
+            );
         }
     }
 }
@@ -123,11 +136,18 @@ fn a_changed_table_refuses_against_the_real_object() {
 fn manifest_generates_the_gqa8_receipt_without_admitting_it() {
     let seq = vec![entry(TILE), entry(REDUCE)];
     let m = build_with(&seq, "gfx1201", PIN, CLASSES).expect("builds");
-    let abi: Vec<(&str, bool)> = m.abi.iter().map(|a| (a.symbol.as_str(), a.admitted)).collect();
+    let abi: Vec<(&str, bool)> = m
+        .abi
+        .iter()
+        .map(|a| (a.symbol.as_str(), a.admitted))
+        .collect();
     for want in [(TILE, true), (GQA8, false), (REDUCE, true)] {
         assert!(abi.contains(&want), "{abi:?}");
     }
-    assert!(m.abi.iter().all(|a| a.artifact_sha256 == sha256_hex(OBJECT)));
+    assert!(m
+        .abi
+        .iter()
+        .all(|a| a.artifact_sha256 == sha256_hex(OBJECT)));
     verify_with(&m, &seq, "gfx1201", PIN, CLASSES).expect("verifies");
 
     // The GQA8 object is analysed; a plan naming it is still refused.

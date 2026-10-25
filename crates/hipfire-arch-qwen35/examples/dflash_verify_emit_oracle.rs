@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Phase oracle for railgun design A slice A5 (byte-identity ladder, step 3:
-//! "HIP graph verify versus emitted HIP"; design `DESIGN-RAILGUN-WINDOW.md`
+//! "HIP graph verify versus emitted HIP"; design `docs/design/2026-10-25-dflash-railgun-window.md`
 //! §2 "Authoring, not capture", §3, §4, §6, §7).
 //!
 //! The same preimage (DeltaNet S/scale/conv/EF snapshot, every KV buffer,
@@ -110,7 +110,10 @@ fn parse_args() -> Result<Args, String> {
         return Err(format!("--kv must be fp8 or q8 (got {})", args.kv));
     }
     if args.pos + B + 8 > args.ctx {
-        return Err(format!("--ctx {} too small for --pos {}", args.ctx, args.pos));
+        return Err(format!(
+            "--ctx {} too small for --pos {}",
+            args.ctx, args.pos
+        ));
     }
     Ok(args)
 }
@@ -175,7 +178,10 @@ fn surfaces(
     push_group(&mut s, gpu, "tape.qkv", &tape.qkv_bufs)?;
     push_group(&mut s, gpu, "tape.alpha", &tape.alpha_bufs)?;
     push_group(&mut s, gpu, "tape.beta", &tape.beta_bufs)?;
-    s.push(("verify.final_hidden".into(), download(gpu, &vs.final_hidden)?));
+    s.push((
+        "verify.final_hidden".into(),
+        download(gpu, &vs.final_hidden)?,
+    ));
     s.push(("verify.logits".into(), download(gpu, &vs.logits)?));
     s.push(("verify.argmax".into(), download(gpu, &vs.argmax)?));
     s.push(("verify.rot".into(), download(gpu, &vs.rot)?));
@@ -243,7 +249,10 @@ fn restore_preimage(
     pre: &Preimage,
 ) -> Result<(), String> {
     he(gpu.hip.device_synchronize(), "device_synchronize")?;
-    he(snap.restore_to(&mut target.dn_state, gpu), "DeltaNet restore")?;
+    he(
+        snap.restore_to(&mut target.dn_state, gpu),
+        "DeltaNet restore",
+    )?;
     let by_name = |name: &str| -> &Vec<u8> {
         &pre.surfaces
             .iter()
@@ -367,7 +376,10 @@ fn run() -> Result<bool, String> {
     let mut gpu = he(Gpu::init(), "gpu init")?;
     println!("gpu: {}", gpu.arch);
     if gpu.arch != "gfx1201" {
-        println!("WARN: the railgun window is exact gfx1201; running on {}", gpu.arch);
+        println!(
+            "WARN: the railgun window is exact gfx1201; running on {}",
+            gpu.arch
+        );
     }
 
     let draft_hfq = HfqFile::open(&args.draft).map_err(|e| format!("open draft: {e:?}"))?;
@@ -378,7 +390,10 @@ fn run() -> Result<bool, String> {
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = args.ctx;
     slot_cfg.kv_mode = KvMode::Q8;
-    let mut target = he(ModelSlot::load(&mut gpu, &args.model, "target", slot_cfg), "load target")?;
+    let mut target = he(
+        ModelSlot::load(&mut gpu, &args.model, "target", slot_cfg),
+        "load target",
+    )?;
     if args.kv == "fp8" {
         let is_kv: Vec<bool> = target
             .config
@@ -429,10 +444,23 @@ fn run() -> Result<bool, String> {
         ),
         "hidden ring",
     )?;
-    let mut snap = he(DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state), "snapshot")?;
-    let mut tape = he(GdnTape::new_for_dflash(&mut gpu, &target.config, B), "gdn tape")?;
+    let mut snap = he(
+        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state),
+        "snapshot",
+    )?;
+    let mut tape = he(
+        GdnTape::new_for_dflash(&mut gpu, &target.config, B),
+        "gdn tape",
+    )?;
     let vs = he(
-        VerifyScratch::with_prefill(&mut gpu, B, dim, vocab, target.weights.output.k, &target.config),
+        VerifyScratch::with_prefill(
+            &mut gpu,
+            B,
+            dim,
+            vocab,
+            target.weights.output.k,
+            &target.config,
+        ),
         "verify scratch",
     )?;
 
@@ -494,7 +522,10 @@ fn run() -> Result<bool, String> {
             }
         }
     }
-    gate("restore fidelity (DN snapshot, KV, ring, head/written)", &fidelity);
+    gate(
+        "restore fidelity (DN snapshot, KV, ring, head/written)",
+        &fidelity,
+    );
 
     // ── Graph arm: warmup (direct), capture (+first launch), replay. ─────
     let mut capture_witness: Vec<PlannedKernel> = Vec::new();
@@ -552,12 +583,19 @@ fn run() -> Result<bool, String> {
         .into_iter()
         .filter(|line| !line.starts_with("host.gdn_frame"))
         .collect();
-    gate("graph determinism: capture+first-launch == replay", &capture_vs_replay);
+    gate(
+        "graph determinism: capture+first-launch == replay",
+        &capture_vs_replay,
+    );
     let warm_vs_replay = compare(&warm_surfaces, &graph_surfaces);
     println!(
         "info: warmup (direct route) vs graph replay: {} differing surfaces{}",
         warm_vs_replay.len(),
-        if warm_vs_replay.is_empty() { "" } else { " (direct and capture routes differ by design)" }
+        if warm_vs_replay.is_empty() {
+            ""
+        } else {
+            " (direct and capture routes differ by design)"
+        }
     );
 
     // ── Plan at the preimage. ────────────────────────────────────────────
@@ -584,12 +622,23 @@ fn run() -> Result<bool, String> {
         plan.host_delta
     );
     let symbols = plan_symbols(&plan.ops);
-    let copies = plan.ops.iter().filter(|o| matches!(o, PlannedOp::Copy { .. })).count();
-    let fills = plan.ops.iter().filter(|o| matches!(o, PlannedOp::Fill { .. })).count();
+    let copies = plan
+        .ops
+        .iter()
+        .filter(|o| matches!(o, PlannedOp::Copy { .. }))
+        .count();
+    let fills = plan
+        .ops
+        .iter()
+        .filter(|o| matches!(o, PlannedOp::Fill { .. }))
+        .count();
     println!("plan routed through Copy: {copies}, Fill: {fills}");
     gate(
         "planning is pure (frame counter restored, ring head untouched)",
-        &if frame_after_plan == frame0 && ring.head == pre.ring_head && ring.written == pre.ring_written {
+        &if frame_after_plan == frame0
+            && ring.head == pre.ring_head
+            && ring.written == pre.ring_written
+        {
             vec![]
         } else {
             vec![format!(
@@ -631,15 +680,23 @@ fn run() -> Result<bool, String> {
     // Negative control for gate 2: a wrong ring head must not equal the witness.
     {
         let mut wrong: Vec<PlannedKernel> = plan_kernels.iter().map(|k| (*k).clone()).collect();
-        if let Some(k) = wrong.iter_mut().find(|k| k.symbol.contains("hidden_commit5")) {
-            let head = u32::from_le_bytes([k.kernarg[80], k.kernarg[81], k.kernarg[82], k.kernarg[83]]);
+        if let Some(k) = wrong
+            .iter_mut()
+            .find(|k| k.symbol.contains("hidden_commit5"))
+        {
+            let head =
+                u32::from_le_bytes([k.kernarg[80], k.kernarg[81], k.kernarg[82], k.kernarg[83]]);
             k.kernarg[80..84].copy_from_slice(&(head ^ 1).to_le_bytes());
         }
         let refs: Vec<&PlannedKernel> = wrong.iter().collect();
         let caught = !compare_kernels(&refs, &capture_witness).is_empty();
         gate(
             "negative control: a flipped commit5 head word is caught by the launch comparator",
-            &if caught { vec![] } else { vec!["flip not detected".to_string()] },
+            &if caught {
+                vec![]
+            } else {
+                vec!["flip not detected".to_string()]
+            },
         );
     }
 
@@ -688,14 +745,20 @@ fn run() -> Result<bool, String> {
                 }
             },
         };
-        gate("patch table complete for a second shape (pos+5, head+3)", &problems);
+        gate(
+            "patch table complete for a second shape (pos+5, head+3)",
+            &problems,
+        );
     }
     rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame0);
 
     // ── Twin arm: execute the plan through ordinary HIP launches. ────────
     restore_preimage(&mut gpu, &mut target, &mut ring, &tape, &vs, &snap, &pre)?;
     {
-        let pbs = vs.prefill_batch.as_ref().ok_or("verify scratch has no pbs")?;
+        let pbs = vs
+            .prefill_batch
+            .as_ref()
+            .ok_or("verify scratch has no pbs")?;
         he(
             qwen35::upload_prefill_batch_inputs(&mut gpu, pbs, &block, pos),
             "upload pbs inputs",
@@ -711,7 +774,10 @@ fn run() -> Result<bool, String> {
     let twin_surfaces = surfaces(&gpu, &target, &ring, &tape, &vs)?;
     let twin_argmax: Vec<u32> = {
         let mut bytes = vec![0u8; B * 4];
-        he(gpu.hip.memcpy_dtoh(&mut bytes, &vs.argmax.buf), "argmax download")?;
+        he(
+            gpu.hip.memcpy_dtoh(&mut bytes, &vs.argmax.buf),
+            "argmax download",
+        )?;
         bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -745,8 +811,17 @@ fn run() -> Result<bool, String> {
     {
         let mut missed = Vec::new();
         for prefix in [
-            "verify.logits", "verify.final_hidden", "verify.argmax", "tape.qkv", "dn.s[", "dn.conv",
-            "kv.k[", "ring.layer", "ring.staging", "host.ring_head", "host.gdn_frame",
+            "verify.logits",
+            "verify.final_hidden",
+            "verify.argmax",
+            "tape.qkv",
+            "dn.s[",
+            "dn.conv",
+            "kv.k[",
+            "ring.layer",
+            "ring.staging",
+            "host.ring_head",
+            "host.gdn_frame",
         ] {
             let mut flipped = twin_surfaces.clone();
             let Some(entry) = flipped
@@ -761,7 +836,10 @@ fn run() -> Result<bool, String> {
                 missed.push(format!("flip in {prefix}* not detected"));
             }
         }
-        gate("negative control: byte flips per surface class are caught", &missed);
+        gate(
+            "negative control: byte flips per surface class are caught",
+            &missed,
+        );
     }
 
     // Round-trip: hand the preimage state back (not part of any gate).

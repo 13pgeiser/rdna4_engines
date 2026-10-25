@@ -549,7 +549,9 @@ pub(crate) fn lookup_facts(
         toolchain_pin: pin,
         artifact_sha256: sha,
     }) {
-        Ok(Lookup::Hit(hit)) => NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new),
+        Ok(Lookup::Hit(hit)) => {
+            NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new)
+        }
         Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
             Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
             None if pin != corpus.toolchain_pin() => {

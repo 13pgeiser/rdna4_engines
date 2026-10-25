@@ -585,7 +585,9 @@ impl Expr {
     pub fn eval(&self, input: &dyn Fn(&str) -> Option<u64>) -> Result<u64, ExprError> {
         Ok(match self {
             Self::Const(c) => *c,
-            Self::Input(name) => input(name).ok_or_else(|| ExprError::UnknownInput(name.clone()))?,
+            Self::Input(name) => {
+                input(name).ok_or_else(|| ExprError::UnknownInput(name.clone()))?
+            }
             Self::Add(a, b) => a
                 .eval(input)?
                 .checked_add(b.eval(input)?)
@@ -864,7 +866,10 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             FactStatus::Conditional(c) => {
                 for g in &c.guards {
                     if let Err(why) = guard_holds(g, launch) {
-                        refusals.push(format!("conditional guard {}@{} fails: {why}", g.kind, g.arg_offset));
+                        refusals.push(format!(
+                            "conditional guard {}@{} fails: {why}",
+                            g.kind, g.arg_offset
+                        ));
                     }
                 }
                 Some(c)
@@ -1092,7 +1097,10 @@ fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
     let size = g.size as usize;
     match g.kind.as_str() {
         "ptr_null" => {
-            let bytes = launch.kernarg.get(at..at + size).ok_or("outside the kernarg")?;
+            let bytes = launch
+                .kernarg
+                .get(at..at + size)
+                .ok_or("outside the kernarg")?;
             if bytes.iter().all(|b| *b == 0) {
                 Ok(())
             } else {
@@ -1102,11 +1110,17 @@ fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
         // `kernarg_eq` is railgun-cert's serialization of the analyzer's
         // `Guard::KernargEq` (a null optional pointer is `size 8, value 0`).
         "scalar_eq" | "kernarg_eq" => {
-            let want: u64 = g.value.parse().map_err(|_| format!("bad value {:?}", g.value))?;
+            let want: u64 = g
+                .value
+                .parse()
+                .map_err(|_| format!("bad value {:?}", g.value))?;
             if size == 0 || size > 8 {
                 return Err(format!("bad size {size}"));
             }
-            let bytes = launch.kernarg.get(at..at + size).ok_or("outside the kernarg")?;
+            let bytes = launch
+                .kernarg
+                .get(at..at + size)
+                .ok_or("outside the kernarg")?;
             let mut le = [0u8; 8];
             le[..size].copy_from_slice(bytes);
             let got = u64::from_le_bytes(le);
@@ -1117,10 +1131,15 @@ fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
             }
         }
         kind @ ("grid" | "block") => {
-            let dims: Option<Vec<u32>> = g.value.split(',').map(|v| v.trim().parse().ok()).collect();
+            let dims: Option<Vec<u32>> =
+                g.value.split(',').map(|v| v.trim().parse().ok()).collect();
             match dims.as_deref() {
                 Some(&[x, y, z]) => {
-                    let have = if kind == "grid" { launch.grid } else { launch.block };
+                    let have = if kind == "grid" {
+                        launch.grid
+                    } else {
+                        launch.block
+                    };
                     if have == [x, y, z] {
                         Ok(())
                     } else {
@@ -1134,8 +1153,15 @@ fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
         // carries the axis, `value` the workgroup count / block extent.
         kind @ ("grid_dim" | "block_dim") => {
             let axis = g.arg_offset as usize;
-            let want: u32 = g.value.parse().map_err(|_| format!("bad value {:?}", g.value))?;
-            let have = if kind == "grid_dim" { launch.grid } else { launch.block };
+            let want: u32 = g
+                .value
+                .parse()
+                .map_err(|_| format!("bad value {:?}", g.value))?;
+            let have = if kind == "grid_dim" {
+                launch.grid
+            } else {
+                launch.block
+            };
             match have.get(axis) {
                 Some(&v) if v == want => Ok(()),
                 Some(&v) => Err(format!("{kind}[{axis}] is {v}, guard {want}")),

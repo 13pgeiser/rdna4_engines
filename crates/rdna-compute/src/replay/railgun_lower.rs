@@ -164,37 +164,46 @@ fn lower_owned(
         ));
     }
     if kernels.len() != nodes {
-        return Err(format!("{} loaded kernels for {nodes} nodes", kernels.len()));
+        return Err(format!(
+            "{} loaded kernels for {nodes} nodes",
+            kernels.len()
+        ));
     }
     let words = program.authored_words();
     let mut buffers: Vec<Option<KernargBuffer>> = (0..nodes).map(|_| None).collect();
-    let commands = emit_segment(plan, &plan.segments[0], arch_lowering, transport, |commands, i| {
-        let node = &program.nodes[i];
-        let metadata = kernels[i].metadata();
-        let image = program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
-        let mut buffer = transport
-            .pool
-            .allocate_for(metadata)
-            .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
-        buffer
-            .write_exact(&image)
-            .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
-        let mut workgroup = [0u16; 3];
-        for axis in 0..3 {
-            workgroup[axis] = u16::try_from(node.block[axis])
-                .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
-        }
-        let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
-            .map_err(|e| format!("{}: {e}", node.symbol))?;
-        device
-            .validate_geometry(geometry)
-            .map_err(|e| format!("{}: {e}", node.symbol))?;
-        commands
-            .dispatch(&kernels[i], geometry, node.dynamic_lds, buffer.address())
-            .map_err(|e| format!("{}: {e}", node.symbol))?;
-        buffers[i] = Some(buffer);
-        Ok(())
-    })?;
+    let commands = emit_segment(
+        plan,
+        &plan.segments[0],
+        arch_lowering,
+        transport,
+        |commands, i| {
+            let node = &program.nodes[i];
+            let metadata = kernels[i].metadata();
+            let image = program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
+            let mut buffer = transport
+                .pool
+                .allocate_for(metadata)
+                .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+            buffer
+                .write_exact(&image)
+                .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+            let mut workgroup = [0u16; 3];
+            for axis in 0..3 {
+                workgroup[axis] = u16::try_from(node.block[axis])
+                    .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
+            }
+            let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
+                .map_err(|e| format!("{}: {e}", node.symbol))?;
+            device
+                .validate_geometry(geometry)
+                .map_err(|e| format!("{}: {e}", node.symbol))?;
+            commands
+                .dispatch(&kernels[i], geometry, node.dynamic_lds, buffer.address())
+                .map_err(|e| format!("{}: {e}", node.symbol))?;
+            buffers[i] = Some(buffer);
+            Ok(())
+        },
+    )?;
     if commands.gfx12_dwords().is_none() {
         return Err("an owned window lowers gfx12 command buffers only".to_owned());
     }
@@ -308,7 +317,9 @@ impl LoweringContext {
         plan: &rp::Pm4Plan,
         arch_lowering: rp::ArchLowering,
         artifacts: &[RecordedArtifact],
-    ) -> Result<OwnedWindowLowering, String> {
+    ) -> Result<(OwnedWindowLowering, LowerTiming), String> {
+        let started = std::time::Instant::now();
+        let loaded_before = self.executables.len();
         if artifacts.len() != program.nodes.len() {
             return Err(format!(
                 "{} code objects for {} nodes",
@@ -333,6 +344,8 @@ impl LoweringContext {
             }
             kernels.push(self.resolved[&key].clone());
         }
+        let load_us = started.elapsed().as_micros() as u64;
+        let new_objects = self.executables.len() - loaded_before;
         let (architecture, register_policy) = (self.architecture, self.register_policy);
         let (initiator, interleave, limits) = (
             self.dispatch_initiator_policy,
@@ -355,7 +368,8 @@ impl LoweringContext {
             gcr_trim: self.gcr_trim,
             entry_policy: self.entry_policy,
         };
-        lower_owned(
+        let emit_started = std::time::Instant::now();
+        let lowering = lower_owned(
             program,
             plan,
             arch_lowering,
@@ -363,8 +377,27 @@ impl LoweringContext {
             &transport,
             &self.host_pool,
             &self.device,
-        )
+        )?;
+        Ok((
+            lowering,
+            LowerTiming {
+                load_us,
+                new_objects,
+                emit_us: emit_started.elapsed().as_micros() as u64,
+            },
+        ))
     }
+}
+
+/// Where one [`LoweringContext::lower`] spent its time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LowerTiming {
+    /// Loading and resolving code objects (zero once they are all loaded).
+    pub load_us: u64,
+    /// Code objects loaded by this call (not already in the context).
+    pub new_objects: usize,
+    /// Kernarg allocation, IB emission and graph creation.
+    pub emit_us: u64,
 }
 
 impl OwnedWindowLowering {
@@ -478,7 +511,10 @@ impl OwnedWindowLowering {
             });
         }
         if let Some(first) = shape_error {
-            return Err(SelfCheckFailure { first, kernarg: bad });
+            return Err(SelfCheckFailure {
+                first,
+                kernarg: bad,
+            });
         }
         if let Some(m) = bad.first() {
             return Err(SelfCheckFailure {

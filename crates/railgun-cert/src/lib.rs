@@ -145,7 +145,11 @@ pub fn cross_check(facts: &KernargFacts, meta: &MetadataEffects) -> Differential
             MutableReadCache::VmemOnly => "vmem_only".into(),
             MutableReadCache::ScalarOrUnknown => "scalar_or_unknown".into(),
         }),
-        guards: if guarded { guard_records(&facts.guards) } else { Vec::new() },
+        guards: if guarded {
+            guard_records(&facts.guards)
+        } else {
+            Vec::new()
+        },
         guarded,
     };
     let Some(effects) = &meta.effects else {
@@ -326,7 +330,11 @@ pub fn kernel_record(
         pm_obligations: BTreeMap::new(),
         pm_analyze_error: None,
         unguarded_unresolved: Vec::new(),
-        guards: if conditional { guard_records(&facts.guards) } else { Vec::new() },
+        guards: if conditional {
+            guard_records(&facts.guards)
+        } else {
+            Vec::new()
+        },
         indexed_effects: if conditional {
             facts.indexed.iter().map(indexed_record).collect()
         } else {
@@ -347,7 +355,11 @@ pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
 
 fn guard_record(g: &Guard) -> GuardRecord {
     match *g {
-        Guard::KernargEq { offset, size, value } => GuardRecord {
+        Guard::KernargEq {
+            offset,
+            size,
+            value,
+        } => GuardRecord {
             kind: "kernarg_eq".into(),
             arg_offset: offset,
             size,
@@ -406,7 +418,12 @@ fn index_load_record(l: &IndexLoad) -> IndexLoadRecord {
         }
         .into(),
         offset_expr: l.byte_offset.to_string(),
-        extension: l.ext.iter().map(|e| ext_name(*e)).collect::<Vec<_>>().join(","),
+        extension: l
+            .ext
+            .iter()
+            .map(|e| ext_name(*e))
+            .collect::<Vec<_>>()
+            .join(","),
         class: class_name(l.class),
         path: path_name(l.path).into(),
         cache: cache_text(l.cache),
@@ -458,10 +475,26 @@ const GUARDED_CASES: &[GuardedCase] = &[GuardedCase {
         (48, 8, "global_buffer"),
     ],
     guards: &[
-        Guard::KernargEq { offset: 28, size: 4, value: 256 },
-        Guard::KernargEq { offset: 32, size: 4, value: 16 },
-        Guard::KernargEq { offset: 40, size: 8, value: 0 },
-        Guard::KernargEq { offset: 48, size: 8, value: 0 },
+        Guard::KernargEq {
+            offset: 28,
+            size: 4,
+            value: 256,
+        },
+        Guard::KernargEq {
+            offset: 32,
+            size: 4,
+            value: 16,
+        },
+        Guard::KernargEq {
+            offset: 40,
+            size: 8,
+            value: 0,
+        },
+        Guard::KernargEq {
+            offset: 48,
+            size: 8,
+            value: 0,
+        },
         Guard::GridDim { axis: 1, value: 16 },
         Guard::GridDim { axis: 2, value: 1 },
         Guard::BlockDim { axis: 0, value: 32 },
@@ -790,7 +823,10 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         records.push(record);
     }
     let proven = records.iter().filter(|r| r.status == STATUS_PROVEN).count();
-    let conditional = records.iter().filter(|r| r.status == STATUS_CONDITIONAL).count();
+    let conditional = records
+        .iter()
+        .filter(|r| r.status == STATUS_CONDITIONAL)
+        .count();
     let failed: Vec<&str> = records
         .iter()
         .filter(|r| r.differential.status == "fail")

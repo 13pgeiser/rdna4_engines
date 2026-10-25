@@ -80,20 +80,37 @@ impl Gpu {
     ) -> HipResult<()> {
         let (rows, k, rank, vocab) = (a.rows, a.k, a.rank, a.vocab);
         if rows == 0 || rows > DFLASH_SELECTOR_MAX_ROWS {
-            return Err(HipError::new(0, "dflash_selector_greedy_exact: rows not in 1..=15"));
+            return Err(HipError::new(
+                0,
+                "dflash_selector_greedy_exact: rows not in 1..=15",
+            ));
         }
         if k == 0 || k > DFLASH_SELECTOR_MAX_K {
-            return Err(HipError::new(0, "dflash_selector_greedy_exact: k not in 1..=16"));
+            return Err(HipError::new(
+                0,
+                "dflash_selector_greedy_exact: k not in 1..=16",
+            ));
         }
         if rank == 0 || vocab == 0 || vocab > u32::MAX as usize || rank > u32::MAX as usize {
-            return Err(HipError::new(0, "dflash_selector_greedy_exact: bad rank/vocab"));
+            return Err(HipError::new(
+                0,
+                "dflash_selector_greedy_exact: bad rank/vocab",
+            ));
         }
-        let cb_elems = vocab
-            .checked_mul(rank)
-            .ok_or_else(|| HipError::new(0, "dflash_selector_greedy_exact: codebook extent overflow"))?;
+        let cb_elems = vocab.checked_mul(rank).ok_or_else(|| {
+            HipError::new(0, "dflash_selector_greedy_exact: codebook extent overflow")
+        })?;
         let esz = |f16: bool| if f16 { 2usize } else { 4 };
-        need("pred_cb", a.pred_cb, cb_elems.saturating_mul(esz(a.pred_f16)))?;
-        need("succ_cb", a.succ_cb, cb_elems.saturating_mul(esz(a.succ_f16)))?;
+        need(
+            "pred_cb",
+            a.pred_cb,
+            cb_elems.saturating_mul(esz(a.pred_f16)),
+        )?;
+        need(
+            "succ_cb",
+            a.succ_cb,
+            cb_elems.saturating_mul(esz(a.succ_f16)),
+        )?;
         need("proj", a.proj, rows * rank * 4)?;
         need("top_ids", a.top_ids, rows * k * 4)?;
         need("top_vals", a.top_vals, rows * k * 4)?;

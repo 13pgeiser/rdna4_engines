@@ -98,7 +98,10 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         taint_overflow: false,
         side: SideRecord::default(),
         implicit: ImplicitRecord::default(),
-        args: vec![arg(0, 8, "pointer", Some("write")), arg(16, 8, "pointer", Some("read"))],
+        args: vec![
+            arg(0, 8, "pointer", Some("write")),
+            arg(16, 8, "pointer", Some("read")),
+        ],
         dwords: vec![],
         unguarded_unresolved: vec![],
         differential: Differential {
@@ -129,8 +132,16 @@ fn receipt(object: &str, elf: &str, k: KernelRecord) -> Receipt {
         arch: "gfx1201".into(),
         strict: false,
         tier: "D".into(),
-        lifter: Tool { name: "l".into(), crate_version: "0".into(), git_sha: "g".into() },
-        certifier: Tool { name: "c".into(), crate_version: "0".into(), git_sha: "g".into() },
+        lifter: Tool {
+            name: "l".into(),
+            crate_version: "0".into(),
+            git_sha: "g".into(),
+        },
+        certifier: Tool {
+            name: "c".into(),
+            crate_version: "0".into(),
+            git_sha: "g".into(),
+        },
         round_trip_proof_sha256: String::new(),
         kernels: vec![],
         checks: vec![],
@@ -154,7 +165,8 @@ impl Fixture {
     /// Write a one-record corpus whose receipt is `bytes`. The index carries
     /// the receipt's real digest, so only receipt content can fail admission.
     fn new(tag: &str, bytes: &[u8], object: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("railgun-corpus-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("railgun-corpus-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("r.json"), bytes).unwrap();
@@ -173,7 +185,11 @@ impl Fixture {
                 header_set_sha256: "h".into(),
                 build_dir: "/b".into(),
             },
-            toolchain: ToolchainPin { pin: pin.clone(), id, version_sha256: "v".into() },
+            toolchain: ToolchainPin {
+                pin: pin.clone(),
+                id,
+                version_sha256: "v".into(),
+            },
             records: vec![CorpusRecord {
                 arch: "gfx1201".into(),
                 artifact_sha256: object.into(),
@@ -200,7 +216,11 @@ impl Fixture {
             programs: vec![],
         };
         std::fs::write(root.join(CORPUS_INDEX), serde_json::to_vec(&index).unwrap()).unwrap();
-        Self { root, object: object.into(), pin }
+        Self {
+            root,
+            object: object.into(),
+            pin,
+        }
     }
 
     fn lookup(&self) -> Result<Lookup, railgun_corpus::CorpusError> {
@@ -233,7 +253,9 @@ fn conditional_receipt_round_trips_and_is_admitted() {
     let r = receipt(&object, &elf, conditional(&object, &elf));
     let bytes = serde_json::to_vec(&r).unwrap();
     let f = Fixture::new("roundtrip", &bytes, &object);
-    let Ok(Lookup::Hit(hit)) = f.lookup() else { panic!("admits") };
+    let Ok(Lookup::Hit(hit)) = f.lookup() else {
+        panic!("admits")
+    };
     let k = &hit.receipt.railgun.kernels[0];
     let want = conditional(&object, &elf);
     assert_eq!(k.status, STATUS_CONDITIONAL);
@@ -255,32 +277,90 @@ fn tampering_any_recorded_fact_fails_admission() {
     let edits: Vec<(&str, Box<dyn Fn(&mut KernelRecord)>)> = vec![
         ("width", Box::new(|k| k.indexed_effects[0].width = 8)),
         ("pc", Box::new(|k| k.indexed_effects[0].pc += 4)),
-        ("mode", Box::new(|k| k.indexed_effects[0].mode = "read".into())),
-        ("cache", Box::new(|k| k.indexed_effects[0].cache = "th=1 scope=0 glc=0 slc=0 dlc=0 nv=0".into())),
-        ("expr", Box::new(|k| k.indexed_effects[0].address_expr.push_str("+4"))),
-        ("base", Box::new(|k| k.indexed_effects[0].base_arg_offset = 16)),
-        ("load-pc", Box::new(|k| k.indexed_effects[0].index_loads[0].pc += 4)),
-        ("load-src", Box::new(|k| k.indexed_effects[0].index_loads[0].source_arg_offset = 0)),
-        ("load-expr", Box::new(|k| k.indexed_effects[0].index_loads[0].offset_expr = "4*workgroup_id_x".into())),
-        ("load-ext", Box::new(|k| k.indexed_effects[0].index_loads[0].extension = "zext32".into())),
-        ("guard-value", Box::new(|k| k.guards[0].value = "128".into())),
-        ("guard-removed", Box::new(|k| { k.guards.remove(2); })),
+        (
+            "mode",
+            Box::new(|k| k.indexed_effects[0].mode = "read".into()),
+        ),
+        (
+            "cache",
+            Box::new(|k| k.indexed_effects[0].cache = "th=1 scope=0 glc=0 slc=0 dlc=0 nv=0".into()),
+        ),
+        (
+            "expr",
+            Box::new(|k| k.indexed_effects[0].address_expr.push_str("+4")),
+        ),
+        (
+            "base",
+            Box::new(|k| k.indexed_effects[0].base_arg_offset = 16),
+        ),
+        (
+            "load-pc",
+            Box::new(|k| k.indexed_effects[0].index_loads[0].pc += 4),
+        ),
+        (
+            "load-src",
+            Box::new(|k| k.indexed_effects[0].index_loads[0].source_arg_offset = 0),
+        ),
+        (
+            "load-expr",
+            Box::new(|k| {
+                k.indexed_effects[0].index_loads[0].offset_expr = "4*workgroup_id_x".into()
+            }),
+        ),
+        (
+            "load-ext",
+            Box::new(|k| k.indexed_effects[0].index_loads[0].extension = "zext32".into()),
+        ),
+        (
+            "guard-value",
+            Box::new(|k| k.guards[0].value = "128".into()),
+        ),
+        (
+            "guard-removed",
+            Box::new(|k| {
+                k.guards.remove(2);
+            }),
+        ),
         ("effects-removed", Box::new(|k| k.indexed_effects.clear())),
-        ("witness-removed", Box::new(|k| k.required_witnesses.clear())),
-        ("status-proven", Box::new(|k| k.status = STATUS_PROVEN.into())),
-        ("status-unknown", Box::new(|k| k.status = STATUS_UNKNOWN.into())),
-        ("status-other", Box::new(|k| k.status = "conditional2".into())),
+        (
+            "witness-removed",
+            Box::new(|k| k.required_witnesses.clear()),
+        ),
+        (
+            "status-proven",
+            Box::new(|k| k.status = STATUS_PROVEN.into()),
+        ),
+        (
+            "status-unknown",
+            Box::new(|k| k.status = STATUS_UNKNOWN.into()),
+        ),
+        (
+            "status-other",
+            Box::new(|k| k.status = "conditional2".into()),
+        ),
         ("case-digest", Box::new(|k| k.case_digest = sha('0'))),
         ("case-digest-empty", Box::new(|k| k.case_digest.clear())),
-        ("differential-guard", Box::new(|k| k.differential.guards.clear())),
-        ("differential-unguarded", Box::new(|k| k.differential.guarded = false)),
+        (
+            "differential-guard",
+            Box::new(|k| k.differential.guards.clear()),
+        ),
+        (
+            "differential-unguarded",
+            Box::new(|k| k.differential.guarded = false),
+        ),
     ];
     // The untouched record admits, so each refusal below is the edit's.
-    assert!(admits("base", &receipt(&object, &elf, conditional(&object, &elf))));
+    assert!(admits(
+        "base",
+        &receipt(&object, &elf, conditional(&object, &elf))
+    ));
     for (name, edit) in &edits {
         let mut k = conditional(&object, &elf);
         edit(&mut k); // digest deliberately not recomputed
-        assert!(!admits(&format!("t-{name}"), &receipt(&object, &elf, k)), "{name}");
+        assert!(
+            !admits(&format!("t-{name}"), &receipt(&object, &elf, k)),
+            "{name}"
+        );
     }
 }
 
@@ -319,15 +399,34 @@ fn missing_fields_and_v1_rows_fail_closed() {
     let (object, elf) = (sha('a'), sha('b'));
     let r = receipt(&object, &elf, conditional(&object, &elf));
     let json = serde_json::to_value(&r).unwrap();
-    for field in ["guards", "indexed_effects", "required_witnesses", "case_digest"] {
+    for field in [
+        "guards",
+        "indexed_effects",
+        "required_witnesses",
+        "case_digest",
+    ] {
         let mut v = json.clone();
-        v["railgun"]["kernels"][0].as_object_mut().unwrap().remove(field);
-        let f = Fixture::new(&format!("missing-{field}"), &serde_json::to_vec(&v).unwrap(), &object);
+        v["railgun"]["kernels"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        let f = Fixture::new(
+            &format!("missing-{field}"),
+            &serde_json::to_vec(&v).unwrap(),
+            &object,
+        );
         assert!(f.lookup().is_err(), "{field}");
     }
     let mut v = json.clone();
-    v["railgun"]["kernels"][0]["differential"].as_object_mut().unwrap().remove("guards");
-    let f = Fixture::new("missing-diff-guards", &serde_json::to_vec(&v).unwrap(), &object);
+    v["railgun"]["kernels"][0]["differential"]
+        .as_object_mut()
+        .unwrap()
+        .remove("guards");
+    let f = Fixture::new(
+        "missing-diff-guards",
+        &serde_json::to_vec(&v).unwrap(),
+        &object,
+    );
     assert!(f.lookup().is_err());
     // A proven row may not carry guarded fields, and a v1-shaped conditional
     // row (no case) is never promoted.
@@ -342,7 +441,10 @@ fn missing_fields_and_v1_rows_fail_closed() {
     k.case_digest.clear();
     k.differential.guards.clear();
     k.differential.guarded = false;
-    assert!(!admits("conditional-without-case", &receipt(&object, &elf, k.clone())));
+    assert!(!admits(
+        "conditional-without-case",
+        &receipt(&object, &elf, k.clone())
+    ));
     k.status = STATUS_PROVEN.into();
     assert!(admits("plain-proven", &receipt(&object, &elf, k)));
 }
@@ -399,8 +501,14 @@ fn conditional_node_is_not_proven_without_a_matching_witness() {
     ]);
     // The legacy admit path never admits a conditional node.
     let e = m.admit("gfx1201", "pin", &plan()).expect_err("refused");
-    assert!(e.iter().any(|r| r.reason.contains("conditional, witness required")));
-    let w = |index, case, kind| ConditionalWitness { index, case_sha256: case, kind };
+    assert!(e
+        .iter()
+        .any(|r| r.reason.contains("conditional, witness required")));
+    let w = |index, case, kind| ConditionalWitness {
+        index,
+        case_sha256: case,
+        kind,
+    };
     for bad in [
         vec![],
         vec![w(0, "case1", "indexed_bind")],

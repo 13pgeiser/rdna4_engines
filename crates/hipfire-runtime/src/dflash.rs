@@ -4868,7 +4868,15 @@ pub fn propose_candidates_from_rows(
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
     propose_candidates_from_rows_capture(
-        weights, projection, ids, unaries, rows, anchor, temperature, uniforms, None,
+        weights,
+        projection,
+        ids,
+        unaries,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        None,
     )
 }
 

@@ -251,7 +251,12 @@ pub struct KernelRecord {
 }
 
 /// The guarded-case digest under the exact object receipt (§A9.2).
-pub fn case_digest(object_sha256: &str, device_elf_sha256: &str, arch: &str, k: &KernelRecord) -> String {
+pub fn case_digest(
+    object_sha256: &str,
+    device_elf_sha256: &str,
+    arch: &str,
+    k: &KernelRecord,
+) -> String {
     let bytes = serde_json::to_vec(&(
         "railgun-case-v1",
         object_sha256,

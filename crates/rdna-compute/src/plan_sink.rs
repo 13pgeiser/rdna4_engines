@@ -55,9 +55,17 @@ pub struct PlannedKernel {
 pub enum PlannedOp {
     Kernel(PlannedKernel),
     /// D2D copy between absolute device addresses.
-    Copy { dst: u64, src: u64, bytes: u64 },
+    Copy {
+        dst: u64,
+        src: u64,
+        bytes: u64,
+    },
     /// 32-bit-word fill at an absolute device address.
-    Fill { dst: u64, value: u32, words: u32 },
+    Fill {
+        dst: u64,
+        value: u32,
+        words: u32,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,7 +126,9 @@ impl Gpu {
     pub fn plan_annotate_last(&mut self, patches: Vec<PatchKind>) {
         match self.hip.plan_last_launch_index() {
             Some(index) => PATCHES.with(|p| p.borrow_mut().push((index, patches))),
-            None => self.hip.plan_refuse("plan_annotate_last with no recorded kernel"),
+            None => self
+                .hip
+                .plan_refuse("plan_annotate_last with no recorded kernel"),
         }
     }
 
@@ -173,7 +183,8 @@ impl Gpu {
                     shared_mem,
                     kernarg,
                     label,
-                } => match self.planned_kernel(&names, func, grid, block, shared_mem, kernarg, label)
+                } => match self
+                    .planned_kernel(&names, func, grid, block, shared_mem, kernarg, label)
                 {
                     Ok(kernel) => PlannedOp::Kernel(kernel),
                     Err(why) => {
@@ -195,7 +206,8 @@ impl Gpu {
             ops.push(op);
         }
         for (event, declared_patches) in patches.drain(..) {
-            if let Some(PlannedOp::Kernel(k)) = op_of_event.get(event).and_then(|&i| ops.get_mut(i)) {
+            if let Some(PlannedOp::Kernel(k)) = op_of_event.get(event).and_then(|&i| ops.get_mut(i))
+            {
                 k.patches.extend(declared_patches);
             }
         }
@@ -276,7 +288,9 @@ impl Gpu {
                 label,
             } = event
             {
-                kernels.push(self.planned_kernel(&names, func, grid, block, shared_mem, kernarg, label)?);
+                kernels.push(
+                    self.planned_kernel(&names, func, grid, block, shared_mem, kernarg, label)?,
+                );
             }
         }
         Ok(kernels)
@@ -289,7 +303,10 @@ impl Gpu {
     pub fn run_planned_ops(&mut self, ops: &[PlannedOp]) -> HipResult<()> {
         self.bind_thread()?;
         if self.hip.plan_active() {
-            return Err(HipError::new(0, "run_planned_ops: refused inside plan mode"));
+            return Err(HipError::new(
+                0,
+                "run_planned_ops: refused inside plan mode",
+            ));
         }
         for op in ops {
             match op {
@@ -317,8 +334,9 @@ impl Gpu {
                     r.map_err(|e| e.with_kernel(&k.symbol))?;
                 }
                 PlannedOp::Copy { dst, src, bytes } => {
-                    let bytes = usize::try_from(*bytes)
-                        .map_err(|_| HipError::new(0, "run_planned_ops: copy size exceeds usize"))?;
+                    let bytes = usize::try_from(*bytes).map_err(|_| {
+                        HipError::new(0, "run_planned_ops: copy size exceeds usize")
+                    })?;
                     // SAFETY: planned from live allocations of the caller.
                     let r = unsafe {
                         self.hip.memcpy_dtod_async_raw(
@@ -449,7 +467,14 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         if self.hip.plan_active() {
-            return self.launch_maybe_blob(func_name, grid, block, shared_mem, params, blob_builder);
+            return self.launch_maybe_blob(
+                func_name,
+                grid,
+                block,
+                shared_mem,
+                params,
+                blob_builder,
+            );
         }
         let func = &self.functions[func_name];
         // SAFETY: forwarded from the typed launch wrapper that assembled

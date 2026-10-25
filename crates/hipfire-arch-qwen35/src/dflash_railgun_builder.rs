@@ -46,32 +46,35 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use hip_bridge::{DeviceBuffer, Event, HipError, HipResult, PinnedHostBuffer, Stream};
-use hipfire_runtime::dflash::{
-    PinnedWindowInputs, SelectorDeviceCodebooks, SelectorGreedyBlock,
-};
+use hipfire_runtime::dflash::{PinnedWindowInputs, SelectorDeviceCodebooks, SelectorGreedyBlock};
 use railgun::index_bind::{
     PositionsIdentity, PositionsStage, PositionsTransport, SealedPositions, TransportFailure,
     WriterExtent, POSITION_BYTES, POSITION_ROWS,
 };
 use railgun::kernel::{Arg, KernelProgram, NodeFacts, WordRole, WITNESS_INDEXED_BIND};
-use railgun::plan::{plan, CacheTable, G4Table, RowPolicy};
+use railgun::plan::{plan, CacheTable, G4Table, Pm4Plan, RowPolicy};
 use railgun::window::{
     AllocationIdentity, BoundWindow, NodeImage, PreparedWindow, QueueFailure, Quiescence, Refusal,
     ResolvedStep, TopologyKey, WindowBindingKey, WindowBindings, WindowCache, WindowExecution,
     WindowInputs, WindowPlan, WindowQueue, WindowShape,
 };
 use railgun::{Binding, ResourceId, WordId};
-use rdna_compute::railgun_window::{RailgunLoweringContext, RailgunTransportDigests, WindowCorpus};
+use rdna_compute::railgun_window::{
+    LowerTiming, RailgunArtifacts, RailgunLoweringContext, RailgunTransportDigests, WindowCorpus,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::dflash_draft_emit::{
     draft_family_key, draft_staged_words, draft_state_tensors, plan_dflash_draft, DraftEmitArgs,
     DraftStagingLayout, DRAFT_ROWS, SCALAR_DRAFT_SEED,
 };
-use crate::dflash_railgun::{PreparedInputs, WindowBuilder, WindowRequest, WindowResults};
+use crate::dflash_railgun::{
+    PreparedInputs, WindowBuilder, WindowRequest, WindowResults, SKELETON_BUILDING,
+};
 use crate::dflash_verify_emit::plan_dflash_verify_full;
 use crate::dflash_window_build::{
     build_window, window_sequence, BuildInput, SealedRetarget, SequenceNode, TransportCopy,
@@ -98,6 +101,15 @@ pub const DEBUG_VAR: &str = "HIPFIRE_DFLASH_RAILGUN_DEBUG";
 /// parameters) instead of the PM4 lowering. A fault that also happens here is
 /// a bad binding; one that only happens on PM4 is the lowering or transport.
 pub const TWIN_VAR: &str = "HIPFIRE_DFLASH_RAILGUN_TWIN";
+/// `1` builds every skeleton synchronously on the window that needs it (the
+/// window waits for lowering and then runs on railgun). Default: lowering runs
+/// on a background thread, the triggering window runs on HIP
+/// (`skeleton_building`) and later windows at the shape use the skeleton.
+/// Identity gates that need every window on railgun set this.
+pub const SYNC_BUILD_VAR: &str = "HIPFIRE_DFLASH_RAILGUN_SYNC_BUILD";
+/// Background skeleton builds in flight at once; further new shapes run on
+/// HIP until one finishes.
+const MAX_BACKGROUND_BUILDS: usize = 2;
 /// Optional G4 probe cache table (`cache-table.<arch>.json`), shared with the
 /// M1 shadow: receipted boundary rows use their own rung, the rest
 /// `WaitIdle + System` (`RowPolicy::UnreceiptedSystem`).
@@ -264,7 +276,10 @@ fn stale_resources(gpu: &Gpu, program: &KernelProgram) -> Vec<String> {
         .iter()
         .enumerate()
         .filter_map(|(i, r)| match gpu.railgun_probe_allocation(r.base) {
-            Err(_) => Some(format!("r{i}[{:#x}+{}] is not a live HIP allocation", r.base, r.bytes)),
+            Err(_) => Some(format!(
+                "r{i}[{:#x}+{}] is not a live HIP allocation",
+                r.base, r.bytes
+            )),
             Ok(b) if b.base != r.base => Some(format!(
                 "r{i}[{:#x}+{}] now lies inside {:#x}+{}",
                 r.base, r.bytes, b.base, b.bytes
@@ -289,7 +304,10 @@ fn named_allocations(gpu: &Gpu, request: &WindowRequest<'_>) -> Vec<(String, u64
     for (n, t) in draft_state_tensors(&*request.draft_scratch, request.verify_scratch) {
         add(format!("draft.{n}"), t);
     }
-    add("verify.final_hidden".into(), &request.verify_scratch.final_hidden);
+    add(
+        "verify.final_hidden".into(),
+        &request.verify_scratch.final_hidden,
+    );
     for (i, t) in request.hidden_rb.layer_bufs.iter().enumerate() {
         add(format!("ring[{i}]"), t);
     }
@@ -311,13 +329,42 @@ fn named_allocations(gpu: &Gpu, request: &WindowRequest<'_>) -> Vec<(String, u64
         macro_rules! pbs {
             ($($f:ident),* $(,)?) => {$( add(concat!("pbs.", stringify!($f)).into(), &p.$f); )*};
         }
-        pbs!(x_batch, x_rot_batch, x_norm_batch, dn_qkv_batch, dn_z_batch, dn_z_fold_batch,
-            dn_alpha_batch, dn_beta_batch, dn_q_raw_batch, dn_k_raw_batch, dn_v_batch,
-            dn_q_batch, dn_k_batch, dn_attn_out_batch, dn_normed_batch, gate_ffn_batch,
-            up_batch, ffn_hidden_batch, dn_normed_rot_batch, positions, rope_positions, pos3,
-            tokens, fa_q_full_batch, fa_q_batch, fa_gate_batch, fa_k_batch, fa_v_batch,
-            fa_attn_out_batch, fa_attn_out_rot_batch, x_rot_f16_batch, dn_normed_rot_f16_batch,
-            ffn_hidden_f16_batch, fa_attn_out_rot_f16_batch);
+        pbs!(
+            x_batch,
+            x_rot_batch,
+            x_norm_batch,
+            dn_qkv_batch,
+            dn_z_batch,
+            dn_z_fold_batch,
+            dn_alpha_batch,
+            dn_beta_batch,
+            dn_q_raw_batch,
+            dn_k_raw_batch,
+            dn_v_batch,
+            dn_q_batch,
+            dn_k_batch,
+            dn_attn_out_batch,
+            dn_normed_batch,
+            gate_ffn_batch,
+            up_batch,
+            ffn_hidden_batch,
+            dn_normed_rot_batch,
+            positions,
+            rope_positions,
+            pos3,
+            tokens,
+            fa_q_full_batch,
+            fa_q_batch,
+            fa_gate_batch,
+            fa_k_batch,
+            fa_v_batch,
+            fa_attn_out_batch,
+            fa_attn_out_rot_batch,
+            x_rot_f16_batch,
+            dn_normed_rot_f16_batch,
+            ffn_hidden_f16_batch,
+            fa_attn_out_rot_f16_batch
+        );
     }
     let sc = &request.target.scratch;
     macro_rules! target {
@@ -397,11 +444,6 @@ struct BuilderKey {
     tape: bool,
     selector: bool,
     allocations: Vec<Alloc>,
-    /// `rdna_compute::scratch::scratch_growth_epoch()`: a scratch slot that
-    /// grew freed its old buffer, so every skeleton holding a pointer into
-    /// scratch is stale (its images would write through freed memory, whose
-    /// address range the allocator may already have handed out again).
-    scratch_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -411,6 +453,168 @@ struct KnownTopology {
     /// `logical_ctx_rows` over which the planned attention geometry (block
     /// size, tile bounds) holds: a window outside it plans its own skeleton.
     l_domain: std::ops::RangeInclusive<u64>,
+    /// `(slot, base, bytes)` of every `Gpu` scratch slot this skeleton binds
+    /// pointers into, as planned. A slot that was replaced (it grew) makes the
+    /// skeleton stale; slots it does not bind never matter.
+    slots: Vec<(String, u64, u64)>,
+    /// The scratch growth epoch at which `slots` was last verified current:
+    /// while it equals the live epoch nothing needs comparing.
+    epoch: u64,
+}
+
+/// Every recorded scratch slot is still live at its planned base and size.
+fn slots_current(recorded: &[(String, u64, u64)], live: &[(String, u64, u64)]) -> bool {
+    recorded
+        .iter()
+        .all(|r| live.iter().any(|l| l.0 == r.0 && l.1 == r.1 && l.2 == r.2))
+}
+
+/// The `Gpu` scratch slots `program` binds pointers into (any resource that
+/// overlaps the slot), as `(name, base, bytes)`.
+fn bound_slots(live: &[(String, u64, u64)], program: &KernelProgram) -> Vec<(String, u64, u64)> {
+    live.iter()
+        .filter(|(_, base, bytes)| {
+            program
+                .resources
+                .iter()
+                .any(|r| r.base < base + (*bytes).max(1) && *base < r.base + r.bytes.max(1))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The first known skeleton of `key` whose planned domain holds `rows` and
+/// whose bound scratch slots are all still live; stale ones are dropped (a
+/// replaced slot never returns).
+fn lookup_known(
+    known: &mut HashMap<BuilderKey, Vec<KnownTopology>>,
+    key: &BuilderKey,
+    rows: u64,
+    epoch: u64,
+    live_slots: impl FnOnce() -> Vec<(String, u64, u64)>,
+) -> Option<KnownTopology> {
+    let list = known.get_mut(key)?;
+    let mut live_slots = Some(live_slots);
+    let mut live: Option<Vec<(String, u64, u64)>> = None;
+    let mut found = None;
+    list.retain_mut(|k| {
+        if found.is_some() || !k.l_domain.contains(&rows) {
+            return true;
+        }
+        if k.epoch == epoch {
+            found = Some(k.clone());
+            return true;
+        }
+        let live = live.get_or_insert_with(|| (live_slots.take().expect("once"))());
+        if slots_current(&k.slots, live) {
+            k.epoch = epoch;
+            found = Some(k.clone());
+            true
+        } else {
+            false
+        }
+    });
+    found
+}
+
+/// Where the front half of a skeleton build (on the window's thread) spent
+/// its time.
+#[derive(Clone, Copy, Debug, Default)]
+struct FrontTiming {
+    plan_us: u64,
+    author_us: u64,
+    pm4_us: u64,
+    resolve_us: u64,
+}
+
+/// What the lowering half needs; `Send`, so it can run on a background thread.
+struct LowerJob {
+    window_plan: Arc<WindowPlan>,
+    pm4: Pm4Plan,
+    /// `None` in twin mode (no PM4 lowering).
+    artifacts: Option<RailgunArtifacts>,
+    resource_names: Vec<String>,
+    key: WindowBindingKey,
+}
+
+/// The planned half of a skeleton (everything that needs the `Gpu` and the
+/// owners) with the job that turns it into a `PreparedWindow`.
+struct Front {
+    job: LowerJob,
+    topology: TopologyKey,
+    scalars_required: Vec<String>,
+    l_domain: std::ops::RangeInclusive<u64>,
+    slots: Vec<(String, u64, u64)>,
+    timing: FrontTiming,
+}
+
+/// A lowered, prepared skeleton and what it cost.
+struct Ready {
+    prepared: PreparedWindow,
+    lower: LowerTiming,
+    prepare_us: u64,
+    total_us: u64,
+}
+
+/// Lower `job` and wrap it in a `PreparedWindow`. Needs no `Gpu`: runs on the
+/// window's thread (synchronous builds) or a background thread.
+fn finish_skeleton(
+    ctx: Option<&Mutex<RailgunLoweringContext>>,
+    arch: &str,
+    job: LowerJob,
+    debug: bool,
+) -> Result<Ready, String> {
+    let started = Instant::now();
+    let LowerJob {
+        window_plan,
+        pm4,
+        artifacts,
+        resource_names,
+        key,
+    } = job;
+    let (queue, lower): (Box<dyn WindowQueue>, LowerTiming) = match (ctx, artifacts) {
+        (Some(ctx), Some(artifacts)) => {
+            let mut ctx = ctx
+                .lock()
+                .map_err(|_| "a previous skeleton build panicked".to_owned())?;
+            let mut queue = ctx.lower(arch, window_plan.program(), &pm4, &artifacts)?;
+            drop(ctx);
+            // HIPFIRE_DFLASH_RAILGUN_DEBUG: read the lowered state back and
+            // compare it with the bound images before every replay.
+            queue.set_self_check(debug);
+            queue.set_resource_names(resource_names);
+            let timing = queue.lowering_timing();
+            (Box::new(queue), timing)
+        }
+        // Twin mode runs the bound images through HIP: no PM4 lowering, and a
+        // queue that does nothing (the twin itself proves quiescence).
+        _ => (Box::new(TwinQueue), LowerTiming::default()),
+    };
+    let prepare_started = Instant::now();
+    let prepared = PreparedWindow::new(window_plan, key, queue).map_err(|e| e.to_string())?;
+    Ok(Ready {
+        prepared,
+        lower,
+        prepare_us: prepare_started.elapsed().as_micros() as u64,
+        total_us: started.elapsed().as_micros() as u64,
+    })
+}
+
+/// A skeleton whose lowering is running on a background thread.
+struct Pending {
+    builder_key: BuilderKey,
+    topology: TopologyKey,
+    scalars_required: Vec<String>,
+    l_domain: std::ops::RangeInclusive<u64>,
+    slots: Vec<(String, u64, u64)>,
+    epoch: u64,
+    front: FrontTiming,
+    /// `BuilderState::generation` when started: an invalidated builder drops
+    /// what an older generation finishes.
+    generation: u64,
+    started: Instant,
+    rx: mpsc::Receiver<Result<Ready, String>>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 // ------------------------------------------------------------------ owner
@@ -482,7 +686,10 @@ impl PositionsDevice {
             Ok(h) => h,
             Err(e) => return fail(gpu, buf, format!("sealed positions pinned stage: {e}")),
         };
-        let fence = match gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING) {
+        let fence = match gpu
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+        {
             Ok(f) => f,
             Err(e) => return fail(gpu, buf, format!("sealed positions fence: {e}")),
         };
@@ -637,7 +844,13 @@ pub struct RailgunWindowBuilder {
     corpus: Option<WindowCorpus>,
     /// One HSA runtime/device, kernarg pools and code-object loads shared by
     /// every skeleton this builder lowers (created on the first window).
-    lowering_ctx: Option<RailgunLoweringContext>,
+    lowering_ctx: Option<Arc<Mutex<RailgunLoweringContext>>>,
+    /// `HIPFIRE_DFLASH_RAILGUN_SYNC_BUILD`.
+    sync_build: bool,
+    /// Skeletons being lowered on background threads.
+    pending: Vec<Pending>,
+    /// Bumped by `invalidate`: older pending builds are dropped when done.
+    generation: u64,
     table: Option<CacheTable>,
     resources: Option<Resources>,
     known: HashMap<BuilderKey, Vec<KnownTopology>>,
@@ -667,6 +880,9 @@ impl RailgunWindowBuilder {
             sequence_out: var(SEQUENCE_OUT_VAR),
             debug: flag(DEBUG_VAR),
             twin: flag(TWIN_VAR),
+            sync_build: flag(SYNC_BUILD_VAR),
+            pending: Vec::new(),
+            generation: 0,
             admitted: None,
             certified: false,
             note: None,
@@ -681,7 +897,14 @@ impl RailgunWindowBuilder {
 
     /// Free the builder's device resources (the owner's `release`).
     pub fn free(self, gpu: &mut Gpu) {
-        let RailgunWindowBuilder { resources, .. } = self;
+        let RailgunWindowBuilder {
+            resources, pending, ..
+        } = self;
+        // Background lowerings hold no device buffers of this builder's, but
+        // finish them before the lowering context goes away.
+        for p in pending {
+            let _ = p.handle.join();
+        }
         if let Some(r) = resources {
             let Resources {
                 books,
@@ -714,13 +937,16 @@ impl RailgunWindowBuilder {
         }
         if self.corpus.is_none() {
             let dir = self.corpus_dir.as_ref().ok_or_else(|| {
-                refuse(format!("{CORPUS_VAR} is not set: no receipt corpus to take facts from"))
+                refuse(format!(
+                    "{CORPUS_VAR} is not set: no receipt corpus to take facts from"
+                ))
             })?;
-            self.corpus =
-                Some(WindowCorpus::open(request.gpu, dir).map_err(refuse)?);
+            self.corpus = Some(WindowCorpus::open(request.gpu, dir).map_err(refuse)?);
         }
         if self.lowering_ctx.is_none() && !self.twin {
-            self.lowering_ctx = Some(request.gpu.railgun_lowering_context().map_err(refuse)?);
+            self.lowering_ctx = Some(Arc::new(Mutex::new(
+                request.gpu.railgun_lowering_context().map_err(refuse)?,
+            )));
         }
         if self.table.is_none() {
             self.table = Some(cache_table(&request.gpu.arch).map_err(refuse)?);
@@ -774,12 +1000,15 @@ impl RailgunWindowBuilder {
     }
 
     /// Plan, author, lower and wrap one window.
-    fn build(
+    /// Plan, author and PM4-plan one skeleton: everything that needs the `Gpu`
+    /// and the owners. The returned [`Front`]'s job lowers it.
+    fn build_front(
         &mut self,
         request: &mut WindowRequest<'_>,
         vmm: &[Alloc],
         scratch_epoch: u64,
-    ) -> Result<Built, Refusal> {
+    ) -> Result<Front, Refusal> {
+        let plan_started = Instant::now();
         let execution = request.execution;
         let whole16 = execution == WindowExecution::Whole16;
         let position = request.shape.position as usize;
@@ -858,7 +1087,10 @@ impl RailgunWindowBuilder {
             None
         };
 
+        let plan_us = plan_started.elapsed().as_micros() as u64;
+
         // ---- author ----------------------------------------------------------
+        let author_started = Instant::now();
         let prefix = if whole16 {
             vec![
                 TransportCopy {
@@ -875,11 +1107,12 @@ impl RailgunWindowBuilder {
         } else {
             Vec::new()
         };
-        let completion: Vec<u64> = if whole16 { vec![argmax_ptr] } else { Vec::new() };
-        let mut facts = CorpusFacts {
-            corpus,
-            transport,
+        let completion: Vec<u64> = if whole16 {
+            vec![argmax_ptr]
+        } else {
+            Vec::new()
         };
+        let mut facts = CorpusFacts { corpus, transport };
         let gpu_ref: &Gpu = &*request.gpu;
         let mut probe = |addr: u64| -> Result<Binding, String> {
             if let Some(a) = vmm
@@ -928,9 +1161,10 @@ impl RailgunWindowBuilder {
         // build-time decision, so a skeleton the manifest refuses is cached
         // like any other instead of being re-planned every window.
         let scalars_required = built.scalars_required.clone();
+        let author_us = author_started.elapsed().as_micros() as u64;
 
-
-        // ---- PM4 plan and lowering --------------------------------------------
+        // ---- PM4 plan -----------------------------------------------------------
+        let pm4_started = Instant::now();
         let table = self.table.as_ref().expect("ensure_ready");
         let pm4 = plan(&built.parts.program, table, RowPolicy::UnreceiptedSystem);
         let window_plan = Arc::new(WindowPlan::new(built.parts, &pm4)?);
@@ -968,22 +1202,21 @@ impl RailgunWindowBuilder {
         } else {
             Vec::new()
         };
-        // Twin mode runs the bound images through HIP: no PM4 lowering, and a
-        // queue that does nothing (the twin itself proves quiescence).
-        let queue: Box<dyn WindowQueue> = if self.twin {
-            Box::new(TwinQueue)
+        let pm4_us = pm4_started.elapsed().as_micros() as u64;
+        // The code objects behind the nodes, proven to be the certified ones,
+        // resolved here (they need the `Gpu`); the lowering itself does not.
+        let resolve_started = Instant::now();
+        let artifacts = if self.twin {
+            None
         } else {
-            let ctx = self.lowering_ctx.as_mut().expect("ensure_ready");
-            let mut queue = request
-                .gpu
-                .lower_railgun_window(ctx, window_plan.program(), &pm4)
-                .map_err(|e| refuse(format!("lowering: {e}")))?;
-            // HIPFIRE_DFLASH_RAILGUN_DEBUG: read the lowered state back and
-            // compare it with the bound images before every replay.
-            queue.set_self_check(self.debug);
-            queue.set_resource_names(resource_names);
-            Box::new(queue)
+            Some(
+                request
+                    .gpu
+                    .railgun_resolve_artifacts(window_plan.program())
+                    .map_err(|e| refuse(format!("lowering: {e}")))?,
+            )
         };
+        let resolve_us = resolve_started.elapsed().as_micros() as u64;
         let key = binding_key(
             &request.gpu,
             request,
@@ -995,20 +1228,204 @@ impl RailgunWindowBuilder {
             tape_populated,
             execution,
             &draft.l_domain,
-            scratch_epoch,
         );
         let topology = TopologyKey {
             binding: key.clone(),
             family: window_plan.family().clone(),
         };
-        let prepared = PreparedWindow::new(window_plan, key, queue)?;
-        Ok(Built {
-            prepared,
+        let slots = bound_slots(&request.gpu.railgun_scratch_slots(), window_plan.program());
+        Ok(Front {
+            job: LowerJob {
+                window_plan,
+                pm4,
+                artifacts,
+                resource_names,
+                key,
+            },
             topology,
             scalars_required,
             l_domain: draft.l_domain.clone(),
+            slots,
+            timing: FrontTiming {
+                plan_us,
+                author_us,
+                pm4_us,
+                resolve_us,
+            },
         })
     }
+
+    /// A window found no valid skeleton. Synchronous mode (and twin mode)
+    /// builds it now. Otherwise the window runs on HIP while the skeleton's
+    /// lowering runs on a background thread ([`Miss::Deferred`]); planning
+    /// still happens here (it needs the `Gpu` and the owners).
+    fn miss(
+        &mut self,
+        request: &mut WindowRequest<'_>,
+        vmm: &[Alloc],
+        builder_key: &BuilderKey,
+        epoch: u64,
+    ) -> Result<Miss, Refusal> {
+        let background = !self.twin && !self.sync_build;
+        let rows = request.shape.logical_ctx_rows;
+        if background
+            && (self.pending.len() >= MAX_BACKGROUND_BUILDS
+                || self
+                    .pending
+                    .iter()
+                    .any(|p| &p.builder_key == builder_key && p.l_domain.contains(&rows)))
+        {
+            return Ok(Miss::Deferred);
+        }
+        let front = self.build_front(request, vmm, epoch)?;
+        let Front {
+            job,
+            topology,
+            scalars_required,
+            l_domain,
+            slots,
+            timing,
+        } = front;
+        let arch = request.gpu.arch.clone();
+        if !background {
+            let ready = finish_skeleton(self.lowering_ctx.as_deref(), &arch, job, self.debug)
+                .map_err(|e| refuse(format!("lowering: {e}")))?;
+            if self.debug {
+                eprintln!("{}", built_line("sync", &topology, &timing, &ready, None));
+            }
+            return Ok(Miss::Built(Built {
+                prepared: ready.prepared,
+                topology,
+                scalars_required,
+                l_domain,
+                slots,
+                epoch,
+            }));
+        }
+        let ctx = self.lowering_ctx.clone().expect("ensure_ready");
+        let debug = self.debug;
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("railgun-skeleton".into())
+            .spawn(move || {
+                let _ = tx.send(finish_skeleton(Some(&ctx), &arch, job, debug));
+            })
+            .map_err(|e| refuse(format!("background skeleton build: {e}")))?;
+        self.pending.push(Pending {
+            builder_key: builder_key.clone(),
+            topology,
+            scalars_required,
+            l_domain,
+            slots,
+            epoch,
+            front: timing,
+            generation: self.generation,
+            started: Instant::now(),
+            rx,
+            handle,
+        });
+        Ok(Miss::Deferred)
+    }
+
+    /// Install every background skeleton that finished: a complete one whose
+    /// scratch slots are still current goes into the cache; anything else is
+    /// dropped (the window shape simply plans again).
+    fn poll_pending(&mut self, cache: &mut WindowCache, gpu: &Gpu) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let outcome = match self.pending[i].rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(r) => r,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("the build thread ended without a result".to_owned())
+                }
+            };
+            let p = self.pending.swap_remove(i);
+            if p.handle.join().is_err() {
+                eprintln!("[dflash-railgun] a background skeleton build panicked");
+            }
+            let ready = match outcome {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[dflash-railgun] background skeleton build failed: {e}");
+                    continue;
+                }
+            };
+            if p.generation != self.generation {
+                continue;
+            }
+            if !slots_current(&p.slots, &gpu.railgun_scratch_slots()) {
+                if self.debug {
+                    eprintln!(
+                        "[dflash-railgun] background skeleton {:016x} dropped: a scratch slot it binds was replaced while it was built",
+                        topology_hash(&p.topology)
+                    );
+                }
+                continue;
+            }
+            if self.debug {
+                eprintln!(
+                    "{}",
+                    built_line(
+                        "background",
+                        &p.topology,
+                        &p.front,
+                        &ready,
+                        Some(p.started.elapsed().as_micros() as u64)
+                    )
+                );
+            }
+            let Ready { prepared, .. } = ready;
+            if let Err(e) = cache.get_or_prepare(&p.topology, move || Ok(prepared)) {
+                eprintln!("[dflash-railgun] background skeleton not cached: {e}");
+                continue;
+            }
+            let list = self.known.entry(p.builder_key).or_default();
+            list.retain(|k| k.topology != p.topology);
+            list.push(KnownTopology {
+                topology: p.topology,
+                scalars_required: p.scalars_required,
+                l_domain: p.l_domain,
+                slots: p.slots,
+                epoch: p.epoch,
+            });
+        }
+    }
+}
+
+enum Miss {
+    Built(Built),
+    Deferred,
+}
+
+/// The DEBUG line for one built skeleton: where its cost went.
+fn built_line(
+    mode: &str,
+    topology: &TopologyKey,
+    front: &FrontTiming,
+    ready: &Ready,
+    background_wall_us: Option<u64>,
+) -> String {
+    let ms = |us: u64| us as f64 / 1000.0;
+    format!(
+        "[dflash-railgun] skeleton built ({mode}): key={:016x} on the window thread: plan={:.1}ms author={:.1}ms pm4={:.1}ms resolve={:.1}ms | lowering{}: load={:.1}ms ({} new code objects) kernargs+ib+graph={:.1}ms prepare={:.1}ms total={:.1}ms",
+        topology_hash(topology),
+        ms(front.plan_us),
+        ms(front.author_us),
+        ms(front.pm4_us),
+        ms(front.resolve_us),
+        background_wall_us
+            .map(|w| format!(" (background, {:.1}ms from spawn to install)", ms(w)))
+            .unwrap_or_default(),
+        ms(ready.lower.load_us),
+        ready.lower.new_objects,
+        ms(ready.lower.emit_us),
+        ms(ready.prepare_us),
+        ms(ready.total_us),
+    )
 }
 
 struct Built {
@@ -1016,6 +1433,8 @@ struct Built {
     topology: TopologyKey,
     scalars_required: Vec<String>,
     l_domain: std::ops::RangeInclusive<u64>,
+    slots: Vec<(String, u64, u64)>,
+    epoch: u64,
 }
 
 /// Facts adapter over the receipt corpus and the loaded transport objects.
@@ -1097,7 +1516,9 @@ fn retire_unsubmitted(sealed: &SealedPositions) -> Result<(), String> {
         S::HostChecked | S::SealedReady => sealed
             .release_unsubmitted()
             .map_err(|e| format!("release_unsubmitted: {e}")),
-        other => Err(format!("positions are {other:?}: not retirable without a completion")),
+        other => Err(format!(
+            "positions are {other:?}: not retirable without a completion"
+        )),
     }
 }
 
@@ -1127,7 +1548,6 @@ fn binding_key(
     tape: bool,
     execution: WindowExecution,
     l_domain: &std::ops::RangeInclusive<u64>,
-    scratch_epoch: u64,
 ) -> WindowBindingKey {
     let cfg = &request.target.config;
     let kv = &request.target.kv_cache;
@@ -1147,7 +1567,12 @@ fn binding_key(
         object_digests: program
             .nodes
             .iter()
-            .map(|n| n.kref.as_ref().map(|k| k.artifact_sha256.clone()).unwrap_or_default())
+            .map(|n| {
+                n.kref
+                    .as_ref()
+                    .map(|k| k.artifact_sha256.clone())
+                    .unwrap_or_default()
+            })
             .collect(),
         toolchain_digest: toolchain_pin.to_owned(),
         device: gpu.arch.clone(),
@@ -1170,9 +1595,9 @@ fn binding_key(
                     .unwrap_or(0),
             })
             .collect(),
-        kv_mapping_generation: vmm
-            .iter()
-            .fold(0u64, |acc, a| acc.wrapping_mul(1_000_003).wrapping_add(a.generation)),
+        kv_mapping_generation: vmm.iter().fold(0u64, |acc, a| {
+            acc.wrapping_mul(1_000_003).wrapping_add(a.generation)
+        }),
         scratch_capacities: vec![
             kv.physical_cap as u64,
             request.verify_scratch.max_n as u64,
@@ -1183,9 +1608,6 @@ fn binding_key(
                 .map_or(0, |p| p.max_batch as u64),
             request.hidden_rb.max_positions as u64,
             request.hidden_rb.max_batch as u64,
-            // Scratch-slot growth epoch: a skeleton planned before a growth is a
-            // different topology (its scratch pointers are stale), never a hit.
-            scratch_epoch,
         ],
         context_mode: context_mode(request.shape.swa_w, request.shape.full_w, l_domain),
         gdn_mode: format!("{:?} ef={}", dn.quant, !dn.s_ef_residual.is_empty()),
@@ -1239,9 +1661,7 @@ fn writer_extents(
             })
             .ok_or_else(|| err(format!("node {node}: dst {dst:#x} is not a KV K/V tensor")))?;
         let a = alloc_of(gpu, tensor);
-        let reserved = gpu
-            .vmm_reserved_bytes(tensor)
-            .map_or(a.bytes, |v| v as u64);
+        let reserved = gpu.vmm_reserved_bytes(tensor).map_or(a.bytes, |v| v as u64);
         let slice_end = (kv.physical_cap as u64)
             .checked_mul(row)
             .filter(|end| *end <= reserved)
@@ -1295,11 +1715,13 @@ impl WindowQueue for TwinQueue {
 }
 
 fn le_u32(b: &[u8], at: usize) -> Option<u32> {
-    b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
+    b.get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
 }
 
 fn le_u64(b: &[u8], at: usize) -> Option<u64> {
-    b.get(at..at + 8).map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
+    b.get(at..at + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
 }
 
 /// The bound window as ordinary HIP operations, in node order: every kernel
@@ -1325,8 +1747,12 @@ pub(crate) fn twin_ops(
     let mut ops = Vec::with_capacity(program.nodes.len());
     for (i, n) in program.nodes.iter().enumerate() {
         let image = images[i];
-        let want = |v: Option<u64>, what: &str| v.ok_or_else(|| format!("node {i} {}: {what} outside its image", n.symbol));
-        let want32 = |v: Option<u32>, what: &str| v.ok_or_else(|| format!("node {i} {}: {what} outside its image", n.symbol));
+        let want = |v: Option<u64>, what: &str| {
+            v.ok_or_else(|| format!("node {i} {}: {what} outside its image", n.symbol))
+        };
+        let want32 = |v: Option<u32>, what: &str| {
+            v.ok_or_else(|| format!("node {i} {}: {what} outside its image", n.symbol))
+        };
         match n.symbol.as_str() {
             railgun::copy::COPY_SYMBOL => ops.push(PlannedOp::Copy {
                 src: want(le_u64(image, 0), "src")?,
@@ -1350,7 +1776,11 @@ pub(crate) fn twin_ops(
                 let mut kernarg = vec![0u8; explicit.next_multiple_of(16)];
                 kernarg[..explicit].copy_from_slice(&image[..explicit]);
                 ops.push(PlannedOp::Kernel(PlannedKernel {
-                    module: n.kref.as_ref().map(|k| k.module.clone()).unwrap_or_default(),
+                    module: n
+                        .kref
+                        .as_ref()
+                        .map(|k| k.module.clone())
+                        .unwrap_or_default(),
                     symbol: n.symbol.clone(),
                     code_object_digest: [0; 32],
                     grid: grids[i],
@@ -1405,8 +1835,12 @@ pub(crate) fn trace_line(
     let mut range: Vec<Option<(u64, u64)>> = vec![None; allocations.len()];
     for (i, n) in program.nodes.iter().enumerate() {
         for (offset, arg) in &n.args {
-            let Arg::Resource { resource, .. } = arg else { continue };
-            let Some(ptr) = le_u64(images[i], *offset as usize) else { continue };
+            let Arg::Resource { resource, .. } = arg else {
+                continue;
+            };
+            let Some(ptr) = le_u64(images[i], *offset as usize) else {
+                continue;
+            };
             if let Some(slot) = range.get_mut(resource.0 as usize) {
                 *slot = Some(match *slot {
                     None => (ptr, ptr),
@@ -1474,7 +1908,10 @@ impl WindowBuilder for RailgunWindowBuilder {
                 .ensure_mapped_capacity(&mut *request.gpu, position + ROWS)
                 .map_err(|e| refuse(format!("KV mapped capacity: {e}")))?;
         }
+        self.poll_pending(cache, &*request.gpu);
         let family = draft_family_key(&request.shape).map_err(refuse)?;
+        // Read BEFORE planning: a skeleton is valid at least as long as this
+        // epoch is current (see `slots_current` for what happens after).
         let scratch_epoch = rdna_compute::scratch::scratch_growth_epoch();
         let vmm = kv_vmm_allocs(request.gpu, &request.target.kv_cache);
         let selector = request.draft_weights.has_candidate_selector();
@@ -1484,28 +1921,35 @@ impl WindowBuilder for RailgunWindowBuilder {
             concat_segments: family.concat_segments,
             tape: request.gdn_tape.is_some(),
             selector,
-            scratch_epoch,
             allocations: fingerprint(
                 request.gpu,
                 request,
                 &vmm,
-                self.resources.as_ref().map(|r| r.positions.sealed.identity()),
+                self.resources
+                    .as_ref()
+                    .map(|r| r.positions.sealed.identity()),
             ),
         };
 
+        let found = lookup_known(
+            &mut self.known,
+            &builder_key,
+            request.shape.logical_ctx_rows,
+            scratch_epoch,
+            || request.gpu.railgun_scratch_slots(),
+        );
         let (prepared, scalars_required, note): (&'c mut PreparedWindow, Vec<String>, PrepNote) =
-            match self
-                .known
-                .get(&builder_key)
-                .and_then(|v| v.iter().find(|k| k.l_domain.contains(&request.shape.logical_ctx_rows)))
-                .cloned()
-            {
+            match found {
                 Some(known) => {
                     let mut rebuilt: Option<TopologyKey> = None;
                     let p = cache.get_or_prepare(&known.topology, || {
-                        let b = self.build(request, &vmm, scratch_epoch)?;
-                        rebuilt = Some(b.topology);
-                        Ok(b.prepared)
+                        match self.miss(request, &vmm, &builder_key, scratch_epoch)? {
+                            Miss::Built(b) => {
+                                rebuilt = Some(b.topology);
+                                Ok(b.prepared)
+                            }
+                            Miss::Deferred => Err(refuse(SKELETON_BUILDING)),
+                        }
                     })?;
                     if let Some(t) = &rebuilt {
                         if *t != known.topology {
@@ -1529,12 +1973,22 @@ impl WindowBuilder for RailgunWindowBuilder {
                         topology,
                         scalars_required,
                         l_domain,
-                    } = self.build(request, &vmm, scratch_epoch)?;
-                    self.known.entry(builder_key).or_default().push(KnownTopology {
-                        topology: topology.clone(),
-                        scalars_required: scalars_required.clone(),
-                        l_domain: l_domain.clone(),
-                    });
+                        slots,
+                        epoch,
+                    } = match self.miss(request, &vmm, &builder_key, scratch_epoch)? {
+                        Miss::Built(b) => b,
+                        Miss::Deferred => return Err(refuse(SKELETON_BUILDING)),
+                    };
+                    self.known
+                        .entry(builder_key)
+                        .or_default()
+                        .push(KnownTopology {
+                            topology: topology.clone(),
+                            scalars_required: scalars_required.clone(),
+                            l_domain: l_domain.clone(),
+                            slots,
+                            epoch,
+                        });
                     let p = cache.get_or_prepare(&topology, move || Ok(prepared))?;
                     let note = PrepNote {
                         hit: false,
@@ -1644,7 +2098,10 @@ impl WindowBuilder for RailgunWindowBuilder {
             .map(|n| {
                 (
                     n.symbol.clone(),
-                    n.kref.as_ref().map(|k| k.artifact_sha256.clone()).unwrap_or_default(),
+                    n.kref
+                        .as_ref()
+                        .map(|k| k.artifact_sha256.clone())
+                        .unwrap_or_default(),
                 )
             })
             .collect();
@@ -1675,7 +2132,16 @@ impl WindowBuilder for RailgunWindowBuilder {
         let Some(note) = self.note.as_ref() else {
             return;
         };
-        eprintln!("{}", trace_line(prepared, shape, note, self.manifest.is_some(), self.certified));
+        eprintln!(
+            "{}",
+            trace_line(
+                prepared,
+                shape,
+                note,
+                self.manifest.is_some(),
+                self.certified
+            )
+        );
     }
 
     fn twin_run(&mut self, gpu: &mut Gpu, prepared: &PreparedWindow) -> HipResult<bool> {
@@ -1684,10 +2150,18 @@ impl WindowBuilder for RailgunWindowBuilder {
         }
         let program = prepared.plan().program();
         let images: Vec<&[u8]> = (0..program.nodes.len())
-            .map(|i| prepared.kernarg_image(i).ok_or_else(|| err(format!("no bound image for node {i}"))))
+            .map(|i| {
+                prepared
+                    .kernarg_image(i)
+                    .ok_or_else(|| err(format!("no bound image for node {i}")))
+            })
             .collect::<HipResult<_>>()?;
         let grids: Vec<[u32; 3]> = (0..program.nodes.len())
-            .map(|i| prepared.grid(i).ok_or_else(|| err(format!("no bound grid for node {i}"))))
+            .map(|i| {
+                prepared
+                    .grid(i)
+                    .ok_or_else(|| err(format!("no bound grid for node {i}")))
+            })
             .collect::<HipResult<_>>()?;
         let ops = twin_ops(program, &images, &grids).map_err(err)?;
         gpu.run_planned_ops(&ops)?;
@@ -1760,10 +2234,12 @@ impl WindowBuilder for RailgunWindowBuilder {
                     .map_err(|_| err("window position exceeds i32"))
             })
             .collect::<HipResult<_>>()?;
-        let array: [i32; POSITION_ROWS] = positions
-            .as_slice()
-            .try_into()
-            .map_err(|_| err(format!("{} verify positions, need {POSITION_ROWS}", positions.len())))?;
+        let array: [i32; POSITION_ROWS] = positions.as_slice().try_into().map_err(|_| {
+            err(format!(
+                "{} verify positions, need {POSITION_ROWS}",
+                positions.len()
+            ))
+        })?;
         let extents = writer_extents(&*request.gpu, &request.target.kv_cache, prepared)?;
 
         let res = self
@@ -1771,10 +2247,14 @@ impl WindowBuilder for RailgunWindowBuilder {
             .as_mut()
             .ok_or_else(|| err("railgun window: sealing before prepare"))?;
         let pos = &mut res.positions;
-        if plan.indexed_positions().map(|r| prepared.key().allocations[r.0 as usize].base)
+        if plan
+            .indexed_positions()
+            .map(|r| prepared.key().allocations[r.0 as usize].base)
             != Some(pos.base())
         {
-            return Err(err("the plan's conditional writers do not read the sealed positions"));
+            return Err(err(
+                "the plan's conditional writers do not read the sealed positions",
+            ));
         }
         let checked = pos.sealed.host_check(&positions, &producer).map_err(ierr)?;
         pos.stage.fill(&array).map_err(ierr)?;
@@ -1794,7 +2274,9 @@ impl WindowBuilder for RailgunWindowBuilder {
             .sealed
             .begin_upload(checked, &pos.stage, &mut transport)
             .map_err(ierr)?;
-        pos.sealed.complete_upload(token, &mut transport).map_err(ierr)?;
+        pos.sealed
+            .complete_upload(token, &mut transport)
+            .map_err(ierr)?;
         prepared
             .attach_indexed_witness(bound, &pos.sealed, &extents)
             .map_err(|e| err(format!("sealed positions bind: {e}")))?;
@@ -1835,7 +2317,9 @@ impl WindowBuilder for RailgunWindowBuilder {
         if let Some(r) = self.resources.as_ref() {
             // Nothing was queued: a sealed or host-checked window retires.
             if let Err(e) = retire_unsubmitted(&r.positions.sealed) {
-                eprintln!("[dflash] railgun window: sealed positions not retired after a refusal: {e}");
+                eprintln!(
+                    "[dflash] railgun window: sealed positions not retired after a refusal: {e}"
+                );
             }
         }
     }
@@ -1889,6 +2373,8 @@ impl WindowBuilder for RailgunWindowBuilder {
     fn invalidate(&mut self) {
         self.known.clear();
         self.reads = None;
+        // A build still running was planned against the state being dropped.
+        self.generation += 1;
     }
 
     fn release(self: Box<Self>, gpu: &mut Gpu) {
@@ -1901,16 +2387,25 @@ mod tests {
     use super::*;
 
     fn inputs(position: usize, abs: &[i32], compact: i32) -> WindowInputs {
-        window_inputs(abs, position, compact, 1234, 99, 8, 100, &[
-            SCALAR_DRAFT_SEED.to_owned(),
-            SCALAR_RING_WRITTEN.to_owned(),
-        ])
+        window_inputs(
+            abs,
+            position,
+            compact,
+            1234,
+            99,
+            8,
+            100,
+            &[SCALAR_DRAFT_SEED.to_owned(), SCALAR_RING_WRITTEN.to_owned()],
+        )
         .expect("inputs")
     }
 
     #[test]
     fn staging_layout_offsets_are_the_planned_ones() {
-        assert_eq!((SEED_OFF, IDS_OFF, Q_OFF, VERIFY_OFF, K_OFF), (0, 4, 68, 132, 196));
+        assert_eq!(
+            (SEED_OFF, IDS_OFF, Q_OFF, VERIFY_OFF, K_OFF),
+            (0, 4, 68, 132, 196)
+        );
         assert_eq!(LAYOUT.seed_off, 0);
         assert_eq!(LAYOUT.ids_off, 4);
         assert_eq!(LAYOUT.q_off, 68);
@@ -1941,8 +2436,17 @@ mod tests {
         assert_eq!(w.scalars.get(SCALAR_RING_WRITTEN), Some(&100));
         // Sections concatenate to exactly the pinned layout.
         let mut words = 0usize;
-        for (section, off) in [(&seed, SEED_OFF), (&ids, IDS_OFF), (&q, Q_OFF), (&verify, VERIFY_OFF)] {
-            assert_eq!(off / 4, words, "section starts where the previous one ended");
+        for (section, off) in [
+            (&seed, SEED_OFF),
+            (&ids, IDS_OFF),
+            (&q, Q_OFF),
+            (&verify, VERIFY_OFF),
+        ] {
+            assert_eq!(
+                off / 4,
+                words,
+                "section starts where the previous one ended"
+            );
             words += section.len();
         }
         assert_eq!(words, K_OFF / 4);
@@ -1962,7 +2466,11 @@ mod tests {
     }
 
     impl PositionsTransport for MockTransport {
-        fn begin_h2d(&mut self, _: u64, _: &[u8; POSITION_BYTES as usize]) -> Result<(), TransportFailure> {
+        fn begin_h2d(
+            &mut self,
+            _: u64,
+            _: &[u8; POSITION_BYTES as usize],
+        ) -> Result<(), TransportFailure> {
             self.begin.map_err(|quiescence| TransportFailure {
                 message: "mock".into(),
                 quiescence,
@@ -2011,7 +2519,10 @@ mod tests {
         assert_eq!(sp.state(), S::SealedReady);
         retire_unsubmitted(&sp).expect("a sealed, unsubmitted window retires");
         assert_eq!(sp.state(), S::Retired);
-        assert!(!stage.is_in_flight(), "the stage is released after the fence");
+        assert!(
+            !stage.is_in_flight(),
+            "the stage is released after the fence"
+        );
         // Refused after only the host check.
         let r = rows(265);
         sp.host_check(&r, &r).expect("host check");
@@ -2028,7 +2539,9 @@ mod tests {
         let r = rows(300);
         let checked = sp.host_check(&r, &r).unwrap();
         stage.fill(&r.clone().try_into().unwrap()).unwrap();
-        let mut bad = MockTransport { begin: Err(Quiescence::Unknown) };
+        let mut bad = MockTransport {
+            begin: Err(Quiescence::Unknown),
+        };
         assert!(sp.begin_upload(checked, &stage, &mut bad).is_err());
         assert_eq!(sp.state(), S::Quarantined);
         assert!(retire_unsubmitted(&sp).is_err());
@@ -2053,7 +2566,10 @@ mod tests {
         let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 2, "a repeated sequence rewrites its own file");
         files.sort_by_key(|f| f.metadata().unwrap().len());
-        assert!(files[0].file_name().to_string_lossy().ends_with(".seq.jsonl"));
+        assert!(files[0]
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".seq.jsonl"));
         // A plain file path keeps the last plan.
         let file = dir.join("last.jsonl");
         write_sequence(&file, &a).unwrap();
@@ -2061,30 +2577,169 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 3);
     }
 
-    /// A scratch slot that grew freed its old buffer: a skeleton planned before
-    /// it must never be fetched afterwards (its bound pointers are stale, and
-    /// the freed range may be reused, e.g. by the kernarg pool). The epoch is
-    /// part of both cache keys.
-    #[test]
-    fn a_scratch_growth_epoch_change_is_a_cache_miss() {
-        let key = |scratch_epoch| BuilderKey {
+    fn slot(name: &str, base: u64, bytes: u64) -> (String, u64, u64) {
+        (name.to_owned(), base, bytes)
+    }
+
+    fn known(
+        domain: std::ops::RangeInclusive<u64>,
+        slots: Vec<(String, u64, u64)>,
+        epoch: u64,
+    ) -> KnownTopology {
+        KnownTopology {
+            topology: TopologyKey {
+                binding: WindowBindingKey {
+                    model_id: String::new(),
+                    draft_id: String::new(),
+                    object_digests: Vec::new(),
+                    toolchain_digest: String::new(),
+                    device: String::new(),
+                    route_flags: 0,
+                    allocations: Vec::new(),
+                    kv_mapping_generation: 0,
+                    scratch_capacities: Vec::new(),
+                    context_mode: String::new(),
+                    gdn_mode: String::new(),
+                    extraction_layers: Vec::new(),
+                },
+                family: railgun::window::ShapeFamily {
+                    kernels: Vec::new(),
+                    projection_rows: Vec::new(),
+                },
+            },
+            scalars_required: Vec::new(),
+            l_domain: domain,
+            slots,
+            epoch,
+        }
+    }
+
+    fn key() -> BuilderKey {
+        BuilderKey {
             execution: WindowExecution::Whole16,
             fc_rows: vec![9],
             concat_segments: 1,
             tape: true,
             selector: true,
-            allocations: vec![Alloc { base: 0x1000, bytes: 64, generation: 0 }],
-            scratch_epoch,
+            allocations: vec![Alloc {
+                base: 0x1000,
+                bytes: 64,
+                generation: 0,
+            }],
+        }
+    }
+
+    /// A scratch slot that grew freed its old buffer: a skeleton that bound it
+    /// is stale (its images would write through freed memory, whose range the
+    /// allocator may hand out again), while one that never bound it is not.
+    #[test]
+    fn only_a_replaced_bound_slot_makes_a_skeleton_stale() {
+        let bound = vec![
+            slot("fp16_x_scratch", 0x1000, 100),
+            slot("mq_signs1", 0x9000, 8),
+        ];
+        let live_same = vec![
+            slot("fp16_x_scratch", 0x1000, 100),
+            slot("mq_signs1", 0x9000, 8),
+            slot("other", 0x5000, 1),
+        ];
+        assert!(slots_current(&bound, &live_same));
+        // An unbound slot growing changes nothing for this skeleton.
+        let live_other_grew = vec![
+            slot("fp16_x_scratch", 0x1000, 100),
+            slot("mq_signs1", 0x9000, 8),
+            slot("other", 0x7000, 99),
+        ];
+        assert!(slots_current(&bound, &live_other_grew));
+        // A bound slot moved, grew in place, or vanished.
+        for live in [
+            vec![
+                slot("fp16_x_scratch", 0x2000, 100),
+                slot("mq_signs1", 0x9000, 8),
+            ],
+            vec![
+                slot("fp16_x_scratch", 0x1000, 200),
+                slot("mq_signs1", 0x9000, 8),
+            ],
+            vec![slot("mq_signs1", 0x9000, 8)],
+        ] {
+            assert!(!slots_current(&bound, &live));
+        }
+    }
+
+    #[test]
+    fn a_skeleton_binds_only_the_slots_its_resources_overlap() {
+        let live = vec![
+            slot("a", 0x1000, 0x100),
+            slot("b", 0x2000, 0x100),
+            slot("c", 0x3000, 0x100),
+        ];
+        let program = KernelProgram {
+            arch: "gfx1201".into(),
+            resources: vec![
+                Binding {
+                    base: 0x10f0,
+                    bytes: 0x20,
+                }, // overlaps the tail of a
+                Binding {
+                    base: 0x3000,
+                    bytes: 4,
+                },
+                Binding {
+                    base: 0x8000,
+                    bytes: 4,
+                },
+            ],
+            words: Vec::new(),
+            nodes: Vec::new(),
         };
-        assert_eq!(key(3), key(3));
-        assert_ne!(key(3), key(4));
-        let mut known: HashMap<BuilderKey, u8> = HashMap::new();
-        known.insert(key(3), 1);
-        assert!(known.get(&key(4)).is_none(), "a grown scratch slot finds no skeleton");
-        let before = rdna_compute::scratch::scratch_growth_epoch();
-        // `note_scratch_growth` is crate-private to rdna-compute: its effect is
-        // covered there; here the public epoch is simply monotone.
-        assert!(rdna_compute::scratch::scratch_growth_epoch() >= before);
+        let got: Vec<String> = bound_slots(&live, &program)
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(got, ["a", "c"]);
+    }
+
+    /// The cache lookup trusts an unchanged epoch, re-verifies the bound slots
+    /// when it moved (refreshing the epoch on success), and drops a stale
+    /// skeleton; domains outside the planned one never match.
+    #[test]
+    fn lookup_verifies_bound_slots_only_after_the_epoch_moved() {
+        let k = key();
+        let mut known_map: HashMap<BuilderKey, Vec<KnownTopology>> = HashMap::new();
+        known_map.insert(
+            k.clone(),
+            vec![
+                known(113..=200, vec![slot("fp16_x_scratch", 0x1000, 100)], 3),
+                known(201..=u64::MAX, vec![slot("fp16_x_scratch", 0x1000, 100)], 3),
+            ],
+        );
+        let never =
+            || -> Vec<(String, u64, u64)> { panic!("same epoch must not look at the slots") };
+        assert!(lookup_known(&mut known_map, &k, 150, 3, never).is_some());
+        assert!(lookup_known(&mut known_map, &k, 50, 3, never).is_none());
+        // An unrelated slot grew (epoch 4): still valid, epoch refreshed.
+        let live = || vec![slot("fp16_x_scratch", 0x1000, 100), slot("zzz", 1, 1)];
+        assert!(lookup_known(&mut known_map, &k, 150, 4, live).is_some());
+        assert_eq!(known_map[&k][0].epoch, 4);
+        assert!(lookup_known(&mut known_map, &k, 150, 4, never).is_some());
+        // The bound slot was replaced (epoch 5): the skeleton is dropped, the
+        // other domain's (also bound to it) is untouched until it is asked for.
+        let grown = || vec![slot("fp16_x_scratch", 0x4000, 200)];
+        assert!(lookup_known(&mut known_map, &k, 150, 5, grown).is_none());
+        assert_eq!(known_map[&k].len(), 1);
+        assert!(lookup_known(&mut known_map, &k, 300, 5, grown).is_none());
+        assert!(known_map[&k].is_empty());
+    }
+
+    /// A background build's skeleton is lowered off the window thread: the
+    /// job and result types must be `Send`.
+    #[test]
+    fn background_build_types_are_send() {
+        fn send<T: Send>() {}
+        send::<LowerJob>();
+        send::<Ready>();
+        send::<Pending>();
     }
 
     #[test]

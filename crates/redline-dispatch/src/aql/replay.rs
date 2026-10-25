@@ -3598,12 +3598,21 @@ mod tests {
             1,
             0x800d,
         ];
-        let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
         assert_eq!(
             decode_pm4_dispatches(&bytes).unwrap(),
             vec![
-                DecodedDispatch { dimensions: [8, 4, 1], workgroup: Some([64, 2, 1]) },
-                DecodedDispatch { dimensions: [16, 4, 1], workgroup: Some([128, 2, 1]) },
+                DecodedDispatch {
+                    dimensions: [8, 4, 1],
+                    workgroup: Some([64, 2, 1])
+                },
+                DecodedDispatch {
+                    dimensions: [16, 4, 1],
+                    workgroup: Some([128, 2, 1])
+                },
             ]
         );
         // A dispatch before any NUM_THREAD write has no workgroup.

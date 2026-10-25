@@ -75,7 +75,11 @@ pub(super) enum Node {
     Shl32(Ix, u8),
     /// Carry-out lane mask of `a + b`; valid only as the carry-in of the
     /// matching high add, under the same EXEC level (`lvl`).
-    Carry { a: Ix, b: Ix, lvl: u8 },
+    Carry {
+        a: Ix,
+        b: Ix,
+        lvl: u8,
+    },
     // 64-bit values.
     C64(u64),
     /// The kernarg qword at byte offset `o` (8-aligned).
@@ -384,7 +388,9 @@ impl Interner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum KargKind {
     /// Inside the pointer argument starting at `arg_offset`.
-    Pointer { arg_offset: u32 },
+    Pointer {
+        arg_offset: u32,
+    },
     /// Inside a declared non-pointer (typed scalar / hidden geometry) argument.
     Scalar,
     Other,
@@ -493,13 +499,19 @@ fn to_expr(
             if classify(o) != KargKind::Scalar {
                 return Err("witness-pointer-in-offset");
             }
-            IdxExpr::Kernarg { offset: o, bits: 32 }
+            IdxExpr::Kernarg {
+                offset: o,
+                bits: 32,
+            }
         }
         Node::K64(o) => {
             if classify(o) != KargKind::Scalar || classify(o + 4) != KargKind::Scalar {
                 return Err("witness-pointer-in-offset");
             }
-            IdxExpr::Kernarg { offset: o, bits: 64 }
+            IdxExpr::Kernarg {
+                offset: o,
+                bits: 64,
+            }
         }
         Node::Entry(r) => IdxExpr::Entry(r),
         Node::Load(inst) => {
@@ -535,7 +547,11 @@ fn to_expr(
 
 /// Per `Load(i)` leaf of `e`, how its consumer uses it.
 pub(super) fn load_ext(e: &IdxExpr, out: &mut std::collections::BTreeMap<u16, Vec<IndexExt>>) {
-    fn go(e: &IdxExpr, parent: Option<IndexExt>, out: &mut std::collections::BTreeMap<u16, Vec<IndexExt>>) {
+    fn go(
+        e: &IdxExpr,
+        parent: Option<IndexExt>,
+        out: &mut std::collections::BTreeMap<u16, Vec<IndexExt>>,
+    ) {
         match e {
             IdxExpr::Load(i) => {
                 let v = out.entry(*i).or_default();

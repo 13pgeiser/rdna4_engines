@@ -221,11 +221,8 @@ pub fn plan_dflash_verify_full(
     // The PM FP8 / IU4 verify scopes `verify_dflash_block_inner` opens around
     // the body (route flags only; entered and left outside plan mode).
     let fp8 = fp8_verify_target(&target.weights, &target.config, &target.kv_cache);
-    let iu4 = qwen35::prefill::multi::dflash_iu4_verify_admitted(
-        gpu,
-        &target.weights,
-        &target.config,
-    );
+    let iu4 =
+        qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &target.weights, &target.config);
     let prev_fp8 = gpu
         .fp8_verify_enter(fp8)
         .map_err(|e| hip_err("fp8_verify_enter", e))?;
@@ -288,8 +285,12 @@ fn plan_phases(
              (per-row GEMV + D2H is not plannable)"
         ));
     }
-    if dflash_moe_verify_graph_lmhead_eligible(target.config.num_experts, false, false, moe_env.as_deref())
-    {
+    if dflash_moe_verify_graph_lmhead_eligible(
+        target.config.num_experts,
+        false,
+        false,
+        moe_env.as_deref(),
+    ) {
         return Err(
             "plan_dflash_verify: the MoE extended verify graph (lm_head+argmax captured) is \
              not planned; dense chain verify only"

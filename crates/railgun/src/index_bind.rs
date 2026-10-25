@@ -40,9 +40,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 
+use crate::kernel::Arg;
 use crate::kernel::{ArgRole, KernelNode, KernelProgram, Lowering, WITNESS_INDEXED_BIND};
 use crate::window::{AllocationIdentity, Quiescence, WindowStep};
-use crate::kernel::Arg;
 use crate::{Binding, ResourceId};
 
 /// Rows of the sealed positions (`batch_size == 16`).
@@ -123,7 +123,11 @@ pub enum PositionsState {
 /// completion fence; `acquire` is the railgun entry/system visibility acquire
 /// of the existing transport/cache receipts.
 pub trait PositionsTransport {
-    fn begin_h2d(&mut self, device: u64, bytes: &[u8; POSITION_BYTES as usize]) -> Result<(), TransportFailure>;
+    fn begin_h2d(
+        &mut self,
+        device: u64,
+        bytes: &[u8; POSITION_BYTES as usize],
+    ) -> Result<(), TransportFailure>;
     fn wait_h2d(&mut self) -> Result<(), TransportFailure>;
     fn acquire(&mut self) -> Result<(), TransportFailure>;
 }
@@ -255,7 +259,9 @@ impl SealedPositions {
             return Err(IndexBindError::Allocation("base + extent overflows".into()));
         }
         if identity.base % 4 != 0 {
-            return Err(IndexBindError::Allocation("base is not 4-byte aligned".into()));
+            return Err(IndexBindError::Allocation(
+                "base is not 4-byte aligned".into(),
+            ));
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -302,7 +308,10 @@ impl SealedPositions {
         }
         let fail = |m: String| Err(IndexBindError::HostCheck(m));
         let Ok(p): Result<[i32; POSITION_ROWS], _> = positions.try_into() else {
-            return fail(format!("{} positions, need {POSITION_ROWS}", positions.len()));
+            return fail(format!(
+                "{} positions, need {POSITION_ROWS}",
+                positions.len()
+            ));
         };
         if positions != producer {
             return fail("positions differ from the physical-position producer".into());
@@ -412,9 +421,7 @@ impl SealedPositions {
                 need: PositionsState::UploadInFlight,
             });
         }
-        if token.generation != s.generation
-            || s.checked.map(|(_, d)| d) != Some(token.digest)
-        {
+        if token.generation != s.generation || s.checked.map(|(_, d)| d) != Some(token.digest) {
             return Err(IndexBindError::Stale(
                 "upload token belongs to another generation or payload".into(),
             ));
@@ -472,7 +479,9 @@ impl SealedPositions {
     pub fn remap(&self, new_base: u64, new_generation: u64) -> Result<(), IndexBindError> {
         let mut s = self.leased("remap")?;
         if new_base == 0 || new_base % 4 != 0 {
-            return Err(IndexBindError::Allocation("remap base is null or misaligned".into()));
+            return Err(IndexBindError::Allocation(
+                "remap base is null or misaligned".into(),
+            ));
         }
         if new_generation <= s.identity.generation {
             return Err(IndexBindError::Allocation(
@@ -522,7 +531,10 @@ impl SealedPositions {
 
     /// `SealedReady`: prove every writer node and the full-program closure
     /// from the window's bound state and return the witness.
-    pub fn bind_writers(&self, input: &BindInputs<'_>) -> Result<IndexedBindWitness, IndexBindError> {
+    pub fn bind_writers(
+        &self,
+        input: &BindInputs<'_>,
+    ) -> Result<IndexedBindWitness, IndexBindError> {
         let mut s = lock(&self.inner);
         if s.state != PositionsState::SealedReady {
             return Err(IndexBindError::State {
@@ -545,7 +557,10 @@ impl SealedPositions {
 
     /// `SealedReady -> SubmittedReadOnly`: the queue accepted the program this
     /// witness was bound to.
-    pub(crate) fn mark_submitted(&self, witness: &IndexedBindWitness) -> Result<(), IndexBindError> {
+    pub(crate) fn mark_submitted(
+        &self,
+        witness: &IndexedBindWitness,
+    ) -> Result<(), IndexBindError> {
         let mut s = lock(&self.inner);
         if s.state != PositionsState::SealedReady {
             return Err(IndexBindError::State {
@@ -595,7 +610,10 @@ impl SealedPositions {
     /// checked and uploaded again. Unknown: quarantined.
     pub(crate) fn submit_failed(&self, quiescence: Quiescence) {
         let mut s = lock(&self.inner);
-        if matches!(s.state, PositionsState::SealedReady | PositionsState::SubmittedReadOnly) {
+        if matches!(
+            s.state,
+            PositionsState::SealedReady | PositionsState::SubmittedReadOnly
+        ) {
             s.state = match quiescence {
                 Quiescence::Proven => PositionsState::Retired,
                 Quiescence::Unknown => PositionsState::Quarantined,
@@ -819,7 +837,8 @@ fn bind_program(
         return closure(format!("positions resource {pr} does not exist"));
     };
     let p_alloc = input.allocations[pr];
-    if p_binding.base != p.base || p_binding.bytes != p.bytes || p_alloc.generation != p.generation {
+    if p_binding.base != p.base || p_binding.bytes != p.bytes || p_alloc.generation != p.generation
+    {
         return closure(format!(
             "resource {pr} is {:#x}+{} gen {}, the sealed positions {:#x}+{} gen {}",
             p_binding.base, p_binding.bytes, p_alloc.generation, p.base, p.bytes, p.generation
@@ -837,7 +856,10 @@ fn bind_program(
     let mut conditional = Vec::new();
     for (index, node) in program.nodes.iter().enumerate() {
         if node.kref.is_none() {
-            return closure(format!("node {index} ({}) has no certified facts", node.symbol));
+            return closure(format!(
+                "node {index} ({}) has no certified facts",
+                node.symbol
+            ));
         }
         if !matches!(node.lowering, Lowering::Pm4) {
             return closure(format!(
@@ -871,7 +893,9 @@ fn bind_program(
         let b = input.bindings.get(dst.0 as usize).ok_or_else(|| {
             IndexBindError::Closure(format!("step {i}: unknown resource {}", dst.0))
         })?;
-        if dst == input.positions_resource || overlaps((b.base, b.base.saturating_add(b.bytes)), p_range) {
+        if dst == input.positions_resource
+            || overlaps((b.base, b.base.saturating_add(b.bytes)), p_range)
+        {
             return closure(format!("step {i} writes the positions allocation"));
         }
     }
@@ -955,7 +979,13 @@ fn bind_writer(
             _ => return bad(format!("receipt has no {size}-byte argument at +{off}")),
         }
     }
-    let role = |off: u32| indexed.args.iter().find(|a| a.offset == off).map(|a| &a.role);
+    let role = |off: u32| {
+        indexed
+            .args
+            .iter()
+            .find(|a| a.offset == off)
+            .map(|a| &a.role)
+    };
     for off in [abi::DST, abi::SRC, abi::POSITIONS] {
         if !matches!(role(off), Some(ArgRole::Pointer { .. })) {
             return bad(format!("argument +{off} is not a pointer in the receipt"));
@@ -995,14 +1025,18 @@ fn bind_writer(
     }
     for off in [abi::N_KV_HEADS, abi::HEAD_DIM, abi::BATCH] {
         if !matches!(role(off), Some(ArgRole::Integer)) {
-            return bad(format!("argument +{off} is not a loaded integer in the receipt"));
+            return bad(format!(
+                "argument +{off} is not a loaded integer in the receipt"
+            ));
         }
     }
     let effect = indexed
         .effects
         .iter()
         .find(|e| e.base_arg_offset == abi::DST)
-        .ok_or_else(|| IndexBindError::writer(node_index, "no indexed effect on the dst argument"))?;
+        .ok_or_else(|| {
+            IndexBindError::writer(node_index, "no indexed effect on the dst argument")
+        })?;
     if !effect
         .index_loads
         .iter()
@@ -1010,21 +1044,27 @@ fn bind_writer(
     {
         return bad("the dst effect has no i32 index load from the positions argument".into());
     }
-    if indexed
-        .effects
-        .iter()
-        .any(|e| e.base_arg_offset != abi::DST || e.index_loads.iter().any(|l| l.source_arg_offset != abi::POSITIONS))
-    {
+    if indexed.effects.iter().any(|e| {
+        e.base_arg_offset != abi::DST
+            || e.index_loads
+                .iter()
+                .any(|l| l.source_arg_offset != abi::POSITIONS)
+    }) {
         return bad("an indexed effect uses an argument outside the dst/positions case".into());
     }
 
     let image = &input.images[node_index];
     let grid = input.grids[node_index];
-    let h_raw = le32(image, abi::N_KV_HEADS).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
-    let hd = le32(image, abi::HEAD_DIM).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
-    let batch = le32(image, abi::BATCH).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
-    let slot_descs = le64(image, abi::SLOT_DESCS).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
-    let row_slot = le64(image, abi::ROW_SLOT).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+    let h_raw = le32(image, abi::N_KV_HEADS)
+        .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+    let hd = le32(image, abi::HEAD_DIM)
+        .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+    let batch = le32(image, abi::BATCH)
+        .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+    let slot_descs = le64(image, abi::SLOT_DESCS)
+        .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+    let row_slot = le64(image, abi::ROW_SLOT)
+        .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
     let h = h_raw as i32;
     if h <= 0 {
         return bad(format!("n_kv_heads {h} is not positive"));
@@ -1054,19 +1094,26 @@ fn bind_writer(
         .ok_or_else(|| IndexBindError::writer(node_index, "R = H*258 overflows"))?;
     let src_elems = h64 * u64::from(hd) * u64::from(batch);
     if row_bytes > i32::MAX as u64 || src_elems > i32::MAX as u64 {
-        return bad(format!("R={row_bytes} or {src_elems} source elements exceed signed 32 bits"));
+        return bad(format!(
+            "R={row_bytes} or {src_elems} source elements exceed signed 32 bits"
+        ));
     }
     let src_bytes = src_elems * 4;
 
     // Pointers from the bound image, each inside its program resource.
     let resource_of = |off: u32| -> Result<(ResourceId, u64, Binding), IndexBindError> {
-        let value = le64(image, off).ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
+        let value = le64(image, off)
+            .ok_or_else(|| IndexBindError::writer(node_index, "short kernarg image"))?;
         let (_, arg) = node
             .args
             .iter()
             .find(|(o, a)| *o == off && matches!(a, Arg::Resource { .. }))
-            .ok_or_else(|| IndexBindError::writer(node_index, format!("+{off} is not a bound resource")))?;
-        let Arg::Resource { resource, .. } = arg else { unreachable!() };
+            .ok_or_else(|| {
+                IndexBindError::writer(node_index, format!("+{off} is not a bound resource"))
+            })?;
+        let Arg::Resource { resource, .. } = arg else {
+            unreachable!()
+        };
         let b = *input
             .bindings
             .get(resource.0 as usize)
@@ -1074,7 +1121,10 @@ fn bind_writer(
         if value < b.base || value - b.base >= b.bytes {
             return Err(IndexBindError::writer(
                 node_index,
-                format!("+{off} = {value:#x} lies outside its allocation {:#x}+{}", b.base, b.bytes),
+                format!(
+                    "+{off} = {value:#x} lies outside its allocation {:#x}+{}",
+                    b.base, b.bytes
+                ),
             ));
         }
         Ok((*resource, value, b))
@@ -1132,7 +1182,9 @@ fn bind_writer(
     let mut mapped: Vec<(u64, u64)> = Vec::new();
     for r in &extent.mapped {
         if r.start >= r.end || r.end > dst_binding.bytes {
-            return bad(format!("mapped interval {r:?} is empty or outside the allocation"));
+            return bad(format!(
+                "mapped interval {r:?} is empty or outside the allocation"
+            ));
         }
         mapped.push((dst_binding.base + r.start, dst_binding.base + r.end));
     }
@@ -1181,7 +1233,9 @@ fn bind_writer(
             ));
         }
         if start % 4 != 0 {
-            return bad(format!("row {bid} start {start:#x} breaks 4-byte code-store alignment"));
+            return bad(format!(
+                "row {bid} start {start:#x} breaks 4-byte code-store alignment"
+            ));
         }
         // Scale store alignment: `H*256 + head*2` after a 4-aligned start.
         if overlaps((start, end), (p.base, p.base + p.bytes)) {

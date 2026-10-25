@@ -1157,3 +1157,8 @@ required-features = ["lab"]
 [[example]]
 name = "bench_vit_gemm_shapes"
 required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "railgun_copy_fill_oracle"
+required-features = ["lab"]

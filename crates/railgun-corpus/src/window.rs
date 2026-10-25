@@ -271,7 +271,11 @@ impl WindowManifest {
         witnesses: &[ConditionalWitness],
     ) -> Result<(), Vec<WindowRefusal>> {
         let mut out = self.validate();
-        for n in self.nodes.iter().filter(|n| n.a1_status == NODE_CONDITIONAL) {
+        for n in self
+            .nodes
+            .iter()
+            .filter(|n| n.a1_status == NODE_CONDITIONAL)
+        {
             for kind in &n.required_witnesses {
                 let held = witnesses.iter().any(|w| {
                     w.index == n.index && w.case_sha256 == n.case_sha256 && w.kind == *kind

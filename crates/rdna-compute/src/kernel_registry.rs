@@ -12614,17 +12614,29 @@ extern "C" __global__ void NAMED(int* p) {}
                 .any(|e| e.module == module && e.symbols.contains(&symbol))
         };
         for (module, symbol) in [
-            ("dflash_selector_greedy_exact", "dflash_selector_greedy_exact"),
+            (
+                "dflash_selector_greedy_exact",
+                "dflash_selector_greedy_exact",
+            ),
             ("railgun_copy", "railgun_copy"),
             ("railgun_fill", "railgun_fill_u32"),
             ("select_regrid", "topk_values_regrid_f32"),
             ("topk_values_fixup_f32", "topk_values_fixup_f32"),
             ("select_regrid", "argmax_f32_batched_regrid"),
-            ("attention_dflash_sliding_f32", "attention_dflash_sliding_f32"),
-            ("dflash_hidden_commit5_gfx1100", "dflash_hidden_commit5_gfx1100"),
+            (
+                "attention_dflash_sliding_f32",
+                "attention_dflash_sliding_f32",
+            ),
+            (
+                "dflash_hidden_commit5_gfx1100",
+                "dflash_hidden_commit5_gfx1100",
+            ),
             ("embedding_q8_batched", "embedding_q8_batched"),
         ] {
-            assert!(has(module, symbol), "gfx1201 corpus lacks {module}/{symbol}");
+            assert!(
+                has(module, symbol),
+                "gfx1201 corpus lacks {module}/{symbol}"
+            );
         }
         for arch in ["gfx1100", "gfx1151"] {
             assert!(

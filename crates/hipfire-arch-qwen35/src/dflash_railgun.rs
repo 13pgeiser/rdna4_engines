@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Railgun design A slice A6: the certified-window owner, admission, and the
-//! window transaction (`DESIGN-RAILGUN-WINDOW.md` §6, §8).
+//! window transaction (`docs/design/2026-10-25-dflash-railgun-window.md` §6, §8).
 //!
 //! [`RailgunWindowOwner`] is owned by the `DflashSpeculator` (one per
 //! speculator, built only when `HIPFIRE_DFLASH_RAILGUN_WINDOW=1` is read at
@@ -107,6 +107,10 @@ pub enum RailgunRefusal {
     /// the bound images and grids. Nothing was dispatched; the first mismatch
     /// is printed.
     LoweringSelfCheck,
+    /// This window's skeleton is not built yet: its planning and lowering run
+    /// off the critical path (a background build), so this window takes the
+    /// HIP route and later windows at the shape use the skeleton.
+    SkeletonBuilding,
     // engine
     EngineUnavailable,
     PrepareRefused,
@@ -144,6 +148,7 @@ impl RailgunRefusal {
             Self::GdnFrameDependent => "gdn_frame_dependent",
             Self::ManifestRefused => "manifest_refused",
             Self::LoweringSelfCheck => "lowering_self_check",
+            Self::SkeletonBuilding => "skeleton_building",
             Self::EngineUnavailable => "engine_unavailable",
             Self::PrepareRefused => "prepare_refused",
             Self::BindRefused => "bind_refused",
@@ -344,6 +349,11 @@ pub struct WindowResults {
     /// The 16 target picks (`Whole16` only).
     pub argmax_per_pos: Option<Vec<u32>>,
 }
+
+/// The `Refusal::Malformed` message a [`WindowBuilder::prepare`] returns when
+/// the window's skeleton is being built in the background: the owner counts it
+/// as [`RailgunRefusal::SkeletonBuilding`] (a HIP window), not a failure.
+pub const SKELETON_BUILDING: &str = "skeleton building in the background";
 
 /// GPU-facing half of a certified window. The integration implements it by
 /// planning the A4 draft and A5 verify emissions, running A2 admission,
@@ -550,13 +560,19 @@ impl RailgunWindowOwner {
             if detail.is_empty() {
                 eprintln!("[dflash] railgun window: HIP route ({})", why.key());
             } else {
-                eprintln!("[dflash] railgun window: HIP route ({}): {detail}", why.key());
+                eprintln!(
+                    "[dflash] railgun window: HIP route ({}): {detail}",
+                    why.key()
+                );
             }
         }
     }
 
     /// Cached owner-level verdict (recomputed after [`Self::invalidate`]).
-    pub fn static_verdict(&mut self, facts: impl FnOnce() -> StaticFacts) -> Result<(), RailgunRefusal> {
+    pub fn static_verdict(
+        &mut self,
+        facts: impl FnOnce() -> StaticFacts,
+    ) -> Result<(), RailgunRefusal> {
         if self.static_verdict.is_none() {
             self.static_verdict = Some(admit_static(&facts()));
         }
@@ -632,7 +648,10 @@ impl RailgunWindowOwner {
             seed,
         } = owners;
         if self.builder.is_none() {
-            return Ok(self.refused(RailgunRefusal::EngineUnavailable, "no window builder installed"));
+            return Ok(self.refused(
+                RailgunRefusal::EngineUnavailable,
+                "no window builder installed",
+            ));
         }
         let Some(mut shape) = Self::shape_hint(
             position,
@@ -692,7 +711,10 @@ impl RailgunWindowOwner {
                 *counters.hip_refused.entry(why.key()).or_insert(0) += 1;
                 *last_route = Some(hip_label(why));
                 if logged.insert(why) {
-                    eprintln!("[dflash] railgun window: HIP route ({}): {detail}", why.key());
+                    eprintln!(
+                        "[dflash] railgun window: HIP route ({}): {detail}",
+                        why.key()
+                    );
                 }
                 Ok(RailgunAttempt::Refused(why))
             };
@@ -701,15 +723,22 @@ impl RailgunWindowOwner {
         //    the owner's 32-entry cache off a family that already ran on HIP.
         let (prepared, prep) = match builder.prepare(cache, &mut request) {
             Ok(v) => v,
+            Err(WindowRefusal::Malformed(m)) if m == SKELETON_BUILDING => {
+                return pre_queue_refusal(RailgunRefusal::SkeletonBuilding, m)
+            }
             Err(e) => return pre_queue_refusal(RailgunRefusal::PrepareRefused, e.to_string()),
         };
         if prepared.plan().execution() != execution {
             return pre_queue_refusal(
                 RailgunRefusal::PrepareRefused,
-                format!("prepared {:?} for a {execution:?} window", prepared.plan().execution()),
+                format!(
+                    "prepared {:?} for a {execution:?} window",
+                    prepared.plan().execution()
+                ),
             );
         }
-        if execution == WindowExecution::Whole16 && prepared.plan().tape_populated() != tape_expected
+        if execution == WindowExecution::Whole16
+            && prepared.plan().tape_populated() != tape_expected
         {
             return pre_queue_refusal(
                 RailgunRefusal::PrepareRefused,
@@ -853,7 +882,9 @@ impl RailgunWindowOwner {
         let verify = match (execution, results.argmax_per_pos) {
             (WindowExecution::Whole16, Some(picks)) if picks.len() == WINDOW_ROWS => {
                 if complete.receipt.tape_populated && !tape_expected {
-                    return Err(err("railgun window: plan populated a GDN tape the owner does not hold"));
+                    return Err(err(
+                        "railgun window: plan populated a GDN tape the owner does not hold",
+                    ));
                 }
                 Some(RailgunVerify {
                     argmax_per_pos: picks,
@@ -927,6 +958,7 @@ fn hip_label(why: RailgunRefusal) -> &'static str {
         RailgunRefusal::GdnFrameDependent => "hip:gdn_frame_dependent",
         RailgunRefusal::ManifestRefused => "hip:manifest_refused",
         RailgunRefusal::LoweringSelfCheck => "hip:lowering_self_check",
+        RailgunRefusal::SkeletonBuilding => "hip:skeleton_building",
         RailgunRefusal::EngineUnavailable => "hip:engine_unavailable",
         RailgunRefusal::PrepareRefused => "hip:prepare_refused",
         RailgunRefusal::BindRefused => "hip:bind_refused",
@@ -1016,7 +1048,10 @@ mod tests {
             kv_fp8: true,
             kv_other_quant: false,
             draft_block: 16,
-            ctx_mode: DraftCtxMode::Windowed { w: 2048, w_full: 2048 },
+            ctx_mode: DraftCtxMode::Windowed {
+                w: 2048,
+                w_full: 2048,
+            },
             retained_pm4_admitted: false,
             online_tuner: false,
         }
@@ -1043,21 +1078,50 @@ mod tests {
     fn static_admission_refusals_are_exact() {
         assert_eq!(admit_static(&facts()), Ok(()));
         let cases: Vec<(Box<dyn Fn(&mut StaticFacts)>, RailgunRefusal)> = vec![
-            (Box::new(|f| f.arch = "gfx1100".into()), RailgunRefusal::NotGfx1201),
-            (Box::new(|f| f.arch = "gfx1200".into()), RailgunRefusal::NotGfx1201),
-            (Box::new(|f| f.num_experts = 256), RailgunRefusal::NotDenseQwen35),
+            (
+                Box::new(|f| f.arch = "gfx1100".into()),
+                RailgunRefusal::NotGfx1201,
+            ),
+            (
+                Box::new(|f| f.arch = "gfx1200".into()),
+                RailgunRefusal::NotGfx1201,
+            ),
+            (
+                Box::new(|f| f.num_experts = 256),
+                RailgunRefusal::NotDenseQwen35,
+            ),
             (Box::new(|f| f.dim = 4096), RailgunRefusal::Not27bClass),
             (Box::new(|f| f.n_heads = 32), RailgunRefusal::Not27bClass),
             (Box::new(|f| f.kv_fp8 = false), RailgunRefusal::KvNotFp8),
-            (Box::new(|f| f.kv_other_quant = true), RailgunRefusal::KvNotFp8),
-            (Box::new(|f| f.draft_block = 8), RailgunRefusal::DraftNotFixed16),
             (
-                Box::new(|f| f.ctx_mode = DraftCtxMode::Windowed { w: 2048, w_full: 8192 }),
+                Box::new(|f| f.kv_other_quant = true),
+                RailgunRefusal::KvNotFp8,
+            ),
+            (
+                Box::new(|f| f.draft_block = 8),
+                RailgunRefusal::DraftNotFixed16,
+            ),
+            (
+                Box::new(|f| {
+                    f.ctx_mode = DraftCtxMode::Windowed {
+                        w: 2048,
+                        w_full: 8192,
+                    }
+                }),
                 RailgunRefusal::DraftNotAllSliding,
             ),
-            (Box::new(|f| f.ctx_mode = DraftCtxMode::Legacy), RailgunRefusal::DraftNotAllSliding),
-            (Box::new(|f| f.retained_pm4_admitted = true), RailgunRefusal::RetainedPm4),
-            (Box::new(|f| f.online_tuner = true), RailgunRefusal::OnlineTune),
+            (
+                Box::new(|f| f.ctx_mode = DraftCtxMode::Legacy),
+                RailgunRefusal::DraftNotAllSliding,
+            ),
+            (
+                Box::new(|f| f.retained_pm4_admitted = true),
+                RailgunRefusal::RetainedPm4,
+            ),
+            (
+                Box::new(|f| f.online_tuner = true),
+                RailgunRefusal::OnlineTune,
+            ),
         ];
         for (mutate, want) in cases {
             let mut f = facts();
@@ -1082,14 +1146,26 @@ mod tests {
             (Box::new(|f| f.greedy = false), RailgunRefusal::Sampling),
             (Box::new(|f| f.cactus = true), RailgunRefusal::Cactus),
             (Box::new(|f| f.pld = true), RailgunRefusal::Pld),
-            (Box::new(|f| f.ngram_cache = true), RailgunRefusal::NgramOverride),
-            (Box::new(|f| f.repeat_penalty = true), RailgunRefusal::RepeatPenalty),
+            (
+                Box::new(|f| f.ngram_cache = true),
+                RailgunRefusal::NgramOverride,
+            ),
+            (
+                Box::new(|f| f.repeat_penalty = true),
+                RailgunRefusal::RepeatPenalty,
+            ),
             (Box::new(|f| f.host_path = true), RailgunRefusal::HostPath),
-            (Box::new(|f| f.diagnostics = true), RailgunRefusal::Diagnostics),
+            (
+                Box::new(|f| f.diagnostics = true),
+                RailgunRefusal::Diagnostics,
+            ),
             (Box::new(|f| f.ctx_slice = true), RailgunRefusal::CtxSlice),
             (Box::new(|f| f.gdn_tape = false), RailgunRefusal::NoGdnTape),
             (Box::new(|f| f.b = 9), RailgunRefusal::BlockNot16),
-            (Box::new(|f| f.gdn_frame_independent = false), RailgunRefusal::GdnFrameDependent),
+            (
+                Box::new(|f| f.gdn_frame_independent = false),
+                RailgunRefusal::GdnFrameDependent,
+            ),
         ];
         for (mutate, want) in cases {
             let mut f = window();
@@ -1116,6 +1192,9 @@ mod tests {
         owner.refuse(RailgunRefusal::LoweringSelfCheck, "");
         assert_eq!(owner.counters().hip_refused["lowering_self_check"], 1);
         assert_eq!(owner.last_route(), Some("hip:lowering_self_check"));
+        owner.refuse(RailgunRefusal::SkeletonBuilding, "");
+        assert_eq!(owner.counters().hip_refused["skeleton_building"], 1);
+        assert_eq!(owner.last_route(), Some("hip:skeleton_building"));
     }
 
     #[test]

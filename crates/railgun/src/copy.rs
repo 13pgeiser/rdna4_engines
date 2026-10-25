@@ -148,7 +148,9 @@ pub fn fill_launch(dst: u64, value: u32, words: u32) -> Launch {
 /// `dst_size`-byte resource. Returns the byte offset on success.
 pub fn check_fill(dst_offset: u64, words: u64, dst_size: u64) -> Result<u64, String> {
     if words == 0 || words > MAX_FILL_WORDS {
-        return Err(format!("fill of {words} words outside 1..={MAX_FILL_WORDS}"));
+        return Err(format!(
+            "fill of {words} words outside 1..={MAX_FILL_WORDS}"
+        ));
     }
     if dst_offset % 4 != 0 {
         return Err(format!("fill offset {dst_offset} not 4-byte aligned"));
@@ -157,7 +159,9 @@ pub fn check_fill(dst_offset: u64, words: u64, dst_size: u64) -> Result<u64, Str
         .checked_add(words * 4)
         .ok_or_else(|| "fill extent overflows".to_string())?;
     if end > dst_size {
-        return Err(format!("fill end {end} exceeds resource of {dst_size} bytes"));
+        return Err(format!(
+            "fill end {end} exceeds resource of {dst_size} bytes"
+        ));
     }
     Ok(dst_offset)
 }

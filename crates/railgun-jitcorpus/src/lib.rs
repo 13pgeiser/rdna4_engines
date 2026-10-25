@@ -130,7 +130,11 @@ impl Inventory {
             let l: Line = serde_json::from_str(line)
                 .map_err(|e| format!("window sequence line {}: {e}", n + 1))?;
             let module = l.module.ok_or_else(|| {
-                format!("window sequence line {}: node {} has no module", n + 1, l.symbol)
+                format!(
+                    "window sequence line {}: node {} has no module",
+                    n + 1,
+                    l.symbol
+                )
             })?;
             let node = (l.symbol, module);
             if !nodes.contains(&node) {
@@ -1214,7 +1218,8 @@ mod tests {
             "{\"phase\":\"selector\",\"symbol\":\"dflash_selector_greedy_exact\",\"route\":\"railgun\",\"module\":\"dflash_selector_greedy_exact\"}\n",
             "{\"phase\":\"transport\",\"symbol\":\"railgun_copy\",\"route\":\"railgun\",\"module\":\"railgun_copy\"}\n",
         );
-        inv.add_window_sequence("dflash-whole16-gfx1201", "gfx1201", jsonl).unwrap();
+        inv.add_window_sequence("dflash-whole16-gfx1201", "gfx1201", jsonl)
+            .unwrap();
         let set = inv
             .node_sets()
             .into_iter()
@@ -1222,7 +1227,11 @@ mod tests {
             .expect("window set");
         assert_eq!(set.nodes.len(), 3, "duplicates collapse");
         let resolved = plan(&inv, "gfx1201").unwrap_or_else(|e| panic!("{e}"));
-        for m in ["railgun_copy", "railgun_fill", "dflash_selector_greedy_exact"] {
+        for m in [
+            "railgun_copy",
+            "railgun_fill",
+            "dflash_selector_greedy_exact",
+        ] {
             assert!(resolved.entries.iter().any(|e| e.module == m), "{m}");
         }
         // A module the registry lacks is named, not skipped.
@@ -1235,7 +1244,9 @@ mod tests {
         .unwrap();
         let err = plan(&bad, "gfx1201").err().expect("unresolved module");
         assert!(err.contains("no_such_module"), "{err}");
-        assert!(inv.add_window_sequence("w", "gfx1201", "{\"symbol\":\"x\"}\n").is_err());
+        assert!(inv
+            .add_window_sequence("w", "gfx1201", "{\"symbol\":\"x\"}\n")
+            .is_err());
     }
 
     #[test]

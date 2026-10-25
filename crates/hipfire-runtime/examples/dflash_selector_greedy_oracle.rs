@@ -21,8 +21,8 @@
 // (`deltanet` is a default feature.) Exit status is non-zero on any mismatch.
 
 use hipfire_runtime::dflash::{
-    self, DflashConfig, DflashWeights, PinnedWindowInputs, SelectorCodebook, SelectorDeviceCodebooks,
-    SelectorGreedyBlock,
+    self, DflashConfig, DflashWeights, PinnedWindowInputs, SelectorCodebook,
+    SelectorDeviceCodebooks, SelectorGreedyBlock,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::{DType, Gpu};
@@ -100,7 +100,8 @@ impl Ctx<'_> {
             .hip
             .memcpy_htod(blk.scores_buffer(), &vec![0xFF; rows * k * 4])
             .unwrap();
-        blk.enqueue(self.gpu, books, &pt, &it, &vt).expect("enqueue");
+        blk.enqueue(self.gpu, books, &pt, &it, &vt)
+            .expect("enqueue");
         self.gpu.hip.device_synchronize().unwrap();
         let got = blk.read_back(self.gpu).expect("readback");
 
@@ -122,7 +123,11 @@ impl Ctx<'_> {
             ok = false;
         }
         if got.scores.len() != cpu_scores.len()
-            || !got.scores.iter().zip(&cpu_scores).all(|(a, b)| same_f32(*a, *b))
+            || !got
+                .scores
+                .iter()
+                .zip(&cpu_scores)
+                .all(|(a, b)| same_f32(*a, *b))
         {
             ok = false;
         }
@@ -159,8 +164,8 @@ fn synth_book(
     let n = vocab * rank;
     if f16 {
         let specials: [u16; 12] = [
-            0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x83FF, 0x0400, 0x7BFF, 0xFBFF, 0x3C00,
-            0xBC00, 0x0200,
+            0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x83FF, 0x0400, 0x7BFF, 0xFBFF, 0x3C00, 0xBC00,
+            0x0200,
         ];
         let nan_inf: [u16; 4] = [0x7C00, 0xFC00, 0x7E00, 0x7D55];
         let data = (0..n)
@@ -176,10 +181,25 @@ fn synth_book(
                 }
             })
             .collect();
-        SelectorCodebook { vocab, rank, f16_data: Some(data), f32_data: None }
+        SelectorCodebook {
+            vocab,
+            rank,
+            f16_data: Some(data),
+            f32_data: None,
+        }
     } else {
         let specials: [f32; 12] = [
-            0.0, -0.0, 1e-40, -1e-40, 1.4e-45, -1.4e-45, 1.1754942e-38, 3.0e38, -3.0e38, 1.0, -1.0,
+            0.0,
+            -0.0,
+            1e-40,
+            -1e-40,
+            1.4e-45,
+            -1.4e-45,
+            1.1754942e-38,
+            3.0e38,
+            -3.0e38,
+            1.0,
+            -1.0,
             1e-20,
         ];
         let nan_inf = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
@@ -195,7 +215,12 @@ fn synth_book(
                 }
             })
             .collect();
-        SelectorCodebook { vocab, rank, f16_data: None, f32_data: Some(data) }
+        SelectorCodebook {
+            vocab,
+            rank,
+            f16_data: None,
+            f32_data: Some(data),
+        }
     }
 }
 
@@ -230,7 +255,9 @@ fn input_staging_checks(ctx: &mut Ctx<'_>) {
     gpu.hip.memcpy_htod(&dst, &vec![0xA5u8; 512]).unwrap();
     let q: Vec<u32> = (0..16).map(|i| 1000 + i * 3).collect();
     let v: Vec<u32> = (0..16).map(|i| 5000 + i).collect();
-    let off = st.pack_seed_mask_positions(0x1234_5678, 248_070, &q, &v).unwrap();
+    let off = st
+        .pack_seed_mask_positions(0x1234_5678, 248_070, &q, &v)
+        .unwrap();
     st.submit(gpu, &dst, &stream).unwrap();
     // In flight: repack and resubmit are refused; the pinned bytes are frozen.
     if st.pack(&[&[1u32]]).is_ok() {
@@ -295,7 +322,11 @@ fn main() {
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     eprintln!("selector: vocab={vocab} rank={rank} k={k} gpu={}", gpu.arch);
     let mut rng = Rng(0x243F_6A88_85A3_08D3);
-    let mut ctx = Ctx { gpu: &mut gpu, fails: 0, cases: 0 };
+    let mut ctx = Ctx {
+        gpu: &mut gpu,
+        fails: 0,
+        cases: 0,
+    };
 
     // ---- real codebooks ----------------------------------------------------
     let books = SelectorDeviceCodebooks::upload(ctx.gpu, &weights).expect("upload books");
@@ -305,13 +336,31 @@ fn main() {
         let ids = rand_ids(&mut rng, rows * k, vocab);
         let vals: Vec<f32> = (0..rows * k).map(|_| rng.unit() * 8.0).collect();
         let seed = rng.below(vocab) as u32;
-        ctx.run(&format!("real random t={t}"), &weights, &books, rows, &proj, &ids, &vals, seed);
+        ctx.run(
+            &format!("real random t={t}"),
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            seed,
+        );
     }
     for rows in 1..=15usize {
         let proj: Vec<f32> = (0..rows * rank).map(|_| rng.unit()).collect();
         let ids = rand_ids(&mut rng, rows * k, vocab);
         let vals: Vec<f32> = (0..rows * k).map(|_| rng.unit() * 4.0).collect();
-        ctx.run(&format!("real rows={rows}"), &weights, &books, rows, &proj, &ids, &vals, 1);
+        ctx.run(
+            &format!("real rows={rows}"),
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            1,
+        );
     }
     // Ties: duplicate ids with equal unaries tie exactly; the first wins.
     for t in 0..trials {
@@ -323,11 +372,24 @@ fn main() {
             let base = rng.below(vocab) as u32;
             let u = rng.unit();
             for j in 0..k {
-                ids[r * k + j] = if t % 2 == 0 { base } else { [base, (base ^ 1) % vocab as u32][j % 2] };
+                ids[r * k + j] = if t % 2 == 0 {
+                    base
+                } else {
+                    [base, (base ^ 1) % vocab as u32][j % 2]
+                };
                 vals[r * k + j] = u;
             }
         }
-        ctx.run(&format!("real ties t={t}"), &weights, &books, rows, &proj, &ids, &vals, 7);
+        ctx.run(
+            &format!("real ties t={t}"),
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            7,
+        );
     }
     // Zero projection: scores are the unaries (signed zeros included).
     {
@@ -335,17 +397,49 @@ fn main() {
         let proj = vec![0f32; rows * rank];
         let ids = rand_ids(&mut rng, rows * k, vocab);
         let vals: Vec<f32> = (0..rows * k).map(|i| [0.0, -0.0][i % 2]).collect();
-        ctx.run("real zero-proj signed-zero unaries", &weights, &books, rows, &proj, &ids, &vals, 3);
+        ctx.run(
+            "real zero-proj signed-zero unaries",
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            3,
+        );
         let proj = vec![-0.0f32; rows * rank];
-        ctx.run("real negzero-proj", &weights, &books, rows, &proj, &ids, &vals, 3);
+        ctx.run(
+            "real negzero-proj",
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            3,
+        );
     }
     // Subnormal / extreme projections against the real books.
-    for (name, scale) in [("1e-40", 1e-40f32), ("1e-38", 1e-38), ("1e-45", 1.4e-45), ("1e30", 1e30)] {
+    for (name, scale) in [
+        ("1e-40", 1e-40f32),
+        ("1e-38", 1e-38),
+        ("1e-45", 1.4e-45),
+        ("1e30", 1e30),
+    ] {
         let rows = 15;
         let proj: Vec<f32> = (0..rows * rank).map(|_| rng.unit() * scale).collect();
         let ids = rand_ids(&mut rng, rows * k, vocab);
         let vals: Vec<f32> = (0..rows * k).map(|_| rng.unit()).collect();
-        ctx.run(&format!("real proj*{name}"), &weights, &books, rows, &proj, &ids, &vals, 11);
+        ctx.run(
+            &format!("real proj*{name}"),
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            11,
+        );
     }
     // Adversarial predecessors: edges of the vocabulary, candidate == previous
     // predecessor, a repeating chain.
@@ -359,7 +453,16 @@ fn main() {
             ids[r * k + k / 2] = seed;
         }
         let vals: Vec<f32> = (0..rows * k).map(|_| rng.unit()).collect();
-        ctx.run(&format!("real edge seed={seed}"), &weights, &books, rows, &proj, &ids, &vals, seed);
+        ctx.run(
+            &format!("real edge seed={seed}"),
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            seed,
+        );
     }
     {
         // Every row offers the same ids so the chain revisits predecessors.
@@ -368,7 +471,16 @@ fn main() {
         let row_ids = rand_ids(&mut rng, k, vocab);
         let ids: Vec<u32> = (0..rows).flat_map(|_| row_ids.clone()).collect();
         let vals = vec![0.5f32; rows * k];
-        ctx.run("real repeating chain", &weights, &books, rows, &proj, &ids, &vals, row_ids[0]);
+        ctx.run(
+            "real repeating chain",
+            &weights,
+            &books,
+            rows,
+            &proj,
+            &ids,
+            &vals,
+            row_ids[0],
+        );
     }
 
     // ---- malformed ids: status word, nothing published past the fault -----
@@ -383,19 +495,40 @@ fn main() {
         let pt = ctx.gpu.upload_f32(&proj, &[rows * rank]).unwrap();
         let it = ctx.gpu.upload_raw(&bytes_u32(&ids), &[rows * k]).unwrap();
         let vt = ctx.gpu.upload_f32(&vals, &[rows * k]).unwrap();
-        ctx.gpu.hip.memcpy_htod(blk.seed_buffer(), &5u32.to_le_bytes()).unwrap();
-        ctx.gpu.hip.memcpy_htod(blk.status_buffer(), &[0xFF; 4]).unwrap();
-        ctx.gpu.hip.memcpy_htod(blk.block_buffer(), &vec![0xFF; (rows + 1) * 4]).unwrap();
+        ctx.gpu
+            .hip
+            .memcpy_htod(blk.seed_buffer(), &5u32.to_le_bytes())
+            .unwrap();
+        ctx.gpu
+            .hip
+            .memcpy_htod(blk.status_buffer(), &[0xFF; 4])
+            .unwrap();
+        ctx.gpu
+            .hip
+            .memcpy_htod(blk.block_buffer(), &vec![0xFF; (rows + 1) * 4])
+            .unwrap();
         blk.enqueue(ctx.gpu, &books, &pt, &it, &vt).unwrap();
         ctx.gpu.hip.device_synchronize().unwrap();
         let g = blk.read_back(ctx.gpu).unwrap();
-        if g.status != (3 | (4 << 8)) || g.block[4..].iter().any(|&w| w != 0xFFFF_FFFF) || g.block[0] != 5 {
+        if g.status != (3 | (4 << 8))
+            || g.block[4..].iter().any(|&w| w != 0xFFFF_FFFF)
+            || g.block[0] != 5
+        {
             ctx.fails += 1;
-            eprintln!("FAIL bad candidate id: status={:#x} block={:?}", g.status, g.block);
+            eprintln!(
+                "FAIL bad candidate id: status={:#x} block={:?}",
+                g.status, g.block
+            );
         }
         // Bad seed.
-        ctx.gpu.hip.memcpy_htod(blk.seed_buffer(), &(vocab as u32).to_le_bytes()).unwrap();
-        ctx.gpu.hip.memcpy_htod(blk.block_buffer(), &vec![0xFF; (rows + 1) * 4]).unwrap();
+        ctx.gpu
+            .hip
+            .memcpy_htod(blk.seed_buffer(), &(vocab as u32).to_le_bytes())
+            .unwrap();
+        ctx.gpu
+            .hip
+            .memcpy_htod(blk.block_buffer(), &vec![0xFF; (rows + 1) * 4])
+            .unwrap();
         blk.enqueue(ctx.gpu, &books, &pt, &it, &vt).unwrap();
         ctx.gpu.hip.device_synchronize().unwrap();
         let g = blk.read_back(ctx.gpu).unwrap();
@@ -442,7 +575,10 @@ fn main() {
 
     input_staging_checks(&mut ctx);
 
-    println!("dflash_selector_greedy_oracle: {} cases, {} failures", ctx.cases, ctx.fails);
+    println!(
+        "dflash_selector_greedy_oracle: {} cases, {} failures",
+        ctx.cases, ctx.fails
+    );
     if ctx.fails != 0 {
         std::process::exit(1);
     }

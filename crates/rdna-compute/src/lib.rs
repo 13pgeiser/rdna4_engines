@@ -129,7 +129,6 @@ pub use trunk_mask::{
 };
 
 pub use compiler::KernelCompiler;
-pub use plan_sink::{PlanSink, PlannedKernel, PlannedOp};
 #[cfg(feature = "lab")]
 pub use dispatch::LabKernelFaultReceipt;
 pub use dispatch::{
@@ -153,6 +152,7 @@ pub use dispatch::{LabLaunchWitness, LabProjectionLaunch};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;
+pub use plan_sink::{PlanSink, PlannedKernel, PlannedOp};
 
 /// Calibration-only override that forces native-BF16 teachers to stay BF16.
 ///

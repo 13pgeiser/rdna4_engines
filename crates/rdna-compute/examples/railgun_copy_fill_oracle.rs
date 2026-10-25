@@ -50,7 +50,15 @@ fn main() {
         1usize, 2, 15, 16, 17, 31, 32, 33, 255, 256, 257, 511, 8192, 20480, 20481, 40000, 262_144,
         262_145, 1_000_003,
     ];
-    let offs = [(0usize, 0usize), (1, 0), (0, 3), (5, 11), (16, 16), (7, 7), (15, 1)];
+    let offs = [
+        (0usize, 0usize),
+        (1, 0),
+        (0, 3),
+        (5, 11),
+        (16, 16),
+        (7, 7),
+        (15, 1),
+    ];
     for &n in &sizes {
         for &(so, dof) in &offs {
             let src_total = MARGIN + so + n + MARGIN;
@@ -82,7 +90,10 @@ fn main() {
             if got != want || src_back != src_host {
                 failures += 1;
                 let first = got.iter().zip(&want).position(|(a, b)| a != b);
-                eprintln!("COPY FAIL n={n} so={so} dof={dof} first_diff={first:?} src_changed={}", src_back != src_host);
+                eprintln!(
+                    "COPY FAIL n={n} so={so} dof={dof} first_diff={first:?} src_changed={}",
+                    src_back != src_host
+                );
             }
             gpu.hip.free(src).ok();
             gpu.hip.free(dst).ok();

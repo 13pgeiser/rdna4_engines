@@ -1549,7 +1549,12 @@ mod tests {
         ), // global_load_d16_hi_b16 v0, v[6:7], off
         (Arch::Gfx1201, "s_clz_i32_u32", &[0xbeaf_0a32]),            // s_clz_i32_u32 s47, s50
         (Arch::Gfx1201, "s_max_u32", &[0x8a9e_231e]),                // s_max_u32 s30, s30, s35
-        (Arch::Gfx1201, "ds_max_u32", &[0xd820_0040, 0x0000_0107]), // ds_max_u32 v7, v1 offset:64
+        (Arch::Gfx1201, "ds_max_u32", &[0xd820_0040, 0x0000_0107]),  // ds_max_u32 v7, v1 offset:64
+        (
+            Arch::Gfx1201,
+            "v_alignbyte_b32",
+            &[0xd617_0006, 0x0686_0702],
+        ), // v_alignbyte_b32 v6, v2, v3, v161.l
         (Arch::Gfx1201, "s_bcnt1_i32_b32", &[0xbe80_1805]),          // s_bcnt1_i32_b32 s0, s5
         (Arch::Gfx1201, "s_bfe_i32", &[0x9380_ff75, 0x0001_001d]),   // s_bfe_i32 s0, ttmp9, 0x1001d
         (Arch::Gfx1201, "s_bitcmp0_b32", &[0xbf0c_8018]),            // s_bitcmp0_b32 s24, 0

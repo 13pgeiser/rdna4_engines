@@ -43,8 +43,8 @@ use std::sync::Arc;
 
 use railgun::copy as rcopy;
 use railgun::kernel::{
-    author, Arg, Axis, DeclaredWord, Expr, FactStatus, KernelProgram, LaunchRecord, NodeFacts, PatchKind,
-    ScalarField, WordRole,
+    author, Arg, Axis, DeclaredWord, Expr, FactStatus, KernelProgram, LaunchRecord, NodeFacts,
+    PatchKind, ScalarField, WordRole,
 };
 use railgun::window::{
     CopyStep, HostDeltaSpec, TransitionSpec, WindowExecution, WindowPlanParts, WindowStep,
@@ -217,10 +217,7 @@ enum Addr {
     /// authored pointer argument is the whole truth.
     Abs,
     /// `draft resource + byte offset expression`.
-    Draft {
-        resource: ResourceId,
-        offset: Expr,
-    },
+    Draft { resource: ResourceId, offset: Expr },
 }
 
 enum Slot<'a> {
@@ -316,15 +313,18 @@ pub fn build_window(
         known: BTreeMap::new(),
     };
 
-
     // ---- launch records ---------------------------------------------------
-    let transport = facts.transport().map_err(|e| {
-        BuildRefusal::whole(format!("railgun transport kernels unavailable: {e}"))
-    });
+    let transport = facts
+        .transport()
+        .map_err(|e| BuildRefusal::whole(format!("railgun transport kernels unavailable: {e}")));
     let has_transport = slots
         .iter()
         .any(|s| matches!(s, Slot::Copy { .. } | Slot::Fill { .. }));
-    let transport = if has_transport { Some(transport?) } else { None };
+    let transport = if has_transport {
+        Some(transport?)
+    } else {
+        None
+    };
 
     let mut launches: Vec<LaunchRecord> = Vec::with_capacity(slots.len());
     // Per kernel slot: the Scalar32 field offsets its patches declare.
@@ -363,9 +363,13 @@ pub fn build_window(
                     }
                 }
                 let digest = hex(&kernel.code_object_digest);
-                let node_facts = facts
-                    .facts(&digest, &kernel.symbol)
-                    .map_err(|e| BuildRefusal::at(node, &kernel.symbol, format!("no exact-artifact facts ({}): {e}", &digest[..16])))?;
+                let node_facts = facts.facts(&digest, &kernel.symbol).map_err(|e| {
+                    BuildRefusal::at(
+                        node,
+                        &kernel.symbol,
+                        format!("no exact-artifact facts ({}): {e}", &digest[..16]),
+                    )
+                })?;
                 let mut kernarg = kernel.kernarg.clone();
                 let mut retargeted = None;
                 if matches!(node_facts.facts.status, FactStatus::Conditional(_)) {
@@ -417,9 +421,7 @@ pub fn build_window(
                     allocations,
                 }
             }
-            Slot::Copy {
-                bytes, planned, ..
-            } => {
+            Slot::Copy { bytes, planned, .. } => {
                 let (src, dst, n) = *planned;
                 if n == 0 || n > rcopy::MAX_COPY_BYTES {
                     return Err(BuildRefusal::at(
@@ -431,7 +433,11 @@ pub fn build_window(
                 let launch = rcopy::copy_launch(src, dst, n as u32);
                 let digest = hex(&transport.expect("transport resolved").copy);
                 let node_facts = facts.facts(&digest, rcopy::COPY_SYMBOL).map_err(|e| {
-                    BuildRefusal::at(node, rcopy::COPY_SYMBOL, format!("no exact-artifact facts ({}): {e}", &digest[..16]))
+                    BuildRefusal::at(
+                        node,
+                        rcopy::COPY_SYMBOL,
+                        format!("no exact-artifact facts ({}): {e}", &digest[..16]),
+                    )
                 })?;
                 let mut declared = Vec::new();
                 if expr_const(bytes).is_none() {
@@ -478,7 +484,11 @@ pub fn build_window(
                 let launch = rcopy::fill_launch(dst, *value, n);
                 let digest = hex(&transport.expect("transport resolved").fill);
                 let node_facts = facts.facts(&digest, rcopy::FILL_SYMBOL).map_err(|e| {
-                    BuildRefusal::at(node, rcopy::FILL_SYMBOL, format!("no exact-artifact facts ({}): {e}", &digest[..16]))
+                    BuildRefusal::at(
+                        node,
+                        rcopy::FILL_SYMBOL,
+                        format!("no exact-artifact facts ({}): {e}", &digest[..16]),
+                    )
                 })?;
                 LaunchRecord {
                     symbol: launch.symbol.to_owned(),
@@ -545,7 +555,11 @@ pub fn build_window(
             } => {
                 for p in &kernel.patches {
                     match p {
-                        PatchKind::Scalar32 { field, expr, domain } => {
+                        PatchKind::Scalar32 {
+                            field,
+                            expr,
+                            domain,
+                        } => {
                             patches.push(PatchKind::Scalar32 {
                                 field: ScalarField {
                                     node,
@@ -600,7 +614,10 @@ pub fn build_window(
                                 return Err(BuildRefusal::at(
                                     node,
                                     &kernel.symbol,
-                                    format!("Interior64 names unknown draft resource {}", resource.0),
+                                    format!(
+                                        "Interior64 names unknown draft resource {}",
+                                        resource.0
+                                    ),
                                 ));
                             };
                             let Some((arg_res, _)) = arg_resource(&program, node, *arg_offset)
@@ -624,7 +641,11 @@ pub fn build_window(
                             // The patch must reproduce the planned pointer.
                             let planned = le_u64(&kernel.kernarg, *arg_offset as usize);
                             let at = eval_at_plan(byte_offset, draft).map_err(|e| {
-                                BuildRefusal::at(node, &kernel.symbol, format!("cannot evaluate Interior64 at the planned shape: {e}"))
+                                BuildRefusal::at(
+                                    node,
+                                    &kernel.symbol,
+                                    format!("cannot evaluate Interior64 at the planned shape: {e}"),
+                                )
                             })?;
                             let b = program.resources[m.program.0 as usize];
                             if planned != Some(b.base + m.delta + at) {
@@ -658,13 +679,22 @@ pub fn build_window(
                 let sym = rcopy::COPY_SYMBOL;
                 if let Some(c) = expr_const(bytes) {
                     if c != pn {
-                        return Err(BuildRefusal::at(node, sym, format!("typed copy size {c} != recorded {pn}")));
+                        return Err(BuildRefusal::at(
+                            node,
+                            sym,
+                            format!("typed copy size {c} != recorded {pn}"),
+                        ));
                     }
                 } else {
-                    let at = eval_at_plan(bytes, draft)
-                        .map_err(|e| BuildRefusal::at(node, sym, format!("cannot evaluate the copy size: {e}")))?;
+                    let at = eval_at_plan(bytes, draft).map_err(|e| {
+                        BuildRefusal::at(node, sym, format!("cannot evaluate the copy size: {e}"))
+                    })?;
                     if at != pn {
-                        return Err(BuildRefusal::at(node, sym, format!("typed copy size evaluates to {at}, recorded {pn}")));
+                        return Err(BuildRefusal::at(
+                            node,
+                            sym,
+                            format!("typed copy size evaluates to {at}, recorded {pn}"),
+                        ));
                     }
                 }
                 let s = endpoint(&program, node, 0, src, ps, draft, &draft_map)
@@ -672,9 +702,11 @@ pub fn build_window(
                 let d = endpoint(&program, node, 8, dst, pd, draft, &draft_map)
                     .map_err(|e| BuildRefusal::at(node, sym, format!("destination: {e}")))?;
                 if s.resource == d.resource {
-                    let (Some(so), Some(dof), Some(len)) =
-                        (expr_const(&s.offset), expr_const(&d.offset), expr_const(bytes))
-                    else {
+                    let (Some(so), Some(dof), Some(len)) = (
+                        expr_const(&s.offset),
+                        expr_const(&d.offset),
+                        expr_const(bytes),
+                    ) else {
                         return Err(BuildRefusal::at(
                             node,
                             sym,
@@ -682,7 +714,11 @@ pub fn build_window(
                         ));
                     };
                     if so < dof + len && dof < so + len {
-                        return Err(BuildRefusal::at(node, sym, "source and destination ranges overlap"));
+                        return Err(BuildRefusal::at(
+                            node,
+                            sym,
+                            "source and destination ranges overlap",
+                        ));
                     }
                 }
                 patches.push(PatchKind::Interior64 {
@@ -731,13 +767,21 @@ pub fn build_window(
                 let (pd, pn) = *planned;
                 let n = expr_const(words).expect("checked while authoring");
                 if n != u64::from(pn) {
-                    return Err(BuildRefusal::at(node, sym, format!("typed fill size {n} != recorded {pn}")));
+                    return Err(BuildRefusal::at(
+                        node,
+                        sym,
+                        format!("typed fill size {n} != recorded {pn}"),
+                    ));
                 }
                 let bytes = Expr::Const(n * 4);
                 let d = endpoint(&program, node, 0, dst, pd, draft, &draft_map)
                     .map_err(|e| BuildRefusal::at(node, sym, format!("destination: {e}")))?;
                 let Some(offset) = expr_const(&d.offset) else {
-                    return Err(BuildRefusal::at(node, sym, "a fill needs a constant destination offset"));
+                    return Err(BuildRefusal::at(
+                        node,
+                        sym,
+                        "a fill needs a constant destination offset",
+                    ));
                 };
                 if let Err(e) = rcopy::check_fill(offset, n, u64::MAX) {
                     return Err(BuildRefusal::at(node, sym, e));
@@ -756,9 +800,12 @@ pub fn build_window(
     // ---- completion surfaces ---------------------------------------------
     let mut completion_surfaces: Vec<ResourceId> = Vec::new();
     for id in &draft.completion_surfaces {
-        let m = draft_map
-            .get(id)
-            .ok_or_else(|| BuildRefusal::whole(format!("completion surface names unknown draft resource {}", id.0)))?;
+        let m = draft_map.get(id).ok_or_else(|| {
+            BuildRefusal::whole(format!(
+                "completion surface names unknown draft resource {}",
+                id.0
+            ))
+        })?;
         if !completion_surfaces.contains(&m.program) {
             completion_surfaces.push(m.program);
         }
@@ -778,8 +825,11 @@ pub fn build_window(
         ring_head: draft.host_delta.ring_head.clone(),
         ring_written: draft.host_delta.ring_written.clone(),
     };
-    let mut scalars_required: Vec<String> =
-        draft.scalars_required.iter().map(|s| (*s).to_owned()).collect();
+    let mut scalars_required: Vec<String> = draft
+        .scalars_required
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
     if let Some(v) = input.verify {
         let (Some(head), Some(written)) = (v.host_delta.ring_head, v.host_delta.ring_written)
         else {
@@ -789,10 +839,7 @@ pub fn build_window(
         };
         let rows = v.rows as u64;
         let cap = input.ring_capacity;
-        if cap == 0
-            || head.to != (head.from + rows) % cap
-            || written.to != written.from + rows
-        {
+        if cap == 0 || head.to != (head.from + rows) % cap || written.to != written.from + rows {
             return Err(BuildRefusal::whole(format!(
                 "ring transition head {}->{} written {}->{} is not +{rows} modulo {cap}",
                 head.from, head.to, written.from, written.to
@@ -947,7 +994,14 @@ fn collect_slots<'a>(
                 });
                 draft_ordinal += 1;
             }
-            (PlannedOp::Copy { dst, src, bytes }, WindowStep::Copy(CopyStep { src: s, dst: d, bytes: b })) => {
+            (
+                PlannedOp::Copy { dst, src, bytes },
+                WindowStep::Copy(CopyStep {
+                    src: s,
+                    dst: d,
+                    bytes: b,
+                }),
+            ) => {
                 slots.push(Slot::Copy {
                     src: Addr::Draft {
                         resource: s.resource,
@@ -1035,10 +1089,15 @@ fn collect_slots<'a>(
 }
 
 fn arg_resource(program: &KernelProgram, node: usize, offset: u32) -> Option<(ResourceId, u64)> {
-    program.nodes.get(node)?.args.iter().find_map(|(o, a)| match a {
-        Arg::Resource { resource, interior } if *o == offset => Some((*resource, *interior)),
-        _ => None,
-    })
+    program
+        .nodes
+        .get(node)?
+        .args
+        .iter()
+        .find_map(|(o, a)| match a {
+            Arg::Resource { resource, interior } if *o == offset => Some((*resource, *interior)),
+            _ => None,
+        })
 }
 /// A resolved copy/fill endpoint: the program resource of the authored
 /// pointer argument, the (re-based) byte-offset expression and the slack that
@@ -1073,7 +1132,10 @@ fn endpoint(
             offset: Expr::Const(interior),
             slack: 0,
         }),
-        Addr::Draft { resource: d, offset } => {
+        Addr::Draft {
+            resource: d,
+            offset,
+        } => {
             let m = draft_map
                 .get(d)
                 .ok_or_else(|| format!("unknown draft resource {}", d.0))?;
@@ -1328,7 +1390,10 @@ mod tests {
                     required_extent: Expr::Const(64),
                 },
                 PatchKind::Scalar32 {
-                    field: ScalarField { node: 0, offset: 16 },
+                    field: ScalarField {
+                        node: 0,
+                        offset: 16,
+                    },
                     expr: input("logical_ctx_rows"),
                     domain: 1..=4096,
                 },
@@ -1338,7 +1403,10 @@ mod tests {
             "k_a",
             kernarg(x(0), A_OUT.0 + 0x100, 9),
             vec![PatchKind::Scalar32 {
-                field: ScalarField { node: 1, offset: 16 },
+                field: ScalarField {
+                    node: 1,
+                    offset: 16,
+                },
                 expr: Expr::add(input("logical_ctx_rows"), Expr::Const(1)),
                 domain: 1..=4096,
             }],
@@ -1422,7 +1490,10 @@ mod tests {
             "k_v0",
             kernarg(A_RING.0, A_VOUT.0, 5),
             vec![PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 16 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 16,
+                },
                 expr: input("ring_head"),
                 domain: 0..=63,
             }],
@@ -1513,7 +1584,12 @@ mod tests {
     }
 
     fn symbols(b: &BuiltWindow) -> Vec<&str> {
-        b.parts.program.nodes.iter().map(|n| n.symbol.as_str()).collect()
+        b.parts
+            .program
+            .nodes
+            .iter()
+            .map(|n| n.symbol.as_str())
+            .collect()
     }
 
     #[test]
@@ -1679,7 +1755,9 @@ mod tests {
                 .iter()
                 .filter(|p| match p {
                     PatchKind::Scalar32 { field, .. } => field.node == node,
-                    PatchKind::Interior64 { node: n, .. } | PatchKind::GridAxis { node: n, .. } => *n == node,
+                    PatchKind::Interior64 { node: n, .. } | PatchKind::GridAxis { node: n, .. } => {
+                        *n == node
+                    }
                 })
                 .collect()
         };
@@ -1702,7 +1780,10 @@ mod tests {
             required_extent: bytes.clone(),
         }));
         assert!(copy.contains(&&PatchKind::Scalar32 {
-            field: ScalarField { node: 3, offset: 16 },
+            field: ScalarField {
+                node: 3,
+                offset: 16
+            },
             expr: bytes.clone(),
             domain: 1..=rcopy::MAX_COPY_BYTES,
         }));
@@ -1815,7 +1896,10 @@ mod tests {
         let image = p.kernarg_image(3).expect("copy image");
         assert_eq!(u32::from_le_bytes(image[16..20].try_into().unwrap()), 64);
         assert_eq!(p.grid(3), Some([rcopy::grid_x(64), 1, 1]));
-        assert_eq!(bound.host_delta().ring_head, Some(Transition { from: 5, to: 21 }));
+        assert_eq!(
+            bound.host_delta().ring_head,
+            Some(Transition { from: 5, to: 21 })
+        );
         assert_eq!(
             bound.host_delta().ring_written,
             Some(Transition { from: 100, to: 116 })
@@ -1897,8 +1981,14 @@ mod tests {
         if let PlannedOp::Kernel(k) = &mut d.ops[3] {
             k.kernarg[8..16].copy_from_slice(&0xdead_0000u64.to_le_bytes());
         }
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok())
-            .expect_err("pointer outside an allocation");
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .expect_err("pointer outside an allocation");
         assert_eq!(err.node, Some(3));
         assert!(err.reason.contains("not a railgun PM4 node"), "{err}");
     }
@@ -1912,7 +2002,14 @@ mod tests {
             src: X_DRAFT.0 + 0x40,
             bytes: 0,
         };
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert_eq!(err.node, Some(1));
         assert!(err.reason.contains("outside 1.."), "{err}");
         // Typed copy size disagrees with the recorded op.
@@ -1922,7 +2019,14 @@ mod tests {
             src: X_DRAFT.0 + 0x40,
             bytes: 128,
         };
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert!(err.reason.contains("typed copy size"), "{err}");
         // Unaligned fill.
         let mut d = draft();
@@ -1931,7 +2035,14 @@ mod tests {
             value: 0,
             words: 16,
         };
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert!(err.reason.contains("not 4-byte aligned"), "{err}");
         // Empty fill.
         let mut d = draft();
@@ -1940,7 +2051,14 @@ mod tests {
             value: 0,
             words: 0,
         };
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert_eq!(err.symbol, rcopy::FILL_SYMBOL);
         // A constant copy whose two ranges overlap inside one allocation.
         let overlap = [TransportCopy {
@@ -1971,35 +2089,63 @@ mod tests {
                 required_extent: Expr::Const(64),
             };
         }
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert_eq!(err.node, Some(0));
         assert!(err.reason.contains("planned pointer"), "{err}");
         // A patch naming another kernel ordinal is refused too.
         let mut d = draft();
         if let PlannedOp::Kernel(k) = &mut d.ops[3] {
             k.patches[0] = PatchKind::Scalar32 {
-                field: ScalarField { node: 0, offset: 16 },
+                field: ScalarField {
+                    node: 0,
+                    offset: 16,
+                },
                 expr: input("logical_ctx_rows"),
                 domain: 1..=4096,
             };
         }
-        let err = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok()).unwrap_err();
+        let err = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert!(err.reason.contains("kernel ordinal"), "{err}");
     }
 
     #[test]
     fn host_splice_is_the_draft_segment_only() {
         let d = draft();
-        let b = build(&d, None, &[], WindowExecution::HostSplice, &mut Source::ok())
-            .expect("host splice draft segment");
+        let b = build(
+            &d,
+            None,
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok(),
+        )
+        .expect("host splice draft segment");
         assert_eq!(
             symbols(&b),
             ["k_a", "railgun_copy", "railgun_fill_u32", "k_a"],
             "no prefix copies and no verify nodes"
         );
         assert_eq!(b.parts.execution, WindowExecution::HostSplice);
-        assert!(!b.parts.hip_graph_certified, "only a Whole16 route is certified");
-        assert!(b.parts.host_delta.ring_head.is_none() && b.parts.host_delta.ring_written.is_none());
+        assert!(
+            !b.parts.hip_graph_certified,
+            "only a Whole16 route is certified"
+        );
+        assert!(
+            b.parts.host_delta.ring_head.is_none() && b.parts.host_delta.ring_written.is_none()
+        );
         assert!(b.parts.host_delta.projection_watermark.is_some());
         assert!(b.scalars_required.is_empty());
         // It lowers as one segment and binds.
@@ -2010,8 +2156,22 @@ mod tests {
         bind(&mut p, &key, &shape(), &i).expect("binds");
         // A verify plan or prefix copies make no sense for it.
         let v = verify();
-        assert!(build(&d, Some(&v), &[], WindowExecution::HostSplice, &mut Source::ok()).is_err());
-        assert!(build(&d, None, &PREFIX, WindowExecution::HostSplice, &mut Source::ok()).is_err());
+        assert!(build(
+            &d,
+            Some(&v),
+            &[],
+            WindowExecution::HostSplice,
+            &mut Source::ok()
+        )
+        .is_err());
+        assert!(build(
+            &d,
+            None,
+            &PREFIX,
+            WindowExecution::HostSplice,
+            &mut Source::ok()
+        )
+        .is_err());
         assert!(build(&d, None, &[], WindowExecution::Whole16, &mut Source::ok()).is_err());
     }
 
@@ -2035,15 +2195,23 @@ mod tests {
         let i = inputs(&b);
         bind(&mut p, &key, &shape(), &i).expect("binds");
         let program = p.plan().program();
-        let images: Vec<&[u8]> = (0..program.nodes.len()).map(|n| p.kernarg_image(n).unwrap()).collect();
-        let grids: Vec<[u32; 3]> = (0..program.nodes.len()).map(|n| p.grid(n).unwrap()).collect();
+        let images: Vec<&[u8]> = (0..program.nodes.len())
+            .map(|n| p.kernarg_image(n).unwrap())
+            .collect();
+        let grids: Vec<[u32; 3]> = (0..program.nodes.len())
+            .map(|n| p.grid(n).unwrap())
+            .collect();
         let ops = twin_ops(program, &images, &grids).expect("twin ops");
         assert_eq!(ops.len(), 8);
         // Prefix copies: the bound absolute addresses and byte counts.
         for (n, c) in PREFIX.iter().enumerate() {
             assert_eq!(
                 ops[n],
-                PlannedOp::Copy { src: c.src, dst: c.dst, bytes: c.bytes },
+                PlannedOp::Copy {
+                    src: c.src,
+                    dst: c.dst,
+                    bytes: c.bytes
+                },
                 "prefix copy {n}"
             );
         }
@@ -2059,17 +2227,26 @@ mod tests {
         );
         assert_eq!(
             ops[4],
-            PlannedOp::Fill { dst: A_OUT.0 + 0x800, value: 0, words: 16 }
+            PlannedOp::Fill {
+                dst: A_OUT.0 + 0x800,
+                value: 0,
+                words: 16
+            }
         );
         // A kernel launches with its bound explicit bytes, block and grid.
-        let PlannedOp::Kernel(k) = &ops[2] else { panic!("node 2 is a kernel") };
+        let PlannedOp::Kernel(k) = &ops[2] else {
+            panic!("node 2 is a kernel")
+        };
         assert_eq!(k.symbol, "k_a");
         assert_eq!(k.kernarg.len(), 32, "explicit 20 bytes padded to 16");
         assert_eq!(&k.kernarg[..20], &images[2][..20]);
         assert!(k.kernarg[20..].iter().all(|b| *b == 0));
         assert_eq!((k.grid, k.block), (grids[2], [64, 1, 1]));
         // The bound scalar (logical_ctx_rows = 16) is in the launch.
-        assert_eq!(u32::from_le_bytes(k.kernarg[16..20].try_into().unwrap()), 16);
+        assert_eq!(
+            u32::from_le_bytes(k.kernarg[16..20].try_into().unwrap()),
+            16
+        );
         // A shorter image is refused, not silently padded.
         assert!(twin_ops(program, &images[..7], &grids[..7]).is_err());
         let short = [&images[2][..8]];
@@ -2111,7 +2288,10 @@ mod tests {
         assert!(!line.contains("OOB"), "{line}");
         // Every program resource appears with its bound range.
         let program = p.plan().program();
-        assert!(line.contains(&format!("r{}[", resource_of(program, A_OUT).0)), "{line}");
+        assert!(
+            line.contains(&format!("r{}[", resource_of(program, A_OUT).0)),
+            "{line}"
+        );
         // The same image digest twice is deterministic; a rebind to another
         // shape changes it.
         assert_eq!(line, trace_line(&p, &s, &note(), true, false));
@@ -2136,7 +2316,10 @@ mod tests {
         use crate::dflash_railgun_builder::assumed_cases;
         use railgun::kernel::IndexedNode;
         let mut program = whole16().parts.program;
-        assert!(assumed_cases(&program).is_empty(), "no conditional node, no case");
+        assert!(
+            assumed_cases(&program).is_empty(),
+            "no conditional node, no case"
+        );
         program.nodes[3].indexed = Some(IndexedNode {
             args: Vec::new(),
             effects: Vec::new(),
@@ -2183,8 +2366,14 @@ mod tests {
         // builder, not silently re-based.
         let mut v = verify();
         v.host_delta.ring_head = Some(Transition { from: 5, to: 22 });
-        let err = build(&draft(), Some(&v), &PREFIX, WindowExecution::Whole16, &mut Source::ok())
-            .unwrap_err();
+        let err = build(
+            &draft(),
+            Some(&v),
+            &PREFIX,
+            WindowExecution::Whole16,
+            &mut Source::ok(),
+        )
+        .unwrap_err();
         assert!(err.reason.contains("modulo 64"), "{err}");
     }
 }

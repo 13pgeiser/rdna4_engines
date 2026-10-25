@@ -1247,7 +1247,12 @@ pub(crate) fn launch_maybe_blob(
         .map_err(|e| e.with_kernel(func_name))?;
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
     let observe = replay.as_ref().is_some_and(|r| r.is_g0_observing());
-    let result: HipResult<()> = if record || observe || capture_mode || force_blob_path || hip.plan_active() {
+    let result: HipResult<()> = if record
+        || observe
+        || capture_mode
+        || force_blob_path
+        || hip.plan_active()
+    {
         let mut blob = blob_builder();
         blob.pad_to(16);
         if observe {

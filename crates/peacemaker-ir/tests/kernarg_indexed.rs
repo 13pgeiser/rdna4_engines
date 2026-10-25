@@ -39,10 +39,26 @@ fn writer() -> Kernel {
 /// The §A9.1 case: HD256, B16, null slot tables, grid [n_kv_heads,16,1], block [32,1,1].
 fn case() -> Vec<Guard> {
     vec![
-        Guard::KernargEq { offset: 28, size: 4, value: 256 },
-        Guard::KernargEq { offset: 32, size: 4, value: 16 },
-        Guard::KernargEq { offset: 40, size: 8, value: 0 },
-        Guard::KernargEq { offset: 48, size: 8, value: 0 },
+        Guard::KernargEq {
+            offset: 28,
+            size: 4,
+            value: 256,
+        },
+        Guard::KernargEq {
+            offset: 32,
+            size: 4,
+            value: 16,
+        },
+        Guard::KernargEq {
+            offset: 40,
+            size: 8,
+            value: 0,
+        },
+        Guard::KernargEq {
+            offset: 48,
+            size: 8,
+            value: 0,
+        },
         Guard::GridDim { axis: 1, value: 16 },
         Guard::GridDim { axis: 2, value: 1 },
         Guard::BlockDim { axis: 0, value: 32 },
@@ -88,7 +104,12 @@ fn the_writer_object_is_conditional_with_exact_effects() {
     for e in [codes, scale] {
         assert_eq!(
             (e.base_arg_offset, e.mode, e.class, e.path),
-            (0, AccessMode::Write, AccessClass::VmemStore, MemPath::Global)
+            (
+                0,
+                AccessMode::Write,
+                AccessClass::VmemStore,
+                MemPath::Global
+            )
         );
         assert_eq!(e.cache, CacheBits::default());
         assert_eq!(e.guards, sorted(case()));
@@ -96,9 +117,19 @@ fn the_writer_object_is_conditional_with_exact_effects() {
         let il = &e.index_loads[0];
         assert_eq!(
             (il.src_arg_offset, il.elem, il.class, il.path, il.cache),
-            (16, IndexElem::I32, AccessClass::SmemLoad, MemPath::Smem, CacheBits::default())
+            (
+                16,
+                IndexElem::I32,
+                AccessClass::SmemLoad,
+                MemPath::Smem,
+                CacheBits::default()
+            )
         );
-        assert_eq!(il.byte_offset.to_string(), "(shl (sext wg_yz) 2)", "4 * bid");
+        assert_eq!(
+            il.byte_offset.to_string(),
+            "(shl (sext wg_yz) 2)",
+            "4 * bid"
+        );
         assert_eq!(il.ext, [IndexExt::Sext64]);
         assert_eq!(e.index_loads[0], codes.index_loads[0]);
     }
@@ -123,7 +154,10 @@ fn the_writer_object_is_conditional_with_exact_effects() {
     // is a constant, not an allocation at address 0.
     for table in [40, 48] {
         let a = f.arg_at(table).unwrap();
-        assert!(a.accesses.is_empty() && a.mode.is_none(), "table {table} untouched");
+        assert!(
+            a.accesses.is_empty() && a.mode.is_none(),
+            "table {table} untouched"
+        );
     }
     assert!(f.side.kernarg_segment == 0 && !f.dynamic_kernarg_reads);
 }
@@ -138,9 +172,21 @@ fn changed_or_missing_guards_cannot_inherit_the_case() {
     };
     // A non-null slot table or row map makes the descriptor path live: the
     // loaded descriptor base reaches the store address and stays Unknown.
-    let f = with(&|g| g[2] = Guard::KernargEq { offset: 40, size: 8, value: 0x1000 });
+    let f = with(&|g| {
+        g[2] = Guard::KernargEq {
+            offset: 40,
+            size: 8,
+            value: 0x1000,
+        }
+    });
     assert_eq!(f.status, KernelStatus::Unknown, "{:?}", f.unresolved);
-    let f = with(&|g| g[3] = Guard::KernargEq { offset: 48, size: 8, value: 0x1000 });
+    let f = with(&|g| {
+        g[3] = Guard::KernargEq {
+            offset: 48,
+            size: 8,
+            value: 0x1000,
+        }
+    });
     assert_eq!(f.status, KernelStatus::Unknown, "{:?}", f.unresolved);
     // Dropping the slot_descs null guard leaves the descriptor load reachable.
     let f = with(&|g| g.retain(|x| !matches!(x, Guard::KernargEq { offset: 40, .. })));
@@ -155,14 +201,28 @@ fn changed_or_missing_guards_cannot_inherit_the_case() {
     // Wrong grid/block: the packed entry registers are not pinned.
     let f = with(&|g| g[7] = Guard::BlockDim { axis: 1, value: 2 });
     assert_eq!(f.status, KernelStatus::Unknown);
-    assert!(rules(&f).contains(&"indexed-entry-guard"), "{:?}", f.unresolved);
+    assert!(
+        rules(&f).contains(&"indexed-entry-guard"),
+        "{:?}",
+        f.unresolved
+    );
     let f = with(&|g| g[5] = Guard::GridDim { axis: 2, value: 2 });
     assert_eq!(f.status, KernelStatus::Unknown);
-    assert!(rules(&f).contains(&"indexed-entry-guard"), "{:?}", f.unresolved);
+    assert!(
+        rules(&f).contains(&"indexed-entry-guard"),
+        "{:?}",
+        f.unresolved
+    );
     let f = with(&|g| g.retain(|x| !matches!(x, Guard::BlockDim { .. } | Guard::GridDim { .. })));
     assert_eq!(f.status, KernelStatus::Unknown);
     // Unsupported guard shapes refuse instead of being ignored.
-    let f = with(&|g| g.push(Guard::KernargEq { offset: 30, size: 4, value: 1 }));
+    let f = with(&|g| {
+        g.push(Guard::KernargEq {
+            offset: 30,
+            size: 4,
+            value: 1,
+        })
+    });
     assert_eq!(f.status, KernelStatus::Unknown);
     assert!(rules(&f).contains(&"guard-unsupported"));
 
@@ -171,10 +231,38 @@ fn changed_or_missing_guards_cannot_inherit_the_case() {
     // can never equal the HD256/B16 case.
     let base = analyze_guarded(&k, Arch::Gfx1201, &case());
     for (idx, g) in [
-        (0, Guard::KernargEq { offset: 28, size: 4, value: 128 }),
-        (0, Guard::KernargEq { offset: 28, size: 4, value: 0xffff_ff00 }),
-        (1, Guard::KernargEq { offset: 32, size: 4, value: 17 }),
-        (1, Guard::KernargEq { offset: 32, size: 4, value: 0xffff_ffff }),
+        (
+            0,
+            Guard::KernargEq {
+                offset: 28,
+                size: 4,
+                value: 128,
+            },
+        ),
+        (
+            0,
+            Guard::KernargEq {
+                offset: 28,
+                size: 4,
+                value: 0xffff_ff00,
+            },
+        ),
+        (
+            1,
+            Guard::KernargEq {
+                offset: 32,
+                size: 4,
+                value: 17,
+            },
+        ),
+        (
+            1,
+            Guard::KernargEq {
+                offset: 32,
+                size: 4,
+                value: 0xffff_ffff,
+            },
+        ),
     ] {
         let f = with(&|c| c[idx] = g);
         assert_ne!(f.guards, base.guards, "{g:?}");
@@ -214,6 +302,10 @@ fn the_single_position_writer_object_is_conditional_under_block_guards_only() {
         assert_eq!(e.index_loads[0].byte_offset.to_string(), "c64:0");
     }
     let none = analyze_guarded(&k, Arch::Gfx1201, &[]);
-    assert_eq!(none.status, KernelStatus::Unknown, "lane term needs the block guards");
+    assert_eq!(
+        none.status,
+        KernelStatus::Unknown,
+        "lane term needs the block guards"
+    );
     assert_eq!(rules(&none), ["indexed-entry-guard", "indexed-entry-guard"]);
 }

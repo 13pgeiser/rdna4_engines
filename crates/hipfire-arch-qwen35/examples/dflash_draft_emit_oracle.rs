@@ -56,16 +56,18 @@
 //! ```
 //! (`HIPFIRE_TEST_TARGET` / `HIPFIRE_TEST_DRAFT` also work.) Exit 0 on PASS.
 
+use hip_bridge::DeviceBuffer;
 use hipfire_arch_qwen35::dflash_draft_emit::{
     bind_draft_ops, draft_family_key, draft_staged_words, draft_state_tensors, plan_dflash_draft,
     DraftEmission, DraftEmitArgs, DraftStagingLayout, DRAFT_ROWS,
 };
 use hipfire_arch_qwen35::dflash_spec::{load_dflash_state, DflashState};
-use hipfire_arch_qwen35::speculative::{draft_dflash_block_rank, KvMode, ModelSlot, ModelSlotConfig};
+use hipfire_arch_qwen35::speculative::{
+    draft_dflash_block_rank, KvMode, ModelSlot, ModelSlotConfig,
+};
 use hipfire_runtime::dflash::{
     self, PinnedWindowInputs, SelectorDeviceCodebooks, SelectorGreedyBlock,
 };
-use hip_bridge::DeviceBuffer;
 use railgun::window::WindowShape;
 use rdna_compute::plan_sink::PlannedOp;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -146,7 +148,12 @@ fn tracked<'a>(r: &'a Rig) -> Vec<(String, &'a DeviceBuffer)> {
 fn twin_only(name: &str) -> bool {
     matches!(
         name,
-        "staging" | "tokens" | "selector_seed" | "selector_scores" | "selector_block" | "selector_status"
+        "staging"
+            | "tokens"
+            | "selector_seed"
+            | "selector_scores"
+            | "selector_block"
+            | "selector_status"
     )
 }
 
@@ -187,9 +194,11 @@ impl Rig {
         let th = &self.df.draft_scratch.target_hidden;
         for r in rows {
             let v = row_vec(r, row_f32);
-            self.gpu
-                .hip
-                .memcpy_htod_offset(&th.buf, (r % self.w) * row_f32 * 4, as_bytes_f32(&v))?;
+            self.gpu.hip.memcpy_htod_offset(
+                &th.buf,
+                (r % self.w) * row_f32 * 4,
+                as_bytes_f32(&v),
+            )?;
         }
         Ok(())
     }
@@ -276,7 +285,8 @@ impl Rig {
             vec![0, 4, 4 + DRAFT_ROWS * 4, 4 + 2 * DRAFT_ROWS * 4],
             "staging layout"
         );
-        self.pinned.submit(&self.gpu, &self.staging.buf, &self.stream)?;
+        self.pinned
+            .submit(&self.gpu, &self.staging.buf, &self.stream)?;
         self.pinned.complete(&self.gpu)?;
         Ok(())
     }
@@ -434,7 +444,9 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
     r.restore(&s0)?;
     let shape_s = shape_of(l, l0, w);
     let key_s = draft_family_key(&shape_s)?;
-    let em_s = r.plan_at(l, l0, seed).map_err(|x| format!("plan at case shape: {x}"))?;
+    let em_s = r
+        .plan_at(l, l0, seed)
+        .map_err(|x| format!("plan at case shape: {x}"))?;
     let mut em_a: Option<(usize, DraftEmission)> = None;
     for off in [37isize, -37, 101, -101, 1, -1, 211, -211, 509, -509] {
         let la = l as isize + off;
@@ -445,7 +457,11 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
         if draft_family_key(&shape_of(la, la - d, w)).ok().as_ref() != Some(&key_s) {
             continue;
         }
-        em_a = Some((la, r.plan_at(la, la - d, seed).map_err(|x| format!("plan at {la}: {x}"))?));
+        em_a = Some((
+            la,
+            r.plan_at(la, la - d, seed)
+                .map_err(|x| format!("plan at {la}: {x}"))?,
+        ));
         break;
     }
     // planning never touches GPU state or cursors; rebuild the case cursors.
@@ -454,22 +470,25 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
     em_s.accepts(&em_s.shape)?;
     let bound = bind_draft_ops(&em_a, &em_s.shape, &em_a.scalars(seed))?;
     if let Some(diff) = first_op_diff(&bound, &em_s.ops) {
-        fails.push(format!("bound plan(L_A={la_used}) != plan at case shape: {diff}"));
+        fails.push(format!(
+            "bound plan(L_A={la_used}) != plan at case shape: {diff}"
+        ));
     }
 
     // ---- twin arms
-    let run_twin = |r: &mut Rig, ops: &[PlannedOp], label: &str, fails: &mut Vec<String>| -> R<Snapshot> {
-        r.restore(&s0)?;
-        r.set_thlog(l, l0, l0);
-        r.stage(l, seed)?;
-        r.gpu.run_planned_ops(ops)?;
-        r.gpu.hip.device_synchronize()?;
-        let t = r.snapshot()?;
-        for m in compare(&e, &t) {
-            fails.push(format!("{label}: {m}"));
-        }
-        Ok(t)
-    };
+    let run_twin =
+        |r: &mut Rig, ops: &[PlannedOp], label: &str, fails: &mut Vec<String>| -> R<Snapshot> {
+            r.restore(&s0)?;
+            r.set_thlog(l, l0, l0);
+            r.stage(l, seed)?;
+            r.gpu.run_planned_ops(ops)?;
+            r.gpu.hip.device_synchronize()?;
+            let t = r.snapshot()?;
+            for m in compare(&e, &t) {
+                fails.push(format!("{label}: {m}"));
+            }
+            Ok(t)
+        };
     let t_a = run_twin(r, &bound, "twinA", &mut fails)?;
     let _t_s = run_twin(r, &em_s.ops, "twinS", &mut fails)?;
 
@@ -527,7 +546,11 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
         ));
     }
     if tokens[1..] != drafted[1..] {
-        fails.push(format!("verify tokens[1..16] {:?} != eager {:?}", &tokens[1..], &drafted[1..]));
+        fails.push(format!(
+            "verify tokens[1..16] {:?} != eager {:?}",
+            &tokens[1..],
+            &drafted[1..]
+        ));
     }
 
     let line = format!(
@@ -558,16 +581,31 @@ fn controls(r: &mut Rig, report: &mut String) -> R<bool> {
     r.set_thlog(l, l0, l0);
     let mut line = |name: &str, pass: bool| {
         ok &= pass;
-        let _ = writeln!(report, "control {name}: {}", if pass { "PASS" } else { "FAIL" });
+        let _ = writeln!(
+            report,
+            "control {name}: {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
     };
     // out-of-family: delta 5 is a different projection family
-    line("refuse other delta", em.accepts(&shape_of(l0 + 5, l0, w)).is_err());
+    line(
+        "refuse other delta",
+        em.accepts(&shape_of(l0 + 5, l0, w)).is_err(),
+    );
     // cold seed: delta > 16
-    line("refuse delta 17", draft_family_key(&shape_of(l0 + 17, l0, w)).is_err());
+    line(
+        "refuse delta 17",
+        draft_family_key(&shape_of(l0 + 17, l0, w)).is_err(),
+    );
     // out of domain bind
     line(
         "refuse out-of-domain bind",
-        bind_draft_ops(&em, &shape_of(*em.l_domain.end() as usize + 1 + d, l0, w), &em.scalars(seed)).is_err(),
+        bind_draft_ops(
+            &em,
+            &shape_of(*em.l_domain.end() as usize + 1 + d, l0, w),
+            &em.scalars(seed),
+        )
+        .is_err(),
     );
     // missing scalar
     line(
@@ -604,7 +642,9 @@ fn controls(r: &mut Rig, report: &mut String) -> R<bool> {
 
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
-    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
+    a.iter()
+        .position(|x| x == name)
+        .and_then(|i| a.get(i + 1).cloned())
 }
 
 fn main() -> R<()> {

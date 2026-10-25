@@ -292,6 +292,7 @@ scratch_store_b32	scratch	0x1a	VADDR:64,VSRC:32,SADDR:64	-	VADDR,VSRC,SADDR	-	St
 v_add_co_ci_u32_e32	vop2	0x20	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1,implicit	vcc:r,vcc:w	-	v_add_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo	40020B02	-
 v_add_nc_u16	vop3	0x303	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_add_nc_u16 v5.l, v5.l, s15	D7030005 02001F05	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_alignbit_b32	vop3	0x216	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_alignbit_b32 v8, v5, v6, 30	D6160008 027A0D05	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_alignbyte_b32	vop3	0x217	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_alignbyte_b32 v6, v2, v3, v161.l	D6170006 06860702	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_and_b16	vop3	0x362	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_and_b16 v2.l, v2.l, 1	D7620002 02010302	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_ashrrev_i16	vop3	0x33a	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_ashrrev_i16 v30.l, 8, v24.l	D73A001E 02023088	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_bfe_i32	vop3	0x211	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_bfe_i32 v26, v18, 0, 8	D611001A 02210112	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::kernel::{
-    author, Expr, ArgFact, ArgGuard, ConditionalFacts, FactStatus, IndexLoad, IndexedArgEffect,
+    author, ArgFact, ArgGuard, ConditionalFacts, Expr, FactStatus, IndexLoad, IndexedArgEffect,
     KernelFacts, KernelRef, LaunchRecord, MemClass, NodeFacts, ReadCache,
 };
 use crate::window::{CopyStep, FillStep, Region};
@@ -91,7 +91,9 @@ pub(crate) fn seal(sealed: &SealedPositions, positions: &[i32; 16]) {
     let stage = PositionsStage::new();
     stage.fill(positions).unwrap();
     let checked = sealed.host_check(positions, positions).unwrap();
-    let token = sealed.begin_upload(checked, &stage, &mut transport).unwrap();
+    let token = sealed
+        .begin_upload(checked, &stage, &mut transport)
+        .unwrap();
     sealed.complete_upload(token, &mut transport).unwrap();
     assert_eq!(sealed.state(), PositionsState::SealedReady);
 }
@@ -118,8 +120,16 @@ fn arg_facts() -> Vec<ArgFact> {
         int(28),
         int(32),
         // Real receipt: guarded-null optional slots are integers, no access.
-        ArgFact { offset: 40, size: 8, role: ArgRole::Integer },
-        ArgFact { offset: 48, size: 8, role: ArgRole::Integer },
+        ArgFact {
+            offset: 40,
+            size: 8,
+            role: ArgRole::Integer,
+        },
+        ArgFact {
+            offset: 48,
+            size: 8,
+            role: ArgRole::Integer,
+        },
     ]
 }
 
@@ -205,22 +215,42 @@ pub(crate) fn writer_launch(dst: u64, dst_ptr: u64) -> LaunchRecord {
         declared: Vec::new(),
         facts: Ok(writer_facts()),
         allocations: vec![
-            (0, Ok(Binding { base: dst, bytes: DST_BYTES })),
-            (8, Ok(Binding { base: SRC, bytes: SRC_BYTES })),
-            (16, Ok(Binding { base: P_BASE, bytes: P_BYTES })),
+            (
+                0,
+                Ok(Binding {
+                    base: dst,
+                    bytes: DST_BYTES,
+                }),
+            ),
+            (
+                8,
+                Ok(Binding {
+                    base: SRC,
+                    bytes: SRC_BYTES,
+                }),
+            ),
+            (
+                16,
+                Ok(Binding {
+                    base: P_BASE,
+                    bytes: P_BYTES,
+                }),
+            ),
         ],
     }
 }
 
 /// A certified (`Proven`) node touching `target` of `bytes` with `classes`.
-pub(crate) fn extra_launch(symbol: &str, target: u64, binding: Binding, classes: &[MemClass]) -> LaunchRecord {
+pub(crate) fn extra_launch(
+    symbol: &str,
+    target: u64,
+    binding: Binding,
+    classes: &[MemClass],
+) -> LaunchRecord {
     let mut kernarg = vec![0u8; 8];
     kernarg.copy_from_slice(&target.to_le_bytes());
-    let mut facts = (*crate::kernel::tests::facts(
-        vec![crate::kernel::tests::ptr(0, classes)],
-        8,
-    ))
-    .clone();
+    let mut facts =
+        (*crate::kernel::tests::facts(vec![crate::kernel::tests::ptr(0, classes)], 8)).clone();
     facts.kref.symbol = symbol.into();
     LaunchRecord {
         symbol: symbol.into(),
@@ -289,7 +319,9 @@ impl Fixture {
                 },
             })
             .collect();
-        let steps = (0..program.nodes.len()).map(|node| WindowStep::Kernel { node }).collect();
+        let steps = (0..program.nodes.len())
+            .map(|node| WindowStep::Kernel { node })
+            .collect();
         let p_res = program
             .resources
             .iter()
@@ -350,7 +382,9 @@ fn rows_0_to_15_and_the_last_16_rows_of_a_mapped_slice_are_accepted() {
     for first in [0, ROWS_IN_SLICE as i32 - 16] {
         let sealed = ready(&contiguous(first));
         let fx = Fixture::new(Vec::new());
-        let w = fx.bind(&sealed).unwrap_or_else(|e| panic!("first={first}: {e}"));
+        let w = fx
+            .bind(&sealed)
+            .unwrap_or_else(|e| panic!("first={first}: {e}"));
         assert_eq!(w.writers().len(), 2);
         let last = w.writers()[0].rows[15];
         assert_eq!(last.1, DST_K + (first as u64 + 16) * ROW, "scale row end");
@@ -363,16 +397,28 @@ fn host_check_rejects_negative_duplicate_truncated_and_foreign_positions() {
     let sealed = SealedPositions::new(p_identity()).unwrap();
     let mut neg = contiguous(0);
     neg[3] = -1;
-    assert!(matches!(sealed.host_check(&neg, &neg), Err(IndexBindError::HostCheck(m)) if m.contains("negative")));
+    assert!(
+        matches!(sealed.host_check(&neg, &neg), Err(IndexBindError::HostCheck(m)) if m.contains("negative"))
+    );
     let mut dup = contiguous(0);
     dup[9] = dup[2];
-    assert!(matches!(sealed.host_check(&dup, &dup), Err(IndexBindError::HostCheck(m)) if m.contains("twice")));
+    assert!(
+        matches!(sealed.host_check(&dup, &dup), Err(IndexBindError::HostCheck(m)) if m.contains("twice"))
+    );
     let short = contiguous(0);
-    assert!(matches!(sealed.host_check(&short[..15], &short[..15]), Err(IndexBindError::HostCheck(m)) if m.contains("15 positions")));
+    assert!(
+        matches!(sealed.host_check(&short[..15], &short[..15]), Err(IndexBindError::HostCheck(m)) if m.contains("15 positions"))
+    );
     // Not the producer's vector (an independently guessed/compacted one).
     let other = contiguous(1);
-    assert!(matches!(sealed.host_check(&contiguous(0), &other), Err(IndexBindError::HostCheck(m)) if m.contains("producer")));
-    assert_eq!(sealed.state(), PositionsState::Retired, "a failed check changes nothing");
+    assert!(
+        matches!(sealed.host_check(&contiguous(0), &other), Err(IndexBindError::HostCheck(m)) if m.contains("producer"))
+    );
+    assert_eq!(
+        sealed.state(),
+        PositionsState::Retired,
+        "a failed check changes nothing"
+    );
     // Non-contiguous but unique is legal: uniqueness is checked, not assumed.
     let mut gap = contiguous(10);
     gap[5] = 400;
@@ -383,7 +429,10 @@ fn host_check_rejects_negative_duplicate_truncated_and_foreign_positions() {
 fn positions_allocation_needs_64_bytes() {
     let mut id = p_identity();
     id.bytes = 60;
-    assert!(matches!(SealedPositions::new(id), Err(IndexBindError::Allocation(_))));
+    assert!(matches!(
+        SealedPositions::new(id),
+        Err(IndexBindError::Allocation(_))
+    ));
     id.bytes = 64;
     SealedPositions::new(id).unwrap();
 }
@@ -392,7 +441,10 @@ fn positions_allocation_needs_64_bytes() {
 fn capacity_position_and_scale_overflow_are_rejected() {
     // Row 1016 is one row past the tensor slice.
     let sealed = ready(&contiguous(ROWS_IN_SLICE as i32 - 15));
-    expect_writer(Fixture::new(Vec::new()).bind(&sealed), "leaves the tensor slice");
+    expect_writer(
+        Fixture::new(Vec::new()).bind(&sealed),
+        "leaves the tensor slice",
+    );
     // The last row's final scale byte: the slice ends one byte short.
     let sealed = ready(&contiguous(ROWS_IN_SLICE as i32 - 16));
     let mut fx = Fixture::new(Vec::new());
@@ -408,16 +460,34 @@ fn capacity_position_and_scale_overflow_are_rejected() {
 fn zero_or_overflowing_h_and_wrong_hd_b_and_dimensions_are_rejected() {
     let sealed = ready(&contiguous(0));
     let cases: [(&str, Box<dyn Fn(&mut Fixture)>); 8] = [
-        ("not positive", Box::new(|fx| set_u32(&mut fx.images[0], 24, 0))),
-        ("not positive", Box::new(|fx| set_u32(&mut fx.images[0], 24, 0x8000_0001))),
-        ("exceed signed 32", Box::new(|fx| {
-            set_u32(&mut fx.images[0], 24, 0x7fff_ffff);
-            fx.grids[0] = [0x7fff_ffff, 16, 1];
-        })),
-        ("head_dim", Box::new(|fx| set_u32(&mut fx.images[1], 28, 128))),
-        ("batch_size", Box::new(|fx| set_u32(&mut fx.images[1], 32, 8))),
+        (
+            "not positive",
+            Box::new(|fx| set_u32(&mut fx.images[0], 24, 0)),
+        ),
+        (
+            "not positive",
+            Box::new(|fx| set_u32(&mut fx.images[0], 24, 0x8000_0001)),
+        ),
+        (
+            "exceed signed 32",
+            Box::new(|fx| {
+                set_u32(&mut fx.images[0], 24, 0x7fff_ffff);
+                fx.grids[0] = [0x7fff_ffff, 16, 1];
+            }),
+        ),
+        (
+            "head_dim",
+            Box::new(|fx| set_u32(&mut fx.images[1], 28, 128)),
+        ),
+        (
+            "batch_size",
+            Box::new(|fx| set_u32(&mut fx.images[1], 32, 8)),
+        ),
         ("grid", Box::new(|fx| fx.grids[0] = [H, 8, 1])),
-        ("block", Box::new(|fx| fx.program.nodes[1].block = [64, 1, 1])),
+        (
+            "block",
+            Box::new(|fx| fx.program.nodes[1].block = [64, 1, 1]),
+        ),
         ("slot_descs", Box::new(|fx| fx.images[0][40] = 1)),
     ];
     for (needle, mutate) in cases {
@@ -458,7 +528,9 @@ fn wrong_dimensions_of_the_kv_slice_and_mapping_generation_changes_are_rejected(
     // A different positions mapping generation than the sealed one.
     let mut fx = Fixture::new(Vec::new());
     fx.allocations[fx.p_res.0 as usize].generation += 1;
-    assert!(matches!(fx.bind(&sealed), Err(IndexBindError::Closure(m)) if m.contains("sealed positions")));
+    assert!(
+        matches!(fx.bind(&sealed), Err(IndexBindError::Closure(m)) if m.contains("sealed positions"))
+    );
 }
 
 #[test]
@@ -494,26 +566,43 @@ fn upload_needs_the_checked_payload_and_the_stage_is_frozen_in_flight() {
     let stage = PositionsStage::new();
     // A different payload than the one that was checked.
     stage.fill(&contiguous(41)).unwrap();
-    let checked = sealed.host_check(&checked_positions, &checked_positions).unwrap();
+    let checked = sealed
+        .host_check(&checked_positions, &checked_positions)
+        .unwrap();
     assert_eq!(
-        sealed.begin_upload(checked, &stage, &mut transport).unwrap_err(),
+        sealed
+            .begin_upload(checked, &stage, &mut transport)
+            .unwrap_err(),
         IndexBindError::PayloadMismatch
     );
     assert_eq!(sealed.state(), PositionsState::Retired);
     assert!(transport.uploaded.is_empty(), "nothing reached the device");
 
     stage.fill(&checked_positions).unwrap();
-    let checked = sealed.host_check(&checked_positions, &checked_positions).unwrap();
-    let token = sealed.begin_upload(checked, &stage, &mut transport).unwrap();
+    let checked = sealed
+        .host_check(&checked_positions, &checked_positions)
+        .unwrap();
+    let token = sealed
+        .begin_upload(checked, &stage, &mut transport)
+        .unwrap();
     assert_eq!(sealed.state(), PositionsState::UploadInFlight);
     // The stage may not be reused before the H2D completion fence.
-    assert_eq!(stage.fill(&contiguous(0)).unwrap_err(), IndexBindError::StageInFlight);
-    assert_eq!(stage.write_byte(0, 9).unwrap_err(), IndexBindError::StageInFlight);
+    assert_eq!(
+        stage.fill(&contiguous(0)).unwrap_err(),
+        IndexBindError::StageInFlight
+    );
+    assert_eq!(
+        stage.write_byte(0, 9).unwrap_err(),
+        IndexBindError::StageInFlight
+    );
     // Submit-side binding before the upload completed is refused.
     let fx = Fixture::new(Vec::new());
     assert!(matches!(
         fx.bind(&sealed),
-        Err(IndexBindError::State { found: PositionsState::UploadInFlight, .. })
+        Err(IndexBindError::State {
+            found: PositionsState::UploadInFlight,
+            ..
+        })
     ));
     sealed.complete_upload(token, &mut transport).unwrap();
     assert!(!stage.is_in_flight());
@@ -559,24 +648,42 @@ fn stale_witnesses_and_post_bind_changes_are_rejected() {
     ));
     let mut grids = fx.grids.clone();
     grids[1] = [H, 16, 2];
-    assert!(matches!(witness.matches_window(1, 7, &fx.images, &grids), Err(IndexBindError::Writer { .. })));
-    assert!(matches!(witness.matches_window(1, 8, &fx.images, &fx.grids), Err(IndexBindError::Stale(_))));
-    assert!(matches!(witness.matches_window(2, 7, &fx.images, &fx.grids), Err(IndexBindError::Stale(_))));
+    assert!(matches!(
+        witness.matches_window(1, 7, &fx.images, &grids),
+        Err(IndexBindError::Writer { .. })
+    ));
+    assert!(matches!(
+        witness.matches_window(1, 8, &fx.images, &fx.grids),
+        Err(IndexBindError::Stale(_))
+    ));
+    assert!(matches!(
+        witness.matches_window(2, 7, &fx.images, &fx.grids),
+        Err(IndexBindError::Stale(_))
+    ));
 
     // Submit consumes the sealed generation; a retired-and-resealed P is a
     // different generation, so last window's witness cannot be reused.
     sealed.mark_submitted(&witness).unwrap();
     assert_eq!(sealed.state(), PositionsState::SubmittedReadOnly);
-    assert!(matches!(sealed.mark_submitted(&witness), Err(IndexBindError::State { .. })));
+    assert!(matches!(
+        sealed.mark_submitted(&witness),
+        Err(IndexBindError::State { .. })
+    ));
     sealed.finish(Quiescence::Proven);
     assert_eq!(sealed.state(), PositionsState::Retired);
     seal(&sealed, &contiguous(8)); // the same bytes, a new generation
-    assert!(matches!(sealed.check_witness(&witness), Err(IndexBindError::Stale(_))));
+    assert!(matches!(
+        sealed.check_witness(&witness),
+        Err(IndexBindError::Stale(_))
+    ));
     let fresh = fx.bind(&sealed).unwrap();
     assert_ne!(fresh.p_generation(), witness.p_generation());
     // A witness for another payload at the same generation count also fails.
     let other = ready(&contiguous(9));
-    assert!(matches!(other.check_witness(&fresh), Err(IndexBindError::Stale(_))));
+    assert!(matches!(
+        other.check_witness(&fresh),
+        Err(IndexBindError::Stale(_))
+    ));
 }
 
 #[test]
@@ -592,7 +699,13 @@ fn sealed_positions_refuse_overwrite_remap_recycle_and_external_writers() {
         sealed.recycle().unwrap_err(),
         sealed.external_write_enqueued(P_BASE + 8, 4).unwrap_err(),
     ] {
-        assert!(matches!(state_op, IndexBindError::Leased(PositionsState::SealedReady, _)), "{state_op:?}");
+        assert!(
+            matches!(
+                state_op,
+                IndexBindError::Leased(PositionsState::SealedReady, _)
+            ),
+            "{state_op:?}"
+        );
     }
     assert_eq!(sealed.identity(), p_identity(), "nothing moved");
     sealed.release_unsubmitted().unwrap();
@@ -613,48 +726,96 @@ fn closure_refused(fx: &Fixture, needle: &str) {
 }
 
 fn p_binding() -> Binding {
-    Binding { base: P_BASE, bytes: P_BYTES }
+    Binding {
+        base: P_BASE,
+        bytes: P_BYTES,
+    }
 }
 
 #[test]
 fn a_same_ib_store_alias_atomic_copy_or_unknown_node_fails_admission() {
     // Direct store to P.
-    let fx = Fixture::new(vec![extra_launch("poke", P_BASE, p_binding(), &[MemClass::VmemStore])]);
+    let fx = Fixture::new(vec![extra_launch(
+        "poke",
+        P_BASE,
+        p_binding(),
+        &[MemClass::VmemStore],
+    )]);
     closure_refused(&fx, "writes the positions allocation");
     // Atomics (both kinds) to P.
-    let fx = Fixture::new(vec![extra_launch("atomic", P_BASE, p_binding(), &[MemClass::AtomicCommutative])]);
+    let fx = Fixture::new(vec![extra_launch(
+        "atomic",
+        P_BASE,
+        p_binding(),
+        &[MemClass::AtomicCommutative],
+    )]);
     closure_refused(&fx, "writes the positions allocation");
     // A non-commutative atomic is not even PM4-lowered.
-    let fx = Fixture::new(vec![extra_launch("atomic", P_BASE, p_binding(), &[MemClass::Atomic])]);
+    let fx = Fixture::new(vec![extra_launch(
+        "atomic",
+        P_BASE,
+        p_binding(),
+        &[MemClass::Atomic],
+    )]);
     closure_refused(&fx, "not PM4-lowered");
     // A store through another resource that overlaps P (an alias by address).
     let fx = Fixture::new(vec![extra_launch(
         "alias",
         P_BASE + 64,
-        Binding { base: P_BASE + 64, bytes: 128 },
+        Binding {
+            base: P_BASE + 64,
+            bytes: 128,
+        },
         &[MemClass::VmemStore],
     )]);
     closure_refused(&fx, "aliases");
     // Copy and fill destinations.
     let mut fx = Fixture::new(Vec::new());
     fx.steps.push(WindowStep::Copy(CopyStep {
-        src: Region { resource: ResourceId(1), byte_offset: Expr::Const(0) },
-        dst: Region { resource: fx.p_res, byte_offset: Expr::Const(0) },
+        src: Region {
+            resource: ResourceId(1),
+            byte_offset: Expr::Const(0),
+        },
+        dst: Region {
+            resource: fx.p_res,
+            byte_offset: Expr::Const(0),
+        },
         bytes: Expr::Const(64),
     }));
     closure_refused(&fx, "step 2 writes the positions");
     let mut fx = Fixture::new(Vec::new());
     fx.steps.push(WindowStep::Fill(FillStep {
-        dst: Region { resource: fx.p_res, byte_offset: Expr::Const(0) },
+        dst: Region {
+            resource: fx.p_res,
+            byte_offset: Expr::Const(0),
+        },
         value: 0,
         words: Expr::Const(16),
     }));
     closure_refused(&fx, "step 2 writes the positions");
     // An unknown-effect node anywhere in the IB.
-    let mut fx = Fixture::new(vec![extra_launch("opaque", SRC, Binding { base: SRC, bytes: SRC_BYTES }, &[MemClass::VmemLoad])]);
-    fx.program.nodes[2].lowering = Lowering::HipDirect { reason: "A1 Unknown".into() };
+    let mut fx = Fixture::new(vec![extra_launch(
+        "opaque",
+        SRC,
+        Binding {
+            base: SRC,
+            bytes: SRC_BYTES,
+        },
+        &[MemClass::VmemLoad],
+    )]);
+    fx.program.nodes[2].lowering = Lowering::HipDirect {
+        reason: "A1 Unknown".into(),
+    };
     closure_refused(&fx, "unknown-effect node");
-    let mut fx = Fixture::new(vec![extra_launch("opaque", SRC, Binding { base: SRC, bytes: SRC_BYTES }, &[MemClass::VmemLoad])]);
+    let mut fx = Fixture::new(vec![extra_launch(
+        "opaque",
+        SRC,
+        Binding {
+            base: SRC,
+            bytes: SRC_BYTES,
+        },
+        &[MemClass::VmemLoad],
+    )]);
     fx.program.nodes[2].kref = None;
     closure_refused(&fx, "no certified facts");
     // An unbound conditional node (witness not consumed) is not PM4.
@@ -666,7 +827,12 @@ fn a_same_ib_store_alias_atomic_copy_or_unknown_node_fails_admission() {
 #[test]
 fn a_pure_read_consumer_of_p_is_allowed() {
     let sealed = ready(&contiguous(0));
-    let fx = Fixture::new(vec![extra_launch("reader", P_BASE, p_binding(), &[MemClass::VmemLoad, MemClass::SmemLoad])]);
+    let fx = Fixture::new(vec![extra_launch(
+        "reader",
+        P_BASE,
+        p_binding(),
+        &[MemClass::VmemLoad, MemClass::SmemLoad],
+    )]);
     let w = fx.bind(&sealed).unwrap();
     assert_eq!(w.writers().len(), 2, "the reader is not a conditional node");
 }
@@ -706,12 +872,30 @@ fn completion_and_unknown_quiescence_release_or_quarantine_the_positions() {
     sealed.mark_submitted(&w).unwrap();
     sealed.finish(Quiescence::Unknown);
     assert_eq!(sealed.state(), PositionsState::Quarantined);
-    assert!(matches!(sealed.recycle(), Err(IndexBindError::Leased(PositionsState::Quarantined, _))));
-    assert!(matches!(sealed.overwrite(), Err(IndexBindError::Leased(PositionsState::Quarantined, _))));
-    assert!(matches!(sealed.remap(0x7500_0000, 99), Err(IndexBindError::Leased(PositionsState::Quarantined, _))));
+    assert!(matches!(
+        sealed.recycle(),
+        Err(IndexBindError::Leased(PositionsState::Quarantined, _))
+    ));
+    assert!(matches!(
+        sealed.overwrite(),
+        Err(IndexBindError::Leased(PositionsState::Quarantined, _))
+    ));
+    assert!(matches!(
+        sealed.remap(0x7500_0000, 99),
+        Err(IndexBindError::Leased(PositionsState::Quarantined, _))
+    ));
     let p = contiguous(0);
-    assert!(matches!(sealed.host_check(&p, &p), Err(IndexBindError::State { found: PositionsState::Quarantined, .. })));
-    assert!(matches!(sealed.release_unsubmitted(), Err(IndexBindError::State { .. })));
+    assert!(matches!(
+        sealed.host_check(&p, &p),
+        Err(IndexBindError::State {
+            found: PositionsState::Quarantined,
+            ..
+        })
+    ));
+    assert!(matches!(
+        sealed.release_unsubmitted(),
+        Err(IndexBindError::State { .. })
+    ));
 
     // A submit that did not queue: proven -> Retired, unknown -> Quarantined.
     let sealed = ready(&contiguous(0));
@@ -727,12 +911,17 @@ fn completion_and_unknown_quiescence_release_or_quarantine_the_positions() {
         (Quiescence::Unknown, PositionsState::Quarantined, false),
     ] {
         let sealed = SealedPositions::new(p_identity()).unwrap();
-        let mut transport = MockTransport { wait_failure: Some(q), ..Default::default() };
+        let mut transport = MockTransport {
+            wait_failure: Some(q),
+            ..Default::default()
+        };
         let stage = PositionsStage::new();
         let p = contiguous(3);
         stage.fill(&p).unwrap();
         let checked = sealed.host_check(&p, &p).unwrap();
-        let token = sealed.begin_upload(checked, &stage, &mut transport).unwrap();
+        let token = sealed
+            .begin_upload(checked, &stage, &mut transport)
+            .unwrap();
         assert!(matches!(
             sealed.complete_upload(token, &mut transport),
             Err(IndexBindError::Transport { quiescence, .. }) if quiescence == q
@@ -742,12 +931,17 @@ fn completion_and_unknown_quiescence_release_or_quarantine_the_positions() {
     }
     // A begin fault leaves nothing in flight.
     let sealed = SealedPositions::new(p_identity()).unwrap();
-    let mut transport = MockTransport { begin_failure: Some(Quiescence::Unknown), ..Default::default() };
+    let mut transport = MockTransport {
+        begin_failure: Some(Quiescence::Unknown),
+        ..Default::default()
+    };
     let stage = PositionsStage::new();
     let p = contiguous(3);
     stage.fill(&p).unwrap();
     let checked = sealed.host_check(&p, &p).unwrap();
-    assert!(sealed.begin_upload(checked, &stage, &mut transport).is_err());
+    assert!(sealed
+        .begin_upload(checked, &stage, &mut transport)
+        .is_err());
     assert_eq!(sealed.state(), PositionsState::Quarantined);
     assert!(!stage.is_in_flight());
 }
@@ -764,10 +958,19 @@ fn guarded_null_slots_are_checked_through_the_guard_not_pointer_args() {
     // A receipt without the null guard cannot consume the case.
     let mut fx = Fixture::new(Vec::new());
     for n in &mut fx.program.nodes[..1] {
-        n.indexed.as_mut().unwrap().guards.retain(|g| g.arg_offset != 40);
+        n.indexed
+            .as_mut()
+            .unwrap()
+            .guards
+            .retain(|g| g.arg_offset != 40);
     }
     expect_writer(fx.bind(&sealed), "no null guard on +40");
     let mut fx = Fixture::new(Vec::new());
-    fx.program.nodes[0].indexed.as_mut().unwrap().guards.retain(|g| g.arg_offset != 32);
+    fx.program.nodes[0]
+        .indexed
+        .as_mut()
+        .unwrap()
+        .guards
+        .retain(|g| g.arg_offset != 32);
     expect_writer(fx.bind(&sealed), "no `== 16` guard");
 }

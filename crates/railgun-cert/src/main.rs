@@ -119,9 +119,9 @@ fn merge(mut a: Value, b: Value) -> Value {
 
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let command = args
-        .next()
-        .ok_or("usage: railgun-cert certify|coverage|whole16-manifest|whole16-verify|whole16-classes ...")?;
+    let command = args.next().ok_or(
+        "usage: railgun-cert certify|coverage|whole16-manifest|whole16-verify|whole16-classes ...",
+    )?;
     if command.starts_with("whole16-") {
         let rest: Vec<String> = args.collect();
         return railgun_cert::whole16::cli(&command, &rest);

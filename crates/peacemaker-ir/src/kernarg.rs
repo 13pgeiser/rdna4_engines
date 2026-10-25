@@ -338,7 +338,10 @@ impl EntryReg {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdxLeaf {
     /// `bits` (32 or 64) of the kernarg segment at `offset`, little-endian.
-    Kernarg { offset: u32, bits: u8 },
+    Kernarg {
+        offset: u32,
+        bits: u8,
+    },
     Entry(EntryReg),
     /// The 32-bit value loaded by `IndexedArgEffect::index_loads[i]`.
     Load(u16),
@@ -361,15 +364,27 @@ pub enum IdxEvalError {
 /// `Ext` is the only width change (32 -> 64) and carries its signedness.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum IdxExpr {
-    Const { value: u64, bits: u8 },
-    Kernarg { offset: u32, bits: u8 },
+    Const {
+        value: u64,
+        bits: u8,
+    },
+    Kernarg {
+        offset: u32,
+        bits: u8,
+    },
     Entry(EntryReg),
     /// Result of the `i`th [`IndexLoad`] of the owning effect (32-bit).
     Load(u16),
     /// Sign (`signed`) or zero extension of a 32-bit operand to 64 bits.
-    Ext { signed: bool, a: Box<IdxExpr> },
+    Ext {
+        signed: bool,
+        a: Box<IdxExpr>,
+    },
     /// Left shift by a constant `amount < bits`.
-    Shl { a: Box<IdxExpr>, amount: u8 },
+    Shl {
+        a: Box<IdxExpr>,
+        amount: u8,
+    },
     Add(Box<IdxExpr>, Box<IdxExpr>),
     Sub(Box<IdxExpr>, Box<IdxExpr>),
     Mul(Box<IdxExpr>, Box<IdxExpr>),
@@ -397,7 +412,9 @@ impl IdxExpr {
             Self::Kernarg { bits, .. } => matches!(bits, 32 | 64),
             Self::Entry(_) | Self::Load(_) => true,
             Self::Ext { a, .. } => a.bits() == 32 && a.is_well_formed(),
-            Self::Shl { a, amount } => a.is_well_formed() && u32::from(*amount) < u32::from(a.bits()),
+            Self::Shl { a, amount } => {
+                a.is_well_formed() && u32::from(*amount) < u32::from(a.bits())
+            }
             Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) => {
                 a.bits() == b.bits() && a.is_well_formed() && b.is_well_formed()
             }
@@ -436,10 +453,7 @@ impl IdxExpr {
     /// complement. Every node other than a signed `Ext` must have an exact wide
     /// value inside `[0, 2^bits)` and the root must too: a wrap or a sign flip
     /// (for example a negative index reaching an unsigned address) is `Wrap`.
-    pub fn eval_checked(
-        &self,
-        leaf: &dyn Fn(IdxLeaf) -> Option<u64>,
-    ) -> Result<u64, IdxEvalError> {
+    pub fn eval_checked(&self, leaf: &dyn Fn(IdxLeaf) -> Option<u64>) -> Result<u64, IdxEvalError> {
         if !self.is_well_formed() {
             return Err(IdxEvalError::Malformed);
         }
@@ -490,7 +504,12 @@ impl IdxExpr {
             Self::Shl { a, amount } => fit(self.bits(), a.wide(leaf)? << *amount)?,
             Self::Add(a, b) => fit(self.bits(), a.wide(leaf)? + b.wide(leaf)?)?,
             Self::Sub(a, b) => fit(self.bits(), a.wide(leaf)? - b.wide(leaf)?)?,
-            Self::Mul(a, b) => fit(self.bits(), a.wide(leaf)?.checked_mul(b.wide(leaf)?).ok_or(IdxEvalError::Wrap)?)?,
+            Self::Mul(a, b) => fit(
+                self.bits(),
+                a.wide(leaf)?
+                    .checked_mul(b.wide(leaf)?)
+                    .ok_or(IdxEvalError::Wrap)?,
+            )?,
         })
     }
 }
@@ -518,7 +537,9 @@ impl std::fmt::Display for IdxExpr {
 impl std::str::FromStr for IdxExpr {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        fn parse(toks: &mut std::iter::Peekable<std::vec::IntoIter<String>>) -> Result<IdxExpr, String> {
+        fn parse(
+            toks: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+        ) -> Result<IdxExpr, String> {
             let tok = toks.next().ok_or("unexpected end")?;
             if tok == "(" {
                 let op = toks.next().ok_or("unexpected end")?;
@@ -556,10 +577,22 @@ impl std::str::FromStr for IdxExpr {
                 "wg_yz" => IdxExpr::Entry(EntryReg::WorkgroupIdYZ),
                 "wi" => IdxExpr::Entry(EntryReg::WorkitemIdPacked),
                 t => match t.split_once(':') {
-                    Some(("c32", v)) => IdxExpr::Const { value: num(v)?, bits: 32 },
-                    Some(("c64", v)) => IdxExpr::Const { value: num(v)?, bits: 64 },
-                    Some(("karg32", v)) => IdxExpr::Kernarg { offset: num(v)? as u32, bits: 32 },
-                    Some(("karg64", v)) => IdxExpr::Kernarg { offset: num(v)? as u32, bits: 64 },
+                    Some(("c32", v)) => IdxExpr::Const {
+                        value: num(v)?,
+                        bits: 32,
+                    },
+                    Some(("c64", v)) => IdxExpr::Const {
+                        value: num(v)?,
+                        bits: 64,
+                    },
+                    Some(("karg32", v)) => IdxExpr::Kernarg {
+                        offset: num(v)? as u32,
+                        bits: 32,
+                    },
+                    Some(("karg64", v)) => IdxExpr::Kernarg {
+                        offset: num(v)? as u32,
+                        bits: 64,
+                    },
                     Some(("load", v)) => IdxExpr::Load(num(v)? as u16),
                     _ => return Err(format!("unknown token {t}")),
                 },
@@ -696,10 +729,10 @@ mod tests {
         assert_eq!(e.to_string(), WRITER);
         assert_eq!((e.bits(), e.load_indices()), (64, vec![0]));
         for bad in [
-            "(add c32:1 c64:1)",  // mixed widths
-            "(sext c64:1)",       // extension of a 64-bit operand
-            "(shl c32:1 32)",     // shift out of range
-            "(mul c32:1)",        // arity
+            "(add c32:1 c64:1)",   // mixed widths
+            "(sext c64:1)",        // extension of a 64-bit operand
+            "(shl c32:1 32)",      // shift out of range
+            "(mul c32:1)",         // arity
             "(add c32:1 c32:1) x", // trailing tokens
             "load:x",
         ] {
@@ -720,7 +753,10 @@ mod tests {
             Err(IdxEvalError::Wrap)
         );
         // A stride whose 32-bit form wraps (H*258 >= 2^32) is refused, not wrapped.
-        assert_eq!(e.eval_checked(&leaf(5, 0x4000_0000)), Err(IdxEvalError::Wrap));
+        assert_eq!(
+            e.eval_checked(&leaf(5, 0x4000_0000)),
+            Err(IdxEvalError::Wrap)
+        );
         // Missing leaves and ill-formed expressions are distinguished.
         assert_eq!(e.eval_checked(&|_| None), Err(IdxEvalError::MissingLeaf));
         let bad = IdxExpr::Add(
