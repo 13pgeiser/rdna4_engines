@@ -2685,8 +2685,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .qwen4_moe_down_i4_scratch
                         .as_ref()
                         .ok_or("no down sidecar")?;
-                    gpu.hip
-                        .memset(ds, v, (geo().mi / 128) * c.pmax.max(c.l) * BLK)?;
+                    // Flat-slot storage has `l` rows; only the grouped-position
+                    // plane reserves padding through `pmax` (as in sidecars()).
+                    let down_rows = if gp_plane(&gpu, &c) { c.pmax } else { c.l };
+                    gpu.hip.memset(ds, v, (geo().mi / 128) * down_rows * BLK)?;
                     gpu.hip.device_synchronize()?;
                     Ok(())
                 };
