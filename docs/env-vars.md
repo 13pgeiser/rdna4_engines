@@ -533,6 +533,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
 | `HIPFIRE_SLOTS_PAGED` / `HIPFIRE_SLOTS_PAGED_PAGES` | Multi-slot engine: `1`/`on`/`true` selects the paged KV pool instead of fixed per-slot slabs (implied by `serve.prefix_cache`); `_PAGES` overrides the physical page count (clamped to ≥ 1). |
 | `HIPFIRE_VL_SEQUENTIAL` | Multi-slot engine: `1`/`on`/`true` forces the legacy one-image-at-a-time VL prefill. Refused together with the paged pool. |
+| `HIPFIRE_VL_PREFILL` | **Developer-only.** Single-slot daemon image-turn prefill route: `auto` (default; unset or any other value) runs the whole image prompt through the batched `forward_prefill_batch` chunks with the vision embeddings spliced over the `<\|image_pad\|>` rows and the same absolute M-RoPE phases the per-token path uses, when the model is dense and batch-admissible, the KV tier has batched attention, and eviction/multi-GPU are off; otherwise it falls back to the per-token loop. `token` forces the per-token loop (the pre-batched behaviour). Logged as `[daemon/vl] prefill: batched` or `prefill: per-token (reason)`. Batched prefill uses the batched GEMM/DeltaNet/attention kernels, so greedy output may differ from `token` in late tokens (the text-prefill-vs-decode contract); decode is unchanged. |
 | `HIPFIRE_PAGE_EVICTION` | `0` keeps model pages in the host page cache after upload (default: evict only on UMA). Shared by the sequential loader and the multi-slot engine. |
 | `HIPFIRE_BENCH_MULTI_SLOT` / `HIPFIRE_BENCH_MULTI_SLOT_SLOTS` / `HIPFIRE_BENCH_MULTI_SLOT_CTX` | `hipfire bench`: load the model on the multi-slot engine with the given slot count and per-slot context. |
 | `HIPFIRE_MTP_TRACE=1` | Per-cycle MTP draft/verify trace on stderr. |
@@ -2605,6 +2606,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_VL_DUMP_DIR` | crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs, crates/saddle-lab/examples/infer.rs | developer |
 | `HIPFIRE_VL_FILE` | crates/hipfire-arch-embeddinggemma2/examples/vision_parity.rs, crates/hipfire-arch-embeddinggemma2/src/carrier.rs | developer |
 | `HIPFIRE_VL_MAX_PIXELS` | crates/hipfire-arch-qwen35-vl/src/image.rs | developer |
+| `HIPFIRE_VL_PREFILL` | crates/hipfire-generate/src/vision.rs | developer |
 | `HIPFIRE_VL_SEQUENTIAL` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-runtime/src/scheduler.rs | developer |
 | `HIPFIRE_VMM_ACCESS_DEVICE` | crates/hip-bridge/examples/vmm_arena_smoke.rs | harness |
 | `HIPFIRE_VMM_CHUNK_BYTES` | crates/rdna-compute/examples/vmm_tensor_smoke.rs | harness |
