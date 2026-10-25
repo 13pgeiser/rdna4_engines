@@ -355,6 +355,214 @@ pub enum WordRole {
     /// `frames` per submit (design I6 wants a device counter; M1 keeps
     /// today's host patch at submit).
     GdnFrame { frames: u32 },
+    /// A loaded 4-byte integer argument the window plan patches per window
+    /// ([`PatchKind::Scalar32`], design A §3). The value and its domain live
+    /// in the plan's patch site, not in the program.
+    Window,
+}
+
+/// Typed overrides [`KernelProgram::encode_kernarg_into`] applies on top of
+/// the authored program: the only ways a window changes a kernarg image
+/// (design A §3: no untyped byte patches). `Default` reproduces
+/// [`KernelProgram::kernarg_image`] exactly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageOverrides<'a> {
+    /// [`PatchKind::GridAxis`]: the node's bound HIP grid; every hidden grid
+    /// word (block counts, grid dims) is rebuilt from it.
+    pub grid: Option<[u32; 3]>,
+    /// The live allocation of every resource, indexed by `ResourceId`
+    /// (replaces the authoring-time bindings).
+    pub resources: Option<&'a [Binding]>,
+    /// [`PatchKind::Interior64`]: `(explicit argument offset, interior byte
+    /// offset)` replacing the authored interior of that pointer.
+    pub interiors: &'a [(u32, u64)],
+}
+
+/// An input name an [`Expr`] resolved no value for, or an arithmetic fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExprError {
+    UnknownInput(String),
+    Overflow,
+}
+
+impl std::fmt::Display for ExprError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(name) => write!(f, "unknown window input {name:?}"),
+            Self::Overflow => f.write_str("checked arithmetic overflow"),
+        }
+    }
+}
+
+/// The small pure expression AST of design A §3: constant, named input,
+/// checked add/multiply, saturating subtraction, min/max, division/modulo by
+/// a nonzero load-time constant, ceil-div. All arithmetic is `u64`; the
+/// conversion to a kernel `u32`/`i32` is a separate checked step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expr {
+    Const(u64),
+    /// A named window input (a `WindowShape` field or a `WindowInputs`
+    /// scalar).
+    Input(String),
+    /// Checked `a + b`.
+    Add(Box<Expr>, Box<Expr>),
+    /// Checked `a * b`.
+    Mul(Box<Expr>, Box<Expr>),
+    /// `a.saturating_sub(b)`, only where the source does.
+    SubSat(Box<Expr>, Box<Expr>),
+    Min(Box<Expr>, Box<Expr>),
+    Max(Box<Expr>, Box<Expr>),
+    /// `a / c`, `c` a nonzero load-time constant.
+    Div(Box<Expr>, std::num::NonZeroU64),
+    /// `a % c`, `c` a nonzero load-time constant.
+    Rem(Box<Expr>, std::num::NonZeroU64),
+    /// `ceil(a / c)`, `c` a nonzero load-time constant (checked: no
+    /// `a + c - 1` wrap).
+    CeilDiv(Box<Expr>, std::num::NonZeroU64),
+}
+
+impl Expr {
+    pub fn input(name: &str) -> Self {
+        Self::Input(name.to_owned())
+    }
+
+    pub fn add(a: Expr, b: Expr) -> Self {
+        Self::Add(Box::new(a), Box::new(b))
+    }
+
+    pub fn mul(a: Expr, b: Expr) -> Self {
+        Self::Mul(Box::new(a), Box::new(b))
+    }
+
+    pub fn sub_sat(a: Expr, b: Expr) -> Self {
+        Self::SubSat(Box::new(a), Box::new(b))
+    }
+
+    pub fn min(a: Expr, b: Expr) -> Self {
+        Self::Min(Box::new(a), Box::new(b))
+    }
+
+    pub fn max(a: Expr, b: Expr) -> Self {
+        Self::Max(Box::new(a), Box::new(b))
+    }
+
+    /// `None` for a zero divisor: it cannot be expressed.
+    pub fn div(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::Div(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    pub fn rem(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::Rem(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    pub fn ceil_div(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::CeilDiv(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    /// Evaluate with `input` resolving the named inputs.
+    pub fn eval(&self, input: &dyn Fn(&str) -> Option<u64>) -> Result<u64, ExprError> {
+        Ok(match self {
+            Self::Const(c) => *c,
+            Self::Input(name) => input(name).ok_or_else(|| ExprError::UnknownInput(name.clone()))?,
+            Self::Add(a, b) => a
+                .eval(input)?
+                .checked_add(b.eval(input)?)
+                .ok_or(ExprError::Overflow)?,
+            Self::Mul(a, b) => a
+                .eval(input)?
+                .checked_mul(b.eval(input)?)
+                .ok_or(ExprError::Overflow)?,
+            Self::SubSat(a, b) => a.eval(input)?.saturating_sub(b.eval(input)?),
+            Self::Min(a, b) => a.eval(input)?.min(b.eval(input)?),
+            Self::Max(a, b) => a.eval(input)?.max(b.eval(input)?),
+            Self::Div(a, c) => a.eval(input)? / c.get(),
+            Self::Rem(a, c) => a.eval(input)? % c.get(),
+            Self::CeilDiv(a, c) => a.eval(input)?.div_ceil(c.get()),
+        })
+    }
+
+    /// Every input name the expression reads, in first-use order.
+    pub fn inputs<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Const(_) => {}
+            Self::Input(name) => {
+                if !out.contains(&name.as_str()) {
+                    out.push(name);
+                }
+            }
+            Self::Add(a, b)
+            | Self::Mul(a, b)
+            | Self::SubSat(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => {
+                a.inputs(out);
+                b.inputs(out);
+            }
+            Self::Div(a, _) | Self::Rem(a, _) | Self::CeilDiv(a, _) => a.inputs(out),
+        }
+    }
+}
+
+/// A grid axis of a [`PatchKind::GridAxis`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    pub fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+}
+
+/// One loaded 4-byte integer argument of a program node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalarField {
+    pub node: usize,
+    /// Explicit-argument byte offset.
+    pub offset: u32,
+}
+
+/// The declared patch kinds of design A §3 (the only ones; `GdnFrame` stays
+/// a [`WordRole`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatchKind {
+    /// `Scalar32 {field, checked expression, domain}`: a loaded scalar
+    /// argument (declared in the program as a [`WordRole::Window`] word).
+    /// The value must lie in `domain` and fit `u32`.
+    Scalar32 {
+        field: ScalarField,
+        expr: Expr,
+        domain: std::ops::RangeInclusive<u64>,
+    },
+    /// `Interior64 {resource, checked byte_offset expression,
+    /// required_extent}`: the pointer argument at `arg_offset` (authored as
+    /// an `Arg::Resource` of `resource`) becomes `base(resource) +
+    /// byte_offset`; `byte_offset + required_extent` must lie inside the
+    /// bound allocation.
+    Interior64 {
+        node: usize,
+        arg_offset: u32,
+        resource: ResourceId,
+        byte_offset: Expr,
+        required_extent: Expr,
+    },
+    /// `GridAxis {axis, checked expression, domain}`: the HIP grid of `node`
+    /// on `axis` (in workgroups; the value must be nonzero, in `domain`, and
+    /// fit `u32`). Every live implicit grid word is rebuilt from the
+    /// resulting geometry.
+    GridAxis {
+        node: usize,
+        axis: Axis,
+        expr: Expr,
+        domain: std::ops::RangeInclusive<u64>,
+    },
 }
 
 /// A dynamic kernarg dword declared by the composer at the launch site
@@ -723,6 +931,27 @@ impl KernelProgram {
         loader_bytes: usize,
         words: &[u32],
     ) -> Result<Vec<u8>, String> {
+        let mut image = vec![0u8; loader_bytes];
+        self.encode_kernarg_into(node, words, &ImageOverrides::default(), &mut image)?;
+        Ok(image)
+    }
+
+    /// The single full-image encoder behind [`Self::kernarg_image`] (design A
+    /// §3: "`KernelProgram::kernarg_image` remains the only full-image
+    /// encoder"). `out` is the loaded object's kernarg segment (`out.len()`
+    /// is the loader's size and must equal the certified one); it is zeroed
+    /// and rewritten in place, so a retired buffer is re-encoded without an
+    /// allocation. `overrides` supplies the typed window patches of §3:
+    /// resource bindings, `Interior64` offsets and the `GridAxis` geometry,
+    /// from which every hidden grid word is rebuilt. Scalar words arrive in
+    /// `words`. Nothing else is writable.
+    pub fn encode_kernarg_into(
+        &self,
+        node: usize,
+        words: &[u32],
+        overrides: &ImageOverrides<'_>,
+        out: &mut [u8],
+    ) -> Result<(), String> {
         let n = self
             .nodes
             .get(node)
@@ -731,22 +960,33 @@ impl KernelProgram {
             .segment_bytes
             .ok_or_else(|| format!("{}: no certified kernarg segment", n.symbol))?
             as usize;
+        let loader_bytes = out.len();
         if loader_bytes != segment {
             return Err(format!("{}: the loaded object's kernarg segment is {loader_bytes} B, the certified one {segment} B", n.symbol));
         }
-        let mut image = vec![0u8; loader_bytes];
+        let resources = overrides.resources.unwrap_or(&self.resources);
+        let grid = overrides.grid.unwrap_or(n.grid);
+        if overrides.grid.is_some() && grid.contains(&0) {
+            return Err(format!("{}: grid {grid:?} has an empty axis", n.symbol));
+        }
+        let image = out;
+        image.fill(0);
         for (offset, arg) in &n.args {
             let at = *offset as usize;
             match arg {
                 Arg::Const(bytes) => image[at..at + bytes.len()].copy_from_slice(bytes),
                 Arg::Resource { resource, interior } => {
-                    let binding = self
-                        .resources
+                    let binding = resources
                         .get(resource.0 as usize)
                         .ok_or_else(|| format!("unknown resource {}", resource.0))?;
+                    let interior = overrides
+                        .interiors
+                        .iter()
+                        .find(|(arg_offset, _)| arg_offset == offset)
+                        .map_or(*interior, |(_, interior)| *interior);
                     let address = binding
                         .base
-                        .checked_add(*interior)
+                        .checked_add(interior)
                         .ok_or_else(|| "pointer overflows".to_owned())?;
                     image[at..at + 8].copy_from_slice(&address.to_le_bytes());
                 }
@@ -758,16 +998,16 @@ impl KernelProgram {
                 }
             }
         }
-        let dims: u64 = if n.grid[2] != 1 || n.block[2] != 1 {
+        let dims: u64 = if grid[2] != 1 || n.block[2] != 1 {
             3
-        } else if n.grid[1] != 1 || n.block[1] != 1 {
+        } else if grid[1] != 1 || n.block[1] != 1 {
             2
         } else {
             1
         };
         for h in &n.hidden {
             let value: u64 = match h.kind {
-                HiddenKind::BlockCount(axis) => u64::from(n.grid[axis as usize]),
+                HiddenKind::BlockCount(axis) => u64::from(grid[axis as usize]),
                 HiddenKind::GroupSize(axis) => u64::from(n.block[axis as usize]),
                 // HIP grids count workgroups: no partial groups, no offset.
                 HiddenKind::Remainder(_) | HiddenKind::GlobalOffset(_) | HiddenKind::Other => 0,
@@ -784,7 +1024,7 @@ impl KernelProgram {
             let at = h.offset as usize;
             image[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
         }
-        Ok(image)
+        Ok(())
     }
 
     /// Authored value of every word, indexed by `WordId`.

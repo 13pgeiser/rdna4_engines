@@ -19,7 +19,12 @@
 //! calls write-only, fails; and an argument the metadata explicitly says is
 //! written that a `Proven` A1 summary never writes fails (A1 would be missing
 //! a write).
+//!
+//! [`whole16`] builds and verifies the DFlash Whole16 window manifest (the
+//! complete node sequence with exact-object identities, the FP8 attention
+//! explicit-ABI table, refusals for non-railgun or fact-less nodes).
 pub mod recording;
+pub mod whole16;
 
 use std::collections::BTreeMap;
 

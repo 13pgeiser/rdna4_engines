@@ -4111,6 +4111,7 @@ impl Gpu {
             .validate_launch_grid(grid)
             .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
+        let plan = self.hip.plan_active();
         let observe = self.replay.is_g0_observing();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
@@ -4132,9 +4133,15 @@ impl Gpu {
             || observe
             || self.graphs.capture_mode
             || self.flags.force_blob_path
+            // Plan mode records the exact blob: the params path cannot be
+            // reconstructed from `kernelParams` pointers.
+            || plan
         {
             let mut blob = blob_builder();
             blob.pad_to(16);
+            if plan {
+                crate::plan_sink::note_declared(self.hip.plan_event_count(), railgun_words);
+            }
             if observe {
                 self.replay
                     .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
@@ -4549,7 +4556,7 @@ impl Gpu {
     }
 
     /// Shared loaded-symbol/Arc-owner proof, borrowing the registry's owner.
-    fn loaded_owner(
+    pub(crate) fn loaded_owner(
         &self,
         symbol: &str,
     ) -> HipResult<(String, &crate::code_object::RecordedArtifact)> {

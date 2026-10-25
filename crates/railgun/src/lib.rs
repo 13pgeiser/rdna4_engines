@@ -33,6 +33,7 @@ pub mod kernel;
 pub mod npu;
 pub mod plan;
 pub mod shadow;
+pub mod window;
 
 use std::ops::RangeInclusive;
 

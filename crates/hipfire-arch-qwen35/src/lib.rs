@@ -47,6 +47,9 @@ pub mod carrier;
 /// last-token semantics and GPU-backed capture/restore paths.
 #[cfg(feature = "deltanet")]
 pub mod checkpoint;
+/// Design A slice A4: the planned (railgun) DFlash draft emitter over the
+/// frozen plan sink, its shape family / patch table, and the oracle binder.
+pub mod dflash_draft_emit;
 /// Minimal DFlash batched-lane seam (lane state wrapper, lane draft, shared
 /// verify head) used by the Gate 0 replay probe. Deltanet-gated like
 /// `dflash_spec`.
@@ -69,6 +72,10 @@ pub mod dflash_spec;
 /// route-proof counters; `speculative` owns the GPU half.
 /// Not deltanet-gated, matching `speculative`, which consumes it.
 pub mod dflash_verify_pm4;
+/// Railgun design A slice A5: the DFlash verify-window emitter
+/// (`plan_dflash_verify`) and its patch-table proof. Not deltanet-gated,
+/// matching `speculative`, which it consumes.
+pub mod dflash_verify_emit;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention

@@ -77,6 +77,7 @@ mod kernels {
     );
     /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
     pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
+    pub const RAILGUN_FILL_SRC: &str = include_str!("../../../kernels/src/railgun_fill.hip");
 }
 
 pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
@@ -5760,6 +5761,13 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
             "railgun_copy",
             &["railgun_copy", "railgun_copy_batch"],
             kernels::RAILGUN_COPY_SRC.into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "railgun_fill",
+            &["railgun_fill_u32"],
+            kernels::RAILGUN_FILL_SRC.into(),
             extra_flags,
         ));
     }

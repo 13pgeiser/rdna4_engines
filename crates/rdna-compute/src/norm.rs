@@ -1200,7 +1200,6 @@ impl Gpu {
             kernels::ROPE_BATCHED_SRC,
             "rope_batched_f32",
         )?;
-        let func = &self.functions["rope_batched_f32"];
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k.buf.as_ptr();
         let mut pos_ptr = positions.buf.as_ptr();
@@ -1222,16 +1221,25 @@ impl Gpu {
         let half = (head_dim / 2) as u32;
         let block = 256u32.min(half);
         let grid_x = (half + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_size as u32, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "rope_batched_f32",
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_f32(fb);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
 
     // ── DeltaNet ops (feature-gated) ─────────────────────────────────────

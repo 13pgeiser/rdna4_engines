@@ -1758,6 +1758,12 @@ pub const SITES: &[Site] = &[
         decisions: &["kv-tier-capture-forces-flash"],
     },
     Site {
+        file: "hipfire-arch-qwen35/src/dflash_verify_emit.rs",
+        function: "plan_phases",
+        occurrences: 6,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
         file: "hipfire-arch-qwen35/src/dflash_cb.rs",
         function: "dflash_cb_verify",
         occurrences: 2,

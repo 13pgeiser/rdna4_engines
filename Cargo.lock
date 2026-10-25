@@ -1467,6 +1467,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "railgun",
  "rdna-compute",
  "saddle-core",
  "serde",

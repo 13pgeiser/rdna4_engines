@@ -17,6 +17,7 @@ pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
 pub mod dflash_hidden_scatter;
 pub mod dflash_sampled_accept;
+pub mod dflash_selector;
 pub mod dflash_state_copy;
 mod dispatch;
 pub mod draft_lane_conv;
@@ -76,6 +77,7 @@ pub mod norm;
 pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
+pub mod plan_sink;
 pub mod pm_decode_twins;
 pub mod pm_mtp_gemm;
 pub mod pm_xbatch;
@@ -126,6 +128,7 @@ pub use trunk_mask::{
 };
 
 pub use compiler::KernelCompiler;
+pub use plan_sink::{PlanSink, PlannedKernel, PlannedOp};
 #[cfg(feature = "lab")]
 pub use dispatch::LabKernelFaultReceipt;
 pub use dispatch::{

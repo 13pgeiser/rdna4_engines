@@ -518,6 +518,15 @@ impl Pm4Plan {
         c.segments = self.segments.len();
         c
     }
+
+    /// True when one segment spans nodes `0..nodes` and nothing else: the
+    /// "one segment" shape of a `Whole16` window (design A §2, slice A1).
+    pub fn is_single_segment(&self, nodes: usize) -> bool {
+        matches!(
+            self.segments.as_slice(),
+            [only] if only.first == 0 && only.end == nodes
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

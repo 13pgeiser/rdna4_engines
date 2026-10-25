@@ -530,6 +530,7 @@ fn describe(b: &BoundaryState) -> String {
 fn word_kind(role: &WordRole) -> String {
     match role {
         WordRole::GdnFrame { frames } => format!("gdn_frame(frames={frames})"),
+        WordRole::Window => "window_scalar32".to_owned(),
     }
 }
 

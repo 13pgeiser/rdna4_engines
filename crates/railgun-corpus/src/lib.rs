@@ -24,6 +24,7 @@
 //! recorded too ([`ObjectOrigin::PmNative`]), keyed by image digest and with no
 //! compile recipe; their bytes ship under `native/<arch>/`, not in the pack.
 pub mod receipt;
+pub mod window;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};

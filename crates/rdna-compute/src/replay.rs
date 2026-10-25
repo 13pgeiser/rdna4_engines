@@ -36,6 +36,7 @@ use redline_dispatch::{
 use crate::code_object::{CodeObjectId, RecordedArtifact};
 use crate::dispatch::VmmResourceMove;
 
+pub(crate) mod railgun_lower;
 pub(crate) mod railgun_shadow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
