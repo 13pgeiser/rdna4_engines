@@ -424,13 +424,19 @@ In short: with streaming on, the prefix cache keeps serving hits from VRAM, but 
 overflow tier is switched off (and its memory not reserved), because a streamed group's KV is
 addressed by block id and can never be moved to a host slot.
 
-| `--kv-resident` | model | `--prefix-cache-mib` | result |
+`--kv-resident` is the ring's depth in tokens; the context limit is the group's own,
+`--max-model-len` x `--max-num-seqs` (131 072 here). "Streams" below means the built program
+declared **and linked** both ops for that group — `kv_resolve` and a streamed store
+(`kv_store_streamed` or the folded form) — with a cache layout the store has a writer for: fp8
+(E4M3) or bf16.
+
+| `--kv-resident` | the group that would stream | `--prefix-cache-mib` | result |
 |---|---|---|---|
 | absent or `0` | any | any | nothing streams; host tier exactly as configured |
-| at/above the group's context (131 072 here) | streams | any | ring covers the context, **nothing streams**; host tier as configured |
-| under the context | no `kv_resolve` / no streamed store row | any | flag ignored with one sentence; host tier as configured |
-| under the context | streams | `0` | host tier off by choice: the prefix cache is VRAM-only |
-| under the context | streams | `> 0` | **host tier switched off at startup, its MiB not reserved**, and the flag reports `0 (off)` |
+| at or above the group's context limit | any | any | the ring covers the context, so nothing streams; host tier as configured |
+| above zero, under the context limit | no streamed path: dense attention, a windowed group, or a packed `fp8_v4` / `k6_v4` cache | any | flag ignored with one sentence naming what is missing; host tier as configured |
+| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `0` | nothing to hold; the prefix cache is VRAM-only |
+| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `> 0` | **host tier switched off at startup, its MiB not reserved**, and the flag reports `0 (off)` |
 
 "Streaming" here is the engine's answer, not the flag's (`kvstream_prefix_host_off`,
 `kvstream/plan.cpp`; `cfg.kv_streams`): the ring must be under the group's context and the
