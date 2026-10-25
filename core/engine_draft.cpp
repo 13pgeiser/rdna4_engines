@@ -104,6 +104,7 @@ int Engine::step_state_init() {
     }
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
 
@@ -123,6 +124,8 @@ void Engine::step_state_fini() {
     couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
+    if (tok_end_) rad_event_destroy(tok_end_);
+    tok_end_ = nullptr;
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -179,7 +182,9 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
  * history pass and every round, then the final proposal into the slots and their readback.
- * Nothing synchronises here; collect_step has the step's one wait. */
+ * Nothing synchronises here. collect_step waits for the ids alone (their copy is fenced ahead of
+ * the passes), and the step loop for the passes after the commit, before finish_serial_drafter
+ * reads the slots. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -191,7 +196,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     }
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
-    RAD_TRY(collect_issue(so));
+    RAD_TRY(collect_issue(so, /*fence=*/true));
 
     int rounds = drafter_.depth;
     serial_row_.resize((size_t)cfg_.max_seqs);
@@ -465,7 +470,9 @@ bool Engine::block_drafting() const {
  * The query pass's rows are device rows that the card positions at the committed end (ADV_BLOCK),
  * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
  * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
- * collect_step's wait covers both passes and the slots' readback. */
+ * collect_step waits for the sampled ids alone, whose copy is fenced ahead of both passes, so the
+ * commit streams the step's tokens while the card runs them; the step loop waits for the passes
+ * and the slots' readback (step_end_) before finish_block_drafter reads the slots. */
 void Engine::block_shape(int* block, int* steps) {
     *steps = drafter_.depth;
     /* The row count is the drafter's (defaulted and checked by declare_drafter). */
@@ -487,7 +494,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* The sampled ids before either pass, as the serial driver reads them. */
-    RAD_TRY(collect_issue(so));
+    RAD_TRY(collect_issue(so, /*fence=*/true));
 
     /* The short block too (block_shape): its query pass is a shorter batch the card positions
      * the same way, its proposals the front of each row at the drafter's pitch (ADV_BTAKE), and

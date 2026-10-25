@@ -3491,6 +3491,7 @@ The four slots are what the amdgpu kernel driver leaves to user queues. It keeps
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: every dispatch of one recorded pass in N on card 0 gets a completion signal of its own, which carries its start and end; the barrier bits and chains stay as unstamped, unlike `--profile-ops`, which plays no recorded pass. One CSV line a dispatch (pass, record, queue, kernel, whether it waited for the one before, whether it was chained, start and end in ns) is appended to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`) once the card is done with it; `scripts/stampgaps.py` reads it per kind of pass (idle share, gaps before ordered starts, kernels by time). AQL backend only |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
+| `RADIANCE_IDS_EARLY=0` | read a step's sampled tokens only once the drafter's passes behind it have run. By default they are read, committed and streamed while the card runs those passes. For an A/B |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
 dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on the operands the model issued;

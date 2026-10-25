@@ -254,6 +254,11 @@ private:
         /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
          * empty on a step with none. */
         std::vector<TokenLogprobs> lp;
+        /* The ids' copy has its own event ahead of the drafter's passes (collect_issue's
+         * `fence`): collect_step waits on it, the commit streams the tokens, and the passes are
+         * waited for after that (step_end_), before anything reads what they wrote or reuses what
+         * the commit released. */
+        bool                  early = false;
     };
 
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
@@ -323,16 +328,22 @@ private:
     void probe_arena_levels();
     int  step_loop();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
-     * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
-     * them. */
-    int  collect_issue(StepOut& so);
+     * Split so the copy is issued before draft passes overwrite the ids. With `fence` (a drafter
+     * queueing its passes behind the step) the copy gets an event of its own, tok_end_, so the
+     * wait for the ids need not wait for the passes too (StepOut::early). */
+    int  collect_issue(StepOut& so, bool fence = false);
     int  collect_step(const RadBatch* b, StepOut& so);
     int  row_logprobs(StepOut& so, int32_t row, int32_t token);
     /* The step's end on the card: after its last draft pass and the host readbacks, before the
-     * step issued ahead. collect_step waits on this event, not the stream, so the card runs the
+     * step issued ahead. The engine waits on this event, not the stream, so the card runs the
      * next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
+    /* The sampled ids' copy, ahead of the drafter's passes (collect_issue's `fence`). */
+    RadEvent tok_end_ = nullptr;
+    /* Whether the ids may be read before the drafter's passes end: not in KL mode, whose scored
+     * rows are read out of the logits after collection, nor in an embedding program. */
+    bool     early_ids_ = false;
 
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the

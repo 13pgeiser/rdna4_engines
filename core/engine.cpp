@@ -409,6 +409,12 @@ int Engine::step_loop() {
      * pass issued ahead would overwrite them. */
     pipelining_ = !cfg_.kld() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    /* RADIANCE_IDS_EARLY=0 waits for the drafter's passes before reading the ids, as before, for
+     * an A/B. */
+    early_ids_ = !cfg_.kld() && !embedding_ && [] {
+        const char* v = std::getenv("RADIANCE_IDS_EARLY");
+        return !(v && *v == '0');
+    }();
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -759,6 +765,17 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
+        /* With the ids read ahead of the drafter's passes the commit has streamed the step's
+         * tokens while the card ran them. Their end now, before anything reads what they wrote
+         * (the slots below) or the next step reuses what the commit released: the commit issued
+         * no work of its own, so everything it freed is in use only by passes this wait covers. */
+        if (so.early) {
+            st = rad_event_sync(step_end_);
+            if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step,
+                                  rad_strerror(st)); return fail_loop(st); }
+            so.early = false;
+        }
+
         /* The drafter for the next step already ran on the card; what remains is to check its
          * acceptance against the host's and publish its proposals. Each driver returns
          * immediately for a kind that is not its own. */
@@ -799,11 +816,17 @@ int Engine::step_loop() {
 }
 
 /* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.
- * Issued by the serial drafter before its passes (a head sampling through the sampler's buffer
- * overwrites the ids), otherwise just before the wait. */
-int Engine::collect_issue(StepOut& so) {
+ * Issued by a drafter before its passes (a head sampling through the sampler's buffer overwrites
+ * the ids), otherwise just before the wait.
+ *
+ * With `fence`, from a drafter that queues its passes behind the step, the copy is followed by
+ * tok_end_, so collect_step can wait for the ids alone and the commit can stream the step's
+ * tokens while the card runs the passes (StepOut::early). Not at -vv: the logits row below is a
+ * pageable copy, read in collect_step. */
+int Engine::collect_issue(StepOut& so, bool fence) {
     so.rb = nullptr;
     so.lg.clear();
+    so.early = false;
     if (so.n_rows <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
     void* src = r0.ctx.buf_ptr(r0.tok_buf);
@@ -824,6 +847,11 @@ int Engine::collect_issue(StepOut& so) {
             so.lg.resize((size_t)nv);
             rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.ctx.stream());
         }
+        return RAD_OK;
+    }
+    if (fence && early_ids_) {
+        RAD_TRY(rad_event_record(tok_end_, r0.ctx.stream()));
+        so.early = true;
     }
     return RAD_OK;
 }
@@ -922,7 +950,8 @@ int Engine::issue_scored_rows(Rank& r) {
 
 int Engine::collect_scored_rows() {
     if (score_rows_.empty()) return RAD_OK;
-    /* step_end_ fences rank 0's stream; every other rank's copies are fenced here. */
+    /* The wait collect_step made (step_end_, or tok_end_ behind the copies issued ahead of the
+     * sampler) fences rank 0's stream; every other rank's copies are fenced here. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         RAD_TRY(rad_dev_set(ranks_[i]->device));
         RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
@@ -968,8 +997,10 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
-    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
-    RAD_TRY(rad_event_sync(step_end_));
+    /* Wait on an event, not the stream: a step issued ahead is queued behind it. The ids' own
+     * event when they were fenced ahead of the drafter's passes (StepOut::early), whose end the
+     * step loop waits for after the commit; else the step's end. */
+    RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());

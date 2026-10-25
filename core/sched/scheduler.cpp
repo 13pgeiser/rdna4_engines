@@ -1966,6 +1966,11 @@ void Scheduler::promote_next() {
 }
 
 /* ------------------------------------------------------------------ commit */
+/* With early ids (Engine::collect_step waits on tok_end_, not step_end_), this runs while the card
+ * may still be running the drafter's passes behind the step. So it issues no device work and
+ * allocates nothing: what it releases (KV blocks, StepSlot cards, prefix-cache publications) may
+ * still be read by those passes, and is reused only by work the engine issues after its wait for
+ * step_end_. Device work or an allocation added here must move behind that wait. */
 int Scheduler::commit(const StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
@@ -2181,7 +2186,9 @@ int Scheduler::commit(const StepResult& res) {
 
     /* Every entry is retired, so anything deferred on this step, or on a drafter snapshot that
      * block_end() / serial_end() has since cleared, can be released: every pass naming them was
-     * issued before this step's readback, which waited for the compute stream. */
+     * issued before this step's readback. That readback may return while the drafter's passes
+     * behind it still run (Engine::StepOut::early), and the engine then waits for them before it
+     * issues anything else, so nothing reuses what is released here before they end. */
     sweep_deferred();
     return RAD_OK;
 }
