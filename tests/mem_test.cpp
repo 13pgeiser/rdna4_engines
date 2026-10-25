@@ -1319,6 +1319,47 @@ TEST(a_ring_that_covers_the_context_streams_nothing_and_the_engine_pays_nothing)
     }
 }
 
+/* The prefix cache's host tier is turned off when --kv-resident really streams, and only then.
+ * The three cases that must leave it on are the ones an operator hits without meaning to: the flag
+ * absent or 0, a ring that covers the group's context (nothing streams), and a flag on a model the
+ * tier does not stream. `cfg.kv_streams` is the one answer to all three (kvstream_cap_probe). */
+TEST(the_prefix_cache_host_tier_is_off_only_when_streaming_is_really_on) {
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].bytes_per_block = 2048;                 /* 16 tokens x 128 B, as declare sets it */
+    /* A pitch of 513 blocks is this fixture's resolve; the ceiling is max_seqs x (1 + n_spec) x
+     * pitch, so a ring under a 128-block context needs a small pitch: 8 x 2 = 16 blocks. */
+    const Program wide = stream_program(groups[G_FULL], 513);
+    const Program narrow = stream_program(groups[G_FULL], 8);
+
+    struct Case {
+        const char* what;
+        int64_t     resident;      /* --kv-resident */
+        bool        streams;
+        int64_t     tier_after;    /* --prefix-cache-mib once bring-up has had its say */
+    };
+    const Case cases[] = {
+        { "the flag absent",           0,          false, 2048 },
+        { "a ring covering the ctx",   2 * 1024,   false, 2048 },
+        { "a ring under the ctx",      256,        true,  0    },
+    };
+    for (const Case& c : cases) {
+        Fixture f;
+        f.cfg.checkpoint_slots = 0;
+        f.cfg.max_ctx = 1024;
+        f.cfg.max_seqs = 2;
+        f.cfg.kv_resident = c.resident;
+        f.cfg.prefix_cache_mib = 2048;
+        CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, c.streams ? narrow : wide, 1024));
+        CHECK_EQ(f.cfg.kv_streams, c.streams);
+        const int64_t off = kvstream_prefix_host_off(f.cfg);
+        CHECK_EQ(f.cfg.prefix_cache_mib, c.tier_after);
+        CHECK_EQ(off, c.streams ? 2048ll : 0ll);
+        CHECK_EQ(kvstream_prefix_host_off(f.cfg), 0ll);    /* idempotent: a second rank says nothing */
+        f.kv.free_stream(rad_malloc_allocator());
+    }
+}
+
 TEST(a_decode_pass_wider_than_a_verify_stages_instead_of_resolving_the_ring) {
     /* The serial drafter's history pass is RAD_PHASE_DECODE, but after a prefill chunk it carries
      * the chunk's tokens of every sequence: more rows a sequence than a decode step can select for
@@ -7472,6 +7513,61 @@ TEST(a_dense_read_groups_floor_holds_every_sequence_while_a_sibling_streams) {
     CHECK(!bkey->streamed());
     CHECK_EQ(bkey->n_blocks, f.cfg.max_seqs * ((f.cfg.max_ctx + 3) / 4));
     CHECK_EQ(bkey->n_slots, bkey->n_blocks);
+}
+
+/* A prefix entry covers every cached group, the streamed one included: a hit re-adopts its block
+ * ids, and the mirror behind them is the tier for that group. A host-tier entry cannot: a slot
+ * holds only the groups whose bytes the tier copies (kv_tier_cached), and a streamed group's rows
+ * are addressed by the block id the sequence used, so its ids can never be given up in exchange
+ * for a slot. An entry that contains one is therefore a VRAM entry: the tiers are never told about
+ * it, and an eviction takes every group's ids with it. */
+TEST(an_entry_with_a_streamed_group_is_never_demoted) {
+    if (!host_backend_or_skip("the tier restore")) return;
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_seqs = 1;
+    f.cfg.max_ctx = 1024;
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups.push_back(paged_group("bkey", RAD_KV_FULL, 2, 16, { 6, 7 }));
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);              /* four blocks of 16 tokens */
+    const int64_t need = f.kv.pool_mib_for_tokens(f.cfg.max_ctx, 256);
+    REQUIRE(need > 0);
+    f.cfg.vram_kv_mib = need;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+
+    const std::vector<int32_t>& cg = f.pc.cached_groups();
+    IdleTiers t;
+    REQUIRE_EQ(t.configure(tier_config(4096 * 1024, 4096 * 1024)), RAD_OK);
+    f.pc.set_tiers(&t);
+    REQUIRE_EQ(f.pc.configure(f.cfg, &f.kv, f.cfg.checkpoint_interval), RAD_OK);
+    REQUIRE_EQ(cg.size(), 2u);
+    CHECK(f.kv.plan(cg[0])->streamed());
+    /* The one fact the tier path depends on: a slot cannot hold this cache's entries, so no
+     * write-back is planned, nothing is queued, and nothing can be dropped to the host. */
+    CHECK(!f.pc.demotable());
+
+    const auto tokens = tok_run(5000, 64);
+    publish(f, 1, tokens, 64);
+    f.kv.free_sequence(1);
+    const std::vector<BlockHash> hs = chain_of(tokens);
+    REQUIRE_EQ(hs.size(), 4u);
+
+    std::vector<TierJob> wb;
+    t.plan_writeback(64, &wb);
+    CHECK_EQ(wb.size(), 0u);                           /* the streamed entry is never copied */
+    CHECK_EQ(f.pc.drop_clean(), 0ll);                  /* so it is never demoted */
+    CHECK(!t.droppable(hs[0]));
+
+    /* The trim still frees it: an entry the tier cannot hold must not be skipped as though its
+     * copy were in flight. All four blocks are at refcount one and the trim takes them. */
+    CHECK_EQ(f.pc.trim(4), 4ll);
+    CHECK_EQ(f.pc.size(), 0ll);
+    CHECK_EQ(f.kv.block_refcount(cg[0], 0), 0);
+    CHECK_EQ(f.kv.block_refcount(cg[1], 0), 0);
+    f.pc.set_tiers(nullptr);
 }
 
 RAD_TEST_MAIN()
