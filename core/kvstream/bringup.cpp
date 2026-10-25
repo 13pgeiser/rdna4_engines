@@ -117,18 +117,32 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
      * line that says what was asked, what it became and why. */
     KVStreamRing ring;
     kvstream_ring(cfg, ctx, bs, ops.sel_pitch, &ring);
-    if (ring.raised_blocks > 0)
-        /* Anything under the computed amount is ignored and pulled up to it, the way Strata sizes
-         * this: the engine knows what a decode step names, and --kv-resident is a request for
-         * streaming rather than for one number. A warning, so startup proceeds -- and a different
-         * sentence from the ignored-flag one above, because this model does stream. */
-        RAD_WARN("--kv-resident %lld raised to %lld tokens: a decode step can name %lld blocks of "
-                 "%lld blocks each (--max-num-seqs %lld x %lld for speculation x %lld), and the ring "
-                 "must hold them all; the ring takes the raised depth and startup proceeds",
-                 (long long)out->asked_tokens, (long long)(ring.ring_blocks * bs),
-                 (long long)ring.raised_blocks, (long long)bs,
-                 (long long)(cfg.max_seqs > 0 ? cfg.max_seqs : 1),
-                 (long long)(1 + (cfg.n_spec > 0 ? cfg.n_spec : 0)), (long long)ops.sel_pitch);
+    if (ring.raised_blocks > 0) {
+        /* Two floors, and the line names whichever bound: the shipped one (a ring under
+         * kStreamFloorTokens is not worth carving -- the misses cost more than the VRAM saved) or
+         * one decode step's selection, which is a correctness bound rather than a preference. A
+         * warning, so startup proceeds -- and a different sentence from the ignored-flag one
+         * above, because this model does stream. */
+        const int64_t asked_blocks = (out->asked_tokens + bs - 1) / bs;
+        const int64_t step = kvstream_ceiling_blocks(cfg, ops.sel_pitch);
+        if (step > asked_blocks && step <= ring.raised_blocks) {
+            RAD_WARN("--kv-resident %lld raised to %lld tokens: a decode step can name %lld blocks "
+                     "of %lld blocks each (--max-num-seqs %lld x %lld for speculation x %lld), and "
+                     "the ring must hold them all; the ring takes the raised depth and startup "
+                     "proceeds",
+                     (long long)out->asked_tokens, (long long)(ring.ring_blocks * bs),
+                     (long long)step, (long long)bs,
+                     (long long)(cfg.max_seqs > 0 ? cfg.max_seqs : 1),
+                     (long long)(1 + (cfg.n_spec > 0 ? cfg.n_spec : 0)),
+                     (long long)ops.sel_pitch);
+        } else {
+            RAD_WARN("--kv-resident %lld raised to %lld tokens: a ring under %lld tokens (%lld "
+                     "blocks of %lld) misses more than it saves, so the shipped floor is what the "
+                     "carve takes. Startup proceeds; raise the flag to go deeper",
+                     (long long)out->asked_tokens, (long long)(ring.ring_blocks * bs),
+                     (long long)kStreamFloorTokens, (long long)ring.raised_blocks, (long long)bs);
+        }
+    }
     /* The raised ring may be the whole context, which is not a streamed group at all: it keeps
      * every block on the card and the report says which context the ring covers. */
     out->ring_blocks   = ring.ring_blocks;
