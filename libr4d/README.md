@@ -262,6 +262,15 @@ per-rank head (124160 × 5120) at 128 rows 3059 → 1984 µs, TranslateGemma's (
 streams with speculation. Same scale blocks, WMMAs and K order per output: the same bytes (the
 numeric cases at 65..150 rows for the fp8 head, 100 for the int8 head).
 
+## Measuring asymmetric W4 GEMMs
+
+`r4d_selftest <libr4d.so> --perfw4 N K M [iters]` sweeps configurations of the asymmetric
+W4-weight/F16-activation kernel used by HYV3's attention and dense MLP at decode. For example,
+`--perfw4 4096 2048 1` measures its TP1 query projection. Activations are initialized and weights
+rotate through more than 256 MiB, including at small shapes. This is a timing diagnostic, not a
+correctness check or whole-model throughput result; validate candidate settings separately before
+changing deployment defaults. It does not measure the routed-expert `moe_gemm_q` kernel.
+
 ## Notes on the kernels
 
 Three properties of the architecture are assumed throughout and not restated per kernel:

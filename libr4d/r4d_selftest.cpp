@@ -5276,11 +5276,11 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
 }
 
 
-/* Timing of the 5/4-bit GEMM at one prefill chunk over the row's tuned axes; `--case w5a16_perf`
- * only (a measurement, not a check). The weight is replicated past the last-level cache and walked
- * in turn, as in perf_row, so the printed GB/s is the weight stream's. */
-static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K) {
-    if (!g_case || std::strcmp(g_case, "w5a16_perf")) return;
+/* Timing of the 5/4-bit GEMM over the row's tuned axes (`--case w5a16_perf` or --perfw4).
+ * A measurement, not a correctness check. The weight is replicated past the last-level cache
+ * and walked in turn, as in perf_row, so the printed GB/s is the weight stream's. */
+static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K,
+                       int min_iters = 12) {
     const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
     const RadKernelInfo* r = find(pl, row);
     if (!r) { std::printf("row absent\n"); return; }
@@ -5307,6 +5307,10 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
     void* d_a = dalloc((size_t)(M * K * 2));
     void* d_y = dalloc((size_t)(M * N * 2));
     if (!d_w || !d_s || !d_a || !d_y) { std::printf("hipMalloc failed\n"); return; }
+    std::vector<uint16_t> ha((size_t)(M * K));
+    for (size_t i = 0; i < ha.size(); ++i)
+        rad_store_f32(ha.data(), RAD_F16, (int64_t)i, 0.003f * (float)((int)(i % 97) - 48));
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
     for (size_t c = 0; c < copies; ++c) {
         st_memcpy((uint8_t*)d_w + c * wq.size(), wq.data(), wq.size(), hipMemcpyHostToDevice);
         st_memcpy((uint8_t*)d_s + c * ws.size(), ws.data(), ws.size(), hipMemcpyHostToDevice);
@@ -5340,7 +5344,9 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
         hipEvent_t e0, e1;
         st_ev_create(&e0); st_ev_create(&e1);
         st_ev_record(e0, nullptr);
-        const int iters = 12;
+        /* A small weight needs more than twelve launches to exceed the last-level cache.
+         * Complete two rotations even for a one-row decode shape. */
+        const int iters = (int)std::max<size_t>((size_t)min_iters, copies * 2);
         for (int i = 0; i < iters; ++i) {
             ts[2].data = (uint8_t*)d_w + (size_t)(i % copies) * wq.size();
             ts[3].data = (uint8_t*)d_s + (size_t)(i % copies) * ws.size();
@@ -30832,6 +30838,8 @@ static void usage(void) {
                 "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
                 "  --perfq N K M [iters]:  the block-quantised trunk rows GLM resolves to: E4M3 with\n"
                 "             F32 block scales and the three OCP-MXFP4 rows, GB/s on weight + scales.\n"
+                "  --perfw4 N K M [iters]:  a tuning sweep of the asymmetric W4 x F16 GEMM;\n"
+                "             M <= 64, N 16-aligned, K 128-aligned. Measurement only, cold weights.\n"
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
@@ -30942,7 +30950,8 @@ int main(int argc, char** argv) {
     const char* real_file = nullptr;
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
-    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0, perf_mx = 0, perf_wpa = 0;
+    int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,
+        perf_q = 0, perf_mx = 0, perf_wpa = 0;
     long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
@@ -31045,6 +31054,18 @@ int main(int argc, char** argv) {
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfw4")) {
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_w4 = 1;
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (perf_n <= 0 || perf_n % 16 || perf_k <= 0 || perf_k % 128 ||
+                perf_m < 1 || perf_m > 64 || perf_it < 1) {
+                std::fprintf(stderr, "--perfw4: positive N in 16s, K in 128s, M 1..64, iters > 0\n");
+                return 2;
+            }
         } else if (!std::strcmp(argv[i], "--perfw8")) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_w8 = 1;
@@ -31439,6 +31460,7 @@ int main(int argc, char** argv) {
         else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
         else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_w4) w5a16_perf(pl, 4, perf_m, perf_n, perf_k, perf_it);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w2) w2_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else         fp8_perf(pl, perf_n, perf_k, perf_m, perf_it);
