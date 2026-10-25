@@ -1315,12 +1315,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-flash-next-gfx1151-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS)",
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS)",
         effect: KernelSelection,
-        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; recorded/captured: the incumbent unfused launches",
+        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; recorded/captured: the incumbent launches",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "GPU byte oracle on Halo (gfx1151) of every output byte against the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal): halo-prefill-044/a-down/ORACLE.md",
+        evidence: "GPU byte oracles on Halo (gfx1151) of every output byte against the incumbent launches: HC down 36/36 vs the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal), halo-prefill-044/a-down/ORACLE.md; HC up v2 152/152 vs hyper_read_up_wmma_bf16_swap, random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region, halo-prefill-044/a-up/ORACLE.md. Eager exact-gfx1151 prefill arms; the recorded body keeps the incumbent launches. No railgun default program is a qwen4 program, so nothing reaches one",
         reaches: &[],
     },
     Decision {
@@ -3618,13 +3618,19 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hc_up_v2_selected",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hyper_read_up_wmma_launch",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/shared_i8.rs",

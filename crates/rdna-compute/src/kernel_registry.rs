@@ -3099,6 +3099,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["qwen4_hc_down_fused_b64_k32"]
         );
         add!(
+            "hyper_read_up_wmma_gfx1151_v2",
+            crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
+            ["hyper_read_up_wmma_bf16_gfx1151_v2"]
+        );
+        add!(
             "hyper_read_up_wmma_gfx1201",
             crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC,
             [
