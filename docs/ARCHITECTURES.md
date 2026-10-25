@@ -1026,6 +1026,17 @@ the whole 128-row scale blocks that cover its share of the columns and an `all_g
 them, with `gemm_nt_q`'s `split_n` keeping every output the unsplit fc's to the bit. The recipe is
 `gemma4-31b-dense-bf16-w4a8-df2.recipe`.
 
+**The 31B by GPTQ.** `arch/gemma4_bf16`'s linears read int8 activations, which the Gram tap
+(`gram_accum`) does not take, so the 31B's Hessians come from this plugin serving the bf16
+checkpoint. With `RADIANCE_CALIB_DIR` set it taps each layer's dense linears, the routed arm aside:
+rank 0 writes q|k|v's and gate|up's inputs whole, and each rank writes its columns of o's and
+down's inputs as `<stem>.part`, all under the names `gemma4_bf16`'s container gives those weights
+(`blk.N.attn_qkv`, `ffn_gate_up`, `attn_o`, `ffn_down`), so
+`data/recipes/gemma4-31b-dense-bf16-w4a8g-df2.recipe` reads them as written. The prefill overlap
+and the fused arms are off while it runs. `RADIANCE_G4_CALIB_LAYERS=lo:hi` takes a slice of layers:
+the 31B's four taps a layer are ~364 MiB a rank at four ranks, and its 60 layers do not fit beside
+the weights in one pass. docs/GEMMA4-31B-GPTQ.md has the corpus, the run and what it changes.
+
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
 of it (`ar_rmsnorm_quant_i8`). At four it does too, in steps of up to 16 rows (decode, and a DFlash
 or DFlash2 verify), on libr4d's `ar_rmsnorm_quant_i8_4rank`, in a form chosen by height. Every form

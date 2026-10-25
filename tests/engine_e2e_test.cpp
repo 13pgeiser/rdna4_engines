@@ -1170,6 +1170,89 @@ TEST(gemma4_chunking_and_batching_change_no_logit) {
                             { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
 }
 
+/* GPTQ for the Gemma 4 31B's w4a8 container, end to end on the tiny Gemma 4 (shaped like the 31B):
+ * arch/gemma4's calibration tap records the trunk's Hessians from the bf16 checkpoint at --tp 2,
+ * where o_proj's and down's inputs are split and each rank writes its block; rad-convert makes the
+ * container with the two shipped recipes, round to nearest and GPTQ; and on documents the Hessians
+ * never saw, the GPTQ one is more than three times closer to the bf16 model (5.8 times here). A
+ * Hessian under another name or of another width is refused, and the weight rounds to nearest,
+ * said on stderr. With the ranks' blocks swapped, the codes fit the wrong inputs and GPTQ is only
+ * 2.2 times closer. */
+TEST(gemma4_s_calibration_tap_gives_gptq_a_container_closer_to_bf16_than_rounding) {
+    REQUIRE(world().ok);
+    World& w = world();
+    const tiny::Gemma4 s;
+    tiny::TempDir d("e2e_g4calib");
+    const std::string grams = d / "grams";
+    REQUIRE(::mkdir(grams.c_str(), 0755) == 0);
+    const Ran tap = radiance(w.gemma4, { "--tp", "2", "--kld-record", d / "tap", "--kld-corpus",
+                                         w.corpus, "--max-num-batched-tokens", "512",
+                                         "--max-num-seqs", "1" },
+                             { "RADIANCE_HOST_DEVICES=2", "RADIANCE_CALIB_DIR=" + grams,
+                               "RADIANCE_CALIB_TOKENS=1000" });
+    if (tap.status != 0) fprintf(stderr, "    the tap exited %d:\n%s\n", tap.status, tail(tap.log).c_str());
+    REQUIRE_EQ(tap.status, 0);
+    /* Rank 0 writes q|k|v's and gate|up's inputs whole; each rank its half of o_proj's (the heads)
+     * and of down's (the FFN). A global layer's heads are wider. */
+    auto expect = [&](int rank, const std::string& what, int64_t k) {
+        const std::string f = grams + "/gram.r" + std::to_string(rank) + "." + what + ".bin";
+        std::error_code ec;
+        const auto n = std::filesystem::file_size(f, ec);
+        if (ec || (int64_t)n != 32 + k * k * 4)
+            fprintf(stderr, "    %s: %s, expected %lld bytes\n", f.c_str(),
+                    ec ? "missing" : std::to_string(n).c_str(), (long long)(32 + k * k * 4));
+        CHECK(!ec && (int64_t)n == 32 + k * k * 4);
+    };
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        const int64_t hd = (l + 1) % s.interval == 0 ? s.global_head_dim : s.head_dim;
+        expect(0, b + "attn_qkv", s.hidden);
+        expect(0, b + "ffn_gate_up", s.hidden);
+        for (int rank : { 0, 1 }) {
+            expect(rank, b + "attn_o.part", s.heads * hd / 2);
+            expect(rank, b + "ffn_down.part", s.ffn / 2);
+        }
+    }
+
+    auto convert = [&](const char* recipe, const std::string& out, std::string* log) {
+        const int st = tiny::run({ RAD_E2E_CONVERT, w.gemma4, "-o", out, "--recipe",
+                                   std::string(RAD_E2E_RECIPES "/") + recipe, "--set",
+                                   "quantization_config.quant_method=compressed-tensors",
+                                   "--kernels", "libref" },
+                                 engine_env({ "CALIB=" + grams }), log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(*log).c_str());
+        return st;
+    };
+    std::string rlog, glog;
+    REQUIRE_EQ(convert("gemma4-31b-dense-bf16-w4a8-df2.recipe", d / "rtn.rad", &rlog), 0);
+    REQUIRE_EQ(convert("gemma4-31b-dense-bf16-w4a8g-df2.recipe", d / "gptq.rad", &glog), 0);
+    /* Every trunk linear of every layer fitted to its Hessian, none rounded to nearest. */
+    size_t fitted = 0;
+    for (size_t at = glog.find("GPTQ quantises"); at != std::string::npos;
+         at = glog.find("GPTQ quantises", at + 1))
+        ++fitted;
+    CHECK_EQ(fitted, (size_t)(4 * s.layers));
+    CHECK(glog.find("rounding it to nearest") == std::string::npos);
+
+    std::string ref_log;
+    const std::string ref = w.reference(w.gemma4, w.corpus_short, &ref_log);
+    REQUIRE(!ref.empty());
+    auto kl = [&](const std::string& rad) {
+        tiny::TempDir o("e2e_g4calib_kld");
+        const Ran r = radiance(rad, { "--kld-ref", ref, "--kld-out", o / "kld.json",
+                                      "--max-num-batched-tokens", "512", "--max-num-seqs", "1" });
+        if (r.status != 0) fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+        const json rep = json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
+        return rep.is_object() && rep.contains("all") ? rep["all"]["kld"]["mean"].get<double>()
+                                                      : -1.0;
+    };
+    const double rtn = kl(d / "rtn.rad"), gptq = kl(d / "gptq.rad");
+    fprintf(stderr, "    mean KL against the bf16 model: round to nearest %.4g, GPTQ %.4g\n", rtn,
+            gptq);
+    REQUIRE(rtn > 0.0 && gptq > 0.0);
+    CHECK(gptq * 3.0 < rtn);
+}
+
 /* A container rad-convert made block fp8 (llama_dense_fp8): the fp8 activation quantisers and
  * GEMMs are per row too, so the invariants hold through them. */
 TEST(llama_fp8_container_chunking_and_batching_change_no_logit) {

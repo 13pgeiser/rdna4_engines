@@ -1,0 +1,44 @@
+# gemma4-31b-dense-bf16-w4a8g-df2.recipe -- Gemma 4 31B dense (text) from Google's bf16 checkpoint
+# at w4a8 with the trunk's int4 codes chosen by GPTQ, and RedHatAI's DFlash2 speculator: the
+# gemma4-31b-dense-bf16-w4a8-df2.recipe container (same grid, same kernels, same size) with the
+# rounding fitted to the bf16 model's own activations instead of to the nearest point.
+#
+#   CALIB=DIR rad-convert <gemma-4-31B-it> --draft-model <gemma-4-31B-it-speculator.dflash2> \
+#       --recipe data/recipes/gemma4-31b-dense-bf16-w4a8g-df2.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-31b-dense-w4a8g-df2-qkv.rad
+#
+# DIR holds the trunk's Hessians, recorded from the bf16 checkpoint by arch/gemma4's calibration
+# tap (RADIANCE_CALIB_DIR; its files carry this container's weight names): every layer's q|k|v and
+# gate|up input whole, and attn_o's and ffn_down's as one block a rank (`.part`), which libquant
+# places on the diagonal. The corpus is the GPTQ one in docs/GEMMA4-31B-GPTQ.md: Gemma 4's tool
+# calls among chat, code, math and reasoning, rendered with the model's own template.
+#
+# Why: round to nearest moves the 31B's distribution where a reply is most constrained. After an
+# argument string in a tool call, `sku:<|"|>MS-110`, the bf16 model closes the string (`<|"|>`, ~1.0)
+# and the round-to-nearest trunk prefers `**,` (58% against 41%), so a streamed call stalls.
+#
+# Everything else is the -df2 recipe's: the drafter, its head and the trunk's int8 lm_head.
+
+blk.*.attn_qkv.weight     gptq codes=i4 group=128 scale=f16 rule=search calib=$CALIB
+blk.*.attn_o.weight       gptq codes=i4 group=128 scale=f16 rule=search calib=$CALIB
+blk.*.ffn_down.weight     gptq codes=i4 group=128 scale=f16 rule=search calib=$CALIB
+blk.*.ffn_gate_up.weight  gptq codes=i4 group=128 scale=f16 rule=search calib=$CALIB
+
+output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+# The drafter's seven linears: block fp8, read at fp8a8 against an E4M3 activation, as the block
+# declares them (rad_fp8.h's DenseFP8). The convolution projections, the selector and the norms
+# stay bf16, as the block reads them.
+dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The draft head: the trunk's tied table under the block's own name, int8 with an f16 scale per
+# (row, 128 of K), which the block reads at w8a8 (rad_block_dflash2.h, head_i8). Not the 2-bit
+# grid the Qwen3.8 recipes use: the selector then ranks the candidates an 8-bit head proposes.
+# Drafts are verified, so this changes what is proposed, never what is accepted.
+dflash.draft_head.weight         rtn codes=i8 group=128 scale=f16 clamp=sym
