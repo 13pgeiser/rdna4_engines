@@ -568,6 +568,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ["attention_flash_q8_0_tile"]
     );
     add!(
+        "attention_flash_q8_0_tile_hd64",
+        kernels::ATTENTION_FLASH_Q8_0_TILE_HD64_SRC,
+        ["attention_flash_q8_0_tile_hd64"]
+    );
+    add!(
         "attention_flash_q8_0_reduce",
         kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
         ["attention_flash_q8_0_reduce"]

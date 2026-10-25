@@ -8627,6 +8627,13 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
 
+/// head_dim 64 twin of [`ATTENTION_FLASH_Q8_0_TILE_SRC`]
+/// (`attention_flash_q8_0_tile_hd64`): same ABI and partials, so it pairs with
+/// the shared `attention_flash_q8_0_reduce`. The reference tile only covers
+/// head_dim in multiples of 128.
+pub const ATTENTION_FLASH_Q8_0_TILE_HD64_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_hd64.hip");
+
 /// Flat-BF16 sibling of the Q8_0 flash tile. Same partials layout and same
 /// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
 /// unmodified — that reduce only ever touches f32 partials.

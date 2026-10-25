@@ -11737,6 +11737,13 @@ impl Gpu {
                 kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC,
                 func,
             )
+        } else if head_dim == 64 && !gemma_tiles {
+            // The reference tile covers head_dim in 128-wide halves only.
+            (
+                "attention_flash_q8_0_tile_hd64",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_HD64_SRC,
+                "attention_flash_q8_0_tile_hd64",
+            )
         } else if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
