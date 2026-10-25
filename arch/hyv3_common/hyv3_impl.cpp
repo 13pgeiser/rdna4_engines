@@ -234,7 +234,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mc.route_scale = meta_text_getf(meta, "router_scaling_factor", 2.826);
     mc.shared_ungated = 1;
     mc.shared_fp32_combine = 1;
-    mc.router_fuse = 0;
+    mc.router_fuse = 1;
     mc.rows = T < 2048 ? T : 2048;
     block_slice_128(m.n_ff_shared, g.world, g.rank, &mc.shared_lo, &mc.shared_hi);
     mc.n_ff_shared = mc.shared_hi - mc.shared_lo;
@@ -260,9 +260,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.mw.eff.declare_qs(b, nm, g, "moe_ffn", mc.n_ff_exp, S, !HYV3_FP8_SOURCE));
     m.mw.edn = decl_b(b, nm.f("moe_down"), RAD_BF16, {S, g.n_embd});
     m.mw.moe = decl_b(b, nm.f("moe_routed"), RAD_BF16, {T, g.n_embd});
-    m.mw.moe_f32 = decl_b(b, nm.f("moe_routed_f32"), RAD_F32, {T, g.n_embd});
-    m.mw.shared_f32 = decl_b(b, nm.f("moe_shared_f32"), RAD_F32, {T, g.n_embd});
-    m.mw.combined_f32 = decl_b(b, nm.f("moe_combined_f32"), RAD_F32, {T, g.n_embd});
     m.mw.sgu = decl_b(b, nm.f("shared_gate_up"), RAD_BF16, {T, 2 * mc.n_ff_shared});
     m.mw.sff.x = decl_b(b, nm.f("shared_ffn"), RAD_BF16, {T, mc.n_ff_shared});
     RAD_ARCH_TRY(m.mw.sff.declare_qs(b, nm, g, "shared_ffn", mc.n_ff_shared, 0,

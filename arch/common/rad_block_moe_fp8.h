@@ -282,9 +282,6 @@ struct MoeFP8 {
         rad_buf edn     = 0;   /* [rows * top_k, n_embd]       bf16, in sorted order */
         /* back in token order, and the shared expert, one row per token */
         rad_buf moe     = 0;   /* [max_tok, n_embd]           bf16; separate routed output if needed */
-        rad_buf moe_f32 = 0;   /* [max_tok, n_embd]           f32; shared_fp32_combine only */
-        rad_buf shared_f32 = 0;/* [max_tok, n_embd]           f32; shared_fp32_combine only */
-        rad_buf combined_f32 = 0; /* [max_tok, n_embd]        f32; shared_fp32_combine only */
         rad_buf sgu     = 0;   /* [max_tok, 2 * n_ff_shared]  bf16 */
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
@@ -426,7 +423,7 @@ struct MoeFP8 {
     mutable bool         calib_dne_failed = false;
     void calib_experts_pass(RadCtx* c_, int64_t slots) const;
     rad_op op_sgate = 0;
-    rad_op op_moe_to_f32 = 0, op_shared_to_f32 = 0, op_combine_f32 = 0, op_combined_to_bf16 = 0;
+    rad_op op_combine = 0; /* BF16 inputs, FP32 addition, one BF16 rounding */
     rad_op op_moe_ar = 0, op_shared_ar = 0;
     rad_op op_ar = 0, op_add = 0;
     bool   ar_out = false;
@@ -631,10 +628,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                          src.shared)) return RAD_E_INVAL;
     const bool shared = c.n_ff_shared > 0 && (src.shared || src.shared_mlp_gate);
     if (shared && c.shared_ungated && src.shared_gate) return RAD_E_INVAL;
-    if (c.shared_fp32_combine && (!shared || !w.moe || !w.moe_f32 || !w.shared_f32 ||
-                                  !w.combined_f32)) {
+    if (c.shared_fp32_combine && (!shared || !w.moe || std::strcmp(g.dtype, "bf16"))) {
         fprintf(stderr, "radiance: layer %d requests an FP32 shared/routed combine without its "
-                        "shared arm and scratch buffers\n", l);
+                        "BF16 shared arm and routed output\n", l);
         return RAD_E_INVAL;
     }
     /* Whether `w.sgate` is excluded from buffer sharing; set with the shared arm and required by
@@ -1416,22 +1412,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
 
     if (separate_fp32_combine) {
-        const auto cast = [&](const char* from, const char* to) {
-            return RAD_OP(b, "cast",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                     RAD_STR("from", from), RAD_STR("to", to)),
-                          RAD_NOWEIGHTS);
-        };
-        op_moe_to_f32 = rw(b, cast("bf16", "f32"), {w.moe}, {w.moe_f32});
-        op_shared_to_f32 = rw(b, cast("bf16", "f32"), {w.sout}, {w.shared_f32});
-        op_combine_f32 = rw(b, RAD_OP(b, "add",
-                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                          RAD_STR("dtype", "f32")),
-                               RAD_NOWEIGHTS),
-                           {w.moe_f32, w.shared_f32}, {w.combined_f32});
-        op_combined_to_bf16 = rw(b, cast("f32", "bf16"), {w.combined_f32}, {w.h.x});
-        if (!op_moe_to_f32 || !op_shared_to_f32 || !op_combine_f32 || !op_combined_to_bf16)
-            return RAD_E_INVAL;
+        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: exactly the
+         * former cast + cast + F32 add + cast chain. Keep the routed gather's BF16 rounding
+         * and the separate TP reductions; folding the shared arm into the gather is different. */
+        op_combine = rw(b, RAD_OP(b, "add",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                      RAD_STR("dtype", "bf16")),
+                           RAD_NOWEIGHTS),
+                       {w.moe, w.sout}, {w.h.x});
+        if (!op_combine) return RAD_E_INVAL;
     }
 
     /* ---- The router GEMM and `router_topk_scatter` as one op, plus the shared gate when the
@@ -1806,21 +1795,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (op_shared_ar)
         RAD_ISSUE_N(c_, op_shared_ar, rows * g.n_embd,
                     brow_slice(w.sout, r0, rows, g.n_embd), RAD_NONE);
-    if (c.shared_fp32_combine) {
-        RAD_ISSUE_N(c_, op_moe_to_f32, rows,
-                    brow_slice(w.moe, r0, rows, g.n_embd),
-                    brow_slice(w.moe_f32, r0, rows, g.n_embd));
-        RAD_ISSUE_N(c_, op_shared_to_f32, rows,
+    if (op_combine)
+        RAD_ISSUE_N(c_, op_combine, rows, brow_slice(w.moe, r0, rows, g.n_embd),
                     brow_slice(w.sout, r0, rows, g.n_embd),
-                    brow_slice(w.shared_f32, r0, rows, g.n_embd));
-        RAD_ISSUE_N(c_, op_combine_f32, rows,
-                    brow_slice(w.moe_f32, r0, rows, g.n_embd),
-                    brow_slice(w.shared_f32, r0, rows, g.n_embd),
-                    brow_slice(w.combined_f32, r0, rows, g.n_embd));
-        RAD_ISSUE_N(c_, op_combined_to_bf16, rows,
-                    brow_slice(w.combined_f32, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd));
-    }
 
     /* A write that takes the all-reduce does it once for the whole step, deciding on T, so this
      * pass must ask with T, not its own rows. */

@@ -729,8 +729,13 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
     CHECK(gather != nullptr);
     CHECK_EQ(gather->writes.size(), 1u);
     CHECK_EQ(gather->writes[0], moe.w.moe);
-    CHECK(moe.op_moe_to_f32 && moe.op_shared_to_f32 && moe.op_combine_f32 &&
-          moe.op_combined_to_bf16);
+    REQUIRE(moe.op_combine);
+    const RecOp* combine = b.op_of(moe.op_combine);
+    REQUIRE(combine);
+    CHECK_EQ(combine->op, std::string("add"));
+    CHECK_EQ(std::string(pstr(combine, "dtype")), std::string("bf16"));
+    CHECK(combine->reads == (std::vector<rad_buf>{moe.w.moe, moe.w.sout}));
+    CHECK(combine->writes == (std::vector<rad_buf>{moe.w.h.x}));
 
     RadBatch batch = decode_batch();
     RadCtx run{}; run.b = &b; run.batch = &batch;
@@ -740,11 +745,12 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
             if (run.issues[i].op == h) return (int)i;
         return -1;
     };
-    const int gather_i = issue_of(moe.op_gather), routed_i = issue_of(moe.op_moe_to_f32);
-    const int shared_i = issue_of(moe.op_shared_to_f32), add_i = issue_of(moe.op_combine_f32);
-    const int cast_i = issue_of(moe.op_combined_to_bf16);
-    CHECK(gather_i >= 0 && routed_i >= 0 && shared_i >= 0 && add_i >= 0 && cast_i >= 0);
-    CHECK(gather_i < routed_i && routed_i < add_i && shared_i < add_i && add_i < cast_i);
+    const int gather_i = issue_of(moe.op_gather), add_i = issue_of(moe.op_combine);
+    CHECK(gather_i >= 0 && add_i >= 0 && gather_i < add_i);
+    REQUIRE(moe.op_sigmoid_scatter);
+    CHECK(issue_of(moe.op_sigmoid_scatter) >= 0);
+    CHECK_EQ(issue_of(moe.op_scatter), -1);
+    CHECK_EQ(issue_of(moe.op_topk), -1);
     const auto lint = lint_step(b, {&run});
     CHECK(lint.empty());
 }
@@ -778,9 +784,8 @@ TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
             return -1;
         };
         CHECK(issue_of(moe.op_gather) < issue_of(moe.op_moe_ar));
-        CHECK(issue_of(moe.op_moe_ar) < issue_of(moe.op_moe_to_f32));
-        CHECK(issue_of(moe.op_shared_ar) < issue_of(moe.op_shared_to_f32));
-        CHECK(issue_of(moe.op_combine_f32) < issue_of(moe.op_combined_to_bf16));
+        CHECK(issue_of(moe.op_moe_ar) < issue_of(moe.op_combine));
+        CHECK(issue_of(moe.op_shared_ar) < issue_of(moe.op_combine));
         CHECK(lint_step(b, {&run}).empty());
     }
 }

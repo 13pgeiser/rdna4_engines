@@ -1298,6 +1298,29 @@ TEST(op_add_mul) {
     CHECK_EQ(y.at(3), 204.0f);
 }
 
+/* HYV3's two already-rounded arms must be added in FP32, then narrowed once. BF16 add is
+ * exactly that, without materialising three FP32 scratch planes. Exercise every BF16 bit pattern,
+ * including subnormals, ties, signed zero and nonfinite values, against the former cast chain. */
+TEST(bf16_add_matches_explicit_fp32_combine) {
+    constexpr int64_t M = 32, N = 2048;
+    T routed(RAD_BF16, {M, N}), shared(RAD_BF16, {M, N});
+    T rf(RAD_F32, {M, N}), sf(RAD_F32, {M, N}), sum(RAD_F32, {M, N});
+    T chain(RAD_BF16, {M, N}), folded(RAD_BF16, {M, N});
+    for (uint32_t i = 0; i < M * N; ++i) {
+        const uint16_t r = (uint16_t)i, s = (uint16_t)(i * 40503u + 73u);
+        std::memcpy(routed.mem.data() + i * 2, &r, 2);
+        std::memcpy(shared.mem.data() + i * 2, &s, 2);
+    }
+    A r; r.t(routed).t(rf).i("M", M).i("n", N).s("from", "bf16").s("to", "f32");
+    A s; s.t(shared).t(sf).i("M", M).i("n", N).s("from", "bf16").s("to", "f32");
+    A a; a.t(rf).t(sf).t(sum).i("M", M).i("n", N).s("dtype", "f32");
+    A c; c.t(sum).t(chain).i("M", M).i("n", N).s("from", "f32").s("to", "bf16");
+    A f; f.t(routed).t(shared).t(folded).i("M", M).i("n", N).s("dtype", "bf16");
+    CHECK_OK(run("cast", r)); CHECK_OK(run("cast", s));
+    CHECK_OK(run("add", a)); CHECK_OK(run("cast", c)); CHECK_OK(run("add", f));
+    CHECK_EQ(std::memcmp(chain.mem.data(), folded.mem.data(), M * N * 2), 0);
+}
+
 /* add's `div` divides the sum after its rounding to y's dtype: 1 + 0.01953125 rounds to bf16
  * 1.015625 (a tie, to even), and 1.015625 / 3 to 0.337890625; the unrounded sum's third would be
  * 0.33984375. In f32 the quotient is f32(4 / 3). */
