@@ -7638,7 +7638,7 @@ int qwen35_fp8_int4_declare(RadBuilder* b, const RadModelMeta* m, const RadBuild
 }  /* namespace */
 
 /* An int4 container's linears are read by the 4-bit GEMMs over their input's bf16 plane: at or
- * below 64 rows a `cast` to f16 and w4a16_asym, above that quant_act_i8g's int8 codes and
+ * below 64 rows w4a16_asym narrows that plane on load, above that quant_act_i8g's int8 codes and
  * w4a8i8_asym, both over the codes and the joined (scale, zero) view. No linear keeps an fp8a8
  * GEMM, and the gated fold (an fp8a8 tile) is not declared over a 4-bit gate_up. */
 TEST(qwen35_fp8_reads_an_int4_container_with_the_4bit_gemms) {
@@ -7666,18 +7666,13 @@ TEST(qwen35_fp8_reads_an_int4_container_with_the_4bit_gemms) {
         CHECK_EQ(pint(&o, "group"), 128);
     }
     /* q|gate, k, v, o for 2 attention layers; qkv|z and out for 6 delta-net layers; gate_up and
-     * down for 8 feed-forwards: 36 linears, each with both GEMMs, a cast and a quantiser. */
+     * down for 8 feed-forwards: 36 linears, each with both GEMMs and a quantiser. The decode GEMM
+     * consumes bf16 directly. */
     CHECK_EQ(f16, 36);
     CHECK_EQ(i8, 36);
     CHECK_EQ(other, 0);
-    int casts = 0;
     for (const auto& o : b.ops)
-        if (o.op == "cast" && pstr(&o, "to") == "f16") {
-            ++casts;
-            CHECK_EQ(pstr(&o, "from"), std::string("bf16"));
-            CHECK_EQ(param(&o, "M")->ihi, 64LL);
-        }
-    CHECK_EQ(casts, 36);
+        CHECK(o.op != "cast" || pstr(&o, "to") != "f16");
     CHECK_EQ(count_op(b, "quant_act_i8g"), 36);
     CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 0);
     int joined = 0;

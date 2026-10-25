@@ -7671,8 +7671,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "skinny GEMM with a 4-bit ASYMMETRIC weight (z-lab's ParoQuant int4), the 5-bit row's kernel with "
   "no fifth-bit plane; rows past 64 in chunks of 64, a partitioned weight (pb1/pb2) one launch a part",
   "N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order, unsigned nibbles",
-  "f16 A (parts side by side), 4-bit W with an f16 scale and integer zero per 128 K, bf16 C, fp32 "
-  "accumulate",
+  "f16 or bf16 A (parts side by side; bf16 is narrowed on load as cast_bf16_f16 does), 4-bit W "
+  "with an f16 scale and integer zero per 128 K, bf16 C, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtW4Asym), ROW(tGemmSkinny), r4d_tune_valid_gemm,
   nullptr, nullptr, r4d_rad_gemm_w4a16asym_m64, nullptr, r4d_rad_layout_w4, r4d_rad_relayout_w4,

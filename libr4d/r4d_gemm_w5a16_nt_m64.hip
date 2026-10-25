@@ -47,11 +47,17 @@ typedef __attribute__((address_space(1))) const uint4v*          r4d_gw4;
 typedef __attribute__((address_space(1))) const unsigned long long* r4d_gu2;
 typedef __attribute__((address_space(1))) const unsigned*        r4d_gu1;
 
-__device__ __forceinline__ v8h fragA(r4d_gu2 p, int u) {
-  union { unsigned long long w[2]; v8h f; } x;
+__device__ __forceinline__ v8h fragA(r4d_gu2 p, int u, int bf) {
+  union { unsigned long long w[2]; uint16_t h[8]; v8h f; } x;
   x.w[0] = p[4 * u];
   x.w[1] = p[4 * u + 2];
-  return x.f;
+  if (!bf) return x.f;
+  // Same narrowing as narrow_f16_kernel: bf16 -> f32 -> f16, nearest even.
+  v8h f;
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    f[i] = (_Float16)__builtin_bit_cast(float, (uint32_t)x.h[i] << 16);
+  return f;
 }
 
 // Do not fold the group scale into the B fragment; see r4d_gemm_w4a16_nt_m64.hip.
@@ -87,7 +93,8 @@ template <int MT, int NPW, bool NT, bool HI, bool ONE = false>
 __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned* __restrict__ Wq,
     const unsigned* __restrict__ Whi, const unsigned* __restrict__ Wsz,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int lda, int ldc) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int lda, int ldc,
+    int bf) {
   extern __shared__ float red[];        // WV*NPW*SK*256 floats: a 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -165,7 +172,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
           const int u = b * 4 + s;
           v8h afrag[MT];
 #pragma unroll
-          for (int i = 0; i < MT; i++) afrag[i] = fragA(pa[i], u);   // loaded once, spent NPW times
+          for (int i = 0; i < MT; i++) afrag[i] = fragA(pa[i], u, bf);   // loaded once, spent NPW times
 #pragma unroll
           for (int j = 0; j < NPW; j++) {
             const v8h bfrag = dequant5(wv[j][s], (hv[j] >> (8 * s)) & 0xFFu, nz[j]);
@@ -245,7 +252,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
 
 void r4d_gemm_w5a16_nt_m64(long a, long wq, long whi, long wsz, long c, int M, int K, int N,
                            int WV, int SK, int MB, int NPW, int NT, long stream, int lda, int ldc,
-                           bool hi5) {
+                           bool hi5, bool bf) {
   if (!lda) lda = K;
   if (!ldc) ldc = N;
   if (M < 1 || M > R4D_GEMM_W4_MAX_M)
@@ -273,14 +280,14 @@ void r4d_gemm_w5a16_nt_m64(long a, long wq, long whi, long wsz, long c, int M, i
   hipStream_t st = (hipStream_t)stream;
 #define LAUNCH(MT, NP, TT) do { \
     if (hi5) hipLaunchKernelGGL((r4d_gemm_w5a16_nt_m64_kernel<MT, NP, TT, true>), grid, block, smem, \
-                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc); \
+                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc, bf); \
     else     hipLaunchKernelGGL((r4d_gemm_w5a16_nt_m64_kernel<MT, NP, TT, false>), grid, block, smem, \
-                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc); } while (0)
+                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc, bf); } while (0)
 #define LAUNCH_ONE(NP, TT) do { \
     if (hi5) hipLaunchKernelGGL((r4d_gemm_w5a16_nt_m64_kernel<1, NP, TT, true, true>), grid, block, smem, \
-                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc); \
+                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc, bf); \
     else     hipLaunchKernelGGL((r4d_gemm_w5a16_nt_m64_kernel<1, NP, TT, false, true>), grid, block, smem, \
-                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc); } while (0)
+                                st, Ap, Wp, Hp, Sp, Cp, M, K, N, WV, SK, lda, ldc, bf); } while (0)
 #define LAUNCH_MB(NP, TT) switch (MB) { \
     case 1: if (one) { LAUNCH_ONE(NP, TT); } else { LAUNCH(1, NP, TT); } break; \
     case 2: LAUNCH(2, NP, TT); break; \
@@ -310,8 +317,9 @@ static int w5_dispatch(const RadArgs* a, RadStream s, bool hi5) {
     int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N % 16) return R4D_NO(RAD_E_SHAPE);
-    /* Any other activation dtype would read plausible but wrong numbers. */
-    if (g.a->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
+    /* BF16 is narrowed on load with the cast kernel's rounding, so a separate cast is not required. */
+    const bool bf = g.a->dtype == RAD_BF16;
+    if (g.a->dtype != RAD_F16 && !bf) return R4D_NO(RAD_E_DTYPE);
     MxParts mp;
     rc = mx_parts(a, &g, &mp);
     if (rc != RAD_OK) return rc;
@@ -342,7 +350,7 @@ static int w5_dispatch(const RadArgs* a, RadStream s, bool hi5) {
                     r4d_addr(g.bscale) + (n0 / 16) * nsz * 16 * 4,
                     r4d_addr(g.y) + (m0 * Ntot + n0) * 2,
                     (int)mm, (int)K, (int)np, c.wv, c.sk, c.mb, c.npw, c.nt, (long)(uintptr_t)s,
-                    (int)lda, (int)Ntot, hi5));
+                    (int)lda, (int)Ntot, hi5, bf));
         }
     }
     return RAD_OK;

@@ -4496,11 +4496,12 @@ static void dflash_conv_numeric(const Plugin& pl, int64_t nt, int64_t H, int64_t
 /* The skinny bf16 GEMM against a host reference at a given K. K is the dimension this kernel
  * decomposes along (pick_sk splits it, rowGo strides rows by it, the unrolled fragment loop walks
  * it), so it is a parameter. The weight is plain row-major [N, K]: the row has no layout hook. */
-static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K) {
+static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
+                               int tuned_sk = 0) {
     if (!sel(row)) return;
     char nm[128];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld", row,
-                  (long long)M, (long long)N, (long long)K);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld sk=%d", row,
+                  (long long)M, (long long)N, (long long)K, tuned_sk);
     const RadKernelInfo* r = find(pl, row);
     if (!r) { ok(nm, false, "row absent"); return; }
 
@@ -4527,6 +4528,7 @@ static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int6
     st_memcpy(ts[1].data, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
 
     std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
+    if (tuned_sk > 0) ps.push_back(PI("sk", tuned_sk));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
@@ -5187,21 +5189,90 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
 }
 
 
-/* The 5-bit skinny GEMM (ParoQuant's int5) and its 4-bit sibling w4a16_asym against the planes'
- * meaning: u5 or u4 codes (a bit stream along K), an f16 scale and a zero point per 128 of K (of
- * dtype `zdt`), an f16 activation, the weight stored through the row's hooks. `pb1`/`pb2` give a
- * partitioned weight. M past 64 runs the dispatcher's 64-row chunks. */
+/* The decode graph no longer casts before this GEMM. A bf16 activation, narrowed on load, must
+ * match cast_bf16_f16 followed by the f16 kernel, including the one-row epilogue. */
+static void w4_bf16_activation_matches_cast(const Plugin& pl, int64_t N = 48, int64_t K = 256,
+                                             bool edge_bits = false) {
+    const char* what = "gemm_w4a16_asym bf16 activation matches the cast then the f16 GEMM";
+    const RadKernelInfo* gemm = find(pl, "gemm_w4a16_asym_nt_m64");
+    const RadKernelInfo* cast = find(pl, "cast_bf16_f16");
+    if (!gemm || !cast) { ok(what, false, "row absent"); return; }
+    const Planes p = asym_planes(4, N, K, RAD_U8);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "w4a16_asym") };
+    std::vector<uint8_t> wq, ws;
+    if (stored(gemm, lp, 2, p, { "codes" }, &wq) != RAD_OK ||
+        stored(gemm, lp, 3, p, { "scale", "zero" }, &ws) != RAD_OK) {
+        ok(what, false, "relayout failed"); return;
+    }
+    std::vector<uint16_t> hb((size_t)(17 * K));
+    for (size_t i = 0; i < hb.size(); ++i) {
+        const uint32_t h = st_mix32((uint32_t)i);
+        hb[i] = edge_bits ? (uint16_t)h : h_to_bf16((float)((int)(h % 65537) - 32768) / 4096.f);
+    }
+    void* d_b = dalloc(hb.size() * 2);
+    void* d_f = dalloc(hb.size() * 2);
+    void* d_w = dalloc(wq.size());
+    void* d_s = dalloc(ws.size());
+    void* d_y0 = dalloc((size_t)(17 * N * 2));
+    void* d_y1 = dalloc((size_t)(17 * N * 2));
+    if (!d_b || !d_f || !d_w || !d_s || !d_y0 || !d_y1) { ok(what, false, "hipMalloc failed"); return; }
+    st_memcpy(d_b, hb.data(), hb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    for (const int64_t M : { (int64_t)1, (int64_t)17 }) {
+        std::vector<RadTensor> ct = { T(d_b, RAD_BF16, { M, K }), T(d_f, RAD_F16, { M, K }) };
+        std::vector<RadParam> cp = { PI("M", M), PI("n", K), PS("from", "bf16"), PS("to", "f16") };
+        RadArgs ca{};
+        ca.t = ct.data(); ca.n_t = 2; ca.p = cp.data(); ca.n_p = 4; ca.world_size = 1;
+        auto gemm_launch = [&](void* a, uint32_t dt, void* y) {
+            std::vector<RadTensor> ts = {
+                T(a, dt, { M, K }), T(nullptr, RAD_F32, { 1 }), T(d_w, RAD_U8, { (int64_t)wq.size() }),
+                T(d_s, RAD_U8, { (int64_t)ws.size() }), T(y, RAD_BF16, { M, N }),
+                T(nullptr, RAD_F32, { 1 }), T(nullptr, RAD_F32, { 1 }) };
+            absent(ts[1]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                         PS("dtype", "w4a16_asym") };
+            RadArgs ga{};
+            ga.t = ts.data(); ga.n_t = (int)ts.size(); ga.p = ps.data(); ga.n_p = (int)ps.size();
+            ga.world_size = 1;
+            return gemm->launch(&ga, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+        };
+        const bool ran = cast->launch(&ca, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess &&
+                         gemm_launch(d_f, RAD_F16, d_y0) && gemm_launch(d_b, RAD_BF16, d_y1);
+        std::vector<uint16_t> y0((size_t)(M * N)), y1(y0.size());
+        if (ran) {
+            st_memcpy(y0.data(), d_y0, y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y1, y1.size() * 2, hipMemcpyDeviceToHost);
+        }
+        // Random raw BF16 bits often make every output NaN. The finite dataset must exercise
+        // actual arithmetic as well, so an all-NaN (or all-zero) comparison cannot pass it.
+        const bool finite = std::all_of(y0.begin(), y0.end(),
+                                        [](uint16_t v) { return std::isfinite(h_bf16(v)); });
+        const bool nonzero = std::any_of(y0.begin(), y0.end(),
+                                         [](uint16_t v) { return (v & 0x7fff) != 0; });
+        const std::string at = " M=" + std::to_string(M) + " N=" + std::to_string(N) +
+                               " K=" + std::to_string(K) + (edge_bits ? " raw bits" : " finite");
+        ok((std::string(what) + at).c_str(),
+           ran && y0 == y1 && (edge_bits || (finite && nonzero)),
+           !ran ? "launch failed" : !edge_bits && (!finite || !nonzero)
+                  ? "finite oracle was nonfinite or all zero" : "output bytes differ");
+        if (!ran) return;
+    }
+}
+
+/* The asymmetric W4/W5 skinny GEMMs against the canonical codes/scales/zeros, including
+ * partitioned weights and the dispatcher's 64-row chunks. */
 static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
                           int64_t pb2 = 0, int bits = 5, uint32_t zdt = RAD_U8,
-                          bool one_row_exact = false) {
+                          bool one_row_exact = false, int tuned_sk = 0) {
     const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
     const char* dtype = bits == 5 ? "w5a16" : "w4a16_asym";
     if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s", row,
-                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt));
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s sk=%d", row,
+                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt), tuned_sk);
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
@@ -5245,6 +5316,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
                                  PS("dtype", dtype) };
     if (pb1) ps.push_back(PI("pb1", pb1));
     if (pb2) ps.push_back(PI("pb2", pb2));
+    if (tuned_sk > 0) ps.push_back(PI("sk", tuned_sk));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
@@ -5323,7 +5395,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
  * A measurement, not a correctness check. The weight is replicated past the last-level cache
  * and walked in turn, as in perf_row, so the printed GB/s is the weight stream's. */
 static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K,
-                       int min_iters = 12) {
+                       int min_iters = 12, uint32_t adt = RAD_F16) {
     const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
     const RadKernelInfo* r = find(pl, row);
     if (!r) { std::printf("row absent\n"); return; }
@@ -5352,14 +5424,14 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
     if (!d_w || !d_s || !d_a || !d_y) { std::printf("hipMalloc failed\n"); return; }
     std::vector<uint16_t> ha((size_t)(M * K));
     for (size_t i = 0; i < ha.size(); ++i)
-        rad_store_f32(ha.data(), RAD_F16, (int64_t)i, 0.003f * (float)((int)(i % 97) - 48));
+        rad_store_f32(ha.data(), adt, (int64_t)i, 0.003f * (float)((int)(i % 97) - 48));
     st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
     for (size_t c = 0; c < copies; ++c) {
         st_memcpy((uint8_t*)d_w + c * wq.size(), wq.data(), wq.size(), hipMemcpyHostToDevice);
         st_memcpy((uint8_t*)d_s + c * ws.size(), ws.data(), ws.size(), hipMemcpyHostToDevice);
     }
-    std::printf("%s M=%lld N=%lld K=%lld  (weight %.1f MiB)\n", row, (long long)M, (long long)N,
-                (long long)K, wq.size() / 1048576.0);
+    std::printf("%s M=%lld N=%lld K=%lld A=%s (weight %.1f MiB)\n", row, (long long)M, (long long)N,
+                (long long)K, rad_dtype_name(adt), wq.size() / 1048576.0);
     struct Cfg { int wv, sk, mb, npw, nt; };
     std::vector<Cfg> cfgs;
     for (int sk : { 0, 1, 2, 4, 5, 8 })
@@ -5370,7 +5442,7 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
     Cfg bc{};
     for (const Cfg& c : cfgs) {
         std::vector<RadTensor> ts = {
-            T(d_a, RAD_F16, { M, K }), T(nullptr, RAD_F32, { 1 }), T(d_w, RAD_U8, { (int64_t)wq.size() }),
+            T(d_a, adt, { M, K }), T(nullptr, RAD_F32, { 1 }), T(d_w, RAD_U8, { (int64_t)wq.size() }),
             T(d_s, RAD_U8, { (int64_t)ws.size() }), T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }),
             T(nullptr, RAD_F32, { 1 }) };
         absent(ts[1]); absent(ts[5]); absent(ts[6]);
@@ -6175,6 +6247,53 @@ static void i8a8h_rot(const Plugin& pl, const char* row, int64_t M, int64_t N, i
        ", crossed " + std::to_string(e_cross));
 }
 
+
+/* Single-row reduction vs the unchanged padded-row epilogue. MB=2 forces the latter without
+ * changing a split or a WMMA. Check ragged columns, narrow projections and HYV3's shared MLP. */
+static void bf16_one_row_identity(const Plugin& pl, int64_t N, int64_t K) {
+    const RadKernelInfo* r = find(pl, "gemm_bf16_nt_m64");
+    if (!r) { ok("bf16 one-row bytes", false, "row absent"); return; }
+    std::vector<uint16_t> ha((size_t)K), hw((size_t)(N * K));
+    for (size_t i = 0; i < ha.size(); ++i)
+        ha[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 401) - 200) * 0.01f);
+    for (size_t i = 0; i < hw.size(); ++i)
+        hw[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i ^ 137u) % 199) - 99) * 0.01f);
+    void* d_a = dalloc(ha.size() * 2);
+    void* d_w = dalloc(hw.size() * 2);
+    void* d_y = dalloc((size_t)(N + 16) * 2);
+    if (!d_a || !d_w || !d_y) { ok("bf16 one-row bytes", false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { 1, K }), T(d_w, RAD_BF16, { N, K }),
+                                  T(d_y, RAD_BF16, { 1, N }) };
+    std::vector<uint16_t> compact((size_t)(N + 16)), padded(compact.size());
+    for (int wv : { 1, 2, 4 })
+        for (int sk : { 1, 2, 3, 4, 8, 16, 32 }) {
+            if (K % (sk * 16) || wv * sk > 32) continue;
+            std::vector<RadParam> ps = { PI("M", 1), PI("N", N), PI("K", K), PS("dtype", "bf16"),
+                                         PI("wv", wv), PI("sk", sk), PI("mb", 1) };
+            RadArgs a{};
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            bool ran = true;
+            for (int pass = 0; pass < 2; ++pass) {
+                ps.back() = PI("mb", pass + 1);
+                auto& out = pass ? padded : compact;
+                if (st_memset(d_y, 0xa5, out.size() * 2) != hipSuccess ||
+                    r->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess ||
+                    st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+                    ran = false; break;
+                }
+            }
+            const bool guard = std::all_of(compact.end() - 16, compact.end(),
+                                           [](uint16_t v) { return v == 0xa5a5; });
+            const std::string at = " N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                                   " wv=" + std::to_string(wv) + " sk=" + std::to_string(sk);
+            ok(("bf16 one-row bytes" + at).c_str(), ran && guard && compact == padded,
+               !ran ? "launch/copy failed" : !guard ? "output guard overwritten" : "bytes differ");
+            if (!ran) return;
+        }
+}
 
 /* The tiled bf16 GEMM against the skinny one, byte for byte, at every tile variant. An op over
  * M 1..max_tok is served by the skinny row at M <= 64 and the tiled one above, so they must agree
@@ -18930,8 +19049,10 @@ static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int ite
     if (!r) { std::printf("--perfbf16: row absent\n"); return; }
 
     const size_t wbytes = (size_t)N * (size_t)K * 2;
-    int copies = (int)(((size_t)768 << 20) / wbytes) + 1;
-    if (copies > 16) copies = 16;
+    // Even a small shared MLP must walk more than the last-level cache. A 16-copy cap
+    // would keep HYV3's 3 MiB down projection warm and overstate its decode bandwidth.
+    const int copies = (int)std::max<size_t>(2, ((size_t)256 << 20) / wbytes + 1);
+    iters = std::max(iters, copies * 2);
 
     void* d_w = dalloc(wbytes * (size_t)copies);
     void* d_a = dalloc((size_t)M * K * 2);
@@ -30650,6 +30771,15 @@ static void device_phase(const Plugin& pl) {
          * zero plane: five groups a row (a pad nibble ends each zero row), then decode and verify
          * rows at the 27B's shapes. */
         // HYV3 decode geometries, plus column tails and two/three partitioned activation copies.
+        w4_bf16_activation_matches_cast(pl);
+        w4_bf16_activation_matches_cast(pl, 48, 256, true);
+        w4_bf16_activation_matches_cast(pl, 4096, 2048);
+        w4_bf16_activation_matches_cast(pl, 2048, 4096);
+        // Cold-sweep candidates at the actual decode row and the selected band's upper edge.
+        for (int64_t m : { 1, 8 }) {
+            w5a16_numeric(pl, m, 4096, 2048, 0, 0, 4, RAD_U8, false, 4);
+            w5a16_numeric(pl, m, 2048, 4096, 0, 0, 4, RAD_U8, false, 8);
+        }
         for (const auto& nk : { std::pair<int64_t, int64_t>{4096, 2048}, {512, 2048},
                                {2048, 4096}, {13824, 2048}, {2048, 6912}, {48, 640} })
             w5a16_numeric(pl, 1, nk.first, nk.second, 0, 0, 4, RAD_U8, true);
@@ -30837,6 +30967,13 @@ static void device_phase(const Plugin& pl) {
             bf16_gemm_numeric(pl, row, 16, 5120, 25600);
         }
         bf16_gemm_numeric(pl, "gemm_bf16_nt_m64", 64, 5120, 25600);
+        for (int64_t m : { 1, 16 })
+            bf16_gemm_numeric(pl, "gemm_bf16_nt_m64", m, 1536, 2048, 8);
+        for (const auto& nk : { std::pair<int64_t, int64_t>{1536, 2048}, {2048, 768},
+                                {48, 5120}, {129, 256}, {1, 16}, {16, 16} }) {
+            bf16_one_row_identity(pl, nk.first, nk.second);
+            bf16_gemm_numeric(pl, "gemm_bf16_nt_m64", 1, nk.first, nk.second);
+        }
     }
     if (sel("gemm_bf16_nt_tiled")) {
         if (!g_case) std::printf("\nthe tiled bf16 GEMM, against the skinny one\n");
@@ -31039,6 +31176,7 @@ static void usage(void) {
                 "  --perfq N K M [iters]:  the block-quantised trunk rows GLM resolves to: E4M3 with\n"
                 "             F32 block scales and the three OCP-MXFP4 rows, GB/s on weight + scales.\n"
                 "  --perfw4 N K M [iters]:  a tuning sweep of the asymmetric W4 x F16 GEMM;\n"
+                "  --perfw4bf16: the same sweep with BF16 inputs narrowed inside the GEMM.\n"
                 "             M <= 64, N 16-aligned, K 128-aligned. Measurement only, cold weights.\n"
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
@@ -31258,9 +31396,9 @@ int main(int argc, char** argv) {
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfw4")) {
+        } else if (!std::strcmp(argv[i], "--perfw4") || !std::strcmp(argv[i], "--perfw4bf16")) {
             if (i + 3 >= argc) { usage(); return 2; }
-            perf_w4 = 1;
+            perf_w4 = !std::strcmp(argv[i], "--perfw4bf16") ? 2 : 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
@@ -31681,7 +31819,8 @@ int main(int argc, char** argv) {
         else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
         else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
-        else if (perf_w4) w5a16_perf(pl, 4, perf_m, perf_n, perf_k, perf_it);
+        else if (perf_w4) w5a16_perf(pl, 4, perf_m, perf_n, perf_k, perf_it,
+                                    perf_w4 == 2 ? RAD_BF16 : RAD_F16);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w2) w2_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else         fp8_perf(pl, perf_n, perf_k, perf_m, perf_it);

@@ -748,8 +748,8 @@ struct LinearFP8 {
      * gemm_nt_q at w5a16 over u5 codes with an f16 scale and a zero point. */
     bool       paro5 = false;
     /* A 4-bit weight with a zero point and no rotation (linear_is_w4): the int4 W4A16 releases.
-     * At or below `w4_split` rows `op_a16` casts the input's bf16 plane to f16 (`a16`) for the
-     * w4a16_asym GEMM `op`; above it `op_q` quantises it to int8 with a scale per (row, 128)
+     * At or below `w4_split` rows the w4a16_asym GEMM `op` reads the input's bf16 plane and
+     * narrows it on load; above it `op_q` quantises it to int8 with a scale per (row, 128)
      * (`a8q`, `a8s`) for the w4a8i8_asym GEMM `op2`. */
     bool       w4 = false;
     int64_t    w4_split = 0;
@@ -1289,7 +1289,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
 
     /* ---- 4-bit weight with a zero point and no rotation: the rotated int4's two GEMMs over this
      * linear's own copies of the input's bf16 plane. At or below kSplit rows (the skinny f16
-     * kernel's ceiling) the plane is cast to f16 for w4a16_asym; above it, where that kernel is
+     * kernel's ceiling) the GEMM reads the bf16 plane and narrows it on load; above it, where that kernel is
      * bound by the f16 matrix instruction, it is quantised to int8 with an f32 scale per
      * (row, 128) for w4a8i8_asym. Two views: codes, and (scale, zero) as `b_scale`, both at the
      * logical extents, so row parts and spans apply to both as they are; a column slice must be
@@ -1331,15 +1331,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
         const int64_t kSplit = 64;
         const int64_t f16_hi = hi > kSplit ? kSplit : hi;
-        a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { f16_hi, K });
-        if (!a16) return RAD_E_INVAL;
-        op_a16 = rw(b, RAD_OP(b, "cast",
-                       RAD_PARAMS(RAD_RANGE("M", 1, f16_hi), RAD_INT("n", K),
-                                  RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
-                       RAD_NOWEIGHTS),
-                    { a.x }, { a16 });
-        op = decl_gemm_q(b, 1, f16_hi, RAD_FP8_BLOCK, "w4a16_asym", 0, 0, { w, ws }, { a16 }, y);
-        if (!op_a16 || !op) return RAD_E_INVAL;
+        op = decl_gemm_q(b, 1, f16_hi, RAD_FP8_BLOCK, "w4a16_asym", 0, 0, { w, ws }, { a.x }, y);
+        if (!op) return RAD_E_INVAL;
         if (hi > kSplit) {
             w4_split = kSplit;
             a8q = decl_b(b, nm.f("%s.a8q", base), RAD_I8, { hi, K });
@@ -1556,8 +1549,7 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         return;
     }
     if (w4) {
-        RAD_ISSUE_N(c, op_a16, rows, brow_slice(a.x, r0, rows, K), brow_slice(a16, 0, rows, K));
-        RAD_ISSUE_N(c, op, rows, brow_slice(a16, 0, rows, K), RAD_NONE, RAD_W(w), RAD_W(ws),
+        RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_NONE, RAD_W(w), RAD_W(ws),
                     brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }

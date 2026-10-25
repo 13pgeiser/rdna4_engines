@@ -115,14 +115,23 @@ diverge by about 1 ULP.
 6. Add a case to `libr4d/r4d_selftest.cpp` so the row is called at least once; a row without one
    reports `no smoke case`.
 
-## Measuring asymmetric W4 GEMMs
+## Measuring W4 and BF16 decode GEMMs
 
 `r4d_selftest <libr4d.so> --perfw4 N K M [iters]` sweeps configurations of the asymmetric
-W4-weight/F16-activation kernel used by HYV3's attention and dense MLP at decode. For example,
-`--perfw4 4096 2048 1` measures its TP1 query projection. Activations are initialized and weights
-rotate through more than 256 MiB, including at small shapes. This is a timing diagnostic, not a
-correctness check or whole-model throughput result; validate candidate settings separately before
-changing deployment defaults. It does not measure the routed-expert `moe_gemm_q` kernel.
+W4-weight/F16-activation kernel. `--perfw4bf16` has the same arguments but reads BF16 activations,
+with the existing BF16-to-F16 conversion inside the GEMM, as HYV3's attention and dense MLP do at
+decode. For example, `--perfw4bf16 4096 2048 1` measures its TP1 query projection. Activations are
+initialized and weights rotate through more than 256 MiB, including at small shapes.
+
+`--perfbf16 N K M [iters]` sweeps the plain BF16 skinny GEMMs. Its weights also rotate through
+more than 256 MiB and at least two complete banks, without a copy-count cap that would leave small
+shared-expert projections in cache. HYV3 TP1's shared gate/up and down are `1536 2048 1` and
+`2048 768 1` respectively.
+
+These are timing diagnostics, not correctness checks or whole-model throughput results; validate
+candidate settings numerically and end to end before keeping them. Store machine-specific choices
+in the normal rad-tune cache, not architecture-specific launch overrides. Neither dense sweep
+measures the routed-expert `moe_gemm_q` kernel.
 
 `r4d_selftest <libr4d.so> --perfhyv3moe M [iters]` measures HYV3's actual TP1
 signed-I4 expert projections (gate/up 1536x2048, down 2048x768, top-8 of 128).
