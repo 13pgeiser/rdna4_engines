@@ -3064,6 +3064,32 @@ TEST(op_attn_paged_ragged) {
     CHECK_NEAR(out.at(5), 1.0f / sum, 1e-6);
 }
 
+/* A run longer than its context: four query rows over two keys, as an MTP head's history pass
+ * right after a one-token prompt is (core/sched/advance_impl.h ADV_HIST ends the context at the
+ * last committed position). Rows sit at seqused - q_len + j = -2, -1, 0, 1: the first two see no
+ * key and are zero, not NaN, and the last two are as if the run were two rows. */
+TEST(op_attn_paged_rows_before_the_context) {
+    const float sc = 1.0f / 1.41421356f;
+    T q(RAD_F32, {4, 1, 2});
+    q.f({ 1, 0,   0, 1,   1, 0,   0, 1 });
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({ 1, 0, 1, 0,
+           0, 1, 0, 1 });
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({2});
+    T out(RAD_F32, {4, 1, 2});
+    A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
+          .i("q_len", 4).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", a));
+    for (int e = 0; e < 4; ++e) CHECK_EQ(out.at(e), 0.0f);
+    /* Row 2 at position 0 sees key 0; row 3 at position 1 sees both, q = [0,1]. */
+    CHECK_NEAR(out.at(4), 1.0f, 1e-6); CHECK_NEAR(out.at(5), 0.0f, 1e-6);
+    const float w0 = std::exp(-sc), sum = w0 + 1.0f;
+    CHECK_NEAR(out.at(6), w0 / sum, 1e-6);
+    CHECK_NEAR(out.at(7), 1.0f / sum, 1e-6);
+}
+
 TEST(op_attn_dense) {
     const float sc = 1.0f / 1.41421356f;
     T q(RAD_F32, {2, 1, 2}); q.f({1, 0, 0, 1});

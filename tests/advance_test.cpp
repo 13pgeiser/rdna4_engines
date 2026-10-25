@@ -352,13 +352,76 @@ TEST(a_history_pass_keeps_the_hosts_rows_and_repeats_the_last_committed_one) {
         CHECK_EQ(s.slot(0, j), pos[j]);
     }
     CHECK_EQ(s.w[Slab::CTX], 100);
-    CHECK_EQ(s.used(0, 0), 105);
+    CHECK_EQ(s.used(0, 0), 104);        /* ends at the last committed position, 103 */
+}
+
+/* Attention places row j of a q_len-row run at seqused - q_len + j and reads keys up to there
+ * (attn_paged's contract, libref/ref_attn.cpp; libr4d's decode kernel computes the same `pos`).
+ * So on every pass the card stages, the last row of a run -- round 1's input on a history pass,
+ * the only row whose output the head goes on with -- must sit exactly at its own position, and no
+ * row may count past its own: a key past it is a position the head's layer has not written for
+ * this sequence. A history pass that accepted acc < n_spec drafts used to put its last row
+ * n_spec - acc positions too far, and MTP round 1 read whatever those slots held. */
+TEST(no_draft_pass_row_reads_keys_past_its_own_position) {
+    const int n_spec = 3;
+    for (int aux = 0; aux <= 2; ++aux)
+        for (int acc = 0; acc <= n_spec; ++acc) {
+            Slab s(ADV_HIST);
+            const int n = aux + 1 + n_spec, head = 200 + aux + acc;
+            s.row(0, true, 0, n, 0, /*card=*/3, 0, 0, aux);
+            s.st[3].head = head; s.st[3].acc = acc;
+            s.run();
+            const int32_t used = s.used(0, 0);
+            for (int j = 0; j < n; ++j)
+                CHECK(used - n + j <= s.w[Slab::POS + j]);
+            CHECK_EQ(s.w[Slab::POS + n - 1], head);
+            CHECK_EQ(used - n + (n - 1), head);
+        }
+    for (int round = 2; round <= n_spec; ++round) {
+        Slab s(ADV_ROUND);
+        s.a.round = round;
+        s.row(0, true, 0, 1, 0, /*card=*/1, 0, 0, 0);
+        s.st[1].head = 300;
+        s.run();
+        CHECK_EQ(s.used(0, 0) - 1, s.w[Slab::POS]);
+        CHECK_EQ(s.w[Slab::POS], 300 + round - 1);
+    }
+}
+
+/* The same pass right after a one- or two-token prompt, where the run is longer than the context
+ * it ends at (head + 1 < aux + 1 + n_spec): its first rows then count before position 0. Nothing
+ * reads their output and attention gives such a row zeros (op_attn_paged_rows_before_the_context
+ * in ref_test); what must hold is that every row still stores at a real position of its own
+ * table, the context is at least one key, and the last row sits at the committed position. */
+TEST(a_history_pass_right_after_a_tiny_prompt_stores_every_row_at_a_real_position) {
+    const int n_spec = 3;
+    int negative = 0;
+    for (int base = 1; base <= 2; ++base)            /* the bonus token's position: a 1-2 token prompt */
+        for (int aux = 0; aux <= 2; ++aux)
+            for (int acc = 0; acc <= n_spec; ++acc) {
+                Slab s(ADV_HIST, /*n_groups=*/1, /*block=*/4);
+                const int n = aux + 1 + n_spec, head = base + aux + acc;
+                s.row(0, true, 0, n, 0, /*card=*/2, 0, 0, aux);
+                s.st[2].head = head; s.st[2].acc = acc;
+                s.run();
+                const int32_t used = s.used(0, 0);
+                CHECK_EQ(used, head + 1);
+                CHECK(used >= 1);
+                for (int j = 0; j < n; ++j) {
+                    const int32_t p = s.w[Slab::POS + j];
+                    CHECK(p >= base && p <= head);
+                    CHECK_EQ(s.slot(0, j), p);         /* block b at entry b: slot == position */
+                }
+                CHECK_EQ(used - n + (n - 1), head);
+                if (used - n < 0) ++negative;
+            }
+    CHECK(negative > 0);                            /* the cases the test is for were reached */
 }
 
 /* What the card writes into a draft pass, for both head shapes. A verify at positions 101..105
  * accepted two drafts: committed position 103, trunk token 7003; slot p is position p. A head
- * with its own cache gets the verified run, tail repeated, context to its end; a cacheless head
- * gets the committed position and a context ending there, every round. */
+ * with its own cache gets the verified run, tail repeated, and a cacheless head the committed
+ * position; both get a context ending there, every round. */
 TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
     auto slab = [](Slab& s, int n_rows, int round, bool shared, int shift) {
         s.a.round = round;
@@ -382,7 +445,7 @@ TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
             CHECK_EQ(o.w[Slab::OUT + j], 40 + (j < 2 ? j : 2));
             CHECK_EQ(o.slot(0, j), pos[j]);
         }
-        CHECK_EQ(o.used(0, 0), 106);        /* the verify step's whole run */
+        CHECK_EQ(o.used(0, 0), 104);        /* the committed positions and no more */
         CHECK_EQ(o.w[Slab::CTX], 101);
     }
     for (int shift = 0; shift < 2; ++shift) {
