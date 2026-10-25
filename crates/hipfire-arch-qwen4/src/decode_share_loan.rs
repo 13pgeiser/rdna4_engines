@@ -61,6 +61,26 @@ pub(crate) trait LoanOps {
     /// The `HIPFIRE_QWEN4_DECODE_SHARE_VERIFY` oracle over the first `bytes`
     /// (a no-op unless the knob is set).
     fn verify(&mut self, bytes: u64) -> Result<(), String>;
+    /// Rebuild every borrowed weight shadow in place (the first
+    /// `shadow_bytes` of the donor tail) on the compute stream. Called once
+    /// per epoch, at its first acquire, after the scratch zero fill; a
+    /// controller without shadows never calls it.
+    fn rebuild_shadows(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// The byte oracle of the rebuilt weight shadows (a no-op unless
+    /// `HIPFIRE_QWEN4_DECODE_SHARE_VERIFY=1`, and then only after the first
+    /// rebuild of the load): called right after a successful rebuild. An `Err`
+    /// names the first differing shadow member/offset and poisons the loan.
+    fn verify_shadows(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Device time of the epoch's shadow rebuild in milliseconds, if it was
+    /// measured (only under the epoch log knob); queried after the restore
+    /// completed, so the events are done.
+    fn rebuild_ms(&mut self) -> Option<f64> {
+        None
+    }
 }
 
 /// Where the donor tail stands.
@@ -94,6 +114,8 @@ pub(crate) struct LoanCounters {
     pub restored_bytes: u64,
     pub recoveries: u64,
     pub zeroed_bytes: u64,
+    /// Epochs whose first acquire rebuilt the borrowed weight shadows.
+    pub shadow_rebuilds: u64,
     /// Time actually blocked in the host wait for a restore.
     pub wait_ns: u64,
 }
@@ -106,6 +128,10 @@ pub(crate) struct LoanController {
     sync_restore: bool,
     /// `HIPFIRE_QWEN4_DECODE_SHARE_LOG`: one line per epoch.
     log_epochs: bool,
+    /// Bytes at the start of the tail that hold the borrowed weight shadows
+    /// (0: resident shadows). Every epoch rebuilds them at its first acquire;
+    /// the scratch zero fill starts after them.
+    shadow_bytes: u64,
     counters: LoanCounters,
 }
 
@@ -118,9 +144,18 @@ impl LoanController {
             epoch: 0,
             epoch_tiles: 0,
             sync_restore,
+            shadow_bytes: 0,
             log_epochs,
             counters: LoanCounters::default(),
         }
+    }
+
+    /// A controller whose donor tail starts with `shadow_bytes` of borrowed
+    /// weight shadows: the scratch zero fill skips them and the first acquire
+    /// of every epoch rebuilds them ([`LoanOps::rebuild_shadows`]).
+    pub(crate) fn with_shadow_bytes(mut self, shadow_bytes: u64) -> Self {
+        self.shadow_bytes = shadow_bytes;
+        self
     }
 
     #[cfg(test)]
@@ -254,8 +289,19 @@ impl LoanController {
         }
         self.state = LoanState::Resident;
         if self.log_epochs {
+            let shadows = if self.shadow_bytes == 0 {
+                String::new()
+            } else {
+                match ops.rebuild_ms() {
+                    Some(ms) => format!(
+                        ", shadows {} MiB rebuilt in {ms:.3} ms",
+                        self.shadow_bytes / MIB
+                    ),
+                    None => format!(", shadows {} MiB rebuilt", self.shadow_bytes / MIB),
+                }
+            };
             eprintln!(
-                "  decode-share epoch {epoch}: tiles {}, class span {} MiB, zeroed {} MiB, restore {} MiB, wait {:.3} ms",
+                "  decode-share epoch {epoch}: tiles {}, class span {} MiB, zeroed {} MiB, restore {} MiB{shadows}, wait {:.3} ms",
                 self.epoch_tiles,
                 bytes / MIB,
                 zeroed_bytes / MIB,
@@ -285,14 +331,18 @@ impl LoanController {
         if matches!(self.state, LoanState::Restoring { .. }) {
             self.wait(ops)?;
         }
+        let mut fresh_epoch = false;
         if self.state == LoanState::Resident {
             self.epoch += 1;
             self.epoch_tiles = 0;
             self.counters.epochs += 1;
+            fresh_epoch = true;
+            // The borrowed weight shadows (if any) fill the start of the tail:
+            // the scratch zero fill below begins after them.
             self.state = LoanState::Dirty {
                 epoch: self.epoch,
                 dirty_bytes: 0,
-                zeroed_bytes: 0,
+                zeroed_bytes: self.shadow_bytes,
             };
         }
         let LoanState::Dirty {
@@ -322,6 +372,21 @@ impl LoanController {
                 dirty_bytes,
                 zeroed_bytes: span,
             };
+        }
+        // The first acquire of an epoch rebuilds the borrowed weight shadows
+        // (stream-ordered after the zero fill; the regions are disjoint).
+        if fresh_epoch && self.shadow_bytes > 0 {
+            if let Err(error) = ops.rebuild_shadows() {
+                return Err(self.recover(
+                    ops,
+                    dirty_bytes,
+                    format!("rebuild donor-tail weight shadows: {error}"),
+                ));
+            }
+            if let Err(error) = ops.verify_shadows() {
+                return Err(self.poison(format!("borrowed weight shadow oracle: {error}")));
+            }
+            self.counters.shadow_rebuilds += 1;
         }
         self.epoch_tiles += 1;
         self.counters.tiles += 1;
@@ -437,8 +502,17 @@ impl LoanController {
     /// One summary line for the free log.
     pub(crate) fn summary(&self) -> String {
         let counters = self.counters;
+        let shadows = if self.shadow_bytes == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {} weight-shadow rebuilds ({} MiB each)",
+                counters.shadow_rebuilds,
+                self.shadow_bytes / MIB
+            )
+        };
         format!(
-            "{} epochs, {} prompt tiles, {} restores ({} MiB), {} recoveries, {} MiB zeroed, host wait {:.3} ms",
+            "{} epochs, {} prompt tiles, {} restores ({} MiB), {} recoveries, {} MiB zeroed{shadows}, host wait {:.3} ms",
             counters.epochs,
             counters.tiles,
             counters.restores,
@@ -504,6 +578,16 @@ mod tests {
         }
         fn verify(&mut self, bytes: u64) -> Result<(), String> {
             self.hit("verify", format!("verify {bytes}"))
+        }
+        fn rebuild_shadows(&mut self) -> Result<(), String> {
+            self.hit("rebuild", "rebuild".to_string())
+        }
+        fn verify_shadows(&mut self) -> Result<(), String> {
+            self.hit("verify_shadows", "verify_shadows".to_string())
+        }
+        fn rebuild_ms(&mut self) -> Option<f64> {
+            self.log.push("rebuild_ms".to_string());
+            Some(1.5)
         }
     }
 
@@ -954,5 +1038,144 @@ mod tests {
         assert_eq!(counters.recoveries, 0);
         assert!(ctl.summary().contains("3 epochs"));
         assert!(ctl.summary().contains("6 prompt tiles"));
+    }
+
+    fn shadow_controller(shadow_bytes: u64) -> LoanController {
+        LoanController::new(false, false).with_shadow_bytes(shadow_bytes)
+    }
+
+    /// The first acquire of an epoch zero-fills only the scratch part (after
+    /// the shadow region) and then rebuilds the shadows; continuation acquires
+    /// (a bigger class too) rebuild nothing.
+    #[test]
+    fn shadows_rebuild_once_per_epoch_after_the_scratch_zero_fill() {
+        let mut ctl = shadow_controller(300);
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        assert_eq!(
+            *ctl.state(),
+            LoanState::Dirty {
+                epoch: 1,
+                dirty_bytes: 1000,
+                zeroed_bytes: 1000
+            }
+        );
+        assert_eq!(
+            fake.log,
+            vec!["capturing", "memset 300+700", "rebuild", "verify_shadows"]
+        );
+        ctl.acquire(&mut fake, 2500).unwrap();
+        ctl.acquire(&mut fake, 400).unwrap();
+        let rebuilds = fake.log.iter().filter(|line| *line == "rebuild").count();
+        assert_eq!(rebuilds, 1, "continuation acquires do not rebuild");
+        let memsets: Vec<_> = fake
+            .log
+            .iter()
+            .filter(|line| line.starts_with("memset"))
+            .collect();
+        assert_eq!(memsets, ["memset 300+700", "memset 1000+1500"]);
+        assert_eq!(
+            ctl.counters().zeroed_bytes,
+            2200,
+            "the shadow region is never zero-filled"
+        );
+        assert_eq!(ctl.counters().shadow_rebuilds, 1);
+        // The restore covers the whole dirty prefix, shadow region included.
+        ctl.require_resident(&mut fake).unwrap();
+        assert!(fake.log.contains(&"enqueue 2500".to_string()));
+        assert!(ctl.is_resident());
+        // A fresh epoch rebuilds again.
+        ctl.acquire(&mut fake, 1000).unwrap();
+        assert_eq!(ctl.counters().shadow_rebuilds, 2);
+        assert_eq!(fake.log.iter().filter(|line| *line == "rebuild").count(), 2);
+    }
+
+    /// A class span equal to the shadow region (no scratch) still rebuilds
+    /// and never zero-fills.
+    #[test]
+    fn a_span_that_is_only_the_shadow_region_zeroes_nothing() {
+        let mut ctl = shadow_controller(512);
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 512).unwrap();
+        assert_eq!(fake.log, vec!["capturing", "rebuild", "verify_shadows"]);
+    }
+
+    /// A controller without shadows never rebuilds (the plain path is unchanged).
+    #[test]
+    fn no_shadow_bytes_means_no_rebuild() {
+        let mut ctl = controller();
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        assert!(!fake.log.iter().any(|line| line == "rebuild"));
+        assert_eq!(ctl.counters().shadow_rebuilds, 0);
+    }
+
+    /// A failed rebuild recovers (blocking copy of the whole dirty prefix) and
+    /// returns the error, leaving the tail resident.
+    #[test]
+    fn a_failed_shadow_rebuild_recovers_the_tail() {
+        let mut ctl = shadow_controller(300);
+        let mut fake = Fake {
+            fail: Some("rebuild"),
+            ..Fake::default()
+        };
+        let error = ctl.acquire(&mut fake, 1000).unwrap_err();
+        assert!(
+            error.contains("rebuild donor-tail weight shadows"),
+            "{error}"
+        );
+        assert!(fake.log.contains(&"blocking 1000".to_string()));
+        assert!(ctl.is_resident());
+        assert_eq!(ctl.counters().shadow_rebuilds, 0);
+    }
+
+    /// After a good rebuild a failing tile whose recovery copy also fails
+    /// poisons the loan.
+    #[test]
+    fn a_failed_tile_after_a_shadow_rebuild_with_a_failed_recovery_poisons() {
+        let mut ctl = shadow_controller(300);
+        let mut fake = Fake {
+            fail: Some("blocking"),
+            sticky: true,
+            ..Fake::default()
+        };
+        ctl.acquire(&mut fake, 1000).unwrap();
+        let error = ctl.after_tile(&mut fake, false).unwrap_err();
+        assert!(error.contains("poisoned"), "{error}");
+        assert!(ctl.check().is_err());
+    }
+
+    /// A byte-oracle mismatch after the rebuild poisons the loan (the donor
+    /// tail is left as is: nothing may run) and is named in the error.
+    #[test]
+    fn a_shadow_oracle_mismatch_poisons() {
+        let mut ctl = shadow_controller(300);
+        let mut fake = Fake {
+            fail: Some("verify_shadows"),
+            ..Fake::default()
+        };
+        let error = ctl.acquire(&mut fake, 1000).unwrap_err();
+        assert!(error.contains("borrowed weight shadow oracle"), "{error}");
+        assert!(ctl.check().is_err());
+        assert!(!fake.log.iter().any(|line| line.starts_with("blocking")));
+        assert_eq!(ctl.counters().shadow_rebuilds, 0);
+    }
+
+    /// The epoch log path reads the rebuild time only after the restore
+    /// completed (the timing events are done by then).
+    #[test]
+    fn the_epoch_log_reads_the_rebuild_time_after_the_restore() {
+        let mut ctl = LoanController::new(false, true).with_shadow_bytes(300);
+        let mut fake = Fake::default();
+        ctl.acquire(&mut fake, 1000).unwrap();
+        ctl.require_resident(&mut fake).unwrap();
+        let wait = fake.log.iter().position(|line| line == "wait").unwrap();
+        let ms = fake
+            .log
+            .iter()
+            .position(|line| line == "rebuild_ms")
+            .unwrap();
+        assert!(ms > wait);
+        assert!(ctl.summary().contains("1 weight-shadow rebuilds"));
     }
 }
