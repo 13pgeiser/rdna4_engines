@@ -1900,7 +1900,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_norm_rope_batch_arena",
                 "gated_delta_gate_batched_rotate_arena",
                 "indexed_attention_cache_append_q8_batch_arena",
-                "hyper_write_bf16x8_gfx1201",
             ]
         );
         add!(
@@ -2152,7 +2151,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -2282,6 +2280,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
             [
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560",
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
             ]
         );
@@ -2354,6 +2354,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
             ]
         );
+        // Match the exact gfx1151-only launcher admission in moe_few.rs.
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq4g128v2_moe_down_top10_k640",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_K640_SRC,
+                ["gemv_mq4g128v2_moe_down_top10_k640",]
+            );
+        }
         add!(
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
             kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
@@ -2573,6 +2581,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_MQ6G256V2_SRC,
             ["gemv_mq6g256v2"]
         );
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq6g256v2_k2560_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_SRC,
+                ["gemv_mq6g256v2_k2560"]
+            );
+            add!(
+                "gemv_mq6g256v2_k2560_u2_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_U2_SRC,
+                ["gemv_mq6g256v2_k2560_u2"]
+            );
+        }
+
         // Default-on `HIPFIRE_QWEN4_ROUTER_FAST`: every eager multi-row router call.
         add!(
             "moe_router_softmax_top10_f32_fast",
@@ -2780,7 +2801,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -8173,6 +8193,52 @@ mod tests {
     }
 
     #[test]
+    fn k640_registry_matches_gfx1151_only_launcher_admission() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let registry = entries(arch, "").unwrap();
+            assert_eq!(
+                registry
+                    .iter()
+                    .any(|entry| entry.module == "gemv_mq4g128v2_moe_down_top10_k640"),
+                arch == "gfx1151",
+                "{arch}: K640 registry must match the launchers architecture guard",
+            );
+        }
+    }
+
+    #[test]
+    fn native_qwen4_gfx1151_route_entries_refuses_partial_closed_plan() {
+        let flags = default_feature_flags("gfx1151").unwrap();
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            let input = RouteKernelInput {
+                arch: "gfx1151",
+                model_arch: 16,
+                tensors: &[],
+                n_heads: 32,
+                n_kv_heads: 4,
+                head_dim: 128,
+                max_seq: 32768,
+                prefill_chunk_rows: 8192,
+                kv_k: "fp8",
+                kv_v: "fp8",
+                state_quant: "q8",
+                spec,
+                host_mapped_experts: false,
+                retained_decode: true,
+                hipcc_extra_flags: "",
+                flags: &flags,
+                route_axes: &[],
+            };
+            match route_entries(&input) {
+                Err(RegistryError::UnsupportedRoute(reason)) => {
+                    assert_eq!(reason, "model arch 16 on gfx1151 has no closed route",)
+                }
+                other => panic!("gfx1151 must keep lazy loading, not a partial plan: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn mq4v2_k5120_inventory_preserves_generic_and_limits_arch() {
         let module = "fused_gate_up_mq4g256v2_k5120_gfx1100";
         let registry = entries("gfx1100", "").unwrap();
@@ -9507,6 +9573,11 @@ mod tests {
         // qualification twins) at the 64-byte ABI.
         for (label, image, count) in [
             ("gfx1151 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151, 6),
+            (
+                "gfx1151 streamed GU K2",
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                1,
+            ),
             ("gfx1201 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201, 6),
             ("gfx1201 W3 K2", kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201, 4),
             (
@@ -10389,7 +10460,7 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap, while accounting explicitly for the later beta source addition.
+    /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports.
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10409,10 +10480,7 @@ mod tests {
         let current: BTreeSet<String> = elf
             .iter()
             .cloned()
-            .chain([
-                "hyper_write_bf16x8_gfx1201".to_owned(),
-                "indexed_attention_rope_table_f32".to_owned(),
-            ])
+            .chain(["indexed_attention_rope_table_f32".to_owned()])
             .collect();
         assert_eq!(tensor_ops_source_exports("gfx1100"), current);
         let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();
@@ -10430,7 +10498,7 @@ mod tests {
                 "indexed_attention_decode_prologue_q8",
             ]
         );
-        // The current registry includes the measured exports and the later beta addition.
+        // The current gfx11 registry contains exactly the measured source exports.
         for arch in ["gfx1100", "gfx1151"] {
             let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
                 .unwrap()
@@ -10481,6 +10549,8 @@ mod tests {
             }
         }
         for (symbol, gfx11, gfx12) in [
+            ("hyper_write_bf16x2", true, true),
+            ("hyper_write_bf16x8_gfx1201", false, true),
             ("indexed_attention_decode_prologue_fp8", false, true),
             ("gated_delta_step_pipe128_q8", false, true),
         ] {
