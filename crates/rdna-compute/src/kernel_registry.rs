@@ -1327,6 +1327,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_gqa_q8_gfx1201",
                 "attention_verify_gqa_fp8_gfx1201",
                 "attention_verify_gqa_fp8_gqa8_gfx1201",
+                "attention_verify_gqa_fwht4_gfx1201",
+                "attention_verify_gqa_fwht3_gfx1201",
                 "attention_verify_reduce_gfx1201"
             ]
         );
@@ -1508,6 +1510,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
             [
                 "attention_verify_gqa_q8_gfx1100",
+                "attention_verify_gqa_fwht4_gfx1100",
+                "attention_verify_gqa_fwht3_gfx1100",
                 "attention_verify_gqa_q8_rows_gfx1100",
                 "attention_verify_reduce_gfx1100"
             ]
@@ -4740,6 +4744,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
                 "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_k5120",
                 "npu_trunk_pack_a_bf16_old",
             ]
         );
@@ -10678,6 +10683,8 @@ mod tests {
                     "attention_verify_gqa_q8_gfx1201",
                     "attention_verify_gqa_fp8_gfx1201",
                     "attention_verify_gqa_fp8_gqa8_gfx1201",
+                    "attention_verify_gqa_fwht4_gfx1201",
+                    "attention_verify_gqa_fwht3_gfx1201",
                     "attention_verify_reduce_gfx1201",
                 ][..],
             ),
@@ -10687,6 +10694,8 @@ mod tests {
                 kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
                 &[
                     "attention_verify_gqa_q8_gfx1100",
+                    "attention_verify_gqa_fwht4_gfx1100",
+                    "attention_verify_gqa_fwht3_gfx1100",
                     "attention_verify_gqa_q8_rows_gfx1100",
                     "attention_verify_reduce_gfx1100",
                 ][..],

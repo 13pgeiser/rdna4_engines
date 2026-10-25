@@ -8376,6 +8376,20 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
 
+/// fwht4-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_KMODE=4`):
+/// K dequantizes fwht4 records (f32 cnorm + 128 B of 4-bit codes, per-128-half
+/// signed-FWHT-rotated, `TURBO_C4` codebook) into the unchanged K plane. The
+/// Q-side rotation lives in `attention_fa2_q_preconvert_fwht4_gfx1201`
+/// (distinct symbol: the host function cache is keyed by symbol); the entry
+/// `attention_q8_0_fa2_gqa_fwht4k_gfx1201` takes the same kernarg list as the
+/// fwht3k entry. `turbo_common.h` is prepended (no `-I` at runtime compile).
+/// JIT-only via `attention_q8_0_fa2_gqa_fwht4k_gfx1201`.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
 /// Route-Q stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
 /// `HIPFIRE_FA2_FP8=1`, i.e. `KMODE=0` + `FA2_FP8`): fp8 (E4M3) QK + PV
 /// arithmetic on the fragment layout (§14.3 of the stage-b plan), 32768 B
@@ -8541,6 +8555,18 @@ pub const ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC: &str =
 /// `attention_q8_0_fa2_gqa_fwht3k_gfx11`; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
+
+/// gfx11 fwht4-K FA2 source (`HIPFIRE_FA2_KMODE=4`): 4-bit nibble K
+/// (`TURBO_C4`, 132 B/head, per-128-half signed FWHT) dequantized into the
+/// unchanged K plane; V stays Q8_0. Q rotation lives in
+/// `attention_fa2_q_preconvert_fwht4_gfx11` (distinct symbol — function
+/// cache is symbol-keyed); entry `attention_q8_0_fa2_gqa_fwht4k_gfx11`.
+/// `turbo_common.h` prepended (no `-I` at runtime compile). JIT-only.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n",
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
@@ -8800,22 +8826,33 @@ pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
 /// VerifyAttn Stage 0 (gfx1201): `attention_verify_gqa_{q8,fp8}_gfx1201`, the
 /// GQA-shared split-K twins of the batched Q8_0 / fp8 flash tiles (one KV scan
 /// per kv head for 8 query rows x 6 q heads, fixed context-independent grid),
-/// `attention_verify_gqa_fp8_gqa8_gfx1201` (fp8 only, H16/KV2 GQA group 8: 6
-/// query rows x 8 q heads per workgroup), and `attention_verify_reduce_gfx1201`,
-/// the parallel twin of
+/// `attention_verify_gqa_fwht{4,3}_gfx1201` (twins of the fwht4 / fwht3 K tiles
+/// with Q8_0 V; they take the K rotation's sign tables as two extra kernel
+/// arguments), `attention_verify_gqa_fp8_gqa8_gfx1201` (fp8 only, H16/KV2 GQA
+/// group 8: 6 query rows x 8 q heads per workgroup), and
+/// `attention_verify_reduce_gfx1201`, the parallel twin of
 /// [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]. Partials and output are
 /// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6
 /// (and GQA 8 for the group-8 entry).
 pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_gqa.gfx1201.hip");
-/// VerifyAttn Stage 0 (gfx1100, Q8 only): `attention_verify_gqa_q8_gfx1100`
+/// VerifyAttn Stage 0 (gfx1100): `attention_verify_gqa_q8_gfx1100`
 /// (twin of `attention_flash_q8_0_tile_batched`),
+/// `attention_verify_gqa_fwht{4,3}_gfx1100` (twins of the fwht4 / fwht3 K tiles
+/// with Q8_0 V, sign tables as two extra kernel arguments),
 /// `attention_verify_gqa_q8_rows_gfx1100` (twin of the multi-row
 /// `attention_flash_q8_0_rows{8,4}_d8`) and `attention_verify_reduce_gfx1100`
 /// (twin of [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]); byte-identical
-/// partials and output at head_dim 256, GQA 6.
-pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip");
+/// partials and output at head_dim 256, GQA 6. The fwht entries use the
+/// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
+/// `kernels/src`, so the header is prepended and the source's guarded
+/// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
+    "#define VA_TURBO_COMMON_INLINED 1\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    "\n",
+    include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip")
+);
 /// VerifyAttn (gfx1151): `attention_verify_wmma_qk_gfx1151` (context-parallel
 /// S = Q.K^T tiles, one K dequant per kv head, f16 S to scratch) and
 /// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online

@@ -7273,8 +7273,13 @@ pub(crate) fn forward_batch_chunk_impl(
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
         && (gpu.flags.iu4_prefill_enabled()
             || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
-        // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
-        && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
+        // The scan never reads KV, so the clause only names qualified tiers:
+        // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
+        // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
+        && (kv_cache.quant_fp8
+            || (gpu.arch != "gfx1201" && kv_cache.quant_q8)
+            || kv_cache.quant_asym4
+            || kv_cache.quant_asym3)
         && dn_state.quant == StateQuant::Q8
         && !dn_state.s_matrices.is_empty()
         && dn_state.s_matrices.len() == dn_state.s_scales.len()
