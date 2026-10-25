@@ -10,8 +10,8 @@ checkout the script is in, and default to containers under `$HOME/models/rad/` a
 `$HOME/models/<org>/<name>`. A script that starts a server first stops any `radiance` already
 running (`oracle.sh` only the one on its own port) and logs to `$HOME/<script>.log`. Most defaults
 are environment overrides (`M=` for the container, `P=` for the port, and so on); each script's
-header lists its own. Scripts that only attach to a live server need `curl` and `jq`; `cardclock.py`
-and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname "$0")`.
+header lists its own. Scripts that only attach to a live server need `curl` and `jq`; `cardclock.py`,
+`agentreplay.py` and `stampgaps.py` need `python3`. Scripts find each other through `$(dirname "$0")`.
 
 ## Bringing a model up
 
@@ -40,6 +40,7 @@ and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname 
 | `ident.sh` | Run-to-run reproducibility at a fixed configuration: one hash per (temperature, question), to compare against another run of the same configuration. A speculative run need not match a non-speculative one byte for byte (the split-K count is chosen from M, so reduction orders differ and a near-tie can flip late in a long answer), but a divergence within the first sentence or two is a defect. |
 | `cardclock.py` | What holds each card's clock under sustained load, and which card a tensor-parallel step waits for (the slowest rank ends the step). Reads every AMD card's `gpu_metrics` table ten times a second and counts a throttler bit only when the clock is lower while it is set (some firmware keeps a bit on at idle). Shows the engine's step counters per window, so a slow window is attributed to slower steps, fewer tokens per step or host time between steps. Drives its own greedy load, or with `--watch` only samples a server under real traffic; `--compare` shows two saved runs side by side. Read-only on the cards. |
 | `statsdump.py` | Records `/stats` to a JSONL file, one row per poll (`--every`, default 1 s), so the dashboard's figures can be read back over time on a machine without a Prometheus scraper. A row is the engine's snapshot verbatim plus the poll's time `t` and the gap since the last good poll `dt_s`; nothing is derived. The file is appended to and rotated at `--max-mib` (default 256, five generations). A failed poll leaves no row; a run that wrote no row, or can no longer write its file, exits 1. The key is taken from `--api-key` or `RADIANCE_API_KEY`. |
+| `stampgaps.py` | Reads the CSV that `RADIANCE_AQL_STAMP=N` writes (every dispatch of one recorded pass in N on card 0, start and end) and prints per kind of pass (told apart by tape length) the median wall, the busy time as the union over the queues, the idle share, the gap before an ordered start (p50, p90, sum) and the kernels by share of the dispatch time. The idle share is what chained launches could win at most, the gaps what they would remove. Stamping costs throughput of its own when passes are short (one in 50: 0.3 % at one GLM-5.3 stream, 4 % at eight), so take N larger at high concurrency. |
 | `oracle.sh` | Every op compared against libref on the operands the model issued, which rad-kbench cannot do: its operands are its own (dense, rank 2), while the engine's are arena slices and weights loaded from a file. Starts its own server on :8302. Read it for `MISMATCH` lines, and for `NOT CHECKED` lines naming rows whose weight layout has no published inverse and so cannot be compared. |
 
 ## Regression checks against a live server
