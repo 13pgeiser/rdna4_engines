@@ -139,10 +139,16 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&q));
   };
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
   for (int c = c0 + wid; c < c1; c += nwarp)
-    wht6_push_chunk<CG>(ld, c, n_groups, lane, lig, gw, w.p_pay, w.p_sc, w.l_pay, w.l_sc);
+    wht6_push_chunk<CG>(ld, c, n_groups, lane, lig, gw, w.p_pay, w.p_sc, w.l_pay, w.l_sc, hck);
+  r4d_archk_put(hck, peer_flags, nbw, s_slot, (unsigned)b, s);
 
   wht6_handshake(peer_flags, my_flags, b, s, tid, drain, acq);
+  r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int c = c0 + wid; c < c1; c += nwarp)
+      wht6_rehash_chunk<CG>(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc);
+  });
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   for (int c = c0 + wid; c < c1; c += nwarp)

@@ -655,6 +655,11 @@ struct Gemma3Mlp {
     G3Linear   ln_gu{}, ln_down{};
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
     rad_op op_gq = 0;
+    /* gate|up, the GeGLU and down's E4M3 quantiser in one launch (libr4d gemm_nt_q_gated_mx at
+     * gelu_tanh) at up to `fold_rows` rows, when both linears are MXFP4: byte-identical to the
+     * GEMM, gelu_mul and quant_act_fp8 it replaces. */
+    rad_op  op_fold = 0;
+    int64_t fold_rows = 0;
     /* Calibration: gate|up's input and down's (this rank's columns). */
     G3Tap       tap_gu{}, tap_dn{};
     const bool* tap_live = nullptr;
@@ -725,6 +730,22 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                    {w.gu}, {ln_down.q8, ln_down.s8});
+    // Not under calibration either: the down tap reads the bf16 product, which the fold never writes.
+    {
+        const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
+        // G3Linear's mx is linear_is_mxfp4, never a rotated (ParoQuant) weight, so one part.
+        if (ln_gu.mx && ln_down.mx && !ln_down.shared_in && !calib_dir() && hi > 0 &&
+            ln_gu.N % 256 == 0 && ln_gu.K % RAD_FP8_BLOCK == 0 &&
+            rad_op_declared(b, "gemm_nt_q_gated_mx")) {
+            op_fold = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
+                           RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", ln_gu.N), RAD_INT("K", ln_gu.K),
+                                      RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
+                                      RAD_STR("act", "gelu_tanh")),
+                           RAD_WEIGHTS(ln_gu.w, ln_gu.ws, ln_gu.wref)),
+                         {ln_gu.q8, ln_gu.s8}, {ln_down.q8, ln_down.s8});
+            if (op_fold) fold_rows = hi;
+        }
+    }
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -754,14 +775,23 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
 void Gemma3Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tail_fused,
                      bool ar_fused) const {
     const int64_t T = batch->n_tok;
+    const bool fold = op_fold && T <= fold_rows;
     if (entry_done) {
-        ln_gu.gemm(c, w.gu, T);
+        if (!fold) ln_gu.gemm(c, w.gu, T);
     } else {
         RAD_ISSUE(c, op_norm,  brows(w.x, T),   RAD_W(w_norm),  brows(w.h, T));
-        ln_gu.step(c, w.h, w.gu, T);
+        if (!fold)
+            ln_gu.step(c, w.h, w.gu, T);
+        else if (!ln_gu.shared_in)
+            RAD_ISSUE_N(c, ln_gu.op_q, T, brows(w.h, T), brows(ln_gu.q8, T), brows(ln_gu.s8, T));
         tap_gu.step(c, w.h, T, tap_live);
     }
-    if (op_gq) {
+    if (fold) {
+        RAD_ISSUE_N(c, op_fold, T, brows(ln_gu.q8, T), brows(ln_gu.s8, T), RAD_W(ln_gu.w),
+                    RAD_W(ln_gu.ws), RAD_W(ln_gu.wref), brows(ln_down.q8, T), brows(ln_down.s8, T),
+                    RAD_NONE);
+        ln_down.gemm(c, w.h, T);
+    } else if (op_gq) {
         RAD_ISSUE_N(c, op_gq, T, brows(w.gu, T), brows(ln_down.q8, T), brows(ln_down.s8, T), RAD_NONE);
         ln_down.gemm(c, w.h, T);
     } else {
@@ -884,12 +914,28 @@ struct G3JunctionFP8 {
     }
 };
 
+/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h): a weight's first
+ * kPrefetchBytes, on decode steps of up to kPrefetchStepRows rows (a verify of four sequences at
+ * speculation 7, as qwen35_fp8's). TranslateGemma-27B MXFP4 + DFlash2 at tp 2 on 2x R9700 (Gen5 x8),
+ * no speculation, two rounds each, x1 / x4 / x8 tok/s against none (56.8 / 182.0 / 325.0): 8 MB 63.3 /
+ * 203.1 / 354.9; 12 MB 63.0 / 202.6 / 354.9; 16 MB 63.5 / 203.9 / 356.6; 20 MB 64.1 / 204.0 / 359.4;
+ * 24 MB 64.4 / 206.4 / 359.3; 32 MB 63.1 / 201.4 / 351.9. Larger than qwen35_fp8's 12 MB: this
+ * model's hidden width (5376) and weights are larger, so its all-reduces take longer and its GEMMs
+ * read more; past ~24 MB the read outlasts the reduction and takes bandwidth from the GEMM it should
+ * feed. With speculation 7 (three rounds, greedy, medians) x1 / x4 / x8 / x16 158.1 / 409.0 / 592.0 / 710.8 -> 177.3 / 428.4 / 592.3 / 717.6. The drafter's reads (Dflash2::Config::prefetch) take the same size. */
+constexpr int64_t kPrefetchBytes    = (int64_t)24 << 20;
+constexpr int64_t kPrefetchStepRows = 32;
+
 struct Layer {
     bool       global = false;
     Gemma3Attn attn{};
     Gemma3Mlp  mlp{};
     G3Junction j_am{}, j_ma{};
     G3JunctionFP8 jf_am{}, jf_ma{};
+    /* The reads beside the decode all-reduces: gate|up's leading bytes beside the attention block's
+     * reduction, the next layer's q's beside the feed-forward's. 0 where none is declared. */
+    rad_op     op_pf_gu = 0, op_pf_next = 0;
+    rad_weight pf_gu_w = 0, pf_next_w = 0;
 };
 
 struct Model {
@@ -974,6 +1020,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
 
     Dflash2::Config dc{};
     dc.short_block = 1;   /* rad_drafter_short_block below */
+    dc.prefetch    = kPrefetchBytes;   /* reads beside the drafter's all-reduces (at tp > 1) */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -1325,6 +1372,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         m.fuse_mx_ar = ar;
     }
+    /* ---- the weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h). Only at
+     * more than one rank; RADIANCE_PREFETCH_BESIDE=0 issues none (prefetch_beside). */
+    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+        for (int64_t l = 0; l < g.n_layer; ++l) {
+            Layer& lay = m.layers[(size_t)l];
+            lay.pf_gu_w  = lay.mlp.ln_gu.w;
+            lay.op_pf_gu = decl_prefetch(b, lay.pf_gu_w, kPrefetchBytes);
+            if (l + 1 < g.n_layer) {
+                lay.pf_next_w  = m.layers[(size_t)l + 1].attn.ln_q.w;
+                lay.op_pf_next = decl_prefetch(b, lay.pf_next_w, kPrefetchBytes);
+            }
+        }
+    }
     /* The pipeline needs the fused fp8 junctions and every block's overlap all-reduce. */
     if (m.pipe_on) {
         bool ok = m.fuse_mx;
@@ -1642,6 +1702,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * m.g.n_embd, brows(m.b_x, T), RAD_NONE);
 
+    /* The reads beside the reductions go on decode steps of up to kPrefetchStepRows rows, none on a
+     * step that carries a prompt's rows (as qwen35_fp8's). */
+    const int64_t pf_h = batch->phase == RAD_PHASE_DECODE && T <= kPrefetchStepRows ? 1 : INT64_MAX;
     if (m.fuse_mx) {
         /* MXFP4 trunk: [post-norm, then add + next norm + quantiser as one op] at every junction;
          * the last block's tail runs unfused into the final norm. */
@@ -1652,9 +1715,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
             /* Per step: the fused junction sends the exact wire only (G3JunctionFP8::op_ar). */
             const bool far = m.fuse_mx_ar && ar_wire_is_exact(m.g, T);
             l.attn.step(c, batch, true, true, far);
+            prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
             if (!far) l.attn.post(c, T);
             l.jf_am.step(c, T, far);
             l.mlp.step(c, batch, true, !last, far);
+            prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
             if (!last) {
                 if (!far) l.mlp.post(c, T);
                 l.jf_ma.step(c, T, far);
@@ -1668,8 +1733,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const bool last = li + 1 == m.layers.size();
         const bool ar = m.fuse_ar && ar_wire_is_exact(m.g, T);   /* exact wire only, as above */
         l.attn.step(c, batch, m.fuse, m.fuse, ar);
+        prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
         if (m.fuse) l.j_am.step(c, T, ar);
         l.mlp.step(c, batch, m.fuse, m.fuse && !last, ar);
+        prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
         if (m.fuse && !last) l.j_ma.step(c, T, ar);
         tap(li);
     }
