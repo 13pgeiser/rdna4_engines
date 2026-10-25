@@ -11834,13 +11834,20 @@ fn ddtree_commit_row_runs(accepted_node_indices: &[usize]) -> Vec<(usize, usize,
 /// `s' >= d' > d` — every source is read before anything overwrites it. Distinct
 /// block rows map to distinct physical rows, so this also holds when the caller
 /// maps through a ring modulus.
+///
+/// That argument is about separate moves. Within one coalesced run the ranges
+/// overlap whenever `src - dst < n` (e.g. `(1, 2, 3)`), and a D2D memcpy over
+/// overlapping ranges is undefined: the blit copies chunks in parallel, so which
+/// bytes win varies run to run (HIPF-136, greedy DDTree nondeterminism). Each run
+/// is therefore issued as ascending chunks of at most `src - dst` rows; chunk k
+/// overwrites only rows chunk k-1 already read.
 fn move_rows_in_place(
     gpu: &Gpu,
     buf: &GpuTensor,
     row_bytes: usize,
     moves: &[(usize, usize, usize)],
 ) -> HipResult<()> {
-    for &(dst, src, n) in moves {
+    for (dst, src, n) in moves.iter().flat_map(|&m| non_overlapping_chunks(m)) {
         let (dst_off, src_off, size) = (dst * row_bytes, src * row_bytes, n * row_bytes);
         match gpu.active_stream.as_ref() {
             // Stream-ordered: the moves serialize against each other and against
@@ -11854,6 +11861,18 @@ fn move_rows_in_place(
         }
     }
     Ok(())
+}
+
+/// Split a `(dst, src, n)` move with `src > dst` into ascending sub-moves whose
+/// source and destination ranges are disjoint.
+fn non_overlapping_chunks(
+    (dst, src, n): (usize, usize, usize),
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    debug_assert!(src > dst, "in-place row moves only shift rows down");
+    let step = src - dst;
+    (0..n)
+        .step_by(step)
+        .map(move |k| (dst + k, src + k, step.min(n - k)))
 }
 
 /// DDTree post-accept gather: relocate the accepted chain's rows from their
@@ -13849,6 +13868,37 @@ mod tests {
             ddtree_commit_row_runs(&[1, 2, 4]),
             vec![(1, 2, 2), (3, 5, 1)]
         );
+    }
+
+    /// A coalesced run overlaps itself when its shift is shorter than the run
+    /// (HIPF-136). The issued copies must be pairwise source/destination
+    /// disjoint and, executed in order, must equal the per-row move.
+    #[test]
+    fn move_chunks_never_overlap_and_match_per_row_moves() {
+        assert_eq!(
+            non_overlapping_chunks((1, 2, 3)).collect::<Vec<_>>(),
+            vec![(1, 2, 1), (2, 3, 1), (3, 4, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 3, 5)).collect::<Vec<_>>(),
+            vec![(1, 3, 2), (3, 5, 2), (5, 7, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 9, 4)).collect::<Vec<_>>(),
+            vec![(1, 9, 4)]
+        );
+        for n in 1..12 {
+            for step in 1..12 {
+                let (dst, src) = (1, 1 + step);
+                let mut rows: Vec<usize> = (0..dst + step + n).collect();
+                for (d, s, m) in non_overlapping_chunks((dst, src, n)) {
+                    assert!(s >= d + m, "chunk ({d}, {s}, {m}) overlaps itself");
+                    rows.copy_within(s..s + m, d);
+                }
+                let want: Vec<usize> = (src..src + n).collect();
+                assert_eq!(rows[dst..dst + n], want[..], "n={n} step={step}");
+            }
+        }
     }
 
     /// The in-place, scratch-free move is only sound because every move reads a
