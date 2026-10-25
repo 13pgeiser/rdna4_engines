@@ -116,7 +116,11 @@ fn main() {
     while tokens.len() < max_b + 1 {
         tokens.push(cfg.bos_token);
     }
-    eprintln!("token stream ({} toks): {:?}", tokens.len(), &tokens[..tokens.len().min(16)]);
+    eprintln!(
+        "token stream ({} toks): {:?}",
+        tokens.len(),
+        &tokens[..tokens.len().min(16)]
+    );
 
     let argmax = |v: &[f32]| -> u32 {
         let mut bi = 0u32;
@@ -161,17 +165,23 @@ fn main() {
         }
         let seq_argmax = argmax(&seq_last_logits);
         // One more step to define the "next token after the batch" reference.
-        let seq_next_logits =
-            decode_step(&cfg, &weights, &mut seq_state, &mut gpu, next_seed, bsz as u32)
-                .expect("seq next");
+        let seq_next_logits = decode_step(
+            &cfg,
+            &weights,
+            &mut seq_state,
+            &mut gpu,
+            next_seed,
+            bsz as u32,
+        )
+        .expect("seq next");
         let seq_next_argmax = argmax(&seq_next_logits);
         drop(seq_state);
 
         // ── (b) Batched verify forward over the same B tokens. ──
         let mut bat_state =
             Gemma4State::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("bat state");
-        let bat_logits =
-            forward_batch(&cfg, &weights, &mut bat_state, &mut gpu, &batch, 0).expect("forward_batch");
+        let bat_logits = forward_batch(&cfg, &weights, &mut bat_state, &mut gpu, &batch, 0)
+            .expect("forward_batch");
         let bat_argmax = argmax(&bat_logits);
 
         // ── (c) Compare last-token logits. ──
@@ -180,9 +190,15 @@ fn main() {
 
         // ── (d) KV-cache equivalence: decode one MORE token at position B from
         //        the forward_batch state and compare its argmax. ──
-        let bat_next_logits =
-            decode_step(&cfg, &weights, &mut bat_state, &mut gpu, next_seed, bsz as u32)
-                .expect("bat next");
+        let bat_next_logits = decode_step(
+            &cfg,
+            &weights,
+            &mut bat_state,
+            &mut gpu,
+            next_seed,
+            bsz as u32,
+        )
+        .expect("bat next");
         let bat_next_argmax = argmax(&bat_next_logits);
         let kv_match = bat_next_argmax == seq_next_argmax;
         let next_cos = cosine(&seq_next_logits, &bat_next_logits);

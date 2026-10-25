@@ -52,15 +52,27 @@ fn decode_rsrc(cap_cfg: &Value, info: &Value, wave: u64, user_sgprs: u64) -> Res
     // RSRC1 (gfx12): VGPRS 0-5, SGPRS 6-9, PRIORITY 10-11, FLOAT_MODE 12-19, PRIV 20, WG_RR_EN 21,
     // DEBUG_MODE 22, DISABLE_PERF 23, BULKY 24, CDBG_USER 25, FP16_OVFL 26, WGP_MODE 29,
     // MEM_ORDERED 30, FWD_PROGRESS 31.
-    for (name, lo, hi) in [("PRIORITY", 10, 11), ("PRIV", 20, 20), ("DEBUG_MODE", 22, 22),
-                           ("DISABLE_PERF", 23, 23), ("BULKY", 24, 24), ("CDBG_USER", 25, 25), ("unnamed27_28", 27, 28)] {
+    for (name, lo, hi) in [
+        ("PRIORITY", 10, 11),
+        ("PRIV", 20, 20),
+        ("DEBUG_MODE", 22, 22),
+        ("DISABLE_PERF", 23, 23),
+        ("BULKY", 24, 24),
+        ("CDBG_USER", 25, 25),
+        ("unnamed27_28", 27, 28),
+    ] {
         if bits(r1, lo, hi) != 0 {
-            return reject(format!("RSRC1.{name} is set (0x{r1:08x}); not representable in pm-raw-kernel-spec-v1"));
+            return reject(format!(
+                "RSRC1.{name} is set (0x{r1:08x}); not representable in pm-raw-kernel-spec-v1"
+            ));
         }
     }
     let float_mode = bits(r1, 12, 19);
     if float_mode != ju64(cap_cfg, "float_mode")? {
-        return reject(format!("config.float_mode {} != RSRC1.FLOAT_MODE {float_mode}", ju64(cap_cfg, "float_mode")?));
+        return reject(format!(
+            "config.float_mode {} != RSRC1.FLOAT_MODE {float_mode}",
+            ju64(cap_cfg, "float_mode")?
+        ));
     }
     let vgprs_field = bits(r1, 0, 5);
     let granule = if wave == 32 { 8 } else { 4 };
@@ -78,12 +90,22 @@ fn decode_rsrc(cap_cfg: &Value, info: &Value, wave: u64, user_sgprs: u64) -> Res
         return reject("RSRC2.WGP_TAKEOVER set");
     }
     if bits(r2, 1, 5) != user_sgprs {
-        return reject(format!("RSRC2.USER_SGPR {} != args.num_user_sgprs {user_sgprs}", bits(r2, 1, 5)));
+        return reject(format!(
+            "RSRC2.USER_SGPR {} != args.num_user_sgprs {user_sgprs}",
+            bits(r2, 1, 5)
+        ));
     }
     for (i, b) in [7u32, 8, 9].iter().enumerate() {
-        let used = jget(info, "cs.uses_block_id")?.get(i).and_then(Value::as_bool).ok_or("uses_block_id")?;
+        let used = jget(info, "cs.uses_block_id")?
+            .get(i)
+            .and_then(Value::as_bool)
+            .ok_or("uses_block_id")?;
         if bit(r2, *b) != used {
-            return reject(format!("RSRC2.TGID_{}_EN {} != cs.uses_block_id[{i}] {used}", axis(i).to_uppercase(), bit(r2, *b)));
+            return reject(format!(
+                "RSRC2.TGID_{}_EN {} != cs.uses_block_id[{i}] {used}",
+                axis(i).to_uppercase(),
+                bit(r2, *b)
+            ));
         }
     }
     let uses_idx = jbool(info, "cs.uses_local_invocation_idx")?;
@@ -91,9 +113,18 @@ fn decode_rsrc(cap_cfg: &Value, info: &Value, wave: u64, user_sgprs: u64) -> Res
         return reject("RSRC2.TG_SIZE_EN != cs.uses_local_invocation_idx");
     }
     let tid = jget(info, "cs.uses_thread_id")?;
-    let tid_cnt = if tid[2].as_bool() == Some(true) { 2 } else if tid[1].as_bool() == Some(true) { 1 } else { 0 };
+    let tid_cnt = if tid[2].as_bool() == Some(true) {
+        2
+    } else if tid[1].as_bool() == Some(true) {
+        1
+    } else {
+        0
+    };
     if bits(r2, 11, 12) != tid_cnt {
-        return reject(format!("RSRC2.TIDIG_COMP_CNT {} != derived {tid_cnt}", bits(r2, 11, 12)));
+        return reject(format!(
+            "RSRC2.TIDIG_COMP_CNT {} != derived {tid_cnt}",
+            bits(r2, 11, 12)
+        ));
     }
     let exceptions = bits(r2, 24, 30) | (bits(r2, 13, 14) << 7);
 
@@ -102,7 +133,9 @@ fn decode_rsrc(cap_cfg: &Value, info: &Value, wave: u64, user_sgprs: u64) -> Res
         return reject("RSRC3.SHARED_VGPR_CNT != 0");
     }
     if bit(r3, 13) || bit(r3, 31) || bit(r3, 12) || bits(r3, 14, 30) != 0 {
-        return reject(format!("RSRC3 has unknown/execution-affecting bits set (0x{r3:08x})"));
+        return reject(format!(
+            "RSRC3 has unknown/execution-affecting bits set (0x{r3:08x})"
+        ));
     }
 
     let fp = json!({
@@ -142,14 +175,20 @@ fn push_field_for_dword<'a>(fields: &'a [Value], dword: u64) -> Option<&'a Value
 pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     let arch = jstr(kernel, "arch")?.to_owned();
     if arch != "gfx1201" {
-        return reject(format!("exporter pilot decodes gfx1201 captures only, spec arch is {arch}"));
+        return reject(format!(
+            "exporter pilot decodes gfx1201 captures only, spec arch is {arch}"
+        ));
     }
     if jstr(cap, "schema")? != "radv-aco-capture-v1" || jstr(cap, "stage")? != "compute" {
         return reject("capture schema/stage mismatch");
     }
     let pd = jget(cap, "physical_device")?;
     if ju64(pd, "gfx_level")? != GFX12 || jstr(pd, "family_name")? != "GFX1201" {
-        return reject(format!("driver compiled for gfx_level {} family {}, spec wants gfx1201", ju64(pd, "gfx_level")?, jstr(pd, "family_name")?));
+        return reject(format!(
+            "driver compiled for gfx_level {} family {}, spec wants gfx1201",
+            ju64(pd, "gfx_level")?,
+            jstr(pd, "family_name")?
+        ));
     }
     if ju64(jget(cap, "aco_options")?, "gfx_level")? != GFX12 {
         return reject("aco_options.gfx_level != GFX12");
@@ -157,26 +196,48 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     let info = jget(cap, "radv_shader_info")?;
     let wave = ju64(info, "wave_size")?;
     if wave != ju64(kernel, "wave")? || wave != ju64(jget(cap, "aco_info")?, "wave_size")? {
-        return reject(format!("wave size mismatch: radv {wave}, aco {}, spec {}", ju64(jget(cap, "aco_info")?, "wave_size")?, ju64(kernel, "wave")?));
+        return reject(format!(
+            "wave size mismatch: radv {wave}, aco {}, spec {}",
+            ju64(jget(cap, "aco_info")?, "wave_size")?,
+            ju64(kernel, "wave")?
+        ));
     }
-    let local: Vec<u64> = jarr(kernel, "local_size")?.iter().filter_map(Value::as_u64).collect();
-    let block: Vec<u64> = jarr(info, "cs.block_size")?.iter().filter_map(Value::as_u64).collect();
+    let local: Vec<u64> = jarr(kernel, "local_size")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    let block: Vec<u64> = jarr(info, "cs.block_size")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
     if local != block {
         return reject(format!("block size {block:?} != spec local_size {local:?}"));
     }
     if jbool(info, "cs.uses_grid_size")? {
-        return reject("shader reads the dispatch grid size (AC_UD_CS_GRID_SIZE); HIP has no such SGPR");
+        return reject(
+            "shader reads the dispatch grid size (AC_UD_CS_GRID_SIZE); HIP has no such SGPR",
+        );
     }
     if !jarr(cap, "symbols")?.is_empty() {
-        return reject(format!("ACO emitted unresolved symbols {:?}", cap["symbols"]));
+        return reject(format!(
+            "ACO emitted unresolved symbols {:?}",
+            cap["symbols"]
+        ));
     }
 
     let cfg = jget(cap, "config")?;
     let aco_cfg = jget(cap, "aco_callback_config")?;
     for (name, c) in [("config", cfg), ("aco_callback_config", aco_cfg)] {
-        for f in ["spilled_sgprs", "spilled_vgprs", "scratch_bytes_per_wave", "num_shared_vgprs"] {
+        for f in [
+            "spilled_sgprs",
+            "spilled_vgprs",
+            "scratch_bytes_per_wave",
+            "num_shared_vgprs",
+        ] {
             if ju64(c, f)? != 0 {
-                return reject(format!("{name}.{f} != 0 (spills/scratch/shared VGPRs are not certifiable)"));
+                return reject(format!(
+                    "{name}.{f} != 0 (spills/scratch/shared VGPRs are not certifiable)"
+                ));
             }
         }
     }
@@ -194,13 +255,17 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     let vgprs_actual = ju64(ra, "vgprs")?;
     let sgprs_actual = ju64(ra, "sgprs")?;
     if vgprs_actual == 0 || vgprs_actual > vgprs_allocated {
-        return reject(format!("vgprs_actual {vgprs_actual} vs allocated {vgprs_allocated}"));
+        return reject(format!(
+            "vgprs_actual {vgprs_actual} vs allocated {vgprs_allocated}"
+        ));
     }
     // gfx10+ has no per-wave SGPR allocation field in RSRC1 (RADV writes SGPRS only for gfx<10); the
     // driver's final config.num_sgprs is the allocation RADV commits to.
     let sgprs_allocated = ju64(cfg, "num_sgprs")?;
     if sgprs_actual > sgprs_allocated {
-        return reject(format!("sgprs_actual {sgprs_actual} > final config.num_sgprs {sgprs_allocated}"));
+        return reject(format!(
+            "sgprs_actual {sgprs_actual} > final config.num_sgprs {sgprs_allocated}"
+        ));
     }
     let lds_bytes = ju64(cfg, "lds_size")?;
     let resources = json!({
@@ -218,7 +283,7 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     let slots = jarr(args, "args")?;
 
     let mut inline_slot_iter = 0usize; // i-th inline_push_consts slot <-> i-th set bit (radv_nir_apply_pipeline_layout.c:364)
-    // (phys sgpr index, dword index, field index in push_fields)
+                                       // (phys sgpr index, dword index, field index in push_fields)
     let mut inline_phys: Vec<(u64, u64)> = Vec::new();
     let mut sgpr_entries: Vec<(u64, Value)> = Vec::new();
     let mut vgpr_entries: Vec<Value> = Vec::new();
@@ -229,14 +294,24 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     for s in slots {
         let slot = ju64(s, "slot")?;
         if jbool(s, "skip")? {
-            return reject(format!("arg slot {slot} is `skip` (pixel-shader compaction); unexpected for compute"));
+            return reject(format!(
+                "arg slot {slot} is `skip` (pixel-shader compaction); unexpected for compute"
+            ));
         }
         let field = match s["field"].as_str() {
             Some(f) => f,
-            None => return reject(format!("arg slot {slot} (file {}, offset {}, size {}) has no named ac_arg field", s["file"], s["offset"], s["size"])),
+            None => {
+                return reject(format!(
+                    "arg slot {slot} (file {}, offset {}, size {}) has no named ac_arg field",
+                    s["file"], s["offset"], s["size"]
+                ))
+            }
         };
         if ju64(s, "field_alias_count")? != 1 {
-            return reject(format!("arg slot {slot} is aliased by {} named fields", s["field_alias_count"]));
+            return reject(format!(
+                "arg slot {slot} is aliased by {} named fields",
+                s["field_alias_count"]
+            ));
         }
         let offset = ju64(s, "offset")?;
         let size = ju64(s, "size")?;
@@ -246,11 +321,15 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
                 let is_user = offset < num_user;
                 if is_user {
                     if offset != last_user_end {
-                        return reject(format!("user SGPR slots are not contiguous at slot {slot}"));
+                        return reject(format!(
+                            "user SGPR slots are not contiguous at slot {slot}"
+                        ));
                     }
                     last_user_end = offset + size;
                 } else if offset != max_sgpr_end {
-                    return reject(format!("system SGPR slots are not contiguous at slot {slot}"));
+                    return reject(format!(
+                        "system SGPR slots are not contiguous at slot {slot}"
+                    ));
                 }
                 max_sgpr_end = max_sgpr_end.max(offset + size);
                 let mut e = json!({
@@ -293,33 +372,44 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
                 }
                 sgpr_entries.push((offset, e));
             }
-            "vgpr" => match field {
-                "ac.local_invocation_ids_packed" => {
-                    if size != 1 {
-                        return reject("packed local id VGPR is not 1 dword");
-                    }
-                    let mut fields = Vec::new();
-                    let mut layout = serde_json::Map::new();
-                    for (i, b) in block.iter().enumerate() {
-                        if *b > 1 {
-                            if *b > 1024 {
-                                return reject("block dimension > 1024");
-                            }
-                            fields.push(json!({"axis": axis(i), "shift": 10 * i, "bits": 10, "max": b - 1}));
-                            layout.insert(axis(i).to_owned(), json!({"shift": 10 * i, "bits": 10, "max": b - 1}));
+            "vgpr" => {
+                match field {
+                    "ac.local_invocation_ids_packed" => {
+                        if size != 1 {
+                            return reject("packed local id VGPR is not 1 dword");
                         }
-                    }
-                    let value = if fields.is_empty() { json!({"kind": "exact", "value": 0}) } else { json!({"kind": "local_id", "fields": fields}) };
-                    entry.push(json!({"loc": {"kind": "vgpr", "base": offset, "len": 1}, "value": value}));
-                    vgpr_entries.push(json!({
+                        let mut fields = Vec::new();
+                        let mut layout = serde_json::Map::new();
+                        for (i, b) in block.iter().enumerate() {
+                            if *b > 1 {
+                                if *b > 1024 {
+                                    return reject("block dimension > 1024");
+                                }
+                                fields.push(json!({"axis": axis(i), "shift": 10 * i, "bits": 10, "max": b - 1}));
+                                layout.insert(
+                                    axis(i).to_owned(),
+                                    json!({"shift": 10 * i, "bits": 10, "max": b - 1}),
+                                );
+                            }
+                        }
+                        let value = if fields.is_empty() {
+                            json!({"kind": "exact", "value": 0})
+                        } else {
+                            json!({"kind": "local_id", "fields": fields})
+                        };
+                        entry.push(json!({"loc": {"kind": "vgpr", "base": offset, "len": 1}, "value": value}));
+                        vgpr_entries.push(json!({
                         "phys": format!("v{offset}"), "vgpr_index": offset, "dwords": 1, "role": "local_id_packed", "source": "hw",
                         "layout": layout, "mesa_field": field,
                         "evidence": [format!("{SRC_ARGS}:588-590 (gfx11+/MI200: local_invocation_ids_packed in VGPR0)"),
                                      "src/amd/common/nir/ac_nir_lower_intrinsics_to_args.c:160-200 (10 bits per component, packed in VGPR0; upper_bound = (block-1) per axis)"]
                     }));
+                    }
+                    other => {
+                        return reject(format!("unsupported VGPR arg `{other}` (slot {slot})"))
+                    }
                 }
-                other => return reject(format!("unsupported VGPR arg `{other}` (slot {slot})")),
-            },
+            }
             f => return reject(format!("arg slot {slot}: unknown register file {f}")),
         }
     }
@@ -337,10 +427,16 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
         let size = ju64(f, "size")?;
         let kind = jstr(f, "kind")?;
         if off + size > push_size || off % 4 != 0 || size % 4 != 0 {
-            return reject(format!("push field {} is outside/misaligned in the {push_size}-byte block", f["name"]));
+            return reject(format!(
+                "push field {} is outside/misaligned in the {push_size}-byte block",
+                f["name"]
+            ));
         }
         let dwords: Vec<u64> = (off / 4..(off + size) / 4).collect();
-        let inlined: Vec<Option<u64>> = dwords.iter().map(|d| inline_phys.iter().find(|(_, dd)| dd == d).map(|(p, _)| *p)).collect();
+        let inlined: Vec<Option<u64>> = dwords
+            .iter()
+            .map(|d| inline_phys.iter().find(|(_, dd)| dd == d).map(|(p, _)| *p))
+            .collect();
         let present = inlined.iter().filter(|x| x.is_some()).count();
         if present == 0 {
             continue; // field never loaded by the shader
@@ -351,7 +447,10 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
         let first = inlined[0].unwrap();
         for (i, p) in inlined.iter().enumerate() {
             if p.unwrap() != first + i as u64 {
-                return reject(format!("push field `{}` dwords are not in consecutive SGPRs", f["name"]));
+                return reject(format!(
+                    "push field `{}` dwords are not in consecutive SGPRs",
+                    f["name"]
+                ));
             }
             covered.insert(dwords[i]);
         }
@@ -371,7 +470,10 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
     }
     for (_, d) in &inline_phys {
         if !covered.contains(d) {
-            return reject(format!("inlined push dword {d} (byte {}) belongs to no declared push field", d * 4));
+            return reject(format!(
+                "inlined push dword {d} (byte {}) belongs to no declared push field",
+                d * 4
+            ));
         }
         let _ = push_field_for_dword(push_fields, *d);
     }
@@ -384,7 +486,10 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
 
     // ---------------------------------------------------------------- hardware-initialised registers
     let mut hw: Vec<Value> = Vec::new();
-    let implicit: Vec<bool> = jarr(args, "gfx12_implicit_workgroup_ids")?.iter().map(|b| b.as_bool().unwrap_or(false)).collect();
+    let implicit: Vec<bool> = jarr(args, "gfx12_implicit_workgroup_ids")?
+        .iter()
+        .map(|b| b.as_bool().unwrap_or(false))
+        .collect();
     if implicit.len() != 3 {
         return reject("gfx12_implicit_workgroup_ids malformed");
     }
@@ -430,11 +535,18 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
         decoded["actual_source"] = ra["source"].clone();
         decoded["sgprs_allocated_source"] = json!("radv_postprocess_binary_config: MAX2(aco config.num_sgprs, args.num_sgprs_used + 2 + 3); gfx10+ has no RSRC1 SGPR allocation field");
         decoded["compute_resource_limits"] = regs["compute_resource_limits"].clone();
-        decoded["compute_num_thread"] = json!([regs["compute_num_thread_x"], regs["compute_num_thread_y"], regs["compute_num_thread_z"]]);
+        decoded["compute_num_thread"] = json!([
+            regs["compute_num_thread_x"],
+            regs["compute_num_thread_y"],
+            regs["compute_num_thread_z"]
+        ]);
         decoded
     };
 
-    let inline_dwords: Vec<Value> = inline_phys.iter().map(|(p, d)| json!({"dword": d, "byte_offset": d * 4, "phys": format!("s{p}")})).collect();
+    let inline_dwords: Vec<Value> = inline_phys
+        .iter()
+        .map(|(p, d)| json!({"dword": d, "byte_offset": d * 4, "phys": format!("s{p}")}))
+        .collect();
     let abi = json!({
         "schema": "pm-aco-abi-v1",
         "symbol": jstr(kernel, "symbol")?,
@@ -472,5 +584,14 @@ pub fn analyze(kernel: &Value, cap: &Value) -> Res<Analysis> {
         "unhandled_by_design": ["hardware ttmp8 (subgroup id) / other ttmp reads are NOT declared; the lift rejects an undefined read"],
     });
     let relocations: Vec<Value> = Vec::new(); // symbols were rejected above if any
-    Ok(Analysis { abi, entry, resources, fp, config, relocations, wave, arch })
+    Ok(Analysis {
+        abi,
+        entry,
+        resources,
+        fp,
+        config,
+        relocations,
+        wave,
+        arch,
+    })
 }

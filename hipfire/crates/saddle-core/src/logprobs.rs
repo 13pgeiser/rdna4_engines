@@ -128,7 +128,10 @@ mod tests {
     fn ordered_descending_and_truncated() {
         let logits = [1.0f32, 5.0, 3.0, 4.0, 2.0];
         let top = top_k_logprobs(&logits, 3);
-        assert_eq!(top.iter().map(|t| t.token_id).collect::<Vec<_>>(), vec![1, 3, 2]);
+        assert_eq!(
+            top.iter().map(|t| t.token_id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
         assert!(top[0].logprob > top[1].logprob && top[1].logprob > top[2].logprob);
     }
 
@@ -139,7 +142,11 @@ mod tests {
         let top = top_k_logprobs(&logits, 3);
         assert_eq!(top.len(), 3);
         assert!(top.iter().all(|t| t.logprob.is_finite()), "{top:?}");
-        assert!(top[0].logprob < 0.0 && top[0].logprob > -1.0, "{:?}", top[0]);
+        assert!(
+            top[0].logprob < 0.0 && top[0].logprob > -1.0,
+            "{:?}",
+            top[0]
+        );
     }
 
     #[test]
@@ -154,7 +161,10 @@ mod tests {
     fn nan_is_never_selected_as_most_likely() {
         let logits = [1.0f32, f32::NAN, 2.0];
         let top = top_k_logprobs(&logits, 3);
-        assert!(top.iter().all(|t| t.token_id != 1), "NaN token selected: {top:?}");
+        assert!(
+            top.iter().all(|t| t.token_id != 1),
+            "NaN token selected: {top:?}"
+        );
         assert_eq!(top[0].token_id, 2);
     }
 
@@ -174,7 +184,10 @@ mod tests {
             let direct = logprob_of(&logits, t.token_id).expect("finite");
             assert!((direct - t.logprob).abs() < 1e-6, "{t:?} vs {direct}");
         }
-        assert!(logprob_of(&logits, 99).is_none(), "out of range must be None");
+        assert!(
+            logprob_of(&logits, 99).is_none(),
+            "out of range must be None"
+        );
     }
 
     #[test]

@@ -63,7 +63,12 @@ fn main() -> ExitCode {
     let Some(hipcc) = toolchain.compiler.clone() else {
         return fail(
             "the ROCm HIP compiler (hipcc)",
-            &[toolchain.root.join("bin").join("hipcc").display().to_string()],
+            &[toolchain
+                .root
+                .join("bin")
+                .join("hipcc")
+                .display()
+                .to_string()],
         );
     };
 

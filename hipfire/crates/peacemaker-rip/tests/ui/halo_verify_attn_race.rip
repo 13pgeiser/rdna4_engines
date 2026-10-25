@@ -13,6 +13,9 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     p.s::<8>("scalars", 0, Live::Whole)?;
     let mut b = Builder::new(kspec, p);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    // registers initialized so the fixture is definedness-clean (R0604)
+    for r in [1, 2, 3, 4, 5, 6] { op(wg.isa(), format!("v_mov_b32_e32 v{r}, 0"), &[v(r)], &[])?; }
+    sop(wg.isa(), "s_mov_b32 s4, 0", &[4], &[])?;
     let k0 = wg.lds::<KTile>("K0", 0, 8704)?;
     let k1 = wg.lds::<KTile>("K1", 8704, 8704)?;
     let (ring, st) = wg.ds_store(Ring::new(k0, k1), Instruction::new("ds_store_b128 v1, v[2:5]", vec![], vec![v(1), vr(2,4)]).memory(MemoryClass::DsStore))?;

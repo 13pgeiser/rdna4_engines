@@ -170,6 +170,9 @@ fn main() -> Result<(), String> {
         qwen_default_q8: true,
         cask: &cask,
         pp: 1,
+        pp_layer_counts: None,
+        admitted_mesh: None,
+        band_placement: None,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
         gemma4_drafter_path: None,
@@ -178,6 +181,7 @@ fn main() -> Result<(), String> {
         mtp_path: None,
         vision_mode: "auto".to_string(),
         xdna: None,
+        batch_request: Default::default(),
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;
 
@@ -406,7 +410,7 @@ fn main() -> Result<(), String> {
             max_seq,
             conf_threshold,
             true, // llama supports sampled verify → temp>0 testable
-            0.5,
+            hipfire_runtime::dspark_block_controller::WindowCost::Measured { max_ratio: 0.5 },
         )
     } else {
         // n-gram (or DSpark fallback when sidecar absent).

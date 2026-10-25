@@ -21,7 +21,8 @@ file_edition() {
   sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9]*\)".*/\1/p' Cargo.toml | head -1
 }
 
-# The repository still has historical rustfmt debt. Keep PR/push lint useful by
+# master still has historical rustfmt debt (beta is clean since the 0.4.3 sweep;
+# the workspace-wide check is `cargo-fmt --all -- --check`). Keep PR/push lint useful by
 # enforcing rustfmt on the Rust files changed by this branch or push, without
 # turning untouched legacy formatting into a permanent red check.
 

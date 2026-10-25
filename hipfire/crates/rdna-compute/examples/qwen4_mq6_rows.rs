@@ -102,7 +102,11 @@ fn mq6_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
     for g in w.chunks_exact_mut(GROUP_BYTES) {
         for h in 0..2 {
             let mut sc = half(&mut r, 6, 10);
-            let zp = half(&mut r, ((sc >> 10) & 31) as u64 + 3, ((sc >> 10) & 31) as u64 + 6);
+            let zp = half(
+                &mut r,
+                ((sc >> 10) & 31) as u64 + 3,
+                ((sc >> 10) & 31) as u64 + 6,
+            );
             if r.below(32) == 0 {
                 sc &= 0x8000;
             }
@@ -156,13 +160,19 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn rows_default() -> Vec<usize> {
     let mut v: Vec<usize> = (1..=64).collect();
     v.extend((16..=1024).step_by(16));
-    v.extend([255, 256, 257, 511, 512, 513, 1023, 1025, 2047, 2048, 2049, 4095, 4096, 4097, 8191]);
+    v.extend([
+        255, 256, 257, 511, 512, 513, 1023, 1025, 2047, 2048, 2049, 4095, 4096, 4097, 8191,
+    ]);
     v.sort_unstable();
     v.dedup();
     v
@@ -255,11 +265,46 @@ struct Shape {
 }
 
 const SHAPES: &[Shape] = &[
-    Shape { name: "gdn_qkv_bf16", ms: &[10240], k: 2560, bf16_first: true, members: None, hcw: None },
-    Shape { name: "gdn_qkv_f32", ms: &[10240], k: 2560, bf16_first: false, members: None, hcw: None },
-    Shape { name: "gdn_z", ms: &[6144], k: 2560, bf16_first: false, members: None, hcw: None },
-    Shape { name: "gdn_ab", ms: &[48], k: 2560, bf16_first: false, members: None, hcw: None },
-    Shape { name: "gdn_zba", ms: &[6144, 48, 48], k: 2560, bf16_first: false, members: Some(&[true, true, true]), hcw: None },
+    Shape {
+        name: "gdn_qkv_bf16",
+        ms: &[10240],
+        k: 2560,
+        bf16_first: true,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "gdn_qkv_f32",
+        ms: &[10240],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "gdn_z",
+        ms: &[6144],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "gdn_ab",
+        ms: &[48],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "gdn_zba",
+        ms: &[6144, 48, 48],
+        k: 2560,
+        bf16_first: false,
+        members: Some(&[true, true, true]),
+        hcw: None,
+    },
     Shape {
         name: "gdn_in_group",
         ms: &[10240, 6144, 48, 48],
@@ -268,12 +313,54 @@ const SHAPES: &[Shape] = &[
         members: Some(&[false, true, true, true]),
         hcw: None,
     },
-    Shape { name: "gdn_out", ms: &[2560], k: 6144, bf16_first: false, members: None, hcw: None },
-    Shape { name: "gdn_out_hcw_bf16", ms: &[2560], k: 6144, bf16_first: false, members: None, hcw: Some(true) },
-    Shape { name: "gdn_out_hcw_f32", ms: &[2560], k: 6144, bf16_first: false, members: None, hcw: Some(false) },
-    Shape { name: "qsa_q", ms: &[12288], k: 2560, bf16_first: false, members: None, hcw: None },
-    Shape { name: "qsa_kv", ms: &[512], k: 2560, bf16_first: false, members: None, hcw: None },
-    Shape { name: "qsa_idx", ms: &[640], k: 2560, bf16_first: false, members: None, hcw: None },
+    Shape {
+        name: "gdn_out",
+        ms: &[2560],
+        k: 6144,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "gdn_out_hcw_bf16",
+        ms: &[2560],
+        k: 6144,
+        bf16_first: false,
+        members: None,
+        hcw: Some(true),
+    },
+    Shape {
+        name: "gdn_out_hcw_f32",
+        ms: &[2560],
+        k: 6144,
+        bf16_first: false,
+        members: None,
+        hcw: Some(false),
+    },
+    Shape {
+        name: "qsa_q",
+        ms: &[12288],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "qsa_kv",
+        ms: &[512],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
+    Shape {
+        name: "qsa_idx",
+        ms: &[640],
+        k: 2560,
+        bf16_first: false,
+        members: None,
+        hcw: None,
+    },
 ];
 
 /// Device state of one shape, sized for the largest batch.
@@ -309,7 +396,11 @@ impl State {
                 }
             }
         }
-        let gates = if sd.hcw.is_some() { Some(gpu.zeros(&[tmax * 4], DType::F32)?) } else { None };
+        let gates = if sd.hcw.is_some() {
+            Some(gpu.zeros(&[tmax * 4], DType::F32)?)
+        } else {
+            None
+        };
         Ok(State {
             w,
             outs,
@@ -358,16 +449,18 @@ fn project(
 ) -> Res<(&'static str, Option<&'static str>)> {
     let k = sd.k;
     let n = sd.ms.len();
-    let projs: Vec<(&GpuTensor, &GpuTensor, usize)> =
-        (0..n).map(|i| (&st.w[i], &st.outs[i].0, sd.ms[i])).collect();
+    let projs: Vec<(&GpuTensor, &GpuTensor, usize)> = (0..n)
+        .map(|i| (&st.w[i], &st.outs[i].0, sd.ms[i]))
+        .collect();
     if gpu.gemm_mq6g256v2_xf16_applies(k, gpu.route_rows(rows)) {
         let x16 = gpu.rotate_x_mq_batched_f16(&st.x, k, rows)?;
         note(gpu, kernels);
         let mut done = vec![false; n];
         let mut route = "xf16";
         if let (Some(members), true) = (sd.members, gpu.qwen4_mq6_x4_regions()) {
-            let idx: Vec<usize> =
-                (0..n).filter(|&j| members[j] && !(j == 0 && sd.bf16_first)).collect();
+            let idx: Vec<usize> = (0..n)
+                .filter(|&j| members[j] && !(j == 0 && sd.bf16_first))
+                .collect();
             if idx.len() == 3 {
                 let regions = [projs[idx[0]], projs[idx[1]], projs[idx[2]]];
                 if gpu.gemm_mq6g256v2_xf16_regions(&regions, &x16, k, rows)? {
@@ -431,24 +524,32 @@ fn exec(gpu: &mut Gpu, sd: &Shape, st: &State, pl: &Pools<'_>, o: usize, t0: usi
     let rows = o + t0;
     let k = sd.k;
     if o > 0 {
-        gpu.hip.memcpy_htod_offset(&st.x.buf, 0, bytes_of(&pl.x_fill[..o * k]))?;
+        gpu.hip
+            .memcpy_htod_offset(&st.x.buf, 0, bytes_of(&pl.x_fill[..o * k]))?;
     }
-    gpu.hip.memcpy_htod_offset(&st.x.buf, o * k * 4, bytes_of(&pl.x_base[..t0 * k]))?;
+    gpu.hip
+        .memcpy_htod_offset(&st.x.buf, o * k * 4, bytes_of(&pl.x_base[..t0 * k]))?;
     let mut kernels = Vec::new();
     let (route, skip): (&'static str, Option<&'static str>) = if let Some(bf16_state) = sd.hcw {
         let (out, rb, _) = &st.outs[0];
         let gates = st.gates.as_ref().ok_or("hcw gates missing")?;
         if o > 0 {
-            gpu.hip.memcpy_htod_offset(&out.buf, 0, &pl.s_fill[..o * rb])?;
-            gpu.hip.memcpy_htod_offset(&gates.buf, 0, bytes_of(&pl.g_fill[..o * 4]))?;
+            gpu.hip
+                .memcpy_htod_offset(&out.buf, 0, &pl.s_fill[..o * rb])?;
+            gpu.hip
+                .memcpy_htod_offset(&gates.buf, 0, bytes_of(&pl.g_fill[..o * 4]))?;
         }
-        gpu.hip.memcpy_htod_offset(&out.buf, o * rb, &pl.s_base[..t0 * rb])?;
-        gpu.hip.memcpy_htod_offset(&gates.buf, o * 16, bytes_of(&pl.g_base[..t0 * 4]))?;
+        gpu.hip
+            .memcpy_htod_offset(&out.buf, o * rb, &pl.s_base[..t0 * rb])?;
+        gpu.hip
+            .memcpy_htod_offset(&gates.buf, o * 16, bytes_of(&pl.g_base[..t0 * 4]))?;
         let m = sd.ms[0];
         if gpu.gemm_mq6g256v2_hcw_applies(m, k, gpu.route_rows(rows)) {
             let x16 = gpu.rotate_x_mq_batched_f16(&st.x, k, rows)?;
             note(gpu, &mut kernels);
-            gpu.gemm_mq6g256v2_hcw(&st.w[0], &x16, true, None, m, k, rows, out, gates, bf16_state)?;
+            gpu.gemm_mq6g256v2_hcw(
+                &st.w[0], &x16, true, None, m, k, rows, out, gates, bf16_state,
+            )?;
             note(gpu, &mut kernels);
             ("hcw", None)
         } else {
@@ -469,7 +570,12 @@ fn exec(gpu: &mut Gpu, sd: &Shape, st: &State, pl: &Pools<'_>, o: usize, t0: usi
             outs.push(v);
         }
     }
-    Ok(Run { outs, kernels, route, skip })
+    Ok(Run {
+        outs,
+        kernels,
+        route,
+        skip,
+    })
 }
 
 /// First differing output of `run` against `want` (the reference's rows).
@@ -517,7 +623,11 @@ fn main() -> Res<()> {
 
     let mut gpu = Gpu::init()?;
     if gpu.arch != "gfx1151" {
-        return Err(format!("the MQ6 prefill route sweep is gfx1151-only, device is {}", gpu.arch).into());
+        return Err(format!(
+            "the MQ6 prefill route sweep is gfx1151-only, device is {}",
+            gpu.arch
+        )
+        .into());
     }
     // What `Qwen4GpuForward::forward_chunk_scoped` sets for the forward.
     gpu.qwen4_scope = true;
@@ -542,18 +652,32 @@ fn main() -> Res<()> {
         }
         let st = State::new(&mut gpu, sd, seed, si, tmax)?;
         xpools.entry(sd.k).or_insert_with(|| {
-            (gen_rows(seed, 0, ref_rows, sd.k, DOMAIN_X), gen_rows(seed, FILL_BASE, omax, sd.k, DOMAIN_X))
+            (
+                gen_rows(seed, 0, ref_rows, sd.k, DOMAIN_X),
+                gen_rows(seed, FILL_BASE, omax, sd.k, DOMAIN_X),
+            )
         });
         let (xb, xf) = &xpools[&sd.k];
-        let (mut s_base, mut s_fill, mut g_base, mut g_fill) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut s_base, mut s_fill, mut g_base, mut g_fill) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         if let Some(bf16_state) = sd.hcw {
             let width = 4 * sd.ms[0];
             s_base = to_bytes(&gen_rows(seed, 0, ref_rows, width, DOMAIN_S), bf16_state);
-            s_fill = to_bytes(&gen_rows(seed, FILL_BASE, omax, width, DOMAIN_S), bf16_state);
+            s_fill = to_bytes(
+                &gen_rows(seed, FILL_BASE, omax, width, DOMAIN_S),
+                bf16_state,
+            );
             g_base = gen_rows(seed, 0, ref_rows, 4, DOMAIN_G);
             g_fill = gen_rows(seed, FILL_BASE, omax, 4, DOMAIN_G);
         }
-        let pl = Pools { x_base: xb, x_fill: xf, s_base: &s_base, s_fill: &s_fill, g_base: &g_base, g_fill: &g_fill };
+        let pl = Pools {
+            x_base: xb,
+            x_fill: xf,
+            s_base: &s_base,
+            s_fill: &s_fill,
+            g_base: &g_base,
+            g_fill: &g_fill,
+        };
 
         let mut prev: Option<Run> = None;
         for &scope in &scopes {
@@ -616,7 +740,14 @@ fn main() -> Res<()> {
                         }
                         Ok(run) => {
                             let d = compare(&st, &run, &rf, r);
-                            (if d.is_some() { "differs" } else { "identical" }, d, run.route, None, run.kernels, None)
+                            (
+                                if d.is_some() { "differs" } else { "identical" },
+                                d,
+                                run.route,
+                                None,
+                                run.kernels,
+                                None,
+                            )
                         }
                         Err(e) => ("error", None, "?", None, Vec::new(), Some(e)),
                     };
@@ -647,7 +778,10 @@ fn main() -> Res<()> {
             gpu.free_tensor(g)?;
         }
     }
-    println!("{}", json!({"event": "summary", "runs": runs, "differing_or_error": fails, "skipped": skips}));
+    println!(
+        "{}",
+        json!({"event": "summary", "runs": runs, "differing_or_error": fails, "skipped": skips})
+    );
     if fails > 0 {
         std::process::exit(1);
     }

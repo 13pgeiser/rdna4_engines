@@ -28,5 +28,8 @@ fn main() {
     let barrier = b.text.iter().position(|t| t == "s_barrier").unwrap();
     assert_eq!(b.text[barrier - 1], "s_waitcnt lgkmcnt(0)");
     assert_eq!((b.count("s_waitcnt"), b.count("s_barrier")), (1, 1));
-    assert_eq!(b.text.last().map(String::as_str), Some("s_cbranch_scc1 .Lk_tile"));
+    assert_eq!(
+        b.text.last().map(String::as_str),
+        Some("s_cbranch_scc1 .Lk_tile")
+    );
 }

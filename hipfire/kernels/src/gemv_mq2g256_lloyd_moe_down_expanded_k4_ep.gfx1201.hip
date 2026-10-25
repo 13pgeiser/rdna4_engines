@@ -20,7 +20,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx1201_ep(
     float* __restrict__ expert_outputs,
     int M,
     int K,
-    int K_TOP
+    int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -30,6 +30,11 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx1201_ep(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0)
+            expert_outputs[(long long)bid * K_TOP * M + (long long)krank * M + row] = 0.0f;
+        return;
+    }
     const long long output_index =
         (long long)bid * K_TOP * M + (long long)krank * M + row;
     if (reinterpret_cast<const void*>(ownership_ptrs[expert_id]) == nonowned_dummy) {

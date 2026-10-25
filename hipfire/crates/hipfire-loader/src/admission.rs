@@ -12,11 +12,21 @@
 //! mutation.
 
 use crate::Carrier;
+pub use hipfire_arch_qwen4::admission::{
+    qwen4_pp_band_budget, qwen4_pp_edge_max_bytes, Qwen4PpBudgetInputs, Qwen4PpRankFit,
+    QWEN4_PP_RESERVE_BYTES,
+};
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
+use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
+pub use hipfire_runtime::loader_api::BatchLoadRequest;
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
+use hipfire_runtime::mesh_placement::{
+    pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
+    EdgeTransportPolicy,
+};
 fn qwen4_vision_tensor_name(name: &str) -> bool {
     [
         "model.visual.",
@@ -215,14 +225,16 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 }
 
 /// Whether a Qwen4 load attaches its native MTP head. The executable HFQM
-/// manifest always carries the validated head, so `auto` (`None`) attaches it
-/// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
+/// manifest always carries the validated head, and Qwen4 declares a measured
+/// AR floor ([`hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR`]), so `auto`
+/// (`None`) attaches it and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
-/// Under expert parallelism (`ep` > 1) the head is attached only on an explicit
-/// request: `Some(true)` admits it (the drafter is replicated on every rank),
-/// while `auto` (`None`) and `Some(false)` stay AR, so the EP default and
-/// flag-off bytes are unchanged.
+/// Under expert parallelism (`ep` > 1) and pipeline parallelism (`pp` > 1) the
+/// head is attached only on an explicit request: `Some(true)` admits it (EP:
+/// the drafter is replicated on every rank; PP: the output band owns the one
+/// head), while `auto` (`None`) and `Some(false)` stay AR, so the EP/PP
+/// default and flag-off bytes are unchanged.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
@@ -231,20 +243,42 @@ pub(crate) fn qwen4_native_mtp(
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
-    if ep > 1 {
+    if pp > 1 || ep > 1 {
         return Ok(spec.mtp == Some(true));
     }
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    match spec.mtp {
-        Some(false) => Ok(false),
-        Some(true) if retained => Err(
-            "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+    qwen4_native_mtp_for_floor(
+        spec.mtp,
+        retained,
+        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR,
+    )
+}
+
+/// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
+/// producer's declared measured AR floor passed in, so the table is testable
+/// without a GPU. `auto` attaches only when the producer declared the floor
+/// ([`hipfire_config::mtp_mode_admits`]) and the load is not the retained
+/// default; explicit `on` ignores the floor and refuses the retained default.
+pub(crate) fn qwen4_native_mtp_for_floor(
+    spec_mtp: Option<bool>,
+    retained: bool,
+    measured_ar_floor: bool,
+) -> Result<bool, String> {
+    use hipfire_config::MtpMode;
+    match MtpMode::from_tri_state(spec_mtp) {
+        MtpMode::Off => Ok(false),
+        MtpMode::On if retained => Err(
+            "qwen4: native MTP (speculation.mtp = on) cannot be used with the MQ4R pre-recorded \
+             launch path (retained Redline) this model would run on. Set speculation.mtp = off, \
+             or load the non-MQ4R HFQM build of this model"
                 .into(),
         ),
-        Some(true) => Ok(true),
-        None => Ok(!retained),
+        MtpMode::On => Ok(true),
+        auto @ MtpMode::Auto => {
+            Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor))
+        }
     }
 }
 
@@ -322,11 +356,7 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    let mode = match spec.mtp {
-        Some(true) => hipfire_config::MtpMode::On,
-        Some(false) => hipfire_config::MtpMode::Off,
-        None => hipfire_config::MtpMode::Auto,
-    };
+    let mode = hipfire_config::MtpMode::from_tri_state(spec.mtp);
     hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
 }
 
@@ -372,6 +402,12 @@ pub(crate) fn partial_offload_refusal(
         let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
             .map_err(|e| format!("qwen35 config: {e}"))?;
         (config.paged_experts, config.reap_keep.is_some())
+    } else if arch_id == 11 {
+        // LFM2.5 parses its own REAP keep-map inside `Lfm2MoeConfig::from_hfq`
+        // (`apply_reap_plan`). It has no paged-expert route.
+        let config = hipfire_arch_lfm2moe::Lfm2MoeConfig::from_hfq(hfq)
+            .map_err(|e| format!("lfm2moe config: {e}"))?;
+        (false, config.reap_keep.is_some())
     } else {
         (false, false)
     };
@@ -387,12 +423,13 @@ pub(crate) fn partial_offload_refusal(
 fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
     use hipfire_config::memory::SpillRefusal::*;
     match refusal {
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
-        // RAM. Qwen4 has its own expert-residency route and the other arches have
-        // none, so either knob is a request this loader cannot honour.
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
             "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
-             only; this source is arch id {arch_id}. Unset both keys for this model"
+             and LFM2.5 only; this source is arch id {arch_id}. Unset both keys for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
@@ -401,8 +438,8 @@ fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &s
         ),
         Pp(pp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
-             pp={pp} would place the first pipeline band's spilled weights in host RAM mapped by \
-             device 0, which has never been run. Unset both keys for this model"
+             pp={pp} would put the first pipeline stage's spilled weights in host RAM, which is \
+             not supported yet. Unset both keys for this model"
         ),
         ExpertParallel(_) => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with expert parallelism \
@@ -411,16 +448,16 @@ fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &s
         ),
         VisionTower => format!(
             "load refused: partial GPU offload ({keys}) cannot place the Qwen3.5-VL vision tower, \
-             which loads through its own lowered loader. Unset both keys for this model"
+             which is loaded by a separate path. Unset both keys for this model"
         ),
         PagedExperts => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with paged experts — \
-             the weight pager owns those buffers and would move them behind the placement's back. \
-             Unset both keys for this model"
+             the weight pager manages those buffers itself and would conflict with the \
+             placement. Unset both keys for this model"
         ),
         ReapKeepMap => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
-             the pruned expert load has no host-placement path. Unset both keys for this model"
+             a pruned-expert model has no host-placement path. Unset both keys for this model"
         ),
     }
 }
@@ -451,22 +488,46 @@ pub fn qwen4_request_admission(
         Qwen4Capabilities::text_ar()
     };
     if !capabilities.supports_modality(modality) {
-        return Err(format!("qwen4: unsupported modality {modality:?}"));
+        return Err(format!(
+            "qwen4: {modality:?} input is not supported by this model route; Qwen4 loads accept \
+             text only"
+        ));
     }
     if native_mtp && !capabilities.native_mtp {
-        return Err("qwen4: native MTP is not supported by this source".into());
+        return Err(
+            "qwen4: native MTP is not supported by this model file; set speculation.mtp = off"
+                .into(),
+        );
     }
     if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
-            "qwen4: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
+            "qwen4: this parallelism combination is not supported (topology.pp={}, tp={}, ep={}). \
+             Use pp=1 and tp=1 with topology.ep from 1 to 8, or tp=1 and ep=1 with topology.pp \
+             from 2 to 8",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
         ));
     }
     Ok(())
 }
 
-/// Qwen4 expert parallelism needs exact gfx1201 cards (the EP gather and the
-/// grouped MoE route are certified there) and one visible device per rank.
+/// Exact architectures Qwen4 expert parallelism is admitted on: the EP gather
+/// and the grouped MoE route are certified on gfx1100 (7900 XTX) and gfx1201
+/// (R9700). Every rank must be the SAME one of them (homogeneous).
+pub const QWEN4_EP_ARCHS: [&str; 2] = ["gfx1100", "gfx1201"];
+
+/// Under the developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) the
+/// ranks also run aliased on gfx1151 (Strix Halo has one GPU): that proves
+/// byte parity and lifecycle on one device, never a physical EP admission.
+const QWEN4_EP_EMULATED_ARCHS: [&str; 1] = ["gfx1151"];
+
+fn qwen4_ep_arch_admitted(arch: &str, emulated: bool) -> bool {
+    QWEN4_EP_ARCHS.contains(&arch) || (emulated && QWEN4_EP_EMULATED_ARCHS.contains(&arch))
+}
+
+/// Qwen4 expert parallelism needs `ep` ranks of one exact, homogeneous
+/// gfx1100 or gfx1201 arch and one visible device per rank (or, under the
+/// developer-only logical emulation `HIPFIRE_EMULATE_GPUS`, at least one
+/// physical device that the ranks alias onto).
 /// Pre-allocation check from what admission already knows: the daemon's own
 /// device architecture and the visible device count (`None` skips the count,
 /// as in [`visible_device_count`]). `ep <= 1` never refuses. Per-device
@@ -478,6 +539,7 @@ pub(crate) fn qwen4_ep_geometry_refusal(
     tp: usize,
     gpu_arch: &str,
     n_devices: Option<usize>,
+    emulated: bool,
 ) -> Option<String> {
     if ep <= 1 {
         return None;
@@ -487,47 +549,116 @@ pub(crate) fn qwen4_ep_geometry_refusal(
             "qwen4: expert parallelism (topology.ep = {ep}) cannot combine with pipeline/tensor parallelism (pp={pp}, tp={tp})"
         ));
     }
-    if gpu_arch != "gfx1201" {
+    if !qwen4_ep_arch_admitted(gpu_arch, emulated) {
         return Some(format!(
-            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; device 0 is {gpu_arch}"
+            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank \
+             (gfx1151 only under HIPFIRE_EMULATE_GPUS); device 0 is {gpu_arch}"
         ));
     }
+    let needed = if emulated { 1 } else { ep };
     match n_devices {
-        Some(n) if n < ep => Some(format!(
-            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {n} visible \
-             (hardware.devices / HIPFIRE_DEVICES)"
-        )),
+        Some(n) if n < needed => Some(if emulated {
+            format!(
+                "qwen4: logical expert parallelism emulation (topology.ep = {ep}) needs at least 1 visible device, {n} visible"
+            )
+        } else {
+            format!(
+                "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {n} visible \
+                 (hardware.devices / HIPFIRE_DEVICES)"
+            )
+        }),
         _ => None,
     }
 }
 
-/// Pure core of [`qwen4_ep_preflight`]: `archs[r]` is rank `r`'s device
+/// Rank -> physical HIP device table for `ep` ranks over `physical_count`
+/// visible devices. Physical mode: rank `r` runs on device `r` and `ep`
+/// devices must be visible. Emulated (`HIPFIRE_EMULATE_GPUS`, developer-only):
+/// rank `r` runs on physical device `r % physical_count` (the
+/// `multi_gpu` alias rule) and one physical device is enough.
+pub fn qwen4_ep_rank_devices(
+    ep: usize,
+    physical_count: usize,
+    emulated: bool,
+) -> Result<Vec<i32>, String> {
+    let ids: Vec<i32> = (0..ep as i32).collect();
+    if emulated {
+        if physical_count == 0 {
+            return Err(format!(
+                "qwen4: logical expert parallelism emulation (topology.ep = {ep}) needs at least 1 visible device, 0 visible"
+            ));
+        }
+        Ok(hipfire_runtime::multi_gpu::alias_ids(
+            &ids,
+            physical_count as i32,
+        ))
+    } else if physical_count < ep {
+        Err(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {physical_count} visible"
+        ))
+    } else {
+        Ok(ids)
+    }
+}
+
+/// Pure core of [`qwen4_ep_preflight`]: `devices[r]` is rank `r`'s physical
+/// device (see [`qwen4_ep_rank_devices`]), `archs[d]` is physical device `d`'s
 /// architecture; `peer(a, b)` is whether device `a` can access device `b`.
-/// Every rank must be gfx1201 and every directed pair must be accessible.
+/// Every rank's device must be the same exact gfx1100 or gfx1201 arch (or,
+/// with `emulated`, gfx1151) as rank 0's, and every directed pair of DISTINCT
+/// physical devices must be accessible (ranks aliased onto one device need no
+/// peer access).
 pub fn qwen4_ep_device_refusal(
     ep: usize,
+    devices: &[i32],
     archs: &[String],
+    emulated: bool,
     mut peer: impl FnMut(usize, usize) -> Result<bool, String>,
 ) -> Result<(), String> {
-    if archs.len() < ep {
+    if devices.len() < ep {
         return Err(format!(
-            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {} visible",
-            archs.len()
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} rank devices, {} mapped",
+            devices.len()
         ));
     }
-    for (rank, arch) in archs.iter().take(ep).enumerate() {
-        if arch != "gfx1201" {
+    let mut arch_of = Vec::with_capacity(ep);
+    for &device in devices.iter().take(ep) {
+        match usize::try_from(device).ok().and_then(|d| archs.get(d)) {
+            Some(arch) => arch_of.push(arch),
+            None => {
+                return Err(format!(
+                    "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {} visible",
+                    archs.len()
+                ));
+            }
+        }
+    }
+    let first = arch_of[0];
+    for (rank, arch) in arch_of.iter().enumerate() {
+        if !qwen4_ep_arch_admitted(arch, emulated) {
             return Err(format!(
-                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; rank {rank} is {arch}"
+                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank \
+                 (gfx1151 only under HIPFIRE_EMULATE_GPUS); rank {rank} is {arch}"
+            ));
+        }
+        if *arch != first {
+            return Err(format!(
+                "qwen4: expert parallelism (topology.ep = {ep}) requires the same architecture on every rank; rank 0 is {first}, rank {rank} is {arch}"
             ));
         }
     }
+    let mut probed: Vec<(i32, i32)> = Vec::new();
     for from in 0..ep {
         for to in 0..ep {
-            if from != to && !peer(from, to)? {
+            let (a, b) = (devices[from], devices[to]);
+            if a == b || probed.contains(&(a, b)) {
+                continue;
+            }
+            probed.push((a, b));
+            if !peer(a as usize, b as usize)? {
                 return Err(format!(
                     "qwen4: expert parallelism (topology.ep = {ep}) needs peer access between every pair of ranks; \
-                     device {from} cannot access device {to}"
+                     device {a} cannot access device {b}"
                 ));
             }
         }
@@ -535,15 +666,19 @@ pub fn qwen4_ep_device_refusal(
     Ok(())
 }
 
-/// Load-time EP device check with real devices: devices `0..ep` of this
-/// process's HIP view (the `hardware.devices` order) must be visible, all
-/// gfx1201, and every directed pair must report `hipDeviceCanAccessPeer`.
-/// Returns the rank → HIP device id table (`rank r` runs on device `r`).
+/// Load-time EP device check with real devices: the rank devices
+/// ([`qwen4_ep_rank_devices`]: devices `0..ep` of this process's HIP view, in
+/// the `hardware.devices` order, or the `r % device_count` aliases under
+/// `HIPFIRE_EMULATE_GPUS`) must be visible, share one exact gfx1100 or gfx1201
+/// arch, and every directed pair of distinct devices must report
+/// `hipDeviceCanAccessPeer`. Returns the rank → HIP device id table.
 pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec<i32>, String> {
     let count = hip
         .device_count()
         .map_err(|error| format!("qwen4: EP device count: {error}"))?
         .max(0) as usize;
+    let emulated = hipfire_runtime::config::get().emulate_gpus.is_some();
+    let devices = qwen4_ep_rank_devices(ep, count, emulated)?;
     let archs = (0..count.min(ep))
         .map(|device| {
             hip.get_arch(device as i32)
@@ -551,11 +686,11 @@ pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec
                 .map_err(|error| format!("qwen4: EP device {device} arch: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    qwen4_ep_device_refusal(ep, &archs, |from, to| {
+    qwen4_ep_device_refusal(ep, &devices, &archs, emulated, |from, to| {
         hip.can_access_peer(from as i32, to as i32)
             .map_err(|error| format!("qwen4: EP peer query {from}->{to}: {error}"))
     })?;
-    Ok((0..ep as i32).collect())
+    Ok(devices)
 }
 
 /// The expert-parallel degree a loaded model of `arch_id` runs with: `1`
@@ -571,9 +706,9 @@ pub fn effective_ep(arch_id: u32) -> usize {
 }
 
 /// Device memory a Qwen4 load keeps free beyond the growth it can name
-/// (context pages, gather workspace, native MTP request buffers): the
-/// first long request's other lazy allocations (measured ~1.9 GiB on Strix
-/// Halo with 8192-row chunks), kernel-cache warmup and VMM page rounding.
+/// (context pages, gather workspace, native MTP request buffers): the first
+/// long request's other lazy allocations (measured ~1.9 GiB on Strix Halo
+/// with 8192-row chunks), kernel-cache warmup and VMM page rounding.
 pub const QWEN4_MEMORY_HEADROOM_BYTES: u64 = 2 << 30;
 
 /// Smallest context an automatic Qwen4 load accepts.
@@ -586,14 +721,25 @@ pub struct Qwen4MemoryAdmission {
     /// Free device memory once the load's own allocations are made.
     pub free: u64,
     /// Target and MTP-head QSA context arenas still unmapped through
-    /// `max_seq` (VMM storage maps them as forwards reach them).
+    /// `max_seq` (VMM storage maps them as forwards reach them), including
+    /// the opt-in F16 arena of the QSA layers.
     pub context_growth: u64,
     /// Gathered QSA prefill workspace still uncommitted through `max_seq`.
     pub gather_growth: u64,
     /// Buffers the first native MTP request allocates and keeps.
     pub mtp_request: u64,
+    /// The PLE page cache budget the PLE prewarm / in-load fill was asked
+    /// to keep resident at serve time (0 when no PLE rows are cached).
+    pub ple_budget: u64,
+    /// The PLE page cache budget admitted: `ple_budget` shrunk to what the
+    /// free memory leaves after the context, the gather workspace, the MTP
+    /// request buffers and the headroom. On unified memory the page cache
+    /// counts as free memory but is reclaimable, so it yields to the
+    /// context; this is 0 when only the context itself fits.
+    pub resident_ple: u64,
     pub headroom: u64,
-    /// Largest context whose growth fits (at most the assembled capacity).
+    /// Largest context whose growth fits with no PLE page cache resident
+    /// (at most the assembled capacity).
     pub card_cap: usize,
     /// The admitted context.
     pub max_seq: usize,
@@ -606,6 +752,20 @@ impl Qwen4MemoryAdmission {
             .saturating_add(self.gather_growth)
             .saturating_add(self.mtp_request)
     }
+
+    /// What must be free after load: [`Self::growth`] plus the admitted
+    /// resident PLE and the headroom.
+    pub fn required(&self) -> u64 {
+        self.growth()
+            .saturating_add(self.resident_ple)
+            .saturating_add(self.headroom)
+    }
+
+    /// Whether the context took part of the requested PLE page cache budget
+    /// (`resident_ple` < `ple_budget`).
+    pub fn ple_shrunk(&self) -> bool {
+        self.resident_ple < self.ple_budget
+    }
 }
 
 /// Admit what a Qwen4 load commits after load against the `free` device
@@ -613,18 +773,22 @@ impl Qwen4MemoryAdmission {
 /// pages and the gathered workspace through a context of `t` tokens
 /// (`growth(t)` = `(context, gather)`, monotone, assembled for `capacity`
 /// tokens) and the native MTP request buffers. `card_cap` is the largest
-/// context that fits. An automatic load (`requested` = `None`) admits
-/// `min(capacity, card_cap)`; an explicit `max_seq` must fit whole. The
-/// session cache is not charged: its snapshots yield to context growth.
+/// context that fits with no PLE page cache resident. The `resident_ple`
+/// bytes of PLE page cache the prewarm / in-load fill ask to keep resident
+/// (unified memory counts them as free) are reclaimable, so the context
+/// takes precedence: the admitted PLE budget is shrunk to what the free
+/// memory leaves after the context. An automatic load (`requested` = `None`)
+/// admits `min(capacity, card_cap)`; an explicit `max_seq` must fit whole.
+/// The session cache is not charged: its snapshots yield to context growth.
 pub fn qwen4_memory_admission(
     capacity: usize,
     requested: Option<usize>,
     free: u64,
     mtp_request: u64,
+    resident_ple: u64,
     headroom: u64,
     growth: impl Fn(usize) -> (u64, u64),
 ) -> Result<Qwen4MemoryAdmission, String> {
-    const MIB: u64 = 1 << 20;
     let fixed = mtp_request.saturating_add(headroom);
     let fits = |tokens: usize| {
         let (context, gather) = growth(tokens);
@@ -647,33 +811,35 @@ pub fn qwen4_memory_admission(
     };
     let max_seq = requested.unwrap_or(capacity.min(card_cap));
     let (context_growth, gather_growth) = growth(max_seq);
+    let left_for_ple = free
+        .saturating_sub(context_growth)
+        .saturating_sub(gather_growth)
+        .saturating_sub(fixed);
     let admission = Qwen4MemoryAdmission {
         free,
         context_growth,
         gather_growth,
         mtp_request,
+        ple_budget: resident_ple,
+        resident_ple: resident_ple.min(left_for_ple),
         headroom,
         card_cap,
         max_seq,
     };
     let detail = || {
         format!(
-            "a {max_seq}-token context commits {} MiB after load ({} MiB QSA context + {} MiB QSA gather workspace + {} MiB native MTP request buffers) plus {} MiB headroom, and {} MiB is free after load",
-            admission.growth() / MIB,
-            context_growth / MIB,
-            gather_growth / MIB,
-            mtp_request / MIB,
-            headroom / MIB,
-            free / MIB
+            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom), and {free} bytes is free after load",
+            admission.growth().saturating_add(headroom),
+            admission.growth(),
         )
     };
     match requested {
         None if max_seq < QWEN4_MIN_AUTO_CONTEXT.min(capacity) => Err(format!(
-            "qwen4: device memory cannot hold an automatic context: {}; free device memory",
+            "qwen4: device memory cannot hold an automatic context: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory); free host memory",
             detail()
         )),
         Some(requested) if requested > card_cap => Err(format!(
-            "qwen4: max_seq {requested} does not fit device memory: {}; lower memory.max_seq to at most {card_cap} or omit it",
+            "qwen4: max_seq {requested} does not fit device memory: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory); lower memory.max_seq to at most {card_cap} or omit it",
             detail()
         )),
         _ => Ok(admission),
@@ -692,34 +858,13 @@ fn qwen4_ple_rows_layout_present(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
             .any(|tensor| hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name))
 }
 
-/// Stderr progress of a PLE derive: one line per phase and per ~5% step, so a
-/// minutes-long derivation of the q4 rows is visible without flooding the log.
-pub fn ple_progress_printer() -> impl FnMut(&hipfire_runtime::ple_convert::PleProgress) + Send {
-    let mut last: Option<(&'static str, u64)> = None;
-    move |progress| {
-        let percent = match progress.total_bytes {
-            0 => 100,
-            total => progress.done_bytes.min(total).saturating_mul(100) / total,
-        };
-        let step = percent / 5 * 5;
-        if last == Some((progress.phase, step)) {
-            return;
-        }
-        last = Some((progress.phase, step));
-        eprintln!(
-            "  qwen4 ple {}: {percent}% ({:.1} of {:.1} GB)",
-            progress.phase,
-            progress.done_bytes as f64 / 1e9,
-            progress.total_bytes as f64 / 1e9
-        );
-    }
-}
-
 /// Resolve and attach the Qwen4 PLE rows source (`memory.ple_format`) on an
-/// opened HFQ source, deriving the q4 rows when they are missing and the
-/// request allows it.  Idempotent; a no-op for non-HFQ sources and for a
-/// source that is not a PLE-bearing Qwen4 base.  Returns the choice for the
-/// load log (`None` when nothing was resolved).
+/// opened HFQ source.  Sidecars are looked up beside `path` exactly as given,
+/// then beside its canonical target.  A missing sidecar is an error: the load
+/// path never derives (`hipfire ple derive` is the explicit step).  Idempotent;
+/// a no-op for non-HFQ sources and for a source that is not a PLE-bearing
+/// Qwen4 base.  Returns the choice for the load log (`None` when nothing was
+/// resolved).
 pub fn resolve_qwen4_ple_rows(
     source: &mut ModelSource,
     path: &str,
@@ -739,22 +884,53 @@ pub fn resolve_qwen4_ple_rows_hfq(
     path: &str,
     gpu_arch: &str,
 ) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
+    resolve_qwen4_ple_rows_requested(hfq, path, hipfire_config::memory::ple_format(), gpu_arch)
+}
+
+/// [`resolve_qwen4_ple_rows_hfq`] for an explicit `memory.ple_format`
+/// request.  The load path's resolve policy lives here: it never derives a
+/// missing q4 sidecar, whatever the request (a q4 request alone is not
+/// consent to write a ~29 GB file; `hipfire ple derive` is the explicit step).
+fn resolve_qwen4_ple_rows_requested(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    path: &str,
+    request: hipfire_config::memory::PleFormatRequest,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
     if !qwen4_ple_rows_layout_present(hfq) {
         return Ok(None);
     }
-    let mut progress = ple_progress_printer();
+    if qwen4_ple_rows_fp8(hfq) {
+        // Stock-FP8 PLE rows are the artifact's own qt=56 shards (their scale
+        // is per shard): there is no q4/q8 sidecar to resolve or derive.
+        return match request {
+            hipfire_config::memory::PleFormatRequest::Auto => Ok(None),
+            format => Err(format!(
+                "qwen4: memory.ple_format = {format:?} requests PLE sidecar rows, but this \
+                 stock-FP8 artifact reads its embedded FP8E4M3PT PLE rows; unset memory.ple_format"
+            )),
+        };
+    }
     hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
         hfq,
         std::path::Path::new(path),
-        hipfire_config::memory::ple_format(),
+        request,
         gpu_arch,
         hipfire_runtime::ple_sidecar::ResolvePolicy {
-            derive_missing_q4: true,
-            progress: Some(&mut progress),
+            derive_missing_q4: false,
+            progress: None,
         },
     )
     .map(Some)
     .map_err(|error| format!("qwen4: PLE rows: {error}"))
+}
+
+/// Whether the base's embedded PLE shards are qt=56 FP8E4M3PT rows (the
+/// stock-FP8 recipe).
+fn qwen4_ple_rows_fp8(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    hfq.tensors().iter().any(|tensor| {
+        tensor.quant_type == 56 && hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name)
+    })
 }
 
 /// Validate a reserved arch-16 HFQM source without allocating weights.
@@ -768,6 +944,7 @@ pub fn admit_qwen4_source(
     modality: InputModality,
     native_mtp: bool,
     spec_mtp: Option<bool>,
+    gpu_arch: &str,
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
@@ -775,8 +952,8 @@ pub fn admit_qwen4_source(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
-    let receipt =
-        hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
+        .map_err(|error| error.to_string())?;
     // An inventory-valid developer profile the executor cannot run (a
     // synthetic MoE, a RoPE base the QSA kernels lack, a build without
     // `qwen4-dev-profiles`) is refused here, not after the weights upload.
@@ -790,6 +967,28 @@ pub fn admit_qwen4_source(
         receipt.config.mtp.is_some(),
         receipt.config.profile.id(),
     )?;
+    // The recipe's device admission: a stock-FP8 artifact needs FP8 expert
+    // kernels (gfx942 only), one device and every routed expert resident.
+    let host_mapped_experts = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
+        .map_err(|error| format!("qwen4: {error}"))?
+        .is_some();
+    // A pipeline band keeps every routed expert resident (packed aggregates
+    // or, for an expert-slab artifact, its own layers' slab arenas); no band
+    // layer is host-mapped.
+    if effective_mesh.pp > 1 && host_mapped_experts {
+        return Err(qwen4_pp_unsupported(
+            effective_mesh.pp,
+            "host-mapped routed experts (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS)",
+        ));
+    }
+    hipfire_arch_qwen4::admission::admit_recipe_on_device(
+        receipt.recipe(),
+        gpu_arch,
+        effective_mesh,
+        native_mtp,
+        host_mapped_experts && receipt.recipe().fp8_experts(),
+    )
+    .map_err(|error| error.to_string())?;
     qwen4_developer_ple_policy(
         receipt.config.profile.is_flash_next(),
         receipt.config.profile.id(),
@@ -834,15 +1033,36 @@ pub struct SourceAdmission {
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
     /// Validated vision-tower sidecar (`params.vision` / `HIPFIRE_VISION_SIDECAR`).
-    /// `Some` only when the sidecar opened, carries arch_id 5|6, and holds the
-    /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
-    /// `None` = trunk-only (or explicit opt-out via empty string).
+    /// `Some` only when the sidecar opened, carries the trunk's VL family arch
+    /// id (Qwen3.5-VL 5|6, EmbeddingGemma-2 18), and holds that family's tower
+    /// probe tensor; the single/pp route threads it into `LoadCtx`, which the
+    /// arch crate opens at load. `None` = trunk-only (or explicit opt-out via
+    /// empty string).
     pub vision_path: Option<std::path::PathBuf>,
     /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
     /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
     /// alone cannot distinguish "off" (never probe a sibling) from "auto with
     /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
     pub vision_mode: String,
+    /// The one admitted mesh: topology, physical identity of every logical
+    /// rank (HIP ordinal + PCI id + arch), per-edge transports and
+    /// numerical-policy identity. Normalized here exactly once; no later
+    /// stage rereads the raw pp/tp/ep request.
+    pub mesh: AdmittedMesh,
+    /// Pipeline band placement (`Some` only for the pp>1 Qwen3.5 load). Built
+    /// from the single `BandPlacement` authority at admission.
+    pub pp_bands: Option<BandPlacement>,
+    /// Explicit per-stage layer counts, read from `HIPFIRE_PP_LAYERS` once at
+    /// admission and normalized through `BandPlacement::from_counts`. `None`
+    /// = the historical uniform split (`Gpus::init_uniform`, which keeps its
+    /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
+    /// this value and never reread the environment.
+    pub pp_layer_counts: Option<Vec<usize>>,
+    /// The continuous-batch request of this load (default off). Admission
+    /// never sets it; the caller that will stage lanes after the load sets it
+    /// on the admitted handle before the load, and the carrier forwards it
+    /// through `LoadCtx::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -855,6 +1075,64 @@ pub struct SequenceResolution {
     pub model_ctx: usize,
     pub card_cap: usize,
     pub kv_mode: &'static str,
+    /// The pre-teardown capacity projection this resolution was admitted
+    /// against ([`qwen35_card_projection`]); `None` where no projection runs
+    /// (Qwen4 on unified memory measures after load).
+    pub projection: Option<Qwen35CardProjection>,
+}
+
+/// The pre-teardown context-capacity projection of a single-card Qwen3.5
+/// VMM load ([`qwen35_card_projection`]), itemised so `hipfire fit` reports
+/// the same numbers admission refuses on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35CardProjection {
+    /// Free device bytes before the load (`KvBackendHints::free_vram_bytes`).
+    pub free: usize,
+    /// Projected resident weights: the HFQ file plus 12.5% and 512 MiB.
+    pub weights: usize,
+    /// The minimum viable prefill scratch reservation.
+    pub scratch: usize,
+    /// VMM page rounding across the K/V owners.
+    pub page_rounding: usize,
+    /// Selected K+V bytes per token over the full-attention layers.
+    pub bytes_per_token: usize,
+    /// Largest context the remaining free memory holds.
+    pub card_cap: usize,
+    /// The checkpoint's trained window (`max_position_embeddings`).
+    pub model_ctx: usize,
+    pub kv_mode: &'static str,
+}
+
+/// The context a Qwen4 admission works from: an omitted `max_seq` on a
+/// discrete GPU is the default context (it keeps no automatic sequence);
+/// everything else, including an explicit value on any GPU, is unchanged.
+fn qwen4_requested_context(unified_memory: bool, max_seq: usize) -> usize {
+    if max_seq == 0 && !unified_memory {
+        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    } else {
+        max_seq
+    }
+}
+
+/// The Qwen4 sequence on a unified-memory APU: an omitted `max_seq` is
+/// automatic (the model's context, capped by the measured card capacity at
+/// load), an explicit one is honored and re-checked against the free memory
+/// after load ([`qwen4_memory_admission`]). A discrete GPU resolves no
+/// sequence, so its requested context is never memory-admitted here.
+fn qwen4_context_sequence(
+    unified_memory: bool,
+    max_seq: usize,
+    model_ctx: usize,
+    kv_mode: &'static str,
+) -> Option<SequenceResolution> {
+    unified_memory.then(|| SequenceResolution {
+        max_seq: if max_seq == 0 { model_ctx } else { max_seq },
+        bound: if max_seq == 0 { "pending" } else { "user" },
+        model_ctx,
+        card_cap: 0,
+        kv_mode,
+        projection: None,
+    })
 }
 
 /// Pure text-vs-VL decision. The vision tower tensor decides; configuration
@@ -893,7 +1171,11 @@ pub fn classify_vision(
         // request or silently downgraded to text.
         QWEN4_ARCH_ID => {
             if has_vision_tensor {
-                Err("qwen4: vision tensors are unsupported by the text-only route".into())
+                Err(
+                    "qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
+                     use the text-only build of the model"
+                        .into(),
+                )
             } else {
                 Ok(false)
             }
@@ -933,15 +1215,53 @@ fn probe_vision(src: &ModelSource, arch_id: u32) -> Result<bool, String> {
     classify_vision(arch_id, has_tensor, has_config)
 }
 
-/// Tower probe tensor shared by the trunk and the vision sidecar.
+/// Tower probe tensor shared by the Qwen3.5-VL trunk and its `.vl` sidecar.
 const VISION_PROBE_TENSOR: &str = "model.visual.patch_embed.proj.weight";
 
+/// EmbeddingGemma-2 (arch 18) tower probe: the vision patch embedder. The
+/// checkpoint carries the tower under flat `vision_tower.*` names — there is
+/// no `model.visual.` alias — so the Qwen probe never resolves there, and the
+/// two families must not share one probe.
+const EMBED_GEMMA_VISION_PROBE_TENSOR: &str = "vision_tower.patch_embedder.input_proj.weight";
+
+/// The `.vl` sidecar contract of one VL family:
+/// `(sidecar arch ids the quantizer stamps on the pack, their spelling in
+/// refusals, the probe tensor proving the tower shipped, the pack remedy)`.
+/// The trunk-side gate and the sidecar-side gate share it, so a pack stamped
+/// by another family — whose tower names never resolve against this trunk —
+/// is refused instead of being opened as the wrong tower.
+fn vision_sidecar_family(
+    arch_id: u32,
+) -> Option<(&'static [u32], &'static str, &'static str, &'static str)> {
+    match arch_id {
+        // Qwen3.5-VL dense (5) / MoE (6): the `--vision-only` pack of
+        // `model.visual.*`; either trunk accepts either family stamp.
+        5 | 6 => Some((
+            &[5, 6],
+            "5|6",
+            VISION_PROBE_TENSOR,
+            "pack the tower with `hipfire-quantize <hf-dir> --include-vision \
+             --include-prefix model.visual.`",
+        )),
+        // EmbeddingGemma-2 (18): the trunk is tower-less by construction and
+        // ships its own arch-18 `.vl` pack of the `vision_tower.*` group.
+        18 => Some((
+            &[18],
+            "18",
+            EMBED_GEMMA_VISION_PROBE_TENSOR,
+            "requantize with `hipfire-quantize <hf-dir>` (the EmbeddingGemma-2 \
+             pack writes the `.vl` tower sidecar beside the trunk)",
+        )),
+        _ => None,
+    }
+}
+
 /// Validate the optional vision-tower sidecar and return its resolved path.
-/// Fail-closed: an unopenable, non-5|6, or tower-less sidecar refuses with a
-/// message naming the remedy. The sidecar opens read-only as a SEPARATE
-/// `HfqFile` (never `attach_overlay` — REAP rejects additive tensor names,
-/// hfq.rs:391-427). Empty string counts as unset (explicit opt-out, same
-/// semantics as `HIPFIRE_DFLASH_DRAFT`).
+/// Fail-closed: an unopenable, wrong-family, or tower-less sidecar refuses
+/// with a message naming the remedy. The sidecar opens read-only as a
+/// SEPARATE `HfqFile` (never `attach_overlay` — REAP rejects additive tensor
+/// names, hfq.rs:391-427). Empty string counts as unset (explicit opt-out,
+/// same semantics as `HIPFIRE_DFLASH_DRAFT`).
 fn resolve_vision_sidecar(
     vision: Option<&str>,
     arch_id: u32,
@@ -957,26 +1277,23 @@ fn resolve_vision_sidecar(
              sources cannot carry a sidecar tower"
         ));
     }
-    if !matches!(arch_id, 5 | 6) {
+    let Some((sidecar_archs, expected, probe, remedy)) = vision_sidecar_family(arch_id) else {
         return Err(format!(
             "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
-             only serve Qwen3.5-VL trunks (arch_id 5|6)"
+             only serve Qwen3.5-VL (arch_id 5|6) and EmbeddingGemma-2 (arch_id 18) trunks"
         ));
-    }
+    };
     let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
         .map_err(|e| format!("vision sidecar '{path}': open failed: {e}"))?;
-    if !matches!(sidecar.arch_id, 5 | 6) {
+    if !sidecar_archs.contains(&sidecar.arch_id) {
         return Err(format!(
-            "vision sidecar '{path}' has arch_id={} (expected 5|6): pack the tower \
-             with `hipfire-quantize <hf-dir> --include-vision --include-prefix model.visual.`",
+            "vision sidecar '{path}' has arch_id={} (expected {expected}): {remedy}",
             sidecar.arch_id
         ));
     }
-    if sidecar.tensor_data(VISION_PROBE_TENSOR).is_none() {
+    if sidecar.tensor_data(probe).is_none() {
         return Err(format!(
-            "vision sidecar '{path}' carries no vision tower tensor \
-             '{VISION_PROBE_TENSOR}': pack the tower with `hipfire-quantize <hf-dir> \
-             --include-vision --include-prefix model.visual.`"
+            "vision sidecar '{path}' carries no vision tower tensor '{probe}': {remedy}"
         ));
     }
     Ok(Some(std::path::PathBuf::from(path)))
@@ -1056,6 +1373,40 @@ fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
     Ok(carrier)
 }
 
+/// Pure DFlash lm-head refusal: `Some(message)` when a draft is attached but the
+/// target's lm_head/embed quant type is not admitted for DFlash's batched
+/// lm-head verify on `gpu_arch`. MQ V2 (qt 44/47/48/49/50) and MQ3 (qt 17)
+/// lm_heads reach `gemm_mq*g256v2_batched_lmhead` / the MQ3 batched lm-head in
+/// the DFlash verify; DFlash admits them only on the gfx11/gfx12 WMMA set, where
+/// that path is validated. gfx1030 (RDNA2, no WMMA) is outside it (#771): the
+/// generic non-WMMA x-batch scalar fallback exists in rdna-compute but has not
+/// been validated for DFlash verify, so the load refuses here instead of
+/// failing at the first `spec_step` after the prior model was torn down.
+fn dflash_lm_head_refusal(lm_qt: Option<u8>, gpu_arch: &str) -> Option<String> {
+    if crate::dflash_lm_head_quant_supported(lm_qt, gpu_arch) {
+        return None;
+    }
+    let qt_desc = match lm_qt {
+        Some(44) => "quant_type=44, MQ4G256V2".to_string(),
+        Some(47) => "quant_type=47, MQ6G256V2".to_string(),
+        Some(48) => "quant_type=48, MQ5G256V2".to_string(),
+        Some(49) => "quant_type=49, MQ3G256V2".to_string(),
+        Some(50) => "quant_type=50, MQ2G256V2".to_string(),
+        Some(17) => "quant_type=17, MQ3G256".to_string(),
+        Some(qt) => format!("quant_type={qt}"),
+        None => "no lm_head/embed_tokens tensor found".to_string(),
+    };
+    Some(format!(
+        "DFlash draft requested but batched lm_head admission for this model's output layer \
+         ({qt_desc}) is unsupported on {gpu_arch}: DFlash's batched lm_head verify is validated \
+         only on gfx11/gfx12 WMMA GPUs for this weight format. Run autoregressive decoding \
+         instead: turn DFlash off (speculation.dflash = off, e.g. `hipfire config <model> set \
+         dflash_mode off` or `--spec off`; unset developer.dflash_draft / \
+         HIPFIRE_DFLASH_DRAFT), or load a build of the model whose output layer is \
+         Q8/HFQ4/MQ4G256 (qt 3/6/13). Autoregressive decode of this model is unaffected"
+    ))
+}
+
 /// Read-only DFlash lm-head quant refusal: a draft is attached but the target's
 /// lm_head/embed quant type is not admitted for the batched GEMM verify paths.
 /// Mirrors the gemma4-entry pre-allocation check (lib.rs) so the refusal fires
@@ -1074,17 +1425,10 @@ fn df_lash_lm_head_admission(
         .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
         .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
         .map(|(info, _)| info.quant_type);
-    if !crate::dflash_lm_head_quant_supported(lm_qt, gpu_arch) {
-        let qt_desc = match lm_qt {
-            Some(qt) => format!("quant_type={qt}"),
-            None => "no lm_head/embed_tokens tensor found".to_string(),
-        };
-        return Err(format!(
-            "DFlash draft requested but target lm_head {qt_desc} is not supported \
-             on gfx11+gfx12 WMMA ({gpu_arch})."
-        ));
+    match dflash_lm_head_refusal(lm_qt, gpu_arch) {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// FLUX/Klein image-gen arch refusal: the trunk GEMM (`gemm_wmma_lds256`)
@@ -1106,8 +1450,22 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     );
     (!gfx11_wmma_w32).then(|| {
         format!(
-            "image generation (arch 40/45) requires RDNA3/3.5 (gfx11 wave32 WMMA); \
+            "image generation (arch 40/45) needs an RDNA3/3.5 GPU (gfx11 wave32 WMMA); \
              detected {gpu_arch}. See docs/IMAGEGEN.md §1."
+        )
+    })
+}
+
+/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
+/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
+/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
+/// allocation, instead of reaching a generic EP or carrier refusal or being
+/// ignored (`topology.ep`).
+fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
+    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
+        format!(
+            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
+             (no pipeline, tensor or expert parallel placement exists for arch 14)"
         )
     })
 }
@@ -1180,18 +1538,29 @@ fn trained_context(source: &ModelSource) -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+/// Smallest projected context an automatic single-card Qwen VMM load accepts
+/// ([`resolve_sequence`]); below it the load is refused before teardown.
+pub const QWEN35_MIN_AUTO_CONTEXT: usize = 512;
+
+/// VMM page rounding reserved across the K/V owners in the projection.
+const QWEN35_VMM_PAGE_ROUNDING_BYTES: usize = 128 << 20;
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
 /// expanded raw tensors/runtime state and 512 MiB for allocator/transients.
 /// Reserve only the minimum 512-row PBS plus the widened guard's existing
 /// 1 GiB headroom and 128 MiB for VMM page rounding across K/V owners.
 /// Per-request prefill selects wider scratch from then-current mapped-KV free VRAM.
-fn resolve_sequence(
+///
+/// The one projection admission refuses on ([`resolve_sequence`]); `hipfire
+/// fit` reads the same value. It is a pre-teardown fit check, never the
+/// effective bound: the Qwen carrier remeasures free VRAM after the weights
+/// upload, immediately before KV reservation.
+pub fn qwen35_card_projection(
     source: &ModelSource,
-    requested: usize,
     gpu_arch: &str,
     hints: KvBackendHints<'_>,
-) -> Result<SequenceResolution, String> {
+) -> Result<Qwen35CardProjection, String> {
     use hipfire_runtime::kv_mode;
     let ModelSource::Hfq(hfq) = source else {
         return Err("automatic Qwen VMM context sizing requires an HFQ weight manifest".into());
@@ -1203,7 +1572,7 @@ fn resolve_sequence(
         .kv_mode
         .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str());
     let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
-    let native_eligible = kv_mode::qwen35_native_eligible(
+    let auto_native = kv_mode::qwen35_native_auto_eligible(
         gpu_arch,
         config.n_heads,
         config.n_kv_heads,
@@ -1213,7 +1582,7 @@ fn resolve_sequence(
         hints.cask.is_some_and(|c| c.sidecar.is_some()),
     );
     let policy =
-        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, raw_mode, native_eligible);
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, raw_mode, auto_native);
     let pair = kv_mode::resolve_kv_pair(
         raw_mode,
         hints.kv_k,
@@ -1240,30 +1609,49 @@ fn resolve_sequence(
         .saturating_add(512 << 20);
     let scratch =
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
-            .ok_or("Qwen minimum prefill scratch sizing overflow or unsupported MoE")?;
-    let projected_card_cap = free
+            .ok_or("Qwen minimum prefill scratch sizing overflow")?;
+    let card_cap = free
         .saturating_sub(weights)
         .saturating_sub(scratch)
-        .saturating_sub(128 << 20)
+        .saturating_sub(QWEN35_VMM_PAGE_ROUNDING_BYTES)
         / bytes_per_token;
+    Ok(Qwen35CardProjection {
+        free,
+        weights,
+        scratch,
+        page_rounding: QWEN35_VMM_PAGE_ROUNDING_BYTES,
+        bytes_per_token,
+        card_cap,
+        model_ctx,
+        kv_mode: kv_mode::qwen_k_display_name(pair.k()),
+    })
+}
+
+fn resolve_sequence(
+    source: &ModelSource,
+    requested: usize,
+    gpu_arch: &str,
+    hints: KvBackendHints<'_>,
+) -> Result<SequenceResolution, String> {
+    let projection = qwen35_card_projection(source, gpu_arch, hints)?;
     // Projection is a pre-teardown fit refusal, never the effective bound.
     // Weight upload changes free VRAM; the Qwen carrier remeasures that
     // *after* weights and immediately before KV reservation.
-    if projected_card_cap < 512 && requested == 0 {
-        return Err("Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM".into());
+    if projection.card_cap < QWEN35_MIN_AUTO_CONTEXT && requested == 0 {
+        return Err("Qwen VMM load refused: the model weights, the minimum prefill scratch and the KV cache do not fit in free VRAM. Free GPU memory, set a smaller memory.max_seq, or use a smaller quantization of this model".into());
     }
     let (max_seq, bound) = if requested != 0 {
         (requested, "user")
     } else {
-        (model_ctx, "pending")
+        (projection.model_ctx, "pending")
     };
-    let kv_mode = kv_mode::qwen_k_display_name(pair.k());
     Ok(SequenceResolution {
         max_seq,
         bound,
-        model_ctx,
+        model_ctx: projection.model_ctx,
         card_cap: 0,
-        kv_mode,
+        kv_mode: projection.kv_mode,
+        projection: Some(projection),
     })
 }
 
@@ -1316,25 +1704,25 @@ fn pp_geometry_refusal(
 ) -> Option<String> {
     if pp == 0 {
         return Some(
-            "load refused: pp=0 is not a valid pipeline-parallel degree \
-             (Gpus::init_uniform requires n_devices >= 1; multi_gpu.rs)"
+            "load refused: topology.pp=0 is not a valid pipeline-parallel degree; use 1 for a \
+             single GPU or the number of GPUs to split across"
                 .to_string(),
         );
     }
     if let Some(layers) = n_layers {
         if pp > layers {
             return Some(format!(
-                "load refused: pp={pp} exceeds n_layers={layers} for this source \
-                 (Gpus::init_uniform refuses n_layers < n_devices — each device must \
-                 own at least one layer; multi_gpu.rs)"
+                "load refused: pp={pp} exceeds n_layers={layers} for this source — each GPU \
+                 needs at least one model layer, so lower topology.pp to at most {layers}"
             ));
         }
     }
     if let Some(devices) = n_devices {
         if pp > devices {
             return Some(format!(
-                "load refused: pp={pp} exceeds visible HIP device count={devices} \
-                 (Gpus::init_uniform cannot bind that many ranks; multi_gpu.rs)"
+                "load refused: pp={pp} exceeds visible HIP device count={devices} — pipeline \
+                 parallelism needs one GPU per stage, so lower topology.pp or make more GPUs \
+                 visible (hardware.devices)"
             ));
         }
     }
@@ -1349,20 +1737,528 @@ fn pp_geometry_refusal(
 fn tp_geometry_refusal(tp: usize, n_devices: Option<usize>) -> Option<String> {
     if tp == 0 {
         return Some(
-            "load refused: tp=0 is not a valid parallel degree \
-             (Gpus::init_ep/init_tp require ep_size/tp_size >= 1; multi_gpu.rs)"
+            "load refused: tp=0 is not a valid parallel degree; use 1 for a single GPU or the \
+             number of GPUs to split across"
                 .to_string(),
         );
     }
     if let Some(devices) = n_devices {
         if tp > devices {
             return Some(format!(
-                "load refused: tp={tp} exceeds visible HIP device count={devices} \
-                 (Gpus::init_ep/init_tp need one device per rank; multi_gpu.rs)"
+                "load refused: tp={tp} exceeds visible HIP device count={devices} — parallel \
+                 loads need one GPU per rank, so lower the degree or make more GPUs visible \
+                 (hardware.devices)"
             ));
         }
     }
     None
+}
+
+/// Numerical-policy identity of every route that has not declared its own.
+pub const LEGACY_NUMERICAL_POLICY: &str = "legacy";
+
+/// Normalize raw parallel degrees into the one rectangular [`DeviceMesh`].
+/// Size-one axes are dropped (`pp=tp=ep=1` is the empty single-device mesh).
+/// Zero degrees and cardinality overflow are refused here instead of being
+/// clamped to one by `DeviceMesh::rect`.
+pub fn normalize_mesh_shape(pp: usize, tp: usize, ep: usize) -> Result<DeviceMesh, String> {
+    if pp == 0 || tp == 0 || ep == 0 {
+        return Err(format!(
+            "mesh degree is zero (pp={pp}, tp={tp}, ep={ep}); every parallel degree must be >= 1"
+        ));
+    }
+    let axes: Vec<(DimKind, usize)> = [(DimKind::Pp, pp), (DimKind::Tp, tp), (DimKind::Ep, ep)]
+        .into_iter()
+        .filter(|&(_, size)| size > 1)
+        .collect();
+    DeviceMesh::rect(&axes).map_err(|e| format!("mesh shape pp={pp}, tp={tp}, ep={ep}: {e}"))
+}
+
+/// Physical identity of the visible devices in HIP logical order, from the
+/// KFD topology records the visibility resolver already produced. The HIP
+/// ordinal is the position (HIP always sees `0..N-1` inside the ROCr-filtered
+/// set); the PCI id is what survives remapping.
+pub fn visible_ranks(devices: &[hipfire_config::devices::GpuDevice]) -> Vec<AdmittedRank> {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(logical, device)| AdmittedRank {
+            logical,
+            device_ordinal: logical as i32,
+            pci_bus_id: Some(device.bdf.to_string()),
+            arch: device.arch.clone(),
+        })
+        .collect()
+}
+
+/// The visible devices admission binds ranks to. Uses the KFD identity when
+/// it covers `needed` ranks (read-only sysfs; no HIP init, no context, no
+/// allocation). Otherwise (no readable topology, e.g. CPU-only unit tests,
+/// WSL2/ROCDXG) ranks carry no PCI identity and the daemon's device arch:
+/// per-device architectures are verified against real devices at load.
+fn visible_device_ranks(gpu_arch: &str, needed: usize) -> Vec<AdmittedRank> {
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        if devices.len() >= needed {
+            return visible_ranks(&devices);
+        }
+    }
+    let count = visible_device_count().unwrap_or(needed).max(1);
+    (0..count)
+        .map(|logical| AdmittedRank {
+            logical,
+            device_ordinal: logical as i32,
+            pci_bus_id: None,
+            arch: gpu_arch.to_string(),
+        })
+        .collect()
+}
+
+/// How logical ranks bind to the visible devices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RankBinding {
+    /// Logical rank `r` runs on visible device `r`: every route that existed
+    /// before the admitted mesh (Qwen3.5 PP/EP/TP, Qwen4 EP, Single).
+    Visible,
+    /// `HIPFIRE_EMULATE_GPUS`: rank `r` aliases onto visible device
+    /// `r % visible` (the `multi_gpu::alias_ids` rule); ranks may share a card.
+    Emulated,
+    /// The admitted generic PP route: the first visible device (the primary,
+    /// output-owning card) is the LAST logical stage, so logical stages stay
+    /// in increasing layer order. Pure pipeline meshes only.
+    OutputCardLast,
+}
+
+/// Per-edge transport admission for routes that provision edges.
+pub struct EdgeAdmission<'a> {
+    pub policy: EdgeTransportPolicy,
+    /// Whether a peer read from logical rank `src` to logical rank `dst` was
+    /// byte-qualified. Pure: admission never probes peer access.
+    pub qualified_peer: &'a dyn Fn(usize, usize) -> bool,
+}
+
+/// Directed PP edges `(src, dst)` as logical rank (flat mesh device) ids: every
+/// device sends to the device with the same TP/EP coordinates one PP stage on.
+fn pp_edges(mesh: &DeviceMesh) -> Result<Vec<(usize, usize)>, String> {
+    let Some(axis) = mesh.axes().iter().position(|a| a.kind == DimKind::Pp) else {
+        return Ok(Vec::new());
+    };
+    let stages = mesh.axes()[axis].size;
+    let mut edges = Vec::new();
+    for dev in 0..mesh.n_devices() {
+        let mut coord = mesh.coord_of(dev).map_err(|e| e.to_string())?;
+        if coord[axis] + 1 < stages {
+            coord[axis] += 1;
+            edges.push((dev, mesh.device_of(&coord).map_err(|e| e.to_string())?));
+        }
+    }
+    Ok(edges)
+}
+
+/// Refuse an enumeration with a negative or repeated ordinal or a repeated PCI id.
+fn validate_distinct_visible(visible: &[AdmittedRank]) -> Result<(), String> {
+    let mut ordinals = std::collections::HashSet::new();
+    let mut pci_ids = std::collections::HashSet::new();
+    for rank in visible {
+        if rank.device_ordinal < 0 || !ordinals.insert(rank.device_ordinal) {
+            return Err("visible devices contain an invalid or duplicate ordinal".to_string());
+        }
+        if let Some(pci) = &rank.pci_bus_id {
+            if !pci_ids.insert(pci.as_str()) {
+                return Err("visible devices contain a duplicate PCI identity".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bind a normalized mesh shape to physical devices: the single admission
+/// value. Pure: no HIP, no peer probing, no allocation of device resources.
+/// `edges: None` keeps the route's existing transports (every pre-admitted-mesh
+/// route); `Some` records one transport decision per directed PP edge.
+pub fn admit_mesh(
+    shape: DeviceMesh,
+    family: &str,
+    numerical_policy: &str,
+    visible: &[AdmittedRank],
+    binding: RankBinding,
+    edges: Option<EdgeAdmission<'_>>,
+) -> Result<AdmittedMesh, String> {
+    let needed = shape.n_devices();
+    validate_distinct_visible(visible)?;
+    let too_few = || {
+        format!(
+            "mesh needs {needed} visible devices, {} visible",
+            visible.len()
+        )
+    };
+    let ranks: Vec<AdmittedRank> = match binding {
+        RankBinding::Visible => {
+            if visible.len() < needed {
+                return Err(too_few());
+            }
+            visible[..needed]
+                .iter()
+                .enumerate()
+                .map(|(logical, rank)| AdmittedRank {
+                    logical,
+                    ..rank.clone()
+                })
+                .collect()
+        }
+        RankBinding::Emulated => {
+            if visible.is_empty() {
+                return Err(too_few());
+            }
+            (0..needed)
+                .map(|logical| AdmittedRank {
+                    logical,
+                    ..visible[logical % visible.len()].clone()
+                })
+                .collect()
+        }
+        RankBinding::OutputCardLast => {
+            if shape.size_of(DimKind::Tp) != 1 || shape.size_of(DimKind::Ep) != 1 {
+                return Err(
+                    "output-card-last rank order is defined for pure pipeline meshes only"
+                        .to_string(),
+                );
+            }
+            if visible.len() < needed {
+                return Err(too_few());
+            }
+            pp_rank_order(&visible[..needed])?
+        }
+    };
+    let edges = match edges {
+        None => Vec::new(),
+        Some(edge) => {
+            resolve_edge_transports(edge.policy, edge.qualified_peer, &pp_edges(&shape)?)?
+        }
+    };
+    Ok(AdmittedMesh {
+        mesh: shape,
+        ranks,
+        edges,
+        family: family.to_string(),
+        numerical_policy: numerical_policy.to_string(),
+    })
+}
+
+/// Generic per-stage layer counts (`HIPFIRE_PP_LAYERS`), read once at
+/// admission. Empty is unset.
+fn pp_layers_request() -> Option<String> {
+    hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Normalized pipeline bands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PpBands {
+    pub placement: BandPlacement,
+    /// Counts the operator declared; `None` for the uniform default.
+    pub explicit_counts: Option<Vec<usize>>,
+}
+
+/// Normalize the pipeline split once. `requested` is the raw
+/// `HIPFIRE_PP_LAYERS` text (`None` = unset/empty). Counts are in logical
+/// stage order and must sum to the trunk layer count. Every legacy load-time
+/// verdict keeps its exact text; they now fire before any teardown.
+pub fn normalize_pp_bands(
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    requested: Option<&str>,
+) -> Result<PpBands, String> {
+    let pp = mesh.size_of(DimKind::Pp);
+    let Some(spec) = requested else {
+        if n_layers < pp {
+            return Err(format!(
+                "load refused: pp={pp} exceeds n_layers ({n_layers}) — each GPU needs at least one model layer, so lower topology.pp to at most {n_layers}"
+            ));
+        }
+        return Ok(PpBands {
+            placement: BandPlacement::uniform(mesh, n_layers)?,
+            explicit_counts: None,
+        });
+    };
+    let counts: Result<Vec<usize>, _> =
+        spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
+    let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+    if counts.len() != pp {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+            counts.len(),
+            pp
+        ));
+    }
+    let sum = counts.iter().fold(0usize, |acc, &c| acc.saturating_add(c));
+    if sum != n_layers {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS sum={sum} != n_layers={n_layers}"
+        ));
+    }
+    if counts.contains(&0) {
+        return Err(
+            "load refused: every pipeline stage needs at least one layer, but a stage was given zero".to_string(),
+        );
+    }
+    Ok(PpBands {
+        placement: BandPlacement::from_counts(mesh, n_layers, &counts)?,
+        explicit_counts: Some(counts),
+    })
+}
+
+/// Developer variable selecting how pipeline edges move bytes:
+/// `auto` (default), `peer` or `host`.
+pub const MESH_TRANSPORT_ENV: &str = "HIPFIRE_MESH_TRANSPORT";
+
+/// Numerical-policy identity of the admitted Qwen4 PP route: every band edge
+/// executes the cut-safe Single schedule (no fusion state across a cut).
+pub const QWEN4_PP_NUMERICAL_POLICY: &str = "qwen4-pp-cut-safe-v1";
+
+/// The one refusal sentence of every feature the Qwen4 PP route does not run.
+pub(crate) fn qwen4_pp_unsupported(pp: usize, what: &str) -> String {
+    format!(
+        "qwen4: pipeline parallelism (topology.pp = {pp}) does not support {what}; drop the option or set topology.pp = 1"
+    )
+}
+
+/// Parse [`MESH_TRANSPORT_ENV`] (`None`/empty = `auto`).
+pub fn parse_mesh_transport(raw: Option<&str>) -> Result<EdgeTransportPolicy, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(EdgeTransportPolicy::Auto),
+        Some("peer") => Ok(EdgeTransportPolicy::Peer),
+        Some("host") => Ok(EdgeTransportPolicy::Host),
+        Some(other) => Err(format!(
+            "{MESH_TRANSPORT_ENV}={other:?} is not one of auto, peer, host"
+        )),
+    }
+}
+
+/// The MTP n-gram modifier does not run on a pipeline mesh. With native MTP
+/// on, an explicit request for it (`speculation.mtp_ngram = on`, i.e.
+/// `hipfire_config::mtp_ngram_enabled()`) refuses before any allocation;
+/// `auto` and `off` are accepted and the load builds the speculator without
+/// an n-gram pool (`auto` would arm it on gfx1201, so the PP default is
+/// pinned off). Inert without native MTP. `pp <= 1` never refuses.
+pub(crate) fn qwen4_pp_mtp_ngram_refusal(
+    pp: usize,
+    native_mtp: bool,
+    explicit_on: bool,
+) -> Result<(), String> {
+    if pp > 1 && native_mtp && explicit_on {
+        return Err(qwen4_pp_unsupported(
+            pp,
+            "the MTP n-gram modifier (speculation.mtp_ngram = on; leave it auto or off)",
+        ));
+    }
+    Ok(())
+}
+
+/// Features the Qwen4 PP route does not run, refused from the load options
+/// before any source, device or cache work. `pp <= 1` never refuses.
+pub(crate) fn qwen4_pp_option_refusal(
+    pp: usize,
+    draft_path: Option<&str>,
+    options: &SourceAdmissionOptions,
+) -> Result<(), String> {
+    if pp <= 1 {
+        return Ok(());
+    }
+    let spec = options.spec;
+    let unsupported = [
+        (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
+        (spec.dspark == Some(true), "DSpark"),
+        (spec.ngram_draft == Some(true), "n-gram drafting"),
+        (crate::carriers::qwen4_ddtree_requested(spec), "DDTree"),
+        (options.kv_adaptive, "adaptive KV"),
+        (options.eagle_drafter, "an EAGLE drafter"),
+        (options.cask, "CASK"),
+        (options.pflash, "PFlash"),
+        (
+            options.expert_count_override,
+            "an experts-per-token override",
+        ),
+        (options.non_single_compute, "a non-Single compute placement"),
+    ];
+    match unsupported.iter().find(|(requested, _)| *requested) {
+        Some((_, what)) => Err(qwen4_pp_unsupported(pp, what)),
+        None => Ok(()),
+    }
+}
+
+/// Explicit environment/config requests the Qwen4 PP route does not run:
+/// host-mapped band layers, the expert hotset, expert staging, turn snapshots
+/// (`HIPFIRE_QWEN4_TURN_SNAPSHOTS=1`), the session-cache disk tier and the NPU
+/// trunk (`npu` is the already resolved mode for the rank architecture).
+/// Unset values are accepted: the PP route never enables any of them. The
+/// in-memory session cache is not refused: every band attaches its own
+/// (`memory.session_cache_bytes`, opportunistic and uncharged exactly as in
+/// Single; only the disk tier and turn snapshots stay refused). `pp <= 1`
+/// never refuses.
+pub(crate) fn qwen4_pp_env_refusal(
+    pp: usize,
+    env: &dyn Fn(&str) -> Option<String>,
+    npu: hipfire_arch_qwen4::npu_trunk::NpuTrunkMode,
+    session_cache_disk_bytes: u64,
+) -> Result<(), String> {
+    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    if pp <= 1 {
+        return Ok(());
+    }
+    let hotset = hipfire_arch_qwen4::expert_hotset::HOTSET_ENV;
+    let vram_layers = hipfire_arch_qwen4::expert_residency::EXPERT_VRAM_LAYERS_ENV;
+    let stage = hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV;
+    let turns = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
+    let unsupported = [
+        (
+            env(vram_layers).is_some(),
+            format!("host-mapped routed experts ({vram_layers})"),
+        ),
+        (
+            env(hotset).is_some_and(|value| value != "0"),
+            format!("the expert hotset ({hotset}; set 0)"),
+        ),
+        (
+            env(stage).as_deref() == Some("1"),
+            format!("expert staging ({stage})"),
+        ),
+        (
+            env(turns).as_deref() == Some("1"),
+            format!("session snapshots ({turns})"),
+        ),
+        (
+            session_cache_disk_bytes > 0,
+            "the session cache disk tier (memory.session_cache_disk_bytes; set 0)".to_string(),
+        ),
+        (
+            matches!(npu, NpuTrunkMode::On | NpuTrunkMode::Emulate),
+            format!("the NPU trunk (fusions.npu_trunk = {})", npu.as_str()),
+        ),
+    ];
+    match unsupported.iter().find(|(requested, _)| *requested) {
+        Some((_, what)) => Err(qwen4_pp_unsupported(pp, what)),
+        None => Ok(()),
+    }
+}
+
+/// The admitted ranks of a Qwen4 PP mesh: known PCI identity on every rank,
+/// one homogeneous gfx1100 or gfx1201, and the output owner (last logical
+/// rank = the daemon's device 0) agreeing with the daemon's architecture.
+pub(crate) fn qwen4_pp_rank_refusal(
+    pp: usize,
+    ranks: &[AdmittedRank],
+    gpu_arch: &str,
+) -> Result<(), String> {
+    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
+    let Some(first) = ranks.first() else {
+        return Err(format!("{prefix} needs at least one rank"));
+    };
+    for rank in ranks {
+        if rank.pci_bus_id.is_none() {
+            return Err(format!(
+                "{prefix} needs a known PCI identity for every rank; rank {} (device {}) has none (KFD topology unreadable)",
+                rank.logical, rank.device_ordinal
+            ));
+        }
+        if !qwen4_ep_arch_admitted(&rank.arch, false) {
+            return Err(format!(
+                "{prefix} requires gfx1100 or gfx1201 on every rank; rank {} is {}",
+                rank.logical, rank.arch
+            ));
+        }
+        if rank.arch != first.arch {
+            return Err(format!(
+                "{prefix} requires the same architecture on every rank; rank 0 is {}, rank {} is {}",
+                first.arch, rank.logical, rank.arch
+            ));
+        }
+    }
+    if first.arch != gpu_arch {
+        return Err(format!(
+            "{prefix} requires every rank to match the primary device; ranks are {}, device 0 is {gpu_arch}",
+            first.arch
+        ));
+    }
+    Ok(())
+}
+
+/// The admitted Qwen4 PP mesh and bands. Pure: no HIP, no peer probing, no
+/// allocation. `visible` is the HIP-order device identity; ranks bind
+/// `OutputCardLast` (the primary device owns the output band). Transport per
+/// directed edge comes from `policy` and `qualified_peer` (logical rank ids,
+/// pre-side-effect byte-qualification evidence: there is none in production,
+/// so `auto` resolves to host-mapped and a forced `peer` refuses). Bands come
+/// from `requested_layers` (`HIPFIRE_PP_LAYERS`) or the uniform split, with
+/// the PLE layer pinned to the first band (`with_first_band_min(2)`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_qwen4_pp_mesh(
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    n_layers: usize,
+    visible: &[AdmittedRank],
+    gpu_arch: &str,
+    emulated: bool,
+    policy: EdgeTransportPolicy,
+    qualified_peer: &dyn Fn(usize, usize) -> bool,
+    requested_layers: Option<&str>,
+) -> Result<(AdmittedMesh, PpBands), String> {
+    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
+    let stages = hipfire_arch_qwen4::EffectiveMesh::PP_MIN_DEGREE
+        ..=hipfire_arch_qwen4::EffectiveMesh::PP_MAX_DEGREE;
+    if !stages.contains(&pp) || tp != 1 || ep != 1 {
+        return Err(format!(
+            "{prefix} is admitted for 2..=8 stages with tp = ep = 1 (tp={tp}, ep={ep})"
+        ));
+    }
+    if emulated {
+        return Err(format!(
+            "{prefix} owns physical devices; HIPFIRE_EMULATE_GPUS aliasing is not admitted"
+        ));
+    }
+    if visible.len() < pp {
+        return Err(format!(
+            "{prefix} needs {pp} visible devices, {} visible (hardware.devices / HIPFIRE_DEVICES)",
+            visible.len()
+        ));
+    }
+    let ordered = pp_rank_order(&visible[..pp]).map_err(|e| format!("{prefix}: {e}"))?;
+    qwen4_pp_rank_refusal(pp, &ordered, gpu_arch)?;
+    let shape = normalize_mesh_shape(pp, 1, 1).map_err(|e| format!("{prefix}: {e}"))?;
+    let mesh = admit_mesh(
+        shape,
+        "qwen4",
+        QWEN4_PP_NUMERICAL_POLICY,
+        visible,
+        RankBinding::OutputCardLast,
+        Some(EdgeAdmission {
+            policy,
+            qualified_peer,
+        }),
+    )
+    .map_err(|e| {
+        if policy == EdgeTransportPolicy::Peer {
+            format!(
+                "{prefix}: peer-to-peer transfers between the pipeline GPUs were requested ({MESH_TRANSPORT_ENV}=peer) but could not be verified: {e}. Use {MESH_TRANSPORT_ENV}=auto or host"
+            )
+        } else {
+            format!("{prefix}: {e}")
+        }
+    })?;
+    let bands = normalize_pp_bands(&mesh.mesh, n_layers, requested_layers)
+        .map_err(|e| format!("{prefix}: {e}"))?;
+    let placement = bands
+        .placement
+        .with_first_band_min(2)
+        .map_err(|e| format!("{prefix}: {e} (the PLE layer lives in the first band)"))?;
+    Ok((
+        mesh,
+        PpBands {
+            placement,
+            explicit_counts: bands.explicit_counts,
+        },
+    ))
 }
 
 /// Read-only source admission: open the source, classify `arch_id` + vision,
@@ -1464,15 +2360,20 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    if arch_id == 14 {
+        let ep = hipfire_config::topology::ep()?;
+        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
+            return Err(refusal);
+        }
+    }
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
-    if hipfire_arch_qwen35::carrier::weight_host_socket()?
-        .is_some()
+    if hipfire_arch_qwen35::carrier::weight_host_socket()?.is_some()
         && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
     {
         return Err(format!(
-            "HIPFIRE_WEIGHT_HOST=1 supports only a single-device dense Qwen3.5 HFQ (arch 5, tp=pp=1); got arch {arch_id}{}, tp={tp}, pp={pp}",
+            "HIPFIRE_WEIGHT_HOST=1 only supports a single-GPU dense Qwen3.5 HFQ model (arch 5, tp=1, pp=1); this load is arch {arch_id}{}, tp={tp}, pp={pp}. Unset HIPFIRE_WEIGHT_HOST or load a supported model",
             if is_dir { " (directory source)" } else { "" }
         ));
     }
@@ -1481,13 +2382,15 @@ pub fn admit_source_with_options(
     // explicit values are honored within the limits below. A discrete GPU
     // keeps the default context for an omitted max_seq and no sequence.
     let unified_memory = hipfire_config::is_unified_memory_arch(gpu_arch);
-    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 && !unified_memory {
-        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    let max_seq = if arch_id == QWEN4_ARCH_ID {
+        qwen4_requested_context(unified_memory, max_seq)
     } else {
         max_seq
     };
     let mut qwen35_ep_experts = None;
     let mut qwen4_sequence = None;
+    let mut qwen4_pp: Option<(AdmittedMesh, PpBands)> = None;
+    let mesh_shape: DeviceMesh;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
@@ -1506,44 +2409,102 @@ pub fn admit_source_with_options(
         let ep = hipfire_config::topology::qwen4_ep()?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
         let spec_mtp = options.spec.mtp;
-        let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
+        let carrier =
+            crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
         crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
+        qwen4_pp_option_refusal(pp, draft_path, &options)?;
+        qwen4_pp_mtp_ngram_refusal(pp, native_mtp, hipfire_config::mtp_ngram_enabled())?;
         carrier.admit_options(draft_path, options)?;
-        if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
+        if let Some(refusal) = qwen4_ep_geometry_refusal(
+            ep,
+            pp,
+            tp,
+            gpu_arch,
+            visible_device_count(),
+            hipfire_runtime::config::get().emulate_gpus.is_some(),
+        ) {
             return Err(refusal);
         }
-        // The PLE rows source is chosen (and a missing q4 derived from the
-        // q8 rows or the embedded shards) here, before the resident model is
-        // torn down: a refusal (missing sidecar, binding mismatch, no space)
-        // leaves the loaded model in place.  The attached sidecar travels
-        // with `source` to the carrier.
+        if pp > 1 {
+            let npu = hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()
+                .map_err(|error| format!("qwen4: {error}"))?
+                .resolve(gpu_arch);
+            qwen4_pp_env_refusal(
+                pp,
+                &|name| hipfire_config::developer_var(name).ok(),
+                npu,
+                hipfire_config::memory::session_cache_disk_bytes(),
+            )?;
+        }
+        // The PLE rows source is chosen here, before the resident model is
+        // torn down: a refusal (missing sidecar, binding mismatch) leaves the
+        // loaded model in place; nothing is derived on this path.  The
+        // attached sidecar travels with `source` to the carrier.
         resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
+        // The one mesh normalization: Qwen4's EffectiveMesh is derived from it.
+        // A malformed request (zero degree / overflow) keeps its raw degrees so
+        // Qwen4's own refusal text is unchanged.
+        let shape = normalize_mesh_shape(pp, tp, ep);
+        let effective_mesh = match &shape {
+            Ok(mesh) => hipfire_arch_qwen4::EffectiveMesh::from_device_mesh(mesh),
+            Err(_) => hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
+        };
         let admitted = admit_qwen4_source(
             &source,
-            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
+            effective_mesh,
             InputModality::Text,
             native_mtp,
             spec_mtp,
+            gpu_arch,
         )?;
+        // Only an admitted (hence well-formed) mesh reaches here.
+        mesh_shape = shape?;
+        if pp > 1 {
+            let policy = parse_mesh_transport(
+                hipfire_config::developer_var(MESH_TRANSPORT_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(|error| {
+                format!("qwen4: pipeline parallelism (topology.pp = {pp}): {error}")
+            })?;
+            // No pre-side-effect byte-qualification evidence exists: `auto`
+            // resolves to host-mapped edges, a forced `peer` refuses.
+            qwen4_pp = Some(admit_qwen4_pp_mesh(
+                pp,
+                tp,
+                ep,
+                admitted.config.num_hidden_layers,
+                &visible_device_ranks(gpu_arch, pp),
+                gpu_arch,
+                hipfire_runtime::config::get().emulate_gpus.is_some(),
+                policy,
+                &|_, _| false,
+                pp_layers_request().as_deref(),
+            )?);
+        }
         // Native positions, or the YaRN-extended `factor x original` context.
         let positions = admitted.config.context_limit();
         if max_seq > positions {
             return Err(format!(
-                "qwen4: max_seq {max_seq} exceeds the model's RoPE context {positions} \
-                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor)"
+                "qwen4: max_seq {max_seq} exceeds the model's trained context of {positions} tokens \
+                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor). \
+                 Lower memory.max_seq to at most {positions}"
             ));
         }
         let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
-        if unified_memory {
-            qwen4_sequence = Some(SequenceResolution {
-                max_seq: if max_seq == 0 { model_ctx } else { max_seq },
-                bound: if max_seq == 0 { "pending" } else { "user" },
-                model_ctx,
-                card_cap: 0,
-                kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
-            });
-        }
-        (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
+        qwen4_sequence = qwen4_context_sequence(
+            unified_memory,
+            max_seq,
+            model_ctx,
+            hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
+        );
+        let topology = if pp > 1 {
+            EffectiveTopology::Pipeline(pp)
+        } else {
+            EffectiveTopology::Single
+        };
+        (topology, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
         // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
@@ -1551,14 +2512,12 @@ pub fn admit_source_with_options(
         // and MiniMax (10) refuse it (replicated-KV EP has no VMM path).
         if is_dir {
             return Err(
-                "EP not supported for safetensors directory sources (load as a single HFQ file)"
+                "expert/tensor parallelism (tp>1) is not supported for safetensors directory sources; load a single HFQ file or set tp=1"
                     .into(),
             );
         }
         if !matches!(arch_id, 5 | 6 | 9 | 10) {
-            return Err(format!(
-                "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-            ));
+            return Err(crate::ep_unsupported_arch_message(arch_id));
         }
         // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
         // the destructure is infallible): dense (`num_experts == 0`) runs the
@@ -1567,7 +2526,7 @@ pub fn admit_source_with_options(
         // topology gate below reuses it instead of re-opening the source.
         let qwen35_num_experts: Option<usize> = if matches!(arch_id, 5 | 6) {
             let ModelSource::Hfq(hfq) = &source else {
-                return Err("EP qwen35 requires an HFQ source".to_string());
+                return Err("expert parallelism for Qwen3.5 needs an HFQ model file, not a safetensors directory; load a single HFQ file or set tp=1".to_string());
             };
             Some(
                 hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
@@ -1595,6 +2554,12 @@ pub fn admit_source_with_options(
                 return Err(refusal);
             }
         }
+        let moe = matches!(arch_id, 9 | 10) || qwen35_num_experts.is_some_and(|n| n > 0);
+        mesh_shape = if moe {
+            normalize_mesh_shape(1, 1, tp)?
+        } else {
+            normalize_mesh_shape(1, tp, 1)?
+        };
         (EffectiveTopology::Expert(tp), None)
     } else {
         // Single / pipeline-parallel via the carrier registry.
@@ -1616,6 +2581,7 @@ pub fn admit_source_with_options(
         } else {
             EffectiveTopology::Single
         };
+        mesh_shape = normalize_mesh_shape(pp, 1, 1)?;
         (topology, Some(carrier))
     };
     // Partial GPU offload: fail closed where the arch is dispatched, before any
@@ -1630,11 +2596,14 @@ pub fn admit_source_with_options(
         hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_available)
     } else if heterogeneous_reason {
         Some(
-            "heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout"
+            "this mixed-GPU DeepSeek setup keeps its compressor cache in a layout the VMM backend cannot manage"
                 .to_string(),
         )
     } else if !hints.vmm_runtime_available {
-        Some("HIP VMM symbols/granularity unavailable".to_string())
+        Some(
+            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs"
+                .to_string(),
+        )
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -1650,14 +2619,14 @@ pub fn admit_source_with_options(
         )
     {
         Some(format!(
-            "device {gpu_arch} has no certified VMM KV path for the selected mode"
+            "{gpu_arch} has no tested VMM KV path for the selected --kv-mode"
         ))
     } else if pp > 1 {
-        Some("pipeline-parallel KV owner has no VMM layout".to_string())
+        Some("pipeline parallelism (topology.pp > 1) does not support VMM KV".to_string())
     } else if tp > 1 && (arch_id == 10 || qwen35_ep_experts.is_some_and(|n| n > 0)) {
-        Some("replicated-KV MoE/EP owner has no VMM layout".to_string())
+        Some("multi-GPU MoE/expert-parallel loads keep a full KV copy on every GPU, which VMM KV does not support".to_string())
     } else if tp > 1 && arch_id == 9 {
-        Some("DeepSeek EP VMM requires every rank to have a validated VMM device".to_string())
+        Some("DeepSeek expert parallelism with VMM KV needs VMM support on every GPU, and at least one GPU lacks it".to_string())
     } else if carrier.is_some_and(|c| !matches!(c.name(), "qwen35" | "deepseek4" | "muse_glimmer"))
     {
         Some(format!(
@@ -1665,14 +2634,14 @@ pub fn admit_source_with_options(
             carrier.unwrap().name()
         ))
     } else if arch_id == 14 && hints.cask.is_some_and(|c| c.sidecar.is_some()) {
-        Some("Muse Glimmer VMM does not support a CASK sidecar".to_string())
+        Some("Muse Glimmer does not support a CASK sidecar together with VMM KV".to_string())
     } else {
         None
     };
     let (kv_backend, kv_backend_reason) = match (request, unsupported) {
         (KvBackendRequest::Explicit(KvBackend::Legacy), _) => (KvBackend::Legacy, None),
         (KvBackendRequest::Explicit(KvBackend::Vmm), Some(reason)) => {
-            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy or a validated VMM source/device"));
+            return Err(format!("KV backend 'vmm' is not available for this load: {reason}. Use --kv-backend legacy (memory.kv_backend = legacy), or a model and GPU that support VMM KV"));
         }
         (KvBackendRequest::Explicit(KvBackend::Vmm), None)
         | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
@@ -1685,15 +2654,17 @@ pub fn admit_source_with_options(
             .is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
         && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
     {
-        return Err("kv_adaptive -> CASK handoff requires VMM; disable the sidecar/handoff or use a validated VMM device".into());
+        return Err("kv_adaptive -> CASK handoff needs the VMM KV backend, which is not available for this load; disable the CASK sidecar/handoff or use a GPU that supports VMM KV".into());
     }
     if let Some(carrier) = carrier {
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
     }
-    // The widened dense PBS ledger does not describe MoE scratch. Preserve
-    // the existing 32768 CLI/config default instead of refusing a Qwen MoE
-    // load or pretending its card capacity was measured.
-    let qwen_moe = if matches!(arch_id, 5 | 6)
+    // Qwen MoE on a discrete card keeps the prior 32768 CLI/config default:
+    // automatic context there is not validated against expert placement. On
+    // unified memory its prefill scratch is charged like dense
+    // (`PrefillBatchScratch::projected_allocation_bytes`), so it sizes itself.
+    let pinned_moe = if !unified_memory
+        && matches!(arch_id, 5 | 6)
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
@@ -1712,7 +2683,7 @@ pub fn admit_source_with_options(
     let sequence = if matches!(arch_id, 5 | 6)
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
-        && !qwen_moe
+        && !pinned_moe
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
     {
         Some(resolve_sequence(&source, max_seq, gpu_arch, hints)?)
@@ -1721,7 +2692,7 @@ pub fn admit_source_with_options(
         // would allocate all of it at load.
         if sequence.bound == "pending" && kv_backend != KvBackend::Vmm {
             return Err(format!(
-                "qwen4: automatic max_seq needs the VMM KV backend ({}); set memory.max_seq for legacy storage",
+                "qwen4: automatic max_seq needs the VMM KV backend, which is not in use ({}); set memory.max_seq to a fixed value to use legacy KV storage",
                 kv_backend_reason.as_deref().unwrap_or("legacy requested")
             ));
         }
@@ -1732,7 +2703,7 @@ pub fn admit_source_with_options(
     let effective_seq = sequence.as_ref().map_or_else(
         || {
             if max_seq == 0 {
-                if qwen_moe {
+                if pinned_moe {
                     32768
                 } else {
                     4096
@@ -1743,8 +2714,9 @@ pub fn admit_source_with_options(
         },
         |resolved| resolved.max_seq,
     );
-    let sequence_reason = (qwen_moe && max_seq == 0)
-        .then_some("max_seq auto-capacity unsupported for MoE; using prior default");
+    let sequence_reason = (pinned_moe && max_seq == 0).then_some(
+        "max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default",
+    );
     let mut has_vision = probe_vision(&source, arch_id)?;
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
@@ -1789,6 +2761,7 @@ pub fn admit_source_with_options(
             "--kv-k/--kv-v are Qwen-only (arch_id={arch_id}); use --kv-mode for this model"
         ));
     }
+    let mut qwen_n_layers: Option<usize> = None;
     if matches!(arch_id, 1 | 5 | 6) {
         use hipfire_runtime::kv_mode::{self, KvMode};
         let policy = if arch_id == 1 {
@@ -1817,9 +2790,10 @@ pub fn admit_source_with_options(
         } else {
             None
         };
+        qwen_n_layers = qwen_cfg.as_ref().map(|cfg| cfg.n_layers);
         let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
-        let native_eligible = qwen_cfg.as_ref().is_some_and(|cfg| {
-            kv_mode::qwen35_native_eligible(
+        let auto_native = qwen_cfg.as_ref().is_some_and(|cfg| {
+            kv_mode::qwen35_native_auto_eligible(
                 gpu_arch,
                 cfg.n_heads,
                 cfg.n_kv_heads,
@@ -1829,7 +2803,7 @@ pub fn admit_source_with_options(
                 hints.cask.is_some_and(|c| c.sidecar.is_some()),
             )
         });
-        let policy = kv_mode::qwen35_policy_for_native(policy, &mode, native_eligible);
+        let policy = kv_mode::qwen35_policy_for_native(policy, &mode, auto_native);
         if adaptive && (k_axis.is_some() || v_axis.is_some()) {
             return Err("adaptive Qwen KV cannot combine with fixed --kv-k/--kv-v; disable kv_adaptive or omit both axes".into());
         }
@@ -1912,11 +2886,19 @@ pub fn admit_source_with_options(
                 k,
                 KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4
             ) {
-                if matches!(k, KvMode::Fp8 | KvMode::Bf16) && !native_eligible {
-                    return Err(format!(
-                        "Qwen native KV requires exact gfx1201, H24/Hkv4/D256, single GPU and no CASK/adaptive (got {gpu_arch}, H{}/Hkv{}/D{}); use --kv-mode q8",
-                        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
-                    ));
+                if matches!(k, KvMode::Fp8 | KvMode::Bf16) {
+                    if let Some(why) = kv_mode::qwen35_native_refusal(
+                        k,
+                        gpu_arch,
+                        cfg.n_heads,
+                        cfg.n_kv_heads,
+                        cfg.head_dim,
+                        pp,
+                        adaptive,
+                        hints.cask.is_some_and(|c| c.sidecar.is_some()),
+                    ) {
+                        return Err(why);
+                    }
                 }
                 if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) && cfg.head_dim != 256
                 {
@@ -1936,6 +2918,47 @@ pub fn admit_source_with_options(
         }
     }
 
+    // One admitted mesh. Visible-device identity (HIP ordinal + PCI id + arch)
+    // is bound here once; placement and carriers consume it and never reread
+    // the raw pp/tp/ep request. Existing routes keep their rank order and
+    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions); the
+    // Qwen4 PP route arrives with its mesh and bands already admitted.
+    let (mesh, pp_bands, pp_layer_counts) = match qwen4_pp {
+        Some((mesh, bands)) => (mesh, Some(bands.placement), bands.explicit_counts),
+        None => {
+            let shape = mesh_shape;
+            let binding = if hipfire_runtime::config::get().emulate_gpus.is_some() {
+                RankBinding::Emulated
+            } else {
+                RankBinding::Visible
+            };
+            let visible = visible_device_ranks(gpu_arch, shape.n_devices());
+            let family = carrier.map_or_else(|| format!("arch{arch_id}"), |c| c.name().to_string());
+            let mesh = admit_mesh(
+                shape,
+                &family,
+                LEGACY_NUMERICAL_POLICY,
+                &visible,
+                binding,
+                None,
+            )?;
+            // Qwen3.5 pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once,
+            // after every other admission verdict, and normalized through
+            // `BandPlacement`.
+            let (pp_bands, pp_layer_counts) = if matches!(topology, EffectiveTopology::Pipeline(_))
+            {
+                let n_layers = qwen_n_layers.ok_or_else(|| {
+                    "qwen35 pipeline admission: layer count unavailable".to_string()
+                })?;
+                let bands =
+                    normalize_pp_bands(&mesh.mesh, n_layers, pp_layers_request().as_deref())?;
+                (Some(bands.placement), bands.explicit_counts)
+            } else {
+                (None, None)
+            };
+            (mesh, pp_bands, pp_layer_counts)
+        }
+    };
     Ok(SourceAdmission {
         source,
         arch_id,
@@ -1953,6 +2976,10 @@ pub fn admit_source_with_options(
         carrier,
         vision_path,
         vision_mode: vision_mode.to_string(),
+        mesh,
+        pp_bands,
+        pp_layer_counts,
+        batch_request: BatchLoadRequest::default(),
     })
 }
 
@@ -1960,11 +2987,414 @@ pub fn admit_source_with_options(
 mod tests {
     use super::*;
 
+    /// #771: gfx1030 + qwen3.8 MQ4V2 (qt=44) + DFlash reached
+    /// `gemm_mq4g256v2_batched_lmhead` at the first `spec_step`. The gate
+    /// refuses at admission with an actionable message; every other arch /
+    /// quant / non-DFlash combination is untouched.
+    mod dflash_lm_head_refusal_771 {
+        use super::*;
+
+        #[test]
+        fn gfx1030_mq4v2_refuses_with_actionable_message() {
+            let msg = dflash_lm_head_refusal(Some(44), "gfx1030")
+                .expect("qt=44 + DFlash on gfx1030 must refuse at admission");
+            for needle in [
+                "gfx1030",
+                "quant_type=44",
+                "MQ4G256V2",
+                "batched lm_head admission",
+                "unsupported",
+                "speculation.dflash = off",
+                "autoregressive",
+            ] {
+                assert!(
+                    msg.to_lowercase().contains(&needle.to_lowercase()),
+                    "refusal must mention {needle:?}: {msg}"
+                );
+            }
+            // A generic non-WMMA x-batch fallback exists; the refusal is an
+            // admission/validation boundary, not a missing-kernel claim.
+            for banned in ["no batched", "missing", "no v2 source", "no kernel"] {
+                assert!(
+                    !msg.to_lowercase().contains(banned),
+                    "refusal must not claim a missing kernel ({banned:?}): {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn other_non_wmma_arches_refuse_v2_and_mq3_lm_heads() {
+            for arch in ["gfx1030", "gfx1010", "gfx942", "gfx906"] {
+                for qt in [17u8, 44, 47, 48, 49, 50] {
+                    let msg = dflash_lm_head_refusal(Some(qt), arch)
+                        .unwrap_or_else(|| panic!("qt={qt} on {arch} must refuse"));
+                    assert!(msg.contains(arch), "{msg}");
+                    assert!(msg.contains(&format!("quant_type={qt}")), "{msg}");
+                }
+            }
+        }
+
+        #[test]
+        fn wmma_arches_keep_mq4v2_dflash() {
+            for arch in [
+                "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            ] {
+                for qt in [44u8, 47, 48, 49, 50, 17] {
+                    assert_eq!(
+                        dflash_lm_head_refusal(Some(qt), arch),
+                        None,
+                        "{arch} qt={qt}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn gfx1030_keeps_dflash_for_supported_lm_head_quants() {
+            // Q8_0 (3), HFQ4G256 (6), MQ4G256 (13) lm_heads never reach a V2
+            // batched lm_head kernel; they stay admitted on gfx1030.
+            for qt in [3u8, 6, 13] {
+                assert_eq!(dflash_lm_head_refusal(Some(qt), "gfx1030"), None, "qt={qt}");
+            }
+        }
+
+        #[test]
+        fn refusal_message_for_unknown_and_missing_lm_head() {
+            let missing = dflash_lm_head_refusal(None, "gfx1030").expect("missing refuses");
+            assert!(
+                missing.contains("no lm_head/embed_tokens tensor"),
+                "{missing}"
+            );
+            let other = dflash_lm_head_refusal(Some(45), "gfx1100").expect("qt45 refuses");
+            assert!(
+                other.contains("quant_type=45") && other.contains("gfx1100"),
+                "{other}"
+            );
+        }
+    }
+
+    mod mesh_normalization {
+        use super::*;
+        use hipfire_runtime::mesh_placement::EdgeTransport;
+
+        fn rank(ordinal: i32, pci: Option<&str>) -> AdmittedRank {
+            AdmittedRank {
+                logical: ordinal as usize,
+                device_ordinal: ordinal,
+                pci_bus_id: pci.map(str::to_string),
+                arch: "gfx1100".to_string(),
+            }
+        }
+
+        fn six() -> Vec<AdmittedRank> {
+            (0..6)
+                .map(|i| rank(i, Some(&format!("0000:{:02x}:00.0", i + 3))))
+                .collect()
+        }
+
+        fn admit(
+            pp: usize,
+            tp: usize,
+            ep: usize,
+            visible: &[AdmittedRank],
+            binding: RankBinding,
+        ) -> Result<AdmittedMesh, String> {
+            admit_mesh(
+                normalize_mesh_shape(pp, tp, ep)?,
+                "test",
+                LEGACY_NUMERICAL_POLICY,
+                visible,
+                binding,
+                None,
+            )
+        }
+
+        #[test]
+        fn single_is_the_identity_mesh() {
+            let mesh = admit(1, 1, 1, &six(), RankBinding::Visible).unwrap();
+            assert!(mesh.mesh.axes().is_empty());
+            assert_eq!(mesh.mesh.n_devices(), 1);
+            assert_eq!(mesh.ranks, vec![rank(0, Some("0000:03:00.0"))]);
+            assert!(mesh.edges.is_empty());
+            assert_eq!(mesh.numerical_policy, LEGACY_NUMERICAL_POLICY);
+        }
+
+        #[test]
+        fn zero_degree_and_overflow_are_refused_not_clamped() {
+            for (pp, tp, ep) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+                let err = normalize_mesh_shape(pp, tp, ep).unwrap_err();
+                assert!(err.contains("mesh degree is zero"), "{err}");
+            }
+            assert!(normalize_mesh_shape(usize::MAX, 2, 1).is_err());
+        }
+
+        #[test]
+        fn rectangular_shapes_drop_size_one_axes() {
+            let mesh = normalize_mesh_shape(2, 3, 1).unwrap();
+            assert_eq!(mesh.n_devices(), 6);
+            assert_eq!(mesh.size_of(DimKind::Pp), 2);
+            assert_eq!(mesh.size_of(DimKind::Tp), 3);
+            assert_eq!(mesh.axes().len(), 2);
+            let ep = normalize_mesh_shape(1, 1, 4).unwrap();
+            assert_eq!(ep.size_of(DimKind::Ep), 4);
+            assert_eq!(ep.axes().len(), 1);
+        }
+
+        #[test]
+        fn visible_binding_keeps_rank_order_and_identity() {
+            let mesh = admit(2, 1, 1, &six(), RankBinding::Visible).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [0, 1]);
+            assert_eq!(mesh.ranks[1].pci_bus_id.as_deref(), Some("0000:04:00.0"));
+            assert_eq!(mesh.ranks[1].logical, 1);
+        }
+
+        #[test]
+        fn pp6_output_card_last_rotates_complete_identity_records() {
+            let mesh = admit(6, 1, 1, &six(), RankBinding::OutputCardLast).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [1, 2, 3, 4, 5, 0]);
+            let logical: Vec<_> = mesh.ranks.iter().map(|r| r.logical).collect();
+            assert_eq!(logical, [0, 1, 2, 3, 4, 5]);
+            assert_eq!(mesh.ranks[5].pci_bus_id.as_deref(), Some("0000:03:00.0"));
+            assert_eq!(mesh.ranks[0].pci_bus_id.as_deref(), Some("0000:04:00.0"));
+            // Only the first `needed` visible devices participate.
+            let pp2 = admit(2, 1, 1, &six(), RankBinding::OutputCardLast).unwrap();
+            let ordinals: Vec<_> = pp2.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [1, 0]);
+        }
+
+        #[test]
+        fn output_card_last_is_pure_pipeline_only() {
+            let err = admit(2, 2, 1, &six(), RankBinding::OutputCardLast).unwrap_err();
+            assert!(err.contains("pure pipeline"), "{err}");
+        }
+
+        #[test]
+        fn too_few_duplicate_or_negative_devices_refuse() {
+            let two = six()[..2].to_vec();
+            assert!(admit(3, 1, 1, &two, RankBinding::Visible)
+                .unwrap_err()
+                .contains("needs 3 visible devices, 2 visible"));
+            let dup_ordinal = vec![rank(0, None), rank(0, None)];
+            assert!(admit(2, 1, 1, &dup_ordinal, RankBinding::Visible)
+                .unwrap_err()
+                .contains("duplicate ordinal"));
+            let dup_pci = vec![rank(0, Some("0000:03:00.0")), rank(1, Some("0000:03:00.0"))];
+            assert!(admit(2, 1, 1, &dup_pci, RankBinding::Visible)
+                .unwrap_err()
+                .contains("duplicate PCI"));
+            let negative = vec![rank(-1, None), rank(1, None)];
+            assert!(admit(2, 1, 1, &negative, RankBinding::Visible).is_err());
+            assert!(admit(1, 1, 1, &[], RankBinding::Visible).is_err());
+        }
+
+        #[test]
+        fn emulation_aliases_ranks_onto_the_visible_devices() {
+            let two = six()[..2].to_vec();
+            let mesh = admit(1, 1, 4, &two, RankBinding::Emulated).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [0, 1, 0, 1]);
+            let logical: Vec<_> = mesh.ranks.iter().map(|r| r.logical).collect();
+            assert_eq!(logical, [0, 1, 2, 3]);
+            assert!(admit(1, 1, 2, &[], RankBinding::Emulated).is_err());
+        }
+
+        #[test]
+        fn edges_follow_pp_adjacency_and_the_policy() {
+            let shape = || normalize_mesh_shape(3, 1, 1).unwrap();
+            let all_peer = |_: usize, _: usize| true;
+            let only_first = |src: usize, dst: usize| (src, dst) == (0, 1);
+            let go = |policy, qualified: &dyn Fn(usize, usize) -> bool| {
+                admit_mesh(
+                    shape(),
+                    "test",
+                    "p",
+                    &six(),
+                    RankBinding::Visible,
+                    Some(EdgeAdmission {
+                        policy,
+                        qualified_peer: qualified,
+                    }),
+                )
+            };
+            let host = go(EdgeTransportPolicy::Host, &all_peer).unwrap();
+            assert_eq!(
+                host.edges
+                    .iter()
+                    .map(|e| (e.src, e.dst))
+                    .collect::<Vec<_>>(),
+                [(0, 1), (1, 2)]
+            );
+            assert!(host
+                .edges
+                .iter()
+                .all(|e| e.transport == EdgeTransport::HostMapped));
+            let auto = go(EdgeTransportPolicy::Auto, &only_first).unwrap();
+            assert_eq!(auto.edges[0].transport, EdgeTransport::Peer);
+            assert_eq!(auto.edges[1].transport, EdgeTransport::HostMapped);
+            assert!(go(EdgeTransportPolicy::Peer, &only_first).is_err());
+            assert!(go(EdgeTransportPolicy::Peer, &all_peer).is_ok());
+        }
+
+        #[test]
+        fn composed_pp_tp_edges_keep_tp_coordinates() {
+            // [pp, tp] row-major: device = pp * 2 + tp.
+            let mesh = normalize_mesh_shape(2, 2, 1).unwrap();
+            assert_eq!(pp_edges(&mesh).unwrap(), [(0, 2), (1, 3)]);
+            assert!(pp_edges(&normalize_mesh_shape(1, 1, 4).unwrap())
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn visible_ranks_carry_physical_pci_identity() {
+            use hipfire_config::devices::{GpuDevice, PciBdf};
+            let devices = [GpuDevice {
+                index: 4,
+                rocr_index: 2,
+                node: 7,
+                arch: "gfx1201".to_string(),
+                unique_id: None,
+                bdf: PciBdf {
+                    domain: 0,
+                    bus: 0x44,
+                    device: 0,
+                    function: 0,
+                },
+            }];
+            let ranks = visible_ranks(&devices);
+            assert_eq!(ranks.len(), 1);
+            assert_eq!(ranks[0].device_ordinal, 0);
+            assert_eq!(ranks[0].pci_bus_id.as_deref(), Some("0000:44:00.0"));
+            assert_eq!(ranks[0].arch, "gfx1201");
+        }
+
+        fn pp_mesh(pp: usize) -> DeviceMesh {
+            normalize_mesh_shape(pp, 1, 1).unwrap()
+        }
+
+        fn counts(bands: &PpBands) -> Vec<usize> {
+            (0..bands.placement.stages())
+                .map(|s| bands.placement.band(s).len())
+                .collect()
+        }
+
+        #[test]
+        fn unset_pp_layers_is_the_historical_uniform_split() {
+            let bands = normalize_pp_bands(&pp_mesh(3), 10, None).unwrap();
+            assert_eq!(bands.explicit_counts, None);
+            assert_eq!(counts(&bands), [4, 3, 3]);
+            assert_eq!(
+                normalize_pp_bands(&pp_mesh(3), 2, None).unwrap_err(),
+                "load refused: pp=3 exceeds n_layers (2) — each GPU needs at least one model layer, so lower topology.pp to at most 2"
+            );
+        }
+
+        #[test]
+        fn explicit_pp_layers_normalize_through_the_band_placement() {
+            let mesh = pp_mesh(6);
+            let bands = normalize_pp_bands(&mesh, 48, Some("9,8,8,8,8,7")).unwrap();
+            assert_eq!(bands.explicit_counts, Some(vec![9, 8, 8, 8, 8, 7]));
+            assert_eq!(bands.placement.band(0), 0..9);
+            assert_eq!(bands.placement.band(5), 41..48);
+            assert_eq!(bands.placement.stage_of_layer(9), 1);
+            bands.placement.validate_for(&mesh, 48).unwrap();
+            // Stale placement: another mesh (new epoch) is refused.
+            assert!(bands.placement.validate_for(&pp_mesh(6), 48).is_err());
+            let spaced = normalize_pp_bands(&pp_mesh(2), 32, Some("16, 16")).unwrap();
+            assert_eq!(counts(&spaced), [16, 16]);
+            // The first-band PLE minimum is enforced on the placement value.
+            assert!(bands.placement.clone().with_first_band_min(9).is_ok());
+            assert!(bands.placement.with_first_band_min(10).is_err());
+        }
+
+        #[test]
+        fn pp_layers_refusals_keep_their_exact_text() {
+            let mesh = pp_mesh(2);
+            let err = |spec| normalize_pp_bands(&mesh, 32, Some(spec)).unwrap_err();
+            assert!(err("a,b").starts_with("HIPFIRE_PP_LAYERS parse: "));
+            assert_eq!(err("32"), "HIPFIRE_PP_LAYERS has 1 entries, expected pp=2");
+            assert_eq!(err("16,15"), "HIPFIRE_PP_LAYERS sum=31 != n_layers=32");
+            assert_eq!(
+                err("0,32"),
+                "load refused: every pipeline stage needs at least one layer, but a stage was given zero"
+            );
+            assert_eq!(
+                err("18446744073709551615,2"),
+                "HIPFIRE_PP_LAYERS sum=18446744073709551615 != n_layers=32"
+            );
+        }
+    }
+
+    /// The load path never derives a missing q4 sidecar: a `q4` request with
+    /// the q4 rows absent from the selected path and its canonical target is
+    /// an error naming both locations and both remedies, and nothing is
+    /// written next to either.
+    #[cfg(unix)]
+    #[test]
+    fn qwen4_ple_load_path_refuses_instead_of_deriving_a_missing_q4() {
+        use hipfire_config::memory::PleFormatRequest;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-loader-ple-no-derive-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let models = root.join("models");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let target = store.join("flash-next.mq4-xts");
+        let marker = format!(
+            "{{\"{}\":{{\"version\":1}}}}",
+            hipfire_runtime::ple_sidecar::PLE_BASE_MARKER_KEY
+        );
+        let tensor = HfqMemTensor {
+            name: "model.language_model.layers.1.ple.ple_embedding.layer_multipliers".into(),
+            quant_type: 54,
+            shape: vec![3],
+            group_size: 0,
+            data: (0u8..24).collect(),
+        };
+        write_hfqm_package_mem(&target, 16, &marker, &[tensor]).unwrap();
+        let link = models.join("flash-next.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut hfq = HfqFile::open(&link).unwrap();
+        let link_str = link.to_str().unwrap();
+        for request in [PleFormatRequest::Q4, PleFormatRequest::Q8] {
+            let error = resolve_qwen4_ple_rows_requested(&mut hfq, link_str, request, "gfx1151")
+                .unwrap_err();
+            let selected = format!("{}.ple-", link.display());
+            let canonical = format!("{}.ple-", std::fs::canonicalize(&link).unwrap().display());
+            assert!(
+                error.contains(&selected) && error.contains(&canonical),
+                "{error}"
+            );
+            assert!(error.contains("hipfire pull"), "{error}");
+        }
+        let error =
+            resolve_qwen4_ple_rows_requested(&mut hfq, link_str, PleFormatRequest::Q4, "gfx1151")
+                .unwrap_err();
+        assert!(error.contains("hipfire ple derive --format q4"), "{error}");
+        assert!(hfq.ple_rows().is_none());
+        for dir in [&store, &models] {
+            let written: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(written.len(), 1, "{dir:?}: {written:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {
         for mode in [
-            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2",
-            "turbo3", "turbo4",
+            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2", "turbo3",
+            "turbo4",
         ] {
             assert!(qwen35_gfx11_vmm_supported(
                 "gfx1100", 5, 1, mode, None, None
@@ -2043,8 +3473,8 @@ mod tests {
         let refuses = qwen35_gfx1151_fwht_k_override;
         for mode in ["", "auto", "q8", " q8 "] {
             for k in [
-                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2",
-                "turbo3", "turbo4", "turbo", " fwht3 ",
+                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2", "turbo3", "turbo4",
+                "turbo", " fwht3 ",
             ] {
                 for arch_id in [5, 6] {
                     assert!(refuses("gfx1151", arch_id, mode, Some(k)));
@@ -2146,7 +3576,10 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
-        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1),
+            Ok(true)
+        );
         assert_eq!(
             qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1, 1),
             Ok(false)
@@ -2169,7 +3602,10 @@ mod tests {
         // Expert parallelism attaches the head only on an explicit `on`:
         // `auto`/off stay AR.
         for ep in [2, 4] {
-            assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep),
+                Ok(false)
+            );
             assert_eq!(
                 qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
                 Ok(false)
@@ -2187,64 +3623,218 @@ mod tests {
         let admit = |pp, tp, ep, mtp| {
             qwen4_request_admission(EffectiveMesh::new(pp, tp, ep), InputModality::Text, mtp)
         };
-        for ep in [1, 2, 4] {
+        for ep in 1..=8 {
             assert_eq!(admit(1, 1, ep, false), Ok(()), "ep {ep}");
         }
         assert_eq!(admit(1, 1, 1, true), Ok(()));
-        for ep in [0, 3, 5, 8] {
-            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in {1, 2, 4}"), "ep {ep}");
+        for ep in [0, 9, 16] {
+            assert!(
+                admit(1, 1, ep, false)
+                    .unwrap_err()
+                    .contains("topology.ep from 1 to 8"),
+                "ep {ep}"
+            );
         }
-        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
+        for pp in 2..=8 {
+            assert_eq!(admit(pp, 1, 1, false), Ok(()), "pp {pp}");
+            // Native MTP is admitted on the mesh (the output band owns the head).
+            assert_eq!(admit(pp, 1, 1, true), Ok(()), "pp {pp}");
+        }
+        for (pp, tp, ep) in [(1, 2, 1), (2, 1, 2), (1, 2, 4), (2, 2, 1), (9, 1, 1)] {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
         }
-        for ep in [2, 4] {
+        for ep in 2..=8 {
             assert_eq!(admit(1, 1, ep, true), Ok(()), "ep {ep}");
         }
     }
 
     #[test]
     fn qwen4_ep_geometry_refusal_names_the_missing_requirement() {
-        assert_eq!(qwen4_ep_geometry_refusal(1, 1, 1, "gfx1100", Some(1)), None);
-        assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4)), None);
-        assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None), None);
-        let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1100", Some(4)).unwrap();
-        assert!(arch.contains("gfx1201") && arch.contains("expert parallelism"), "{arch}");
-        let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2)).unwrap();
-        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
-        assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2)).is_some());
-        assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2)).is_some());
+        assert_eq!(
+            qwen4_ep_geometry_refusal(1, 1, 1, "gfx1030", Some(1), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(6), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(8, 1, 1, "gfx1100", Some(8), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None, false),
+            None
+        );
+        let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1151", Some(4), false).unwrap();
+        assert!(
+            arch.contains("gfx1100 or gfx1201") && arch.contains("expert parallelism"),
+            "{arch}"
+        );
+        let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2), false).unwrap();
+        assert!(
+            count.contains("4 visible devices") && count.contains("2 visible"),
+            "{count}"
+        );
+        assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2), false).is_some());
+        assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2), false).is_some());
+        // Emulation needs one physical device, not one per rank.
+        assert_eq!(
+            qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(1), true),
+            None
+        );
+        assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(0), true).is_some());
+        assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1030", Some(1), true).is_some());
+        // gfx1151 runs logical ranks under emulation only.
+        assert_eq!(
+            qwen4_ep_geometry_refusal(4, 1, 1, "gfx1151", Some(1), true),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen4_ep_rank_devices_maps_physical_and_aliased_ranks() {
+        // Physical mode: rank r is device r, and every rank needs its own device.
+        assert_eq!(qwen4_ep_rank_devices(4, 4, false), Ok(vec![0, 1, 2, 3]));
+        assert_eq!(qwen4_ep_rank_devices(2, 8, false), Ok(vec![0, 1]));
+        let short = qwen4_ep_rank_devices(6, 4, false).unwrap_err();
+        assert!(
+            short.contains("6 visible devices") && short.contains("4 visible"),
+            "{short}"
+        );
+        // Emulation: rank r -> physical device r % count.
+        assert_eq!(qwen4_ep_rank_devices(2, 1, true), Ok(vec![0, 0]));
+        assert_eq!(qwen4_ep_rank_devices(3, 1, true), Ok(vec![0, 0, 0]));
+        assert_eq!(qwen4_ep_rank_devices(6, 1, true), Ok(vec![0; 6]));
+        assert_eq!(
+            qwen4_ep_rank_devices(6, 4, true),
+            Ok(vec![0, 1, 2, 3, 0, 1])
+        );
+        assert_eq!(
+            qwen4_ep_rank_devices(8, 4, true),
+            Ok(vec![0, 1, 2, 3, 0, 1, 2, 3])
+        );
+        assert!(qwen4_ep_rank_devices(6, 0, true).is_err());
     }
 
     #[test]
     fn qwen4_ep_device_refusal_checks_arch_count_and_every_directed_pair() {
-        let gfx1201 = |n: usize| vec!["gfx1201".to_string(); n];
+        let homogeneous = |arch: &str, n: usize| vec![arch.to_string(); n];
+        let ranks = |n: i32| (0..n).collect::<Vec<i32>>();
         let all = |_: usize, _: usize| Ok(true);
-        assert_eq!(qwen4_ep_device_refusal(4, &gfx1201(4), all), Ok(()));
-        assert_eq!(qwen4_ep_device_refusal(2, &gfx1201(4), all), Ok(()));
+        // Homogeneous gfx1201 and gfx1100 sets are admitted at every degree.
+        for arch in ["gfx1201", "gfx1100"] {
+            for ep in 2..=8usize {
+                assert_eq!(
+                    qwen4_ep_device_refusal(
+                        ep,
+                        &ranks(ep as i32),
+                        &homogeneous(arch, ep),
+                        false,
+                        all
+                    ),
+                    Ok(()),
+                    "{arch} ep {ep}"
+                );
+            }
+        }
+        assert_eq!(
+            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), false, all),
+            Ok(())
+        );
         // Too few devices.
-        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all).unwrap_err().contains("3 visible"));
-        // A different arch on rank 2 refuses and names the rank.
-        let mut mixed = gfx1201(4);
+        assert!(
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), false, all)
+                .unwrap_err()
+                .contains("3 visible")
+        );
+        // A different admitted arch on rank 2 refuses (mixed) and names the ranks.
+        let mut mixed = homogeneous("gfx1201", 4);
         mixed[2] = "gfx1100".to_string();
-        let error = qwen4_ep_device_refusal(4, &mixed, all).unwrap_err();
-        assert!(error.contains("rank 2") && error.contains("gfx1100"), "{error}");
+        let error = qwen4_ep_device_refusal(4, &ranks(4), &mixed, false, all).unwrap_err();
+        assert!(
+            error.contains("same architecture")
+                && error.contains("rank 2")
+                && error.contains("gfx1100"),
+            "{error}"
+        );
+        // An unadmitted arch refuses even when homogeneous.
+        for arch in ["gfx1151", "gfx1030", "gfx942", ""] {
+            let error = qwen4_ep_device_refusal(2, &ranks(2), &homogeneous(arch, 2), false, all)
+                .unwrap_err();
+            assert!(
+                error.contains("gfx1100 or gfx1201") && error.contains("rank 0"),
+                "{arch}: {error}"
+            );
+        }
         // An arch beyond the rank count is not part of the mesh.
-        assert_eq!(qwen4_ep_device_refusal(2, &mixed, all), Ok(()));
+        assert_eq!(
+            qwen4_ep_device_refusal(2, &ranks(2), &mixed, false, all),
+            Ok(())
+        );
         // Every directed pair is probed; one missing direction refuses.
         let mut probed = Vec::new();
-        qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| {
+        qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), false, |a, b| {
             probed.push((a, b));
             Ok(true)
         })
         .unwrap();
         assert_eq!(probed.len(), 12);
         let error =
-            qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| Ok(!(a == 3 && b == 1))).unwrap_err();
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), false, |a, b| {
+                Ok(!(a == 3 && b == 1))
+            })
+            .unwrap_err();
         assert!(error.contains("device 3 cannot access device 1"), "{error}");
         // A failed query is an error, not "no peer".
-        assert!(qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
-            .unwrap_err()
-            .contains("hip"));
+        assert!(qwen4_ep_device_refusal(
+            2,
+            &ranks(2),
+            &homogeneous("gfx1201", 2),
+            false,
+            |_, _| Err("hip".to_string())
+        )
+        .unwrap_err()
+        .contains("hip"));
+        // Aliased ranks (emulation): same-device pairs are never probed and a
+        // single physical device needs no peer access at all.
+        let one = homogeneous("gfx1100", 1);
+        let mut probes = 0;
+        assert_eq!(
+            qwen4_ep_device_refusal(6, &[0; 6], &one, true, |_, _| {
+                probes += 1;
+                Ok(false)
+            }),
+            Ok(())
+        );
+        assert_eq!(probes, 0);
+        // Four physical devices under six ranks: only distinct physical pairs
+        // are probed, once each.
+        let mut pairs = Vec::new();
+        qwen4_ep_device_refusal(
+            6,
+            &[0, 1, 2, 3, 0, 1],
+            &homogeneous("gfx1100", 4),
+            true,
+            |a, b| {
+                pairs.push((a, b));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(pairs.len(), 12);
+        // Aliased devices are still arch-checked; gfx1151 is admitted only aliased.
+        assert!(
+            qwen4_ep_device_refusal(6, &[0; 6], &homogeneous("gfx1030", 1), true, all).is_err()
+        );
+        assert_eq!(
+            qwen4_ep_device_refusal(6, &[0; 6], &homogeneous("gfx1151", 1), true, all),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2434,7 +4024,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("minimal probe must fail later on invalid Qwen4 config");
             assert!(
-                !err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                !err.contains("qwen4: unsupported option(s)"),
                 "resolved schema defaults must pass the DDTree source gate: {err}"
             );
             assert!(
@@ -2451,7 +4041,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("active DDTree must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                err.contains("qwen4: unsupported option(s): DDTree;"),
                 "active DDTree must be refused at source admission: {err}"
             );
 
@@ -2464,7 +4054,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("non-default top-K must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                err.contains("qwen4: unsupported option(s): DDTree;"),
                 "non-default DDTree top-K must be refused at source admission: {err}"
             );
 
@@ -2472,7 +4062,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("active adaptive KV must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree, adaptive-KV"),
+                err.contains("qwen4: unsupported option(s): adaptive KV;"),
                 "active adaptive KV must be refused at source admission: {err}"
             );
             for (option, options) in [
@@ -2533,7 +4123,7 @@ mod tests {
         assert!(qwen4_request_admission(single, InputModality::Image, true).is_err());
         assert!(qwen4_request_admission(single, InputModality::Video, true).is_err());
         assert!(qwen4_request_admission(
-            hipfire_arch_qwen4::EffectiveMesh::new(2, 1, 1),
+            hipfire_arch_qwen4::EffectiveMesh::new(1, 2, 1),
             InputModality::Text,
             true
         )
@@ -2598,6 +4188,18 @@ mod tests {
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
     }
 
+    #[test]
+    fn muse_glimmer_refuses_every_parallel_axis() {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
+            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
+                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
+            assert!(err.contains("single-device only"), "{err}");
+        }
+        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
+        // Other architectures keep their own topology gates.
+        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
+    }
+
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`
     /// envelope every pp-capable source carries, and fails open (`None`) on
     /// sources with no layer key rather than refusing a servable load.
@@ -2639,13 +4241,13 @@ mod tests {
         let err_zero = pp_geometry_refusal(0, Some(64), Some(4)).expect("pp=0 refuses");
         assert!(err_zero.contains("pp=0"), "reason: {err_zero}");
         assert!(
-            err_zero.contains("init_uniform"),
-            "names deep site: {err_zero}"
+            err_zero.contains("topology.pp"),
+            "names the setting: {err_zero}"
         );
         let err = pp_geometry_refusal(99, Some(64), Some(4)).expect("pp=99 refuses");
         assert!(err.contains("pp=99"), "reason: {err}");
         assert!(err.contains("n_layers=64"), "reason: {err}");
-        assert!(err.contains("init_uniform"), "names deep site: {err}");
+        assert!(err.contains("topology.pp"), "names the setting: {err}");
         let err = pp_geometry_refusal(8, Some(64), Some(4)).expect("pp=8 > 4 devices");
         assert!(err.contains("device count=4"), "reason: {err}");
         // Servable degrees pass untouched.
@@ -2663,7 +4265,10 @@ mod tests {
     fn tp_geometry_checks_degree_and_devices_only() {
         let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
         assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
-        assert!(err_zero.contains("init_ep"), "names deep site: {err_zero}");
+        assert!(
+            err_zero.contains("single GPU"),
+            "names the remedy: {err_zero}"
+        );
         let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
         assert!(err.contains("tp=99"), "reason: {err}");
         assert!(err.contains("device count=4"), "reason: {err}");
@@ -2683,11 +4288,20 @@ mod tests {
     }
 
     /// Vision-sidecar fixtures: minimal HFQ files via the in-memory writer.
-    /// The trunk is a tower-less arch-5 text pack; the sidecar carries just
-    /// the probe tensor. Admission is read-only — no GPU needed.
+    /// The trunk is a tower-less text pack; the sidecar carries just the
+    /// trunk family's probe tensor. Admission is read-only — no GPU needed.
     mod vision_sidecar {
         use super::*;
         use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        /// The probe tensor admission looks for on an `arch_id` sidecar.
+        fn probe_for(arch_id: u32) -> &'static str {
+            if arch_id == 18 {
+                super::super::EMBED_GEMMA_VISION_PROBE_TENSOR
+            } else {
+                super::super::VISION_PROBE_TENSOR
+            }
+        }
 
         fn write_hfq(name: &str, arch_id: u32, with_tower: bool) -> std::path::PathBuf {
             let dir = std::env::temp_dir().join(format!(
@@ -2706,7 +4320,7 @@ mod tests {
             }];
             if with_tower {
                 tensors.push(HfqMemTensor {
-                    name: super::super::VISION_PROBE_TENSOR.into(),
+                    name: probe_for(arch_id).into(),
                     quant_type: 1,
                     shape: vec![4, 4],
                     group_size: 0,
@@ -2801,6 +4415,134 @@ mod tests {
             assert!(err.contains("arch_id=9"), "names the sidecar arch: {err}");
             cleanup(&trunk);
             cleanup(&sidecar);
+        }
+
+        /// EmbeddingGemma-2: tower-less arch-18 trunk + its arch-18 `.vl` pack
+        /// admits, and the resolved path reaches the carrier through
+        /// `LoadCtx` exactly as the Qwen3.5-VL sidecar does.
+        #[test]
+        fn embed_gemma_sidecar_promotes_tower_less_trunk() {
+            let trunk = write_hfq("eg2-trunk", 18, false);
+            let sidecar = write_hfq("eg2-sidecar", 18, true);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .expect("EmbeddingGemma-2 tower sidecar must admit");
+            assert!(
+                admitted.has_vision,
+                "sidecar tower promotes the tower-less arch-18 trunk"
+            );
+            assert_eq!(admitted.vision_path, Some(sidecar.clone()));
+            assert!(
+                admitted
+                    .carrier
+                    .is_some_and(|c| c.name() == "embeddinggemma2"),
+                "trunk still routes to embeddinggemma2"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// An arch-18 pack without the EmbeddingGemma-2 tower probe refuses
+        /// with the requantize remedy — never silently text-only.
+        #[test]
+        fn embed_gemma_sidecar_without_tower_refuses() {
+            let trunk = write_hfq("eg2-b-trunk", 18, false);
+            let sidecar = write_hfq("eg2-b-sidecar", 18, false);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("tower-less arch-18 sidecar must refuse");
+            assert!(err.contains("no vision tower tensor"), "remedy: {err}");
+            assert!(
+                err.contains(super::super::EMBED_GEMMA_VISION_PROBE_TENSOR),
+                "names the EmbeddingGemma-2 probe: {err}"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// The two families do not interchange: an arch-18 trunk refuses a
+        /// Qwen3.5-VL sidecar (and vice versa) — the wrong tower's names would
+        /// never resolve against the trunk.
+        #[test]
+        fn sidecar_families_do_not_interchange() {
+            let eg2_trunk = write_hfq("eg2-x-trunk", 18, false);
+            let qwen_sidecar = write_hfq("eg2-x-qwen-sidecar", 5, true);
+            let err = admit_source(
+                eg2_trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(qwen_sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("Qwen sidecar on an arch-18 trunk must refuse");
+            assert!(err.contains("arch_id=5"), "names the sidecar arch: {err}");
+            assert!(err.contains("expected 18"), "names the family: {err}");
+            cleanup(&eg2_trunk);
+            cleanup(&qwen_sidecar);
+
+            let qwen_trunk = write_hfq("eg2-y-trunk", 5, false);
+            let eg2_sidecar = write_hfq("eg2-y-sidecar", 18, true);
+            let err = admit_source(
+                qwen_trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(eg2_sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("EmbeddingGemma-2 sidecar on a Qwen trunk must refuse");
+            assert!(err.contains("arch_id=18"), "names the sidecar arch: {err}");
+            assert!(err.contains("expected 5|6"), "names the family: {err}");
+            cleanup(&qwen_trunk);
+            cleanup(&eg2_sidecar);
+        }
+
+        /// A sidecar requested for any arch outside the two VL families is
+        /// refused before the file is even opened.
+        #[test]
+        fn sidecar_for_a_non_vl_arch_refuses() {
+            let missing = std::env::temp_dir().join("hipfire-vision-admit-never-exists.hfq");
+            let _ = std::fs::remove_file(&missing);
+            let err =
+                super::super::resolve_vision_sidecar(Some(missing.to_str().unwrap()), 13, false)
+                    .map(|_| ())
+                    .expect_err("text-only arch must refuse a sidecar request");
+            assert!(
+                err.contains("arch_id=13") && err.contains("EmbeddingGemma-2"),
+                "names the arch and both VL families: {err}"
+            );
         }
         #[test]
         fn automatic_backend_resolves_by_capability_not_source_spelling() {
@@ -2964,7 +4706,7 @@ mod tests {
             assert!(mode_spelling
                 .kv_backend_reason
                 .unwrap()
-                .contains("no certified VMM KV path"));
+                .contains("no tested VMM KV path"));
             let default = admit(auto, "gfx1151", Some("q8"), None, true).unwrap();
             assert_eq!(default.kv_backend, KvBackend::Vmm);
             let unavailable = admit(auto, "gfx1151", Some("q8"), None, false).unwrap();
@@ -2972,14 +4714,14 @@ mod tests {
             assert!(unavailable
                 .kv_backend_reason
                 .unwrap()
-                .contains("HIP VMM symbols/granularity unavailable"));
+                .contains("does not provide the virtual-memory (VMM) support"));
             let gfx1201 = admit(auto, "gfx1201", Some("q8"), Some("fwht3"), true).unwrap();
             assert_eq!(gfx1201.kv_backend, KvBackend::Vmm);
             assert!(gfx1201.kv_backend_reason.is_none());
             cleanup(&trunk);
         }
         #[test]
-        fn moe_preserves_legacy_context_when_dense_capacity_is_unknown() {
+        fn moe_pins_legacy_context_on_discrete_and_sizes_itself_on_uma() {
             let path = write_hfq("moe-capacity", 6, false);
             let metadata = r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}}"#;
             let embedding = HfqMemTensor {
@@ -3034,6 +4776,25 @@ mod tests {
             .expect("explicit MoE max_seq must remain authoritative");
             assert_eq!(explicit.max_seq, 50000);
             assert!(explicit.sequence_reason.is_none());
+            // Unified memory sizes MoE like dense: the trained window, capped
+            // by the carrier's post-weight card measurement.
+            let uma = super::super::admit_source(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                None,
+                0,
+                hints,
+            )
+            .expect("UMA MoE omission sizes automatically");
+            let sequence = uma.sequence.expect("UMA MoE resolves a sequence");
+            assert_eq!((sequence.max_seq, sequence.bound), (131072, "pending"));
+            assert!(uma.sequence_reason.is_none());
             cleanup(&path);
         }
     }
@@ -3453,6 +5214,7 @@ mod tests {
                 None,
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3472,6 +5234,7 @@ mod tests {
                 None,
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3494,6 +5257,7 @@ mod tests {
                 Some(CAPACITY),
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3504,6 +5268,7 @@ mod tests {
                 Some(8192),
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3520,6 +5285,7 @@ mod tests {
                 None,
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3530,6 +5296,7 @@ mod tests {
                 Some(CAPACITY),
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3540,9 +5307,23 @@ mod tests {
             );
             assert!(error.contains(&format!("at most {cap}")), "{error}");
             assert!(
-                error.contains(
-                    "15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"
-                ),
+                error.contains(&format!(
+                    "with the current free host memory the context fits up to {cap} tokens"
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("this limit moves with free host memory)"),
+                "{error}"
+            );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "{} bytes QSA context incl. any F16 arena + {} bytes QSA gather workspace + {} bytes native MTP request buffers",
+                    15_392 * MIB,
+                    512 * MIB,
+                    740 * MIB
+                )),
                 "{error}"
             );
         }
@@ -3554,6 +5335,7 @@ mod tests {
                 None,
                 fixed() - 1,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3562,6 +5344,1300 @@ mod tests {
                 error.contains("cannot hold an automatic context"),
                 "{error}"
             );
+            assert!(
+                error.contains("this limit moves with free host memory)"),
+                "{error}"
+            );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
+        }
+
+        /// Strix Halo serve receipt (Flash-Next, native MTP on, max_seq
+        /// 262144): 62,336 bytes of QSA context and 2,048 bytes of gather
+        /// workspace per token.
+        mod halo_256k {
+            use super::{qwen4_memory_admission, QWEN4_MEMORY_HEADROOM_BYTES};
+
+            const CAPACITY: usize = 262_144;
+            const FREE: u64 = 34_674_597_888;
+            const MTP_REQUEST: u64 = 1_237_893_184;
+            /// Requested resident PLE: 14 GiB.
+            const PLE: u64 = 15_032_385_536;
+
+            fn growth(tokens: usize) -> (u64, u64) {
+                (tokens as u64 * 62_336, tokens as u64 * 2_048)
+            }
+
+            fn admit(
+                requested: Option<usize>,
+                free: u64,
+                ple: u64,
+            ) -> Result<super::super::super::Qwen4MemoryAdmission, String> {
+                qwen4_memory_admission(
+                    CAPACITY,
+                    requested,
+                    free,
+                    MTP_REQUEST,
+                    ple,
+                    QWEN4_MEMORY_HEADROOM_BYTES,
+                    growth,
+                )
+            }
+
+            #[test]
+            fn halo_256k_serve_fits_by_shrinking_ple() {
+                assert_eq!(growth(CAPACITY), (16_341_008_384, 536_870_912));
+                for requested in [Some(CAPACITY), None] {
+                    let admission = admit(requested, FREE, PLE).unwrap();
+                    assert_eq!(admission.max_seq, 262_144);
+                    assert_eq!(admission.card_cap, 262_144);
+                    assert_eq!(admission.ple_budget, 15_032_385_536);
+                    assert_eq!(admission.resident_ple, 14_411_341_760);
+                    assert!(admission.ple_shrunk());
+                    // The shrunk PLE takes the card to exactly its free memory.
+                    assert_eq!(admission.required(), FREE);
+                }
+            }
+
+            #[test]
+            fn halo_256k_refuses_when_the_context_itself_does_not_fit() {
+                let free = 19_000_000_000;
+                let error = admit(Some(CAPACITY), free, PLE).unwrap_err();
+                assert!(error.contains("max_seq 262144 does not fit"), "{error}");
+                // The cap is the largest context that fits with PLE 0.
+                let cap = 242_523;
+                let total = |tokens: usize| {
+                    let (context, gather) = growth(tokens);
+                    context + gather + MTP_REQUEST + QWEN4_MEMORY_HEADROOM_BYTES
+                };
+                assert!(total(cap) <= free);
+                assert!(total(cap + 1) > free);
+                assert!(error.contains(&format!("at most {cap}")), "{error}");
+                assert!(
+                    error.contains("needs 20263256128 bytes free after load"),
+                    "{error}"
+                );
+                assert!(!error.contains("PLE prewarm budget"), "{error}");
+                // The cap does not depend on the requested PLE budget.
+                for ple in [0, PLE, u64::MAX] {
+                    assert_eq!(admit(None, free, ple).unwrap().card_cap, cap);
+                }
+                let auto = admit(None, free, PLE).unwrap();
+                assert_eq!(auto.max_seq, cap);
+                // The 22,336 bytes the cap leaves free are all the PLE gets.
+                assert_eq!(auto.resident_ple, 22_336);
+                assert!(auto.ple_shrunk());
+            }
+
+            #[test]
+            fn halo_256k_keeps_the_full_ple_when_everything_fits() {
+                let free = 40u64 << 30;
+                let admission = admit(Some(CAPACITY), free, PLE).unwrap();
+                assert_eq!(admission.max_seq, 262_144);
+                assert_eq!(admission.resident_ple, 15_032_385_536);
+                assert_eq!(admission.ple_budget, 15_032_385_536);
+                assert!(!admission.ple_shrunk());
+                assert_eq!(admission.required(), 20_263_256_128 + PLE);
+            }
+        }
+    }
+
+    /// Strix Halo (gfx1151, 121 GiB shared host/GTT) admission of the
+    /// Flash-Next geometry with the opt-in QSA F16 arena, against the
+    /// measured free memory and the resident PLE budget. Growth comes from
+    /// the real `Qwen4Config` (48 layers, every 4th full attention = 12 QSA
+    /// layers, 2 KV heads x head_dim 256, 1 index head x 128, compress 4),
+    /// row-exact like `Qwen4State::context_growth_bytes`; the gathered
+    /// workspace is the real `qsa_gathered_wmma_scratch_bytes` when the
+    /// arena is off (with it on the route does not need the shared workspace).
+    mod qwen4_halo_arena {
+        use super::super::{
+            qwen4_context_sequence, qwen4_memory_admission, qwen4_requested_context,
+            QWEN4_MEMORY_HEADROOM_BYTES,
+        };
+        use hipfire_arch_qwen4::config::{
+            Qwen4Config, ARCHITECTURE_NAME, MODEL_TYPE, TEXT_MODEL_TYPE,
+        };
+        use rdna_compute::tensor_ops::{qsa_gathered_wmma_scratch_bytes, QsaStateLayout};
+
+        const MIB: u64 = 1 << 20;
+        const CAPACITY: usize = 262_144;
+        /// Free device memory after the load (min of HIP free and
+        /// MemAvailable + TTM pool).
+        const FREE: u64 = 33_605 * MIB;
+        /// Resident PLE budget: `ple_prewarm_budget_for(Auto, 23,038 MiB
+        /// MemAvailable)` = 23,038 - 8,192 MiB (below the 15 GiB cap).
+        const PLE: u64 = 14_846 * MIB;
+        /// Free device memory with the whole PLE budget already taken out:
+        /// what a context must fit in when the PLE page cache yields to it
+        /// (18,759 MiB, the card the pre-shrink admission refused on).
+        const TIGHT_FREE: u64 = FREE - PLE;
+
+        fn config() -> Qwen4Config {
+            let layers: Vec<_> = (0..48)
+                .map(|idx| {
+                    if idx % 4 == 3 {
+                        "full_attention"
+                    } else {
+                        "linear_attention"
+                    }
+                })
+                .collect();
+            // Parsed from text: a `json!` literal this size overflows the
+            // macro's recursion limit.
+            let layers = serde_json::to_string(&layers).unwrap();
+            let text = r#"{
+                "architectures": ["@ARCH@"],
+                "model_type": "@MODEL@",
+                "text_config": {
+                    "model_type": "@TEXT@",
+                    "dtype": "bfloat16",
+                    "hidden_size": 2560,
+                    "vocab_size": 248320,
+                    "num_hidden_layers": 48,
+                    "max_position_embeddings": 262144,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "partial_rotary_factor": 0.25,
+                    "rope_parameters": {"rope_theta": 10000000.0},
+                    "attention_bias": false,
+                    "layer_types": @LAYERS@,
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 48,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "mamba_ssm_dtype": "float32",
+                    "indexer_n_heads": 4,
+                    "indexer_kv_heads": 1,
+                    "indexer_head_dim": 128,
+                    "indexer_budget": 2048,
+                    "indexer_compress_ratio": 4,
+                    "num_experts": 512,
+                    "num_experts_per_tok": 10,
+                    "moe_intermediate_size": 640,
+                    "shared_expert_intermediate_size": 640,
+                    "norm_topk_prob": true,
+                    "hc_count": 4,
+                    "hc_lowrank": 320,
+                    "ple_layer_ids": [2],
+                    "ple_conv_kernel_size": 4,
+                    "ple_embed_dim": 2560,
+                    "split_ngram_parts": 128,
+                    "heads_per_ngram": 8,
+                    "ngram_size": 3,
+                    "ngram_vocab_size_base": 20000000,
+                    "make_ngram_vocab_size_divisible_by": 128,
+                    "eos_token_id": 248044,
+                    "tie_word_embeddings": false,
+                    "mtp_num_hidden_layers": 1,
+                    "mtp_use_dedicated_embeddings": false,
+                    "output_gate_type": "sigmoid",
+                    "mtp": {
+                        "hybrid": true,
+                        "layer_types": ["full_attention"],
+                        "num_hidden_layers": 1,
+                        "rope_theta": 10000000.0
+                    }
+                }
+            }"#
+            .replace("@ARCH@", ARCHITECTURE_NAME)
+            .replace("@MODEL@", MODEL_TYPE)
+            .replace("@TEXT@", TEXT_MODEL_TYPE)
+            .replace("@LAYERS@", &layers);
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            Qwen4Config::from_value(&value).expect("Flash-Next geometry")
+        }
+
+        /// `(context, gather)` growth of the target's QSA layers through
+        /// `tokens` (nothing mapped yet, no native MTP head: the receipt's
+        /// 20,352 MiB): per layer the rows `tokens` need, from the real
+        /// `qsa_context_arena_bytes` (pooled keys by `ceil(t / 4)`, the F16
+        /// arena rounded to four tokens), as `Qwen4State::context_growth_bytes`
+        /// counts them.
+        fn growth(arena: bool) -> impl Fn(usize) -> (u64, u64) {
+            growth_with(arena, false)
+        }
+
+        /// [`growth`] with the pooled BF16 mirror (`pooled_bf16`) on or off:
+        /// the mirror adds `ceil(t / 4)` blocks of 128 BF16 channels per layer.
+        fn growth_with(arena: bool, mirror: bool) -> impl Fn(usize) -> (u64, u64) {
+            let config = config();
+            assert_eq!(config.n_full_layers(), 12);
+            let layout = QsaStateLayout {
+                f16_arena: arena,
+                pooled_bf16: mirror,
+                ..QsaStateLayout::F32
+            };
+            let layers = config.n_full_layers() as u64;
+            let kv_heads = config.num_key_value_heads;
+            move |tokens| {
+                let tokens = tokens.min(CAPACITY);
+                let gather = if arena {
+                    0
+                } else {
+                    qsa_gathered_wmma_scratch_bytes(kv_heads, tokens).unwrap() as u64
+                };
+                let context =
+                    layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
+                (context, gather)
+            }
+        }
+
+        fn admit(
+            requested: Option<usize>,
+            arena: bool,
+            resident_ple: u64,
+        ) -> Result<super::super::Qwen4MemoryAdmission, String> {
+            admit_at(FREE, requested, arena, resident_ple)
+        }
+
+        fn admit_at(
+            free: u64,
+            requested: Option<usize>,
+            arena: bool,
+            resident_ple: u64,
+        ) -> Result<super::super::Qwen4MemoryAdmission, String> {
+            qwen4_memory_admission(
+                CAPACITY,
+                requested,
+                free,
+                0,
+                resident_ple,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth(arena),
+            )
+        }
+
+        #[test]
+        fn config_costs_are_the_expected_halo_figures() {
+            let (with_arena, _) = growth(true)(CAPACITY);
+            let (plain, gather) = growth(false)(CAPACITY);
+            assert_eq!(plain, 14_208 * MIB);
+            assert_eq!(gather, 512 * MIB);
+            assert_eq!(with_arena, 20_352 * MIB);
+            assert_eq!(with_arena - plain, 6_144 * MIB);
+            // Row-exact: 12 x (4608 t + 512 ceil(t/4) + 8192 ceil(t/4)).
+            let cost = |t: u64| 12 * (4608 * t + 512 * t.div_ceil(4) + 8192 * t.div_ceil(4));
+            for t in [215_245u64, 215_246, 215_247, 215_248, CAPACITY as u64] {
+                assert_eq!(growth(true)(t as usize).0, cost(t), "{t}");
+            }
+            assert_eq!(cost(215_245), 17_522_743_296);
+            assert_eq!(cost(215_246), 17_522_798_592);
+        }
+
+        #[test]
+        fn halo_arena_context_fits_by_shrinking_ple() {
+            // Without any PLE: 20,352 + 2,048 <= 33,605 MiB.
+            let admission = admit(Some(CAPACITY), true, 0).unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.required(), (20_352 + 2_048) * MIB);
+            assert!(!admission.ple_shrunk());
+            // The requested 14,846 MiB PLE budget on top would take it over
+            // the card (20,352 + 2,048 + 14,846 = 37,246 MiB > 33,605 MiB by
+            // 3,641 MiB); the context takes precedence and the PLE shrinks to
+            // the 11,205 MiB the card has left.
+            assert_eq!((20_352 + 2_048 + 14_846) * MIB - FREE, 3_641 * MIB);
+            let admission = admit(Some(CAPACITY), true, PLE).unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.ple_budget, PLE);
+            assert_eq!(admission.resident_ple, 11_205 * MIB);
+            assert!(admission.ple_shrunk());
+            assert_eq!(admission.required(), FREE);
+            // Auto resolves to the same whole context and PLE.
+            assert_eq!(admit(None, true, PLE).unwrap(), admission);
+        }
+
+        #[test]
+        fn halo_arena_context_over_the_card_is_refused_with_exact_cap() {
+            let error = admit_at(TIGHT_FREE, Some(CAPACITY), true, PLE).unwrap_err();
+            assert_eq!(TIGHT_FREE - QWEN4_MEMORY_HEADROOM_BYTES, 17_522_753_536);
+            assert!(
+                error.contains("max_seq 262144 does not fit device memory"),
+                "{error}"
+            );
+            assert!(error.contains("at most 215245"), "{error}");
+            for part in [
+                format!("needs {} bytes free after load", (20_352 + 2_048) * MIB),
+                format!("{} bytes QSA context incl. any F16 arena", 20_352 * MIB),
+                "0 bytes QSA gather workspace".to_string(),
+                "0 bytes native MTP request buffers".to_string(),
+                format!("= {} bytes growth", 20_352 * MIB),
+                format!("{} bytes headroom", QWEN4_MEMORY_HEADROOM_BYTES),
+                format!("{TIGHT_FREE} bytes is free after load"),
+            ] {
+                assert!(error.contains(&part), "{part}: {error}");
+            }
+            assert!(
+                error.contains(
+                    "with the current free host memory the context fits up to 215245 tokens"
+                ),
+                "{error}"
+            );
+            assert!(
+                error.contains("this limit moves with free host memory)"),
+                "{error}"
+            );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
+        }
+
+        #[test]
+        fn halo_arena_card_cap_is_the_largest_fit() {
+            let admission = admit_at(TIGHT_FREE, None, true, PLE).unwrap();
+            assert_eq!(admission.card_cap, 215_245);
+            assert_eq!(admission.max_seq, 215_245);
+            // The cap leaves 10,240 bytes: all the PLE the context allows.
+            assert_eq!(admission.ple_budget, PLE);
+            assert_eq!(admission.resident_ple, 10_240);
+            assert!(admission.ple_shrunk());
+            assert_eq!(admission.required(), TIGHT_FREE);
+            let next = growth(true)(215_246).0 + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert_eq!(next - TIGHT_FREE, 45_056);
+            // The cap does not depend on the requested PLE budget.
+            for ple in [0, PLE, u64::MAX] {
+                assert_eq!(
+                    admit_at(TIGHT_FREE, None, true, ple).unwrap().card_cap,
+                    215_245
+                );
+            }
+            // An explicit context at the cap is honored, one past it refuses.
+            assert_eq!(
+                admit_at(TIGHT_FREE, Some(215_245), true, PLE)
+                    .unwrap()
+                    .max_seq,
+                215_245
+            );
+            assert!(admit_at(TIGHT_FREE, Some(215_246), true, PLE).is_err());
+        }
+
+        /// The default-on pooled BF16 mirror is charged row-exact
+        /// (`256 * ceil(t / 4)` bytes per QSA layer) in the growth the
+        /// admission sizes the context against.
+        #[test]
+        fn halo_pooled_bf16_mirror_is_counted_in_the_card_cap() {
+            let off = growth_with(true, false);
+            let on = growth_with(true, true);
+            for t in [1usize, 4, 5, 215_245, 215_246, CAPACITY] {
+                let t_u = t as u64;
+                assert_eq!(on(t).0 - off(t).0, 12 * 256 * t_u.div_ceil(4), "{t}");
+            }
+            assert_eq!(on(CAPACITY).0 - off(CAPACITY).0, 192 * MIB);
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                TIGHT_FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap();
+            let cap = admission.card_cap;
+            assert!(cap < 215_245, "the mirror lowers the cap: {cap}");
+            let total = |t: usize| on(t).0 + on(t).1 + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert!(total(cap) <= TIGHT_FREE);
+            assert!(total(cap + 1) > TIGHT_FREE);
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                TIGHT_FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("at most {cap}")), "{error}");
+            // On the measured card the whole context fits with the mirror
+            // counted: the PLE shrinks to 33,605 - 20,544 - 2,048 MiB.
+            let whole = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap();
+            assert_eq!(whole.context_growth, 20_544 * MIB);
+            assert_eq!(whole.resident_ple, 11_013 * MIB);
+            assert!(whole.ple_shrunk());
+        }
+
+        #[test]
+        fn halo_without_the_arena_accepts_the_whole_context() {
+            for requested in [None, Some(CAPACITY)] {
+                let admission = admit(requested, false, PLE).unwrap();
+                assert_eq!(admission.max_seq, CAPACITY);
+                assert_eq!(admission.card_cap, CAPACITY);
+                assert_eq!(admission.context_growth, 14_208 * MIB);
+                assert_eq!(admission.gather_growth, 512 * MIB);
+                // 14,208 + 512 + 14,846 + 2,048 = 31,614 MiB <= 33,605 MiB:
+                // the whole PLE budget is kept.
+                assert_eq!(admission.resident_ple, PLE);
+                assert!(!admission.ple_shrunk());
+                assert_eq!(admission.required(), 31_614 * MIB);
+            }
+        }
+
+        #[test]
+        fn discrete_arch_resolves_no_sequence_and_keeps_the_explicit_context() {
+            const KV: &str = "bf16";
+            let model_ctx = 262_144;
+            for arch in ["gfx1100", "gfx1201"] {
+                let unified = hipfire_config::is_unified_memory_arch(arch);
+                assert!(!unified, "{arch}");
+                // An omitted max_seq is the default context, an explicit
+                // 262144 is kept; neither resolves a memory-admitted sequence.
+                assert_eq!(
+                    qwen4_requested_context(unified, 0),
+                    hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+                );
+                assert_eq!(qwen4_requested_context(unified, CAPACITY), CAPACITY);
+                assert!(qwen4_context_sequence(unified, 0, model_ctx, KV).is_none());
+                assert!(qwen4_context_sequence(unified, CAPACITY, model_ctx, KV).is_none());
+            }
+            // Halo resolves a sequence: omitted is pending at the model
+            // context, explicit is the user's bound (checked after load).
+            let halo = hipfire_config::is_unified_memory_arch("gfx1151");
+            assert!(halo);
+            assert_eq!(qwen4_requested_context(halo, 0), 0);
+            let pending = qwen4_context_sequence(halo, 0, model_ctx, KV).unwrap();
+            assert_eq!((pending.max_seq, pending.bound), (model_ctx, "pending"));
+            let user = qwen4_context_sequence(halo, CAPACITY, model_ctx, KV).unwrap();
+            assert_eq!((user.max_seq, user.bound), (CAPACITY, "user"));
+            assert_eq!(user.card_cap, 0);
+        }
+
+        #[test]
+        fn halo_free_is_the_gtt_clamp_of_the_measured_host_memory() {
+            use rdna_compute::uma_memory::{device_free_from, DeviceMemory};
+            // 121 GiB GTT-backed APU (1 GiB carve-out): hipMemGetInfo still
+            // shows 40,000 MiB free, MemAvailable + TTM pool only 33,605 MiB.
+            let halo = DeviceMemory {
+                device_free: 40_000 * MIB,
+                device_total: 121 << 30,
+                uma: true,
+                carveout_total: Some(1 << 30),
+                host_available: Some(FREE),
+            };
+            assert_eq!(device_free_from(halo), Some(FREE));
+            // The host side unreadable: refuse to size blind.
+            let blind = DeviceMemory {
+                host_available: None,
+                ..halo
+            };
+            assert_eq!(device_free_from(blind), None);
+            // A carve-out APU and a discrete card trust hipMemGetInfo.
+            let carve = DeviceMemory {
+                carveout_total: Some(121 << 30),
+                ..halo
+            };
+            assert_eq!(device_free_from(carve), Some(40_000 * MIB));
+            let discrete = DeviceMemory { uma: false, ..halo };
+            assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_admission_tests {
+    use super::*;
+    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    use hipfire_runtime::mesh_placement::EdgeTransport;
+
+    fn rank(ordinal: i32, pci: Option<&str>, arch: &str) -> AdmittedRank {
+        AdmittedRank {
+            logical: ordinal as usize,
+            device_ordinal: ordinal,
+            pci_bus_id: pci.map(str::to_string),
+            arch: arch.to_string(),
+        }
+    }
+
+    fn visible(n: i32, arch: &str) -> Vec<AdmittedRank> {
+        (0..n)
+            .map(|i| rank(i, Some(&format!("0000:{:02x}:00.0", i + 3)), arch))
+            .collect()
+    }
+
+    fn mesh(
+        pp: usize,
+        visible: &[AdmittedRank],
+        policy: EdgeTransportPolicy,
+        peer: bool,
+        layers: Option<&str>,
+    ) -> Result<(AdmittedMesh, PpBands), String> {
+        admit_qwen4_pp_mesh(
+            pp,
+            1,
+            1,
+            48,
+            visible,
+            "gfx1100",
+            false,
+            policy,
+            &move |_, _| peer,
+            layers,
+        )
+    }
+
+    #[test]
+    fn transport_variable_truth_table() {
+        assert_eq!(parse_mesh_transport(None), Ok(EdgeTransportPolicy::Auto));
+        assert_eq!(
+            parse_mesh_transport(Some("")),
+            Ok(EdgeTransportPolicy::Auto)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some("auto")),
+            Ok(EdgeTransportPolicy::Auto)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some(" peer ")),
+            Ok(EdgeTransportPolicy::Peer)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some("host")),
+            Ok(EdgeTransportPolicy::Host)
+        );
+        for bad in ["Peer", "p2p", "1", "host,peer"] {
+            let error = parse_mesh_transport(Some(bad)).unwrap_err();
+            assert!(error.contains(MESH_TRANSPORT_ENV), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepted_cell_binds_output_card_last_and_pins_the_ple_band() {
+        for (pp, arch) in [(2usize, "gfx1100"), (6, "gfx1100"), (8, "gfx1100")] {
+            let vis = visible(pp as i32, arch);
+            let (mesh, bands) = mesh(pp, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+            assert_eq!(mesh.family, "qwen4");
+            assert_eq!(mesh.numerical_policy, QWEN4_PP_NUMERICAL_POLICY);
+            // Logical stage s < S-1 runs on visible device s+1; the last stage
+            // (the output band) on visible device 0, PCI identity attached.
+            for stage in 0..pp {
+                let expected = (stage as i32 + 1) % pp as i32;
+                assert_eq!(mesh.ranks[stage].logical, stage);
+                assert_eq!(mesh.ranks[stage].device_ordinal, expected);
+                assert_eq!(
+                    mesh.ranks[stage].pci_bus_id.as_deref(),
+                    Some(format!("0000:{:02x}:00.0", expected + 3).as_str())
+                );
+            }
+            assert_eq!(mesh.ranks[pp - 1].device_ordinal, 0);
+            assert_eq!(mesh.edges.len(), pp - 1);
+            assert!(bands.explicit_counts.is_none());
+            let placement = &bands.placement;
+            assert_eq!(placement.stages(), pp);
+            assert!(placement.band(0).len() >= 2);
+            let counts: Vec<usize> = (0..pp).map(|s| placement.band(s).len()).collect();
+            assert_eq!(counts.iter().sum::<usize>(), 48);
+        }
+        // gfx1201 is the other admitted architecture.
+        let vis = visible(4, "gfx1201");
+        assert!(admit_qwen4_pp_mesh(
+            4,
+            1,
+            1,
+            48,
+            &vis,
+            "gfx1201",
+            false,
+            EdgeTransportPolicy::Auto,
+            &|_, _| false,
+            None
+        )
+        .is_ok());
+        // PP6 uniform split is 8 layers per stage (48 / 6).
+        let vis = visible(6, "gfx1100");
+        let (_, bands) = mesh(6, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+        assert_eq!(bands.placement.band(0), 0..8);
+        // Only visible devices beyond the stage count are ignored.
+        let vis = visible(8, "gfx1100");
+        let (mesh8, _) = mesh(4, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+        assert_eq!(mesh8.ranks.len(), 4);
+        assert_eq!(mesh8.ranks[3].device_ordinal, 0);
+    }
+
+    #[test]
+    fn generic_counts_come_from_the_pp_layers_request() {
+        let vis = visible(6, "gfx1100");
+        let (_, bands) = mesh(
+            6,
+            &vis,
+            EdgeTransportPolicy::Auto,
+            false,
+            Some("9,8,8,8,8,7"),
+        )
+        .unwrap();
+        assert_eq!(bands.explicit_counts, Some(vec![9, 8, 8, 8, 8, 7]));
+        assert_eq!(bands.placement.band(0), 0..9);
+        assert_eq!(bands.placement.band(5), 41..48);
+        let vis2 = visible(2, "gfx1100");
+        let (_, bands) = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some("2,46")).unwrap();
+        assert_eq!(bands.placement.band(0), 0..2);
+        // A first band under 2 layers cuts the PLE layer off the input band.
+        for spec in ["1,47", "0,48"] {
+            let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some(spec)).unwrap_err();
+            assert!(error.contains("topology.pp = 2"), "{spec}: {error}");
+        }
+        let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some("1,47")).unwrap_err();
+        assert!(error.contains("at least 2"), "{error}");
+        // Count mismatches and wrong sums keep the generic verdicts.
+        for spec in ["24", "24,24,0", "20,20", "a,b"] {
+            let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some(spec)).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains("HIPFIRE_PP_LAYERS"),
+                "{spec}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_policy_decides_each_directed_edge_with_no_fallback() {
+        let vis = visible(4, "gfx1100");
+        let transports = |policy, peer| {
+            mesh(4, &vis, policy, peer, None)
+                .map(|(mesh, _)| mesh.edges.iter().map(|e| e.transport).collect::<Vec<_>>())
+        };
+        // No byte-qualification evidence: auto is host-mapped.
+        assert_eq!(
+            transports(EdgeTransportPolicy::Auto, false).unwrap(),
+            vec![EdgeTransport::HostMapped; 3]
+        );
+        assert_eq!(
+            transports(EdgeTransportPolicy::Host, true).unwrap(),
+            vec![EdgeTransport::HostMapped; 3]
+        );
+        // With evidence auto and peer pick peer.
+        assert_eq!(
+            transports(EdgeTransportPolicy::Auto, true).unwrap(),
+            vec![EdgeTransport::Peer; 3]
+        );
+        assert_eq!(
+            transports(EdgeTransportPolicy::Peer, true).unwrap(),
+            vec![EdgeTransport::Peer; 3]
+        );
+        // A forced peer without evidence refuses, naming topology.pp and the variable.
+        let error = transports(EdgeTransportPolicy::Peer, false).unwrap_err();
+        assert!(
+            error.contains("topology.pp = 4")
+                && error.contains(MESH_TRANSPORT_ENV)
+                && error.contains("peer-to-peer transfers between the pipeline GPUs"),
+            "{error}"
+        );
+        // Edge ids are logical stage pairs.
+        let (mesh, _) = mesh(4, &vis, EdgeTransportPolicy::Host, false, None).unwrap();
+        let pairs: Vec<_> = mesh.edges.iter().map(|e| (e.src, e.dst)).collect();
+        assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn every_mesh_refusal_names_topology_pp_before_side_effects() {
+        let vis = visible(6, "gfx1100");
+        let admit = |pp, tp, ep, v: &[AdmittedRank], arch: &str, emulated| {
+            admit_qwen4_pp_mesh(
+                pp,
+                tp,
+                ep,
+                48,
+                v,
+                arch,
+                emulated,
+                EdgeTransportPolicy::Auto,
+                &|_, _| false,
+                None,
+            )
+            .map(|_| ())
+        };
+        assert!(admit(2, 1, 1, &vis, "gfx1100", false).is_ok());
+        let mut refusals = vec![
+            admit(1, 1, 1, &vis, "gfx1100", false),
+            admit(9, 1, 1, &visible(9, "gfx1100"), "gfx1100", false),
+            admit(2, 2, 1, &vis, "gfx1100", false),
+            admit(2, 1, 2, &vis, "gfx1100", false),
+            admit(2, 1, 1, &vis, "gfx1100", true),
+            admit(7, 1, 1, &vis, "gfx1100", false),
+        ];
+        // Unknown PCI identity on any rank.
+        let mut unknown = vis.clone();
+        unknown[3].pci_bus_id = None;
+        refusals.push(admit(6, 1, 1, &unknown, "gfx1100", false));
+        // Mixed architectures; unadmitted architecture; daemon mismatch.
+        let mut mixed = vis.clone();
+        mixed[2].arch = "gfx1201".to_string();
+        refusals.push(admit(6, 1, 1, &mixed, "gfx1100", false));
+        refusals.push(admit(6, 1, 1, &visible(6, "gfx1151"), "gfx1151", false));
+        refusals.push(admit(6, 1, 1, &visible(6, "gfx1030"), "gfx1030", false));
+        refusals.push(admit(6, 1, 1, &vis, "gfx1201", false));
+        // Duplicate PCI identity / ordinal.
+        let mut dup = vis.clone();
+        dup[4].pci_bus_id = dup[1].pci_bus_id.clone();
+        refusals.push(admit(6, 1, 1, &dup, "gfx1100", false));
+        let mut dup_ordinal = vis.clone();
+        dup_ordinal[4].device_ordinal = 1;
+        refusals.push(admit(6, 1, 1, &dup_ordinal, "gfx1100", false));
+        for refusal in refusals {
+            let error = refusal.unwrap_err();
+            assert!(error.contains("topology.pp"), "{error}");
+        }
+        let error = admit(2, 1, 1, &vis[..1], "gfx1100", false).unwrap_err();
+        assert!(error.contains("needs 2 visible devices"), "{error}");
+        let mut unknown = vis.clone();
+        unknown[1].pci_bus_id = None;
+        let error = admit(2, 1, 1, &unknown, "gfx1100", false).unwrap_err();
+        assert!(error.contains("PCI identity"), "{error}");
+    }
+
+    fn options_with(f: impl FnOnce(&mut SourceAdmissionOptions)) -> SourceAdmissionOptions {
+        let mut options = SourceAdmissionOptions::default();
+        f(&mut options);
+        options
+    }
+
+    #[test]
+    fn unsupported_load_options_are_refused_under_pp_only() {
+        let cases: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
+            (
+                "DFlash",
+                Some("draft.hfq"),
+                SourceAdmissionOptions::default(),
+            ),
+            ("DFlash", None, options_with(|o| o.spec.dflash = Some(true))),
+            ("DSpark", None, options_with(|o| o.spec.dspark = Some(true))),
+            (
+                "n-gram drafting",
+                None,
+                options_with(|o| o.spec.ngram_draft = Some(true)),
+            ),
+            (
+                "DDTree",
+                None,
+                options_with(|o| o.spec.ddtree_budget = Some(1)),
+            ),
+            ("adaptive KV", None, options_with(|o| o.kv_adaptive = true)),
+            ("EAGLE", None, options_with(|o| o.eagle_drafter = true)),
+            ("CASK", None, options_with(|o| o.cask = true)),
+            ("PFlash", None, options_with(|o| o.pflash = true)),
+            (
+                "experts-per-token",
+                None,
+                options_with(|o| o.expert_count_override = true),
+            ),
+            (
+                "compute placement",
+                None,
+                options_with(|o| o.non_single_compute = true),
+            ),
+        ];
+        assert_eq!(
+            qwen4_pp_option_refusal(2, None, &SourceAdmissionOptions::default()),
+            Ok(())
+        );
+        for (name, draft, options) in cases {
+            let error = qwen4_pp_option_refusal(2, draft, &options).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains(name),
+                "{name}: {error}"
+            );
+            // Single and EP never see the PP refusal.
+            assert_eq!(
+                qwen4_pp_option_refusal(1, draft, &options),
+                Ok(()),
+                "{name}"
+            );
+        }
+        // Explicit `off` values are accepted.
+        let off = options_with(|o| {
+            o.spec.mtp = Some(false);
+            o.spec.dflash = Some(false);
+            o.spec.dspark = Some(false);
+            o.spec.ngram_draft = Some(false);
+        });
+        assert_eq!(qwen4_pp_option_refusal(8, None, &off), Ok(()));
+    }
+
+    #[test]
+    fn qwen4_spill_policy_after_the_floor_gate_is_unchanged_for_flash_next() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        // Fully resident: the head stays attached unless explicitly off.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(None), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                !qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0),
+                "{arch}"
+            );
+        }
+        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
+        // explicit `on` attaches everywhere; `off` never.
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1151",
+            24
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(Some(false)),
+            "gfx1201",
+            24
+        ));
+    }
+
+    #[test]
+    fn qwen4_native_mtp_auto_follows_the_declared_floor_and_explicit_on_ignores_it() {
+        // (mtp, retained, floor) -> verdict.
+        // The Qwen4 producer's own declaration admits auto on the non-retained load.
+        assert!(hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR);
+        assert_eq!(
+            qwen4_native_mtp_for_floor(None, false, hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR),
+            Ok(true)
+        );
+        // A producer without the floor keeps `auto` AR, retained or not.
+        for retained in [false, true] {
+            assert_eq!(qwen4_native_mtp_for_floor(None, retained, false), Ok(false));
+        }
+        // The retained default keeps `auto` AR even with the floor.
+        assert_eq!(qwen4_native_mtp_for_floor(None, true, true), Ok(false));
+        // Explicit `on` ignores the floor declaration; retained still refuses it.
+        for floor in [false, true] {
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(true), false, floor),
+                Ok(true)
+            );
+            assert!(qwen4_native_mtp_for_floor(Some(true), true, floor).is_err());
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), false, floor),
+                Ok(false)
+            );
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), true, floor),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_qwen4_carrier_declares_a_measured_ar_floor() {
+        // Capability is declared by the producer, defaulting false: Qwen3.5/3.6
+        // and DeepSeek V4 (native MTP without a floor) must auto -> AR, and every
+        // other carrier keeps the trait default.
+        for carrier in crate::registry_carriers() {
+            let expected = carrier.claims_arch_id(hipfire_arch_qwen4::ARCH_ID, false);
+            assert_eq!(
+                carrier.mtp_measured_ar_floor(),
+                expected,
+                "{} floor declaration",
+                carrier.name()
+            );
+        }
+        assert!(!hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR);
+        assert!(!hipfire_arch_deepseek4::MTP_MEASURED_AR_FLOOR);
+        for arch_id in [5u32, 6, 9] {
+            let carrier = crate::carrier_for(arch_id).expect("carrier");
+            assert!(!carrier.mtp_measured_ar_floor(), "arch {arch_id}");
+        }
+        assert!(crate::carrier_for(hipfire_arch_qwen4::ARCH_ID)
+            .expect("qwen4 carrier")
+            .mtp_measured_ar_floor());
+    }
+
+    #[test]
+    fn native_mtp_under_pp_is_explicit_only_and_ar_otherwise() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        for pp in [2usize, 6, 8] {
+            for arch in ["gfx1100", "gfx1201"] {
+                // `auto` and `off` keep the explicit AR default.
+                assert_eq!(
+                    qwen4_native_mtp(with(None), arch, "m/fn.mq4", pp, 1, 1),
+                    Ok(false)
+                );
+                assert_eq!(
+                    qwen4_native_mtp(with(Some(false)), arch, "m/fn.mq4", pp, 1, 1),
+                    Ok(false)
+                );
+                // An explicit request attaches the output band's head, also
+                // for a `.mq4r` name (no retained route exists under PP).
+                for path in ["m/fn.mq4", "m/fn.mq4r"] {
+                    assert_eq!(
+                        qwen4_native_mtp(with(Some(true)), arch, path, pp, 1, 1),
+                        Ok(true),
+                        "{arch} pp {pp} {path}"
+                    );
+                }
+            }
+        }
+        // Single is unchanged.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", "m/qwen3.8-flash-next.mq4", 1, 1, 1),
+            Ok(true)
+        );
+        // The request boundary admits MTP on a PP mesh and still refuses the
+        // meshes it never admitted.
+        for pp in 2..=8usize {
+            let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, 1, 1);
+            assert!(qwen4_request_admission(mesh, InputModality::Text, false).is_ok());
+            assert!(qwen4_request_admission(mesh, InputModality::Text, true).is_ok());
+        }
+        for (pp, tp, ep) in [(2, 2, 1), (2, 1, 2), (9, 1, 1)] {
+            let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep);
+            assert!(qwen4_request_admission(mesh, InputModality::Text, false).is_err());
+            assert!(qwen4_request_admission(mesh, InputModality::Text, true).is_err());
+        }
+    }
+
+    #[test]
+    fn pp_mtp_ngram_refusal_truth_table() {
+        for pp in [1usize, 2, 8] {
+            for native_mtp in [false, true] {
+                for explicit_on in [false, true] {
+                    let result = qwen4_pp_mtp_ngram_refusal(pp, native_mtp, explicit_on);
+                    if pp > 1 && native_mtp && explicit_on {
+                        // Only an explicit `on` next to native MTP on a mesh refuses.
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.contains(&format!("topology.pp = {pp}"))
+                                && error.contains("n-gram"),
+                            "pp {pp}: {error}"
+                        );
+                    } else {
+                        // Single, AR (native MTP off) and `auto`/`off` are untouched.
+                        assert_eq!(
+                            result,
+                            Ok(()),
+                            "pp {pp} native {native_mtp} explicit {explicit_on}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_speculator_stays_refused_next_to_pp_native_mtp() {
+        // Native MTP alone is admitted under PP; each other speculation
+        // mechanism still refuses, also when native MTP is requested too.
+        let mtp = options_with(|o| o.spec.mtp = Some(true));
+        assert_eq!(qwen4_pp_option_refusal(2, None, &mtp), Ok(()));
+        let refused: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
+            ("DFlash", Some("draft.hfq"), mtp),
+            (
+                "DFlash",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.dflash = Some(true);
+                }),
+            ),
+            (
+                "DSpark",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.dspark = Some(true);
+                }),
+            ),
+            (
+                "n-gram drafting",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.ngram_draft = Some(true);
+                }),
+            ),
+            (
+                "DDTree",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.ddtree_budget = Some(1);
+                }),
+            ),
+        ];
+        for (name, draft, options) in refused {
+            let error = qwen4_pp_option_refusal(4, draft, &options).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 4") && error.contains(name),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_requests_the_pp_route_cannot_run_are_refused() {
+        let none = |_: &str| -> Option<String> { None };
+        let ok = |env: &dyn Fn(&str) -> Option<String>, npu, disk| {
+            qwen4_pp_env_refusal(2, env, npu, disk)
+        };
+        assert_eq!(ok(&none, NpuTrunkMode::Off, 0), Ok(()));
+        assert_eq!(ok(&none, NpuTrunkMode::Auto, 0), Ok(()));
+        let set = |name: &'static str, value: &'static str| {
+            move |query: &str| (query == name).then(|| value.to_string())
+        };
+        let refused: Vec<(&str, Result<(), String>)> = vec![
+            (
+                "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "0"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_EXPERT_HOTSET",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_HOTSET", "/tmp/x"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
+                ok(
+                    &set(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "1"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_TURN_SNAPSHOTS",
+                ok(
+                    &set("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "1"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            ("session_cache_disk_bytes", ok(&none, NpuTrunkMode::Off, 1)),
+            ("fusions.npu_trunk = on", ok(&none, NpuTrunkMode::On, 0)),
+            (
+                "fusions.npu_trunk = emulate",
+                ok(&none, NpuTrunkMode::Emulate, 0),
+            ),
+        ];
+        for (name, result) in refused {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains(name),
+                "{name}: {error}"
+            );
+        }
+        // Explicit off values are accepted (hotset 0, stage 0, snapshots 0).
+        for (name, value) in [
+            ("HIPFIRE_QWEN4_EXPERT_HOTSET", "0"),
+            (hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "0"),
+            ("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "0"),
+        ] {
+            assert_eq!(
+                ok(&set(name, value), NpuTrunkMode::Off, 0),
+                Ok(()),
+                "{name}"
+            );
+        }
+        // Single is never refused.
+        assert_eq!(
+            qwen4_pp_env_refusal(
+                1,
+                &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
+                NpuTrunkMode::On,
+                9
+            ),
+            Ok(())
+        );
+    }
+
+    mod source_order {
+        use super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        fn probe(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-qwen4-pp-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            write_hfqm_package_mem(
+                &path,
+                QWEN4_ARCH_ID,
+                "{}",
+                &[HfqMemTensor {
+                    name: "model.embed_tokens.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                }],
+            )
+            .unwrap();
+            path
+        }
+
+        fn admit(
+            path: &std::path::Path,
+            tp: usize,
+            pp: usize,
+            options: SourceAdmissionOptions,
+        ) -> Result<(), String> {
+            admit_source_with_options(
+                path.to_str().unwrap(),
+                tp,
+                pp,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1100",
+                None,
+                "auto",
+                None,
+                2048,
+                KvBackendHints::without_device(),
+                options,
+            )
+            .map(|_| ())
+        }
+
+        #[test]
+        fn pp_refusals_fire_before_the_source_is_inspected() {
+            let path = probe("order");
+            let defaults = SpecLoadCfg {
+                dflash: Some(false),
+                dspark: Some(false),
+                ngram_draft: Some(false),
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(4),
+                mtp: Some(false),
+                ..SpecLoadCfg::default()
+            };
+            // Admitted options reach the (invalid) source's own validation.
+            let error = admit(
+                &path,
+                1,
+                2,
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("config admission failed"), "{error}");
+            // An explicit native MTP request is admitted under PP too: it
+            // reaches the source's own validation instead of a PP refusal.
+            let error = admit(
+                &path,
+                1,
+                2,
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("config admission failed") && !error.contains("topology.pp"),
+                "{error}"
+            );
+            // Every refusal precedes it and names topology.pp.
+            for options in [
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        dflash: Some(true),
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        dspark: Some(true),
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    cask: true,
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    pflash: true,
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        ngram_draft: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+            ] {
+                let error = admit(&path, 1, 2, options).unwrap_err();
+                assert!(
+                    error.contains("topology.pp = 2") && !error.contains("config admission failed"),
+                    "{error}"
+                );
+            }
+            // tp with pp is refused at the request boundary, before the source.
+            let error = admit(
+                &path,
+                2,
+                2,
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("topology.pp from 2 to 8")
+                    && !error.contains("config admission failed"),
+                "{error}"
+            );
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
         }
     }
 }

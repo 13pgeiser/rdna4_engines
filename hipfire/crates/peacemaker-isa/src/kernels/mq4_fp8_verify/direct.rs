@@ -29,7 +29,18 @@
 use super::*;
 
 /// Direct-template VGPR layout.
-struct Lay { t: u8, p: [u8; 2], bf: [u8; 2], cs: [u8; 2], ax: [u8; 2], hdr: u8, sca: u8, scb: u8, dt: [u8; 2], end: u16 }
+struct Lay {
+    t: u8,
+    p: [u8; 2],
+    bf: [u8; 2],
+    cs: [u8; 2],
+    ax: [u8; 2],
+    hdr: u8,
+    sca: u8,
+    scb: u8,
+    dt: [u8; 2],
+    end: u16,
+}
 impl Lay {
     fn new() -> Lay {
         let t = V0;
@@ -40,7 +51,18 @@ impl Lay {
         let hdr = t + 104;
         let (sca, scb) = (hdr + 2, hdr + 3);
         let dt = [hdr + 4, hdr + 12];
-        Lay { t, p, bf, cs, ax, hdr, sca, scb, dt, end: u16::from(dt[1]) + 8 }
+        Lay {
+            t,
+            p,
+            bf,
+            cs,
+            ax,
+            hdr,
+            sca,
+            scb,
+            dt,
+            end: u16::from(dt[1]) + 8,
+        }
     }
 }
 
@@ -50,9 +72,15 @@ fn plan(spec: &Spec, l: &Lay) -> Result<RegPlan, String> {
     p.v::<8>("t_acc", l.t, w())?;
     for h in 0..2 {
         p.v::<8>("p_acc", l.p[h], w())?;
-        for f in 0..8 { p.v::<2>("b_frag", l.bf[h] + 2 * f, w())?; }
-        for q in 0..4 { p.v::<2>("codes", l.cs[h] + 2 * q, w())?; }
-        for q in 0..4 { p.v::<4>("x_frag", l.ax[h] + 4 * q, w())?; }
+        for f in 0..8 {
+            p.v::<2>("b_frag", l.bf[h] + 2 * f, w())?;
+        }
+        for q in 0..4 {
+            p.v::<2>("codes", l.cs[h] + 2 * q, w())?;
+        }
+        for q in 0..4 {
+            p.v::<4>("x_frag", l.ax[h] + 4 * q, w())?;
+        }
         p.v::<8>("dequant_temp", l.dt[h], w())?;
     }
     p.v::<2>("header", l.hdr, w())?;
@@ -70,22 +98,44 @@ fn chain(b: &mut Builder, l: &Lay, h: usize, warm: bool) -> R {
     let other = 1 - h;
     let mut slots: Vec<Vec<Fill>> = vec![Vec::new(); 8];
     // The previous group's second half (P1, scale SCB), then this group's two scales and the next group's header.
-    let (pn, pc, ph, gx) = if warm { (BASEC, PCN, BASEH, GX0) } else { (PCN, PC, PHN, GX1) };
+    let (pn, pc, ph, gx) = if warm {
+        (BASEC, PCN, BASEH, GX0)
+    } else {
+        (PCN, PC, PHN, GX1)
+    };
     // Dequantize the other half's fragments (the next half in sequence) between the chain's WMMAs.
     for t in 0..8u8 {
         if !warm || h == 1 {
-            slots[usize::from(t)].extend(dequant(l.cs[other] + t, l.bf[other] + 2 * t, l.dt[usize::from(t % 2)]));
+            slots[usize::from(t)].extend(dequant(
+                l.cs[other] + t,
+                l.bf[other] + 2 * t,
+                l.dt[usize::from(t % 2)],
+            ));
         }
         if t % 2 == 1 {
             let q = t / 2;
             // Codes of the half three ahead (X+3) into the stage just consumed.
-            let (ptr, imm) = if h == 0 { (pn, 64 + 8 * u32::from(q)) } else { (pc, 8 * u32::from(q)) };
-            slots[usize::from(t)].push(Fill::GLoad { dwords: 2, dst: l.cs[other] + 2 * q, ptr, imm });
+            let (ptr, imm) = if h == 0 {
+                (pn, 64 + 8 * u32::from(q))
+            } else {
+                (pc, 8 * u32::from(q))
+            };
+            slots[usize::from(t)].push(Fill::GLoad {
+                dwords: 2,
+                dst: l.cs[other] + 2 * q,
+                ptr,
+                imm,
+            });
         }
     }
     // This chain's activation registers, reloaded for the next group's same half as consumed.
     for q in 0..4u8 {
-        slots[usize::from(2 * q + 1)].push(Fill::XLoad { dwords: 4, dst: l.ax[h] + 4 * q, soff: gx, imm: 128 * h as u32 + 16 * u32::from(q) });
+        slots[usize::from(2 * q + 1)].push(Fill::XLoad {
+            dwords: 4,
+            dst: l.ax[h] + 4 * q,
+            soff: gx,
+            imm: 128 * h as u32 + 16 * u32::from(q),
+        });
     }
     if h == 0 {
         if !warm {
@@ -93,13 +143,22 @@ fn chain(b: &mut Builder, l: &Lay, h: usize, warm: bool) -> R {
             slots[1].push(cvt_scale(l.scb, l.hdr, 1));
             slots[1].push(cvt_scale(l.sca, l.hdr, 0));
         }
-        slots[1].push(Fill::GLoad { dwords: 2, dst: l.hdr, ptr: ph, imm: 0 });
+        slots[1].push(Fill::GLoad {
+            dwords: 2,
+            dst: l.hdr,
+            ptr: ph,
+            imm: 0,
+        });
     } else if !warm {
         slots[1].extend(fold(l.t, l.p[0], l.sca));
     }
     for t in 0..8u8 {
-        if !warm { wmma(b, l.p[h], l.ax[h] + 2 * t, l.bf[h] + 2 * t, t != 0)?; }
-        for f in &slots[usize::from(t)] { emit_fill(b, f)?; }
+        if !warm {
+            wmma(b, l.p[h], l.ax[h] + 2 * t, l.bf[h] + 2 * t, t != 0)?;
+        }
+        for f in &slots[usize::from(t)] {
+            emit_fill(b, f)?;
+        }
     }
     Ok(())
 }
@@ -119,19 +178,55 @@ fn body(b: &mut Builder, spec: &Spec, l: &Lay) -> R {
 fn prologue(b: &mut Builder, spec: &Spec, l: &Lay) -> R {
     common_prologue(b, spec)?;
     // X voffset of the lane's token row: (bs + ml) * K + 64 * kg.
-    op(b, format!("v_add_nc_u32_e32 v{T3}, s{BS}, v{T0}"), &[v(T3)], &[s(BS), v(T0)])?;
-    op(b, format!("v_mul_lo_u32 v{XOFF}, v{T3}, s{}", ka_k(spec)), &[v(XOFF)], &[v(T3), s(ka_k(spec))])?;
-    op(b, format!("v_lshlrev_b32_e32 v{T3}, 6, v{T1}"), &[v(T3)], &[v(T1)])?;
-    op(b, format!("v_add_nc_u32_e32 v{XOFF}, v{XOFF}, v{T3}"), &[v(XOFF)], &[v(XOFF), v(T3)])?;
-    for r in 0..8 { op(b, format!("v_mov_b32_e32 v{}, 0", l.t + r), &[v(l.t + r)], &[])?; }
-    for r in 0..8 { op(b, format!("v_mov_b32_e32 v{}, 0", l.p[1] + r), &[v(l.p[1] + r)], &[])?; }
+    op(
+        b,
+        format!("v_add_nc_u32_e32 v{T3}, s{BS}, v{T0}"),
+        &[v(T3)],
+        &[s(BS), v(T0)],
+    )?;
+    op(
+        b,
+        format!("v_mul_lo_u32 v{XOFF}, v{T3}, s{}", ka_k(spec)),
+        &[v(XOFF)],
+        &[v(T3), s(ka_k(spec))],
+    )?;
+    op(
+        b,
+        format!("v_lshlrev_b32_e32 v{T3}, 6, v{T1}"),
+        &[v(T3)],
+        &[v(T1)],
+    )?;
+    op(
+        b,
+        format!("v_add_nc_u32_e32 v{XOFF}, v{XOFF}, v{T3}"),
+        &[v(XOFF)],
+        &[v(XOFF), v(T3)],
+    )?;
+    for r in 0..8 {
+        op(
+            b,
+            format!("v_mov_b32_e32 v{}, 0", l.t + r),
+            &[v(l.t + r)],
+            &[],
+        )?;
+    }
+    for r in 0..8 {
+        op(
+            b,
+            format!("v_mov_b32_e32 v{}, 0", l.p[1] + r),
+            &[v(l.p[1] + r)],
+            &[],
+        )?;
+    }
     op(b, format!("v_mov_b32_e32 v{}, 0", l.scb), &[v(l.scb)], &[])?;
     sop(b, format!("s_mov_b32 s{G}, 0"), &[G], &[])?;
     group_scalars(b, false)?;
     mad64(b, PCN, s(NGO), "1", BASEC)?;
     // Group 0's half 0 codes, then the warm-up of group -1: group 0's half-1
     // codes, activations and header, half 0 dequantized, group 1's half-0 codes.
-    for q in 0..4u8 { gload(b, 2, l.cs[0] + 2 * q, BASEC, 8 * u32::from(q))?; }
+    for q in 0..4u8 {
+        gload(b, 2, l.cs[0] + 2 * q, BASEC, 8 * u32::from(q))?;
+    }
     chain(b, l, 0, true)?;
     chain(b, l, 1, true)?;
     Ok(())
@@ -143,7 +238,13 @@ pub(super) fn emit(spec: Spec) -> Result<Emitted, String> {
     b.enable_delay_alu();
     prologue(&mut b, &spec, &l)?;
     b.loop_(&lbl(&spec, "loop"), |b| body(b, &spec, &l))?;
-    let epi = Epi { t: l.t, p: l.p[1], sc: l.scb, s_pool: (0..8).map(|r| l.p[0] + r).collect(), y_pool: (0..8).map(|r| l.bf[0] + r).collect() };
+    let epi = Epi {
+        t: l.t,
+        p: l.p[1],
+        sc: l.scb,
+        s_pool: (0..8).map(|r| l.p[0] + r).collect(),
+        y_pool: (0..8).map(|r| l.bf[0] + r).collect(),
+    };
     epilogue(&mut b, &spec, &epi)?;
     b.finish()
 }

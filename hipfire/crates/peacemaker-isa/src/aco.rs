@@ -34,7 +34,11 @@ fn register(token: &str) -> Option<RegRef> {
         let base = token.get(1..)?.parse::<u8>().ok()?;
         (base, base)
     };
-    Some(RegRef { kind, base, len: end.checked_sub(base)?.checked_add(1)? })
+    Some(RegRef {
+        kind,
+        base,
+        len: end.checked_sub(base)?.checked_add(1)?,
+    })
 }
 
 fn operands(asm: &str) -> Vec<&str> {
@@ -62,7 +66,11 @@ fn decoded(asm: &str) -> Instruction {
         let fields = operands(asm);
         assert_eq!(fields.len(), 4, "invalid ACO buffer load: {asm}");
         defs.push(register(fields[0]).expect("buffer load destination must be a VGPR"));
-        uses.extend(fields[1..].iter().filter_map(|field| register(field.split_whitespace().next().unwrap_or(""))));
+        uses.extend(
+            fields[1..]
+                .iter()
+                .filter_map(|field| register(field.split_whitespace().next().unwrap_or(""))),
+        );
         memory = Some(MemoryClass::VmemLoad);
     } else if name == "s_mov_b32" {
         let fields = operands(asm);
@@ -70,9 +78,19 @@ fn decoded(asm: &str) -> Instruction {
         defs.push(register(fields[0]).expect("scalar move destination must be an SGPR"));
         uses.extend(fields[1..].iter().filter_map(|field| register(field)));
     } else {
-        assert!(matches!(name, "s_endpgm" | "v_nop") || name.starts_with("s_wait_") || name == "s_clause", "unsupported ACO disassembly: {asm}");
+        assert!(
+            matches!(name, "s_endpgm" | "v_nop")
+                || name.starts_with("s_wait_")
+                || name == "s_clause",
+            "unsupported ACO disassembly: {asm}"
+        );
     }
-    Instruction { text: asm.into(), defs, uses, memory }
+    Instruction {
+        text: asm.into(),
+        defs,
+        uses,
+        memory,
+    }
 }
 
 /// Import the subset disassembled by `aco-shim` as a physical-register program.
@@ -81,7 +99,9 @@ pub fn import_disasm(disasm: &str) -> Program {
     let mut arch = Arch::Gfx1201;
     let mut instructions = Vec::new();
     // The CLI prints ACO IR before the assembled disassembly.
-    let cli_output = disasm.lines().any(|line| line.starts_with("assembled_bytes="));
+    let cli_output = disasm
+        .lines()
+        .any(|line| line.starts_with("assembled_bytes="));
     let mut in_disassembly = !cli_output;
     for raw in disasm.lines() {
         let line = raw.trim();
@@ -89,12 +109,16 @@ pub fn import_disasm(disasm: &str) -> Program {
             in_disassembly = true;
             continue;
         }
-        if !in_disassembly { continue; }
+        if !in_disassembly {
+            continue;
+        }
         if let Some(value) = line.strip_prefix(".arch ") {
             arch = value.parse().expect("unsupported ACO architecture");
             continue;
         }
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         instructions.push(decoded(line));
     }
     Program { arch, instructions }
@@ -117,11 +141,25 @@ s_endpgm
         let program = import_disasm(source);
         assert_eq!(program.arch, Arch::Gfx1201);
         assert_eq!(program.instructions[0].memory, Some(MemoryClass::VmemLoad));
-        assert!(program.instructions[3].uses.iter().any(|r| r.overlaps(program.instructions[0].defs[0])));
-        assert!(program.instructions[3].uses.contains(&RegRef { kind: Kind::V, base: 5, len: 1 }));
-        assert!(program.instructions[4].uses.contains(&RegRef { kind: Kind::V, base: 12, len: 1 }));
+        assert!(program.instructions[3]
+            .uses
+            .iter()
+            .any(|r| r.overlaps(program.instructions[0].defs[0])));
+        assert!(program.instructions[3].uses.contains(&RegRef {
+            kind: Kind::V,
+            base: 5,
+            len: 1
+        }));
+        assert!(program.instructions[4].uses.contains(&RegRef {
+            kind: Kind::V,
+            base: 12,
+            len: 1
+        }));
         assert_eq!(export(&program), source);
-        let cli_output = format!("After Instruction Selection:\nBB0\nassembled_bytes=60\n{}", source.strip_prefix(".arch gfx1201\n").unwrap());
+        let cli_output = format!(
+            "After Instruction Selection:\nBB0\nassembled_bytes=60\n{}",
+            source.strip_prefix(".arch gfx1201\n").unwrap()
+        );
         let imported = import_disasm(&cli_output);
         assert_eq!(imported.instructions.len(), program.instructions.len());
         assert_eq!(imported.instructions[4].uses, program.instructions[4].uses);

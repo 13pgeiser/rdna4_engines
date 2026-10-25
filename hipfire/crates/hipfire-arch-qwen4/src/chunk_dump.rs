@@ -51,13 +51,18 @@ static CONFIG: LazyLock<Option<ChunkDump>> = LazyLock::new(|| {
         .ok()
         .filter(|dir| !dir.is_empty())?;
     let layers = match hipfire_config::developer_var(CHUNK_DUMP_LAYERS_ENV) {
-        Ok(list) if !list.trim().is_empty() => {
-            list.split(',').filter_map(|x| x.trim().parse().ok()).collect()
-        }
+        Ok(list) if !list.trim().is_empty() => list
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect(),
         _ => DEFAULT_LAYERS.into_iter().collect(),
     };
     let raw = hipfire_config::developer_var(CHUNK_DUMP_RAW_ENV).as_deref() == Ok("1");
-    Some(ChunkDump { dir: PathBuf::from(dir), layers, raw })
+    Some(ChunkDump {
+        dir: PathBuf::from(dir),
+        layers,
+        raw,
+    })
 });
 
 /// The dump configuration, `None` unless `HIPFIRE_CHUNK_DUMP_DIR` is set.
@@ -111,7 +116,9 @@ impl ChunkDump {
         bf16_grouped: bool,
     ) -> Result<(), String> {
         gpu.bind_thread().map_err(|error| error.to_string())?;
-        gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
         let dir = self
             .dir
             .join(format!("rank-{}", gpu.device_id))
@@ -124,9 +131,21 @@ impl ChunkDump {
         };
         let capacity = scratch.max_chunk;
         let k = config.num_experts_per_tok;
-        let route = read(gpu, &scratch.moe_topk_indices, rows_bytes(&scratch.moe_topk_indices, rows, capacity).min(rows * k * 4))?;
-        let fold = read(gpu, &scratch.ffn_output, rows_bytes(&scratch.ffn_output, rows, capacity))?;
-        let streams = read(gpu, &scratch.streams, rows_bytes(&scratch.streams, rows, capacity))?;
+        let route = read(
+            gpu,
+            &scratch.moe_topk_indices,
+            rows_bytes(&scratch.moe_topk_indices, rows, capacity).min(rows * k * 4),
+        )?;
+        let fold = read(
+            gpu,
+            &scratch.ffn_output,
+            rows_bytes(&scratch.ffn_output, rows, capacity),
+        )?;
+        let streams = read(
+            gpu,
+            &scratch.streams,
+            rows_bytes(&scratch.streams, rows, capacity),
+        )?;
         let mut grouped = serde_json::json!({"present": false});
         let mut live_rows: Vec<u8> = Vec::new();
         if bf16_grouped {
@@ -163,7 +182,8 @@ impl ChunkDump {
                 "tile_digests": digests,
             });
         } else {
-            grouped["reason"] = "the layer did not run the BF16 grouped (symmetric IU4) route".into();
+            grouped["reason"] =
+                "the layer did not run the BF16 grouped (symmetric IU4) route".into();
         }
         let digest = serde_json::json!({
             "layer": layer,
@@ -175,7 +195,12 @@ impl ChunkDump {
             "hc_streams": sha(&streams),
             "grouped": grouped,
         });
-        write("digest.json", serde_json::to_string_pretty(&digest).map_err(|e| e.to_string())?.as_bytes())?;
+        write(
+            "digest.json",
+            serde_json::to_string_pretty(&digest)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )?;
         if self.raw {
             write("fold-output.bin", &fold)?;
             write("hc-streams.bin", &streams)?;

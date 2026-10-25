@@ -39,7 +39,12 @@ __global__ void gated_delta_net_q8(
     // 1 = per-token: Q8 roundtrip after every token (PARO drift-echo correctness,
     // ~1.8× slower in batched). MQ4/HFQ4 weights pass 0; PARO passes 1. For
     // n_tokens==1 (AR decode / DFlash draft) both modes are identical.
-    int requant_per_token
+    int requant_per_token,
+    // Q/K head ratio (n_heads / qk_heads): Q/K token stride is
+    // (n_heads / qk_head_ratio) * HD and state head h reads Q/K head
+    // h / qk_head_ratio (same mapping as repeat_interleave_qk_f32_batched).
+    // 1 = Q/K already expanded to n_heads (legacy layout).
+    int qk_head_ratio
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -47,6 +52,8 @@ __global__ void gated_delta_net_q8(
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
     const int stride = n_heads * HD;
+    const int qk_stride = (n_heads / qk_head_ratio) * HD;
+    const int qk_head = h / qk_head_ratio;
     const int row_start = tile * TILE_ROWS;
 
     __shared__ float S_tile[TILE_ROWS * HD];  // 4 KiB
@@ -77,8 +84,8 @@ __global__ void gated_delta_net_q8(
 
     for (int t = 0; t < n_tokens; t++) {
         const int bt = lane * n_tokens + t;
-        const float* q_t = q + bt * stride + h * HD;
-        const float* k_t = k + bt * stride + h * HD;
+        const float* q_t = q + bt * qk_stride + qk_head * HD;
+        const float* k_t = k + bt * qk_stride + qk_head * HD;
         const float* v_t = v + bt * stride + h * HD;
         float alpha = expf(gate[bt * n_heads + h]);
         float beta_v = beta[bt * n_heads + h];

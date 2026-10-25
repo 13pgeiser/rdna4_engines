@@ -258,16 +258,8 @@ fn run() -> Result<(), String> {
     let x_t = upload_f32(&mut gpu, &x_trans, &[ROWS, DIM])?;
     let t_post = Instant::now();
     parent_hc_post(
-        &mut gpu,
-        backend,
-        &x_t,
-        &x, // residual = original multi-stream x
-        &post,
-        &comb,
-        ROWS,
-        HC_MULT,
-        DIM,
-        &out_post,
+        &mut gpu, backend, &x_t, &x, // residual = original multi-stream x
+        &post, &comb, ROWS, HC_MULT, DIM, &out_post,
     )?;
     gpu.hip
         .device_synchronize()
@@ -286,16 +278,7 @@ fn run() -> Result<(), String> {
     };
     let t_head = Instant::now();
     parent_hc_head(
-        &mut gpu,
-        backend,
-        &x,
-        p_head,
-        ROWS,
-        HC_MULT,
-        DIM,
-        NORM_EPS,
-        HC_EPS,
-        &y_head,
+        &mut gpu, backend, &x, p_head, ROWS, HC_MULT, DIM, NORM_EPS, HC_EPS, &y_head,
     )?;
     gpu.hip
         .device_synchronize()

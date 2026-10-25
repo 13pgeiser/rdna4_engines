@@ -3,7 +3,7 @@
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "f8866a05cb",
-  "s_text_sha256": "b8ad6ed821898da5cbc9ef49ca1b175b86884d13d4761404101ecb15858fc05d",
+  "s_text_sha256": "3f4548ea8a70ef142f240074e7b18e6756fca3923ffe2a68010ce72858367664",
   "kernels": [
     {
       "kernel_id": "gemv_hfq4g256_multirow_xbatch_mq4v2",
@@ -13521,7 +13521,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "b8ad6ed821898da5cbc9ef49ca1b175b86884d13d4761404101ecb15858fc05d"
+      "s_text_sha256": "3f4548ea8a70ef142f240074e7b18e6756fca3923ffe2a68010ce72858367664"
     }
   ]
 }

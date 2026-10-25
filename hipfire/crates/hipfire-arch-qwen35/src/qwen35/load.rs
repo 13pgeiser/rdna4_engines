@@ -13,6 +13,7 @@ use super::weights::build_expert_binding;
 use super::weights::dtype_from_quant_type;
 use super::weights::hfq_source_fingerprint;
 use super::weights::mixed_expert_tag;
+use super::weights::validate_qt53_admission;
 use super::weights::DeltaNetLayerWeights;
 use super::weights::ExpertWeights;
 use super::weights::FullAttnLayerWeights;
@@ -22,12 +23,15 @@ use super::weights::MoeFfnWeights;
 use super::weights::MoeParoSidecars;
 use super::weights::MoeProjectionSource;
 use super::weights::PackedExpertOwners;
+use super::weights::Qt53Fact;
 use super::weights::Qwen35EpConfigFingerprint;
 use super::weights::Qwen35EpShardInfo;
 use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
+use super::weights::QT_MQ4G128V2;
+use super::weights::QT_MQ4G256V2;
 use hip_bridge::DeviceBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -79,7 +83,36 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
+/// Sidecar `.mtp` files name the MoE tensors of the MTP layer in their own
+/// scheme; under the [`crate::mtp_head::MTP_MOE_PREFIX`] layer prefix the
+/// trunk MoE loader resolves them through this map.
+fn mtp_sidecar_tensor_name(name: &str) -> Option<String> {
+    let rest = name
+        .strip_prefix(crate::mtp_head::MTP_MOE_PREFIX)?
+        .strip_prefix(".mlp.")?;
+    let fixed = match rest {
+        "gate.weight" => "moe_router",
+        "shared_expert_gate.weight" => "moe_shared_expert_gate",
+        "shared_expert.gate_proj.weight" => "moe_shared_gate",
+        "shared_expert.up_proj.weight" => "moe_shared_up",
+        "shared_expert.down_proj.weight" => "moe_shared_down",
+        _ => {
+            let (expert, proj) = rest.strip_prefix("experts.")?.split_once('.')?;
+            let proj = match proj {
+                "gate_up_proj.weight" => "gate_up",
+                "down_proj.weight" => "down",
+                _ => return None,
+            };
+            return Some(format!("moe_experts.{expert}.{proj}"));
+        }
+    };
+    Some(fixed.to_owned())
+}
+
 pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+    if let Some(sidecar) = mtp_sidecar_tensor_name(name) {
+        return vec![sidecar];
+    }
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {
@@ -147,6 +180,55 @@ fn load_norm_weight(
     let (info, data) =
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
+}
+
+/// Bytes of one row-local MQ4G128V2 (qt53) blob: `m * ceil(k/128) * 68`.
+/// `None` on overflow, `m == 0` or `k == 0`.
+fn mq4g128v2_blob_bytes(m: usize, k: usize) -> Option<usize> {
+    if m == 0 || k == 0 {
+        return None;
+    }
+    m.checked_mul(k.div_ceil(128))?
+        .checked_mul(rdna_compute::MQ4G128V2_GROUP_BYTES)
+}
+
+/// Pure CPU validation of one MQ4G128V2 (qt53) tensor blob, shared by the
+/// ordinary loaders and the MTP head loader.
+///
+/// The row-local layout is `ceil(k/128)` groups of 68 B per row —
+/// `[f16 scale][f16 zero][64 B nibbles]` — with a final partial group allowed,
+/// so any `k > 0` is legal (127/129 included). The blob must be EXACTLY
+/// `m * ceil(k/128) * 68` bytes (overflow-checked) and every group's fp16
+/// scale and zero must be finite (exponent field not all-ones). Role
+/// admission (routed-expert down only) is NOT decided here; see
+/// [`super::weights::validate_qt53_admission`].
+pub(crate) fn validate_mq4g128v2_blob(data: &[u8], m: usize, k: usize) -> Result<(), String> {
+    if m == 0 || k == 0 {
+        return Err(format!("MQ4G128V2 requires m>0 and k>0, got M={m} K={k}"));
+    }
+    let expected = mq4g128v2_blob_bytes(m, k)
+        .ok_or_else(|| format!("MQ4G128V2 blob length overflows usize: M={m} K={k}"))?;
+    if data.len() != expected {
+        return Err(format!(
+            "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    for (group, header) in data
+        .chunks_exact(rdna_compute::MQ4G128V2_GROUP_BYTES)
+        .enumerate()
+    {
+        let scale = u16::from_le_bytes([header[0], header[1]]);
+        let zero = u16::from_le_bytes([header[2], header[3]]);
+        // fp16 inf/NaN: exponent field (bits 14..10) all ones.
+        if scale & 0x7C00 == 0x7C00 || zero & 0x7C00 == 0x7C00 {
+            return Err(format!(
+                "MQ4G128V2 group {group} has a non-finite fp16 header \
+                 (scale=0x{scale:04x} zero=0x{zero:04x}) (M={m} K={k})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Shared quant-type dispatch for a projection weight at `target`.
@@ -565,6 +647,28 @@ fn load_weight_tensor_raw_with(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
+        }
+        53 => {
+            // MQ4G128V2 (qt=53): row-local 68 B per ceil(K/128) group. Reaches
+            // here only for routed-expert down tensors: file-level
+            // `validate_qt53_admission` (run before any upload) refuses every
+            // other role, mixed tier and AWQ. Exact length + finite headers are
+            // checked here; placement (device / host-mapped) rides `target`.
+            validate_mq4g128v2_blob(data, m, k)
+                .map_err(|e| HipError::new(0, &format!("qwen35: qt53 {e}")))?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G128V2,
                 m,
                 k,
                 row_stride: 0,
@@ -2864,7 +2968,8 @@ fn load_weights_inner(
     use std::time::Instant;
     // Every allocation of the weight sweep is immutable model data: railgun
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
-    let _weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+    let _weights_role =
+        hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
     let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,
@@ -2894,7 +2999,7 @@ fn load_weights_inner(
             host_expert_bytes as f64 / (1u64 << 30) as f64,
         );
     }
-    Ok(Qwen35Weights {
+    let weights = Qwen35Weights {
         token_embd,
         embd_format,
         output_norm,
@@ -2904,7 +3009,11 @@ fn load_weights_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
-    })
+    };
+    // Model-level symmetric IU4 resolution for the qt53 artifact class (default
+    // on by capability; typed refusal or explicit-kill warning; no-op for every
+    // other model).
+    finalize_expert_iu4(devices, layout, weights)
 }
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
@@ -2928,6 +3037,10 @@ impl WeightSource for HfqSource<'_> {
         self.hfq.mq4v2_symmetric()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Single early file-level qt53 (MQ4G128V2) admission: wrong role,
+        // mixed tier, AWQ, bad K or an unsupported mode fails here, before the
+        // first upload of any resident, host-mapped or per-expert path.
+        validate_hfq_qt53_admission(self.hfq, self.c)?;
         // Partial GPU offload is resolved by the loader (see
         // `hipfire_runtime::offload`), which also prints the residency line; this
         // source no longer decides or announces placement.
@@ -3155,9 +3268,20 @@ pub struct ParoSource<'a> {
 }
 impl<'a> ParoSource<'a> {
     pub fn new(source: &'a dyn ModelSource, c: &'a Qwen35Config) -> HipResult<Self> {
-        source
+        let qc = source
             .quant_config()
             .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
+        // qwen3.5 Paro decode/prefill bind only the G128 kernels; the shared
+        // loader would hand a G64 checkpoint ParoQ4G64 weights they never admit.
+        if qc.group_size != 128 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen3.5 ParoQuant supports group_size 128 only, got {}",
+                    qc.group_size
+                ),
+            ));
+        }
         let mp = paro_text_prefix(source)?;
         Ok(Self { source, mp, c })
     }
@@ -3765,6 +3889,63 @@ fn qwen35_hfq_sidecar_sources(
         .collect()
 }
 
+/// Container facts of every tensor in `hfq`, for [`validate_qt53_admission`].
+fn hfq_qt53_facts(hfq: &HfqFile) -> Vec<Qt53Fact<'_>> {
+    hfq.tensor_infos()
+        .iter()
+        .map(|info| Qt53Fact {
+            name: &info.name,
+            quant_type: info.quant_type,
+            shape: &info.shape,
+        })
+        .collect()
+}
+
+/// The single early file-level qt53 (MQ4G128V2) admission hook for the
+/// ordinary single-device loader. Pure metadata scan; files without a qt53
+/// tensor pass untouched.
+pub(crate) fn validate_hfq_qt53_admission(hfq: &HfqFile, config: &Qwen35Config) -> HipResult<()> {
+    if !hfq
+        .tensor_infos()
+        .iter()
+        .any(|i| i.quant_type == QT_MQ4G128V2)
+    {
+        return Ok(());
+    }
+    if config.paged_experts {
+        return Err(HipError::new(
+            0,
+            "qwen35: qt53 (MQ4G128V2) is not supported with paged experts \
+             (the weight pager owns the expert buffers)",
+        ));
+    }
+    validate_qt53_admission(
+        &hfq_qt53_facts(hfq),
+        config.dim,
+        config.moe_intermediate_size,
+    )
+}
+
+/// Loudly refuse a qt53 (MQ4G128V2) file in a loading mode that cannot serve
+/// it (sealed EP, dense TP, ...), naming qt53 and the first offending tensor.
+pub(crate) fn reject_hfq_qt53_for_mode(hfq: &HfqFile, mode: &str) -> HipResult<()> {
+    match hfq
+        .tensor_infos()
+        .iter()
+        .find(|info| info.quant_type == QT_MQ4G128V2)
+    {
+        None => Ok(()),
+        Some(info) => Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: qt53 (MQ4G128V2) tensor '{}' is not supported by {mode} loading; \
+                 load it through the ordinary single-device resident or host-mapped path",
+                info.name
+            ),
+        )),
+    }
+}
+
 fn expected_mq4_bytes(m: usize, k: usize) -> Option<usize> {
     if k % 256 != 0 {
         return None;
@@ -4027,6 +4208,8 @@ pub fn preflight_weights_dense_tp(
 ) -> Result<(), String> {
     crate::qwen35::config::validate_dense_tp(config, shard)
         .map_err(|e| format!("preflight: {e}"))?;
+    reject_hfq_qt53_for_mode(hfq, "dense tensor-parallel")
+        .map_err(|e| format!("preflight: {}", e.message))?;
 
     // ── Checked blob-range validation before any GPU init ──
     // HfqFile::open only bounds the index; tensor_data_pread zero-pads short
@@ -4420,6 +4603,7 @@ pub fn load_weights_dense_tp_rank(
     {
         return Err(HipError::new(0, "invalid dense TP rank layout"));
     }
+    reject_hfq_qt53_for_mode(hfq, "dense tensor-parallel")?;
     let dim = config.dim;
     let head_dim = config.head_dim;
     let q_range = layout.q_head_range.clone();
@@ -4950,6 +5134,24 @@ fn packable_expert_dtype(qt: u8, target: MemoryTarget) -> Option<DType> {
     }
 }
 
+/// Uniform per-layer `(gate_up, down)` dtype pair the packer can serve.
+/// Equal-dtype pairs follow [`packable_expert_dtype`]. The single admitted
+/// mixed pair is qt44 gate_up + qt53 down, host-mapped only: on a device
+/// placement it keeps literal per-expert tensors like every other mixed pair.
+fn packable_expert_pair(
+    gate_up_qt: u8,
+    down_qt: u8,
+    target: MemoryTarget,
+) -> Option<(DType, DType)> {
+    if (gate_up_qt, down_qt) == (QT_MQ4G256V2, QT_MQ4G128V2) {
+        return (target == MemoryTarget::HostMapped)
+            .then_some((DType::MQ4G256V2, DType::MQ4G128V2));
+    }
+    let gate_up = packable_expert_dtype(gate_up_qt, target)?;
+    let down = packable_expert_dtype(down_qt, target)?;
+    (gate_up == down).then_some((gate_up, down))
+}
+
 struct PackedExpertSpec {
     gate_up_name: String,
     down_name: String,
@@ -4972,7 +5174,8 @@ struct ResolvedExpert {
 /// or anything else ([`ExpertLayerLayout::Mixed`]).
 #[derive(Debug, PartialEq, Eq)]
 enum ExpertLayerLayout {
-    Uniform(DType),
+    /// `(gate_up dtype, down dtype)` shared by every routed expert.
+    Uniform(DType, DType),
     Mixed,
 }
 
@@ -4989,12 +5192,10 @@ enum ExpertLayerLayout {
 /// fallback: a host-placed graded layer (`.mq4p`, whose expert 0 can be MQ6
 /// ahead of an MQ4 expert 1) reaches the graded packer only through here.
 fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> ExpertLayerLayout {
-    let mut shape: Option<(DType, usize, usize)> = None;
+    let mut shape: Option<((DType, DType), usize, usize)> = None;
     for expert in experts {
-        let admitted = packable_expert_dtype(expert.gate_up_qt, target)
-            .zip(packable_expert_dtype(expert.down_qt, target))
-            .filter(|(gate_dt, down_dt)| gate_dt == down_dt)
-            .map(|(gate_dt, _)| (gate_dt, expert.gate_up_bytes, expert.down_bytes));
+        let admitted = packable_expert_pair(expert.gate_up_qt, expert.down_qt, target)
+            .map(|pair| (pair, expert.gate_up_bytes, expert.down_bytes));
         let Some(admitted) = admitted else {
             return ExpertLayerLayout::Mixed;
         };
@@ -5005,7 +5206,7 @@ fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> Ex
         }
     }
     match shape {
-        Some((dtype, _, _)) => ExpertLayerLayout::Uniform(dtype),
+        Some(((gate_up, down), _, _)) => ExpertLayerLayout::Uniform(gate_up, down),
         None => ExpertLayerLayout::Mixed,
     }
 }
@@ -5112,7 +5313,9 @@ fn try_load_packed_experts(
             down_bytes,
         });
     }
-    let ExpertLayerLayout::Uniform(expert_dtype) = classify_expert_layer(&resolved, target) else {
+    let ExpertLayerLayout::Uniform(gate_up_dtype, down_dtype) =
+        classify_expert_layer(&resolved, target)
+    else {
         // A layer that is not uniform belongs to the graded host packer, which
         // declines a device placement (that placement keeps its literal
         // per-expert tensors). Never one host tensor per expert — each pays
@@ -5160,10 +5363,7 @@ fn try_load_packed_experts(
                 let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
                     HipError::new(
                         0,
-                        &format!(
-                            "qwen35: packed tensor disappeared: {}",
-                            spec.gate_up_name
-                        ),
+                        &format!("qwen35: packed tensor disappeared: {}", spec.gate_up_name),
                     )
                 })?;
                 if bytes.len() != gate_up_stride {
@@ -5223,6 +5423,27 @@ fn try_load_packed_experts(
             HostBlob::Owned(results.next().expect("two packed expert jobs").data),
         )
     };
+    if down_dtype == DType::MQ4G128V2 {
+        // qt53 down: exact per-expert extent and finite fp16 headers before
+        // any upload (the packed slices bypass `load_weight_tensor_raw`).
+        let down_all = down_host.as_ref();
+        for (slot, spec) in specs.iter().enumerate() {
+            let blob = down_all
+                .get(slot * down_stride..(slot + 1) * down_stride)
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "qwen35: qt53 packed down blob truncated at '{}'",
+                            spec.down_name
+                        ),
+                    )
+                })?;
+            validate_mq4g128v2_blob(blob, dim, mi).map_err(|e| {
+                HipError::new(0, &format!("qwen35: qt53 down '{}': {e}", spec.down_name))
+            })?;
+        }
+    }
     let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
     let zero_copy =
         matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
@@ -5259,7 +5480,7 @@ fn try_load_packed_experts(
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
             buf: gate_up_owner.sub_offset(slot * gate_up_stride, gate_up_stride),
-            gpu_dtype: expert_dtype,
+            gpu_dtype: gate_up_dtype,
             m: 2 * mi,
             k: dim,
             row_stride: 0,
@@ -5272,7 +5493,7 @@ fn try_load_packed_experts(
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
             buf: down_owner.sub_offset(slot * down_stride, down_stride),
-            gpu_dtype: expert_dtype,
+            gpu_dtype: down_dtype,
             m: dim,
             k: mi,
             row_stride: 0,
@@ -5356,12 +5577,35 @@ fn try_load_graded_host_experts(
         else {
             return Ok(None);
         };
-        let (Ok(gate_dt), Ok(down_dt)) = (
+        let (gate_dt, down_dt) = match (
             super::weights::dtype_from_quant_type(gate_up_qt),
             super::weights::dtype_from_quant_type(down_qt),
-        ) else {
-            return Ok(None);
+        ) {
+            (Ok(gate_dt), Ok(down_dt)) => (gate_dt, down_dt),
+            (gate, down) => {
+                // An unmapped expert dtype is a load error, never a silent
+                // decline that lets a later fallback misread the bank.
+                let error = gate.err().or(down.err()).expect("one dtype lookup failed");
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "qwen35: graded host experts: expert {expert_id} gate_up qt{gate_up_qt} / \
+                         down qt{down_qt}: {}",
+                        error.message
+                    ),
+                ));
+            }
         };
+        if gate_dt == DType::MQ4G128V2 || down_dt == DType::MQ4G128V2 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen35: graded host expert packing does not support qt53 (MQ4G128V2): \
+                     expert {expert_id} gate_up qt{gate_up_qt} / down qt{down_qt}; qt53 layers \
+                     must be uniform qt44 gate_up + qt53 down"
+                ),
+            ));
+        }
         if matches!(
             gate_dt,
             DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
@@ -5791,6 +6035,7 @@ impl PendingMoeFfn {
             expert_binding,
             mixed_expert_gate_up_tiers,
             mixed_expert_down_tiers,
+            expert_iu4: None,
         })
     }
     /// Sealed EP commit: run the C1 compact live bind over the rank's owned
@@ -5907,8 +6152,54 @@ impl PendingMoeFfn {
             expert_binding,
             mixed_expert_gate_up_tiers,
             mixed_expert_down_tiers,
+            expert_iu4: None,
         })
     }
+}
+
+/// The sealed expert plan, dispatch table and binding cache of one MoE layer
+/// on a Single device, built purely from the artifact's own tensor headers
+/// (names, shapes, quant tags, encoded bytes, sidecars) — no `Gpu`, no device
+/// tensor. `load_moe_ffn` calls exactly this, so a CPU test that feeds an
+/// installed HFQ through it sees the same `ExpertTable` (including the sealed
+/// `Single` execution contract every ordinary load carries) the daemon binds.
+pub(crate) fn build_moe_layer_expert_binding(
+    hfq: &HfqFile,
+    p: &str,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    physical_device: i32,
+    source_expert_ids: &[usize],
+    original_router_rows: usize,
+) -> HipResult<(
+    hipfire_runtime::sealed_moe::ExpertExecutionPlan,
+    hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
+    hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
+)> {
+    // Capture and validate the actual per-expert source records before any
+    // owner is published. The table/cache contain only CPU metadata and can
+    // therefore fail without leaving a partially bound executable owner.
+    // REAP's compact slots retain the original source IDs so heterogeneous
+    // dtype, sidecar, and source-name metadata follows the loaded tensors.
+    let source_records = qwen35_hfq_expert_sources(hfq, p, config, source_expert_ids)?;
+    let source_fingerprint = hfq_source_fingerprint(hfq);
+    let router_source = qwen35_router_source_projection(
+        hfq,
+        &format!("{p}.mlp.gate.weight"),
+        config.num_experts,
+        original_router_rows,
+        config.dim,
+        &source_fingerprint,
+    )?;
+    let sidecar_sources = qwen35_hfq_sidecar_sources(hfq, &source_records, &router_source)?;
+    build_expert_binding(
+        source_records,
+        router_source,
+        sidecar_sources,
+        layer_idx,
+        config.n_layers,
+        super::weights::ExpertBindingTarget::Single { physical_device },
+    )
 }
 
 pub(crate) fn load_moe_ffn(
@@ -5957,30 +6248,18 @@ pub(crate) fn load_moe_ffn(
     // therefore fail without leaving a partially bound executable owner.
     // REAP's compact slots retain the original source IDs so heterogeneous
     // dtype, sidecar, and source-name metadata follows the loaded tensors.
-    let source_records = qwen35_hfq_expert_sources(hfq, p, config, &source_expert_ids)?;
-    let source_fingerprint = hfq_source_fingerprint(hfq);
     let original_router_rows = config
         .reap_keep
         .as_ref()
         .map_or(n_exp, |plan| plan.original_experts);
-    let router_source = qwen35_router_source_projection(
+    let (expert_execution_plan, expert_table, expert_binding) = build_moe_layer_expert_binding(
         hfq,
-        &format!("{p}.mlp.gate.weight"),
-        n_exp,
-        original_router_rows,
-        config.dim,
-        &source_fingerprint,
-    )?;
-    let sidecar_sources = qwen35_hfq_sidecar_sources(hfq, &source_records, &router_source)?;
-    let (expert_execution_plan, expert_table, expert_binding) = build_expert_binding(
-        source_records,
-        router_source,
-        sidecar_sources,
+        p,
+        config,
         layer_idx as usize,
-        config.n_layers,
-        super::weights::ExpertBindingTarget::Single {
-            physical_device: gpu.device_id,
-        },
+        gpu.device_id,
+        &source_expert_ids,
+        original_router_rows,
     )?;
 
     // `load_weight_tensor` retains the historical panic for an absent source.
@@ -6082,18 +6361,11 @@ pub(crate) fn load_moe_ffn(
     );
 
     let expert_ids = source_expert_ids;
-    let packed = match try_load_packed_experts(
-        hfq,
-        gpu,
-        p,
-        &expert_ids,
-        mi,
-        config.dim,
-        expert_target,
-    ) {
-        Ok(packed) => packed,
-        Err(error) => return Err(pending.rollback(gpu, error)),
-    };
+    let packed =
+        match try_load_packed_experts(hfq, gpu, p, &expert_ids, mi, config.dim, expert_target) {
+            Ok(packed) => packed,
+            Err(error) => return Err(pending.rollback(gpu, error)),
+        };
     if packed.is_none() && residency.experts_host() {
         // No packer covered this layer (uniform host packing needs an admitted
         // dtype and shared projection strides; graded packing needs one
@@ -6397,7 +6669,676 @@ pub(crate) fn load_moe_ffn(
         }
     }
 
-    pending.commit(expert_execution_plan, expert_table, expert_binding, gpu)
+    let mut ffn = pending.commit(expert_execution_plan, expert_table, expert_binding, gpu)?;
+    // Default-on symmetric IU4 expert prefill route for the qt53 artifact class:
+    // layer-level capability + header verification here (no-op for every other
+    // model and under the explicit kill); the model-level verdict, scratch
+    // reservation and logging run once in `finalize_expert_iu4`. A layer that
+    // cannot carry the route fails the load, so the committed layer is released
+    // here and the staged-load transaction reclaims the rest.
+    match expert_iu4_layer_capability(gpu, config, &ffn, residency.experts_host()) {
+        Ok(capability) => {
+            ffn.expert_iu4 = capability;
+            Ok(ffn)
+        }
+        Err(error) => {
+            let _ = gpu.bind_thread();
+            let _ = gpu.hip.device_synchronize();
+            super::weights::free_moe_ffn(gpu, ffn);
+            Err(error)
+        }
+    }
+}
+
+// ─── Default-on symmetric IU4 routed-expert prefill (qt53 artifact class) ──
+//
+// The qt53 artifact class (uniform qt44 gate_up + qt53 down routed experts) has
+// no acceptable non-IU4 prefill: the qt53 F32 fallback is ~3.7x slower. The
+// route therefore resolves by capability at load (`finalize_expert_iu4`), and a
+// model that cannot carry it fails the load with a typed refusal unless the
+// user explicitly kills it (`HIPFIRE_MOE_SYM_IU4=0` / `HIPFIRE_IU4_PREFILL=0`).
+
+type ExpertIu4Capability = (
+    hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
+    bool,
+);
+
+/// Facts of one loaded MoE layer that decide whether it can carry the IU4
+/// capability. Pure data so the decision is CPU-testable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpertIu4LayerFacts {
+    pub(crate) experts: usize,
+    pub(crate) top_k: usize,
+    pub(crate) hidden: usize,
+    pub(crate) intermediate: usize,
+    /// Routed experts are host-mapped (`memory.moe_expert_budget` spill).
+    /// Informational admitted state: host-mapped experts carry the capability
+    /// (the pipeline passes the real `host_mapped` bool to the NT8 PM entries).
+    pub(crate) experts_host: bool,
+    /// Loaded resident expert tensors (`0` when paged; the pager owns them).
+    pub(crate) resident_experts: usize,
+    /// `Some(dtype)` only when every expert's gate_up has that dtype.
+    pub(crate) gate_up_dtype: Option<DType>,
+    /// `Some(dtype)` only when every expert's down has that dtype.
+    pub(crate) down_dtype: Option<DType>,
+    /// Every expert's gate_up is `[2 * intermediate, hidden]` and down is
+    /// `[hidden, intermediate]`.
+    pub(crate) shapes_ok: bool,
+    pub(crate) has_dtype_tags: bool,
+    pub(crate) has_awq: bool,
+    pub(crate) cpu_deferred: bool,
+    pub(crate) paro: bool,
+}
+
+/// `Some(dtype)` when the iterator is non-empty and every item is equal.
+fn uniform_dtype(mut dtypes: impl Iterator<Item = DType>) -> Option<DType> {
+    let first = dtypes.next()?;
+    dtypes.all(|dtype| dtype == first).then_some(first)
+}
+
+/// The qt53 artifact class: any routed expert projection is qt53
+/// (`MQ4G128V2`). Membership is deliberately broader than eligibility, so a
+/// partly-qt53 or otherwise ineligible layer of a qt53 model is refused at
+/// load instead of silently reaching the slow fallback.
+fn expert_iu4_is_qt53_class(mut projections: impl Iterator<Item = (DType, DType)>) -> bool {
+    projections.any(|(gate_up, down)| gate_up == DType::MQ4G128V2 || down == DType::MQ4G128V2)
+}
+
+fn expert_iu4_layer_facts(
+    ffn: &MoeFfnWeights,
+    config: &Qwen35Config,
+    experts_host: bool,
+) -> ExpertIu4LayerFacts {
+    let (hidden, intermediate) = (config.dim, config.moe_intermediate_size);
+    ExpertIu4LayerFacts {
+        experts: config.num_experts,
+        top_k: config.num_experts_per_tok,
+        hidden,
+        intermediate,
+        experts_host,
+        resident_experts: ffn.experts.len(),
+        gate_up_dtype: uniform_dtype(ffn.experts.iter().map(|e| e.gate_up.gpu_dtype)),
+        down_dtype: uniform_dtype(ffn.experts.iter().map(|e| e.down.gpu_dtype)),
+        shapes_ok: ffn.experts.iter().all(|e| {
+            (e.gate_up.m, e.gate_up.k) == (2 * intermediate, hidden)
+                && (e.down.m, e.down.k) == (hidden, intermediate)
+        }),
+        has_dtype_tags: ffn.expert_dtype_tags.is_some()
+            || ffn.mixed_expert_gate_up_tiers.is_some()
+            || ffn.mixed_expert_down_tiers.is_some()
+            || ffn.global_expert_dtypes.is_some(),
+        has_awq: ffn.expert_down_awq_ptrs.is_some()
+            || ffn
+                .experts
+                .iter()
+                .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some()),
+        cpu_deferred: ffn.cpu_deferred_experts,
+        paro: ffn.paro_shared.is_some(),
+    }
+}
+
+/// Pure per-layer eligibility: the expert spec this layer would carry, or the
+/// first reason it cannot carry the capability. Fully loaded (resident or
+/// host-mapped), uniform qt44 (MQ4G256V2) gate_up + qt53 (MQ4G128V2) down only;
+/// the spec's own geometry requirements are those of `ExpertIu4Spec::validate`.
+/// Paged/EP/CPU-deferred/tagged/AWQ/Paro layers stay refused.
+pub(crate) fn expert_iu4_layer_spec(
+    facts: &ExpertIu4LayerFacts,
+) -> Result<hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec, &'static str> {
+    use hipfire_dispatch::families::moe_expert_iu4::{ExpertIu4Spec, ExpertNumerics};
+    if facts.experts == 0 || facts.resident_experts != facts.experts {
+        return Err("routed experts are not fully resident (paged, EP or absent)");
+    }
+    if facts.gate_up_dtype != Some(DType::MQ4G256V2) || facts.down_dtype != Some(DType::MQ4G128V2) {
+        return Err("routed experts are not uniform qt44 gate/up + qt53 down");
+    }
+    if !facts.shapes_ok {
+        return Err("routed expert shapes do not match the model geometry");
+    }
+    if facts.has_dtype_tags {
+        return Err("routed experts carry per-expert dtype tags");
+    }
+    if facts.has_awq {
+        return Err("routed experts carry AWQ scales");
+    }
+    if facts.cpu_deferred {
+        return Err("routed FFN is deferred to the CPU expert splice");
+    }
+    if facts.paro {
+        return Err("routed experts carry ParoQuant sidecars");
+    }
+    let (Ok(experts), Ok(top_k), Ok(hidden), Ok(intermediate)) = (
+        u32::try_from(facts.experts),
+        u32::try_from(facts.top_k),
+        u32::try_from(facts.hidden),
+        u32::try_from(facts.intermediate),
+    ) else {
+        return Err("expert geometry exceeds 32 bits");
+    };
+    let spec = ExpertIu4Spec {
+        experts,
+        top_k,
+        hidden,
+        intermediate,
+        gate_up_codec: DType::MQ4G256V2,
+        down_codec: DType::MQ4G128V2,
+        numerics: ExpertNumerics::SymmetricBf16SlotsF32OrderedCombine,
+    };
+    spec.validate().map_err(|reject| reject.reason())?;
+    Ok(spec)
+}
+
+/// Model-level result of the per-layer capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertIu4Verdict {
+    pub(crate) spec: hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
+    pub(crate) verified: bool,
+    /// First reason `verified` is false.
+    pub(crate) reason: Option<&'static str>,
+}
+
+/// Pure model verdict over every MoE layer's capability, in layer order.
+/// `None` when no layer carries one (nothing eligible: no spec to bind).
+/// `verified` only when EVERY MoE layer carries the same spec with verified
+/// symmetric headers; otherwise the capability is withheld from ALL layers.
+pub(crate) fn expert_iu4_model_verdict(
+    layers: &[Option<ExpertIu4Capability>],
+) -> Option<ExpertIu4Verdict> {
+    let spec = layers.iter().flatten().next()?.0;
+    let mut reason = None;
+    for layer in layers {
+        match layer {
+            None => {
+                reason.get_or_insert("a MoE layer is not eligible for the symmetric IU4 route");
+            }
+            Some((layer_spec, _)) if *layer_spec != spec => {
+                reason.get_or_insert("MoE layers disagree on the expert recipe or geometry");
+            }
+            Some((_, false)) => {
+                reason.get_or_insert("a MoE layer's routed headers are not symmetric");
+            }
+            Some((_, true)) => {}
+        }
+    }
+    Some(ExpertIu4Verdict {
+        spec,
+        verified: reason.is_none(),
+        reason,
+    })
+}
+
+/// Why the load of a qt53-class model is refused (the model cannot carry the
+/// IU4 route and the user did not explicitly kill it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertIu4Refusal {
+    /// A device hosting MoE layers has no gfx1201 PM objects / producers.
+    ArchIncapable,
+    /// A layer is ineligible, headers are not symmetric, or the header
+    /// verifier failed.
+    Unverified,
+    /// The scratch / sign-table reservation failed on an owner device.
+    ReservationFailed,
+}
+
+impl ExpertIu4Refusal {
+    /// Stable `DispatchError::UnsupportedVariant::variant` name.
+    pub(crate) fn variant(self) -> &'static str {
+        match self {
+            Self::ArchIncapable => "iu4-arch-incapable",
+            Self::Unverified => "iu4-experts-not-verified-symmetric",
+            Self::ReservationFailed => "iu4-scratch-reservation-failed",
+        }
+    }
+}
+
+/// Outcome of the model-level IU4 resolution for a qt53-class model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertIu4LoadDecision {
+    /// Bind the capability on every MoE layer (reserved and prewarmed).
+    Bind,
+    /// Explicit user kill: load with no capability and a loud WARNING.
+    LoadWithWarning,
+    /// Fail the load with a typed refusal.
+    Refuse(ExpertIu4Refusal),
+}
+
+/// Pure load decision. An explicit kill wins over every other input (the
+/// verifier and reservation are not even run); otherwise the first failing
+/// requirement in the order arch -> verified -> reservation refuses; only a
+/// capable, verified, reserved, un-killed model binds. Never silently falls
+/// back to the slow qt53 route.
+pub(crate) fn expert_iu4_load_decision(
+    arch_capable: bool,
+    verified: bool,
+    kill: bool,
+    reserve_ok: bool,
+) -> ExpertIu4LoadDecision {
+    if kill {
+        ExpertIu4LoadDecision::LoadWithWarning
+    } else if !arch_capable {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::ArchIncapable)
+    } else if !verified {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::Unverified)
+    } else if !reserve_ok {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::ReservationFailed)
+    } else {
+        ExpertIu4LoadDecision::Bind
+    }
+}
+
+const EXPERT_IU4_ARTIFACT_CLASS: &str =
+    "symmetric qt44 gate_up + qt53 down routed experts (MQ4G256V2 + MQ4G128V2)";
+const EXPERT_IU4_REMEDY: &str = "run on a gfx1201 build with the IU4 route, use the qt44 \
+    (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to explicitly accept the \
+    ~3.7x slower qt53 F32 prefill fallback";
+
+/// `DispatchError::UnsupportedVariant::arch` is `&'static str`; map the arches
+/// that reach this route and leave anything else empty (the message carries the
+/// real arch string).
+fn expert_iu4_static_arch(arch: &str) -> &'static str {
+    match arch {
+        "gfx1201" => "gfx1201",
+        "gfx1200" => "gfx1200",
+        "gfx1151" => "gfx1151",
+        "gfx1100" => "gfx1100",
+        "gfx1030" => "gfx1030",
+        "gfx942" => "gfx942",
+        _ => "",
+    }
+}
+
+fn expert_iu4_refusal_dispatch_error(
+    refusal: ExpertIu4Refusal,
+    arch: &str,
+) -> hipfire_dispatch::types::DispatchError {
+    hipfire_dispatch::types::DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant: refusal.variant(),
+        arch: expert_iu4_static_arch(arch),
+        quant: "MQ4G128V2",
+    }
+}
+
+/// Full load-error text: the typed dispatch refusal, the concrete detail, the
+/// artifact class, and the remedies.
+fn expert_iu4_refusal_message(refusal: ExpertIu4Refusal, arch: &str, detail: &str) -> String {
+    format!(
+        "qwen35: {} (device arch '{arch}'): {detail}. Artifact class: {EXPERT_IU4_ARTIFACT_CLASS}; \
+         it has no acceptable prefill without the symmetric IU4 route. Remedy: {EXPERT_IU4_REMEDY}",
+        expert_iu4_refusal_dispatch_error(refusal, arch),
+    )
+}
+
+fn expert_iu4_kill_warning() -> String {
+    "  qwen35 symmetric IU4 MoE: WARNING: the IU4 route is explicitly disabled \
+     (HIPFIRE_MOE_SYM_IU4=0 or HIPFIRE_IU4_PREFILL=0); this qt53 model uses the qt53 F32 \
+     fallback for every prefill, ~3.7x slower than the IU4 route"
+        .to_owned()
+}
+
+fn expert_iu4_admitted_info(moe_layers: usize) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: INFO: {moe_layers} MoE layers admitted by capability \
+         (default on; HIPFIRE_MOE_SYM_IU4=0 kills it); headers verified symmetric, scratch reserved"
+    )
+}
+fn expert_iu4_wide_reserved_info(device: usize, rows: usize) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: INFO: device {device}: scratch reserved for {rows}-row \
+         widened resident MoE prefill"
+    )
+}
+
+fn expert_iu4_wide_fallback_warning(
+    device: usize,
+    wide_rows: usize,
+    rows: usize,
+    error: &str,
+) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: WARNING: device {device}: widened {wide_rows}-row scratch \
+         reservation failed ({error}); falling back to the incumbent {rows}-row prefill ceiling"
+    )
+}
+
+/// Outcome of one device's scratch reservation. `wide_failure` is the widened
+/// attempt `(rows, error)` that fell back to the incumbent `rows`.
+struct ExpertIu4Reservation<E> {
+    rows: usize,
+    wide_failure: Option<(usize, E)>,
+}
+
+/// Pure reservation policy over an allocator `reserve(rows)`. A `wide` target
+/// above the incumbent is tried first; its failure is returned (for a loud
+/// warning) while the incumbent rows are reserved instead. A failure of the
+/// incumbent reservation is returned unchanged, exactly as before widening.
+fn expert_iu4_reserve_rows<E>(
+    wide: Option<usize>,
+    incumbent: usize,
+    mut reserve: impl FnMut(usize) -> Result<(), E>,
+) -> Result<ExpertIu4Reservation<E>, E> {
+    let mut wide_failure = None;
+    if let Some(wide_rows) = wide.filter(|&rows| rows > incumbent) {
+        match reserve(wide_rows) {
+            Ok(()) => {
+                return Ok(ExpertIu4Reservation {
+                    rows: wide_rows,
+                    wide_failure: None,
+                });
+            }
+            Err(error) => wide_failure = Some((wide_rows, error)),
+        }
+    }
+    reserve(incumbent)?;
+    Ok(ExpertIu4Reservation {
+        rows: incumbent,
+        wide_failure,
+    })
+}
+
+fn layer_moe_ffn_mut(layer: &mut LayerWeights) -> Option<&mut MoeFfnWeights> {
+    match layer {
+        LayerWeights::DeltaNetMoe(l) => Some(&mut l.ffn),
+        LayerWeights::FullAttnMoe(l) => Some(&mut l.ffn),
+        _ => None,
+    }
+}
+
+/// Per-layer resolution while the layer loads. `Ok(None)`: the layer is not of
+/// the qt53 artifact class (nothing to do, no log), or the user explicitly
+/// killed the route ([`Gpu::moe_sym_iu4_disabled`]; [`finalize_expert_iu4`]
+/// emits the one WARNING). Otherwise the layer must be on a capable device and
+/// eligible, and its expert headers must verify symmetric (FN load-time
+/// verifier `qwen4_moe_sym_check`: gate/up `(2I, H, 136)`, down `(H, I, 68)`
+/// over the layer's expert pointer tables; host-mapped layers verify through the
+/// same device pointer tables): `Ok(Some((spec, true)))`. Anything else is the
+/// typed refusal of [`expert_iu4_load_decision`] as a load error; the caller
+/// releases the layer.
+fn expert_iu4_layer_capability(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    ffn: &MoeFfnWeights,
+    experts_host: bool,
+) -> HipResult<Option<ExpertIu4Capability>> {
+    if !expert_iu4_is_qt53_class(
+        ffn.experts
+            .iter()
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+    ) || gpu.moe_sym_iu4_disabled()
+    {
+        return Ok(None);
+    }
+    let layer = ffn.layer_idx;
+    // Not killed, so `requested()` false means the device lacks the gfx1201 PM
+    // objects / combine object / C2 producers.
+    let arch_capable = gpu.moe_sym_iu4_requested();
+    let mut capability = None;
+    let mut detail = format!(
+        "layer {layer}: device arch '{}' has no symmetric IU4 PM objects/producers",
+        gpu.arch
+    );
+    if arch_capable {
+        let facts = expert_iu4_layer_facts(ffn, config, experts_host);
+        detail = match expert_iu4_layer_spec(&facts) {
+            Err(reason) => format!("layer {layer}: {reason}"),
+            Ok(spec) => {
+                let (experts, hidden, intermediate) =
+                    (facts.experts, facts.hidden, facts.intermediate);
+                let checked = gpu
+                    .qwen4_moe_sym_check(
+                        &ffn.expert_gate_up_ptrs,
+                        2 * intermediate,
+                        hidden,
+                        experts,
+                        136,
+                    )
+                    .and_then(|gate_up| {
+                        if gate_up {
+                            gpu.qwen4_moe_sym_check(
+                                &ffn.expert_down_ptrs,
+                                hidden,
+                                intermediate,
+                                experts,
+                                68,
+                            )
+                        } else {
+                            Ok(false)
+                        }
+                    });
+                match checked {
+                    Ok(true) => {
+                        capability = Some((spec, true));
+                        String::new()
+                    }
+                    Ok(false) => format!("layer {layer}: routed headers are not symmetric"),
+                    Err(error) => format!(
+                        "layer {layer}: symmetric header verification failed: {}",
+                        error.message
+                    ),
+                }
+            }
+        };
+    }
+    match expert_iu4_load_decision(arch_capable, capability.is_some(), false, true) {
+        ExpertIu4LoadDecision::Bind | ExpertIu4LoadDecision::LoadWithWarning => Ok(capability),
+        ExpertIu4LoadDecision::Refuse(refusal) => Err(HipError::new(
+            0,
+            &expert_iu4_refusal_message(refusal, &gpu.arch, &detail),
+        )),
+    }
+}
+
+/// Return every GPU owner of a fully loaded model after a post-sweep refusal.
+/// Mirrors the staged-load rollback placement (`GpuStagedLoadOps`): embedding on
+/// device 0, final norm and output on the output device, each layer through the
+/// single layer teardown `LayerWeights::free_gpu` on its band device. The
+/// load path never installs a pager or EP shard.
+fn release_loaded_weights(devices: &mut [Gpu], layout: &Layout, weights: Qwen35Weights) {
+    let Qwen35Weights {
+        token_embd,
+        output_norm,
+        output,
+        layers,
+        pager,
+        lm_head_aliases_embd,
+        ..
+    } = weights;
+    debug_assert!(
+        pager.is_none(),
+        "post-sweep refusal runs before any pager install"
+    );
+    for gpu in devices.iter_mut() {
+        let _ = gpu.bind_thread();
+        let _ = gpu.hip.device_synchronize();
+    }
+    for (index, layer) in layers.into_iter().enumerate() {
+        layer.free_gpu(&mut devices[layout.device_for_layer(index)]);
+    }
+    let out_dev = layout.output_device();
+    if lm_head_aliases_embd {
+        output.free_metadata_only(&mut devices[out_dev]);
+    } else {
+        output.free_all(&mut devices[out_dev]);
+    }
+    let _ = devices[out_dev].free_tensor(output_norm);
+    let _ = devices[0].free_tensor(token_embd);
+}
+
+/// Model-level IU4 resolution, once after every layer is loaded (config-free:
+/// the per-layer capability, spec and header verdict were resolved in
+/// [`expert_iu4_layer_capability`] while loading each layer). Does nothing (no
+/// GPU work, no log) unless some MoE layer is of the qt53 artifact class. For
+/// that class the route resolves by capability (default on):
+///
+/// * explicit kill (`Gpu::moe_sym_iu4_disabled`) -> load proceeds with no
+///   capability and one WARNING; no verifier, no reservation;
+/// * otherwise every MoE layer must carry the same verified capability on a
+///   capable arch, and the route's scratch must reserve on every owner device
+///   sized for the model's prefill chunk ceiling
+///   ([`prefill_max_batch_for_model`]), or for the widened resident-MoE rows
+///   when prefill's own static decision can widen the model
+///   ([`resident_moe_iu4_load_wide_rows`]; a failed widened reservation falls
+///   back to the incumbent rows with a WARNING and prefill then cannot widen),
+///   plus the FWHT sign tables, so no allocation happens inside prefill ->
+///   capability bound on ALL layers and one INFO;
+/// * any failure (incapable arch, a MoE layer without the capability, disagreeing
+///   layer recipes, reservation/sign-table error) refuses the whole load with a
+///   typed error after releasing the loaded weights.
+fn finalize_expert_iu4(
+    devices: &mut [Gpu],
+    layout: &Layout,
+    mut weights: Qwen35Weights,
+) -> HipResult<Qwen35Weights> {
+    use std::collections::BTreeSet;
+    let mut hosting: BTreeSet<usize> = BTreeSet::new();
+    let mut caps: Vec<Option<ExpertIu4Capability>> = Vec::new();
+    let mut uncapable_layer: Option<u16> = None;
+    let mut qt53_class = false;
+    for (index, layer) in weights.layers.iter_mut().enumerate() {
+        if let Some(ffn) = layer_moe_ffn_mut(layer) {
+            hosting.insert(layout.device_for_layer(index));
+            caps.push(ffn.expert_iu4);
+            if ffn.expert_iu4.is_none() {
+                uncapable_layer.get_or_insert(ffn.layer_idx);
+            }
+            qt53_class |= expert_iu4_is_qt53_class(
+                ffn.experts
+                    .iter()
+                    .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+            );
+        }
+    }
+    let Some(&first_device) = hosting.iter().next().filter(|_| qt53_class) else {
+        return Ok(weights);
+    };
+
+    let kill = devices[first_device].moe_sym_iu4_disabled();
+    let mut arch_capable = false;
+    let mut verified = false;
+    let mut reserve_ok = true;
+    let mut detail = String::new();
+    let mut spec = None;
+    if !kill {
+        // Not killed, so `requested()` false means the device lacks the gfx1201
+        // PM objects / combine object / C2 producers.
+        let incapable = hosting
+            .iter()
+            .copied()
+            .find(|&device| !devices[device].moe_sym_iu4_requested());
+        arch_capable = incapable.is_none();
+        if let Some(device) = incapable {
+            detail = format!(
+                "device {device} ({}) has no symmetric IU4 PM objects/producers",
+                devices[device].arch
+            );
+        } else {
+            match (expert_iu4_model_verdict(&caps), uncapable_layer) {
+                (Some(verdict), None) if verdict.verified => {
+                    verified = true;
+                    spec = Some(verdict.spec);
+                }
+                (_, Some(layer)) => {
+                    detail = format!(
+                        "layer {layer}: routed experts are not the qt44 gate_up + qt53 down \
+                         artifact (the layer carries no symmetric IU4 capability)"
+                    );
+                }
+                (Some(verdict), None) => {
+                    detail = verdict
+                        .reason
+                        .unwrap_or("MoE layers are not verified")
+                        .to_owned();
+                }
+                (None, None) => {
+                    detail = "no MoE layer carries the symmetric IU4 capability".to_owned();
+                }
+            }
+        }
+        if let (true, Some(spec)) = (verified, spec) {
+            for &device in &hosting {
+                let incumbent =
+                    super::prefill::prefill_max_batch_for_model(&devices[device], &weights);
+                // The widened rows are reserved only where prefill's own static
+                // decision can widen this model (single hosting device; TP/EP,
+                // host-mapped, paged or ineligible layers keep the incumbent).
+                let wide = if hosting.len() == 1 {
+                    super::prefill::resident_moe_iu4_load_wide_rows(&devices[device], &weights)
+                } else {
+                    None
+                };
+                let gpu = &mut devices[device];
+                let reserved = expert_iu4_reserve_rows(wide, incumbent, |rows| {
+                    gpu.reserve_qwen4_moe_sym(
+                        rows,
+                        spec.top_k as usize,
+                        spec.experts as usize,
+                        spec.hidden as usize,
+                        spec.intermediate as usize,
+                    )
+                })
+                // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT
+                // sign tables; build them here too so an admitted prefill
+                // allocates nothing.
+                .and_then(|reservation| {
+                    gpu.ensure_mq_signs()?;
+                    gpu.ensure_mq_signs_128()?;
+                    Ok(reservation)
+                });
+                match reserved {
+                    Ok(reservation) => {
+                        if let Some((wide_rows, error)) = &reservation.wide_failure {
+                            eprintln!(
+                                "{}",
+                                expert_iu4_wide_fallback_warning(
+                                    device,
+                                    *wide_rows,
+                                    reservation.rows,
+                                    &error.message
+                                )
+                            );
+                        } else if wide.is_some_and(|rows| rows == reservation.rows) {
+                            eprintln!(
+                                "{}",
+                                expert_iu4_wide_reserved_info(device, reservation.rows)
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        reserve_ok = false;
+                        detail = format!(
+                            "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
+                            error.message
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    match expert_iu4_load_decision(arch_capable, verified, kill, reserve_ok) {
+        ExpertIu4LoadDecision::Bind => {
+            // Every MoE layer already carries the verified, agreeing capability.
+            eprintln!("{}", expert_iu4_admitted_info(caps.len()));
+            Ok(weights)
+        }
+        ExpertIu4LoadDecision::LoadWithWarning => {
+            // The layers loaded with no capability (kill); make that explicit.
+            for layer in weights.layers.iter_mut() {
+                if let Some(ffn) = layer_moe_ffn_mut(layer) {
+                    ffn.expert_iu4 = None;
+                }
+            }
+            eprintln!("{}", expert_iu4_kill_warning());
+            Ok(weights)
+        }
+        ExpertIu4LoadDecision::Refuse(refusal) => {
+            let arch = devices[first_device].arch.clone();
+            let error = HipError::new(0, &expert_iu4_refusal_message(refusal, &arch, &detail));
+            release_loaded_weights(devices, layout, weights);
+            Err(error)
+        }
+    }
 }
 
 // ─── Sealed EP streaming load ─────────────────────────────────────────────────
@@ -7093,6 +8034,7 @@ fn load_weights_ep_rank_inner(
     fault: Option<EpFault>,
 ) -> HipResult<Qwen35Weights> {
     let assignment = validate_ep_load_topology(config, mesh, physical_devices, shard, rank, gpu)?;
+    reject_hfq_qt53_for_mode(hfq, "sealed expert-parallel (EP)")?;
     let source_identity = Qwen35HfqSourceIdentity::capture(hfq);
     let config_fingerprint = Qwen35EpConfigFingerprint::capture(config);
     let ctx = SealedEpLoadCtx {
@@ -7610,6 +8552,9 @@ mod sealed_ep_tests {
             error.message.contains("fault injection"),
             "fault stage {stage:?} fired with the injected error: {error:?}"
         );
+        // clr pins the mmap'd copy source as KFD userptr (counted by
+        // hipMemGetInfo) until munmap; unmap so only device allocations count.
+        drop(hfq);
         gpus.devices[0].drain_pool();
         gpus.devices[1].drain_pool();
         let free_after = free_vram_bytes(&gpus.devices[0]);
@@ -8322,17 +9267,51 @@ mod packed_host_expert_tests {
         // A layer that is uniform in an admitted dtype keeps the uniform packer.
         assert_eq!(
             classify_expert_layer(&[mq6(), mq6()], host),
-            ExpertLayerLayout::Uniform(DType::MQ6G256)
+            ExpertLayerLayout::Uniform(DType::MQ6G256, DType::MQ6G256)
         );
         assert_eq!(
             classify_expert_layer(&[mq4(), mq4(), mq4()], device),
-            ExpertLayerLayout::Uniform(DType::MQ4G256)
+            ExpertLayerLayout::Uniform(DType::MQ4G256, DType::MQ4G256)
         );
         // qt 15 is host-only: the same uniform layer on the device is not.
         assert_eq!(
             classify_expert_layer(&[mq6(), mq6()], device),
             ExpertLayerLayout::Mixed
         );
+    }
+
+    /// qt44 gate_up + qt53 down is the one admitted mixed pair: host-packed as a
+    /// uniform layer, literal per-expert on the device, and never graded.
+    #[test]
+    fn qt44_gate_up_with_qt53_down_packs_only_host_mapped() {
+        let host = MemoryTarget::HostMapped;
+        let device = MemoryTarget::Device;
+        let a3b = || resolved(44, 53, 1024 * 8 * 136, 2048 * 4 * 68);
+        assert_eq!(
+            classify_expert_layer(&[a3b(), a3b(), a3b()], host),
+            ExpertLayerLayout::Uniform(DType::MQ4G256V2, DType::MQ4G128V2)
+        );
+        assert_eq!(
+            classify_expert_layer(&[a3b(), a3b()], device),
+            ExpertLayerLayout::Mixed
+        );
+        // Mixing the qt53 layer with any other pair or stride is Mixed, so it
+        // reaches the graded packer, which refuses qt53 loudly.
+        assert_eq!(
+            classify_expert_layer(
+                &[a3b(), resolved(44, 44, 1024 * 8 * 136, 2048 * 2 * 136)],
+                host
+            ),
+            ExpertLayerLayout::Mixed
+        );
+        // Reversed or other qt53 pairings are never packable.
+        for (g, d) in [(53u8, 44u8), (53, 53), (13, 53), (45, 53), (44, 52)] {
+            assert_eq!(
+                classify_expert_layer(&[resolved(g, d, 8 << 20, 4 << 20)], host),
+                ExpertLayerLayout::Mixed,
+                "({g},{d})"
+            );
+        }
     }
 
     /// Real loader views must preserve numerical output at nonzero offsets,
@@ -8497,6 +9476,7 @@ mod packed_host_expert_tests {
                     &w,
                     &residual,
                     false,
+                    false,
                     |e| {
                         Ok(CpuMoeExpert {
                             gate_up_quant: q,
@@ -8542,5 +9522,459 @@ mod packed_host_expert_tests {
             "PACKED_HOST_EXPERT_PARITY PASS: {path} (GPU bits; CPU widths 4/2/1 when supported)"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod qt53_blob_tests {
+    use super::*;
+
+    const GROUP: usize = 68;
+
+    /// `m * ceil(k/128)` groups of 68 B with a symmetric finite header
+    /// (scale 1.0 = 0x3C00, zero -8.0 = 0xC800) and a distinct payload.
+    fn blob(m: usize, k: usize) -> Vec<u8> {
+        let groups = m * k.div_ceil(128);
+        let mut out = Vec::with_capacity(groups * GROUP);
+        for g in 0..groups {
+            out.extend_from_slice(&0x3C00u16.to_le_bytes());
+            out.extend_from_slice(&0xC800u16.to_le_bytes());
+            out.extend((0..64).map(|i| (g + i) as u8));
+        }
+        out
+    }
+
+    #[test]
+    fn accepts_a3b_down_shape() {
+        // A3B routed down: [H=2048, I=512] -> 2048 rows x 4 groups x 68 B.
+        let data = blob(2048, 512);
+        assert_eq!(data.len(), 2048 * 4 * 68);
+        assert_eq!(mq4g128v2_blob_bytes(2048, 512), Some(data.len()));
+        validate_mq4g128v2_blob(&data, 2048, 512).unwrap();
+    }
+
+    #[test]
+    fn accepts_ceil_groups_for_partial_last_group() {
+        for k in [1usize, 127, 128, 129, 255, 256, 257] {
+            let data = blob(3, k);
+            assert_eq!(data.len(), 3 * k.div_ceil(128) * 68, "k={k}");
+            validate_mq4g128v2_blob(&data, 3, k).unwrap_or_else(|e| panic!("k={k}: {e}"));
+        }
+        // 127 and 129 straddle the 128 boundary: 1 vs 2 groups per row.
+        assert_eq!(mq4g128v2_blob_bytes(1, 127), Some(68));
+        assert_eq!(mq4g128v2_blob_bytes(1, 129), Some(136));
+    }
+
+    #[test]
+    fn rejects_zero_dims() {
+        let data = blob(2, 128);
+        assert!(validate_mq4g128v2_blob(&data, 0, 128).is_err());
+        assert!(validate_mq4g128v2_blob(&data, 2, 0).is_err());
+        assert!(validate_mq4g128v2_blob(&[], 0, 0).is_err());
+        assert_eq!(mq4g128v2_blob_bytes(0, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(2, 0), None);
+    }
+
+    #[test]
+    fn rejects_short_and_long_blobs() {
+        let data = blob(4, 512);
+        assert!(validate_mq4g128v2_blob(&data[..data.len() - 1], 4, 512).is_err());
+        assert!(validate_mq4g128v2_blob(&data[..data.len() - GROUP], 4, 512).is_err());
+        assert!(validate_mq4g128v2_blob(&[], 4, 512).is_err());
+        let mut long = data.clone();
+        long.push(0);
+        assert!(validate_mq4g128v2_blob(&long, 4, 512).is_err());
+        long.truncate(data.len());
+        long.extend_from_slice(&[0u8; GROUP]);
+        assert!(validate_mq4g128v2_blob(&long, 4, 512).is_err());
+        // Right bytes, wrong shape (qt44's 256-group stride is not qt53's).
+        assert!(validate_mq4g128v2_blob(&data, 4, 256).is_err());
+        assert!(validate_mq4g128v2_blob(&data, 2, 1024).is_ok());
+    }
+
+    #[test]
+    fn rejects_overflowing_extent_without_wrapping() {
+        assert_eq!(mq4g128v2_blob_bytes(usize::MAX, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(usize::MAX / 68 + 1, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(3, usize::MAX), None);
+        for (m, k) in [
+            (usize::MAX, 128),
+            (usize::MAX / 68 + 1, 128),
+            (3, usize::MAX),
+        ] {
+            let err = validate_mq4g128v2_blob(&[0u8; 68], m, k).expect_err("overflow");
+            assert!(err.contains("overflow"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_nonfinite_fp16_headers_in_any_group() {
+        let finite = blob(2, 256);
+        validate_mq4g128v2_blob(&finite, 2, 256).unwrap();
+        let groups = finite.len() / GROUP;
+        // inf / NaN in scale or zero, signed, first / middle / last group.
+        for bits in [0x7C00u16, 0xFC00, 0x7E00, 0x7FFF, 0xFFFF] {
+            for group in [0, groups / 2, groups - 1] {
+                for offset in [0usize, 2] {
+                    let mut data = finite.clone();
+                    let at = group * GROUP + offset;
+                    data[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+                    let err = validate_mq4g128v2_blob(&data, 2, 256)
+                        .expect_err("non-finite header must be rejected");
+                    assert!(err.contains("non-finite"), "{err}");
+                    assert!(err.contains(&format!("group {group}")), "{err}");
+                }
+            }
+        }
+        // Largest finite fp16 (0x7BFF), subnormal and signed zero are finite.
+        for bits in [0x7BFFu16, 0xFBFF, 0x0001, 0x0000, 0x8000, 0x8001] {
+            let mut data = finite.clone();
+            data[0..2].copy_from_slice(&bits.to_le_bytes());
+            data[2..4].copy_from_slice(&bits.to_le_bytes());
+            validate_mq4g128v2_blob(&data, 2, 256).unwrap();
+        }
+        // Non-header payload bytes are never interpreted as a header.
+        let mut data = finite.clone();
+        data[4..68].fill(0xFF);
+        validate_mq4g128v2_blob(&data, 2, 256).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod expert_iu4_load_tests {
+    use super::*;
+    use hipfire_dispatch::families::moe_expert_iu4::{ExpertIu4Spec, ExpertNumerics};
+
+    /// A3B shapes: E=256, top_k=8, H=2048, I=512, resident uniform qt44 + qt53.
+    fn a3b() -> ExpertIu4LayerFacts {
+        ExpertIu4LayerFacts {
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+            experts_host: false,
+            resident_experts: 256,
+            gate_up_dtype: Some(DType::MQ4G256V2),
+            down_dtype: Some(DType::MQ4G128V2),
+            shapes_ok: true,
+            has_dtype_tags: false,
+            has_awq: false,
+            cpu_deferred: false,
+            paro: false,
+        }
+    }
+
+    fn a3b_spec() -> ExpertIu4Spec {
+        ExpertIu4Spec {
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+            gate_up_codec: DType::MQ4G256V2,
+            down_codec: DType::MQ4G128V2,
+            numerics: ExpertNumerics::SymmetricBf16SlotsF32OrderedCombine,
+        }
+    }
+
+    #[test]
+    fn uniform_dtype_requires_non_empty_equal() {
+        assert_eq!(uniform_dtype(std::iter::empty()), None);
+        assert_eq!(
+            uniform_dtype([DType::MQ4G128V2; 3].into_iter()),
+            Some(DType::MQ4G128V2)
+        );
+        assert_eq!(
+            uniform_dtype([DType::MQ4G128V2, DType::MQ4G256V2].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn layer_spec_admits_resident_uniform_qt44_qt53() {
+        assert_eq!(expert_iu4_layer_spec(&a3b()), Ok(a3b_spec()));
+    }
+
+    #[test]
+    fn layer_spec_refusal_table() {
+        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 13] = [
+            ("not fully resident", |f| f.resident_experts = 0),
+            ("not fully resident", |f| f.resident_experts = 255),
+            ("not fully resident", |f| f.experts = 0),
+            ("not uniform qt44", |f| f.gate_up_dtype = None),
+            ("not uniform qt44", |f| {
+                f.down_dtype = Some(DType::MQ4G256V2)
+            }),
+            ("not uniform qt44", |f| {
+                f.gate_up_dtype = Some(DType::MQ4G128V2)
+            }),
+            ("shapes do not match", |f| f.shapes_ok = false),
+            ("dtype tags", |f| f.has_dtype_tags = true),
+            ("AWQ", |f| f.has_awq = true),
+            ("CPU expert splice", |f| f.cpu_deferred = true),
+            ("ParoQuant", |f| f.paro = true),
+            // Spec geometry requirement surfaces its reason.
+            ("top_k", |f| f.top_k = 10),
+            ("multiple of 128", |f| f.intermediate = 576),
+        ];
+        for (needle, edit) in cases {
+            let mut facts = a3b();
+            edit(&mut facts);
+            let reason = expert_iu4_layer_spec(&facts).expect_err(needle);
+            assert!(reason.contains(needle), "{needle}: got {reason}");
+        }
+    }
+
+    #[test]
+    fn model_verdict_is_none_without_any_capability() {
+        // Flag off / nothing eligible: no layer carries a capability.
+        assert_eq!(expert_iu4_model_verdict(&[]), None);
+        assert_eq!(expert_iu4_model_verdict(&[None, None, None]), None);
+    }
+
+    #[test]
+    fn model_verdict_verifies_only_when_every_layer_does() {
+        let ok = Some((a3b_spec(), true));
+        let verdict = expert_iu4_model_verdict(&[ok, ok, ok]).unwrap();
+        assert!(verdict.verified);
+        assert_eq!(verdict.reason, None);
+        assert_eq!(verdict.spec, a3b_spec());
+
+        // One asymmetric layer withholds the capability from the whole model.
+        let bad = Some((a3b_spec(), false));
+        for layers in [[bad, ok, ok], [ok, bad, ok], [ok, ok, bad]] {
+            let verdict = expert_iu4_model_verdict(&layers).unwrap();
+            assert!(!verdict.verified);
+            assert!(verdict.reason.unwrap().contains("not symmetric"));
+        }
+
+        // An ineligible layer beside capable ones also withholds it.
+        for layers in [[None, ok, ok], [ok, None, ok], [ok, ok, None]] {
+            let verdict = expert_iu4_model_verdict(&layers).unwrap();
+            assert!(!verdict.verified);
+            assert!(verdict.reason.unwrap().contains("not eligible"));
+        }
+
+        // Layers that disagree on the recipe never verify.
+        let other = ExpertIu4Spec {
+            top_k: 4,
+            ..a3b_spec()
+        };
+        let verdict = expert_iu4_model_verdict(&[ok, Some((other, true))]).unwrap();
+        assert!(!verdict.verified);
+        assert!(verdict.reason.unwrap().contains("disagree"));
+    }
+
+    #[test]
+    fn layer_spec_admits_host_mapped_experts() {
+        // Host-mapped experts are admitted state, not a refusal: the pipeline
+        // passes the real `host_mapped` bool to both PM GEMM launchers.
+        let mut facts = a3b();
+        facts.experts_host = true;
+        assert_eq!(expert_iu4_layer_spec(&facts), Ok(a3b_spec()));
+    }
+
+    #[test]
+    fn qt53_class_is_any_qt53_expert_projection() {
+        let (g, d, other) = (DType::MQ4G256V2, DType::MQ4G128V2, DType::MQ4G256);
+        assert!(!expert_iu4_is_qt53_class([].into_iter()));
+        assert!(expert_iu4_is_qt53_class([(g, d), (g, d)].into_iter()));
+        // One qt53 expert makes the artifact the qt53 class (the layer is then
+        // refused as non-uniform rather than silently falling back).
+        assert!(expert_iu4_is_qt53_class([(g, g), (g, d)].into_iter()));
+        assert!(expert_iu4_is_qt53_class([(d, other)].into_iter()));
+        // qt44-only (mq4r/mq4rs) and other recipes are not the qt53 class.
+        assert!(!expert_iu4_is_qt53_class(
+            [(g, g), (other, other)].into_iter()
+        ));
+    }
+
+    /// Exhaustive 2^4 table: arch capable x verified x kill x reservation ok.
+    #[test]
+    fn load_decision_exhaustive_table() {
+        use ExpertIu4LoadDecision::{Bind, LoadWithWarning, Refuse};
+        use ExpertIu4Refusal::{ArchIncapable, ReservationFailed, Unverified};
+        let mut seen = 0;
+        for bits in 0u8..16 {
+            let (arch, verified, kill, reserve) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let expected = if kill {
+                // The explicit kill wins over every other input.
+                LoadWithWarning
+            } else if !arch {
+                Refuse(ArchIncapable)
+            } else if !verified {
+                Refuse(Unverified)
+            } else if !reserve {
+                Refuse(ReservationFailed)
+            } else {
+                Bind
+            };
+            assert_eq!(
+                expert_iu4_load_decision(arch, verified, kill, reserve),
+                expected,
+                "arch={arch} verified={verified} kill={kill} reserve={reserve}"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 16);
+        // Spot the three outcome classes explicitly.
+        assert_eq!(expert_iu4_load_decision(true, true, false, true), Bind);
+        assert_eq!(
+            expert_iu4_load_decision(false, false, true, false),
+            LoadWithWarning
+        );
+        assert_eq!(
+            expert_iu4_load_decision(false, true, false, true),
+            Refuse(ArchIncapable)
+        );
+        // Exactly one Bind row: capable, verified, not killed, reserved.
+        let binds = (0u8..16)
+            .filter(|bits| {
+                expert_iu4_load_decision(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0)
+                    == Bind
+            })
+            .count();
+        assert_eq!(binds, 1);
+    }
+
+    #[test]
+    fn refusal_is_a_typed_dispatch_error_with_artifact_and_remedy() {
+        use hipfire_dispatch::types::DispatchError;
+        for (refusal, variant) in [
+            (ExpertIu4Refusal::ArchIncapable, "iu4-arch-incapable"),
+            (
+                ExpertIu4Refusal::Unverified,
+                "iu4-experts-not-verified-symmetric",
+            ),
+            (
+                ExpertIu4Refusal::ReservationFailed,
+                "iu4-scratch-reservation-failed",
+            ),
+        ] {
+            match expert_iu4_refusal_dispatch_error(refusal, "gfx1100") {
+                DispatchError::UnsupportedVariant {
+                    family,
+                    variant: got,
+                    arch,
+                    quant,
+                } => {
+                    assert_eq!(family, "moe");
+                    assert_eq!(got, variant);
+                    assert_eq!(arch, "gfx1100");
+                    assert_eq!(quant, "MQ4G128V2");
+                }
+                other => panic!("expected UnsupportedVariant, got {other:?}"),
+            }
+            let message = expert_iu4_refusal_message(refusal, "gfx1100", "layer 3: detail");
+            for needle in [
+                variant,
+                "layer 3: detail",
+                "symmetric qt44 gate_up + qt53 down",
+                "gfx1201 build with the IU4 route",
+                "qt44 (mq4r/mq4rs)",
+                "HIPFIRE_MOE_SYM_IU4=0",
+            ] {
+                assert!(message.contains(needle), "{needle}: {message}");
+            }
+        }
+        // Unknown arch strings stay empty rather than inventing a static name.
+        assert_eq!(expert_iu4_static_arch("gfx9999"), "");
+        assert_eq!(expert_iu4_static_arch("gfx1201"), "gfx1201");
+    }
+
+    #[test]
+    fn kill_warning_and_admitted_info_text() {
+        let warning = expert_iu4_kill_warning();
+        assert!(warning.contains("WARNING"), "{warning}");
+        assert!(warning.contains("qt53 F32 fallback"), "{warning}");
+        assert!(warning.contains("3.7x slower"), "{warning}");
+        assert!(warning.contains("HIPFIRE_MOE_SYM_IU4=0"), "{warning}");
+        let info = expert_iu4_admitted_info(40);
+        assert!(info.contains("INFO"), "{info}");
+        assert!(info.contains("40 MoE layers"), "{info}");
+        assert!(info.contains("admitted by capability"), "{info}");
+        assert!(info.contains("default on"), "{info}");
+        assert!(info.contains("HIPFIRE_MOE_SYM_IU4=0 kills it"), "{info}");
+    }
+    #[test]
+    fn wide_reservation_logs_are_exact() {
+        assert_eq!(
+            expert_iu4_wide_reserved_info(0, 8192),
+            "  qwen35 symmetric IU4 MoE: INFO: device 0: scratch reserved for 8192-row widened \
+             resident MoE prefill"
+        );
+        assert_eq!(
+            expert_iu4_wide_fallback_warning(1, 8192, 512, "out of memory"),
+            "  qwen35 symmetric IU4 MoE: WARNING: device 1: widened 8192-row scratch reservation \
+             failed (out of memory); falling back to the incumbent 512-row prefill ceiling"
+        );
+    }
+
+    /// Simulated allocator: records every requested row count and fails the
+    /// rows listed in `fail`.
+    fn simulated_reserve<'a>(
+        fail: &'static [usize],
+        calls: &'a mut Vec<usize>,
+    ) -> impl FnMut(usize) -> Result<(), String> + 'a {
+        move |rows| {
+            calls.push(rows);
+            if fail.contains(&rows) {
+                Err(format!("alloc {rows}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reserve_rows_default_widened_reserves_8192_only() {
+        let mut calls = Vec::new();
+        let got =
+            expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!((got.rows, got.wide_failure), (8192, None));
+        assert_eq!(calls, [8192]);
+    }
+
+    #[test]
+    fn reserve_rows_without_a_widen_target_keeps_the_incumbent() {
+        // Explicit max batch, chunk opt-out, kill, ineligible placement and
+        // non-IU4 arch all hand the loader no widened target.
+        let mut calls = Vec::new();
+        let got = expert_iu4_reserve_rows(None, 512, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!((got.rows, got.wide_failure), (512, None));
+        assert_eq!(calls, [512]);
+        // A target not above the incumbent is never reserved.
+        let mut calls = Vec::new();
+        let got =
+            expert_iu4_reserve_rows(Some(4096), 16384, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!(got.rows, 16384);
+        assert_eq!(calls, [16384]);
+    }
+
+    #[test]
+    fn reserve_rows_failed_wide_falls_back_to_incumbent_loudly() {
+        let mut calls = Vec::new();
+        let got = expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[8192], &mut calls))
+            .unwrap();
+        assert_eq!(got.rows, 512);
+        assert_eq!(got.wide_failure, Some((8192, "alloc 8192".to_owned())));
+        assert_eq!(calls, [8192, 512]);
+    }
+
+    #[test]
+    fn reserve_rows_incumbent_failure_keeps_the_existing_error() {
+        let mut calls = Vec::new();
+        let err = expert_iu4_reserve_rows(None, 512, simulated_reserve(&[512], &mut calls))
+            .err()
+            .unwrap();
+        assert_eq!(err, "alloc 512");
+        // A failed wide attempt does not mask the incumbent's own error.
+        let mut calls = Vec::new();
+        let err =
+            expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[8192, 512], &mut calls))
+                .err()
+                .unwrap();
+        assert_eq!(err, "alloc 512");
+        assert_eq!(calls, [8192, 512]);
     }
 }

@@ -167,7 +167,10 @@ fn main() {
         candidate_guards,
     );
     assert!(baseline_guards, "retained baseline overwrote output guard");
-    assert!(candidate_guards, "wave64x4 candidate overwrote output guard");
+    assert!(
+        candidate_guards,
+        "wave64x4 candidate overwrote output guard"
+    );
     assert_eq!(
         numerical_violations, 0,
         "wave64x4 candidate failed grouped baseline tolerance: {first_bad:?}"

@@ -11,9 +11,10 @@ fn main() {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    let model_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| { eprintln!("usage: test_e4_engine_repro <model.hfq>"); std::process::exit(2) });
+    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: test_e4_engine_repro <model.hfq>");
+        std::process::exit(2)
+    });
     println!("=== E4 engine repro === model={model_path}");
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");

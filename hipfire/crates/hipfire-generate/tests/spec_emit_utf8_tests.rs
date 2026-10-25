@@ -103,7 +103,11 @@ fn cohere2moe_spec_emitter_streams_split_characters_whole() {
 fn spec_usage_counts_eos_for_qwen_not_ds4() {
     let tokenizer = byte_level_tokenizer();
     let counted = |mut emit: Box<dyn SpecEmit + '_>| {
-        let outcomes = [emit.begin(100 + u32::from(b'h')), emit.observe(100 + u32::from(b'i')), emit.observe(EOS)];
+        let outcomes = [
+            emit.begin(100 + u32::from(b'h')),
+            emit.observe(100 + u32::from(b'i')),
+            emit.observe(EOS),
+        ];
         outcomes
             .iter()
             .filter(|o| hipfire_generate::qwen::spec_outcome_seed_committable(o))

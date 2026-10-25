@@ -101,7 +101,9 @@ impl DflashBlockPolicy {
     pub fn resolve(self, vmm_batch: bool, lanes: usize) -> usize {
         match self {
             Self::Fixed(b) => b,
-            Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => DFLASH_BLOCK_AUTO_BATCHED,
+            Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => {
+                DFLASH_BLOCK_AUTO_BATCHED
+            }
             Self::Auto => DFLASH_BLOCK_UNBATCHED,
         }
     }
@@ -751,6 +753,7 @@ fn hfq_weight(
             })
         }
         53 => panic!("dflash: MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dflash has no consumer for {name}"),
+        131..=134 => panic!("dflash: MQ-I4 (qt={}) is a typed-Qwen4 expert-slab format; generic dflash has no consumer for {name}", info.quant_type),
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same allow-list as hfq.rs::load_weight_tensor
@@ -1624,7 +1627,13 @@ impl DraftLaneWorkspace {
     }
 
     fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [self.input, self.fc_out, self.k_out, self.v_out, self.positions] {
+        for t in [
+            self.input,
+            self.fc_out,
+            self.k_out,
+            self.v_out,
+            self.positions,
+        ] {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -2382,15 +2391,19 @@ fn gemm_dispatch_shared<const N: usize>(
     };
     let k = projections[0].0.k;
     let eligible = enabled
-        && k > 0 && k % 256 == 0
+        && k > 0
+        && k % 256 == 0
         && gpu.arch_caps.is_gfx1100()
-        && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
-        && batch > 1 && batch <= 16
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && batch > 1
+        && batch <= 16
         && !crate::config::get().draft_gemm_dump
         && mq_x_rot.is_some_and(|s| s.shape[0] / k >= batch)
         && mq_x_rot_f16.is_some_and(|s| s.shape[0] / k >= batch)
-        && projections.iter().all(|(w, _)|
-            w.gpu_dtype == DType::MQ4G256V2 && w.k == k && w.awq_scale.is_none());
+        && projections
+            .iter()
+            .all(|(w, _)| w.gpu_dtype == DType::MQ4G256V2 && w.k == k && w.awq_scale.is_none());
     if !eligible {
         for (w, y) in projections {
             gemm_dispatch(gpu, x, w, y, batch, mq_x_rot, mq_x_rot_f16)?;
@@ -2455,6 +2468,15 @@ fn gemm_dispatch(
         DType::MQ4G128V2 => Err(hip_bridge::HipError::new(
             0,
             "dflash GEMM cannot consume MQ4G128V2: qt=53 is admitted only by typed Qwen4 sealed/dense consumers",
+        )),
+        DType::MQ3I4G128R256
+        | DType::MQ3I4G128R128
+        | DType::MQ2I4G128R256
+        | DType::MQ2I4G128R128
+        | DType::E8PI4G128R256
+        | DType::E8PI4G128R128 => Err(hip_bridge::HipError::new(
+            0,
+            "dflash GEMM cannot consume MQ-I4 / E8P-I4 (qt=131..=136): typed-Qwen4 expert-slab format with no generic GPU kernel",
         )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
@@ -3007,7 +3029,8 @@ fn draft_dtod_at(
     if ordered {
         gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
     } else {
-        gpu.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
+        gpu.hip
+            .memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
     }
 }
 
@@ -3230,6 +3253,42 @@ pub fn draft_forward_opts(
     scratch: &mut DflashScratch,
     graph_ffn: bool,
 ) -> HipResult<()> {
+    draft_forward_based(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        0,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        graph_ffn,
+    )
+}
+
+/// [`draft_forward`] whose host `target_hidden` holds only rows
+/// `target_hidden_base..ctx_len` (a caller that keeps the draft's window, not
+/// the whole context). Windowed scratch only, and `target_hidden_base` must
+/// not pass `ctx_len - W`: every row the forward can upload is still held.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_forward_based(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    target_hidden_base: usize,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    graph_ffn: bool,
+) -> HipResult<()> {
+    let base = target_hidden_base;
     let b = block_size;
     let l = ctx_len;
     let tot = l + b;
@@ -3246,7 +3305,18 @@ pub fn draft_forward_opts(
         assert_eq!(ne_slice.len(), b * h, "noise_embedding size");
     }
     if let Some(th_slice) = target_hidden {
-        assert_eq!(th_slice.len(), l * ne * h, "target_hidden size");
+        assert_eq!(th_slice.len(), (l - base) * ne * h, "target_hidden size");
+    }
+    match scratch.ctx_mode {
+        DraftCtxMode::Legacy => {
+            assert_eq!(base, 0, "a based target_hidden needs a windowed scratch")
+        }
+        DraftCtxMode::Windowed { w, .. } => {
+            assert!(
+                base <= l.saturating_sub(w),
+                "target_hidden base past the window"
+            )
+        }
     }
     assert_eq!(positions_q.len(), b, "positions_q size");
     assert_eq!(positions_k.len(), tot, "positions_k size");
@@ -3317,7 +3387,7 @@ pub fn draft_forward_opts(
         // at the ring boundary. Out-of-window rows are never read (fc is the
         // only consumer and its fill is span-limited too).
         let row_f32 = ne * h;
-        let expected_full_len = l * row_f32;
+        let expected_full_len = (l - base) * row_f32;
         let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
         // the context, or the slice length suggests ctx_slice (unusual l).
@@ -3325,7 +3395,7 @@ pub fn draft_forward_opts(
             if windowed {
                 let up_start = l.saturating_sub(swa_w);
                 for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
-                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let seg = &th_slice[(row0 - base) * row_f32..(row0 - base + len) * row_f32];
                     let dst_byte_off = slot0 * row_f32 * 4;
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
@@ -3346,7 +3416,7 @@ pub fn draft_forward_opts(
             if windowed {
                 let up_start = prev.max(l.saturating_sub(swa_w));
                 for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
-                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let seg = &th_slice[(row0 - base) * row_f32..(row0 - base + len) * row_f32];
                     let dst_byte_off = slot0 * row_f32 * 4;
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
@@ -3472,7 +3542,15 @@ pub fn draft_forward_opts(
             )?;
         } else {
             // Residual.
-            draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
+            draft_dtod_at(
+                gpu,
+                ordered,
+                &scratch.residual.buf,
+                0,
+                &scratch.x.buf,
+                0,
+                (b * h) * 4,
+            )?;
             // attn_norm.
             gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
         }
@@ -3534,7 +3612,11 @@ pub fn draft_forward_opts(
         gemm_dispatch_shared(
             gpu,
             qkv_src,
-            [(&layer.wq, &scratch.q), (&layer.wk, &scratch.k_noise), (&layer.wv, &scratch.v_noise)],
+            [
+                (&layer.wq, &scratch.q),
+                (&layer.wk, &scratch.k_noise),
+                (&layer.wv, &scratch.v_noise),
+            ],
             b,
             scratch.mq_x_rot.as_ref(),
             scratch.mq_x_rot_f16.as_ref(),
@@ -3722,8 +3804,24 @@ pub fn draft_forward_opts(
             )?;
             cat_off += seg_bytes;
         }
-        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
-        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &k_cat_l.buf,
+            cat_off,
+            &scratch.k_noise.buf,
+            0,
+            noise_bytes,
+        )?;
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &v_cat_l.buf,
+            cat_off,
+            &scratch.v_noise.buf,
+            0,
+            noise_bytes,
+        )?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -3893,7 +3991,15 @@ pub fn draft_forward_opts(
                     eps,
                 )?;
             } else {
-                draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
+                draft_dtod_at(
+                    gpu,
+                    ordered,
+                    &scratch.residual.buf,
+                    0,
+                    &scratch.x.buf,
+                    0,
+                    (b * h) * 4,
+                )?;
                 gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
             }
             let k = cfg.conv_kernel_size.unwrap_or(2);
@@ -4093,11 +4199,23 @@ mod block_policy_tests {
 
     #[test]
     fn param_parses_auto_fixed_and_absent() {
-        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Auto));
-        assert_eq!(DflashBlockPolicy::from_param(Some(&json!("auto"))), Ok(DflashBlockPolicy::Auto));
-        assert_eq!(DflashBlockPolicy::from_param(Some(&json!(8))), Ok(DflashBlockPolicy::Fixed(8)));
+        assert_eq!(
+            DflashBlockPolicy::from_param(None),
+            Ok(DflashBlockPolicy::Auto)
+        );
+        assert_eq!(
+            DflashBlockPolicy::from_param(Some(&json!("auto"))),
+            Ok(DflashBlockPolicy::Auto)
+        );
+        assert_eq!(
+            DflashBlockPolicy::from_param(Some(&json!(8))),
+            Ok(DflashBlockPolicy::Fixed(8))
+        );
         for bad in [json!(3), json!(17), json!("8"), json!(true), json!(-1)] {
-            assert!(DflashBlockPolicy::from_param(Some(&bad)).is_err(), "{bad} must be refused");
+            assert!(
+                DflashBlockPolicy::from_param(Some(&bad)).is_err(),
+                "{bad} must be refused"
+            );
         }
     }
 
@@ -4581,6 +4699,10 @@ pub struct DflashCandidateProposal {
     /// Per-row probability of the selected token (entry of `probabilities` at
     /// the chosen index when temperature>0). `None` for greedy.
     pub selected_probabilities: Option<Vec<f32>>,
+    /// Per-row softmax (temperature 1) mass of the selected candidate over
+    /// the row's top-K selector scores, at every temperature (the draft's own
+    /// confidence; picks the DFlash2 verify depth).
+    pub confidence: Vec<f32>,
     pub top_k: usize,
 }
 
@@ -4652,14 +4774,21 @@ pub fn propose_candidates_from_rows(
         ));
     }
     if ids.len() != rows * k || unaries.len() != rows * k {
-        return Err(hip_bridge::HipError::new(
-            0,
-            "ids/unaries length != rows*K",
-        ));
+        return Err(hip_bridge::HipError::new(0, "ids/unaries length != rows*K"));
     }
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     propose_inner(
-        vocab, weights, projection, ids, unaries, rows, k, rank, anchor, temperature, uniforms,
+        vocab,
+        weights,
+        projection,
+        ids,
+        unaries,
+        rows,
+        k,
+        rank,
+        anchor,
+        temperature,
+        uniforms,
     )
 }
 
@@ -4701,6 +4830,7 @@ fn propose_inner(
     } else {
         None
     };
+    let mut confidence = Vec::with_capacity(rows);
     let mut pred = anchor;
     for r in 0..rows {
         let proj_off = r * rank;
@@ -4726,6 +4856,10 @@ fn propose_inner(
             }
             scores.push(unary + dot);
         }
+        // Softmax (temperature 1) mass of the selected candidate, at every
+        // request temperature: the draft's own confidence in this row.
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
         let sel_idx = if temperature == 0.0 {
             let mut best = 0usize;
             let mut best_s = scores[0];
@@ -4750,6 +4884,7 @@ fn propose_inner(
             }
             idx
         };
+        confidence.push((scores[sel_idx] - max_s).exp() / z);
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;
@@ -4759,6 +4894,7 @@ fn propose_inner(
         candidates: top_ids.to_vec(),
         probabilities: all_probs,
         selected_probabilities: selected_probs,
+        confidence,
         top_k: k,
     })
 }
@@ -4968,8 +5104,15 @@ pub fn propose_candidates_lanes_device(
     lanes: &[SelectorLane],
     rows64_scope: bool,
 ) -> HipResult<Vec<DflashCandidateProposal>> {
-    if rows_total == 0 || lanes.iter().any(|l| l.rows == 0 || l.first_row + l.rows > rows_total) {
-        return Err(hip_bridge::HipError::new(0, "selector lanes outside the rows"));
+    if rows_total == 0
+        || lanes
+            .iter()
+            .any(|l| l.rows == 0 || l.first_row + l.rows > rows_total)
+    {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector lanes outside the rows",
+        ));
     }
     if !weights.has_candidate_selector() {
         return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));

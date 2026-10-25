@@ -23,7 +23,10 @@ pub const SAMPLED_ROWS_COMPACT_SYMBOL: &str = "sampled_rows_compact_f32";
 const BLOCK: u32 = 256;
 
 fn err(msg: impl AsRef<str>) -> HipError {
-    HipError::new(0, &format!("sampled_rows_compact_into_f32: {}", msg.as_ref()))
+    HipError::new(
+        0,
+        &format!("sampled_rows_compact_into_f32: {}", msg.as_ref()),
+    )
 }
 
 impl Gpu {

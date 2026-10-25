@@ -6,10 +6,10 @@
 //! from `crates/hipfire-daemon/src/main.rs` (wave 5 / D3).
 //! See `lib.rs` for the layering rationale.
 
+use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
-use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
@@ -559,6 +559,9 @@ pub fn generate_deepseek4_spec(
             repeat_window: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            // The DSpark speculator keeps no one-row windows to retain.
+            stop_sequences: false,
+            logprobs: false,
         });
     }
 
@@ -604,6 +607,7 @@ pub fn generate_deepseek4_spec(
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
             decoded_vocab,
+            logprobs_top_k: None,
         },
         temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
@@ -2219,16 +2223,26 @@ fn trace_gemma4_logits(
 ///   4. Stop set: `<eos>` (config.eos_token, id 1) UNION `bundle.eos_tok`
 ///      (loader-resolved `<end_of_turn>` / `<turn|>`) UNION documented 106 —
 ///      the HF `eos_token_id` list is `[1, 106]`; parsing as a scalar drops
-///      106 and decode loops `<turn|>` forever.
+///      106 and decode loops `<turn|>` forever — UNION `<|tool_response>`,
+///      which the model emits after a native tool call.
+///   5. Tools: rendered through the embedded template (which declares them as
+///      `<|tool>` blocks); the model's `<|tool_call>call:NAME{ARGS}<tool_call|>`
+///      answers are withheld from content by [`Gemma4TurnText`] and staged as
+///      calls on a `finish_reason == "tool_calls"` terminal. A template with no
+///      tool-call format refuses tools by name before `gen_start`.
+///   6. Terminal: the two-phase `commit_ready` → `commit` → `done` handshake
+///      ([`gemma4_commit_terminal`]) carrying `finish_reason` and usage, which
+///      serve needs to build the non-stream body and the final usage chunk.
 ///
 /// Prompt cache: `Gemma4Bundle::prefill` plans the canonical render against
 /// the engine session cache (cold-exact snapshots only: the previous turn's
 /// prompt on the prefill chunk grid, or a cached stride snapshot) and the
-/// turn commits after `done`; the daemon reports arch 13 `cache_capable`
-/// when a cache is attached.
+/// turn's snapshots publish only after the client commits; the daemon reports
+/// arch 13 `cache_capable` when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
-/// `HIPFIRE_GEMMA4_EAGLE=1`) runs greedy requests through the generic
+/// `HIPFIRE_GEMMA4_EAGLE=1`; not faster than AR on gfx1151) runs tool-free
+/// greedy, sampled, penalized and logprobs requests through the generic
 /// `generate_spec` core instead ([`generate_gemma4_spec`]).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
@@ -2256,12 +2270,33 @@ pub fn generate_gemma4(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let tools_nonempty = tools.is_some_and(|t| !t.is_empty());
+    if tools_nonempty {
+        if let Some(reason) =
+            gemma4_tools_unsupported_reason(m.chat_template.as_deref(), jinja_enabled)
+        {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("tools are not supported on producer route gemma4_ar: {reason}"),
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
     // Open the stream contract BEFORE any GPU work or token emission: the CLI's
     // StreamContractGate fail-closes on any event preceding `gen_start`, so
     // without this the first `token` is rejected, the client aborts, and the
     // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
     crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Gemma4Ar),
         stdout,
         id,
         false,
@@ -2271,11 +2306,7 @@ pub fn generate_gemma4(
         .as_mut()
         .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
     else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4 bundle missing on arch_id=13 generate",
-        );
+        emit_error_with_id(stdout, id, "gemma4 bundle missing on arch_id=13 generate");
         return;
     };
 
@@ -2285,10 +2316,6 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -2335,12 +2362,27 @@ pub fn generate_gemma4(
                             &synthesized
                         }
                     };
-                frame.render_messages(messages_slice, tools, None)
+                gemma4_template_messages(messages_slice)
+                    .and_then(|values| frame.render_message_values(values, tools, None))
             } else {
                 frame.render()
             };
             match render_result {
                 Ok(rendered) => tokenizer.encode(&rendered),
+                // A raw-prompt fallback would silently drop the tool
+                // declarations and history the client sent.
+                Err(e) if tools_nonempty => {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("gemma4 chat template render failed for a tools request: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
                 Err(e) => {
                     eprintln!(
                         "[daemon] jinja render failed in gemma4 path ({e}) —                          falling back to BOS + raw prompt"
@@ -2364,12 +2406,21 @@ pub fn generate_gemma4(
 
     // Stop set (see doc comment item 4). `bundle.eos_tok` already resolved
     // `<end_of_turn>` / `<turn|>` at load; union with config.eos_token
-    // (`<eos>`, id 1) and the documented 106 for robustness across exports.
+    // (`<eos>`, id 1), the documented 106, and `<|tool_response>`, which
+    // ends a tool-call turn (the client sends the response).
     let stop_set: Vec<u32> = {
         let mut s = vec![cfg_eos_tok, bundle.eos_tok];
         if !s.contains(&106) {
             s.push(106);
         }
+        if let Some(tool_response) = m
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.special_token_id("<|tool_response>"))
+        {
+            s.push(tool_response);
+        }
+        s.sort_unstable();
         s.dedup();
         s
     };
@@ -2389,20 +2440,18 @@ pub fn generate_gemma4(
         return;
     }
 
-    // Greedy, penalty-free requests that fit one verify block past their
-    // budget go to the EAGLE speculator. It commits the target's batched
-    // verify argmax, which can differ from AR decode on near-tied logits.
-    let spec = temp <= 1e-6
-        && sampler_cfg.repeat_penalty == 1.0
-        && sampler_cfg.presence_penalty == 0.0
-        && sampler_cfg.frequency_penalty == 0.0
-        && logprobs_top_k.is_none()
+    // Tool-free requests that fit one verify block past their budget go to
+    // the EAGLE speculator. Greedy ones commit the target's batched verify
+    // argmax, which can differ from AR decode on near-tied logits; sampled
+    // and penalized ones draw each verify row with the AR sampler.
+    let spec = !tools_nonempty
         && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
             .ok()
             .as_deref()
             == Some("1")
         && m.speculator.as_ref().is_some_and(|s| {
-            spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
+            (temp <= 1e-6 || !s.requires_greedy())
+                && spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
         });
     let route = if spec {
         hipfire_runtime::session_cache::SessionRoute::Mtp
@@ -2421,10 +2470,13 @@ pub fn generate_gemma4(
             id,
             prompt_ids,
             reused,
+            &sampler_cfg,
+            request_seed,
             max_tokens,
             max_think_tokens,
             enable_thinking,
             cfg_eos_tok,
+            logprobs_top_k,
         );
         return;
     }
@@ -2439,9 +2491,8 @@ pub fn generate_gemma4(
         }
     };
     m.conversation_tokens.extend_from_slice(&prompt_ids);
-    let computed_prompt = prompt_ids.len() - reused;
-    let prefill_ms = t0.elapsed().as_millis();
-    let mut gemma_router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut turn_text = Gemma4TurnText::new(enable_thinking, max_think_tokens, tools_nonempty);
     // Multi-byte characters span tokens: decode incrementally, never per token.
     let mut text_stream = TokenTextStream::new();
 
@@ -2451,6 +2502,7 @@ pub fn generate_gemma4(
     let mut sample_logits: Vec<f32> = Vec::with_capacity(last_logits.len());
 
     let mut generated_count: usize = 0;
+    let mut ended_on_stop = false;
     let mut ttft_ms: Option<f64> = None;
     let decode_t0 = Instant::now();
     loop {
@@ -2466,6 +2518,7 @@ pub fn generate_gemma4(
         );
         trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
         if stop_set.contains(&next_tok) {
+            ended_on_stop = true;
             break;
         }
 
@@ -2473,31 +2526,14 @@ pub fn generate_gemma4(
             ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
-        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
-        let (emits, _) = gemma_router.push(&frag);
-        for ev in emits {
-            match ev {
-                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                GemmaEmit::Token(text) => {
-                    let mut envelope = serde_json::json!({
-                        "type": "token",
-                        "id": id,
-                        "text": text,
-                        "attempt_id": active_attempt_id(),
-                    });
-                    if let Some((lp, top)) = crate::common::token_logprob_fields(
-                        &last_logits,
-                        next_tok,
-                        logprobs_top_k,
-                        m.tokenizer.as_ref().unwrap(),
-                    ) {
-                        envelope["logprob"] = serde_json::json!(lp);
-                        envelope["top_logprobs"] = top;
-                    }
-                    let _ = writeln!(stdout, "{}", envelope);
-                    let _ = stdout.flush();
-                }
-            }
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let frag = text_stream.push(tokenizer, next_tok);
+        let pushed = turn_text.push(stdout, id, &frag, || {
+            crate::common::token_logprob_fields(&last_logits, next_tok, logprobs_top_k, tokenizer)
+        });
+        if let Err(error) = pushed {
+            emit_gemma4_malformed_tool_call(stdout, id, &error);
+            return;
         }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -2526,63 +2562,318 @@ pub fn generate_gemma4(
             }
         }
     }
-    let tail = text_stream.flush();
-    for ev in gemma_router
-        .push(&tail)
-        .0
-        .into_iter()
-        .chain(gemma_router.flush())
-    {
-        match ev {
-            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-            GemmaEmit::Token(text) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
-            }
-        }
+    if let Err(error) = turn_text.finish(stdout, id, &text_stream.flush(), ended_on_stop) {
+        emit_gemma4_malformed_tool_call(stdout, id, &error);
+        return;
     }
 
     m.seq_pos = bundle.state.n_tokens;
 
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let prefill_tok_s = computed_prompt as f64 * 1000.0 / prefill_ms.max(1) as f64;
-    let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"cached_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
-        id,
-        generated_count,
-        tok_s,
-        computed_prompt,
-        reused,
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let stats = Gemma4TurnStats {
+        generated: generated_count,
+        prompt_tokens: prompt_ids.len(),
+        prefill_tokens: prompt_ids.len() - reused,
+        cached_tokens: reused,
         prefill_ms,
-        prefill_tok_s,
-        tok_s,
-        ttft_ms,
+        decode_ms: decode_t0.elapsed().as_secs_f64() * 1000.0,
+        ttft_ms: ttft_ms.unwrap_or(total_ms),
         total_ms,
-        active_attempt_id(),
+    };
+    let finish_reason = gemma4_finish_reason(ended_on_stop, turn_text.calls().len());
+    let pending_done = gemma4_pending_done(id, finish_reason, &stats);
+    if gemma4_commit_terminal(stdout, id, pending_done, turn_text.calls(), generated_count) {
+        hipfire_runtime::arch_model::ArchModel::session_commit(bundle);
+    }
+}
+
+/// Why a Gemma 4 load cannot serve `tools`, or `None` when it can. Tools need
+/// the embedded template (it declares them as `<|tool>` blocks the model was
+/// trained on) and that template's native `<|tool_call>` format, which
+/// [`GemmaToolSplitter`](gemma4::emit::GemmaToolSplitter) parses.
+pub fn gemma4_tools_unsupported_reason(
+    chat_template: Option<&str>,
+    jinja_enabled: bool,
+) -> Option<&'static str> {
+    match chat_template {
+        _ if !jinja_enabled => {
+            Some("HIPFIRE_JINJA_CHAT=0 disables the chat template that declares tools to the model")
+        }
+        None => Some("this model embeds no chat template, so it cannot declare tools"),
+        Some(template) if !template.contains("<|tool_call>") => {
+            Some("this model's chat template has no tool-call format")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The `messages` the Gemma 4 template reads. It walks OpenAI-shaped
+/// `tool_calls[].function.{name,arguments}` (arguments a mapping, else it
+/// raises) and names a tool result by its `tool_call_id`'s call or its
+/// `name`; [`Message`](hipfire_runtime::prompt_frame::Message) serializes
+/// neither shape, so assistant calls and tool results are projected here.
+pub fn gemma4_template_messages(
+    messages: &[hipfire_runtime::prompt_frame::Message],
+) -> Result<Vec<serde_json::Value>, String> {
+    use hipfire_runtime::prompt_frame::Role;
+    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut values = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut value = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        match message.role {
+            Role::Assistant if !message.tool_calls.is_empty() => {
+                let mut calls = Vec::with_capacity(message.tool_calls.len());
+                for call in &message.tool_calls {
+                    let mut projected = serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": normalize_glimmer_tool_arguments(&call.arguments)?,
+                        },
+                    });
+                    if let Some(call_id) = call.id.as_deref().filter(|s| !s.is_empty()) {
+                        call_names.insert(call_id, call.name.as_str());
+                        projected["id"] = serde_json::Value::from(call_id);
+                    }
+                    calls.push(projected);
+                }
+                value["tool_calls"] = serde_json::Value::Array(calls);
+            }
+            Role::Tool => {
+                let name = message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|call_id| call_names.get(call_id).copied())
+                    .or(message.name.as_deref());
+                if let Some(name) = name {
+                    value["name"] = serde_json::Value::from(name);
+                }
+            }
+            _ => {}
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Answer-side emission of one Gemma 4 turn: the thought router splits
+/// reasoning from the answer, the tool splitter withholds native tool-call
+/// blocks from the answer, and the rest is written as `token` / `reasoning`
+/// events. With tools off the splitter is a pass-through, so the wire is
+/// exactly the router's output.
+pub struct Gemma4TurnText {
+    router: GemmaThoughtRouter,
+    tools: gemma4::emit::GemmaToolSplitter,
+}
+
+impl Gemma4TurnText {
+    pub fn new(enable_thinking: bool, max_think_tokens: usize, tools_enabled: bool) -> Self {
+        Self {
+            router: GemmaThoughtRouter::new(enable_thinking, max_think_tokens),
+            tools: gemma4::emit::GemmaToolSplitter::new(tools_enabled),
+        }
+    }
+
+    /// Route one decoded fragment. `logprob` is evaluated per emitted answer
+    /// envelope, only when one is emitted.
+    pub fn push<W: Write>(
+        &mut self,
+        out: &mut W,
+        id: &str,
+        frag: &str,
+        mut logprob: impl FnMut() -> Option<(f64, serde_json::Value)>,
+    ) -> Result<(), gemma4::emit::GemmaToolCallError> {
+        let (emits, _) = self.router.push(frag);
+        for emit in emits {
+            match emit {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(out, id, &text),
+                GemmaEmit::Token(text) => {
+                    let visible = self.tools.push(&text)?;
+                    if !visible.is_empty() {
+                        emit_gemma4_token(out, id, visible, logprob());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Route the decoder's held `tail`, flush the router, and close the
+    /// splitter. `ended_on_stop` is false for a max_tokens / context cut, so
+    /// a half-written tool call is dropped rather than released.
+    pub fn finish<W: Write>(
+        &mut self,
+        out: &mut W,
+        id: &str,
+        tail: &str,
+        ended_on_stop: bool,
+    ) -> Result<(), gemma4::emit::GemmaToolCallError> {
+        let (mut emits, _) = self.router.push(tail);
+        emits.extend(self.router.flush());
+        for emit in emits {
+            match emit {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(out, id, &text),
+                GemmaEmit::Token(text) => {
+                    let visible = self.tools.push(&text)?;
+                    if !visible.is_empty() {
+                        emit_gemma4_token(out, id, visible, None);
+                    }
+                }
+            }
+        }
+        let visible = self.tools.finish(ended_on_stop)?;
+        if !visible.is_empty() {
+            emit_gemma4_token(out, id, visible, None);
+        }
+        Ok(())
+    }
+
+    /// Tool calls parsed so far, in emission order.
+    pub fn calls(&self) -> &[hipfire_runtime::prompt_frame::ToolCall] {
+        self.tools.calls()
+    }
+}
+
+fn emit_gemma4_token<W: Write>(
+    out: &mut W,
+    id: &str,
+    text: String,
+    logprob: Option<(f64, serde_json::Value)>,
+) {
+    let mut envelope = serde_json::json!({
+        "type": "token",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    if let Some((lp, top)) = logprob {
+        envelope["logprob"] = serde_json::json!(lp);
+        envelope["top_logprobs"] = top;
+    }
+    let _ = writeln!(out, "{}", envelope);
+    let _ = out.flush();
+}
+
+/// A tool-call block the model closed but that does not parse: the turn
+/// fails closed (no calls, no done, no session publish), as DS4 does for
+/// malformed DSML.
+fn emit_gemma4_malformed_tool_call(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    error: &gemma4::emit::GemmaToolCallError,
+) {
+    emit_active_attempt_error(
+        stdout,
+        Some(id),
+        &format!("malformed Gemma 4 tool call: {error}"),
+        "validation",
+        false,
+        false,
     );
     let _ = stdout.flush();
-    hipfire_runtime::arch_model::ArchModel::session_commit(bundle);
+}
+
+/// Token and timing accounting for one Gemma 4 turn's terminal.
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4TurnStats {
+    pub generated: usize,
+    /// The full rendered prompt (`usage.prompt_tokens`).
+    pub prompt_tokens: usize,
+    /// Prompt tokens actually run through prefill.
+    pub prefill_tokens: usize,
+    /// Prompt tokens served from the session cache.
+    pub cached_tokens: usize,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub ttft_ms: f64,
+    pub total_ms: f64,
+}
+
+/// `stop` only when a stop token ended the turn (a cut turn never looks
+/// complete); `tool_calls` when that turn produced calls.
+pub fn gemma4_finish_reason(ended_on_stop: bool, calls: usize) -> &'static str {
+    if !ended_on_stop {
+        "length"
+    } else if calls > 0 {
+        "tool_calls"
+    } else {
+        "stop"
+    }
+}
+
+/// The Gemma 4 `done` payload staged as `commit_ready` (same field set as the
+/// Qwen AR terminal, so serve reports `usage` and `finish_reason`).
+pub fn gemma4_pending_done(
+    id: &str,
+    finish_reason: &str,
+    stats: &Gemma4TurnStats,
+) -> serde_json::Value {
+    let rate = |n: usize, ms: f64| {
+        if ms > 0.0 {
+            n as f64 * 1000.0 / ms
+        } else {
+            0.0
+        }
+    };
+    let round1 = |x: f64| (x * 10.0).round() / 10.0;
+    let decode_tok_s = round1(rate(stats.generated, stats.decode_ms));
+    serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": stats.generated,
+        "tok_s": decode_tok_s,
+        "prompt_tokens": stats.prompt_tokens,
+        "prefill_tokens": stats.prefill_tokens,
+        "cached_tokens": stats.cached_tokens,
+        "prefill_ms": round1(stats.prefill_ms),
+        "prefill_tok_s": round1(rate(stats.prefill_tokens, stats.prefill_ms)),
+        "decode_tok_s": decode_tok_s,
+        "ttft_ms": round1(stats.ttft_ms),
+        "total_ms": round1(stats.total_ms),
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    })
+}
+
+/// Two-phase terminal for a Gemma 4 turn: stage `calls` on a `tool_calls`
+/// payload, publish `commit_ready`, and on the client's `commit` emit the
+/// byte-identical `done`. Without this handshake serve never builds an HTTP
+/// terminal (non-stream 500, stream with no finish/usage chunk). Returns
+/// `true` when the client committed; only then may the caller publish the
+/// turn's session snapshots. On abort the correlated `aborted` pair is
+/// emitted instead.
+pub fn gemma4_commit_terminal<W: Write>(
+    stdout: &mut W,
+    id: &str,
+    mut pending_done: serde_json::Value,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+    generated: usize,
+) -> bool {
+    let finish_reason = pending_done
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("stop")
+        .to_owned();
+    stage_terminal_tool_calls(&mut pending_done, &finish_reason, calls);
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done);
+            true
+        }
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated);
+            false
+        }
+    }
 }
 
 /// Gemma 4 EAGLE spec decode on the generic `generate_spec` core: the
 /// `MtpSpeculator<Gemma4Drafter>` in `m.speculator`, the bundle as
 /// `SpecTarget` and `GemmaSpecEmit`. `reused` prompt tokens come from the
-/// session plan; greedy only. Writes the Gemma `done` envelope and commits
-/// the session's snapshots.
+/// session plan; tool-free only. The request's sampler (temperature,
+/// top-p/k, min-p, penalties, seed) and logprobs reach the drafter through
+/// `configure_request`. Ends on the same two-phase terminal as AR and
+/// publishes the session's snapshots only on commit.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4_spec(
     m: &mut LoadedModel,
@@ -2591,12 +2882,31 @@ fn generate_gemma4_spec(
     id: &str,
     prompt_ids: Vec<u32>,
     reused: usize,
+    sampler_cfg: &hipfire_runtime::sampler::SamplerConfig,
+    request_seed: u32,
     max_tokens: usize,
     max_think_tokens: usize,
     enable_thinking: bool,
     cfg_eos_tok: u32,
+    logprobs_top_k: Option<usize>,
 ) {
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.configure_request(SpecRequestConfig {
+            temp: sampler_cfg.temperature,
+            top_p: sampler_cfg.top_p,
+            top_k: sampler_cfg.top_k,
+            min_p: sampler_cfg.min_p.unwrap_or(0.0),
+            rng_seed: request_seed as u64,
+            repeat_penalty: sampler_cfg.repeat_penalty,
+            repeat_window: sampler_cfg.repeat_window,
+            presence_penalty: sampler_cfg.presence_penalty,
+            frequency_penalty: sampler_cfg.frequency_penalty,
+            logprobs: logprobs_top_k.is_some(),
+            ..SpecRequestConfig::default()
+        });
+    }
     // Host mirrors match the reused prefix; the bundle owns device state.
+    let prompt_tokens = prompt_ids.len();
     m.seq_pos = reused;
     m.conversation_tokens.clear();
     m.conversation_tokens
@@ -2627,38 +2937,39 @@ fn generate_gemma4_spec(
                 ThinkMode::NonThink
             },
             decoded_vocab: None,
+            logprobs_top_k,
         },
-        0.0,
+        sampler_cfg.temperature,
     ) else {
         // generate_spec already wrote the terminal event.
         return;
     };
     let per_s = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
-    let tok_s = per_s(run.generated, run.decode_s);
     // τ = mean tokens committed per window (accepted drafts + 1 bonus).
     let tau = per_s(run.spec_accepted + run.spec_cycles, run.spec_cycles as f64);
     let prefill_ms = run.prefill_s * 1000.0;
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"cached_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
-        id,
-        run.generated,
-        tok_s,
-        run.prefill_tokens_len,
-        reused,
-        prefill_ms as u128,
-        per_s(run.prefill_tokens_len, run.prefill_s),
-        tok_s,
+    let stats = Gemma4TurnStats {
+        generated: run.generated,
+        prompt_tokens,
+        prefill_tokens: run.prefill_tokens_len,
+        cached_tokens: reused,
         prefill_ms,
-        (run.total_s * 1000.0) as u128,
-        run.spec_cycles,
-        tau,
-        draft_len,
-        active_attempt_id(),
-    );
-    let _ = stdout.flush();
-    if let Some(state) = m.state.as_deref_mut() {
-        state.session_commit();
+        decode_ms: run.decode_s * 1000.0,
+        ttft_ms: prefill_ms,
+        total_ms: run.total_s * 1000.0,
+    };
+    // A stop token ends the window loop with a semantic stop; a budget or
+    // context-capacity exit does not.
+    let ended_on_stop = run.semantic_stop.is_some() && !run.ctx_exhausted;
+    let mut pending_done = gemma4_pending_done(id, gemma4_finish_reason(ended_on_stop, 0), &stats);
+    pending_done["spec"] = serde_json::Value::from("gemma4_eagle");
+    pending_done["rounds"] = serde_json::Value::from(run.spec_cycles);
+    pending_done["tau"] = serde_json::Value::from((tau * 1000.0).round() / 1000.0);
+    pending_done["draft_len"] = serde_json::Value::from(draft_len);
+    if gemma4_commit_terminal(stdout, id, pending_done, &[], run.generated) {
+        if let Some(state) = m.state.as_deref_mut() {
+            state.session_commit();
+        }
     }
 }
 
@@ -4810,8 +5121,15 @@ pub fn generate_muse_glimmer(
                     ctx_len + block_size,
                     "positions.len() must equal ctx_len + block_size"
                 );
+                // A verify window writes `block_size` KV rows from `cur_pos`; one
+                // that would cross the cache finishes the request on AR decode.
+                let past_cap = cur_pos as usize + block_size > cache_cap;
                 // Device: forward from resident log. Host: suffix Vec + host call.
-                let drafter_ok = if device_capture {
+                let drafter_ok = if past_cap {
+                    Err(format!(
+                        "verify window {cur_pos}+{block_size} would pass max_seq {cache_cap}"
+                    ))
+                } else if device_capture {
                     let log = match bundle.state.target_hidden_log() {
                         Some(l) => l,
                         None => {
@@ -4866,10 +5184,11 @@ pub fn generate_muse_glimmer(
                 };
                 if let Err(e) = drafter_ok {
                     // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                    let fatal = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
-                        .ok()
-                        .as_deref()
-                        != Some("1");
+                    let fatal = !past_cap
+                        && hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
+                            .ok()
+                            .as_deref()
+                            != Some("1");
                     if fatal {
                         emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
                         let es = format!("{e}");
@@ -4888,7 +5207,9 @@ pub fn generate_muse_glimmer(
                         }
                         return;
                     }
-                    eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    if !past_cap {
+                        eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    }
                     // One-token-ahead AR fallback: `last_pick` is already emitted and pending at
                     // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
                     // sample a NEW prediction from the returned logits and make it the next pending seed.
@@ -5845,6 +6166,11 @@ pub fn generate_lfm2moe(
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // `primed_think` records whether the rendered prompt ended with the
+    // template's `<think>` generation-primer, so we only re-emit the opener
+    // (below) when the model truly begins inside the reasoning block. A jinja
+    // render failure that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
@@ -5909,7 +6235,10 @@ pub fn generate_lfm2moe(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = hipfire_engine::emit::render_tail_opens_think(&rendered);
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
                     hipfire_runtime::prompt_frame::ChatFrame {
@@ -5951,26 +6280,10 @@ pub fn generate_lfm2moe(
 
     // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
     // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
-    // `<|endoftext|>` (and rarely `</s>`). The single `next_tok == eos_tok` stop
-    // in the decode loop misses the others, so the model LEAKS a literal
-    // `<|endoftext|>` into the visible answer (observed: "...Paris.<|endoftext|>")
-    // and wastefully keeps generating. This id-set is the FAST path: it catches
-    // any EOS-class token whose literal string round-trips through `encode` to a
-    // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
-    // `<|endoftext|>` (encode yields subwords, not the special id), so the
-    // reliable catch for that one is the string-level guard in the decode loop
-    // below, which matches on the DECODED frag.
-    let stop_toks: Vec<u32> = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        let mut v = vec![eos_tok];
-        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
-            let ids = tk.encode(s);
-            if ids.len() == 1 && !v.contains(&ids[0]) {
-                v.push(ids[0]);
-            }
-        }
-        v
-    };
+    // `<|endoftext|>` (and rarely `</s>`). This id-set is the FAST path; the
+    // string-level guard in the decode loop below stays as a backstop for a
+    // marker the tokenizer does not register as a special token.
+    let stop_toks = lfm2moe::carrier::stop_tokens(m.tokenizer.as_ref().unwrap(), eos_tok);
 
     // Capacity guard BEFORE gen_start — an oversized prompt is a validation error
     // and must not emit gen_start (client expects no stream on validation failure).
@@ -6088,6 +6401,20 @@ pub fn generate_lfm2moe(
         return;
     }
 
+    // LFM2.5's chat template primes the assistant turn with `<think>`
+    // (generation-prompt block), so generated tokens begin *inside* the
+    // reasoning block and the model only ever emits the closing `</think>`.
+    // Downstream `<think>` consumers — the serve reasoning_content/content
+    // split, the run/chat-path stripper, history `stripThinkingInline` — key
+    // on a LEADING `<think>` and so never engage without the opener. The
+    // primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only) so the turn is a well-formed
+    // `<think>...</think>...` block for every consumer. Mirrors the MiniMax
+    // `primed_think` convention above.
+    if primed_think {
+        emit_dense_token_text(stdout, id, "<think>");
+    }
+
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
     // client cancel stops the loop immediately and emits `aborted`+`done`.
@@ -6100,6 +6427,30 @@ pub fn generate_lfm2moe(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // LFM2.5 tool calls arrive inside dedicated special tokens
+    // (\x3C\x7Ctool_call_start\x7C\x3E / \x3C\x7Ctool_call_end\x7C\x3E as
+    // TEXT). The span — markers included — is suppressed from the client
+    // stream and parsed into `tool_calls` at the terminal (vLLM/llama.cpp
+    // semantics: the marker block is protocol, not content). Everything
+    // still lands in `conversation_tokens` so multi-turn history stays
+    // byte-faithful. An unclosed span is re-emitted as raw text (the
+    // treat-as-text fallback) and never fabricates calls.
+    let tool_open_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E"));
+    let tool_close_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E"));
+    // `in_tool_span`: between the markers; `tool_span_tokens`: every token
+    // since the opener (for the unclosed fallback); `tool_body_tokens`: only
+    // the inner tokens (what gets parsed); `tool_calls`: extracted so far.
+    let mut in_tool_span = false;
+    let mut tool_span_tokens: Vec<u32> = Vec::new();
+    let mut tool_body_tokens: Vec<u32> = Vec::new();
+    let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut hit_eos = false;
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     // Multi-byte characters span tokens: decode incrementally, never per token.
@@ -6115,22 +6466,106 @@ pub fn generate_lfm2moe(
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_toks.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
 
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        // String-level EOS-class guard. The id-based `stop_toks` above misses
-        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
-        // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The leaking turn-end token decodes on its own to the
-        // marker: catch it on the token's own text and stop WITHOUT emitting
-        // (was: "...Paris.<|endoftext|>").
+        // String-level EOS-class guard: backstop for a marker that is not in
+        // the special-token table (so not in `stop_toks`). The leaking turn-end
+        // token decodes on its own to the marker: catch it on the token's own
+        // text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
         if matches!(
             tokenizer.decode(&[next_tok]).trim(),
-            "<|endoftext|>" | "</s>" | "<|im_end|>"
+            "\x3C\x7Cendoftext\x7C\x3E" | "</s>" | "\x3C\x7Cim_end\x7C\x3E"
         ) {
+            hit_eos = true;
             break;
         }
+
+        // Tool-call span handling. Marker ids come from `special_token_id`
+        // at the top of the loop; on span close the body parses into
+        // structured `tool_calls` (emitted as an event at the terminal).
+        // While inside, text_stream is NOT fed — the span never reaches the
+        // client. Tokens always enter `conversation_tokens` and the decode
+        // step, so KV and history see the real stream.
+        if tool_open_tok.is_some_and(|t| next_tok == t) && !in_tool_span {
+            in_tool_span = true;
+            tool_span_tokens.clear();
+            tool_span_tokens.push(next_tok);
+            tool_body_tokens.clear();
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+        if in_tool_span {
+            tool_span_tokens.push(next_tok);
+            if tool_close_tok.is_some_and(|t| next_tok == t) {
+                in_tool_span = false;
+                let body_text = tokenizer.decode(&tool_body_tokens);
+                tool_calls.extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
+                    &body_text,
+                ));
+            } else {
+                tool_body_tokens.push(next_tok);
+            }
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+
         emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -6173,6 +6608,18 @@ pub fn generate_lfm2moe(
     }
     emit_dense_token_text(stdout, id, &text_stream.flush());
 
+    // Unclosed tool span (EOS or max_tokens landed mid-call): never
+    // fabricate a call from a truncated body — re-emit the buffered span
+    // text so the client sees exactly what the model wrote (the
+    // treat-as-text fallback vLLM uses).
+    if in_tool_span {
+        emit_dense_token_text(
+            stdout,
+            id,
+            &m.tokenizer.as_ref().unwrap().decode(&tool_span_tokens),
+        );
+    }
+
     // Abort latched between loop exit and commit must not proceed to the
     // two-phase commit handshake — emit the attested `aborted` terminal
     // instead so the client's drain loop terminates.
@@ -6191,15 +6638,32 @@ pub fn generate_lfm2moe(
     } else {
         0.0
     };
-    let pending_done = serde_json::json!({
+    // "length" when the token budget ended the turn mid-stream; a truncated
+    // reply must not masquerade as a complete "stop". `tool_calls` when the
+    // turn ended by producing executable calls (same convention as every
+    // other arch).
+    let finish_reason = if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract surfaces calls ONLY from a `{"type":"tool_calls"}`
+    // event read BEFORE the commit_ready terminal — precede the handshake.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)

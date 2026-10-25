@@ -88,8 +88,8 @@ fn fill_q8_cache(seq_len: usize, salt: u32) -> Vec<u8> {
                     let r = prng_u32((g * 64 + kv * 8 + b) as u64 * 32 + c as u64, salt);
                     codes[c] = ((r % 61) as i8).wrapping_sub(30);
                 }
-                let scale =
-                    0.01 + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
+                let scale = 0.01
+                    + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
                 let blk = pack_q8_block(scale, &codes);
                 let base = g * ROW_STRIDE + (kv * BPH + b) * Q8_BLOCK;
                 buf[base..base + 34].copy_from_slice(&blk);
@@ -109,8 +109,7 @@ fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
             for g3 in 0..32 {
                 let mut packed = 0u32;
                 for i in 0..8 {
-                    let code =
-                        (prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32;
+                    let code = (prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32;
                     packed |= code << (3 * i);
                 }
                 let bytes = packed.to_le_bytes();
@@ -132,7 +131,9 @@ fn pos_causal(batch: usize, ctx: usize) -> Vec<i32> {
 }
 
 fn pos_trunc(batch: usize, ctx: usize) -> Vec<i32> {
-    (0..batch).map(|q| std::cmp::min(q, ctx - 1) as i32).collect()
+    (0..batch)
+        .map(|q| std::cmp::min(q, ctx - 1) as i32)
+        .collect()
 }
 
 fn pos_bytes(pos: &[i32]) -> Vec<u8> {
@@ -144,8 +145,7 @@ fn pos_bytes(pos: &[i32]) -> Vec<u8> {
 }
 
 fn write_f32(path: &str, v: &[f32]) {
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
     std::fs::write(path, bytes).unwrap();
 }
 
@@ -169,10 +169,14 @@ fn time_q8(
     for _ in 0..reps {
         let start = gpu.hip.event_create().unwrap();
         let stop = gpu.hip.event_create().unwrap();
-        gpu.hip.event_record(&start, gpu.active_stream.as_ref()).unwrap();
+        gpu.hip
+            .event_record(&start, gpu.active_stream.as_ref())
+            .unwrap();
         gpu.attention_q8_0_fa2_gqa_gfx1201(d_q, d_k, d_v, d_out, d_pos, NH, NKV, HD, ctx, batch)
             .unwrap();
-        gpu.hip.event_record(&stop, gpu.active_stream.as_ref()).unwrap();
+        gpu.hip
+            .event_record(&stop, gpu.active_stream.as_ref())
+            .unwrap();
         gpu.hip.event_synchronize(&stop).unwrap();
         us.push(gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64 * 1000.0);
         let _ = gpu.hip.event_destroy(start);
@@ -201,8 +205,10 @@ fn run_direct(
     let d_out = gpu.zeros(&[batch * NH * HD], DType::F32).unwrap();
     // warmup
     for _ in 0..2 {
-        gpu.attention_q8_0_fa2_gqa_gfx1201(&d_q, &d_k, &d_v, &d_out, &d_pos, NH, NKV, HD, ctx, batch)
-            .unwrap();
+        gpu.attention_q8_0_fa2_gqa_gfx1201(
+            &d_q, &d_k, &d_v, &d_out, &d_pos, NH, NKV, HD, ctx, batch,
+        )
+        .unwrap();
     }
     let us = time_q8(gpu, &d_q, &d_k, &d_v, &d_out, &d_pos, batch, ctx, reps);
     let o: Vec<f32> = gpu.download_f32(&d_out).unwrap();
@@ -212,7 +218,9 @@ fn run_direct(
     write_f32(&path, &o);
     let cksum: u64 = o.iter().fold(0, |a, &x| a.wrapping_add(x.to_bits() as u64));
     eprintln!("direct {tag} batch={batch} ctx={ctx} median_us={us:.2} cksum={cksum:016x}");
-    tlog.push_str(&format!("{tag} batch={batch} ctx={ctx} median_us={us:.2}\n"));
+    tlog.push_str(&format!(
+        "{tag} batch={batch} ctx={ctx} median_us={us:.2}\n"
+    ));
 }
 
 fn run_fwht3(
@@ -225,7 +233,11 @@ fn run_fwht3(
     vq8: &[u8],
     q: &[f32],
 ) {
-    let pos = if batch > ctx { pos_trunc(batch, ctx) } else { pos_causal(batch, ctx) };
+    let pos = if batch > ctx {
+        pos_trunc(batch, ctx)
+    } else {
+        pos_causal(batch, ctx)
+    };
     let d_k = gpu.upload_raw(kfw, &[kfw.len()]).unwrap();
     let d_v = gpu.upload_raw(vq8, &[vq8.len()]).unwrap();
     let d_q = gpu.upload_f32(q, &[batch, NH, HD]).unwrap();
@@ -274,8 +286,14 @@ fn run_split(
     let p: Vec<f32> = gpu.download_f32(&d_part).unwrap();
     assert!(o.iter().all(|x| x.is_finite()), "non-finite split out");
     write_f32(&format!("{outdir}/split_b{batch}_c{ctx}_s{splits}.f32"), &o);
-    write_f32(&format!("{outdir}/partials_b{batch}_c{ctx}_s{splits}.f32"), &p);
-    let ck = |v: &[f32]| v.iter().fold(0u64, |a, &x| a.wrapping_add(x.to_bits() as u64));
+    write_f32(
+        &format!("{outdir}/partials_b{batch}_c{ctx}_s{splits}.f32"),
+        &p,
+    );
+    let ck = |v: &[f32]| {
+        v.iter()
+            .fold(0u64, |a, &x| a.wrapping_add(x.to_bits() as u64))
+    };
     eprintln!(
         "split batch={batch} ctx={ctx} s={splits} o_ck={:016x} p_ck={:016x}",
         ck(&o),
@@ -311,73 +329,172 @@ fn main() {
     let mut tlog = String::new();
 
     if !only.starts_with("split") {
-    // 7 shapes (TIME + dumps).
-    for &(b, c) in &[(4, 256), (8, 512), (32, 2048), (64, 4096), (128, 8192), (256, 16384), (512, 32768)] {
-        let k = fill_q8_cache(c, 0xA11 + b as u32);
-        let v = fill_q8_cache(c, 0xB22 + b as u32);
-        let q = fill_q(b, 0xC33 + b as u32);
-        run_direct(&mut gpu, &outdir, "shape", b, c, pos_causal(b, c), &k, &v, &q, reps, &mut tlog);
-    }
-    // Truncated tiles.
-    for &(b, c) in &[(16, 15), (16, 16), (16, 17), (32, 31), (32, 32), (32, 33), (64, 63), (64, 64), (64, 65)] {
-        let k = fill_q8_cache(c, 0xA11);
-        let v = fill_q8_cache(c, 0xB22);
-        let q = fill_q(b, 0xC33);
-        run_direct(&mut gpu, &outdir, "trunc", b, c, pos_trunc(b, c), &k, &v, &q, 3, &mut tlog);
-    }
-    // Retained tails.
-    for &(b, c) in &[(3, 100), (6, 2000), (8, 5000)] {
-        let k = fill_q8_cache(c, 0xA11);
-        let v = fill_q8_cache(c, 0xB22);
-        let q = fill_q(b, 0xC33);
-        run_direct(&mut gpu, &outdir, "tail", b, c, pos_causal(b, c), &k, &v, &q, reps, &mut tlog);
-    }
-    // Odd batches.
-    for &(b, c) in &[(1, 256), (7, 512), (9, 512)] {
-        let k = fill_q8_cache(c, 0xA11);
-        let v = fill_q8_cache(c, 0xB22);
-        let q = fill_q(b, 0xC33);
-        run_direct(&mut gpu, &outdir, "batch", b, c, pos_causal(b, c), &k, &v, &q, 3, &mut tlog);
-    }
-    // Position variants on (8,512).
-    {
-        let (b, c) = (8, 512);
-        let k = fill_q8_cache(c, 0xA11);
-        let v = fill_q8_cache(c, 0xB22);
-        let q = fill_q(b, 0xC33);
-        run_direct(&mut gpu, &outdir, "posdup", b, c,
-            vec![504, 504, 506, 506, 508, 508, 511, 511], &k, &v, &q, 3, &mut tlog);
-        run_direct(&mut gpu, &outdir, "posnonmono", b, c,
-            vec![511, 500, 505, 495, 502, 480, 511, 509], &k, &v, &q, 3, &mut tlog);
-        run_direct(&mut gpu, &outdir, "posallneg", b, c,
-            vec![-1; 8], &k, &v, &q, 3, &mut tlog);
-    }
-    // fwht3 vs own baseline.
-    for &(b, c) in &[(64, 4096), (16, 17)] {
-        let kfw = fill_fwht3_k(c, 0xF30D);
-        let v = fill_q8_cache(c, 0xB22);
-        let q = fill_q(b, 0xC33);
-        run_fwht3(&mut gpu, &outdir, "k3", b, c, &kfw, &v, &q);
-    }
-    }
-    // Partial/merge at splits 1 and 8.
-    if only.is_empty() || only.starts_with("split") {
-    for &(b, c) in &[(64, 4096), (16, 17)] {
-        // --only split1: s=1 only; --only split8: s=8 only; else both.
-        let splits: &[usize] = if only == "split1" {
-            &[1]
-        } else if only == "split8" {
-            &[8]
-        } else {
-            &[1, 8]
-        };
-        for &s in splits {
+        // 7 shapes (TIME + dumps).
+        for &(b, c) in &[
+            (4, 256),
+            (8, 512),
+            (32, 2048),
+            (64, 4096),
+            (128, 8192),
+            (256, 16384),
+            (512, 32768),
+        ] {
+            let k = fill_q8_cache(c, 0xA11 + b as u32);
+            let v = fill_q8_cache(c, 0xB22 + b as u32);
+            let q = fill_q(b, 0xC33 + b as u32);
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "shape",
+                b,
+                c,
+                pos_causal(b, c),
+                &k,
+                &v,
+                &q,
+                reps,
+                &mut tlog,
+            );
+        }
+        // Truncated tiles.
+        for &(b, c) in &[
+            (16, 15),
+            (16, 16),
+            (16, 17),
+            (32, 31),
+            (32, 32),
+            (32, 33),
+            (64, 63),
+            (64, 64),
+            (64, 65),
+        ] {
             let k = fill_q8_cache(c, 0xA11);
             let v = fill_q8_cache(c, 0xB22);
             let q = fill_q(b, 0xC33);
-            run_split(&mut gpu, &outdir, b, c, s, &k, &v, &q);
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "trunc",
+                b,
+                c,
+                pos_trunc(b, c),
+                &k,
+                &v,
+                &q,
+                3,
+                &mut tlog,
+            );
+        }
+        // Retained tails.
+        for &(b, c) in &[(3, 100), (6, 2000), (8, 5000)] {
+            let k = fill_q8_cache(c, 0xA11);
+            let v = fill_q8_cache(c, 0xB22);
+            let q = fill_q(b, 0xC33);
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "tail",
+                b,
+                c,
+                pos_causal(b, c),
+                &k,
+                &v,
+                &q,
+                reps,
+                &mut tlog,
+            );
+        }
+        // Odd batches.
+        for &(b, c) in &[(1, 256), (7, 512), (9, 512)] {
+            let k = fill_q8_cache(c, 0xA11);
+            let v = fill_q8_cache(c, 0xB22);
+            let q = fill_q(b, 0xC33);
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "batch",
+                b,
+                c,
+                pos_causal(b, c),
+                &k,
+                &v,
+                &q,
+                3,
+                &mut tlog,
+            );
+        }
+        // Position variants on (8,512).
+        {
+            let (b, c) = (8, 512);
+            let k = fill_q8_cache(c, 0xA11);
+            let v = fill_q8_cache(c, 0xB22);
+            let q = fill_q(b, 0xC33);
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "posdup",
+                b,
+                c,
+                vec![504, 504, 506, 506, 508, 508, 511, 511],
+                &k,
+                &v,
+                &q,
+                3,
+                &mut tlog,
+            );
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "posnonmono",
+                b,
+                c,
+                vec![511, 500, 505, 495, 502, 480, 511, 509],
+                &k,
+                &v,
+                &q,
+                3,
+                &mut tlog,
+            );
+            run_direct(
+                &mut gpu,
+                &outdir,
+                "posallneg",
+                b,
+                c,
+                vec![-1; 8],
+                &k,
+                &v,
+                &q,
+                3,
+                &mut tlog,
+            );
+        }
+        // fwht3 vs own baseline.
+        for &(b, c) in &[(64, 4096), (16, 17)] {
+            let kfw = fill_fwht3_k(c, 0xF30D);
+            let v = fill_q8_cache(c, 0xB22);
+            let q = fill_q(b, 0xC33);
+            run_fwht3(&mut gpu, &outdir, "k3", b, c, &kfw, &v, &q);
         }
     }
+    // Partial/merge at splits 1 and 8.
+    if only.is_empty() || only.starts_with("split") {
+        for &(b, c) in &[(64, 4096), (16, 17)] {
+            // --only split1: s=1 only; --only split8: s=8 only; else both.
+            let splits: &[usize] = if only == "split1" {
+                &[1]
+            } else if only == "split8" {
+                &[8]
+            } else {
+                &[1, 8]
+            };
+            for &s in splits {
+                let k = fill_q8_cache(c, 0xA11);
+                let v = fill_q8_cache(c, 0xB22);
+                let q = fill_q(b, 0xC33);
+                run_split(&mut gpu, &outdir, b, c, s, &k, &v, &q);
+            }
+        }
     }
     std::fs::write(format!("{outdir}/time.log"), &tlog).unwrap();
     eprintln!("wrote {outdir}/time.log");

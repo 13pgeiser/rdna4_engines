@@ -817,11 +817,13 @@
       "pinned_now": [
         {
           "name": "co",
-          "sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d"
+          "sha256": "1214242d3c152aa7919182150c96c4b1033aadc312731171679948c50658c3f0",
+          "freeze_time_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d"
         },
         {
           "name": "hxaco",
-          "sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757"
+          "sha256": "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+          "freeze_time_sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757"
         },
         {
           "name": "source_rs",
@@ -829,6 +831,7 @@
         }
       ],
       "exists_now": true,
+      "code_end_tail_fill": "0.4.3 regeneration of the shipped builder twin (builder 19fc7e2c): sha256 above are the regenerated objects, freeze_time_sha256 the 2026-10-11 freeze-time objects. The regeneration only appended the emitter's code-end tail fill (s_code_end words) to .text (4296 -> 4736 bytes; the freeze-time .text is a byte prefix). Kernel body, descriptors, symbols and metadata are unchanged; only the added tail, the ELF layout fields derived from the new .text size (section addresses/offsets, .relro_padding) and the _DYNAMIC symbol value in .symtab differ. No GPU hardware oracle, timing or Vulkan measurement was repeated and none is claimed (CPU compiler, static, emulator and RIP oracle checks run on the new objects are not hardware remeasurement); acceptance/oracle/timing/perf/receipt records and the 2026-10-11 pilot results stay bound to the freeze-time objects.",
       "required_before_use": [
         "loaded_executable_binding_proof"
       ]
@@ -1122,25 +1125,29 @@
     {
       "role": "accepted builder twin asm",
       "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
-      "sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f",
+      "sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd",
+      "freeze_time_sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin code object",
       "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
-      "sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
+      "sha256": "1214242d3c152aa7919182150c96c4b1033aadc312731171679948c50658c3f0",
+      "freeze_time_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin hxaco",
       "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
-      "sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
+      "sha256": "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+      "freeze_time_sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin radiowave record",
       "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.radiowave.json",
-      "sha256": "9d5924ff7e7699493c48d610c0d9ce23bbf496001f5591a9081195a8de02bacf",
+      "sha256": "8ae44ce1fa2fef8a1cd9b3ee60c9b5b521b31951afa3d579d1eee26381f2a413",
+      "freeze_time_sha256": "9d5924ff7e7699493c48d610c0d9ce23bbf496001f5591a9081195a8de02bacf",
       "hashed_with": "sha256sum"
     },
     {
@@ -1152,7 +1159,8 @@
     {
       "role": "accepted builder twin proof record",
       "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.proof.json",
-      "sha256": "1b71bd5d8f82ce3bd74e47bb8cd67d7f45be951b367c8dfaba8f36b6e6b23a98",
+      "sha256": "7841824b22f266904466041d1b8a2317358717baea2630dd60a55d894ea78cb4",
+      "freeze_time_sha256": "1b71bd5d8f82ce3bd74e47bb8cd67d7f45be951b367c8dfaba8f36b6e6b23a98",
       "hashed_with": "sha256sum"
     },
     {

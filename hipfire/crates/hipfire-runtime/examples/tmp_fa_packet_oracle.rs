@@ -67,12 +67,10 @@ impl Rng {
 
 fn cases() -> Vec<Case> {
     let ctxs = [
-        1usize, 15, 16, 17, 63, 64, 65, 127, 128, 129, 511, 512, 4095, 4096,
-        4097, 8191, 8192,
+        1usize, 15, 16, 17, 63, 64, 65, 127, 128, 129, 511, 512, 4095, 4096, 4097, 8191, 8192,
     ];
     let edge_batches = [
-        1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
-        255, 256, 257, 511, 512,
+        1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512,
     ];
     let mut set = BTreeSet::new();
     // Every batch 1..=512 is exercised; contexts rotate over the complete
@@ -143,13 +141,7 @@ fn fill_u32(gpu: &Gpu, ptr: *mut c_void, n: usize) {
     .expect("fill_u32");
 }
 
-fn scan_pair(
-    gpu: &Gpu,
-    a: *mut c_void,
-    bptr: *mut c_void,
-    n: usize,
-    result: *mut c_void,
-) {
+fn scan_pair(gpu: &Gpu, a: *mut c_void, bptr: *mut c_void, n: usize, result: *mut c_void) {
     let mut b = KernargBlob::new();
     b.push_ptr(a);
     b.push_ptr(bptr);
@@ -183,7 +175,11 @@ fn scan_guard(gpu: &Gpu, ptr: *mut c_void, n: usize, result: *mut c_void) {
 }
 
 fn prepare_region(gpu: &Gpu, owner: &GpuTensor, used_words: usize) -> GpuTensor {
-    fill_u32(gpu, owner.buf.as_ptr(), GUARD_WORDS + used_words + GUARD_WORDS);
+    fill_u32(
+        gpu,
+        owner.buf.as_ptr(),
+        GUARD_WORDS + used_words + GUARD_WORDS,
+    );
     owner.sub_offset(GUARD_WORDS, used_words)
 }
 
@@ -201,25 +197,17 @@ fn compare_stage(
     let guard_b = ptr_add(result_base, 4 * 4);
     scan_guard(gpu, a_owner.buf.as_ptr(), GUARD_WORDS, guard_a);
     scan_guard(gpu, b_owner.buf.as_ptr(), GUARD_WORDS, guard_b);
-    scan_guard(
-        gpu,
-        ptr_add(a, used_words * 4),
-        GUARD_WORDS,
-        guard_a,
-    );
-    scan_guard(
-        gpu,
-        ptr_add(b, used_words * 4),
-        GUARD_WORDS,
-        guard_b,
-    );
+    scan_guard(gpu, ptr_add(a, used_words * 4), GUARD_WORDS, guard_a);
+    scan_guard(gpu, ptr_add(b, used_words * 4), GUARD_WORDS, guard_b);
 }
 
 fn result_words(gpu: &Gpu, results: &GpuTensor, case_index: usize) -> [u32; METRICS_PER_CASE] {
     let byte_off = case_index * METRICS_PER_CASE * 4;
     let view = results.sub_offset(byte_off, METRICS_PER_CASE * 4);
     let mut bytes = vec![0u8; METRICS_PER_CASE * 4];
-    gpu.hip.memcpy_dtoh(&mut bytes, &view.buf).expect("result dtoh");
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &view.buf)
+        .expect("result dtoh");
     let mut out = [0u32; METRICS_PER_CASE];
     for (i, chunk) in bytes.chunks_exact(4).enumerate() {
         out[i] = u32::from_le_bytes(chunk.try_into().unwrap());
@@ -261,8 +249,12 @@ fn main() {
     for x in &mut q_owner_host[GUARD_WORDS..GUARD_WORDS + max_qn] {
         *x = ((rng.next() % 20001) as f32 / 10000.0 - 1.0) * 4.0;
     }
-    let q_ref = gpu.upload_f32(&q_owner_host, &[q_owner_host.len()]).expect("upload Q ref");
-    let q_owner = gpu.upload_f32(&q_owner_host, &[q_owner_host.len()]).expect("upload Q");
+    let q_ref = gpu
+        .upload_f32(&q_owner_host, &[q_owner_host.len()])
+        .expect("upload Q ref");
+    let q_owner = gpu
+        .upload_f32(&q_owner_host, &[q_owner_host.len()])
+        .expect("upload Q");
     let q = q_owner.sub_offset(GUARD_WORDS, max_qn);
 
     let kv_bytes = MAX_CTX * ROWB;
@@ -297,20 +289,31 @@ fn main() {
         v_owner_host[GUARD_BYTES + 3 * ROWB + d] = 0;
     }
     for kh in 0..NKV {
-        k_owner_host[GUARD_BYTES + 5 * ROWB + 1024 + 2 * kh..GUARD_BYTES + 5 * ROWB + 1026 + 2 * kh]
+        k_owner_host
+            [GUARD_BYTES + 5 * ROWB + 1024 + 2 * kh..GUARD_BYTES + 5 * ROWB + 1026 + 2 * kh]
             .copy_from_slice(&0u16.to_le_bytes());
-        v_owner_host[GUARD_BYTES + 7 * ROWB + 1024 + 2 * kh..GUARD_BYTES + 7 * ROWB + 1026 + 2 * kh]
+        v_owner_host
+            [GUARD_BYTES + 7 * ROWB + 1024 + 2 * kh..GUARD_BYTES + 7 * ROWB + 1026 + 2 * kh]
             .copy_from_slice(&0u16.to_le_bytes());
     }
-    let k_ref = gpu.upload_raw(&k_owner_host, &[k_owner_host.len()]).expect("upload K ref");
-    let v_ref = gpu.upload_raw(&v_owner_host, &[v_owner_host.len()]).expect("upload V ref");
-    let k_owner = gpu.upload_raw(&k_owner_host, &[k_owner_host.len()]).expect("upload K");
-    let v_owner = gpu.upload_raw(&v_owner_host, &[v_owner_host.len()]).expect("upload V");
+    let k_ref = gpu
+        .upload_raw(&k_owner_host, &[k_owner_host.len()])
+        .expect("upload K ref");
+    let v_ref = gpu
+        .upload_raw(&v_owner_host, &[v_owner_host.len()])
+        .expect("upload V ref");
+    let k_owner = gpu
+        .upload_raw(&k_owner_host, &[k_owner_host.len()])
+        .expect("upload K");
+    let v_owner = gpu
+        .upload_raw(&v_owner_host, &[v_owner_host.len()])
+        .expect("upload V");
     let k = k_owner.sub_offset(GUARD_BYTES, kv_bytes);
     let v = v_owner.sub_offset(GUARD_BYTES, kv_bytes);
 
     let pos_stride_bytes = MAX_BATCH * 4;
-    let mut pos_owner_host = vec![0x56u8; GUARD_BYTES + all_cases.len() * pos_stride_bytes + GUARD_BYTES];
+    let mut pos_owner_host =
+        vec![0x56u8; GUARD_BYTES + all_cases.len() * pos_stride_bytes + GUARD_BYTES];
     for (ci, case) in all_cases.iter().enumerate() {
         let dst = GUARD_BYTES + ci * pos_stride_bytes;
         for qq in 0..MAX_BATCH {
@@ -328,16 +331,30 @@ fn main() {
             pos_owner_host[dst + qq * 4..dst + qq * 4 + 4].copy_from_slice(&p.to_le_bytes());
         }
     }
-    let pos_ref = gpu.upload_raw(&pos_owner_host, &[pos_owner_host.len()]).expect("upload positions ref");
-    let pos_owner = gpu.upload_raw(&pos_owner_host, &[pos_owner_host.len()]).expect("upload positions");
+    let pos_ref = gpu
+        .upload_raw(&pos_owner_host, &[pos_owner_host.len()])
+        .expect("upload positions ref");
+    let pos_owner = gpu
+        .upload_raw(&pos_owner_host, &[pos_owner_host.len()])
+        .expect("upload positions");
 
     let max_out_words = max_qn;
     let max_partial_words = 8 * MAX_BATCH * NH * (HD + 2);
-    let old_out_owner = gpu.zeros(&[GUARD_WORDS + max_out_words + GUARD_WORDS], DType::F32).expect("old out");
-    let new_out_owner = gpu.zeros(&[GUARD_WORDS + max_out_words + GUARD_WORDS], DType::F32).expect("new out");
-    let old_partial_owner = gpu.zeros(&[GUARD_WORDS + max_partial_words + GUARD_WORDS], DType::F32).expect("old partial");
-    let new_partial_owner = gpu.zeros(&[GUARD_WORDS + max_partial_words + GUARD_WORDS], DType::F32).expect("new partial");
-    let results = gpu.zeros(&[all_cases.len() * METRICS_PER_CASE * 4], DType::Raw).expect("results");
+    let old_out_owner = gpu
+        .zeros(&[GUARD_WORDS + max_out_words + GUARD_WORDS], DType::F32)
+        .expect("old out");
+    let new_out_owner = gpu
+        .zeros(&[GUARD_WORDS + max_out_words + GUARD_WORDS], DType::F32)
+        .expect("new out");
+    let old_partial_owner = gpu
+        .zeros(&[GUARD_WORDS + max_partial_words + GUARD_WORDS], DType::F32)
+        .expect("old partial");
+    let new_partial_owner = gpu
+        .zeros(&[GUARD_WORDS + max_partial_words + GUARD_WORDS], DType::F32)
+        .expect("new partial");
+    let results = gpu
+        .zeros(&[all_cases.len() * METRICS_PER_CASE * 4], DType::Raw)
+        .expect("results");
 
     let started = Instant::now();
     let mut failed_cases = 0usize;
@@ -433,7 +450,13 @@ fn main() {
 
     // Device-side whole-owner input immutability, including poisoned guards.
     let input_results = gpu.zeros(&[4 * 3 * 4], DType::Raw).expect("input results");
-    scan_pair(&gpu, q_owner.buf.as_ptr(), q_ref.buf.as_ptr(), q_owner_host.len(), input_results.buf.as_ptr());
+    scan_pair(
+        &gpu,
+        q_owner.buf.as_ptr(),
+        q_ref.buf.as_ptr(),
+        q_owner_host.len(),
+        input_results.buf.as_ptr(),
+    );
     scan_pair(
         &gpu,
         k_owner.buf.as_ptr(),
@@ -456,16 +479,26 @@ fn main() {
         ptr_add(input_results.buf.as_ptr(), 9 * 4),
     );
     let mut input_bytes = vec![0u8; 4 * 3 * 4];
-    gpu.hip.memcpy_dtoh(&mut input_bytes, &input_results.buf).expect("input result dtoh");
+    gpu.hip
+        .memcpy_dtoh(&mut input_bytes, &input_results.buf)
+        .expect("input result dtoh");
     let input_words: Vec<u32> = input_bytes
         .chunks_exact(4)
         .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
         .collect();
-    let input_diffs = [input_words[0], input_words[3], input_words[6], input_words[9]];
+    let input_diffs = [
+        input_words[0],
+        input_words[3],
+        input_words[6],
+        input_words[9],
+    ];
     let elapsed = started.elapsed();
     let summary = format!(
         "SUMMARY cases={} failed={} input_diffs(Q/K/V/P)={:?} elapsed_s={:.3}\n",
-        all_cases.len(), failed_cases, input_diffs, elapsed.as_secs_f64(),
+        all_cases.len(),
+        failed_cases,
+        input_diffs,
+        elapsed.as_secs_f64(),
     );
     eprint!("{summary}");
     lines.push_str(&summary);

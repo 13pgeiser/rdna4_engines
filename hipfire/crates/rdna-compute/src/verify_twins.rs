@@ -33,15 +33,28 @@ fn seg_err(msg: impl AsRef<str>) -> HipError {
 /// must occur exactly once) into `__device__ __forceinline__ void
 /// {kernel}_seg_body(`, apply `edits` (each `from` must occur exactly once)
 /// and append the wrapper selected by `twin_define`.
-pub fn seg_twin_source(src: &str, kernel: &str, twin_define: &str, edits: &[(&str, &str)]) -> HipResult<String> {
+pub fn seg_twin_source(
+    src: &str,
+    kernel: &str,
+    twin_define: &str,
+    edits: &[(&str, &str)],
+) -> HipResult<String> {
     let entry = format!("extern \"C\" __global__ void {kernel}(");
     if src.matches(&entry).count() != 1 {
-        return Err(seg_err(format!("segment twin {kernel}: entry `{entry}` not found exactly once")));
+        return Err(seg_err(format!(
+            "segment twin {kernel}: entry `{entry}` not found exactly once"
+        )));
     }
-    let mut body = src.replacen(&entry, &format!("__device__ __forceinline__ void {kernel}_seg_body("), 1);
+    let mut body = src.replacen(
+        &entry,
+        &format!("__device__ __forceinline__ void {kernel}_seg_body("),
+        1,
+    );
     for (from, to) in edits {
         if body.matches(from).count() != 1 {
-            return Err(seg_err(format!("segment twin {kernel}: checked edit `{from}` not found exactly once")));
+            return Err(seg_err(format!(
+                "segment twin {kernel}: checked edit `{from}` not found exactly once"
+            )));
         }
         body = body.replacen(from, to, 1);
     }
@@ -135,9 +148,15 @@ pub fn seg_twin_module_source(twin: &str) -> HipResult<String> {
         ATTN_FP8_KV_BATCHED_SEGS => {
             // Same source the singleton launcher compiles: kv_slot_desc.h
             // stripped and prepended.
-            let stripped = kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let stripped = kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC
+                .replace("#include \"kv_slot_desc.h\"", "");
             let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            seg_twin_source(&src, "attention_fp8_e4m3_kv_batched", "HIPFIRE_SEGS_ATTN_FP8", ATTN_FP8_LOAD_EDITS)
+            seg_twin_source(
+                &src,
+                "attention_fp8_e4m3_kv_batched",
+                "HIPFIRE_SEGS_ATTN_FP8",
+                ATTN_FP8_LOAD_EDITS,
+            )
         }
         other => Err(seg_err(format!("unknown segment twin {other}"))),
     }
@@ -146,7 +165,9 @@ pub fn seg_twin_module_source(twin: &str) -> HipResult<String> {
 /// Singleton block size of `attention_fp8_e4m3_kv_batched` for a launch
 /// with `max_ctx_len` (the singleton launcher's formula).
 fn attn_batched_block(max_ctx_len: usize, head_dim: usize) -> u32 {
-    (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256)
+    (max_ctx_len.max(head_dim) as u32)
+        .next_power_of_two()
+        .min(256)
 }
 
 fn as_bytes<T: Copy>(rows: &[T]) -> &[u8] {
@@ -157,7 +178,9 @@ fn as_bytes<T: Copy>(rows: &[T]) -> &[u8] {
 impl Gpu {
     fn ensure_seg_twin(&mut self, twin: &'static str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1201() {
-            return Err(seg_err(format!("{twin}: segment twins are certified on gfx1201 only")));
+            return Err(seg_err(format!(
+                "{twin}: segment twins are certified on gfx1201 only"
+            )));
         }
         if !self.functions.contains_key(twin) {
             let src = seg_twin_module_source(twin)?;
@@ -179,7 +202,9 @@ impl Gpu {
         let mut outs: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
         for (i, s) in segs.iter().enumerate() {
             if [s.q, s.k_cache, s.v_cache, s.out, s.positions].contains(&0) || s.n_rows == 0 {
-                return Err(seg_err(format!("attn fp8 segs: segment {i} has a null pointer or no rows")));
+                return Err(seg_err(format!(
+                    "attn fp8 segs: segment {i} has a null pointer or no rows"
+                )));
             }
             outs.push((s.out, s.out + s.n_rows * (n_heads * head_dim * 4) as u64));
         }
@@ -221,16 +246,25 @@ impl Gpu {
     ) -> HipResult<()> {
         let segs = max_ctx_lens.len();
         if segs == 0 || max_rows == 0 || segs > u16::MAX as usize {
-            return Err(seg_err("attn fp8 segs: requires 1..=65535 segments and rows"));
+            return Err(seg_err(
+                "attn fp8 segs: requires 1..=65535 segments and rows",
+            ));
         }
         let block = attn_batched_block(max_ctx_lens[0], head_dim);
-        if max_ctx_lens.iter().any(|&c| attn_batched_block(c, head_dim) != block) {
-            return Err(seg_err("attn fp8 segs: segments disagree on the singleton block size"));
+        if max_ctx_lens
+            .iter()
+            .any(|&c| attn_batched_block(c, head_dim) != block)
+        {
+            return Err(seg_err(
+                "attn fp8 segs: segments disagree on the singleton block size",
+            ));
         }
         let max_ctx = *max_ctx_lens.iter().max().expect("non-empty");
         self.bind_thread()?;
         self.ensure_seg_twin(ATTN_FP8_KV_BATCHED_SEGS)?;
-        let tp = unsafe { (table.buf.as_ptr() as *mut u8).add(at * std::mem::size_of::<AttnFp8Seg>()) } as *mut c_void;
+        let tp =
+            unsafe { (table.buf.as_ptr() as *mut u8).add(at * std::mem::size_of::<AttnFp8Seg>()) }
+                as *mut c_void;
         let nh = n_heads as i32;
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;

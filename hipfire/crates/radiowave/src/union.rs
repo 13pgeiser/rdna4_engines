@@ -249,7 +249,10 @@ fn validate_hex(domain: &str, value: &str, len: usize) -> UnionResult<()> {
     if value.len() != len {
         return Err(malformed(
             domain,
-            format!("expected {len} lowercase hex characters, found {}", value.len()),
+            format!(
+                "expected {len} lowercase hex characters, found {}",
+                value.len()
+            ),
         ));
     }
     if !value
@@ -259,7 +262,10 @@ fn validate_hex(domain: &str, value: &str, len: usize) -> UnionResult<()> {
         return Err(malformed(domain, "must be lowercase hexadecimal"));
     }
     if value.bytes().all(|byte| byte == b'0') {
-        return Err(malformed(domain, "all-zero value is a placeholder, not an identity"));
+        return Err(malformed(
+            domain,
+            "all-zero value is a placeholder, not an identity",
+        ));
     }
     Ok(())
 }
@@ -537,7 +543,10 @@ pub fn derive_private_cache_key(
 ) -> PrivateCacheKeyDigest {
     PrivateCacheKeyDigest(domain_sha256_hex(
         PRIVATE_CACHE_KEY_DOMAIN,
-        &[envelope.as_str().as_bytes(), certificate.as_str().as_bytes()],
+        &[
+            envelope.as_str().as_bytes(),
+            certificate.as_str().as_bytes(),
+        ],
     ))
 }
 
@@ -591,15 +600,12 @@ pub struct UnionTarget {
 
 impl UnionTarget {
     pub fn validate(&self) -> UnionResult<()> {
-        let exact = self
-            .architecture
-            .strip_prefix("gfx")
-            .is_some_and(|rest| {
-                (3..=4).contains(&rest.len())
-                    && rest
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            });
+        let exact = self.architecture.strip_prefix("gfx").is_some_and(|rest| {
+            (3..=4).contains(&rest.len())
+                && rest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
         if !exact {
             return Err(malformed(
                 "target.architecture",
@@ -745,9 +751,19 @@ impl ProducerRecord {
             self.kind,
             ProducerKind::RadvAco | ProducerKind::RadvLlvm | ProducerKind::WindowsDriver
         );
-        require_presence("producer.spirv_sha256", kind, spirv, self.spirv_sha256.is_some())?;
+        require_presence(
+            "producer.spirv_sha256",
+            kind,
+            spirv,
+            self.spirv_sha256.is_some(),
+        )?;
         require_presence("producer.driver", kind, spirv, self.driver.is_some())?;
-        require_presence("producer.mesa", kind, self.kind.is_radv(), self.mesa.is_some())?;
+        require_presence(
+            "producer.mesa",
+            kind,
+            self.kind.is_radv(),
+            self.mesa.is_some(),
+        )?;
         if let Some(driver) = &self.driver {
             driver.validate("producer.driver")?;
         }
@@ -888,7 +904,10 @@ pub struct AdapterRecord {
 impl AdapterRecord {
     fn validate(&self, raw: &RawArtifact) -> UnionResult<()> {
         if self.adapted_code_length == 0 {
-            return Err(incomplete("adapter.adapted_code_length", "must be non-zero"));
+            return Err(incomplete(
+                "adapter.adapted_code_length",
+                "must be non-zero",
+            ));
         }
         self.raw_body.within("adapter.raw_body", raw.code.length)?;
         let prologue_end = self
@@ -1042,7 +1061,10 @@ impl EnvelopeRecord {
 
     fn validate(&self) -> UnionResult<()> {
         if self.container_length() == 0 {
-            return Err(incomplete("envelope.length", "container length must be non-zero"));
+            return Err(incomplete(
+                "envelope.length",
+                "container length must be non-zero",
+            ));
         }
         if let Self::Hsa(envelope) = self {
             ensure_text("envelope.symbol", &envelope.symbol)?;
@@ -1335,9 +1357,15 @@ impl LoadedExecutableReceipt {
         self.target.validate()?;
         ensure_text("loaded.entry.name", &self.entry.name)?;
         if self.upload.uploaded_length == 0 {
-            return Err(incomplete("loaded.upload.uploaded_length", "must be non-zero"));
+            return Err(incomplete(
+                "loaded.upload.uploaded_length",
+                "must be non-zero",
+            ));
         }
-        match (self.relocation.applied_count, &self.relocation.applied_sha256) {
+        match (
+            self.relocation.applied_count,
+            &self.relocation.applied_sha256,
+        ) {
             (0, None) => {}
             (0, Some(_)) => {
                 return Err(malformed(
@@ -1684,7 +1712,10 @@ impl PairOracleReceipt {
             .iter()
             .any(|surface| surface.kind == SurfaceKind::Output)
         {
-            return Err(incomplete("surfaces", "at least one output surface is required"));
+            return Err(incomplete(
+                "surfaces",
+                "at least one output surface is required",
+            ));
         }
         let mut names = BTreeSet::new();
         for surface in &self.surfaces {
@@ -1814,8 +1845,10 @@ impl PairOracleReceipt {
                 self.semantic_recipe_id.as_str(),
                 record.semantic.recipe_id.as_str(),
             )?;
-            self.target
-                .require_same(&format!("{} certified vs receipt", arm.as_str()), &record.target)?;
+            self.target.require_same(
+                &format!("{} certified vs receipt", arm.as_str()),
+                &record.target,
+            )?;
         }
         Ok(())
     }
@@ -2007,7 +2040,10 @@ impl VulkanExecutableRecord {
 
     fn validate_workgroup_and_subgroup(&self) -> UnionResult<()> {
         if self.workgroup.size.contains(&0) {
-            return Err(malformed("workgroup.size", "every dimension must be non-zero"));
+            return Err(malformed(
+                "workgroup.size",
+                "every dimension must be non-zero",
+            ));
         }
         let invocations: u64 = self.workgroup.size.iter().map(|&n| u64::from(n)).product();
         if invocations > 1024 {
@@ -2078,7 +2114,10 @@ impl VulkanExecutableRecord {
         let mut bound = BTreeSet::new();
         for requirement in &self.buffer_bindings {
             let key = (requirement.set, requirement.binding);
-            ensure_text("buffer_bindings.logical_resource", &requirement.logical_resource)?;
+            ensure_text(
+                "buffer_bindings.logical_resource",
+                &requirement.logical_resource,
+            )?;
             if !bound.insert(key) {
                 return Err(malformed(
                     "buffer_bindings",
@@ -2107,7 +2146,10 @@ impl VulkanExecutableRecord {
         if let Some(missing) = layout.difference(&bound).next() {
             return Err(incomplete(
                 "buffer_bindings",
-                format!("layout binding {}:{} has no requirement", missing.0, missing.1),
+                format!(
+                    "layout binding {}:{} has no requirement",
+                    missing.0, missing.1
+                ),
             ));
         }
         Ok(())
@@ -2179,9 +2221,13 @@ versioned_json!(SharedBufferViewRecord, "shared_buffer_view");
 impl SharedBufferViewRecord {
     pub fn validate(&self) -> UnionResult<()> {
         ensure_version("shared_buffer_view", self.schema_version)?;
-        self.physical_range.end("shared_buffer_view.physical_range")?;
+        self.physical_range
+            .end("shared_buffer_view.physical_range")?;
         if self.generation == 0 {
-            return Err(incomplete("shared_buffer_view.generation", "generations start at 1"));
+            return Err(incomplete(
+                "shared_buffer_view.generation",
+                "generations start at 1",
+            ));
         }
         Ok(())
     }
@@ -2282,12 +2328,18 @@ impl BoundaryContractRecord {
             ));
         }
         if self.accesses.is_empty() {
-            return Err(incomplete("boundary.accesses", "at least one range access is required"));
+            return Err(incomplete(
+                "boundary.accesses",
+                "at least one range access is required",
+            ));
         }
         for access in &self.accesses {
             access.range.end("boundary.accesses.range")?;
             if access.generation == 0 {
-                return Err(incomplete("boundary.accesses.generation", "generations start at 1"));
+                return Err(incomplete(
+                    "boundary.accesses.generation",
+                    "generations start at 1",
+                ));
             }
         }
         let ops: BTreeSet<VisibilityOp> = self.visibility.iter().copied().collect();
@@ -2456,7 +2508,10 @@ impl UnionPlanRecord {
             .chain(&self.cell.geometry.workgroup)
             .any(|&n| n == 0)
         {
-            return Err(malformed("cell.geometry", "every dimension must be non-zero"));
+            return Err(malformed(
+                "cell.geometry",
+                "every dimension must be non-zero",
+            ));
         }
         if self.mode == UnionMode::Off {
             if !(self.islands.is_empty()
@@ -2472,7 +2527,10 @@ impl UnionPlanRecord {
             return Ok(());
         }
         if self.islands.is_empty() {
-            return Err(incomplete("islands", "an enabled plan needs at least one island"));
+            return Err(incomplete(
+                "islands",
+                "an enabled plan needs at least one island",
+            ));
         }
         let resources = self.validate_resources()?;
         let apis = self.validate_islands()?;
@@ -2509,7 +2567,10 @@ impl UnionPlanRecord {
                     format!("island {} has no admitted kernel", island.island_id),
                 ));
             }
-            if apis.insert(island.island_id, island.backend.api()).is_some() {
+            if apis
+                .insert(island.island_id, island.backend.api())
+                .is_some()
+            {
                 return Err(malformed(
                     "islands",
                     format!("duplicate island id {}", island.island_id),

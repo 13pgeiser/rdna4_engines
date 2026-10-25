@@ -120,8 +120,12 @@ fn run() -> Result<(), String> {
     }
 
     println!();
-    println!("layer_range={:?} n_layers={} experts_loaded={}",
-        weights.layer_range, weights.layers.len(), weights.experts_loaded);
+    println!(
+        "layer_range={:?} n_layers={} experts_loaded={}",
+        weights.layer_range,
+        weights.layers.len(),
+        weights.experts_loaded
+    );
     for layer in &weights.layers {
         println!(
             "  layer {:>2}: ratio={} compressor={} indexer={} experts={} gate_bias={} tid2eid={}",
@@ -140,7 +144,11 @@ fn run() -> Result<(), String> {
         println!();
         println!("=== vs Gate 1 projection (full main tower) ===");
         compare_tier("dense_bf16", res.dense_bf16_bytes, PROJ_DENSE_BF16_GIB);
-        compare_tier("expert_compressed", res.expert_compressed_bytes, PROJ_EXPERT_GIB);
+        compare_tier(
+            "expert_compressed",
+            res.expert_compressed_bytes,
+            PROJ_EXPERT_GIB,
+        );
         compare_tier("bf16", res.bf16_bytes, PROJ_BF16_GIB);
         compare_tier("f32", res.f32_bytes, PROJ_F32_GIB);
         compare_tier("i64", res.i64_bytes, PROJ_I64_GIB);
@@ -152,9 +160,7 @@ fn run() -> Result<(), String> {
         );
     } else {
         println!();
-        println!(
-            "(partial load — skip full-model Gate 1 comparison; re-run with --full for that)"
-        );
+        println!("(partial load — skip full-model Gate 1 comparison; re-run with --full for that)");
     }
 
     println!();
@@ -164,10 +170,7 @@ fn run() -> Result<(), String> {
 
 fn print_residency(r: &ParentResidency) {
     let row = |name: &str, b: u64| {
-        println!(
-            "  {name:<22} {b:>16} bytes  ({:>8.3} GiB)",
-            b as f64 / GIB
-        );
+        println!("  {name:<22} {b:>16} bytes  ({:>8.3} GiB)", b as f64 / GIB);
     };
     row("dense_bf16", r.dense_bf16_bytes);
     row("expert_compressed", r.expert_compressed_bytes);

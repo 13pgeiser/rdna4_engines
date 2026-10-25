@@ -123,7 +123,10 @@ fn parse_spec(s: &str) -> Result<Spec, String> {
         sp.prec = Some(p.parse().map_err(|_| "format string: bad precision")?);
     }
     sp.ty = ch[i..].iter().collect();
-    if !matches!(sp.ty.as_str(), "" | "?" | "x" | "X" | "b" | "o" | "e" | "#?") {
+    if !matches!(
+        sp.ty.as_str(),
+        "" | "?" | "x" | "X" | "b" | "o" | "e" | "#?"
+    ) {
         return Err(format!("format string: unsupported spec `{s}`"));
     }
     Ok(sp)
@@ -138,8 +141,15 @@ pub fn display(v: &Value) -> Result<String, String> {
         Value::Char(c) => c.to_string(),
         Value::Str(s) => s.to_string(),
         Value::Ref(_) => return Err("internal: unresolved reference in format".into()),
-        Value::Nat(n) => n.display().ok_or_else(|| format!("`{}` does not implement Display", n.type_name()))?,
-        other => return Err(format!("`{}` does not implement Display (use {{:?}})", other.type_name())),
+        Value::Nat(n) => n
+            .display()
+            .ok_or_else(|| format!("`{}` does not implement Display", n.type_name()))?,
+        other => {
+            return Err(format!(
+                "`{}` does not implement Display (use {{:?}})",
+                other.type_name()
+            ))
+        }
     })
 }
 
@@ -163,22 +173,45 @@ pub fn debug(v: &Value, pretty: bool) -> String {
                 format!("({})", inner.join(", "))
             }
         }
-        Value::Array(xs) => format!("[{}]", xs.iter().map(|x| debug(x, pretty)).collect::<Vec<_>>().join(", ")),
+        Value::Array(xs) => format!(
+            "[{}]",
+            xs.iter()
+                .map(|x| debug(x, pretty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Value::Struct(n, fs) => {
             if fs.is_empty() {
                 n.to_string()
             } else {
-                format!("{n} {{ {} }}", fs.iter().map(|(k, x)| format!("{k}: {}", debug(x, pretty))).collect::<Vec<_>>().join(", "))
+                format!(
+                    "{n} {{ {} }}",
+                    fs.iter()
+                        .map(|(k, x)| format!("{k}: {}", debug(x, pretty)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         }
         Value::Enum(_, var, xs) => {
             if xs.is_empty() {
                 var.to_string()
             } else {
-                format!("{var}({})", xs.iter().map(|x| debug(x, pretty)).collect::<Vec<_>>().join(", "))
+                format!(
+                    "{var}({})",
+                    xs.iter()
+                        .map(|x| debug(x, pretty))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         }
-        Value::Range(r) => format!("{}..{}{}", r.start.map(|s| s.to_string()).unwrap_or_default(), if r.inclusive { "=" } else { "" }, r.end.map(|s| s.to_string()).unwrap_or_default()),
+        Value::Range(r) => format!(
+            "{}..{}{}",
+            r.start.map(|s| s.to_string()).unwrap_or_default(),
+            if r.inclusive { "=" } else { "" },
+            r.end.map(|s| s.to_string()).unwrap_or_default()
+        ),
         Value::Nat(n) => n.debug(),
         Value::Closure(_) => "<closure>".into(),
         Value::Func(_) => "<fn>".into(),
@@ -188,7 +221,11 @@ pub fn debug(v: &Value, pretty: bool) -> String {
 
 fn int_radix(i: i128, t: Option<IntTy>, radix: u32, upper: bool) -> String {
     let bits = t.map_or(32, IntTy::bits);
-    let u: u128 = if i < 0 { (i + (1i128 << bits)) as u128 } else { i as u128 };
+    let u: u128 = if i < 0 {
+        (i + (1i128 << bits)) as u128
+    } else {
+        i as u128
+    };
     match (radix, upper) {
         (16, false) => format!("{u:x}"),
         (16, true) => format!("{u:X}"),
@@ -207,7 +244,9 @@ pub fn render(v: &Value, sp: &Spec) -> Result<String, String> {
         },
         "?" | "#?" => debug(v, sp.alt || sp.ty == "#?"),
         "x" | "X" | "b" | "o" => {
-            let Value::Int(i, t) = v else { return Err(format!("`{}` has no radix formatting", v.type_name())) };
+            let Value::Int(i, t) = v else {
+                return Err(format!("`{}` has no radix formatting", v.type_name()));
+            };
             let (radix, upper) = match sp.ty.as_str() {
                 "x" => (16, false),
                 "X" => (16, true),
@@ -242,13 +281,14 @@ pub fn render(v: &Value, sp: &Spec) -> Result<String, String> {
             let pad = w - n;
             if sp.zero && numeric {
                 // Zero padding goes after the sign / radix prefix.
-                let split = if body.starts_with("0x") || body.starts_with("0b") || body.starts_with("0o") {
-                    2
-                } else if body.starts_with('-') || body.starts_with('+') {
-                    1
-                } else {
-                    0
-                };
+                let split =
+                    if body.starts_with("0x") || body.starts_with("0b") || body.starts_with("0o") {
+                        2
+                    } else if body.starts_with('-') || body.starts_with('+') {
+                        1
+                    } else {
+                        0
+                    };
                 body.insert_str(split, &"0".repeat(pad));
             } else {
                 let fill = sp.fill.unwrap_or(' ');
@@ -258,7 +298,11 @@ pub fn render(v: &Value, sp: &Spec) -> Result<String, String> {
                     '>' => (pad, 0),
                     _ => (pad / 2, pad - pad / 2),
                 };
-                body = format!("{}{body}{}", fill.to_string().repeat(l), fill.to_string().repeat(r));
+                body = format!(
+                    "{}{body}{}",
+                    fill.to_string().repeat(l),
+                    fill.to_string().repeat(r)
+                );
             }
         }
     }
@@ -286,9 +330,18 @@ mod tests {
     fn radix_and_padding_follow_rust() {
         let v = Value::Int(255, Some(IntTy::U32));
         assert_eq!(render(&v, &parse_spec("#x").unwrap()).unwrap(), "0xff");
-        assert_eq!(render(&v, &parse_spec("#010x").unwrap()).unwrap(), "0x000000ff");
+        assert_eq!(
+            render(&v, &parse_spec("#010x").unwrap()).unwrap(),
+            "0x000000ff"
+        );
         assert_eq!(render(&v, &parse_spec("04").unwrap()).unwrap(), "0255");
-        assert_eq!(render(&Value::Int(-1, Some(IntTy::I32)), &parse_spec("x").unwrap()).unwrap(), "ffffffff");
-        assert_eq!(render(&Value::str("ab"), &parse_spec("*^6").unwrap()).unwrap(), "**ab**");
+        assert_eq!(
+            render(&Value::Int(-1, Some(IntTy::I32)), &parse_spec("x").unwrap()).unwrap(),
+            "ffffffff"
+        );
+        assert_eq!(
+            render(&Value::str("ab"), &parse_spec("*^6").unwrap()).unwrap(),
+            "**ab**"
+        );
     }
 }

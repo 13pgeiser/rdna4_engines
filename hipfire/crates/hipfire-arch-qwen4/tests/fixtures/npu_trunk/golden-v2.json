@@ -60,7 +60,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "stock",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -852,7 +852,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "stock",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -1644,7 +1644,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "overlay:gfx1151-zab-v1",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -2424,7 +2424,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "overlay:gfx1151-zab-v1",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -3216,7 +3216,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "overlay:gfx1151-zab-v1",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -4111,7 +4111,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "overlay:gfx1151-zab-v1",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -5006,7 +5006,7 @@
         },
         "epilogue": "bf16",
         "trunk_route": "stock",
-        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+        "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
       },
       "npu": {
         "tops_corun": 16.1,

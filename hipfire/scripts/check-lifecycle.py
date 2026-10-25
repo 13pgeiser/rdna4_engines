@@ -50,6 +50,7 @@ DEPRECATED_GATES = {
     "memory.cask.sidecar": 'DefaultValue::String("")',
     "memory.cask.enabled": "DefaultValue::Bool(false)",
     "memory.cask.auto_attach": "DefaultValue::Bool(false)",
+    "diagnostic.replay.gfx1151_cu_count": 'DefaultValue::String("all")',
     "speculation.prefill.mode": 'DefaultValue::String("off")',
     "speculation.prefill.drafter": 'DefaultValue::String("")',
 }
@@ -84,6 +85,8 @@ DEPRECATED_ENV_NAME = re.compile(r"PFLASH|CASK|TRIATT")
 ENV_VALUE_NOTES = {
     "HIPFIRE_DFLASH_WINDOW": "`0` (legacy contiguous DFlash) deprecated, removal 0.5.0",
     "HIPFIRE_KV_MODE": "`asymN`/`turbo*` values deprecated, removal 0.5.0",
+    "HIPFIRE_GFX1151_QKVZA_R4_STREAM": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
+    "HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
 DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap", "cask_off"}
@@ -92,6 +95,7 @@ DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap", "cask_off"}
 DEFAULT_REACHED_ALLOWLIST = {
     ("crates/hipfire-runtime/src/config.rs", "MQ4R route selection by file extension"),
     ("crates/hipfire-runtime/src/config.rs", "DS4 MQ2R selection by file extension"),
+    ("crates/hipfire-runtime/src/config.rs", "A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension"),
     ("crates/hipfire-cli/src/serve/mod.rs", "MQ4R route selection by file extension"),
     ("crates/hipfire-arch-deepseek4/src/deepseek4.rs", "DS4 MQ2R selection by file extension"),
 }

@@ -9,18 +9,27 @@
 //! lowering and execution; this module only supplies family-owned typed data
 //! and the source-bound MoE sealer inputs.
 
+use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
+use crate::weights::Qwen4BandScope;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
-    MoeQ8RouterPolicy, MoeRecipe, MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
+    MoeQ8RouterPolicy, MoeRecipe, MoeRouteCapability, MoeRoutePolicy, MoeSharedDecode,
+    MoeSharedDtypes, MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
+    NARROW_VERIFY_MAX_ROWS,
 };
+use hipfire_dispatch::pipeline::gated_mlp::MlpLadder;
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+use hipfire_dispatch::pipeline::step_graph::{
+    OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph,
+    StepGraphError,
+};
 use hipfire_dispatch::pipeline::{
     execute_final_hyper as execute_shared_final_hyper, project_weight, seal_decode, seal_prefill,
     BoundMoeExperts, ExpertBindingCache, ExpertTable, HyperReadOp,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 #[inline]
@@ -247,7 +256,7 @@ pub struct Qwen4LayerDescription<'a> {
 }
 
 /// Dense FFN projections, source-bound once by the family and consumed by
-/// `Step::DenseFfn`.
+/// `Step::GatedMlp` on the trunk ladder.
 #[derive(Clone, Copy)]
 pub struct Qwen4DenseBinding<'a> {
     pub gate: WeightRef<'a>,
@@ -263,6 +272,17 @@ pub enum Qwen4FfnBinding<'a> {
     Moe(Qwen4MoeBinding<'a>),
 }
 
+/// Widest window the CPU expert splice serves: single-token decode and a
+/// speculative verify of at most this many rows. Anything wider keeps the PCIe
+/// grouped read of the host-placed experts.
+pub const QWEN4_CPU_SPLICE_MAX_ROWS: usize = NARROW_VERIFY_MAX_ROWS;
+
+// The D2 tier split serves exactly the same narrow window as the D1 splice
+// (AR decode, every admitted verify/replay width up to the cap), so the one
+// speculative cap (`QWEN4_CPU_SPLICE_MAX_ROWS`, `spec_verify_rows_cap`) covers
+// both CPU numerical modes.
+const _: () = assert!(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS == QWEN4_CPU_SPLICE_MAX_ROWS);
+
 /// MoE resources are source-bound once by the family and consumed by the
 /// shared prefill sealer/lowering. The dispatch layer owns all route policy.
 #[derive(Clone, Copy)]
@@ -275,6 +295,12 @@ pub struct Qwen4MoeBinding<'a> {
     pub route_policy: MoeRoutePolicy,
     pub intermediate: usize,
     pub experts_all_gate_up_mq4: bool,
+    /// Expert-slab layers whose experts mix codecs: every expert's gate/up and
+    /// down dtype, and the codec-tag tensor. `None` on every other layer (a
+    /// slab layer of one codec carries no table; its dtype names the codec).
+    pub expert_gate_up_dtypes: Option<&'a [DType]>,
+    pub expert_down_dtypes: Option<&'a [DType]>,
+    pub expert_codec_tags: Option<&'a GpuTensor>,
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     pub expert_stage_ptrs: Option<hipfire_dispatch::families::moe::MoeStageTables<'a>>,
@@ -284,6 +310,11 @@ pub struct Qwen4MoeBinding<'a> {
     pub expert_down_entries: &'a [usize],
     pub layer_idx: u16,
     pub norm_topk_prob: bool,
+    /// The layer's routed experts are armed for the CPU splice
+    /// (`Qwen4MoeLayerRuntime::cpu_deferred_experts`, set at load). Layer-level
+    /// flag only: [`seal_moe_for_layer`] narrows it per call to a decode or
+    /// `<= QWEN4_CPU_SPLICE_MAX_ROWS`-row verify window.
+    pub cpu_deferred_experts: bool,
     /// Expert-parallel row exchange (`None` outside EP): installed into the
     /// one-row decode MoE and the few-row grouped prefill MoE so non-owned
     /// expanded rows are filled from their owners.
@@ -315,7 +346,6 @@ pub struct Qwen4LayerScratch<'a> {
     pub gdn_gate: &'a GpuTensor,
     pub gdn_beta: &'a GpuTensor,
     pub gdn_recurrent_output: &'a GpuTensor,
-    pub gdn_bf16: &'a GpuTensor,
     pub gdn_z: &'a GpuTensor,
     pub gdn_output: &'a GpuTensor,
     pub qsa_index: &'a GpuTensor,
@@ -399,7 +429,6 @@ pub fn execute_final_hyper(
             low: &view(scratch.hc_low, 0, low),
             up: &view(scratch.hc_up, 0, wide),
             mixed: &view(scratch.hc_mixed, 0, hidden),
-            bf16_scratch: scratch.gdn_bf16,
             rows,
             branches: dims.hc_count,
             hidden: dims.hidden,
@@ -518,7 +547,9 @@ fn lm_head_tile_rows(m: usize) -> Result<usize, DispatchError> {
     let row_bytes = m
         .checked_mul(DType::F32.size())
         .ok_or_else(|| DispatchError::Hip("Qwen4 LM-head logits row width overflows".into()))?;
-    let safe = LM_HEAD_OUTPUT_LIMIT_BYTES.checked_div(row_bytes).unwrap_or(0);
+    let safe = LM_HEAD_OUTPUT_LIMIT_BYTES
+        .checked_div(row_bytes)
+        .unwrap_or(0);
     if safe == 0 {
         return Err(DispatchError::Hip(format!(
             "Qwen4 LM-head logits row of {m} F32 values exceeds the {LM_HEAD_OUTPUT_LIMIT_BYTES}-byte projection output limit"
@@ -841,7 +872,10 @@ fn require_dense_weight(
 /// operation order.  The decode-vs-prefill route is decided on `route_rows`
 /// (`Gpu::route_rows(rows)`: the canonical chunk under the invariant prefill
 /// profile, so a one-row prefill still seals the grouped prefill call);
-/// `rows` sizes the call.
+/// `rows` sizes the call.  The one exception is the gfx942 qt=55 FP8 route
+/// ([`hipfire_dispatch::families::moe::MoeRouteCapability::Fp8B128Grouped`]): it has no indexed decode, so it
+/// always seals the grouped prefill call, one routing row included, over the
+/// same preallocated grouping scratch every other row count uses.
 pub fn seal_moe_for_layer<'a>(
     ctx: &'a hipfire_dispatch::context::DispatchCtx,
     dims: Qwen4ProgramDims,
@@ -850,17 +884,160 @@ pub fn seal_moe_for_layer<'a>(
     rows: usize,
     route_rows: usize,
 ) -> Result<hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>, DispatchError> {
+    if moe.routed_experts.tier_identity().is_some() {
+        validate_tier_moe_binding(&moe, moe_dims(dims)?.num_experts)?;
+    }
     let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
-    if route_rows == 1 {
-        let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch)?;
+    // Frozen per-call lab-wide verify width: the row-exact rows this GPU runs
+    // (the existing `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer / runtime oracle
+    // override, clamped `8..=64`). `8` (or below) is the default product route;
+    // above 8 is an explicit lab-wide eager-verify scope that may ask for the
+    // actual CPU-owned expert window. Ordinary prefill, lanes and the default
+    // route never observe wider here: their `route_rows` is the canonical chunk
+    // (a short tail keeps `rows != route_rows`) or their width exceeds the
+    // qualified capacity below.
+    let cpu_wide_verify_rows =
+        rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.arch.arch());
+    // Per-call actual eager-verify scope: the forward's `cpu_wide_verify`
+    // ctx flag (real verify call) AND the canonical override presence.
+    // Global presence alone never arms: a whole 64-row ordinary prefill has
+    // `rows == route_rows` too but its ctx flag stays false.
+    let cpu_lab_present = ctx.cpu_wide_verify()
+        && rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&ctx.arch.arch());
+    let cpu_wide_scope = hipfire_dispatch::families::moe::CpuWideVerifyScope::from_lab_presence(
+        cpu_lab_present,
+        cpu_wide_verify_rows,
+    );
+    // An armed layer splices only a window whose routing rows are its real rows
+    // (the invariant prefill profile pins `route_rows` to the canonical chunk, so
+    // a short prefill there keeps the PCIe grouped read) and which is at most
+    // the qualified width: the legacy 4-row gate by default, or the whole
+    // logical 1..64-row window inside an explicit lab-wide eager-verify scope
+    // with actual prewarmed host scratch (the admission owner's 64-row
+    // reservation; `cpu_d1_prewarmed_scratch_rows` reports `0` until that
+    // lands, so wide D1 stays refused — fail-closed, never a fake admission).
+    // Every wider/unqualified window is unchanged (PCIe grouped read).
+    let cpu_deferred = {
+        let legacy = hipfire_dispatch::cpu_split::cpu_splice_window(
+            moe.cpu_deferred_experts,
+            rows,
+            route_rows,
+        );
+        // Geometry-aware D1 capacity: this layer's expert dims + sealing
+        // device; the source reads actual prewarmed rows (host scratch bound
+        // by pinned-transfer stage rows), 0 until admission prewarms.
+        let d1_geo = moe_dims(dims).ok();
+        let (d1_mi, d1_top_k) = d1_geo
+            .map(|m| (m.intermediate, m.experts_per_token))
+            .unwrap_or((0, 0));
+        let d1_rows = hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows(
+            dims.hidden,
+            d1_mi,
+            d1_top_k,
+            ctx.device_id(),
+        );
+        legacy
+            || hipfire_dispatch::families::moe::cpu_d1_wide_window_qualified(
+                moe.cpu_deferred_experts,
+                rows,
+                route_rows,
+                cpu_wide_scope,
+                d1_rows,
+            )
+    };
+    if cpu_deferred
+        && (moe.route_policy.capability.is_fp8_grouped()
+            || moe.row_gather.is_some()
+            || moe.tile_exchange.is_some()
+            || moe.shared_down_out.is_some())
+    {
+        return Err(DispatchError::Hip(format!(
+            "Qwen4 layer {}: the CPU expert splice cannot combine with stock FP8 or expert parallelism",
+            moe.layer_idx
+        )));
+    }
+    if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
+        let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch, cpu_deferred)?;
         seal_decode(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 decode MoE: {error:?}")))
     } else {
-        let params = build_moe_prefill(dims, moe, scratch, scratch.moe_router_logits, rows)?;
+        let params = build_moe_prefill(
+            dims,
+            moe,
+            scratch,
+            scratch.moe_router_logits,
+            rows,
+            cpu_deferred,
+        )?;
+        // D2 wide qualification happens inside `select_prefill` (seal): the
+        // forward loop threads this call's canonical route rows through the
+        // dispatch context (`batch_size = route_rows`, so a short tail of a
+        // long prefill keeps `rows != route_rows` and the GPU route) while
+        // `params.batch_size` sizes the call. The frozen lab-wide scope is
+        // measured there from the arch. No whole-forward chunking: one logical
+        // 1..64-row window seals one forward with full-window state/capture.
+        let _ = cpu_wide_scope;
         seal_prefill(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 prefill MoE: {error:?}")))
     }
+}
+
+/// Constant-time per-seal proof that a tier layer's binding is the exact
+/// incumbent aggregate-MQ4 single-device route and nothing else.
+///
+/// A tier layer's identity (`RoutedExpertWeights::tier_identity`: generation,
+/// logical digest, per-expert placement and codec bytes, owner keepalive) is
+/// built once by the runtime from the loader's `LayerExpertTierView`; the sealed
+/// call retains it through the bound expert set. Its absolute pointer tables
+/// (`expert_gate_up_ptrs`/`expert_down_ptrs` device views and the host
+/// `expert_*_entries` mirrors) are the view's frozen tables, range-checked once
+/// at build against both tier owners (`Qwen4MoeLayerRuntime::build`). Nothing
+/// here derives placement from expert 0 or from an aggregate resident tensor.
+///
+/// Refused for a tier layer: EP (row gather / tile exchange), the sealed
+/// expert-slab route and its codec tables (tier codecs are all MQ4 and the
+/// route must stay the uniform MQ4 one, so no `expert_codec_tags` and no
+/// per-expert dtype tables) and stock FP8. `expert_stage_ptrs` is allowed: the
+/// tier staging path supplies dedicated host-only sparse stage tables, and dispatch
+/// keeps validating those staged pointers as for any staged layer.
+fn validate_tier_moe_binding(
+    moe: &Qwen4MoeBinding<'_>,
+    num_experts: usize,
+) -> Result<(), DispatchError> {
+    let refuse =
+        |why: &str| DispatchError::Hip(format!("Qwen4 expert-tier layer {}: {why}", moe.layer_idx));
+    if !matches!(
+        moe.route_policy.capability,
+        MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
+    ) {
+        return Err(refuse(
+            "tiers run only the aggregate MQ4 QT44/QT53 route (no FP8 or expert-slab capability)",
+        ));
+    }
+    if moe.row_gather.is_some() || moe.tile_exchange.is_some() || moe.shared_down_out.is_some() {
+        return Err(refuse("expert parallelism cannot use expert tiers"));
+    }
+    if moe.expert_codec_tags.is_some()
+        || moe.expert_gate_up_dtypes.is_some()
+        || moe.expert_down_dtypes.is_some()
+    {
+        return Err(refuse(
+            "tier layers are uniform MQ4 and carry no codec tag or per-expert dtype tables",
+        ));
+    }
+    if !moe.experts_all_gate_up_mq4 {
+        return Err(refuse("tier layers require MQ4 gate/up experts"));
+    }
+    if moe.routed_experts.len() != num_experts
+        || moe.expert_gate_up_entries.len() != num_experts
+        || moe.expert_down_entries.len() != num_experts
+    {
+        return Err(refuse(
+            "tier pointer entries and expert views must cover every expert of the layer",
+        ));
+    }
+    Ok(())
 }
 
 /// MoE extents of a program whose FFN is MoE; a dense program has no MoE
@@ -893,15 +1070,17 @@ fn moe_dims(dims: Qwen4ProgramDims) -> Result<MoeDims, DispatchError> {
 
 /// Build the indexed decode descriptor for a single-token layer invocation.
 ///
-/// Rows-one execution deliberately keeps the old decode contract: one
-/// normalized activation, GEMV-sized scratch, and `seal_decode`'s exact
-/// indexed route.  Grouped prefill descriptors are built only for a real
-/// multi-row tile.
+/// Rows-one execution of a QT44/QT53 layer deliberately keeps the old decode
+/// contract: one normalized activation, GEMV-sized scratch, and
+/// `seal_decode`'s exact indexed route.  Grouped prefill descriptors are
+/// built for every multi-row tile and, for the qt=55 FP8 layer, for one row
+/// too ([`seal_moe_for_layer`] never calls this for it).
 fn build_moe_decode<'a>(
     dims: Qwen4ProgramDims,
     moe: Qwen4MoeBinding<'a>,
     input: &'a GpuTensor,
     scratch: &'a Qwen4LayerScratch<'a>,
+    cpu_deferred_experts: bool,
 ) -> Result<MoeParams<'a>, DispatchError> {
     let moe_dims = moe_dims(dims)?;
     let (first_gate_up, first_down) = moe
@@ -920,10 +1099,10 @@ fn build_moe_decode<'a>(
         experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     Ok(MoeParams {
         dtypes,
@@ -939,9 +1118,10 @@ fn build_moe_decode<'a>(
         k: moe_dims.experts_per_token,
         n_exp: moe_dims.num_experts,
         norm_topk_prob: moe.norm_topk_prob,
+        selection_bias: None,
         x_rot_prerotated: false,
         defer_routed_combine: false,
-        cpu_deferred_experts: false,
+        cpu_deferred_experts,
         ep_mode: MoeEpMode::None,
         layer_idx: moe.layer_idx,
         x_norm: input,
@@ -968,7 +1148,7 @@ fn build_moe_decode<'a>(
             down: moe.expert_down_entries,
         }),
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         routed_gate_up_k: dims.hidden,
         routed_down_m: dims.hidden,
         routed_down_k: moe_dims.intermediate,
@@ -996,6 +1176,7 @@ fn build_moe_prefill<'a>(
     scratch: &'a Qwen4LayerScratch<'a>,
     router_matrix: &'a GpuTensor,
     rows: usize,
+    cpu_deferred_experts: bool,
 ) -> Result<MoePrefillParams<'a>, DispatchError> {
     let (first_gate_up, first_down) = moe
         .routed_experts
@@ -1028,10 +1209,10 @@ fn build_moe_prefill<'a>(
         experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     let prelude = MoePrefillPrelude {
         normalization: MoeNormalization::Provided,
@@ -1060,7 +1241,7 @@ fn build_moe_prefill<'a>(
         n_exp: moe_dims.num_experts,
         m_total_max,
         force_mq4_grouped_fp16: false,
-        cpu_deferred_experts: false,
+        cpu_deferred_experts,
         topk_indices: scratch.moe_topk_indices,
         topk_weights: scratch.moe_topk_weights,
         x_batch: scratch.ffn_output,
@@ -1071,7 +1252,7 @@ fn build_moe_prefill<'a>(
         expert_stage_ptrs: moe.expert_stage_ptrs,
         routed_experts: moe.routed_experts,
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         gate_batch: scratch.moe_gate_batch,
         up_batch: scratch.moe_up_batch,
         rot_batch: scratch.moe_rot_batch,
@@ -1091,7 +1272,534 @@ fn build_moe_prefill<'a>(
         shared_down_out: moe.shared_down_out,
         ep_layer_idx: moe.layer_idx,
         ep_tile_exchange: moe.tile_exchange,
+        expert_iu4: None,
     })
+}
+
+/// The HC streams: the only resource live across trunk layer boundaries, hence
+/// the operand of every pipeline `BandXfer`. Always the first declared
+/// resource of [`qwen4_step_graph_with_output`].
+pub const QWEN4_STREAMS_RESOURCE: ResourceId = ResourceId(0);
+
+/// The ladder of every Qwen4 dense FFN (`Step::GatedMlp` on the trunk), also
+/// declared on its [`SplitRule::GatedMlp`] so the splitter admits its shards.
+pub(crate) const QWEN4_DENSE_LADDER: MlpLadder = MlpLadder::Trunk;
+
+/// The FFN output rows (`scratch.ffn_output`): on a TP mesh the operand of
+/// every dense layer's `AllReduce`.
+pub const QWEN4_FFN_OUTPUT_RESOURCE: ResourceId = ResourceId(4);
+
+fn step_graph_error(error: StepGraphError) -> String {
+    format!("Qwen4 step graph: {error}")
+}
+
+/// [`qwen4_step_graph_with_output`] for a forward that computes logits but no
+/// top-1 rows.
+pub fn qwen4_step_graph(config: &Qwen4Config, route: MeshRoute) -> Result<StepGraph, String> {
+    qwen4_step_graph_with_output(config, route, true, false)
+}
+
+/// Pure declaration of the trunk program `forward_chunk_scoped` builds: one
+/// [`OpDecl`] per `Step` it emits per layer (the op kind is the `OpKind` of
+/// that `Step`), the input op (token embedding plus HC stream init: `Embed`)
+/// and, when `head`, the head ops the builder runs after the trunk (final HC
+/// read `HyperRead`, LM head `Project`, and with `top1` the `Argmax` of the
+/// requested rows). `top1` requires `head`, as in the builder.
+///
+/// Every op carries `layer: Some(_)` so its pipeline stage never depends on
+/// issue order: the input op is attributed to layer 0 and the head ops to the
+/// last layer, hence the input pin is the band owning layer 0 and the output
+/// pin the band owning the last layer. The wide-hidden capture is not an op:
+/// the output band's `forward_mesh_chunk` copies the final streams after the
+/// trunk ops. The graph is the same for every [`MeshRoute`]; row
+/// counts are not part of it (shapes are per row).
+///
+/// Per layer, in order: `GroupedDepthwise` (PLE layer only), `HyperRead`,
+/// `GatedDeltaNet` | `IndexedAttention`, `HyperWrite`, `HyperRead`, `Clear`
+/// (MoE only), `Moe` | `GatedMlp`, `HyperWrite`.
+///
+/// Only [`QWEN4_STREAMS_RESOURCE`] is written in one layer and read in the
+/// next. Scratch activations are written before they are read within one
+/// layer, and the PLE rows are a host-fed input read only at the PLE layer
+/// (input band). The only weight resources are a dense layer's FFN gate, up
+/// and down (the manifest names, BF16 so unpacked): its
+/// [`SplitRule::GatedMlp`] splits them on a TP mesh, whose partial output the
+/// next `HyperWrite` reduces first. Every other op is replicated; the graph
+/// declares no state resources.
+pub fn qwen4_step_graph_with_output(
+    config: &Qwen4Config,
+    _route: MeshRoute,
+    head: bool,
+    top1: bool,
+) -> Result<StepGraph, String> {
+    let layers = config.num_hidden_layers;
+    if layers == 0 || config.layer_types.len() != layers {
+        return Err(format!(
+            "Qwen4 step graph: {layers} layers with {} layer types",
+            config.layer_types.len()
+        ));
+    }
+    if top1 && !head {
+        return Err("Qwen4 step graph: top-1 rows require the LM head".to_string());
+    }
+    let ple_layer = config.ple.as_ref().map(|ple| ple.layer);
+    if ple_layer.is_some_and(|layer| layer >= layers) {
+        return Err("Qwen4 step graph: PLE layer is outside the trunk".to_string());
+    }
+    let mut graph = StepGraph::new();
+    let mut resource = |class: ResourceClass, shape: &[usize]| {
+        graph
+            .add_resource(ResourceDecl {
+                class,
+                shape: shape.to_vec(),
+                alias: None,
+            })
+            .map_err(step_graph_error)
+    };
+    let streams = resource(
+        ResourceClass::Activation,
+        &[config.hc_count, config.hidden_size],
+    )?;
+    debug_assert_eq!(streams, QWEN4_STREAMS_RESOURCE);
+    let tokens = resource(ResourceClass::Input, &[1])?;
+    let mixed = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    let attention_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    let ffn_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    debug_assert_eq!(ffn_output, QWEN4_FFN_OUTPUT_RESOURCE);
+    let ple_rows = match config.ple.as_ref() {
+        Some(ple) => Some(resource(
+            ResourceClass::Input,
+            &[ple.head_count * ple.row_width],
+        )?),
+        None => None,
+    };
+    let logits = resource(ResourceClass::Output, &[config.vocab_size])?;
+    let top1_rows = resource(ResourceClass::Output, &[1])?;
+
+    let mut ops: Vec<OpDecl> = Vec::new();
+    let mut op = |kind: OpKind,
+                  layer: usize,
+                  rule: SplitRule,
+                  reads: &[ResourceId],
+                  writes: &[ResourceId]| {
+        ops.push(OpDecl {
+            kind,
+            layer: Some(layer),
+            rule,
+            reads: reads.to_vec(),
+            writes: writes.to_vec(),
+        });
+    };
+    op(OpKind::Embed, 0, SplitRule::Opaque, &[tokens], &[streams]);
+    for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+        if let (Some(index), Some(rows)) = (ple_layer, ple_rows) {
+            if index == layer {
+                op(
+                    OpKind::GroupedDepthwise,
+                    layer,
+                    SplitRule::Opaque,
+                    &[streams, rows],
+                    &[streams],
+                );
+            }
+        }
+        op(
+            OpKind::HyperRead,
+            layer,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        op(
+            match kind {
+                LayerType::LinearAttention => OpKind::GatedDeltaNet,
+                LayerType::FullAttention => OpKind::IndexedAttention,
+            },
+            layer,
+            SplitRule::Opaque,
+            &[mixed],
+            &[attention_output],
+        );
+        op(
+            OpKind::HyperWrite,
+            layer,
+            SplitRule::RowComplete,
+            &[streams, attention_output],
+            &[streams],
+        );
+        op(
+            OpKind::HyperRead,
+            layer,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        match config.ffn {
+            Qwen4FfnConfig::Moe { .. } => {
+                op(
+                    OpKind::Clear,
+                    layer,
+                    SplitRule::Pointwise,
+                    &[],
+                    &[ffn_output],
+                );
+                op(
+                    OpKind::Moe,
+                    layer,
+                    SplitRule::Opaque,
+                    &[mixed],
+                    &[ffn_output],
+                );
+            }
+            Qwen4FfnConfig::Dense {
+                intermediate_size, ..
+            } => {
+                let hidden = config.hidden_size;
+                let mlp = format!("model.language_model.layers.{layer}.mlp");
+                let mut weight = |name: &str, shape: [usize; 2]| {
+                    resource(
+                        ResourceClass::Weight {
+                            name: format!("{mlp}.{name}.weight"),
+                            layer: Some(layer),
+                            group: 1,
+                        },
+                        &shape,
+                    )
+                };
+                let gate = weight("gate_proj", [intermediate_size, hidden])?;
+                let up = weight("up_proj", [intermediate_size, hidden])?;
+                let down = weight("down_proj", [hidden, intermediate_size])?;
+                op(
+                    OpKind::GatedMlp,
+                    layer,
+                    SplitRule::GatedMlp {
+                        input: mixed,
+                        gate,
+                        up,
+                        down,
+                        output: ffn_output,
+                        ladder: QWEN4_DENSE_LADDER,
+                    },
+                    &[mixed, gate, up, down],
+                    &[ffn_output],
+                );
+            }
+        }
+        op(
+            OpKind::HyperWrite,
+            layer,
+            SplitRule::RowComplete,
+            &[streams, ffn_output],
+            &[streams],
+        );
+    }
+    if head {
+        let last = layers - 1;
+        op(
+            OpKind::HyperRead,
+            last,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        op(
+            OpKind::Project,
+            last,
+            SplitRule::Opaque,
+            &[mixed],
+            &[logits],
+        );
+        if top1 {
+            op(
+                OpKind::Argmax,
+                last,
+                SplitRule::RowComplete,
+                &[logits],
+                &[top1_rows],
+            );
+        }
+    }
+    for decl in ops {
+        graph.add_op(decl).map_err(step_graph_error)?;
+    }
+    Ok(graph)
+}
+
+/// Ops of `graph` (a [`qwen4_step_graph_with_output`] graph) that a rank owning
+/// `scope` runs, in issue order: every op attributed to a layer of the band.
+/// The input op (layer 0) is therefore only on the input band and the head ops
+/// (last layer) only on the output band.
+pub fn qwen4_rank_op_ids(graph: &StepGraph, scope: &Qwen4BandScope) -> Vec<OpId> {
+    graph
+        .ops()
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.layer.is_some_and(|layer| scope.band.contains(&layer)))
+        .map(|(index, _)| OpId(index as u32))
+        .collect()
+}
+
+#[cfg(test)]
+mod step_graph_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+    use crate::weights::Qwen4Manifest;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+    use hipfire_runtime::mesh_placement::BandPlacement;
+    use hipfire_runtime::mesh_split::{split_program, CollectiveKind, RankItem, SplitPlan};
+    use hipfire_runtime::weight_manifest::plan_manifest;
+
+    fn expected_kinds(config: &Qwen4Config, head: bool, top1: bool) -> Vec<(OpKind, usize)> {
+        let moe = matches!(config.ffn, Qwen4FfnConfig::Moe { .. });
+        let mut out = vec![(OpKind::Embed, 0)];
+        for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+            if config.ple.as_ref().is_some_and(|ple| ple.layer == layer) {
+                out.push((OpKind::GroupedDepthwise, layer));
+            }
+            out.push((OpKind::HyperRead, layer));
+            out.push((
+                match kind {
+                    LayerType::LinearAttention => OpKind::GatedDeltaNet,
+                    LayerType::FullAttention => OpKind::IndexedAttention,
+                },
+                layer,
+            ));
+            out.push((OpKind::HyperWrite, layer));
+            out.push((OpKind::HyperRead, layer));
+            if moe {
+                out.push((OpKind::Clear, layer));
+                out.push((OpKind::Moe, layer));
+            } else {
+                out.push((OpKind::GatedMlp, layer));
+            }
+            out.push((OpKind::HyperWrite, layer));
+        }
+        let last = config.num_hidden_layers - 1;
+        if head {
+            out.push((OpKind::HyperRead, last));
+            out.push((OpKind::Project, last));
+        }
+        if top1 {
+            out.push((OpKind::Argmax, last));
+        }
+        out
+    }
+
+    fn kinds(graph: &StepGraph) -> Vec<(OpKind, usize)> {
+        graph
+            .ops()
+            .iter()
+            .map(|op| (op.kind, op.layer.expect("every op is layer-attributed")))
+            .collect()
+    }
+
+    fn split(
+        config: &Qwen4Config,
+        counts: &[usize],
+        head: bool,
+        top1: bool,
+    ) -> (StepGraph, SplitPlan, BandPlacement) {
+        let graph = qwen4_step_graph_with_output(config, MeshRoute::Prefill, head, top1).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+        let placement = BandPlacement::from_counts(&mesh, config.num_hidden_layers, counts)
+            .unwrap()
+            .with_first_band_min(2)
+            .unwrap();
+        // The real declaration authority: the Qwen4 manifest's weights and
+        // state (PLE conv state pinned to the input stage).
+        let manifest = Qwen4Manifest::build(config).unwrap();
+        let plan = plan_manifest(
+            &manifest.weights,
+            &manifest.state,
+            &mesh,
+            config.num_hidden_layers,
+            &placement,
+        )
+        .unwrap();
+        let split = split_program(&graph, &plan, &mesh).unwrap();
+        (graph, split, placement)
+    }
+
+    #[test]
+    fn graph_matches_the_trunk_builder_step_order() {
+        let config = compact_test_config();
+        for (head, top1) in [(true, false), (true, true), (false, false)] {
+            let graph =
+                qwen4_step_graph_with_output(&config, MeshRoute::Decode, head, top1).unwrap();
+            assert_eq!(kinds(&graph), expected_kinds(&config, head, top1));
+            // Identical for every route.
+            for route in [MeshRoute::Prefill, MeshRoute::Verify] {
+                assert_eq!(
+                    qwen4_step_graph_with_output(&config, route, head, top1).unwrap(),
+                    graph
+                );
+            }
+        }
+        assert_eq!(
+            qwen4_step_graph(&config, MeshRoute::Decode).unwrap(),
+            qwen4_step_graph_with_output(&config, MeshRoute::Decode, true, false).unwrap()
+        );
+        assert!(qwen4_step_graph_with_output(&config, MeshRoute::Decode, false, true).is_err());
+        let graph = qwen4_step_graph(&config, MeshRoute::Decode).unwrap();
+        assert_eq!(
+            graph.resources()[QWEN4_STREAMS_RESOURCE.0 as usize].class,
+            ResourceClass::Activation
+        );
+    }
+
+    #[test]
+    fn dense_and_no_ple_variants_follow_the_config() {
+        let mut config = compact_test_config();
+        config.ffn = Qwen4FfnConfig::Dense {
+            intermediate_size: 1024,
+        };
+        config.ple = None;
+        let graph = qwen4_step_graph(&config, MeshRoute::Decode).unwrap();
+        assert_eq!(kinds(&graph), expected_kinds(&config, true, false));
+        assert!(graph.ops().iter().all(|op| !matches!(
+            op.kind,
+            OpKind::GroupedDepthwise | OpKind::Clear | OpKind::Moe
+        )));
+    }
+
+    #[test]
+    fn bad_config_is_refused() {
+        let mut config = compact_test_config();
+        config.layer_types.pop();
+        assert!(qwen4_step_graph(&config, MeshRoute::Decode).is_err());
+    }
+
+    fn assert_split(counts: &[usize], head: bool, top1: bool) {
+        assert_split_config(&compact_test_config(), counts, head, top1);
+    }
+
+    fn assert_split_config(config: &Qwen4Config, counts: &[usize], head: bool, top1: bool) {
+        assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
+        let (graph, plan, placement) = split(config, counts, head, top1);
+        let stages = counts.len();
+        assert_eq!(plan.ranks.len(), stages);
+
+        // Every op runs on exactly one band: the one owning its layer (input
+        // op on band 0, head ops on the output band).
+        let mut owner = vec![None; graph.ops().len()];
+        for rank in &plan.ranks {
+            for item in &rank.items {
+                if let RankItem::Op(op) = item {
+                    assert!(
+                        owner[op.0 as usize].replace(rank.device).is_none(),
+                        "op {} placed twice",
+                        op.0
+                    );
+                }
+            }
+        }
+        for (index, decl) in graph.ops().iter().enumerate() {
+            let stage = placement.stage_of_layer(decl.layer.unwrap());
+            assert_eq!(owner[index], Some(stage), "op {index} {:?}", decl.kind);
+        }
+        assert_eq!(owner[0], Some(0), "input op on the input band");
+        assert_eq!(
+            owner[graph.ops().len() - 1],
+            Some(stages - 1),
+            "last op on the output band"
+        );
+
+        // Exactly one BandXfer of the streams per edge, nothing else.
+        assert_eq!(plan.collectives.len(), stages - 1);
+        for (edge, collective) in plan.collectives.iter().enumerate() {
+            assert_eq!(
+                collective.kind,
+                CollectiveKind::BandXfer {
+                    src: edge,
+                    dst: edge + 1
+                }
+            );
+            assert_eq!(collective.operand, QWEN4_STREAMS_RESOURCE);
+            assert_eq!(collective.group, vec![edge, edge + 1]);
+            let producer = &graph.ops()[collective.producer.0 as usize];
+            assert_eq!(producer.kind, OpKind::HyperWrite);
+            assert_eq!(producer.layer, Some(placement.band(edge).end - 1));
+        }
+
+        // Rank programs: receive, run the band's ops, publish.
+        for rank in &plan.ranks {
+            let stage = rank.device;
+            let scope = Qwen4BandScope {
+                band: placement.band(stage),
+                input: stage == 0,
+                output: stage + 1 == stages,
+            };
+            let ops: Vec<OpId> = rank
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RankItem::Op(op) => Some(*op),
+                    RankItem::Collective(_) => None,
+                })
+                .collect();
+            assert_eq!(ops, qwen4_rank_op_ids(&graph, &scope), "stage {stage}");
+            let collectives: Vec<usize> = rank
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(item, RankItem::Collective(_)))
+                .map(|(position, _)| position)
+                .collect();
+            let expected = usize::from(stage > 0) + usize::from(stage + 1 < stages);
+            assert_eq!(collectives.len(), expected, "stage {stage}");
+            if stage > 0 {
+                assert_eq!(collectives[0], 0, "receive precedes the band's ops");
+            }
+            if stage + 1 < stages {
+                assert_eq!(
+                    *collectives.last().unwrap(),
+                    rank.items.len() - 1,
+                    "publish follows the band's ops"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pp2_even_split_places_every_op_once_with_one_streams_edge() {
+        assert_split(&[24, 24], true, true);
+        assert_split(&[24, 24], false, false);
+    }
+
+    #[test]
+    fn pp6_uneven_split_places_every_op_once_with_streams_edges() {
+        assert_split(&[9, 8, 8, 8, 8, 7], true, true);
+        assert_split(&[9, 8, 8, 8, 8, 7], true, false);
+        assert_split(&[9, 8, 8, 8, 8, 7], false, false);
+    }
+
+    /// A dense profile's PP stage is one TP part: its declared FFN weights run
+    /// locally, so the streams transfers stay the only collectives.
+    #[test]
+    fn dense_pp_split_keeps_only_streams_edges() {
+        let ffn = Qwen4FfnConfig::Dense {
+            intermediate_size: 8,
+        };
+        let config = crate::config::synthetic_test_config(ffn, 16, 4, false, false);
+        for (head, top1) in [(true, true), (false, false)] {
+            assert_split_config(&config, &[2, 2], head, top1);
+            assert_split_config(&config, &[2, 1, 1], head, top1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod expert_iu4_binding_tests {
+    /// Qwen4 binds the FN symmetric route elsewhere; its prefill constructor must
+    /// never carry the Qwen35 expert IU4 capability.
+    #[test]
+    fn moe_prefill_constructor_binds_no_expert_iu4() {
+        let src = include_str!("program.rs");
+        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
+        assert_eq!(production.matches("MoePrefillParams {").count(), 1);
+        assert_eq!(production.matches("expert_iu4:").count(), 1);
+        assert_eq!(production.matches("expert_iu4: None,").count(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1133,7 +1841,9 @@ mod lm_head_tile_tests {
 
     #[test]
     fn ragged_row_counts_are_covered_exactly() {
-        for rows in [1usize, 2, 255, 257, 2047, 2049, 4097, 4607, 6145, 8191, 8193, 10_000] {
+        for rows in [
+            1usize, 2, 255, 257, 2047, 2049, 4097, 4607, 6145, 8191, 8193, 10_000,
+        ] {
             assert_exact_safe(VOCAB, rows);
         }
     }

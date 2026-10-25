@@ -118,18 +118,30 @@ fn run_shape(gpu: &mut Gpu, m: usize, k: usize, label: &str) {
 
     let y_gemv_h = gpu.download_f32(&y_gemv).expect("download gemv");
     let y_gemm1_h = gpu.download_f32(&y_gemm1).expect("download gemm1");
-    let (a_abs, a_rel) =
-        max_err(&y_gemm1_h, &y_gemv_h, &format!("{label} TestA batch=1"));
+    let (a_abs, a_rel) = max_err(&y_gemm1_h, &y_gemv_h, &format!("{label} TestA batch=1"));
     {
         let g = gpu.download_f32(&y_gemv).expect("dl gemv");
         let nz = g.iter().filter(|v| **v != 0.0).count();
         let mx = g.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-        eprintln!("     oracle out: {} / {} nonzero, max|y|={:.4e}", nz, g.len(), mx);
+        eprintln!(
+            "     oracle out: {} / {} nonzero, max|y|={:.4e}",
+            nz,
+            g.len(),
+            mx
+        );
         // Guard the trivially-passing failure mode: if BOTH kernels emitted
         // zeros, every max_abs below would read 0.000e0 and the comparison
         // would prove nothing. Require the oracle to have done real work.
-        assert!(nz == g.len(), "oracle produced {} zero outputs of {}", g.len() - nz, g.len());
-        assert!(mx > 1.0, "oracle output magnitude {mx:.3e} too small to discriminate");
+        assert!(
+            nz == g.len(),
+            "oracle produced {} zero outputs of {}",
+            g.len() - nz,
+            g.len()
+        );
+        assert!(
+            mx > 1.0,
+            "oracle output magnitude {mx:.3e} too small to discriminate"
+        );
     }
     eprintln!("  A: batch=1 vs gemv   max_abs={a_abs:.3e}  max_rel={a_rel:.3e}");
 
@@ -200,8 +212,18 @@ fn main() {
     //   shapes the assignment names: m=2048/k=3840 and m=3840/k=15360.
     // Group-boundary K: 768 = 3×256, not a multiple of 1024.
     run_shape(&mut gpu, 2048, 3840, "gemma4-12b v_proj    m=2048  k=3840");
-    run_shape(&mut gpu, 3840, 15360, "gemma4-12b down_proj m=3840  k=15360");
-    run_shape(&mut gpu, 512, 768, "group-boundary         m=512   k=768  (K%256=0, K%1024≠0)");
+    run_shape(
+        &mut gpu,
+        3840,
+        15360,
+        "gemma4-12b down_proj m=3840  k=15360",
+    );
+    run_shape(
+        &mut gpu,
+        512,
+        768,
+        "group-boundary         m=512   k=768  (K%256=0, K%1024≠0)",
+    );
 
     eprintln!("PASS: all shapes ran without error.");
 }

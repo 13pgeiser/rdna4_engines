@@ -396,7 +396,10 @@ fn cpu_ref(wbytes: &[u8], k: usize, row: usize, xrow: &[f32]) -> f64 {
         let off = (row * gpr + g) * GROUP_BYTES;
         let mut cb = [0f32; 4];
         for (j, slot) in cb.iter_mut().enumerate() {
-            *slot = f16_to_f32(u16::from_le_bytes([wbytes[off + 2 * j], wbytes[off + 2 * j + 1]]));
+            *slot = f16_to_f32(u16::from_le_bytes([
+                wbytes[off + 2 * j],
+                wbytes[off + 2 * j + 1],
+            ]));
         }
         for c in 0..256 {
             let byte = wbytes[off + 8 + c / 4];
@@ -583,7 +586,12 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
     assert_eq!(m % 16, 0, "M must be a multiple of 16 for the 16-row tile");
 
-    let r = build_routing(n_tokens, k_top, n_experts, 0xD15EA5E ^ (m as u64) ^ ((k as u64) << 8));
+    let r = build_routing(
+        n_tokens,
+        k_top,
+        n_experts,
+        0xD15EA5E ^ (m as u64) ^ ((k as u64) << 8),
+    );
     let row_tiles = m.div_ceil(16);
     let slot_tiles = r.m_total_max / 16;
     let per_expert_bytes = m * gpr * GROUP_BYTES;
@@ -610,7 +618,11 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
     );
 
     // ── device buffers shared by every phase ────────────────────────────────
-    let x_rows = if x_row_div > 1 { n_tokens } else { n_tokens * k_top };
+    let x_rows = if x_row_div > 1 {
+        n_tokens
+    } else {
+        n_tokens * k_top
+    };
 
     let tile_t = gpu
         .upload_raw(
@@ -643,7 +655,10 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
     let wptrs: Vec<u64> = w_tensors.iter().map(|t| t.buf.as_ptr() as u64).collect();
     let wptr_t = gpu
         .upload_raw(
-            &wptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+            &wptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_experts],
         )
         .expect("upload expert_weight_ptrs");
@@ -678,6 +693,7 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
         b.push_i32(k as i32);
         b.push_i32(x_row_div as i32);
         b.push_i32(r.m_total_max as i32);
+        b.push_i32((wptr_t.buf.size() / 8) as i32);
         b.into_vec()
     };
 
@@ -800,6 +816,7 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
         b.push_i32(k as i32);
         b.push_i32(x_row_div as i32);
         b.push_i32(r.m_total_max as i32);
+        b.push_i32((wptr_t.buf.size() / 8) as i32);
         b.into_vec()
     };
 
@@ -859,10 +876,8 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
         drop(host_w);
 
         let st = error_stats(&samples);
-        let ok = !samples.is_empty()
-            && nonfinite == 0
-            && st.norm_err <= tol
-            && st.max_rel_wc <= tol;
+        let ok =
+            !samples.is_empty() && nonfinite == 0 && st.norm_err <= tol && st.max_rel_wc <= tol;
         // B2 is informational: it measures the kernel family's inherent fp16
         // bilinear-reconstruction deviation, gated loosely for gross defects.
         if kind == CbKind::Exact {
@@ -874,9 +889,7 @@ fn run_shape(gpu: &mut Gpu, sh: &Shape) -> bool {
             CbKind::Lloyd => "realistic Lloyd-Max codebook (INFORMATIONAL)",
         };
         println!();
-        println!(
-            "  [Phase {phase}] numeric parity vs independent CPU reference — {kind_txt}"
-        );
+        println!("  [Phase {phase}] numeric parity vs independent CPU reference — {kind_txt}");
         println!(
             "    {} sampled outputs across all {} used tiles   ref rms = {:.6e}",
             samples.len(),

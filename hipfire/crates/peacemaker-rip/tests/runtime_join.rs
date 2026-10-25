@@ -5,12 +5,12 @@
 //! show this (its raw instructions never touch its ledger), and the
 //! builder's own barrier repair would mask a missing wait, so the proof is
 //! the ledger *before* the publishing barrier.
+use peacemaker_author::runtime::{Driver, Phase, Transition};
+use peacemaker_author::{Gfx1151, Gfx1201, Target};
 use peacemaker_isa::insn::{Instruction, MemoryClass};
 use peacemaker_isa::ledger::Counter;
 use peacemaker_isa::reg::{Kind, Live, RegRef};
 use peacemaker_isa::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
-use peacemaker_author::runtime::{Driver, Phase, Transition};
-use peacemaker_author::{Gfx1151, Gfx1201, Target};
 
 fn probe(arch: Arch) -> Builder {
     let mut plan = RegPlan::new(16, 8).unwrap();
@@ -38,10 +38,19 @@ fn probe(arch: Arch) -> Builder {
     )
 }
 fn v(n: u8) -> RegRef {
-    RegRef { kind: Kind::V, base: n, len: 1 }
+    RegRef {
+        kind: Kind::V,
+        base: n,
+        len: 1,
+    }
 }
 fn store(o: u32) -> Instruction {
-    Instruction::new(format!("ds_store_b32 v2, v0 offset:{o}"), vec![], vec![v(2), v(0)]).memory(MemoryClass::DsStore)
+    Instruction::new(
+        format!("ds_store_b32 v2, v0 offset:{o}"),
+        vec![],
+        vec![v(2), v(0)],
+    )
+    .memory(MemoryClass::DsStore)
 }
 fn cmp(text: &str) -> Instruction {
     Instruction::new(text, vec![], vec![])
@@ -58,7 +67,10 @@ fn joined_frontier<T: Target>(arch: Arch, counter: Counter) {
         d.isa().wait(counter, 0) // raw drain of this path only
     })
     .unwrap();
-    assert!(d.isa().ledger().pending_stores(), "e0 is still outstanding on the skipped path");
+    assert!(
+        d.isa().ledger().pending_stores(),
+        "e0 is still outstanding on the skipped path"
+    );
     d.wait(r).unwrap();
     assert!(
         !d.isa().ledger().pending_stores(),

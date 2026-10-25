@@ -70,8 +70,8 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::tokenizer::Tokenizer;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
     use rdna_compute::sampling::SlotSampleParams;

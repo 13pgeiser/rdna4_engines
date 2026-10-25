@@ -22,7 +22,10 @@ mod gate {
     struct Lcg(u64);
     impl Lcg {
         fn f(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         }
         fn vec(&mut self, n: usize, scale: f32, bias: f32) -> Vec<f32> {
@@ -124,7 +127,19 @@ mod gate {
 
     fn gdn_single(gpu: &mut Gpu, io: &GdnIo, st: &GdnState) -> HipResult<()> {
         gpu.gated_delta_net_q8_compact(
-            &io.q, &io.k, &io.v, &io.gate, &io.beta, &st.sq, &st.sc, &st.out, 1, GH, HD, 3, st.ef.as_ref(),
+            &io.q,
+            &io.k,
+            &io.v,
+            &io.gate,
+            &io.beta,
+            &st.sq,
+            &st.sc,
+            &st.out,
+            1,
+            GH,
+            HD,
+            3,
+            st.ef.as_ref(),
         )
     }
 
@@ -181,7 +196,11 @@ mod gate {
                 let st = GdnState {
                     sq: up_raw(gpu, &r.bytes(GH * HD * HD))?,
                     sc: up_f(gpu, &r.vec(GH * HD, 0.004, 0.006))?,
-                    ef: if row % 2 == 1 { Some(up_raw(gpu, &r.halves(GH * HD * HD))?) } else { None },
+                    ef: if row % 2 == 1 {
+                        Some(up_raw(gpu, &r.halves(GH * HD * HD))?)
+                    } else {
+                        None
+                    },
                     out: up_f(gpu, &vec![0.0; GH * HD])?,
                 };
                 for _ in 0..3 {
@@ -192,17 +211,34 @@ mod gate {
                 ios.push(gdn_io(gpu, &mut r)?);
                 states.push(st);
             }
-            let twin: Vec<GdnState> = states.iter().map(|s| gdn_dup(gpu, s)).collect::<HipResult<_>>()?;
-            let shifted: Vec<GdnState> = states.iter().map(|s| gdn_dup(gpu, s)).collect::<HipResult<_>>()?;
+            let twin: Vec<GdnState> = states
+                .iter()
+                .map(|s| gdn_dup(gpu, s))
+                .collect::<HipResult<_>>()?;
+            let shifted: Vec<GdnState> = states
+                .iter()
+                .map(|s| gdn_dup(gpu, s))
+                .collect::<HipResult<_>>()?;
             // Reference: per-row singleton launches in row order, frames F, F+1, ...
             let frame0 = rdna_compute::norm::gdn_requant_frame_checkpoint();
             for (io, st) in ios.iter().zip(&states) {
                 gdn_single(gpu, io, st)?;
             }
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame0);
-            let rows: Vec<GdnRow> = ios.iter().zip(&twin).map(|(io, s)| gdn_row(io, s)).collect();
+            let rows: Vec<GdnRow> = ios
+                .iter()
+                .zip(&twin)
+                .map(|(io, s)| gdn_row(io, s))
+                .collect();
             let table = staging(gpu, rows.len() * 72)?;
-            gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &rows, &tags(k), &tags(k), 1, GH)?;
+            gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                &table,
+                &rows,
+                &tags(k),
+                &tags(k),
+                1,
+                GH,
+            )?;
             gpu.gated_delta_net_q8_compact3_b2_rows(&table, k, 1, GH, HD)?;
             gpu.hip.device_synchronize()?;
             let mut all = true;
@@ -213,21 +249,41 @@ mod gate {
                 }
                 all &= same;
             }
-            c.check(all, &format!("gdn k={k}: every row's output+S_q8+scales+EF bitwise == per-row singleton"));
+            c.check(
+                all,
+                &format!(
+                    "gdn k={k}: every row's output+S_q8+scales+EF bitwise == per-row singleton"
+                ),
+            );
             let live = bytes(gpu, &states[0].out)?.iter().any(|&b| b != 0);
-            c.check(live, &format!("gdn k={k}: singleton output is non-zero (comparison not vacuous)"));
+            c.check(
+                live,
+                &format!("gdn k={k}: singleton output is non-zero (comparison not vacuous)"),
+            );
             // Wrong-frame control: the same twin launched one frame late.
             // Stochastic-rounding rows (no EF, even rows) must change, so the
             // per-row frame binding is really tested; EF rows round
             // deterministically and must not.
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame0 + 1);
-            let srows: Vec<GdnRow> = ios.iter().zip(&shifted).map(|(io, s)| gdn_row(io, s)).collect();
-            gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &srows, &tags(k), &tags(k), 1, GH)?;
+            let srows: Vec<GdnRow> = ios
+                .iter()
+                .zip(&shifted)
+                .map(|(io, s)| gdn_row(io, s))
+                .collect();
+            gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                &table,
+                &srows,
+                &tags(k),
+                &tags(k),
+                1,
+                GH,
+            )?;
             gpu.gated_delta_net_q8_compact3_b2_rows(&table, k, 1, GH, HD)?;
             gpu.hip.device_synchronize()?;
             let mut frame_ok = true;
             for row in 0..k {
-                let changed = gdn_state_bytes(gpu, &states[row])? != gdn_state_bytes(gpu, &shifted[row])?;
+                let changed =
+                    gdn_state_bytes(gpu, &states[row])? != gdn_state_bytes(gpu, &shifted[row])?;
                 frame_ok &= changed == states[row].ef.is_none();
             }
             c.check(
@@ -241,30 +297,70 @@ mod gate {
                 let mut alias = rows.clone();
                 alias[1].s_q8 = alias[0].s_q8;
                 c.check(
-                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &alias, &tags(k), &tags(k), 1, GH).is_err(),
+                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                        &table,
+                        &alias,
+                        &tags(k),
+                        &tags(k),
+                        1,
+                        GH,
+                    )
+                    .is_err(),
                     &format!("gdn k={k}: row 1 pointed at row 0's state refused"),
                 );
                 let mut alias = rows.clone();
                 alias[1].output = alias[0].output + 4;
                 c.check(
-                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &alias, &tags(k), &tags(k), 1, GH).is_err(),
+                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                        &table,
+                        &alias,
+                        &tags(k),
+                        &tags(k),
+                        1,
+                        GH,
+                    )
+                    .is_err(),
                     &format!("gdn k={k}: overlapping output refused"),
                 );
                 let mut wrong = tags(k);
                 wrong.swap(0, 1);
                 c.check(
-                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &rows, &wrong, &tags(k), 1, GH).is_err(),
+                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                        &table,
+                        &rows,
+                        &wrong,
+                        &tags(k),
+                        1,
+                        GH,
+                    )
+                    .is_err(),
                     &format!("gdn k={k}: wrong-row tags refused"),
                 );
                 let mut null = rows.clone();
                 null[k - 1].v = 0;
                 c.check(
-                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(&table, &null, &tags(k), &tags(k), 1, GH).is_err(),
+                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                        &table,
+                        &null,
+                        &tags(k),
+                        &tags(k),
+                        1,
+                        GH,
+                    )
+                    .is_err(),
                     &format!("gdn k={k}: null input refused"),
                 );
                 let small = staging(gpu, (k - 1) * 72)?;
                 c.check(
-                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(&small, &rows, &tags(k), &tags(k), 1, GH).is_err(),
+                    gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                        &small,
+                        &rows,
+                        &tags(k),
+                        &tags(k),
+                        1,
+                        GH,
+                    )
+                    .is_err(),
                     &format!("gdn k={k}: undersized row-table staging refused"),
                 );
                 gpu.free_tensor(small)?;
@@ -295,7 +391,18 @@ mod gate {
 
     fn conv_single(gpu: &mut Gpu, b: &ConvBufs, w: &GpuTensor) -> HipResult<()> {
         gpu.conv1d_silu_split_qknorm(
-            &b.q, &b.k, &b.v, &b.input, w, &b.state, CK, CV, GQK, HD, 1.0 / (HD as f32).sqrt(), 1e-6,
+            &b.q,
+            &b.k,
+            &b.v,
+            &b.input,
+            w,
+            &b.state,
+            CK,
+            CV,
+            GQK,
+            HD,
+            1.0 / (HD as f32).sqrt(),
+            1e-6,
         )
     }
     fn conv_bytes(gpu: &Gpu, b: &ConvBufs) -> HipResult<Vec<u8>> {
@@ -315,7 +422,13 @@ mod gate {
         })
     }
     fn conv_row(b: &ConvBufs) -> ConvRow {
-        ConvRow { q_out: p(&b.q), k_out: p(&b.k), v_out: p(&b.v), input: p(&b.input), state: p(&b.state) }
+        ConvRow {
+            q_out: p(&b.q),
+            k_out: p(&b.k),
+            v_out: p(&b.v),
+            input: p(&b.input),
+            state: p(&b.state),
+        }
     }
 
     pub fn conv(gpu: &mut Gpu, c: &mut Checks) -> HipResult<()> {
@@ -341,18 +454,58 @@ mod gate {
                 }
                 refs.push(b);
             }
-            let twin: Vec<ConvBufs> = refs.iter().map(|b| conv_dup(gpu, b)).collect::<HipResult<_>>()?;
-            let perm: Vec<ConvBufs> = refs.iter().map(|b| conv_dup(gpu, b)).collect::<HipResult<_>>()?;
+            let twin: Vec<ConvBufs> = refs
+                .iter()
+                .map(|b| conv_dup(gpu, b))
+                .collect::<HipResult<_>>()?;
+            let perm: Vec<ConvBufs> = refs
+                .iter()
+                .map(|b| conv_dup(gpu, b))
+                .collect::<HipResult<_>>()?;
             for b in &refs {
                 conv_single(gpu, b, &w)?;
             }
             let table = staging(gpu, k * 40)?;
             let rows: Vec<ConvRow> = twin.iter().map(conv_row).collect();
-            gpu.stage_conv1d_silu_split_qknorm_b256_rows(&table, &rows, &tags(k), &tags(k), CK, CV)?;
-            gpu.conv1d_silu_split_qknorm_b256_rows(&table, k, &w, CK, CV, GQK, HD, 1.0 / (HD as f32).sqrt(), 1e-6)?;
+            gpu.stage_conv1d_silu_split_qknorm_b256_rows(
+                &table,
+                &rows,
+                &tags(k),
+                &tags(k),
+                CK,
+                CV,
+            )?;
+            gpu.conv1d_silu_split_qknorm_b256_rows(
+                &table,
+                k,
+                &w,
+                CK,
+                CV,
+                GQK,
+                HD,
+                1.0 / (HD as f32).sqrt(),
+                1e-6,
+            )?;
             let prow: Vec<ConvRow> = perm.iter().rev().map(conv_row).collect();
-            gpu.stage_conv1d_silu_split_qknorm_b256_rows(&table, &prow, &tags(k), &tags(k), CK, CV)?;
-            gpu.conv1d_silu_split_qknorm_b256_rows(&table, k, &w, CK, CV, GQK, HD, 1.0 / (HD as f32).sqrt(), 1e-6)?;
+            gpu.stage_conv1d_silu_split_qknorm_b256_rows(
+                &table,
+                &prow,
+                &tags(k),
+                &tags(k),
+                CK,
+                CV,
+            )?;
+            gpu.conv1d_silu_split_qknorm_b256_rows(
+                &table,
+                k,
+                &w,
+                CK,
+                CV,
+                GQK,
+                HD,
+                1.0 / (HD as f32).sqrt(),
+                1e-6,
+            )?;
             gpu.hip.device_synchronize()?;
             let (mut all, mut all_p) = (true, true);
             for row in 0..k {
@@ -360,21 +513,46 @@ mod gate {
                 all &= want == conv_bytes(gpu, &twin[row])?;
                 all_p &= want == conv_bytes(gpu, &perm[row])?;
             }
-            c.check(all, &format!("conv k={k}: every row's q/k/v + conv state bitwise == per-row singleton"));
+            c.check(
+                all,
+                &format!("conv k={k}: every row's q/k/v + conv state bitwise == per-row singleton"),
+            );
             let live = bytes(gpu, &refs[0].q)?.iter().any(|&b| b != 0);
-            c.check(live, &format!("conv k={k}: singleton q_out is non-zero (comparison not vacuous)"));
-            c.check(all_p, &format!("conv k={k}: reversed row table still bitwise per row"));
+            c.check(
+                live,
+                &format!("conv k={k}: singleton q_out is non-zero (comparison not vacuous)"),
+            );
+            c.check(
+                all_p,
+                &format!("conv k={k}: reversed row table still bitwise per row"),
+            );
             if k >= 2 {
                 let mut alias = rows.clone();
                 alias[1].state = alias[0].state;
                 c.check(
-                    gpu.stage_conv1d_silu_split_qknorm_b256_rows(&table, &alias, &tags(k), &tags(k), CK, CV).is_err(),
+                    gpu.stage_conv1d_silu_split_qknorm_b256_rows(
+                        &table,
+                        &alias,
+                        &tags(k),
+                        &tags(k),
+                        CK,
+                        CV,
+                    )
+                    .is_err(),
                     &format!("conv k={k}: shared conv state refused"),
                 );
                 let mut wrong = tags(k);
                 wrong[k - 1] += 77;
                 c.check(
-                    gpu.stage_conv1d_silu_split_qknorm_b256_rows(&table, &rows, &wrong, &tags(k), CK, CV).is_err(),
+                    gpu.stage_conv1d_silu_split_qknorm_b256_rows(
+                        &table,
+                        &rows,
+                        &wrong,
+                        &tags(k),
+                        CK,
+                        CV,
+                    )
+                    .is_err(),
                     &format!("conv k={k}: wrong-row tag refused"),
                 );
             }
@@ -395,20 +573,46 @@ mod gate {
         let w = up_f(gpu, &r.vec(HD, 0.3, 1.0))?;
         let awq = up_f(gpu, &r.vec(n, 0.4, 1.0))?;
         for k in KS {
-            let xs: Vec<GpuTensor> = (0..k).map(|_| up_f(gpu, &r.vec(n, 2.0, 0.0))).collect::<HipResult<_>>()?;
-            let zs: Vec<GpuTensor> = (0..k).map(|_| up_f(gpu, &r.vec(n, 3.0, 0.0))).collect::<HipResult<_>>()?;
-            let mk = |gpu: &mut Gpu| -> HipResult<Vec<GpuTensor>> { (0..k).map(|_| up_f(gpu, &vec![0.0; n])).collect() };
+            let xs: Vec<GpuTensor> = (0..k)
+                .map(|_| up_f(gpu, &r.vec(n, 2.0, 0.0)))
+                .collect::<HipResult<_>>()?;
+            let zs: Vec<GpuTensor> = (0..k)
+                .map(|_| up_f(gpu, &r.vec(n, 3.0, 0.0)))
+                .collect::<HipResult<_>>()?;
+            let mk = |gpu: &mut Gpu| -> HipResult<Vec<GpuTensor>> {
+                (0..k).map(|_| up_f(gpu, &vec![0.0; n])).collect()
+            };
             let (refs, twin, perm) = (mk(gpu)?, mk(gpu)?, mk(gpu)?);
             for i in 0..k {
-                gpu.gated_norm_rotate_mq_gfx1100(&xs[i], &zs[i], &w, Some(&awq), &refs[i], GH, HD, 1e-6)?;
+                gpu.gated_norm_rotate_mq_gfx1100(
+                    &xs[i],
+                    &zs[i],
+                    &w,
+                    Some(&awq),
+                    &refs[i],
+                    GH,
+                    HD,
+                    1e-6,
+                )?;
             }
             let table = staging(gpu, k * 24)?;
-            let rows: Vec<GatedNormRow> =
-                (0..k).map(|i| GatedNormRow { x: p(&xs[i]), z: p(&zs[i]), x_rot: p(&twin[i]) }).collect();
+            let rows: Vec<GatedNormRow> = (0..k)
+                .map(|i| GatedNormRow {
+                    x: p(&xs[i]),
+                    z: p(&zs[i]),
+                    x_rot: p(&twin[i]),
+                })
+                .collect();
             gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&table, &rows, &tags(k), &tags(k))?;
             gpu.gated_norm_mq_rotate_awq_k6144_rows(&table, k, &w, &awq, 1e-6)?;
-            let prow: Vec<GatedNormRow> =
-                (0..k).rev().map(|i| GatedNormRow { x: p(&xs[i]), z: p(&zs[i]), x_rot: p(&perm[i]) }).collect();
+            let prow: Vec<GatedNormRow> = (0..k)
+                .rev()
+                .map(|i| GatedNormRow {
+                    x: p(&xs[i]),
+                    z: p(&zs[i]),
+                    x_rot: p(&perm[i]),
+                })
+                .collect();
             gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&table, &prow, &tags(k), &tags(k))?;
             gpu.gated_norm_mq_rotate_awq_k6144_rows(&table, k, &w, &awq, 1e-6)?;
             gpu.hip.device_synchronize()?;
@@ -418,21 +622,37 @@ mod gate {
                 all &= want == bytes(gpu, &twin[i])?;
                 all_p &= want == bytes(gpu, &perm[i])?;
             }
-            c.check(all, &format!("gated norm k={k}: every row bitwise == per-row singleton"));
+            c.check(
+                all,
+                &format!("gated norm k={k}: every row bitwise == per-row singleton"),
+            );
             let live = bytes(gpu, &refs[0])?.iter().any(|&b| b != 0);
-            c.check(live, &format!("gated norm k={k}: singleton x_rot is non-zero (comparison not vacuous)"));
-            c.check(all_p, &format!("gated norm k={k}: reversed row table still bitwise per row"));
+            c.check(
+                live,
+                &format!("gated norm k={k}: singleton x_rot is non-zero (comparison not vacuous)"),
+            );
+            c.check(
+                all_p,
+                &format!("gated norm k={k}: reversed row table still bitwise per row"),
+            );
             if k >= 2 {
                 let mut alias = rows.clone();
                 alias[1].x_rot = alias[0].x_rot;
                 c.check(
-                    gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&table, &alias, &tags(k), &tags(k)).is_err(),
+                    gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(
+                        &table,
+                        &alias,
+                        &tags(k),
+                        &tags(k),
+                    )
+                    .is_err(),
                     &format!("gated norm k={k}: shared output refused"),
                 );
                 let mut wrong = tags(k);
                 wrong[0] = 1;
                 c.check(
-                    gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&table, &rows, &wrong, &tags(k)).is_err(),
+                    gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&table, &rows, &wrong, &tags(k))
+                        .is_err(),
                     &format!("gated norm k={k}: wrong-row tag refused"),
                 );
             }
@@ -482,9 +702,27 @@ mod gate {
             };
             let (refs, twin, perm) = (mk(gpu)?, mk(gpu)?, mk(gpu)?);
             for i in 0..k {
-                gpu.qwen35_fa_prep_gfx1100(&qi[i], &refs[i].q, &refs[i].g, &refs[i].k, &qw, &kw, &pos[i].buf, eps, theta, 24, 4)?;
+                gpu.qwen35_fa_prep_gfx1100(
+                    &qi[i],
+                    &refs[i].q,
+                    &refs[i].g,
+                    &refs[i].k,
+                    &qw,
+                    &kw,
+                    &pos[i].buf,
+                    eps,
+                    theta,
+                    24,
+                    4,
+                )?;
             }
-            let row = |i: usize, o: &Out| FaPrepRow { q_interleaved: p(&qi[i]), q: p(&o.q), gate: p(&o.g), k: p(&o.k), pos: p(&pos[i]) };
+            let row = |i: usize, o: &Out| FaPrepRow {
+                q_interleaved: p(&qi[i]),
+                q: p(&o.q),
+                gate: p(&o.g),
+                k: p(&o.k),
+                pos: p(&pos[i]),
+            };
             let table = staging(gpu, k * 40)?;
             let rows: Vec<FaPrepRow> = (0..k).map(|i| row(i, &twin[i])).collect();
             gpu.stage_qwen36_27b_fa_prep_rows(&table, &rows, &tags(k), &tags(k))?;
@@ -507,19 +745,27 @@ mod gate {
             }
             c.check(all, &format!("fa prep k={k}: every row's q/gate/k (distinct positions) bitwise == per-row singleton"));
             let live = bytes(gpu, &refs[0].q)?.iter().any(|&b| b != 0);
-            c.check(live, &format!("fa prep k={k}: singleton q is non-zero (comparison not vacuous)"));
-            c.check(all_p, &format!("fa prep k={k}: reversed row table still bitwise per row"));
+            c.check(
+                live,
+                &format!("fa prep k={k}: singleton q is non-zero (comparison not vacuous)"),
+            );
+            c.check(
+                all_p,
+                &format!("fa prep k={k}: reversed row table still bitwise per row"),
+            );
             if k >= 2 {
                 let mut alias = rows.clone();
                 alias[1].k = alias[0].k;
                 c.check(
-                    gpu.stage_qwen36_27b_fa_prep_rows(&table, &alias, &tags(k), &tags(k)).is_err(),
+                    gpu.stage_qwen36_27b_fa_prep_rows(&table, &alias, &tags(k), &tags(k))
+                        .is_err(),
                     &format!("fa prep k={k}: shared in-place K refused"),
                 );
                 let mut wrong = tags(k);
                 wrong.reverse();
                 c.check(
-                    gpu.stage_qwen36_27b_fa_prep_rows(&table, &rows, &wrong, &tags(k)).is_err(),
+                    gpu.stage_qwen36_27b_fa_prep_rows(&table, &rows, &wrong, &tags(k))
+                        .is_err(),
                     &format!("fa prep k={k}: wrong-row tags refused"),
                 );
             }
@@ -537,10 +783,18 @@ mod gate {
     pub fn run() -> i32 {
         let mut gpu = Gpu::init().expect("gpu init");
         println!("arch={}", gpu.arch);
-        let mut c = Checks { pass: 0, fails: vec![] };
+        let mut c = Checks {
+            pass: 0,
+            fails: vec![],
+        };
         let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
         type Gate = fn(&mut Gpu, &mut Checks) -> HipResult<()>;
-        let gates: [(&str, Gate); 4] = [("gdn", gdn), ("conv", conv), ("gated_norm", gated_norm), ("fa_prep", fa_prep)];
+        let gates: [(&str, Gate); 4] = [
+            ("gdn", gdn),
+            ("conv", conv),
+            ("gated_norm", gated_norm),
+            ("fa_prep", fa_prep),
+        ];
         for (name, f) in gates {
             if which != "all" && which != name {
                 continue;

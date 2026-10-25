@@ -25,18 +25,19 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
-use crate::qwen35::prefill::{fp8_verify_target, verify_dense_math, DenseBatchMath};
+use crate::qwen35::prefill::fp8_verify_target;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
-use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
+use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -147,29 +148,19 @@ fn dflash_gemm_q8_lmhead(
         );
     }
 
-    const Q8_LM_MAX: usize = 64;
-    let mut chunk_start = 0usize;
-    while chunk_start < n {
-        let chunk_end = (chunk_start + Q8_LM_MAX).min(n);
-        let chunk_n = chunk_end - chunk_start;
-        let x_chunk = x.sub_offset(chunk_start * w_out.k, chunk_n * w_out.k);
-        let y_chunk = y.sub_offset(chunk_start * w_out.m, chunk_n * w_out.m);
-        // #397 Ship 5.3: GemmQ8_0Batched routes to the identical
-        // gpu.gemm_q8_0_batched the prior direct call used.
-        run_spec_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
-            &w_out.buf,
-            w_out.gpu_dtype,
-            &x_chunk,
-            &y_chunk,
-            w_out.m,
-            w_out.k,
-            chunk_n,
-        )?;
-        chunk_start = chunk_end;
-    }
-    Ok(())
+    // The dispatch key is the scalar Q8 kernel chunked at its 64-row cap
+    // (`rdna_compute::gemm::q8_0_batched_chunks`); pass all `n` rows.
+    run_spec_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
+        &w_out.buf,
+        w_out.gpu_dtype,
+        x,
+        y,
+        w_out.m,
+        w_out.k,
+        n,
+    )
 }
 
 /// Shared MQ{2,3,4,5,6}G256V2 batched lm_head launcher used by the five
@@ -542,7 +533,15 @@ pub fn dflash_finish_retained_lm_head_argmax(
 ) -> HipResult<Vec<u32>> {
     if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
         let math = verify_dense_math(gpu);
-        dflash_enqueue_verify_lm_head_argmax(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
+        dflash_enqueue_verify_lm_head_argmax(
+            gpu,
+            w_out,
+            final_hidden,
+            verify_scratch,
+            b,
+            vocab,
+            math,
+        )?;
         return dflash_download_verify_argmax(gpu, verify_scratch, b);
     }
 
@@ -580,9 +579,7 @@ fn selector_candidates_shape(proposal: &dflash::DflashCandidateProposal) -> HipR
 
 /// The temperature>0 selector inputs: flattened normalized q (`[rows*top_k]`)
 /// and the per-row selected probability (`[rows]`), shape-checked.
-fn selector_temp_inputs(
-    proposal: &dflash::DflashCandidateProposal,
-) -> HipResult<(&[f32], &[f32])> {
+fn selector_temp_inputs(proposal: &dflash::DflashCandidateProposal) -> HipResult<(&[f32], &[f32])> {
     let rows = proposal.tokens.len();
     let top_k = proposal.top_k;
     let probs = proposal.probabilities.as_ref().ok_or_else(|| {
@@ -1359,7 +1356,10 @@ impl DnCbExtents {
     /// `None` unless the geometry is the one the exact save-free kernels
     /// cover: 128-wide heads and conv kernel dimension 4 (3 ring slots).
     fn for_config(config: &Qwen35Config) -> Option<Self> {
-        if config.conv_kernel_dim != 4 || config.linear_key_head_dim != 128 || config.linear_value_head_dim != 128 {
+        if config.conv_kernel_dim != 4
+            || config.linear_key_head_dim != 128
+            || config.linear_value_head_dim != 128
+        {
             return None;
         }
         let hv = config.linear_num_value_heads;
@@ -1706,7 +1706,11 @@ impl DeltaNetSnapshot {
     ///
     /// Cross-lane pointer distinctness is the caller's whole-chunk check
     /// ([`Self::push_owner_ptrs`]).
-    pub(crate) fn cb_verify_owned_exact(&self, state: &DeltaNetState, config: &Qwen35Config) -> bool {
+    pub(crate) fn cb_verify_owned_exact(
+        &self,
+        state: &DeltaNetState,
+        config: &Qwen35Config,
+    ) -> bool {
         let Some(ext) = DnCbExtents::for_config(config) else {
             return false;
         };
@@ -1718,7 +1722,13 @@ impl DeltaNetSnapshot {
     fn exact_extents(&self, state: &DeltaNetState, ext: &DnCbExtents) -> bool {
         /// Equal live/backup size per layer, each at least `logical`
         /// (`exact`: exactly `logical`).
-        fn fam_ok(live: &[GpuTensor], back: &[DeviceBuffer], n: usize, logical: usize, exact: bool) -> bool {
+        fn fam_ok(
+            live: &[GpuTensor],
+            back: &[DeviceBuffer],
+            n: usize,
+            logical: usize,
+            exact: bool,
+        ) -> bool {
             live.len() == n
                 && back.len() == n
                 && live.iter().zip(back).all(|(l, b)| {
@@ -1731,8 +1741,20 @@ impl DeltaNetSnapshot {
             && state.quant == qwen35::StateQuant::Q8
             && fam_ok(&state.s_matrices, &self.s_matrix_bufs, n, ext.s, true)
             && fam_ok(&state.s_scales, &self.s_scale_bufs, n, ext.scales, false)
-            && fam_ok(&state.conv_states, &self.conv_state_bufs, n, ext.conv, false)
-            && fam_ok(&state.s_ef_residual, &self.s_ef_residual_bufs, n, ext.ef, false)
+            && fam_ok(
+                &state.conv_states,
+                &self.conv_state_bufs,
+                n,
+                ext.conv,
+                false,
+            )
+            && fam_ok(
+                &state.s_ef_residual,
+                &self.s_ef_residual_bufs,
+                n,
+                ext.ef,
+                false,
+            )
     }
 
     /// Every buffer of `state` and of this snapshot is a HIP-owned allocation.
@@ -1844,20 +1866,24 @@ impl DeltaNetSnapshot {
         // and pool rounding only pads, so the common extent covers every
         // element and never overruns either side.
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         Ok(())
     }
@@ -1920,20 +1946,24 @@ impl DeltaNetSnapshot {
         }
         // Common extent (see `save_from`).
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         Ok(())
     }
@@ -2503,23 +2533,27 @@ impl GdnTape {
                 let pre: Vec<_> = pre
                     .into_iter()
                     .enumerate()
-                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
-                        base,
-                        conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
-                    })
+                    .map(
+                        |(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
+                            base,
+                            conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
+                        },
+                    )
                     .collect();
                 let gdn: Vec<_> = gdn
                     .into_iter()
                     .enumerate()
-                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
-                        base,
-                        s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
-                        s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
-                        ef_src: snap
-                            .s_ef_residual_bufs
-                            .get(la)
-                            .map_or(0, |b| b.as_ptr() as u64),
-                    })
+                    .map(
+                        |(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
+                            base,
+                            s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
+                            s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
+                            ef_src: snap
+                                .s_ef_residual_bufs
+                                .get(la)
+                                .map_or(0, |b| b.as_ptr() as u64),
+                        },
+                    )
                     .collect();
                 let Some(from) = ml.from.as_mut() else {
                     unreachable!("armed at construction")
@@ -2604,7 +2638,12 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
-            if let Some(ml) = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if let Some(ml) = self
+                .replay_ml
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
                 ml.order(gpu)?;
             }
             return gpu.graphs.replay_graph_launch(
@@ -2950,8 +2989,8 @@ impl GdnReplayMlFrom {
     /// failure frees what was allocated and returns the error.
     fn arm(gpu: &mut Gpu, n_la: usize) -> HipResult<Self> {
         gpu.ensure_dflash_gdn_replay_ml_from()?;
-        let pre_bytes = n_la
-            * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
+        let pre_bytes =
+            n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
         let gdn_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
         let alloc_pair = |gpu: &mut Gpu| -> HipResult<(DeviceBuffer, DeviceBuffer)> {
@@ -3209,6 +3248,12 @@ pub struct VerifyScratch {
     /// (`HIPFIRE_DFLASH_DEVICE_ACCEPT`), grown on first sampled window. A
     /// `Mutex` because the singleton step borrows `VerifyScratch` shared.
     pub device_accept: std::sync::Mutex<Option<DflashAcceptScratch>>,
+    /// Reusable verbatim-lookup tail buffer of the singleton DFlash step
+    /// (`spec_step_dflash`'s `lookup` seam), reserved at its 15-candidate
+    /// maximum so a spliced window allocates nothing. A `Mutex` because the
+    /// singleton step borrows `VerifyScratch` shared; only locked when a
+    /// lookup is supplied.
+    pub lookup_tail: std::sync::Mutex<Vec<u32>>,
 }
 
 impl VerifyScratch {
@@ -3230,6 +3275,7 @@ impl VerifyScratch {
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
             prefill_batch: None,
             device_accept: std::sync::Mutex::new(None),
+            lookup_tail: std::sync::Mutex::new(Vec::with_capacity(DFLASH_LOOKUP_MAX_CANDIDATES)),
         })
     }
 
@@ -3259,7 +3305,11 @@ impl VerifyScratch {
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
-        if let Some(acc) = self.device_accept.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(acc) = self
+            .device_accept
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             acc.free(gpu);
         }
     }
@@ -3905,6 +3955,16 @@ impl SparseQRows {
         self.val.clear();
     }
 
+    /// Keep the first `rows` rows (no-op when fewer exist).
+    pub fn truncate_rows(&mut self, rows: usize) {
+        if rows < self.rows() {
+            let end = self.off[rows] as usize;
+            self.off.truncate(rows + 1);
+            self.idx.truncate(end);
+            self.val.truncate(end);
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.off.len().saturating_sub(1)
     }
@@ -4040,7 +4100,11 @@ pub enum TargetRowRef<'a> {
     Dense { raw: &'a [f32], tau: f32, z: f32 },
     /// The kept set `p >= tau` (`tau > 0`): ascending ids and RAW probs. The
     /// truncated value of id `idx[k]` is `val[k] * inv_z`, every other id 0.
-    Sparse { idx: &'a [u32], val: &'a [f32], inv_z: f32 },
+    Sparse {
+        idx: &'a [u32],
+        val: &'a [f32],
+        inv_z: f32,
+    },
 }
 
 /// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
@@ -4070,7 +4134,12 @@ pub struct FastTargetRows {
 impl FastTargetRows {
     /// Dense-mode rows.
     pub fn dense(probs: Vec<f32>, tau: Vec<f32>, z: Vec<f32>) -> Self {
-        Self { probs, tau, z, ..Self::default() }
+        Self {
+            probs,
+            tau,
+            z,
+            ..Self::default()
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -4136,7 +4205,10 @@ impl FastTargetRows {
             || self.idx.len() != rows * cap
             || self.val.len() != rows * cap
         {
-            return Err(HipError::new(0, "sparse target rows: inconsistent compact arrays"));
+            return Err(HipError::new(
+                0,
+                "sparse target rows: inconsistent compact arrays",
+            ));
         }
         self.dense_slot.clear();
         let mut n_dense = 0usize;
@@ -4150,10 +4222,13 @@ impl FastTargetRows {
                 continue;
             }
             let ids = &self.idx[r * cap..r * cap + c];
-            let ok = ids.iter().all(|&i| (i as usize) < vocab)
-                && ids.windows(2).all(|w| w[0] < w[1]);
+            let ok =
+                ids.iter().all(|&i| (i as usize) < vocab) && ids.windows(2).all(|w| w[0] < w[1]);
             if !ok {
-                return Err(HipError::new(0, "sparse target rows: compact ids not ascending/in range"));
+                return Err(HipError::new(
+                    0,
+                    "sparse target rows: compact ids not ascending/in range",
+                ));
             }
             self.dense_slot.push(SPARSE_NONE);
         }
@@ -4262,11 +4337,25 @@ impl TargetRowsScratch {
             return Err(HipError::new(0, "sparse target run: not a sparse run"));
         }
         self.ensure_sparse(gpu, run_rows, vocab)?;
-        dflash_target_rows_core(gpu, logits, &self.bufs, run_rows, vocab, cfg, &mut self.host)
+        dflash_target_rows_core(
+            gpu,
+            logits,
+            &self.bufs,
+            run_rows,
+            vocab,
+            cfg,
+            &mut self.host,
+        )
     }
 
     /// Lane-owned copy of rows `r0..r0 + b` of the last [`Self::run_sparse`].
-    pub fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+    pub fn split_lane_into(
+        &self,
+        r0: usize,
+        b: usize,
+        vocab: usize,
+        out: &mut FastTargetRows,
+    ) -> HipResult<()> {
         self.host.split_lane_into(r0, b, vocab, out)
     }
 }
@@ -4275,7 +4364,13 @@ impl FastTargetRows {
     /// Sparse mode: the `b` rows `r0..r0 + b` of this run as a lane-owned
     /// `FastTargetRows`, identical to what the per-lane download of those
     /// rows produces (including its validation and dense-row slots).
-    fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+    fn split_lane_into(
+        &self,
+        r0: usize,
+        b: usize,
+        vocab: usize,
+        out: &mut FastTargetRows,
+    ) -> HipResult<()> {
         let cap = self.capacity;
         if cap == 0 || r0 + b > self.tau.len() || self.dense_slot.len() != self.tau.len() {
             return Err(HipError::new(0, "sparse target run: inconsistent run rows"));
@@ -4289,9 +4384,11 @@ impl FastTargetRows {
         out.counts.clear();
         out.counts.extend_from_slice(&self.counts[r0..r0 + b]);
         out.idx.clear();
-        out.idx.extend_from_slice(&self.idx[r0 * cap..(r0 + b) * cap]);
+        out.idx
+            .extend_from_slice(&self.idx[r0 * cap..(r0 + b) * cap]);
         out.val.clear();
-        out.val.extend_from_slice(&self.val[r0 * cap..(r0 + b) * cap]);
+        out.val
+            .extend_from_slice(&self.val[r0 * cap..(r0 + b) * cap]);
         let n_dense = out.plan_dense_rows(vocab)?;
         out.dense_rows.clear();
         if n_dense == 0 {
@@ -4305,7 +4402,10 @@ impl FastTargetRows {
             }
             let src = self.dense_slot[r0 + i];
             if src == SPARSE_NONE {
-                return Err(HipError::new(0, "sparse target run: dense row classification mismatch"));
+                return Err(HipError::new(
+                    0,
+                    "sparse target run: dense row classification mismatch",
+                ));
             }
             let (s, src) = (slot as usize, src as usize);
             out.dense_rows[s * vocab..(s + 1) * vocab]
@@ -4355,16 +4455,7 @@ fn dflash_target_rows_core(
     let sparse = bufs.len() == 6;
     let (probs_gpu, tau_gpu, z_gpu) = (&bufs[0], &bufs[1], &bufs[2]);
     gpu.softmax_temp_topp_batched_into_f32(
-        logits,
-        probs_gpu,
-        tau_gpu,
-        z_gpu,
-        vocab,
-        b,
-        cfg.temp,
-        cfg.top_p,
-        cfg.top_k,
-        0.0,
+        logits, probs_gpu, tau_gpu, z_gpu, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
     )?;
     // Exact-row views: a persistent scratch may be larger than this pass.
     gpu.download_f32_into(&tau_gpu.sub_offset(0, b), &mut out.tau)?;
@@ -4485,7 +4576,10 @@ pub fn dflash_sampled_accept_device(
 ) -> HipResult<SampledWindowDecision> {
     let b = block.len();
     if !dflash_device_accept_eligible(true, &cfg, q, b) {
-        return Err(HipError::new(0, "device sampled accept: ineligible window (cactus / dense q / receipt shape)"));
+        return Err(HipError::new(
+            0,
+            "device sampled accept: ineligible window (cactus / dense q / receipt shape)",
+        ));
     }
     let n = b - 1;
     let nnz = q.sparse_q.offsets()[n] as usize;
@@ -4493,7 +4587,8 @@ pub fn dflash_sampled_accept_device(
     DflashAcceptScratch::ensure(scratch, gpu, b, vocab, payload_words)?;
     let s = scratch.as_mut().expect("scratch ensured above");
     s.host_uniforms.clear();
-    s.host_uniforms.extend((0..n).map(|_| xorshift_next_unit(rng)));
+    s.host_uniforms
+        .extend((0..n).map(|_| xorshift_next_unit(rng)));
     let u_fin = xorshift_next_unit(rng);
     rdna_compute::dflash_sampled_accept::dflash_accept_pack_payload(
         &mut s.host_payload,
@@ -4512,10 +4607,25 @@ pub fn dflash_sampled_accept_device(
     // The scratch tensors may be larger than this window: kernels size by the
     // explicit (rows, vocab) arguments, never by the tensor.
     gpu.softmax_temp_topp_batched_into_f32(
-        &logits_batch, &s.probs, &s.tau, &s.z, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
+        &logits_batch,
+        &s.probs,
+        &s.tau,
+        &s.z,
+        vocab,
+        b,
+        cfg.temp,
+        cfg.top_p,
+        cfg.top_k,
+        0.0,
     )?;
     let d = gpu.dflash_sampled_accept_sparse_q_f32(
-        s, &s.probs, &s.tau, &s.z, &s.host_payload, n, vocab,
+        s,
+        &s.probs,
+        &s.tau,
+        &s.z,
+        &s.host_payload,
+        n,
+        vocab,
     )?;
     Ok(SampledWindowDecision {
         accepted_drafts: d.accept_len,
@@ -4572,8 +4682,16 @@ pub fn dflash_sampled_accept_rows(
         QRows::Dense(&q.dense_q)
     };
     dflash_sampled_accept_q_rows(
-        block, &q.selected_q, q_rows, fast, logits, vocab, cfg,
-        max_accept, rng, scratch,
+        block,
+        &q.selected_q,
+        q_rows,
+        fast,
+        logits,
+        vocab,
+        cfg,
+        max_accept,
+        rng,
+        scratch,
     )
 }
 
@@ -4590,6 +4708,38 @@ fn dflash_sampled_accept_q_rows(
     rng: &mut u64,
     scratch: &mut Vec<f32>,
 ) -> SampledWindowDecision {
+    dflash_sampled_accept_q_rows_with(
+        block,
+        selected_q,
+        q,
+        fast,
+        logits,
+        vocab,
+        cfg,
+        max_accept,
+        &mut || xorshift_next_unit(rng),
+        scratch,
+    )
+}
+
+/// [`dflash_sampled_accept_q_rows`] over an explicit uniform source: the body
+/// is the single accept/residual/bonus implementation, `next_u` replaces the
+/// xorshift draw (one call per accept test, per residual draw and per bonus
+/// draw, in the same order). The law tests drive it with exact uniform grids.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn dflash_sampled_accept_q_rows_with(
+    block: &[u32],
+    selected_q: &[f32],
+    q: QRows<'_>,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    max_accept: usize,
+    next_u: &mut impl FnMut() -> f32,
+    scratch: &mut Vec<f32>,
+) -> SampledWindowDecision {
     let b = block.len();
     let mut accept_len = 0;
     let mut rejected_bonus = None;
@@ -4602,16 +4752,20 @@ fn dflash_sampled_accept_q_rows(
         let p_d = selected_q[i].max(f32::MIN_POSITIVE);
         if !use_cactus {
             if let (
-                Some(TargetRowRef::Sparse { idx: tidx, val: tval, inv_z }),
+                Some(TargetRowRef::Sparse {
+                    idx: tidx,
+                    val: tval,
+                    inv_z,
+                }),
                 QRows::Sparse(qs),
             ) = (fast.map(|f| f.row(i, vocab)), q)
             {
                 let p_t = sparse_row_prob(tidx, tval, inv_z, block[i + 1]);
-                let u = xorshift_next_unit(rng);
+                let u = next_u();
                 if u * p_d <= p_t {
                     accept_len += 1;
                 } else {
-                    let u2 = xorshift_next_unit(rng);
+                    let u2 = next_u();
                     let (qidx, qval) = qs.row(i);
                     rejected_bonus = Some(sample_residual_sparse(
                         tidx, tval, inv_z, qidx, qval, vocab, u2,
@@ -4631,7 +4785,7 @@ fn dflash_sampled_accept_q_rows(
         } else {
             p_t
         };
-        let u = xorshift_next_unit(rng);
+        let u = next_u();
         if u * p_d <= accept_prob {
             accept_len += 1;
         } else {
@@ -4650,7 +4804,7 @@ fn dflash_sampled_accept_q_rows(
                     }
                 }
             }
-            let u2 = xorshift_next_unit(rng);
+            let u2 = next_u();
             rejected_bonus = Some(match q {
                 QRows::Dense(d) => sample_residual(scratch, &d[i], u2),
                 QRows::Sparse(s) => {
@@ -4665,7 +4819,7 @@ fn dflash_sampled_accept_q_rows(
         b
     } else {
         let i = accept_len.min(b - 1);
-        let u = xorshift_next_unit(rng);
+        let u = next_u();
         sampled_target_bonus(
             scratch, i, vocab, fast, logits, cfg.temp, cfg.top_k, cfg.top_p, u,
         )
@@ -4789,7 +4943,11 @@ pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32
     let ex = excluded as usize;
     let mut sum = 0.0f32;
     for i in 0..p_target.len() {
-        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        let d = if i == ex {
+            p_target[i] - 1.0
+        } else {
+            p_target[i]
+        };
         if d > 0.0 {
             sum += d;
         }
@@ -4800,7 +4958,11 @@ pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32
     let u_scaled = u * sum;
     let mut acc = 0.0f32;
     for i in 0..p_target.len() {
-        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        let d = if i == ex {
+            p_target[i] - 1.0
+        } else {
+            p_target[i]
+        };
         if d > 0.0 {
             acc += d;
             if u_scaled < acc {
@@ -5432,7 +5594,8 @@ fn dflash_commit_decision_borrowed(
         // so the rewritten KV/DeltaNet rows are the verify's FP8 / IU4 rows
         // (n >= 2; the per-token n == 1 fallback inside is the decode GEMV).
         let fp8 = fp8_verify_target(target.weights, target.config, target.kv_cache);
-        let iu4 = qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
+        let iu4 =
+            qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
         fp8_verify_scoped(gpu, fp8, |gpu| {
             iu4_verify_scoped(gpu, iu4, |gpu| {
                 qwen35::forward_prefill_batch(
@@ -5594,7 +5757,6 @@ pub fn dflash_greedy_accept_commit_parts(
     )
 }
 
-
 /// Run the target on `draft_tokens` (length B) positions starting at
 /// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
@@ -5745,7 +5907,9 @@ fn verify_dflash_block_inner(
     // A retained route that stands down (`HipAuto`, e.g. PM4 disabled) runs
     // the ordinary HIP body; prime/capture/PM4 windows are never IU4-scoped.
     let iu4 = tree_verify.is_none()
-        && retained.as_ref().is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
+        && retained
+            .as_ref()
+            .is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
         && qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &target.weights, &target.config);
     let prev = gpu.fp8_verify_enter(fp8)?;
     let prev_iu4 = gpu.iu4_verify_enter(iu4);
@@ -6315,15 +6479,7 @@ pub(crate) fn dflash_verify_head(
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
         let math = verify_dense_math(gpu);
-        dflash_enqueue_verify_lm_head(
-            gpu,
-            w_out,
-            final_hidden,
-            verify_scratch,
-            b,
-            vocab,
-            math,
-        )?;
+        dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
             // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
@@ -6826,12 +6982,21 @@ pub fn scatter_hidden_prefill_to_interleaved(
     });
     if !*FAST {
         return scatter_hidden_block_to_interleaved(
-            gpu, hidden_rb, dst, dst_row_offset, block_size, n_rows, dst_modulus,
+            gpu,
+            hidden_rb,
+            dst,
+            dst_row_offset,
+            block_size,
+            n_rows,
+            dst_modulus,
         );
     }
     assert!(n_rows <= block_size, "scatter: n_rows > block_size");
     let max_pos = hidden_rb.max_positions;
-    assert!(block_size <= hidden_rb.written.max(max_pos), "scatter: block_size > written");
+    assert!(
+        block_size <= hidden_rb.written.max(max_pos),
+        "scatter: block_size > written"
+    );
     let num_extract = hidden_rb.extract_layers.len();
     let row_bytes = hidden_rb.hidden_dim * 4;
     let r_skip = block_size.saturating_sub(max_pos);
@@ -7157,10 +7322,24 @@ pub fn dflash_sampled_selector_draft_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     dflash_sampled_selector_draft_parts_into(
-        gpu, weights, &df.draft_weights, &df.draft_config,
-        &mut df.draft_scratch, &df.verify_scratch, &[],
+        gpu,
+        weights,
+        &df.draft_weights,
+        &df.draft_config,
+        &mut df.draft_scratch,
+        &df.verify_scratch,
+        &[],
         &df.verify_scratch.logits.sub_offset(0, vocab),
-        position, compact_offset, seed, b, vocab, None, false, cfg, rng, out,
+        position,
+        compact_offset,
+        seed,
+        b,
+        vocab,
+        None,
+        false,
+        cfg,
+        rng,
+        out,
     )
 }
 
@@ -7186,7 +7365,10 @@ fn dflash_sampled_selector_draft_parts_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     if b < 2 || cfg.temp <= 0.0 || !draft_weights.has_candidate_selector() {
-        return Err(HipError::new(0, "sampled DFlash draft requires b>=2, temp>0 and selector"));
+        return Err(HipError::new(
+            0,
+            "sampled DFlash draft requires b>=2, temp>0 and selector",
+        ));
     }
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
@@ -7195,9 +7377,17 @@ fn dflash_sampled_selector_draft_parts_into(
     out.block.resize(b, draft_cfg.mask_token_id);
     out.block[0] = seed;
     draft_dflash_forward_rank(
-        gpu, weights, draft_weights, draft_cfg, draft_scratch,
-        target_hidden_host, &out.block, position, compact_offset,
-        ctx_slice, draft_ffn_graph,
+        gpu,
+        weights,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        target_hidden_host,
+        &out.block,
+        position,
+        compact_offset,
+        ctx_slice,
+        draft_ffn_graph,
     )?;
     let batch = b - 1;
     let h = draft_cfg.hidden;
@@ -7207,16 +7397,31 @@ fn dflash_sampled_selector_draft_parts_into(
         assert!(
             batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}",
-            verify_scratch.max_n, batch,
+            verify_scratch.max_n,
+            batch,
         );
         dflash_enqueue_verify_lm_head(
-            gpu, &weights.output, &hidden_rows, verify_scratch,
-            batch, vocab, DenseBatchMath::Product,
+            gpu,
+            &weights.output,
+            &hidden_rows,
+            verify_scratch,
+            batch,
+            vocab,
+            DenseBatchMath::Product,
         )?;
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         return dflash_sampled_selector_rows_into(
-            gpu, draft_weights, draft_scratch, &hidden_rows, &logits_batch,
-            seed, batch, vocab, cfg, rng, out,
+            gpu,
+            draft_weights,
+            draft_scratch,
+            &hidden_rows,
+            &logits_batch,
+            seed,
+            batch,
+            vocab,
+            cfg,
+            rng,
+            out,
         );
     } else {
         let mut host_logits = Vec::with_capacity(batch * vocab);
@@ -7227,10 +7432,18 @@ fn dflash_sampled_selector_draft_parts_into(
             debug_assert_eq!(logits.len(), vocab);
             host_logits.extend_from_slice(&logits);
         }
-        out.uniforms.extend((0..batch).map(|_| xorshift_next_unit(rng)));
+        out.uniforms
+            .extend((0..batch).map(|_| xorshift_next_unit(rng)));
         dflash::propose_candidates_host(
-            gpu, draft_weights, draft_scratch, &hidden_rows,
-            &host_logits, batch, seed, cfg.temp, Some(&out.uniforms),
+            gpu,
+            draft_weights,
+            draft_scratch,
+            &hidden_rows,
+            &host_logits,
+            batch,
+            seed,
+            cfg.temp,
+            Some(&out.uniforms),
         )?
     };
     dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
@@ -7251,10 +7464,18 @@ fn dflash_sampled_selector_rows_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     out.uniforms.clear();
-    out.uniforms.extend((0..rows).map(|_| xorshift_next_unit(rng)));
+    out.uniforms
+        .extend((0..rows).map(|_| xorshift_next_unit(rng)));
     let proposal = dflash::propose_candidates_device(
-        gpu, draft_weights, draft_scratch, hidden_rows, logits_rows,
-        rows, seed, cfg.temp, Some(&out.uniforms),
+        gpu,
+        draft_weights,
+        draft_scratch,
+        hidden_rows,
+        logits_rows,
+        rows,
+        seed,
+        cfg.temp,
+        Some(&out.uniforms),
     )?;
     dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
 }
@@ -7272,12 +7493,19 @@ fn dflash_sampled_apply_proposal_into(
     if out.sparse {
         out.sparse_q.clear();
         apply_dflash2_selector_proposal_sparse(
-            &proposal, vocab, &mut out.block, &mut out.sparse_q,
+            &proposal,
+            vocab,
+            &mut out.block,
+            &mut out.sparse_q,
             &mut out.selected_q,
         )?;
     } else {
         apply_dflash2_selector_proposal(
-            &proposal, vocab, true, &mut out.block, &mut out.dense_q,
+            &proposal,
+            vocab,
+            true,
+            &mut out.block,
+            &mut out.dense_q,
             &mut out.selected_q,
         )?;
     }
@@ -7686,7 +7914,8 @@ fn selector_lanes_batched(gpu: &Gpu, shared: &DflashScratch) -> bool {
 /// (64 launches at C8) instead of one `embedding_lookup_q8_batched` launch.
 /// Default on; every row byte is identical either way.
 static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH").map_or(true, |v| v.trim() != "0")
+    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH")
+        .map_or(true, |v| v.trim() != "0")
 });
 
 /// Whether the batched draft's noise rows come from one batched Q8_0
@@ -7697,7 +7926,12 @@ static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLo
 /// `(float)half(d) * (float)int8(q)` with the same 256-thread element
 /// striding — one block per row instead of one launch per row — so each
 /// row's bytes cannot differ.
-fn noise_embed_batch_admitted(gpu: &Gpu, target_weights: &Qwen35Weights, shared: &DflashScratch, rows: usize) -> bool {
+fn noise_embed_batch_admitted(
+    gpu: &Gpu,
+    target_weights: &Qwen35Weights,
+    shared: &DflashScratch,
+    rows: usize,
+) -> bool {
     *DRAFT_NOISE_EMBED_BATCH_ON
         && gpu.arch == "gfx1201"
         && matches!(target_weights.embd_format, llama::EmbeddingFormat::Q8_0)
@@ -7770,24 +8004,29 @@ pub fn draft_dflash_sampled_blocks_batched(
     lanes: &mut [DflashSampledDraftLane<'_>],
 ) -> HipResult<Vec<Vec<u32>>> {
     for (i, lane) in lanes.iter().enumerate() {
-        if lane.draft.b < 3 || lane.cfg.temp <= 0.0
+        if lane.draft.b < 3
+            || lane.cfg.temp <= 0.0
             || !lane.draft.df.draft_weights.has_candidate_selector()
         {
-            return Err(HipError::new(0, &format!(
+            return Err(HipError::new(
+                0,
+                &format!(
                 "draft_dflash_sampled_blocks_batched: lane {i} requires b>=3, temp>0 and selector"
-            )));
+            ),
+            ));
         }
     }
     {
-        let mut drafts: Vec<DflashDraftLane<'_>> = lanes.iter_mut().map(|lane| {
-            DflashDraftLane {
+        let mut drafts: Vec<DflashDraftLane<'_>> = lanes
+            .iter_mut()
+            .map(|lane| DflashDraftLane {
                 df: &mut *lane.draft.df,
                 position: lane.draft.position,
                 seed: lane.draft.seed,
                 b: lane.draft.b,
                 compact_offset: lane.draft.compact_offset,
-            }
-        }).collect();
+            })
+            .collect();
         draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, &mut drafts)?;
     }
     let mut blocks = Vec::with_capacity(lanes.len());
@@ -7802,8 +8041,10 @@ pub fn draft_dflash_sampled_blocks_batched(
         let lent = scratch.mq_x_rot.is_none();
         if lent {
             if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
-                return Err(HipError::new(0,
-                    "the shared draft scratch has no FWHT rotation buffers for the lane selector"));
+                return Err(HipError::new(
+                    0,
+                    "the shared draft scratch has no FWHT rotation buffers for the lane selector",
+                ));
             }
             scratch.mq_x_rot = shared.mq_x_rot.take();
             scratch.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
@@ -7811,8 +8052,17 @@ pub fn draft_dflash_sampled_blocks_batched(
         lane.out.block.clear();
         lane.out.block.push(draft.seed);
         let result = dflash_sampled_selector_rows_into(
-            gpu, &draft.df.draft_weights, scratch, &hidden_rows, &logits_rows,
-            draft.seed, rows, vocab, lane.cfg, lane.rng, lane.out,
+            gpu,
+            &draft.df.draft_weights,
+            scratch,
+            &hidden_rows,
+            &logits_rows,
+            draft.seed,
+            rows,
+            vocab,
+            lane.cfg,
+            lane.rng,
+            lane.out,
         );
         // Restore the shared buffers even when projection/scoring failed.
         if lent {
@@ -7838,8 +8088,11 @@ pub fn dflash_draft_batch_eligible(
     config: &Qwen35Config,
     draft_weights: &DflashWeights,
 ) -> bool {
-    use rdna_compute::DType::{MQ4G256V2, F16, F32};
-    if config.num_experts > 0 || gpu.draft_collapse_fused_enabled() || !gpu.arch.starts_with("gfx12") {
+    use rdna_compute::DType::{F16, F32, MQ4G256V2};
+    if config.num_experts > 0
+        || gpu.draft_collapse_fused_enabled()
+        || !gpu.arch.starts_with("gfx12")
+    {
         return false;
     }
     if target_weights.output.gpu_dtype != MQ4G256V2 {
@@ -7870,7 +8123,12 @@ fn draft_dflash_forward_head_batched(
     head: &VerifyScratch,
     lanes: &mut [DflashDraftLane<'_>],
 ) -> HipResult<bool> {
-    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    let err = |m: String| {
+        Err(HipError::new(
+            0,
+            &format!("draft_dflash_blocks_batched: {m}"),
+        ))
+    };
     if lanes.is_empty() {
         return Ok(false);
     }
@@ -7911,11 +8169,18 @@ fn draft_dflash_forward_head_batched(
         let mut ids: Vec<i32> = Vec::with_capacity(rows);
         for l in lanes.iter() {
             for i in 0..l.b {
-                ids.push((if i == 0 { l.seed } else { draft_cfg.mask_token_id }) as i32);
+                ids.push(
+                    (if i == 0 {
+                        l.seed
+                    } else {
+                        draft_cfg.mask_token_id
+                    }) as i32,
+                );
             }
         }
         let id_view = shared.noise_tokens.sub_offset(0, rows);
-        let id_bytes: &[u8] = unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, rows * 4) };
+        let id_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, rows * 4) };
         gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
         let out_view = shared.x.sub_offset(0, rows * h);
         gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &id_view, rows, h)?;
@@ -7923,7 +8188,11 @@ fn draft_dflash_forward_head_batched(
         let mut off = 0usize;
         for l in lanes.iter() {
             for i in 0..l.b {
-                let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
+                let tok = if i == 0 {
+                    l.seed
+                } else {
+                    draft_cfg.mask_token_id
+                };
                 let dst = shared.x.sub_offset((off + i) * h, h);
                 match target_weights.embd_format {
                     llama::EmbeddingFormat::HFQ4G256 => {
@@ -7932,8 +8201,12 @@ fn draft_dflash_forward_head_batched(
                     llama::EmbeddingFormat::HFQ4G128 => {
                         gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
                     }
-                    llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
-                    llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
+                    llama::EmbeddingFormat::Q8_0 => {
+                        gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::F32 => {
+                        gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
+                    }
                     _ => return err("unsupported target embedding format for noise lookup".into()),
                 }
             }
@@ -7950,9 +8223,15 @@ fn draft_dflash_forward_head_batched(
     let geos: Vec<Geo> = lanes
         .iter()
         .map(|l| {
-            let ctx = l.df.draft_scratch.thlog.abs_positions().len().min(l.position);
+            let ctx =
+                l.df.draft_scratch
+                    .thlog
+                    .abs_positions()
+                    .len()
+                    .min(l.position);
             let co = l.compact_offset;
-            let pos_q: Vec<i32> = ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
+            let pos_q: Vec<i32> =
+                ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
             let mut pos_k = Vec::with_capacity(ctx + l.b);
             let th_abs = l.df.draft_scratch.thlog.abs_positions();
             pos_k.extend_from_slice(&th_abs[th_abs.len().saturating_sub(ctx)..]);
@@ -7994,7 +8273,16 @@ fn draft_dflash_forward_head_batched(
             dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
         }
         llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
-        gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)
+        gemm_mq_batched_lmhead_draft(
+            gpu,
+            w_out.gpu_dtype,
+            &w_out.buf,
+            &rotated,
+            &logits_all,
+            w_out.m,
+            w_out.k,
+            rows,
+        )
     })();
     gpu.draft_rows64_exit(prev);
     scoped?;
@@ -8022,8 +8310,14 @@ pub fn draft_dflash_blocks_batched(
     if lanes.is_empty() {
         return Ok(Vec::new());
     }
-    let rows64 = draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, lanes)?;
-    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    let rows64 =
+        draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, lanes)?;
+    let err = |m: String| {
+        Err(HipError::new(
+            0,
+            &format!("draft_dflash_blocks_batched: {m}"),
+        ))
+    };
     let rows: usize = lanes.iter().map(|l| l.b).sum();
     let draft_weights = std::sync::Arc::clone(&lanes[0].df.draft_weights);
     let h = lanes[0].df.draft_config.hidden;
@@ -8047,7 +8341,11 @@ pub fn draft_dflash_blocks_batched(
         let mut sel: Vec<dflash::SelectorLane> = Vec::with_capacity(lanes.len());
         let mut off = 0usize;
         for l in lanes.iter() {
-            sel.push(dflash::SelectorLane { first_row: off + 1, rows: l.b - 1, anchor: l.seed });
+            sel.push(dflash::SelectorLane {
+                first_row: off + 1,
+                rows: l.b - 1,
+                anchor: l.seed,
+            });
             off += l.b;
         }
         let proposals = dflash::propose_candidates_lanes_device(
@@ -8124,8 +8422,9 @@ pub fn draft_dflash_blocks_batched(
         gpu.argmax_f32_batched(&logits_all, &argmax_buf, vocab, rows)?;
         let mut host_idx = vec![0i32; rows];
         {
-            let bytes: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4) };
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4)
+            };
             gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
         }
         let mut off = 0usize;
@@ -8137,6 +8436,214 @@ pub fn draft_dflash_blocks_batched(
         }
     }
     Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DFlash verbatim-lookup splice seam
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Largest lookup candidate count the singleton DFlash2 window can verify:
+/// 16 verify rows incl. the seed. Mirrors `spec_lookup::LOOKUP_MAX_CANDIDATES`
+/// (this crate does not depend on the policy module).
+pub const DFLASH_LOOKUP_MAX_CANDIDATES: usize = 15;
+
+/// Verbatim-lookup candidates composed into one DFlash2 verify window
+/// (selector mode only). The window's effective verify rows are
+/// `b_eff = 1 + K + L <= b`; every downstream verify / accept / commit /
+/// rollback step runs at `b_eff`. The learned draft always runs at the
+/// original `b` (no draft-work saving), so RNG draws of the learned draft are
+/// identical with and without a lookup.
+pub enum DflashLookup<'a> {
+    /// Copy window: `tokens` (1..=b-1) replace every learned candidate
+    /// (K = 0). The learned draft forward still runs; its candidates are
+    /// discarded.
+    Copy(&'a [u32]),
+    /// Hybrid: after the learned draft, the source may keep the first K
+    /// learned candidates and append a lookup tail.
+    Tail(&'a mut dyn DflashTailSource),
+}
+
+pub trait DflashTailSource {
+    /// `drafted` = learned candidates d1..d(b-1) (seed excluded). Sequential
+    /// stopping rule REQUIRED: the decision to splice at K may read only
+    /// `drafted[..K]` (sampled-law validity).
+    /// `Some(k)` with `1 <= k` and the tail (`1..=b-1-k` tokens) written into
+    /// `tail` (cleared first); `None` keeps the incumbent window unchanged.
+    fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize>;
+}
+
+fn lookup_err(msg: &str) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(0, msg)
+}
+
+/// Copy-window shape: `1 <= tokens.len() <= b - 1`, every id `< vocab`.
+fn dflash_lookup_check_copy(tokens: &[u32], b: usize, vocab: usize) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Err(lookup_err(
+            "dflash lookup: Copy window needs at least one token",
+        ));
+    }
+    if tokens.len() + 1 > b {
+        return Err(lookup_err(&format!(
+            "dflash lookup: Copy window of {} tokens exceeds the window's {} verify rows",
+            tokens.len(),
+            b
+        )));
+    }
+    dflash_lookup_check_ids(tokens, vocab)
+}
+
+fn dflash_lookup_check_ids(tokens: &[u32], vocab: usize) -> HipResult<()> {
+    if let Some(&t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+        return Err(lookup_err(&format!(
+            "dflash lookup: token id {t} out of vocab {vocab}"
+        )));
+    }
+    Ok(())
+}
+
+/// Pre-draft refusal: nothing has run yet, so an `Err` leaves every piece of
+/// state (RNG included) untouched.
+fn dflash_lookup_preflight(
+    lookup: &Option<DflashLookup<'_>>,
+    selector_mode: bool,
+    pld_spine: bool,
+    b: usize,
+    vocab: usize,
+) -> HipResult<()> {
+    let Some(lookup) = lookup else {
+        return Ok(());
+    };
+    if !selector_mode {
+        return Err(lookup_err(
+            "dflash lookup: requires the DFlash2 candidate selector (learned q receipts)",
+        ));
+    }
+    if pld_spine {
+        return Err(lookup_err("dflash lookup: not supported with a PLD spine"));
+    }
+    if b < 2 {
+        return Err(lookup_err("dflash lookup: window has no candidate rows"));
+    }
+    if let DflashLookup::Copy(tokens) = lookup {
+        dflash_lookup_check_copy(tokens, b, vocab)?;
+    }
+    Ok(())
+}
+
+/// Resolve the splice against the learned block `drafted` (`[seed, d1..d(b-1)]`).
+/// On `Ok(Some(keep))` the lookup tokens (Copy: the caller's tokens; Tail: the
+/// source's tail) are in `tail` and `1 + keep + tail.len() <= b`. `Ok(None)`:
+/// the source declined, keep the incumbent window. Validation precedes every
+/// verify/commit write; `drafted` is never mutated here.
+fn dflash_lookup_resolve(
+    lookup: DflashLookup<'_>,
+    drafted: &[u32],
+    b: usize,
+    vocab: usize,
+    tail: &mut Vec<u32>,
+) -> HipResult<Option<usize>> {
+    match lookup {
+        DflashLookup::Copy(tokens) => {
+            dflash_lookup_check_copy(tokens, b, vocab)?;
+            tail.clear();
+            tail.extend_from_slice(tokens);
+            Ok(Some(0))
+        }
+        DflashLookup::Tail(source) => {
+            if drafted.len() != b {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: learned block has {} rows, window has {}",
+                    drafted.len(),
+                    b
+                )));
+            }
+            tail.clear();
+            let Some(k) = source.splice(&drafted[1..], tail) else {
+                tail.clear();
+                return Ok(None);
+            };
+            if k < 1 || k > b - 1 {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: Tail keep {k} outside 1..={}",
+                    b - 1
+                )));
+            }
+            if tail.is_empty() {
+                return Err(lookup_err("dflash lookup: Tail spliced with an empty tail"));
+            }
+            if k + tail.len() > b - 1 {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: Tail keep {k} + tail {} exceeds {} candidate rows",
+                    tail.len(),
+                    b - 1
+                )));
+            }
+            dflash_lookup_check_ids(tail, vocab)?;
+            Ok(Some(k))
+        }
+    }
+}
+
+/// A sampled window needs the learned q receipt of at least `keep` rows to
+/// splice onto; checked before any receipt mutation.
+fn dflash_lookup_check_receipt(receipt: Option<&DflashSampledDraft>, keep: usize) -> HipResult<()> {
+    let Some(r) = receipt else {
+        return Err(lookup_err(
+            "dflash lookup: sampled window without a q receipt",
+        ));
+    };
+    let rows = if r.sparse {
+        r.sparse_q.rows()
+    } else {
+        r.dense_q.len()
+    };
+    if r.selected_q.len() < keep || rows < keep {
+        return Err(lookup_err(&format!(
+            "dflash lookup: q receipt holds {} rows, Tail keeps {keep}",
+            r.selected_q.len().min(rows)
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild the q receipt of a spliced sampled window: learned rows `..keep`
+/// keep their real q (selected probability and support), every lookup row is a
+/// POINT-MASS q (`selected_q = 1.0`, support `{c: 1.0}` — a one-entry sparse
+/// row, or a one-hot dense row). The learned selector `proposal` is dropped:
+/// it describes the discarded learned rows and must not feed lookup rows.
+/// Dense mode reuses the discarded learned rows' buffers.
+fn dflash_lookup_splice_receipt(
+    receipt: &mut DflashSampledDraft,
+    keep: usize,
+    tokens: &[u32],
+    vocab: usize,
+) -> HipResult<()> {
+    receipt.selected_q.truncate(keep);
+    receipt.uniforms.truncate(keep);
+    receipt.proposal = None;
+    if receipt.sparse {
+        receipt.sparse_q.truncate_rows(keep);
+        for &c in tokens {
+            receipt.sparse_q.push_row(&[c], &[1.0], vocab)?;
+            receipt.selected_q.push(1.0);
+        }
+    } else {
+        for (j, &c) in tokens.iter().enumerate() {
+            let row = keep + j;
+            if row < receipt.dense_q.len() {
+                let r = &mut receipt.dense_q[row];
+                r.clear();
+                r.resize(vocab, 0.0);
+            } else {
+                receipt.dense_q.push(vec![0.0; vocab]);
+            }
+            receipt.dense_q[row][c as usize] = 1.0;
+            receipt.selected_q.push(1.0);
+        }
+        receipt.dense_q.truncate(keep + tokens.len());
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8176,6 +8683,16 @@ pub fn draft_dflash_blocks_batched(
 /// Use this for accept-rate bisect experiments — if training-time context
 /// was shorter than inference-time, truncation may help. `None` uses the
 /// full cumulative context (the default, distribution-preserving path).
+///
+/// `lookup`: `None` is the incumbent window. `Some(Copy(tokens))` verifies
+/// `[seed, tokens..]` in place of the learned candidates; `Some(Tail(src))`
+/// calls `src.splice` after the learned draft and, on `Some(k)`, verifies
+/// `[seed, d1..dk, tail..]`. A declining `Tail` source is byte-identical to
+/// `None`. DFlash2 selector mode only. The learned draft still runs at the
+/// original `b`; all later stages run at `b_eff = 1 + K + L <= b`.
+/// Sampled windows give lookup rows point-mass q receipts (see
+/// `dflash_lookup_splice_receipt`). Invalid splices return `Err` before any
+/// verify/commit write, with the sampling RNG restored to its entry state.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
@@ -8218,6 +8735,7 @@ pub fn spec_step_dflash(
     // Retained-PM4 verify route owned by the speculator. `None` keeps the
     // shipping HIP/HipGraph path byte-for-byte.
     verify_pm4: Option<&mut DflashVerifyPm4>,
+    lookup: Option<DflashLookup<'_>>,
 ) -> HipResult<SpecStepResult> {
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
@@ -8271,6 +8789,10 @@ pub fn spec_step_dflash(
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
     let mask_token = draft_cfg.mask_token_id;
+    dflash_lookup_preflight(&lookup, selector_mode, pld_spine.is_some(), b, vocab)?;
+    // Sampled windows consume RNG in the learned draft before the splice can
+    // be refused; an abandoned window restores it.
+    let rng_at_entry = *rng_state;
 
     // Ensure active_stream is set before any draft/verify work so memset_async
     // and stream-ordered launches have a non-null stream to ride on. Without
@@ -8397,7 +8919,12 @@ pub fn spec_step_dflash(
             drafted.push(pld[i]);
         }
         if use_temp_sampling {
-            let sample_cfg = DflashSampleCfg { temp, top_p, top_k, cactus_delta };
+            let sample_cfg = DflashSampleCfg {
+                temp,
+                top_p,
+                top_k,
+                cactus_delta,
+            };
             if dflash_sparse_target_enabled(&sample_cfg) {
                 // q = point mass at the PLD token: a one-entry sparse row,
                 // identical arithmetic to the one-hot vocab row below.
@@ -8424,12 +8951,29 @@ pub fn spec_step_dflash(
     } else if use_temp_sampling && selector_mode {
         let mut receipt = DflashSampledDraft::default();
         dflash_sampled_selector_draft_parts_into(
-            gpu, &target.weights, draft_weights, draft_cfg, draft_scratch,
-            verify_scratch, target_hidden_host, &target.scratch.logits,
-            position, target.kv_cache.compact_offset as i32, seed_token,
-            b, vocab, ctx_slice, draft_ffn_graph,
-            DflashSampleCfg { temp, top_p, top_k, cactus_delta },
-            rng_state, &mut receipt,
+            gpu,
+            &target.weights,
+            draft_weights,
+            draft_cfg,
+            draft_scratch,
+            verify_scratch,
+            target_hidden_host,
+            &target.scratch.logits,
+            position,
+            target.kv_cache.compact_offset as i32,
+            seed_token,
+            b,
+            vocab,
+            ctx_slice,
+            draft_ffn_graph,
+            DflashSampleCfg {
+                temp,
+                top_p,
+                top_k,
+                cactus_delta,
+            },
+            rng_state,
+            &mut receipt,
         )?;
         drafted = std::mem::take(&mut receipt.block);
         q_receipt = Some(receipt);
@@ -8854,6 +9398,48 @@ pub fn spec_step_dflash(
         }
     } // close else (DFlash draft path)
 
+    // ── 5a. Verbatim-lookup splice ───────────────────────────────────────
+    // From here every stage runs at the effective verify rows `b_eff`; the
+    // learned draft above ran at the original `b`. `block` is truncated to
+    // `b_eff` before it is filled, so verify/graph B/logit slices/accept/
+    // hidden ring/GDN tape+rollback/thlog all see the spliced window.
+    let b = match lookup {
+        None => b,
+        Some(lk) => {
+            let mut tail = verify_scratch
+                .lookup_tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let plan = dflash_lookup_resolve(lk, &drafted, b, vocab, &mut tail).and_then(|keep| {
+                if let Some(keep) = keep {
+                    if use_temp_sampling {
+                        dflash_lookup_check_receipt(q_receipt.as_ref(), keep)?;
+                    }
+                }
+                Ok(keep)
+            });
+            match plan {
+                Err(e) => {
+                    *rng_state = rng_at_entry;
+                    return Err(e);
+                }
+                Ok(None) => b,
+                Ok(Some(keep)) => {
+                    if use_temp_sampling {
+                        let receipt = q_receipt.as_mut().expect("receipt checked above");
+                        if let Err(e) = dflash_lookup_splice_receipt(receipt, keep, &tail, vocab) {
+                            *rng_state = rng_at_entry;
+                            return Err(e);
+                        }
+                    }
+                    drafted.truncate(1 + keep);
+                    drafted.extend_from_slice(&tail);
+                    drafted.len()
+                }
+            }
+        }
+    };
+    block.truncate(b);
     for i in 1..b {
         block[i] = drafted[i];
     }
@@ -9053,7 +9639,12 @@ pub fn spec_step_dflash(
                     && fast_sample_active
                     && dflash_device_accept_eligible(
                         dflash_device_accept_enabled() && gpu.dflash_device_accept_supported(),
-                        &DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                        &DflashSampleCfg {
+                            temp,
+                            top_p,
+                            top_k,
+                            cactus_delta,
+                        },
                         r,
                         b,
                     ) =>
@@ -9064,7 +9655,12 @@ pub fn spec_step_dflash(
                     &block,
                     r,
                     vocab,
-                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    DflashSampleCfg {
+                        temp,
+                        top_p,
+                        top_k,
+                        cactus_delta,
+                    },
                     max_accept.unwrap_or(usize::MAX),
                     rng_state,
                     &mut *verify_scratch
@@ -9162,8 +9758,16 @@ pub fn spec_step_dflash(
                 let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
                 let mut rows = FastTargetRows::default();
                 dflash_target_rows_into(
-                    gpu, &logits_batch, b, vocab,
-                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    gpu,
+                    &logits_batch,
+                    b,
+                    vocab,
+                    DflashSampleCfg {
+                        temp,
+                        top_p,
+                        top_k,
+                        cactus_delta,
+                    },
                     &mut rows,
                 )?;
                 Some(rows)
@@ -9181,9 +9785,20 @@ pub fn spec_step_dflash(
             };
             let mut target_probs = Vec::with_capacity(vocab);
             let decision = dflash_sampled_accept_rows(
-                &block, &q, fast_tgt.as_ref(), &verify_out.logits_per_pos,
-                vocab, DflashSampleCfg { temp, top_p, top_k, cactus_delta },
-                max_accept.unwrap_or(usize::MAX), rng_state, &mut target_probs,
+                &block,
+                &q,
+                fast_tgt.as_ref(),
+                &verify_out.logits_per_pos,
+                vocab,
+                DflashSampleCfg {
+                    temp,
+                    top_p,
+                    top_k,
+                    cactus_delta,
+                },
+                max_accept.unwrap_or(usize::MAX),
+                rng_state,
+                &mut target_probs,
             );
             accept_len = decision.accepted_drafts;
             bonus_token = decision.bonus_token;
@@ -9392,7 +10007,10 @@ pub fn spec_step_dflash(
         let us_draft = t_draft_end.duration_since(t_spec_start).as_micros();
         let us_ngram = t_verify_start.duration_since(t_draft_end).as_micros();
         let us_verify = t_verify_end.duration_since(t_verify_start).as_micros();
-        let us_accept = commit_times.accept_end.duration_since(t_verify_end).as_micros();
+        let us_accept = commit_times
+            .accept_end
+            .duration_since(t_verify_end)
+            .as_micros();
         let us_scatter = commit_times
             .scatter_end
             .duration_since(commit_times.accept_end)
@@ -9418,12 +10036,7 @@ pub fn spec_step_dflash(
             us_total,
         );
     }
-    let _ = (
-        t_phase,
-        t_draft_end,
-        t_verify_start,
-        t_verify_end,
-    );
+    let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end);
 
     Ok(SpecStepResult {
         accepted: accept_len,
@@ -12034,7 +12647,12 @@ fn dflash_seed_outer_chunk_len(remaining: usize, ceiling: usize) -> usize {
 /// checkpoint plus `interval`, and at `cap` recycles the oldest, so the ring
 /// length never exceeds `cap`. (A failed snapshot allocation only lowers the
 /// real count.)
-pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval: usize, cap: usize) -> usize {
+pub fn dflash_seed_checkpoint_count(
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> usize {
     if cap == 0 {
         return 0;
     }
@@ -12059,7 +12677,12 @@ pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval:
 /// with a free-byte deduction that covers everything allocated before the
 /// seed's own query (admission is monotone in free bytes, and a ceiling that
 /// does not depend on memory equals `min_ceiling`).
-pub fn dflash_seed_checkpoint_bound(prompt_len: usize, min_ceiling: usize, interval: usize, cap: usize) -> usize {
+pub fn dflash_seed_checkpoint_bound(
+    prompt_len: usize,
+    min_ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> usize {
     qwen35::prefill::WIDENED_RUNGS
         .iter()
         .copied()
@@ -12217,7 +12840,12 @@ impl SeedPrefill {
         }
         if self.pbs.is_none() {
             let rows = self.ceiling.min(total).max(2);
-            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, target.config, rows, false)?);
+            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(
+                gpu,
+                target.config,
+                rows,
+                false,
+            )?);
         }
         qwen35::forward_prefill_batch_with_pbs(
             gpu,
@@ -12622,7 +13250,8 @@ mod sparse_target_tests {
     fn sparse_accept_matches_dense_10k_cases() {
         let mut rng = Lcg(0x5EED_0001);
         let (mut full, mut zero, mut budget, mut rejected) = (0usize, 0usize, 0usize, 0usize);
-        let (mut dense_rows_seen, mut overflow_seen, mut sparse_rows_seen) = (0usize, 0usize, 0usize);
+        let (mut dense_rows_seen, mut overflow_seen, mut sparse_rows_seen) =
+            (0usize, 0usize, 0usize);
         let mut empty_q_rows = 0usize;
         for case in 0..10_000usize {
             let vocab = 2 + rng.below(if case % 50 == 0 { 400 } else { 40 });
@@ -12663,8 +13292,26 @@ mod sparse_target_tests {
                 }
                 // Rebuilt legacy rows are bit-identical to the dense rows.
                 let (mut a, mut c) = (Vec::new(), Vec::new());
-                sampled_target_row_into(&mut a, r, vocab, Some(&dense_fast), &[], temp, top_k, top_p);
-                sampled_target_row_into(&mut c, r, vocab, Some(&sparse_fast), &[], temp, top_k, top_p);
+                sampled_target_row_into(
+                    &mut a,
+                    r,
+                    vocab,
+                    Some(&dense_fast),
+                    &[],
+                    temp,
+                    top_k,
+                    top_p,
+                );
+                sampled_target_row_into(
+                    &mut c,
+                    r,
+                    vocab,
+                    Some(&sparse_fast),
+                    &[],
+                    temp,
+                    top_k,
+                    top_p,
+                );
                 assert_eq!(a, c, "case {case} row {r}");
             }
 
@@ -12726,7 +13373,11 @@ mod sparse_target_tests {
                 top_k,
                 cactus_delta: if rng.below(8) == 0 { 0.1 } else { 0.0 },
             };
-            let max_accept = if rng.below(10) < 7 { usize::MAX } else { rng.below(b + 1) };
+            let max_accept = if rng.below(10) < 7 {
+                usize::MAX
+            } else {
+                rng.below(b + 1)
+            };
             let seed = rng.next_u64() | 1;
             let q_dense = DflashSampledDraft {
                 selected_q: selected.clone(),
@@ -12742,7 +13393,15 @@ mod sparse_target_tests {
             let run = |fast: &FastTargetRows, q: &DflashSampledDraft, scratch: &mut Vec<f32>| {
                 let mut s = seed;
                 let d = dflash_sampled_accept_rows(
-                    &block, q, Some(fast), &[], vocab, cfg, max_accept, &mut s, scratch,
+                    &block,
+                    q,
+                    Some(fast),
+                    &[],
+                    vocab,
+                    cfg,
+                    max_accept,
+                    &mut s,
+                    scratch,
                 );
                 (d.accepted_drafts, d.bonus_token, d.committed_len, s)
             };
@@ -12770,12 +13429,22 @@ mod sparse_target_tests {
                 assert_eq!(got, reference, "case {case} {name}");
                 let all_sparse = sparse_fast.dense_slot.iter().all(|&s| s == SPARSE_NONE);
                 if name == "sparse/sparse" && all_sparse && cfg.cactus_delta <= 0.0 {
-                    assert_eq!(s.capacity(), 0, "case {case}: sparse path built a vocab row");
+                    assert_eq!(
+                        s.capacity(),
+                        0,
+                        "case {case}: sparse path built a vocab row"
+                    );
                 }
             }
         }
-        assert!(full > 0 && zero > 0 && budget > 0 && rejected > 0, "coverage {full} {zero} {budget} {rejected}");
-        assert!(dense_rows_seen > 0 && overflow_seen > 0 && sparse_rows_seen > 0, "rows {dense_rows_seen} {overflow_seen} {sparse_rows_seen}");
+        assert!(
+            full > 0 && zero > 0 && budget > 0 && rejected > 0,
+            "coverage {full} {zero} {budget} {rejected}"
+        );
+        assert!(
+            dense_rows_seen > 0 && overflow_seen > 0 && sparse_rows_seen > 0,
+            "rows {dense_rows_seen} {overflow_seen} {sparse_rows_seen}"
+        );
         assert!(empty_q_rows > 0);
     }
 
@@ -12791,7 +13460,11 @@ mod sparse_target_tests {
             for j in 0..vocab {
                 if rng.below(dens) == 0 && rng.below(8) != 0 {
                     tidx.push(j as u32);
-                    tval.push(if tied { (1 + rng.below(3)) as f32 * 0.07 } else { 0.01 + rng.unit() * 0.4 });
+                    tval.push(if tied {
+                        (1 + rng.below(3)) as f32 * 0.07
+                    } else {
+                        0.01 + rng.unit() * 0.4
+                    });
                 }
             }
             let (mut qidx, mut qval) = (Vec::new(), Vec::new());
@@ -12876,7 +13549,11 @@ mod sparse_target_tests {
                     "case {case} u {u} categorical"
                 );
             }
-            assert_eq!(argmax_u32(&p), argmax_sparse(&tidx, &tval, inv_z, vocab), "case {case} argmax");
+            assert_eq!(
+                argmax_u32(&p),
+                argmax_sparse(&tidx, &tval, inv_z, vocab),
+                "case {case} argmax"
+            );
         }
     }
 
@@ -12889,7 +13566,11 @@ mod sparse_target_tests {
             let mut p = vec![0.0f32; vocab];
             for j in 0..vocab {
                 if rng.below(3) == 0 {
-                    let v = if rng.below(4) == 0 { 1.0 } else { rng.unit() * 0.6 };
+                    let v = if rng.below(4) == 0 {
+                        1.0
+                    } else {
+                        rng.unit() * 0.6
+                    };
                     idx.push(j as u32);
                     val.push(v);
                     p[j] = v;
@@ -12910,7 +13591,8 @@ mod sparse_target_tests {
     fn sparse_q_rows_reproduce_last_write_and_reject_bad_ids() {
         let mut q = SparseQRows::default();
         q.clear();
-        q.push_row(&[5, 3, 5, 9, 3], &[0.1, 0.2, 0.3, 0.4, 0.5], 16).unwrap();
+        q.push_row(&[5, 3, 5, 9, 3], &[0.1, 0.2, 0.3, 0.4, 0.5], 16)
+            .unwrap();
         q.push_row(&[], &[], 16).unwrap();
         q.push_row(&[7, 7], &[0.25, 0.0], 16).unwrap();
         assert_eq!(q.rows(), 3);
@@ -12956,7 +13638,12 @@ mod sparse_target_tests {
 
     #[test]
     fn cactus_disables_the_sparse_representation() {
-        let cfg = DflashSampleCfg { temp: 0.8, top_p: 0.9, top_k: 20, cactus_delta: 0.1 };
+        let cfg = DflashSampleCfg {
+            temp: 0.8,
+            top_p: 0.9,
+            top_k: 20,
+            cactus_delta: 0.1,
+        };
         assert!(!dflash_sparse_target_enabled(&cfg));
     }
 }
@@ -13081,7 +13768,11 @@ mod tests {
                     .map(|_| {
                         let x = xorshift_next_unit(&mut rng);
                         // Sparse-ish rows: many exact zeros like a nucleus.
-                        if x < 0.5 { 0.0 } else { x }
+                        if x < 0.5 {
+                            0.0
+                        } else {
+                            x
+                        }
                     })
                     .collect();
                 let s: f32 = r.iter().sum();
@@ -13665,7 +14356,13 @@ mod tests {
 mod dn_exchange_tests {
     use super::*;
 
-    const EXT: DnCbExtents = DnCbExtents { n_layers: 2, s: 64, scales: 16, conv: 24, ef: 128 };
+    const EXT: DnCbExtents = DnCbExtents {
+        n_layers: 2,
+        s: 64,
+        scales: 16,
+        conv: 24,
+        ef: 128,
+    };
     const LIVE: usize = 0x10_0000;
     const SNAP: usize = 0x20_0000;
     const FWD0: usize = 0xF0_0000;
@@ -13696,7 +14393,11 @@ mod dn_exchange_tests {
     fn state(base: usize) -> DeltaNetState {
         let fam = |f: usize| -> Vec<GpuTensor> {
             (0..EXT.n_layers)
-                .map(|l| GpuTensor { buf: buf(addr(base, f, l), fam_bytes(f)), shape: vec![fam_bytes(f)], dtype: fam_dtype(f) })
+                .map(|l| GpuTensor {
+                    buf: buf(addr(base, f, l), fam_bytes(f)),
+                    shape: vec![fam_bytes(f)],
+                    dtype: fam_dtype(f),
+                })
                 .collect()
         };
         DeltaNetState {
@@ -13710,7 +14411,9 @@ mod dn_exchange_tests {
 
     fn snapshot(base: usize, live: &DeltaNetState) -> DeltaNetSnapshot {
         let fam = |f: usize| -> Vec<DeviceBuffer> {
-            (0..EXT.n_layers).map(|l| buf(addr(base, f, l), fam_bytes(f))).collect()
+            (0..EXT.n_layers)
+                .map(|l| buf(addr(base, f, l), fam_bytes(f)))
+                .collect()
         };
         DeltaNetSnapshot {
             s_matrix_bufs: fam(0),
@@ -13743,12 +14446,25 @@ mod dn_exchange_tests {
         let mut sn = snapshot(SNAP, &st);
         sn.exchange_buffers(&mut st);
         for l in 0..EXT.n_layers {
-            assert_eq!(live_ptrs(&st, l), expect(SNAP, l), "live now owns the old snapshot bank");
-            assert_eq!(sn.layer_state_ptrs(l), expect(LIVE, l), "snapshot now owns the old live bank");
+            assert_eq!(
+                live_ptrs(&st, l),
+                expect(SNAP, l),
+                "live now owns the old snapshot bank"
+            );
+            assert_eq!(
+                sn.layer_state_ptrs(l),
+                expect(LIVE, l),
+                "snapshot now owns the old live bank"
+            );
         }
         // Handle sizes, tensor shape/dtype and quant mode are untouched.
         for f in 0..4 {
-            let fam = [&st.s_matrices, &st.s_scales, &st.conv_states, &st.s_ef_residual][f];
+            let fam = [
+                &st.s_matrices,
+                &st.s_scales,
+                &st.conv_states,
+                &st.s_ef_residual,
+            ][f];
             for t in fam.iter() {
                 assert_eq!(t.buf.size(), fam_bytes(f));
                 assert_eq!(t.shape, vec![fam_bytes(f)]);
@@ -13756,7 +14472,10 @@ mod dn_exchange_tests {
             }
         }
         assert_eq!(st.quant, qwen35::StateQuant::Q8);
-        assert!(sn.exact_extents(&st, &EXT), "still an exact pair after the exchange");
+        assert!(
+            sn.exact_extents(&st, &EXT),
+            "still an exact pair after the exchange"
+        );
     }
 
     #[test]
@@ -13771,8 +14490,14 @@ mod dn_exchange_tests {
             assert_eq!(sn.layer_state_ptrs(l), expect(SNAP, l));
         }
         assert_eq!(sn.bulk_fingerprint, fp0);
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
         assert_eq!(sn.bulk_n_items, 3);
     }
 
@@ -13783,10 +14508,20 @@ mod dn_exchange_tests {
         sn.exchange_buffers(&mut st);
         // Old reverse (backup -> live) is the new forward SAVE; old forward is
         // the new RESTORE.
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
         assert_eq!(sn.bulk_n_items, 3);
-        assert_eq!(sn.bulk_fingerprint, DeltaNetSnapshot::bulk_fingerprint(&st), "valid for the new live owners");
+        assert_eq!(
+            sn.bulk_fingerprint,
+            DeltaNetSnapshot::bulk_fingerprint(&st),
+            "valid for the new live owners"
+        );
     }
 
     #[test]
@@ -13795,10 +14530,19 @@ mod dn_exchange_tests {
         let mut sn = snapshot(SNAP, &st);
         sn.bulk_fingerprint ^= 1; // built against some other live state
         sn.exchange_buffers(&mut st);
-        assert_eq!(sn.bulk_n_items, 0, "stale tables must not be re-fingerprinted into validity");
+        assert_eq!(
+            sn.bulk_n_items, 0,
+            "stale tables must not be re-fingerprinted into validity"
+        );
         // Allocations stay owned (freed by `free_gpu`), directions not swapped.
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
         // The exchange itself still happened.
         assert_eq!(live_ptrs(&st, 0), expect(SNAP, 0));
         // Disarmed stays disarmed across a second exchange.
@@ -13814,13 +14558,19 @@ mod dn_exchange_tests {
 
         let mut bad = state(LIVE);
         bad.conv_states[1].buf = buf(addr(LIVE, 2, 1), EXT.conv + 4096);
-        assert!(!sn.exact_extents(&bad, &EXT), "live conv ring rounded but the snapshot's is not (unequal banks)");
+        assert!(
+            !sn.exact_extents(&bad, &EXT),
+            "live conv ring rounded but the snapshot's is not (unequal banks)"
+        );
 
         let mut bad = state(LIVE);
         bad.s_scales[0].buf = buf(addr(LIVE, 1, 0), EXT.scales - 4);
         let mut bad_snap = snapshot(SNAP, &st);
         bad_snap.s_scale_bufs[0] = buf(addr(SNAP, 1, 0), EXT.scales - 4);
-        assert!(!bad_snap.exact_extents(&bad, &EXT), "equal banks below the logical scales extent");
+        assert!(
+            !bad_snap.exact_extents(&bad, &EXT),
+            "equal banks below the logical scales extent"
+        );
 
         let mut bad = state(LIVE);
         bad.s_matrices[0].buf = buf(addr(LIVE, 0, 0), EXT.s + 4096);
@@ -13835,7 +14585,10 @@ mod dn_exchange_tests {
         ok.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
         let mut ok_snap = snapshot(SNAP, &st);
         ok_snap.s_ef_residual_bufs[0] = buf(addr(SNAP, 3, 0), EXT.ef + 4096);
-        assert!(ok_snap.exact_extents(&ok, &EXT), "equal pool-rounded EF banks are admitted");
+        assert!(
+            ok_snap.exact_extents(&ok, &EXT),
+            "equal pool-rounded EF banks are admitted"
+        );
         let mut bad = state(LIVE);
         bad.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
         assert!(!sn.exact_extents(&bad, &EXT), "unequal EF banks");
@@ -13858,10 +14611,16 @@ mod dn_exchange_tests {
 
         let mut bad_snap = snapshot(SNAP, &st);
         bad_snap.s_scale_bufs.pop();
-        assert!(!bad_snap.exact_extents(&st, &EXT), "snapshot scales family short");
+        assert!(
+            !bad_snap.exact_extents(&st, &EXT),
+            "snapshot scales family short"
+        );
 
         let other = DnCbExtents { n_layers: 3, ..EXT };
-        assert!(!sn.exact_extents(&st, &other), "layer count differs from the config's");
+        assert!(
+            !sn.exact_extents(&st, &other),
+            "layer count differs from the config's"
+        );
         let none = DnCbExtents { n_layers: 0, ..EXT };
         assert!(!sn.exact_extents(&st, &none));
     }
@@ -13880,7 +14639,10 @@ mod dn_exchange_tests {
         }
         assert!(sn.exact_extents(&st, &EXT));
         sn.exchange_buffers(&mut st);
-        assert!(sn.exact_extents(&st, &EXT), "equal sizes: an exchange keeps every owner's capacity");
+        assert!(
+            sn.exact_extents(&st, &EXT),
+            "equal sizes: an exchange keeps every owner's capacity"
+        );
         assert_eq!(st.conv_states[0].buf.size(), EXT.conv + 8192);
         assert_eq!(sn.conv_state_bufs[0].size(), EXT.conv + 8192);
     }
@@ -13949,13 +14711,21 @@ mod device_accept_tests {
 
     #[test]
     fn admission_follows_switch_cactus_and_q_representation() {
-        let cfg = DflashSampleCfg { temp: 0.7, top_p: 0.9, top_k: 20, cactus_delta: 0.0 };
+        let cfg = DflashSampleCfg {
+            temp: 0.7,
+            top_p: 0.9,
+            top_k: 20,
+            cactus_delta: 0.0,
+        };
         let d = sparse_draft(5);
         assert!(dflash_device_accept_eligible(true, &cfg, &d, 5));
         // Kill switch.
         assert!(!dflash_device_accept_eligible(false, &cfg, &d, 5));
         // CACTUS keeps the dense host arithmetic.
-        let cactus = DflashSampleCfg { cactus_delta: 0.05, ..cfg };
+        let cactus = DflashSampleCfg {
+            cactus_delta: 0.05,
+            ..cfg
+        };
         assert!(!dflash_device_accept_eligible(true, &cactus, &d, 5));
         // Dense q (HIPFIRE_DFLASH_SPARSE_TARGET=0) keeps the host loop.
         let mut dense = sparse_draft(5);
@@ -13964,21 +14734,40 @@ mod device_accept_tests {
         // Receipt not covering the window.
         assert!(!dflash_device_accept_eligible(true, &cfg, &d, 6));
         assert!(!dflash_device_accept_eligible(true, &cfg, &d, 1));
-        assert!(!dflash_device_accept_eligible(true, &cfg, &DflashSampledDraft::default(), 5));
+        assert!(!dflash_device_accept_eligible(
+            true,
+            &cfg,
+            &DflashSampledDraft::default(),
+            5
+        ));
     }
 
     /// Duplicate selector candidate ids: the payload carries the last write.
     #[test]
     fn payload_carries_the_last_write_sparse_rows() {
         let mut q = SparseQRows::with_capacity(1, 8);
-        q.push_row(&[9, 4, 9, 2], &[0.1, 0.2, 0.3, 0.4], 16).unwrap();
-        let mut payload = Vec::new();
-        dflash_accept_pack_payload(&mut payload, &[4], &[0.5], 0.25, 1, &[0.2], q.offsets(), &q.idx, &q.val)
+        q.push_row(&[9, 4, 9, 2], &[0.1, 0.2, 0.3, 0.4], 16)
             .unwrap();
+        let mut payload = Vec::new();
+        dflash_accept_pack_payload(
+            &mut payload,
+            &[4],
+            &[0.5],
+            0.25,
+            1,
+            &[0.2],
+            q.offsets(),
+            &q.idx,
+            &q.val,
+        )
+        .unwrap();
         // 4n+3 header words, then ids [2, 4, 9] and values [0.4, 0.2, 0.3].
         let n = 1;
         let ids = &payload[4 * n + 3..4 * n + 6];
-        let vals: Vec<f32> = payload[4 * n + 6..].iter().map(|&w| f32::from_bits(w)).collect();
+        let vals: Vec<f32> = payload[4 * n + 6..]
+            .iter()
+            .map(|&w| f32::from_bits(w))
+            .collect();
         assert_eq!(ids, &[2, 4, 9]);
         assert_eq!(vals, vec![0.4, 0.2, 0.3]);
     }
@@ -14020,7 +14809,9 @@ mod device_accept_tests {
                 // the proposed token is one of the candidates; its q is the row's value.
                 let pick = cands[rng.below(6)];
                 let (ids, vals) = draft.sparse_q.row(draft.sparse_q.rows() - 1);
-                draft.selected_q.push(vals[ids.iter().position(|&i| i == pick).unwrap()]);
+                draft
+                    .selected_q
+                    .push(vals[ids.iter().position(|&i| i == pick).unwrap()]);
                 draft.block.push(pick);
             }
             let max_accept = [n, n, n, 2][round % 4];
@@ -14028,8 +14819,15 @@ mod device_accept_tests {
             let u_fin = rng.unit();
             let mut payload = Vec::new();
             dflash_accept_pack_payload(
-                &mut payload, &draft.block[1..], &uniforms, u_fin, max_accept, &draft.selected_q,
-                draft.sparse_q.offsets(), &draft.sparse_q.idx, &draft.sparse_q.val,
+                &mut payload,
+                &draft.block[1..],
+                &uniforms,
+                u_fin,
+                max_accept,
+                &draft.selected_q,
+                draft.sparse_q.offsets(),
+                &draft.sparse_q.idx,
+                &draft.sparse_q.val,
             )
             .unwrap();
             let dev = dflash_sampled_accept_reference(&probs, &tau, &z, &payload, n, vocab);
@@ -14053,7 +14851,12 @@ mod device_accept_tests {
                     counts[r] = c as u32;
                 }
                 let mut f = FastTargetRows {
-                    tau: tau.clone(), z: z.clone(), capacity: cap, counts, idx, val,
+                    tau: tau.clone(),
+                    z: z.clone(),
+                    capacity: cap,
+                    counts,
+                    idx,
+                    val,
                     ..FastTargetRows::default()
                 };
                 let nd = f.plan_dense_rows(vocab).unwrap();
@@ -14063,18 +14866,24 @@ mod device_accept_tests {
             let mut accept = 0usize;
             let mut host_bonus = None;
             for i in 0..n.min(max_accept) {
-                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(i, vocab) else { unreachable!() };
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(i, vocab) else {
+                    unreachable!()
+                };
                 let p_t = sparse_row_prob(idx, val, inv_z, draft.block[i + 1]);
                 if uniforms[i] * draft.selected_q[i].max(f32::MIN_POSITIVE) <= p_t {
                     accept += 1;
                 } else {
                     let (qi, qv) = draft.sparse_q.row(i);
-                    host_bonus = Some(sample_residual_sparse(idx, val, inv_z, qi, qv, vocab, u_fin));
+                    host_bonus = Some(sample_residual_sparse(
+                        idx, val, inv_z, qi, qv, vocab, u_fin,
+                    ));
                     break;
                 }
             }
             let host_bonus = host_bonus.unwrap_or_else(|| {
-                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(accept, vocab) else { unreachable!() };
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(accept, vocab) else {
+                    unreachable!()
+                };
                 sample_categorical_sparse(idx, val, inv_z, vocab, u_fin)
             });
             assert_eq!(dev.accept_len, accept, "round {round}");
@@ -14083,6 +14892,952 @@ mod device_accept_tests {
                 bonus_mismatch += 1;
             }
         }
-        assert!(bonus_mismatch * 100 <= checked, "{bonus_mismatch}/{checked} bonus draws differ");
+        assert!(
+            bonus_mismatch * 100 <= checked,
+            "{bonus_mismatch}/{checked} bonus draws differ"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    //! Verbatim-lookup splice seam, host only.
+    //!
+    //! The law tests drive the REAL host accept loop
+    //! (`dflash_sampled_accept_q_rows_with`, the single implementation behind
+    //! `dflash_sampled_accept_rows`) with an EXACT uniform source: every
+    //! uniform the window consumes is enumerated over a midpoint grid of
+    //! `grid` cells per draw (depth-first, only as many draws as the window
+    //! takes). Every threshold of these toy windows (accept ratio `p/q`,
+    //! residual / bonus CDF fractions) is a multiple of `1/grid`, so each cell
+    //! lies wholly on one side of every threshold and the integral is exact
+    //! up to f64 rounding (asserted to 1e-6). Candidates of model rows are
+    //! enumerated with weight `q(c)`; point-mass rows are fixed. The q
+    //! receipts are built by the production `dflash_lookup_splice_receipt`.
+    //!
+    //! Law checked at every window position `i` that the chain can reach:
+    //! `P(emitted_i = x | positions < i all accepted) == p_i(x)` — covering
+    //! the accept-or-residual token for candidate rows (q = 0 / p = 0 at the
+    //! candidate included) and the bonus after a full or budget-bound accept —
+    //! plus `P(reach i) == prod_{j<i} sum_c min(q_j, p_j)`.
+    //!
+    //! Pre-existing: `xorshift_next_unit` may return exactly `0.0` (2^-24), at
+    //! which a point-mass candidate with `p = 0` is accepted (`0 <= 0`). That
+    //! measure-2^-24 event predates the seam (PLD uses the same arithmetic)
+    //! and is not representable on the midpoint grid.
+    use super::*;
+
+    fn integrate<T>(
+        grid: usize,
+        run: &mut impl FnMut(&mut dyn FnMut() -> f32) -> T,
+        visit: &mut impl FnMut(T, f64),
+    ) {
+        fn go<T>(
+            grid: usize,
+            script: &mut Vec<usize>,
+            run: &mut impl FnMut(&mut dyn FnMut() -> f32) -> T,
+            visit: &mut impl FnMut(T, f64),
+        ) {
+            let mut pos = 0usize;
+            let mut need_more = false;
+            let out = {
+                let s: &[usize] = &script[..];
+                let mut src = || -> f32 {
+                    if pos < s.len() {
+                        let u = (s[pos] as f32 + 0.5) / (grid as f32);
+                        pos += 1;
+                        u
+                    } else {
+                        need_more = true;
+                        0.5
+                    }
+                };
+                run(&mut src)
+            };
+            if need_more {
+                for cell in 0..grid {
+                    script.push(cell);
+                    go(grid, script, run, visit);
+                    script.pop();
+                }
+            } else {
+                debug_assert_eq!(pos, script.len());
+                visit(out, (grid as f64).powi(-(script.len() as i32)));
+            }
+        }
+        go(grid, &mut Vec::new(), run, visit)
+    }
+
+    const V: usize = 6;
+    const T0: [f32; V] = [0.5, 0.25, 0.125, 0.125, 0.0, 0.0];
+    const T1: [f32; V] = [0.25, 0.25, 0.25, 0.125, 0.125, 0.0];
+    const T2: [f32; V] = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0];
+    const T3: [f32; V] = [0.125, 0.125, 0.125, 0.125, 0.25, 0.25];
+    const T4: [f32; V] = [0.25, 0.25, 0.5, 0.0, 0.0, 0.0];
+    const T5: [f32; V] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.5];
+    const T6: [f32; V] = [0.0, 0.5, 0.5, 0.0, 0.0, 0.0];
+    const TONE: [f32; V] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+
+    #[derive(Clone)]
+    enum RowQ {
+        Model(Vec<f32>),
+        Point(u32),
+    }
+
+    /// Raw target row plus the nucleus/top-k cut that `tau`/`z` describe
+    /// (`tau <= 0`: no cut). Logits mode derives the same cut from top_k/top_p.
+    #[derive(Clone)]
+    struct Target {
+        raw: Vec<f32>,
+        tau: f32,
+        z: f32,
+    }
+
+    impl Target {
+        fn plain(raw: &[f32]) -> Self {
+            Self {
+                raw: raw.to_vec(),
+                tau: 0.0,
+                z: 1.0,
+            }
+        }
+        fn cut(raw: &[f32], tau: f32, z: f32) -> Self {
+            Self {
+                raw: raw.to_vec(),
+                tau,
+                z,
+            }
+        }
+        /// The truncated distribution, computed independently of the code under test.
+        fn expected(&self) -> Vec<f64> {
+            self.raw
+                .iter()
+                .map(|&p| {
+                    if self.tau <= 0.0 {
+                        p as f64
+                    } else if p >= self.tau {
+                        p as f64 / self.z as f64
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        FastDense,
+        FastSparse,
+        Logits { top_k: usize, top_p: f32 },
+    }
+
+    struct Win {
+        rows: Vec<RowQ>,
+        targets: Vec<Target>,
+        max_accept: usize,
+        grid: usize,
+    }
+
+    fn build_target(win: &Win, mode: Mode) -> (DflashSampleCfg, Option<FastTargetRows>, Vec<f32>) {
+        let rows = win.targets.len();
+        let base = DflashSampleCfg {
+            temp: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            cactus_delta: 0.0,
+        };
+        match mode {
+            Mode::FastDense => {
+                let probs: Vec<f32> = win
+                    .targets
+                    .iter()
+                    .flat_map(|t| t.raw.iter().copied())
+                    .collect();
+                let tau = win.targets.iter().map(|t| t.tau).collect();
+                let z = win.targets.iter().map(|t| t.z).collect();
+                (base, Some(FastTargetRows::dense(probs, tau, z)), Vec::new())
+            }
+            Mode::FastSparse => {
+                let cap = V;
+                let mut tau = Vec::new();
+                let mut z = Vec::new();
+                let mut counts = Vec::new();
+                let mut idx = vec![0u32; rows * cap];
+                let mut val = vec![0f32; rows * cap];
+                for (r, t) in win.targets.iter().enumerate() {
+                    // An uncut row keeps its non-zero entries (z = 1): same law as the dense row.
+                    let tau_r = if t.tau <= 0.0 { 1e-9 } else { t.tau };
+                    let mut c = 0;
+                    for (j, &p) in t.raw.iter().enumerate() {
+                        if p >= tau_r {
+                            idx[r * cap + c] = j as u32;
+                            val[r * cap + c] = p;
+                            c += 1;
+                        }
+                    }
+                    counts.push(c as u32);
+                    tau.push(tau_r);
+                    z.push(t.z);
+                }
+                let mut f = FastTargetRows {
+                    tau,
+                    z,
+                    capacity: cap,
+                    counts,
+                    idx,
+                    val,
+                    ..FastTargetRows::default()
+                };
+                assert_eq!(f.plan_dense_rows(V).unwrap(), 0);
+                (base, Some(f), Vec::new())
+            }
+            Mode::Logits { top_k, top_p } => {
+                let logits: Vec<f32> = win
+                    .targets
+                    .iter()
+                    .flat_map(|t| {
+                        t.raw.iter().map(|&p| {
+                            if p > 0.0 {
+                                (p as f64).ln() as f32
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                    })
+                    .collect();
+                (
+                    DflashSampleCfg {
+                        top_p,
+                        top_k,
+                        ..base
+                    },
+                    None,
+                    logits,
+                )
+            }
+        }
+    }
+
+    /// The learned receipt of the window (`rows.len()` rows: real q for the
+    /// leading model rows, garbage learned q for the rows a lookup replaces),
+    /// spliced by the production receipt builder.
+    fn build_receipt(win: &Win, cands: &[u32], sparse_q: bool) -> DflashSampledDraft {
+        let l = win.rows.len();
+        let keep = win
+            .rows
+            .iter()
+            .take_while(|r| matches!(r, RowQ::Model(_)))
+            .count();
+        let mut r = DflashSampledDraft::default();
+        r.sparse = sparse_q;
+        for i in 0..l {
+            let (qrow, tok) = match &win.rows[i] {
+                RowQ::Model(q) => (q.clone(), cands[i]),
+                RowQ::Point(_) => (vec![1.0 / V as f32; V], 0),
+            };
+            r.selected_q.push(qrow[tok as usize]);
+            if sparse_q {
+                let ids: Vec<u32> = (0..V as u32).filter(|&j| qrow[j as usize] > 0.0).collect();
+                let vals: Vec<f32> = ids.iter().map(|&j| qrow[j as usize]).collect();
+                r.sparse_q.push_row(&ids, &vals, V).unwrap();
+            } else {
+                r.dense_q.push(qrow);
+            }
+        }
+        let toks: Vec<u32> = win.rows[keep..]
+            .iter()
+            .map(|row| match row {
+                RowQ::Point(c) => *c,
+                RowQ::Model(_) => panic!("model rows must precede point rows"),
+            })
+            .collect();
+        dflash_lookup_check_receipt(Some(&r), keep).unwrap();
+        dflash_lookup_splice_receipt(&mut r, keep, &toks, V).unwrap();
+        r
+    }
+
+    fn check_law(name: &str, win: &Win, mode: Mode, sparse_q: bool) {
+        const TOL: f64 = 1e-6;
+        let l = win.rows.len();
+        assert_eq!(win.targets.len(), l + 1);
+        let expect: Vec<Vec<f64>> = win.targets.iter().map(Target::expected).collect();
+        for e in &expect {
+            let s: f64 = e.iter().sum();
+            assert!(
+                (s - 1.0).abs() < 1e-6,
+                "{name}: target row does not sum to 1: {e:?}"
+            );
+        }
+        let (cfg, fast, logits) = build_target(win, mode);
+        let choices: Vec<Vec<(u32, f64)>> = win
+            .rows
+            .iter()
+            .map(|r| match r {
+                RowQ::Model(q) => (0..V as u32)
+                    .filter(|&c| q[c as usize] > 0.0)
+                    .map(|c| (c, q[c as usize] as f64))
+                    .collect(),
+                RowQ::Point(c) => vec![(*c, 1.0)],
+            })
+            .collect();
+
+        let mut reach = vec![0f64; l + 1];
+        let mut emit = vec![vec![0f64; V]; l + 1];
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut odo = vec![0usize; l];
+        'combos: loop {
+            let cands: Vec<u32> = (0..l).map(|i| choices[i][odo[i]].0).collect();
+            let wc: f64 = (0..l).map(|i| choices[i][odo[i]].1).product();
+            let receipt = build_receipt(win, &cands, sparse_q);
+            let block: Vec<u32> = std::iter::once(0u32).chain(cands.iter().copied()).collect();
+            let q_rows = if receipt.sparse {
+                QRows::Sparse(&receipt.sparse_q)
+            } else {
+                QRows::Dense(&receipt.dense_q)
+            };
+            let mut run = |src: &mut dyn FnMut() -> f32| {
+                let mut next = || src();
+                dflash_sampled_accept_q_rows_with(
+                    &block,
+                    &receipt.selected_q,
+                    q_rows,
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    win.max_accept,
+                    &mut next,
+                    &mut scratch,
+                )
+            };
+            let mut visit = |d: SampledWindowDecision, wu: f64| {
+                let w = wc * wu;
+                let a = d.accepted_drafts;
+                for i in 0..a {
+                    reach[i] += w;
+                    emit[i][block[i + 1] as usize] += w;
+                }
+                reach[a] += w;
+                emit[a][d.bonus_token as usize] += w;
+            };
+            integrate(win.grid, &mut run, &mut visit);
+            let mut i = l;
+            loop {
+                if i == 0 {
+                    break 'combos;
+                }
+                i -= 1;
+                odo[i] += 1;
+                if odo[i] < choices[i].len() {
+                    break;
+                }
+                odo[i] = 0;
+            }
+        }
+
+        let mut analytic = 1.0f64;
+        for i in 0..=l {
+            let reachable = i <= win.max_accept;
+            let want_reach = if reachable { analytic } else { 0.0 };
+            assert!(
+                (reach[i] - want_reach).abs() < TOL,
+                "{name}: reach[{i}] = {} want {want_reach}",
+                reach[i]
+            );
+            if reachable && want_reach > 1e-9 {
+                for x in 0..V {
+                    let got = emit[i][x] / reach[i];
+                    assert!(
+                        (got - expect[i][x]).abs() < TOL,
+                        "{name}: position {i} token {x}: P = {got}, target p = {}",
+                        expect[i][x]
+                    );
+                }
+            }
+            if i < l {
+                let alpha: f64 = match &win.rows[i] {
+                    RowQ::Model(q) => (0..V).map(|c| (q[c] as f64).min(expect[i][c])).sum(),
+                    RowQ::Point(c) => expect[i][*c as usize].min(1.0),
+                };
+                analytic *= alpha;
+            }
+        }
+    }
+
+    fn model_uniform4() -> RowQ {
+        RowQ::Model(vec![0.25, 0.25, 0.25, 0.25, 0.0, 0.0])
+    }
+
+    /// Model rows (real q, incl. q = 0 entries) then a point-mass row, then the
+    /// bonus row: all four target-row shapes and both q representations.
+    #[test]
+    fn lookup_law_mixed_model_then_point_rows() {
+        let win = Win {
+            rows: vec![
+                model_uniform4(),
+                RowQ::Model(vec![0.5, 0.5, 0.0, 0.0, 0.0, 0.0]),
+                RowQ::Point(2),
+            ],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T1),
+                Target::plain(&T2),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        check_law("mixed/fast-dense/sparse-q", &win, Mode::FastDense, true);
+        check_law("mixed/fast-dense/dense-q", &win, Mode::FastDense, false);
+        check_law("mixed/fast-sparse/sparse-q", &win, Mode::FastSparse, true);
+        check_law("mixed/fast-sparse/dense-q", &win, Mode::FastSparse, false);
+        check_law(
+            "mixed/logits/sparse-q",
+            &win,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 1.0,
+            },
+            true,
+        );
+    }
+
+    /// Pure point-mass windows: p(c) in {1/2, 1/2, 1/2}, certain accept
+    /// (p(c) = 1), zero target mass at the candidate (always rejected, residual
+    /// is p itself), and the bonus after a full accept.
+    #[test]
+    fn lookup_law_point_rows_zero_and_full_target_mass() {
+        let all_half = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(1), RowQ::Point(5)],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T6),
+                Target::plain(&T5),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        let zero_mass = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(4)],
+            targets: vec![Target::plain(&T0), Target::plain(&T4), Target::plain(&T3)],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        let certain = Win {
+            rows: vec![RowQ::Point(1), RowQ::Point(0)],
+            targets: vec![Target::plain(&TONE), Target::plain(&T0), Target::plain(&T3)],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        for (name, w) in [
+            ("all-half", &all_half),
+            ("zero-mass", &zero_mass),
+            ("certain", &certain),
+        ] {
+            check_law(
+                &format!("{name}/fast-dense/sparse-q"),
+                w,
+                Mode::FastDense,
+                true,
+            );
+            check_law(
+                &format!("{name}/fast-sparse/sparse-q"),
+                w,
+                Mode::FastSparse,
+                true,
+            );
+            check_law(
+                &format!("{name}/fast-dense/dense-q"),
+                w,
+                Mode::FastDense,
+                false,
+            );
+            check_law(
+                &format!("{name}/logits/sparse-q"),
+                w,
+                Mode::Logits {
+                    top_k: 0,
+                    top_p: 1.0,
+                },
+                true,
+            );
+        }
+    }
+
+    /// Tail window (one learned row then two lookup rows) under every
+    /// `max_accept` budget: the boundary bonus is drawn from the boundary row.
+    #[test]
+    fn lookup_law_tail_window_budget_clamp() {
+        for max_accept in [0usize, 1, 2, 3, usize::MAX] {
+            let win = Win {
+                rows: vec![model_uniform4(), RowQ::Point(2), RowQ::Point(3)],
+                targets: vec![
+                    Target::plain(&T0),
+                    Target::plain(&T2),
+                    Target::plain(&T2),
+                    Target::plain(&T3),
+                ],
+                max_accept,
+                grid: 16,
+            };
+            check_law(
+                &format!("tail/ma{max_accept}/fast-sparse"),
+                &win,
+                Mode::FastSparse,
+                true,
+            );
+            check_law(
+                &format!("tail/ma{max_accept}/fast-dense/dense-q"),
+                &win,
+                Mode::FastDense,
+                false,
+            );
+        }
+    }
+
+    /// top_k / top_p truncation of p (the target of every row, including the
+    /// point-mass rows' residual and the bonus) in all three target
+    /// representations; point mass on a zero-mass (truncated-away) token.
+    #[test]
+    fn lookup_law_truncated_targets() {
+        let q = RowQ::Model(vec![0.125, 0.125, 0.125, 0.125, 0.25, 0.25]);
+        let mk = |raw: &[f32], tau: f32, z: f32| Win {
+            rows: vec![q.clone(), RowQ::Point(1), RowQ::Point(3)],
+            targets: (0..4).map(|_| Target::cut(raw, tau, z)).collect(),
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        // top_k = 2 of [.25, .25, .125 x4] -> [.5, .5, 0 ...].
+        let topk = mk(&[0.25, 0.25, 0.125, 0.125, 0.125, 0.125], 0.2, 0.5);
+        check_law("topk/fast-dense", &topk, Mode::FastDense, true);
+        check_law("topk/fast-sparse", &topk, Mode::FastSparse, true);
+        check_law("topk/fast-sparse/dense-q", &topk, Mode::FastSparse, false);
+        check_law(
+            "topk/logits",
+            &topk,
+            Mode::Logits {
+                top_k: 2,
+                top_p: 1.0,
+            },
+            false,
+        );
+        // top_p = 0.7 of [.375, .375, .125, .125, 0, 0] -> [.5, .5, 0 ...].
+        let topp = mk(&[0.375, 0.375, 0.125, 0.125, 0.0, 0.0], 0.3, 0.75);
+        check_law("topp/fast-dense", &topp, Mode::FastDense, true);
+        check_law("topp/fast-sparse", &topp, Mode::FastSparse, true);
+        check_law(
+            "topp/logits",
+            &topp,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 0.7,
+            },
+            true,
+        );
+    }
+
+    /// One lookup (or learned) row, thresholds at arbitrary multiples of 1/8
+    /// (thirds, fifths, sixths, sevenths of the renormalized mass): grid 840.
+    #[test]
+    fn lookup_law_single_row_fine_grid() {
+        let point = |c: u32, t: Target| Win {
+            rows: vec![RowQ::Point(c)],
+            targets: vec![t.clone(), t],
+            max_accept: usize::MAX,
+            grid: 840,
+        };
+        // p(c) = 1/4: residual over thirds-of-six masses.
+        let a = point(0, Target::plain(&[0.25, 0.375, 0.125, 0.125, 0.125, 0.0]));
+        check_law("fine/point/plain", &a, Mode::FastDense, true);
+        // top_p = 0.7 of [.5, .25, .125, .125, 0, 0] -> [2/3, 1/3, 0 ...].
+        let b = point(
+            1,
+            Target::cut(&[0.5, 0.25, 0.125, 0.125, 0.0, 0.0], 0.2, 0.75),
+        );
+        check_law(
+            "fine/point/topp-logits",
+            &b,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 0.7,
+            },
+            true,
+        );
+        check_law("fine/point/topp-sparse", &b, Mode::FastSparse, true);
+        // kept mass 5/8 -> fifths.
+        let c = point(
+            0,
+            Target::cut(&[0.375, 0.25, 0.125, 0.125, 0.125, 0.0], 0.2, 0.625),
+        );
+        check_law("fine/point/fifths", &c, Mode::FastDense, false);
+        // Learned row, q != p everywhere (ratios 1/3 and sub-1 residual).
+        let d = Win {
+            rows: vec![RowQ::Model(vec![0.375, 0.375, 0.25, 0.0, 0.0, 0.0])],
+            targets: vec![
+                Target::plain(&[0.125, 0.5, 0.25, 0.125, 0.0, 0.0]),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 840,
+        };
+        check_law("fine/model", &d, Mode::FastDense, true);
+    }
+
+    /// The accept loop draws exactly: one uniform per accept test, one more
+    /// per rejection (residual) or one bonus draw — point-mass rows follow the
+    /// same rule as learned rows.
+    #[test]
+    fn lookup_rng_draw_counts_follow_accept_rule() {
+        let run = |rows: &[RowQ], targets: &[&[f32; V]], max_accept: usize| -> (usize, usize) {
+            let win = Win {
+                rows: rows.to_vec(),
+                targets: targets.iter().map(|t| Target::plain(*t)).collect(),
+                max_accept,
+                grid: 1,
+            };
+            let (cfg, fast, logits) = build_target(&win, Mode::FastDense);
+            let cands: Vec<u32> = rows
+                .iter()
+                .map(|r| match r {
+                    RowQ::Point(c) => *c,
+                    RowQ::Model(_) => unreachable!(),
+                })
+                .collect();
+            let receipt = build_receipt(&win, &cands, true);
+            let block: Vec<u32> = std::iter::once(0u32).chain(cands.iter().copied()).collect();
+            let mut draws = 0usize;
+            let mut next = || {
+                draws += 1;
+                0.5f32
+            };
+            let mut scratch = Vec::new();
+            let d = dflash_sampled_accept_q_rows_with(
+                &block,
+                &receipt.selected_q,
+                QRows::Sparse(&receipt.sparse_q),
+                fast.as_ref(),
+                &logits,
+                V,
+                cfg,
+                max_accept,
+                &mut next,
+                &mut scratch,
+            );
+            (d.accepted_drafts, draws)
+        };
+        let two_ok = [RowQ::Point(0), RowQ::Point(1)];
+        // u = 0.5 accepts p = 0.5 (0.5 <= 0.5): 2 accept tests + 1 bonus.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], usize::MAX), (2, 3));
+        // Budget 1: 1 accept test, loop stops, 1 bonus draw from the boundary row.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], 1), (1, 2));
+        // Budget 0: no accept test, only the bonus draw.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], 0), (0, 1));
+        // Row 1 rejects (p = 0): accept test + residual draw, no bonus.
+        let rej = [RowQ::Point(0), RowQ::Point(4)];
+        assert_eq!(run(&rej, &[&T0, &T4, &T3], usize::MAX), (1, 3));
+    }
+
+    /// The public RNG-driven wrapper is the generic body fed the xorshift
+    /// stream: same decision, same RNG state afterwards.
+    #[test]
+    fn lookup_accept_wrapper_matches_uniform_source() {
+        let win = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(2), RowQ::Point(3)],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T1),
+                Target::plain(&T2),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 1,
+        };
+        let (cfg, fast, logits) = build_target(&win, Mode::FastDense);
+        let receipt = build_receipt(&win, &[0, 2, 3], true);
+        let block = [0u32, 0, 2, 3];
+        for seed in 1u64..200 {
+            for max_accept in [0usize, 1, 2, usize::MAX] {
+                let mut rng_a = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut rng_b = rng_a;
+                let mut scratch_a = Vec::new();
+                let mut scratch_b = Vec::new();
+                let a = dflash_sampled_accept_rows(
+                    &block,
+                    &receipt,
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    max_accept,
+                    &mut rng_a,
+                    &mut scratch_a,
+                );
+                let b = dflash_sampled_accept_q_rows_with(
+                    &block,
+                    &receipt.selected_q,
+                    QRows::Sparse(&receipt.sparse_q),
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    max_accept,
+                    &mut || xorshift_next_unit(&mut rng_b),
+                    &mut scratch_b,
+                );
+                assert_eq!(a.accepted_drafts, b.accepted_drafts);
+                assert_eq!(a.bonus_token, b.bonus_token);
+                assert_eq!(rng_a, rng_b);
+            }
+        }
+    }
+
+    struct FakeSource {
+        ret: Option<usize>,
+        tail: Vec<u32>,
+        seen: Vec<u32>,
+        buffer_was_clear: bool,
+    }
+
+    impl FakeSource {
+        fn new(ret: Option<usize>, tail: &[u32]) -> Self {
+            Self {
+                ret,
+                tail: tail.to_vec(),
+                seen: Vec::new(),
+                buffer_was_clear: false,
+            }
+        }
+    }
+
+    impl DflashTailSource for FakeSource {
+        fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize> {
+            self.seen = drafted.to_vec();
+            self.buffer_was_clear = tail.is_empty();
+            tail.extend_from_slice(&self.tail);
+            self.ret
+        }
+    }
+
+    const B: usize = 8;
+    const VOCAB: usize = 100;
+
+    fn learned_block() -> Vec<u32> {
+        vec![7, 11, 12, 13, 14, 15, 16, 17]
+    }
+
+    /// Every refusal happens in the pure helpers: the learned block and the
+    /// (caller-visible) tail scratch of a rejected Copy are never touched.
+    #[test]
+    fn lookup_copy_validation_errors_precede_mutation() {
+        let drafted = learned_block();
+        let mut tail = vec![9u32, 9, 9];
+        let too_long: Vec<u32> = (20..28).collect(); // 8 tokens -> 9 rows > b = 8
+        let oob = [20u32, VOCAB as u32];
+        for (name, tokens) in [
+            ("empty", &[] as &[u32]),
+            ("too long", &too_long[..]),
+            ("id out of vocab", &oob[..]),
+        ] {
+            let r =
+                dflash_lookup_resolve(DflashLookup::Copy(tokens), &drafted, B, VOCAB, &mut tail);
+            assert!(r.is_err(), "{name} must be refused");
+            assert_eq!(tail, vec![9, 9, 9], "{name}: tail scratch mutated");
+            assert_eq!(drafted, learned_block(), "{name}: learned block mutated");
+            assert!(
+                dflash_lookup_preflight(&Some(DflashLookup::Copy(tokens)), true, false, B, VOCAB)
+                    .is_err(),
+                "{name}: preflight must refuse before the draft runs"
+            );
+        }
+        // b - 1 tokens fit exactly (b_eff == b) and replace every learned row.
+        let full: Vec<u32> = (20..27).collect();
+        let r = dflash_lookup_resolve(DflashLookup::Copy(&full), &drafted, B, VOCAB, &mut tail);
+        assert_eq!(r.unwrap(), Some(0));
+        assert_eq!(tail, full);
+        assert_eq!(drafted, learned_block());
+    }
+
+    #[test]
+    fn lookup_tail_validation_errors_precede_mutation() {
+        let drafted = learned_block();
+        let cases: Vec<(&str, Option<usize>, Vec<u32>, bool)> = vec![
+            ("k = 0", Some(0), vec![50], false),
+            ("k > b - 1", Some(8), vec![50], false),
+            ("empty tail", Some(2), vec![], false),
+            (
+                "k + tail > b - 1",
+                Some(2),
+                vec![50, 51, 52, 53, 54, 55],
+                false,
+            ),
+            ("k = b - 1 leaves no room", Some(7), vec![50], false),
+            (
+                "tail id out of vocab",
+                Some(2),
+                vec![50, VOCAB as u32],
+                false,
+            ),
+            ("exact fit", Some(2), vec![50, 51, 52, 53, 54], true),
+            ("k = 1", Some(1), vec![50], true),
+        ];
+        for (name, ret, tail_tokens, ok) in cases {
+            let mut src = FakeSource::new(ret, &tail_tokens);
+            let mut tail = vec![9u32, 9, 9];
+            let r =
+                dflash_lookup_resolve(DflashLookup::Tail(&mut src), &drafted, B, VOCAB, &mut tail);
+            assert_eq!(r.is_ok(), ok, "{name}");
+            assert_eq!(drafted, learned_block(), "{name}: learned block mutated");
+            assert_eq!(src.seen, drafted[1..], "{name}: source must see d1..d(b-1)");
+            assert!(
+                src.buffer_was_clear,
+                "{name}: tail buffer not cleared first"
+            );
+            if ok {
+                assert_eq!(r.unwrap(), ret);
+                assert_eq!(tail, tail_tokens);
+                assert!(1 + ret.unwrap() + tail.len() <= B);
+            }
+        }
+        // A declining source: incumbent window, tail left empty.
+        let mut src = FakeSource::new(None, &[50, 51]);
+        let mut tail = vec![9u32];
+        let r = dflash_lookup_resolve(DflashLookup::Tail(&mut src), &drafted, B, VOCAB, &mut tail);
+        assert_eq!(r.unwrap(), None);
+        assert!(tail.is_empty());
+        // The learned block must be the window's full block.
+        let mut src = FakeSource::new(Some(1), &[50]);
+        assert!(dflash_lookup_resolve(
+            DflashLookup::Tail(&mut src),
+            &drafted[..5],
+            B,
+            VOCAB,
+            &mut tail
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lookup_preflight_refuses_unsupported_modes_before_the_draft() {
+        let copy = [1u32, 2, 3];
+        assert!(dflash_lookup_preflight(&None, false, true, B, VOCAB).is_ok());
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), true, false, B, VOCAB)
+                .is_ok()
+        );
+        // Not selector mode: no learned q receipts to compose with.
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), false, false, B, VOCAB)
+                .is_err()
+        );
+        // PLD spine owns the block.
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), true, true, B, VOCAB)
+                .is_err()
+        );
+        let mut src = FakeSource::new(Some(1), &[1]);
+        assert!(dflash_lookup_preflight(
+            &Some(DflashLookup::Tail(&mut src)),
+            false,
+            false,
+            B,
+            VOCAB
+        )
+        .is_err());
+        assert!(src.seen.is_empty(), "preflight must not call the source");
+    }
+
+    fn learned_receipt(sparse: bool, rows: usize) -> DflashSampledDraft {
+        let mut r = DflashSampledDraft::default();
+        r.sparse = sparse;
+        for i in 0..rows {
+            let ids = [i as u32 + 1, i as u32 + 40];
+            let vals = [0.5f32 - 0.01 * i as f32, 0.25];
+            r.selected_q.push(vals[0]);
+            r.uniforms.push(0.1 * i as f32);
+            if sparse {
+                r.sparse_q.push_row(&ids, &vals, VOCAB).unwrap();
+            } else {
+                let mut d = vec![0f32; VOCAB];
+                d[ids[0] as usize] = vals[0];
+                d[ids[1] as usize] = vals[1];
+                r.dense_q.push(d);
+            }
+        }
+        r
+    }
+
+    /// Learned rows `..keep` keep their real receipts; lookup rows are point
+    /// masses; the learned selector proposal never reaches a lookup row.
+    #[test]
+    fn lookup_receipt_keeps_learned_rows_and_point_masses_the_tail() {
+        for sparse in [true, false] {
+            for (keep, tokens) in [
+                (0usize, vec![10u32, 11, 12]),
+                (2, vec![10, 11, 12]),
+                (3, vec![5]),
+            ] {
+                let orig = learned_receipt(sparse, 7);
+                let mut r = learned_receipt(sparse, 7);
+                dflash_lookup_check_receipt(Some(&r), keep).unwrap();
+                dflash_lookup_splice_receipt(&mut r, keep, &tokens, VOCAB).unwrap();
+                let rows = keep + tokens.len();
+                assert_eq!(r.selected_q.len(), rows);
+                assert!(r.proposal.is_none());
+                assert_eq!(r.uniforms.len(), keep);
+                assert_eq!(&r.selected_q[..keep], &orig.selected_q[..keep]);
+                assert!(r.selected_q[keep..].iter().all(|&q| q == 1.0));
+                if sparse {
+                    assert_eq!(r.sparse_q.rows(), rows);
+                    for i in 0..keep {
+                        assert_eq!(r.sparse_q.row(i), orig.sparse_q.row(i), "learned row {i}");
+                    }
+                    for (j, &c) in tokens.iter().enumerate() {
+                        assert_eq!(r.sparse_q.row(keep + j), (&[c][..], &[1.0f32][..]));
+                    }
+                } else {
+                    assert_eq!(r.dense_q.len(), rows);
+                    for i in 0..keep {
+                        assert_eq!(r.dense_q[i], orig.dense_q[i], "learned row {i}");
+                    }
+                    for (j, &c) in tokens.iter().enumerate() {
+                        let row = &r.dense_q[keep + j];
+                        assert_eq!(row.len(), VOCAB);
+                        assert_eq!(row[c as usize], 1.0);
+                        assert_eq!(row.iter().filter(|&&x| x != 0.0).count(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_receipt_check_refuses_short_or_missing_receipts() {
+        assert!(dflash_lookup_check_receipt(None, 1).is_err());
+        let r = learned_receipt(true, 3);
+        assert!(dflash_lookup_check_receipt(Some(&r), 3).is_ok());
+        assert!(dflash_lookup_check_receipt(Some(&r), 4).is_err());
+        let d = learned_receipt(false, 2);
+        assert!(dflash_lookup_check_receipt(Some(&d), 2).is_ok());
+        assert!(dflash_lookup_check_receipt(Some(&d), 3).is_err());
+    }
+
+    #[test]
+    fn lookup_sparse_q_truncate_rows() {
+        let mut q = SparseQRows::with_capacity(4, 4);
+        q.push_row(&[3, 1], &[0.1, 0.2], 16).unwrap();
+        q.push_row(&[5], &[1.0], 16).unwrap();
+        q.push_row(&[2, 9], &[0.3, 0.4], 16).unwrap();
+        q.truncate_rows(5); // no-op beyond the end
+        assert_eq!(q.rows(), 3);
+        q.truncate_rows(1);
+        assert_eq!(q.rows(), 1);
+        assert_eq!(q.row(0), (&[1u32, 3][..], &[0.2f32, 0.1][..]));
+        q.push_row(&[7], &[1.0], 16).unwrap();
+        assert_eq!(q.row(1), (&[7u32][..], &[1.0f32][..]));
+        q.truncate_rows(0);
+        assert_eq!(q.rows(), 0);
+        assert_eq!(q.offsets(), &[0]);
     }
 }

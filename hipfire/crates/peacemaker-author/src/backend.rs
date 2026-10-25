@@ -40,11 +40,15 @@ pub struct Auth {
 impl Auth {
     pub(crate) fn mint() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self { session: NEXT.fetch_add(1, Ordering::Relaxed) }
+        Self {
+            session: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
     }
     /// The same session for a scope the core re-enters (a loop body).
     pub(crate) fn reenter(&self) -> Self {
-        Self { session: self.session }
+        Self {
+            session: self.session,
+        }
     }
 }
 
@@ -105,7 +109,12 @@ pub trait Backend: Sized {
     /// End the slot layout; every slot must be Free.
     fn lds_relayout(&mut self, auth: &Auth) -> Result<(), String>;
     /// One DS store touching every slot in `slots`; returns its event.
-    fn ds_store(&mut self, auth: &Auth, slots: &[usize], insn: Self::Insn) -> Result<EventId, String>;
+    fn ds_store(
+        &mut self,
+        auth: &Auth,
+        slots: &[usize],
+        insn: Self::Insn,
+    ) -> Result<EventId, String>;
     /// One DS load reading every slot in `slots`.
     fn ds_load(&mut self, auth: &Auth, slots: &[usize], insn: Self::Insn) -> Result<(), String>;
     /// The LDS store `event` has not been retired by any wait yet.
@@ -117,7 +126,8 @@ pub trait Backend: Sized {
     /// Full barrier carrying `transitions`.
     fn barrier(&mut self, auth: &Auth, transitions: &[SlotTransition]) -> Result<(), String>;
     /// gfx12 split barrier: signal.
-    fn barrier_signal(&mut self, auth: &Auth, transitions: &[SlotTransition]) -> Result<(), String>;
+    fn barrier_signal(&mut self, auth: &Auth, transitions: &[SlotTransition])
+        -> Result<(), String>;
     /// gfx12 split barrier: wait for the signal in flight.
     fn barrier_wait(&mut self, auth: &Auth) -> Result<(), String>;
 
@@ -162,5 +172,10 @@ pub trait Backend: Sized {
     /// Emit `body` once as a loop at `head`; the backend verifies that its
     /// state reaches a fixed point across the back edge. `body` may be run
     /// more than once; the last run's code is the one kept.
-    fn loop_(&mut self, auth: &Auth, head: &str, body: &dyn Fn(&mut Self) -> Result<(), String>) -> Result<(), String>;
+    fn loop_(
+        &mut self,
+        auth: &Auth,
+        head: &str,
+        body: &dyn Fn(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String>;
 }

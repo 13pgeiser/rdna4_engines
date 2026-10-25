@@ -5,8 +5,12 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Rsrc1(pub u32);
 impl Rsrc1 {
-    pub fn vgpr_granules(self) -> u32 { self.0 & 0x3f }
-    pub fn next_free_vgpr(self, wave32: bool) -> u32 { (self.vgpr_granules() + 1) * if wave32 { 8 } else { 4 } }
+    pub fn vgpr_granules(self) -> u32 {
+        self.0 & 0x3f
+    }
+    pub fn next_free_vgpr(self, wave32: bool) -> u32 {
+        (self.vgpr_granules() + 1) * if wave32 { 8 } else { 4 }
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Rsrc2(pub u32);
@@ -14,7 +18,11 @@ pub struct Rsrc2(pub u32);
 pub struct Rsrc3(pub u32);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelCodeProperties(pub u16);
-impl KernelCodeProperties { pub fn wave32(self) -> bool { self.0 & (1 << 10) != 0 } }
+impl KernelCodeProperties {
+    pub fn wave32(self) -> bool {
+        self.0 & (1 << 10) != 0
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernargPreload(pub u16);
 #[derive(Clone, Debug, Eq, PartialEq)]

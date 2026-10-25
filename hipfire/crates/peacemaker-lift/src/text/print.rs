@@ -38,7 +38,7 @@
 use peacemaker_ir::{
     inst::{Arch, Form, FormFields, Inst, Opcode},
     isa::{self, OpRow},
-    operand::{ImmField, Modifiers, Operand, Omod, Special},
+    operand::{ImmField, Modifiers, Omod, Operand, Special},
     reg::Kind,
 };
 
@@ -52,8 +52,10 @@ pub enum PrintError {
 
 /// Canonical objdump text for one instruction.
 pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
-    let row = isa::lookup(arch, inst.op, inst.form)
-        .ok_or(PrintError::UnknownOpcode { op: inst.op, form: inst.form })?;
+    let row = isa::lookup(arch, inst.op, inst.form).ok_or(PrintError::UnknownOpcode {
+        op: inst.op,
+        form: inst.form,
+    })?;
     if inst.form == Form::Sopp && row.name == "s_delay_alu" {
         return delay_text(&inst.mods);
     }
@@ -72,8 +74,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     // `v_cmpx*` VOP3 rows carry a hidden exec VDST (fixed encoding 0x7e)
     // that canonical text omits; the two visible operands map to the
     // SRC0/SRC1 slots.
-    let cmpx_offset =
-        usize::from(row.name.starts_with("v_cmpx") && inst.form == Form::Vop3);
+    let cmpx_offset = usize::from(row.name.starts_with("v_cmpx") && inst.form == Form::Vop3);
     if cmpx_offset == 1 && inst.operands.len() + 1 != slots.len() {
         return Err(PrintError::Unspellable(format!(
             "{} needs two visible operands, have {}",
@@ -84,9 +85,10 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     let mut parts: Vec<String> = Vec::new();
     // VOPC compares carry a synthetic vcc destination that objdump prints.
     if skew == 1 {
-        let first = inst.operands.first().ok_or_else(|| {
-            PrintError::Unspellable(format!("{} is missing vcc_lo", row.name))
-        })?;
+        let first = inst
+            .operands
+            .first()
+            .ok_or_else(|| PrintError::Unspellable(format!("{} is missing vcc_lo", row.name)))?;
         if *first != Operand::Special(Special::VccLo) {
             return Err(PrintError::Unspellable(format!(
                 "{} leads with {first:?}, not vcc_lo",
@@ -101,10 +103,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         }
         let op_index = slot_index + skew - cmpx_offset;
         let operand = inst.operands.get(op_index).ok_or_else(|| {
-            PrintError::Unspellable(format!(
-                "{} is missing its {slot_name} operand",
-                row.name
-            ))
+            PrintError::Unspellable(format!("{} is missing its {slot_name} operand", row.name))
         })?;
         let mut text = operand_text(operand, Some(slot_name), row, inst)?;
         if matches!(inst.form, Form::Vop3 | Form::Vop1Dpp | Form::Vop2Dpp) {
@@ -112,12 +111,23 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         }
         parts.push(text);
     }
+    // `s_fmamk_f32 D, S0, K, S1` / `s_fmaak_f32 D, S0, S1, K`: the K constant is
+    // the instruction's literal word, spelled as the fourth operand.
+    if matches!(row.name, "s_fmamk_f32" | "s_fmaak_f32") {
+        let literal = inst.literal.ok_or_else(|| {
+            PrintError::Unspellable(format!("{} is missing its literal word", row.name))
+        })?;
+        let at = if row.name == "s_fmamk_f32" {
+            2
+        } else {
+            parts.len()
+        };
+        parts.insert(at.min(parts.len()), format!("{literal:#x}"));
+    }
     // Trailing operands the grammar does not declare (DS offsets, VMEM
     // offset/offen/scope) join with a space, exactly as objdump does.
     let mut tail: Vec<String> = Vec::new();
-    for operand in
-        inst.operands.iter().skip(slots.len() + skew - cmpx_offset)
-    {
+    for operand in inst.operands.iter().skip(slots.len() + skew - cmpx_offset) {
         tail.push(operand_text(operand, None, row, inst)?);
     }
     let mut text = row.name.to_owned();
@@ -148,10 +158,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
 }
 
 /// One canonical line per instruction, in order (assembler-parity input).
-pub fn kernel_lines(
-    insts: &[Inst],
-    arch: Arch,
-) -> Result<Vec<String>, PrintError> {
+pub fn kernel_lines(insts: &[Inst], arch: Arch) -> Result<Vec<String>, PrintError> {
     insts.iter().map(|inst| canonical(inst, arch)).collect()
 }
 
@@ -192,15 +199,9 @@ fn operand_text(
                 peacemaker_ir::operand::Half::Lo => "l",
             }
         )),
-        Operand::Special(_) | Operand::Hwreg(_) | Operand::SendMsg(_) => {
-            Ok(format!("{operand}"))
-        }
-        Operand::Inline(peacemaker_ir::operand::InlineConst::Integer(n)) => {
-            Ok(format!("{n}"))
-        }
-        Operand::Inline(peacemaker_ir::operand::InlineConst::FloatBits(b)) => {
-            Ok(llvm_float(*b))
-        }
+        Operand::Special(_) | Operand::Hwreg(_) | Operand::SendMsg(_) => Ok(format!("{operand}")),
+        Operand::Inline(peacemaker_ir::operand::InlineConst::Integer(n)) => Ok(format!("{n}")),
+        Operand::Inline(peacemaker_ir::operand::InlineConst::FloatBits(b)) => Ok(llvm_float(*b)),
         Operand::Inline(peacemaker_ir::operand::InlineConst::InvTwoPi) => {
             Ok("0.15915494".to_owned())
         }
@@ -224,10 +225,19 @@ fn operand_text(
             let hints = if row.name.contains("_load") {
                 ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"]
             } else {
-                ["RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB"]
+                [
+                    "RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB",
+                ]
             };
-            Ok(format!("th:TH_{}_{}", if row.name.contains("_load") { "LOAD" } else { "STORE" },
-                hints[usize::from(*th)]))
+            Ok(format!(
+                "th:TH_{}_{}",
+                if row.name.contains("_load") {
+                    "LOAD"
+                } else {
+                    "STORE"
+                },
+                hints[usize::from(*th)]
+            ))
         }
         Operand::Scope(_) | Operand::CacheTh(_) | Operand::Vmem(_) => Ok(format!("{operand}")),
         Operand::Depctr(_) => Err(PrintError::Unspellable(
@@ -237,8 +247,7 @@ fn operand_text(
 }
 
 /// VOP3 rows whose SGPR-wide source prints as a range, not single.
-const MAD_PAIR_ROWS: [&str; 2] =
-    ["v_mad_co_u64_u32", "v_mad_co_i64_i32"];
+const MAD_PAIR_ROWS: [&str; 2] = ["v_mad_co_u64_u32", "v_mad_co_i64_i32"];
 
 /// LLVM float-inline spelling: `.0` suffix on integral values.
 fn llvm_float(bits: u32) -> String {
@@ -255,10 +264,7 @@ fn sopp_imm_text(row: &OpRow, n: i16) -> String {
         return format!("0x{:x}", n as u16);
     }
     match row.name {
-        name
-            if name.starts_with("s_branch")
-                || name.starts_with("s_cbranch") =>
-        {
+        name if name.starts_with("s_branch") || name.starts_with("s_cbranch") => {
             format!("{}", n as u16)
         }
         name if name.starts_with("s_wait_") || name == "s_clause" => {
@@ -401,16 +407,27 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     let mut out = String::new();
     match inst.form {
         Form::Vop1Dpp | Form::Vop2Dpp => {
-            let dpp = mods.dpp.ok_or_else(|| PrintError::Unspellable("DPP modifiers missing".into()))?;
-            let control = if let Some(shift) = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v)) {
-                format!("row_shl:{shift}")
-            } else if let Some(lane) = dpp.ctrl.checked_sub(0x150).filter(|v| *v <= 15) {
-                format!("row_share:{lane}")
-            } else {
-                return Err(PrintError::Unspellable(format!("DPP control {:#x}", dpp.ctrl)));
-            };
-            out.push_str(&format!(" {control} row_mask:{:#x} bank_mask:{:#x}", dpp.row_mask, dpp.bank_mask));
-            if dpp.bound_ctrl { out.push_str(" bound_ctrl:1"); }
+            let dpp = mods
+                .dpp
+                .ok_or_else(|| PrintError::Unspellable("DPP modifiers missing".into()))?;
+            let control =
+                if let Some(shift) = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v)) {
+                    format!("row_shl:{shift}")
+                } else if let Some(lane) = dpp.ctrl.checked_sub(0x150).filter(|v| *v <= 15) {
+                    format!("row_share:{lane}")
+                } else {
+                    return Err(PrintError::Unspellable(format!(
+                        "DPP control {:#x}",
+                        dpp.ctrl
+                    )));
+                };
+            out.push_str(&format!(
+                " {control} row_mask:{:#x} bank_mask:{:#x}",
+                dpp.row_mask, dpp.bank_mask
+            ));
+            if dpp.bound_ctrl {
+                out.push_str(" bound_ctrl:1");
+            }
         }
         Form::Vop3 => {
             if mods.omod != Omod::None {
@@ -427,6 +444,10 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
             out.push_str(&vop3_op_sel_suffix(inst, row)?);
         }
         Form::Vop3p => {
+            // SWMMAC carries its sparse-index half select in OP_SEL bit 0.
+            if row.name.starts_with("v_swmmac_") && mods.op_sel & 1 != 0 {
+                out.push_str(" index_key:1");
+            }
             if mods.neg_lo != 0 {
                 out.push_str(&format!(
                     " neg_lo:[{},{},{}]",
@@ -479,9 +500,7 @@ fn has_w16_operand(row: &OpRow) -> bool {
 fn src_slot_count(row: &OpRow) -> u32 {
     grammar_slots(row)
         .iter()
-        .filter(|(name, _)| {
-            *name == "SRC0" || *name == "SRC1" || *name == "SRC2"
-        })
+        .filter(|(name, _)| *name == "SRC0" || *name == "SRC1" || *name == "SRC2")
         .count() as u32
 }
 
@@ -492,15 +511,20 @@ fn vop3_op_sel_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     let nsrcs = src_slot_count(row);
     // LLVM only decodes the used bits (sources plus the bit-3 destination
     // select); anything else is unspellable, not normalisable.
-    let allowed = if nsrcs >= 3 { 0xf } else { ((1 << nsrcs) - 1) | 0x8 };
+    let allowed = if nsrcs >= 3 {
+        0xf
+    } else {
+        ((1 << nsrcs) - 1) | 0x8
+    };
     if u32::from(inst.mods.op_sel) & !allowed != 0 {
         return Err(PrintError::Unspellable(format!(
             "{} has op_sel {:#x} outside its spellable bits",
             row.name, inst.mods.op_sel
         )));
     }
-    let mut entries: Vec<String> =
-        (0..nsrcs).map(|i| ((inst.mods.op_sel >> i) & 1).to_string()).collect();
+    let mut entries: Vec<String> = (0..nsrcs)
+        .map(|i| ((inst.mods.op_sel >> i) & 1).to_string())
+        .collect();
     entries.push(((inst.mods.op_sel >> 3) & 1).to_string());
     Ok(format!(" op_sel:[{}]", entries.join(",")))
 }
@@ -520,9 +544,10 @@ fn vopd_text(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     // and the T3 test fails closed on any disagreement with objdump.
     let x_row = row;
     let arch = Arch::Gfx1201;
-    let y_row = isa::lookup(arch, y_op, Form::Vopd).ok_or(
-        PrintError::UnknownOpcode { op: y_op, form: Form::Vopd },
-    )?;
+    let y_row = isa::lookup(arch, y_op, Form::Vopd).ok_or(PrintError::UnknownOpcode {
+        op: y_op,
+        form: Form::Vopd,
+    })?;
     if inst.operands.len() < x_count {
         return Err(PrintError::Unspellable(format!(
             "{} has fewer operands than its X half",
@@ -531,8 +556,7 @@ fn vopd_text(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     }
     let x_slots = grammar_slots(x_row);
     let y_slots = grammar_slots(y_row);
-    if x_slots.len() != x_count || inst.operands.len() != x_count + y_slots.len()
-    {
+    if x_slots.len() != x_count || inst.operands.len() != x_count + y_slots.len() {
         return Err(PrintError::Unspellable(format!(
             "{} operand split disagrees with its halves",
             row.name

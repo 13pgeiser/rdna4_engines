@@ -61,6 +61,8 @@ fn run(gpu: &mut Gpu, t: usize, inputs: &Inputs) -> Vec<f32> {
         0,
         t,
         true,
+        16,
+        48,
     )
     .unwrap();
     let result = gpu.download_f32(&out).unwrap();

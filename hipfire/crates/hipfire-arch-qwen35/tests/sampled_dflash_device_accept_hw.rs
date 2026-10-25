@@ -43,14 +43,20 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// runs every case at the production vocabulary (segment 970 instead of 128).
 fn vocab() -> usize {
     static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("HIPFIRE_DSA_HW_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(32_768)
+        std::env::var("HIPFIRE_DSA_HW_VOCAB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32_768)
     });
     *V
 }
 /// Windows per case: 3000 by default; `HIPFIRE_DSA_HW_TRIALS` overrides.
 fn trials() -> usize {
     static T: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("HIPFIRE_DSA_HW_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(3_000)
+        std::env::var("HIPFIRE_DSA_HW_TRIALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3_000)
     });
     *T
 }
@@ -105,8 +111,19 @@ fn softmax_rows(gpu: &mut Gpu, lg: &[f32], rows: usize, top_p: f32, top_k: usize
     let probs = gpu.alloc_tensor(&[rows * vocab()], DType::F32).unwrap();
     let tau = gpu.alloc_tensor(&[rows], DType::F32).unwrap();
     let z = gpu.alloc_tensor(&[rows], DType::F32).unwrap();
-    gpu.softmax_temp_topp_batched_into_f32(&l, &probs, &tau, &z, vocab(), rows, 0.8, top_p, top_k, 0.0)
-        .unwrap();
+    gpu.softmax_temp_topp_batched_into_f32(
+        &l,
+        &probs,
+        &tau,
+        &z,
+        vocab(),
+        rows,
+        0.8,
+        top_p,
+        top_k,
+        0.0,
+    )
+    .unwrap();
     resident(gpu, probs, tau, z)
 }
 
@@ -177,7 +194,10 @@ fn pack(
         off.push(ids.len() as u32);
     }
     let mut out = Vec::new();
-    dflash_accept_pack_payload(&mut out, tokens, us, u_fin, max_accept, selq, &off, &ids, &vals).unwrap();
+    dflash_accept_pack_payload(
+        &mut out, tokens, us, u_fin, max_accept, selq, &off, &ids, &vals,
+    )
+    .unwrap();
     out
 }
 
@@ -206,20 +226,48 @@ fn kernel_equals_twin(
         let u_fin = rng.unit();
         let payload = pack(&tokens, &us, u_fin, max_accept(k), &selq, &q);
         let dev = gpu
-            .dflash_sampled_accept_sparse_q_f32(scratch, &rows.probs, &rows.tau, &rows.z, &payload, n, vocab())
+            .dflash_sampled_accept_sparse_q_f32(
+                scratch,
+                &rows.probs,
+                &rows.tau,
+                &rows.z,
+                &payload,
+                n,
+                vocab(),
+            )
             .unwrap_or_else(|e| panic!("{name} #{k}: {e}"));
-        let twin = dflash_sampled_accept_reference(&rows.h_probs, &rows.h_tau, &rows.h_z, &payload, n, vocab());
+        let twin = dflash_sampled_accept_reference(
+            &rows.h_probs,
+            &rows.h_tau,
+            &rows.h_z,
+            &payload,
+            n,
+            vocab(),
+        );
         assert_eq!(dev, twin, "{name} #{k}: kernel != twin");
         // The retained hipcc kernel is the non-production oracle of the builder kernel.
         let oracle = gpu
-            .dflash_sampled_accept_sparse_q_f32_hip_oracle(scratch, &rows.probs, &rows.tau, &rows.z, &payload, n, vocab())
+            .dflash_sampled_accept_sparse_q_f32_hip_oracle(
+                scratch,
+                &rows.probs,
+                &rows.tau,
+                &rows.z,
+                &payload,
+                n,
+                vocab(),
+            )
             .unwrap_or_else(|e| panic!("{name} #{k} (hip oracle): {e}"));
         assert_eq!(dev, oracle, "{name} #{k}: builder kernel != hipcc oracle");
         decisions.push(dev);
     }
     let rej = decisions.iter().filter(|d| d.rejected).count();
-    let by_len = (0..=n).map(|l| decisions.iter().filter(|d| d.accept_len == l).count()).collect::<Vec<_>>();
-    println!("{name}: {} windows, {rej} rejected, accept_len histogram {by_len:?}", trials());
+    let by_len = (0..=n)
+        .map(|l| decisions.iter().filter(|d| d.accept_len == l).count())
+        .collect::<Vec<_>>();
+    println!(
+        "{name}: {} windows, {rej} rejected, accept_len histogram {by_len:?}",
+        trials()
+    );
     decisions
 }
 
@@ -233,7 +281,15 @@ fn device_accept_kernel_equals_host_twin() {
     // serve config rows (tau > 0, kept set <= cap).
     let lg = logits(n + 1, 1);
     let rows = softmax_rows(&mut gpu, &lg, n + 1, 0.9, 20);
-    let d = kernel_equals_twin(&mut gpu, &scratch, "serve", &rows, n, |r| selector_q(&rows, n, 8, r), |_| n);
+    let d = kernel_equals_twin(
+        &mut gpu,
+        &scratch,
+        "serve",
+        &rows,
+        n,
+        |r| selector_q(&rows, n, 8, r),
+        |_| n,
+    );
     assert!(d.iter().any(|d| d.rejected) && d.iter().any(|d| !d.rejected));
     assert!(d.iter().all(|d| d.fallback == 0));
 
@@ -256,14 +312,28 @@ fn device_accept_kernel_equals_host_twin() {
         |r| (0..n).map(|i| vec![(tops[i][r.below(12)], 1.0)]).collect(),
         |_| n,
     );
-    assert!(d.iter().any(|w| w.rejected), "point-mass windows must reject sometimes");
+    assert!(
+        d.iter().any(|w| w.rejected),
+        "point-mass windows must reject sometimes"
+    );
     for w in d.iter().filter(|w| w.rejected) {
         let p = rows.h_probs[w.accept_len * vocab() + w.bonus as usize];
-        assert!(p >= rows.h_tau[w.accept_len], "residual left the kept set: {w:?}");
+        assert!(
+            p >= rows.h_tau[w.accept_len],
+            "residual left the kept set: {w:?}"
+        );
     }
 
     // Budget bound: the bonus is drawn from the boundary row.
-    kernel_equals_twin(&mut gpu, &scratch, "budget", &rows, n, |r| selector_q(&rows, n, 8, r), |k| [0, 2, n][k % 3]);
+    kernel_equals_twin(
+        &mut gpu,
+        &scratch,
+        "budget",
+        &rows,
+        n,
+        |r| selector_q(&rows, n, 8, r),
+        |k| [0, 2, n][k % 3],
+    );
 
     // Full support (tau = 0): the identity row, no kept-set cut at all.
     let mut probs = Vec::new();
@@ -275,8 +345,19 @@ fn device_accept_kernel_equals_host_twin() {
         probs.extend(r);
     }
     let full = synthetic_rows(&mut gpu, &probs, &vec![0.0; n + 1], &vec![1.0; n + 1]);
-    let d = kernel_equals_twin(&mut gpu, &scratch, "full_support", &full, n, |r| selector_q(&full, n, 8, r), |_| n);
-    assert!(d.iter().any(|w| w.bonus as usize > vocab() / 2), "draws must reach the whole vocabulary");
+    let d = kernel_equals_twin(
+        &mut gpu,
+        &scratch,
+        "full_support",
+        &full,
+        n,
+        |r| selector_q(&full, n, 8, r),
+        |_| n,
+    );
+    assert!(
+        d.iter().any(|w| w.bonus as usize > vocab() / 2),
+        "draws must reach the whole vocabulary"
+    );
 
     // Degenerate residual: q puts more mass than p on the proposed id (p is a
     // point mass there), so p - q <= 0 everywhere.
@@ -306,7 +387,15 @@ fn device_accept_kernel_equals_host_twin() {
         }
     }
     let flat = synthetic_rows(&mut gpu, &probs, &vec![0.025; n + 1], &vec![1.0; n + 1]);
-    kernel_equals_twin(&mut gpu, &scratch, "tie_rows", &flat, n, |r| selector_q(&flat, n, 8, r), |_| n);
+    kernel_equals_twin(
+        &mut gpu,
+        &scratch,
+        "tie_rows",
+        &flat,
+        n,
+        |r| selector_q(&flat, n, 8, r),
+        |_| n,
+    );
 }
 
 /// With one proposed row the committed token is the truncated target row's law.
@@ -329,12 +418,25 @@ fn device_accept_committed_token_law() {
         let (x, qx) = draw(&q, rng.unit());
         let payload = pack(&[x], &[rng.unit()], rng.unit(), 1, &[qx], &[q.clone()]);
         let d = gpu
-            .dflash_sampled_accept_sparse_q_f32(&scratch, &rows.probs, &rows.tau, &rows.z, &payload, 1, vocab())
+            .dflash_sampled_accept_sparse_q_f32(
+                &scratch,
+                &rows.probs,
+                &rows.tau,
+                &rows.z,
+                &payload,
+                1,
+                vocab(),
+            )
             .unwrap();
-        *counts.entry(if d.rejected { d.bonus } else { x }).or_default() += 1;
+        *counts
+            .entry(if d.rejected { d.bonus } else { x })
+            .or_default() += 1;
     }
     for (&tok, _) in &counts {
-        assert!(target[tok as usize] > 0.0, "token {tok} is outside the kept set");
+        assert!(
+            target[tok as usize] > 0.0,
+            "token {tok} is outside the kept set"
+        );
     }
     let (mut chi, mut cells) = (0.0f64, 0usize);
     for c in 0..vocab() {
@@ -342,7 +444,10 @@ fn device_accept_committed_token_law() {
         let e = p * LAW_TRIALS as f64;
         let got = *counts.get(&(c as u32)).unwrap_or(&0) as f64;
         let sd = (e * (1.0 - p)).sqrt();
-        assert!((got - e).abs() <= 6.0 * sd + 3.0, "token {c}: {got} draws, expected {e:.1} (sd {sd:.1})");
+        assert!(
+            (got - e).abs() <= 6.0 * sd + 3.0,
+            "token {c}: {got} draws, expected {e:.1} (sd {sd:.1})"
+        );
         if e >= 5.0 {
             chi += (got - e) * (got - e) / e;
             cells += 1;
@@ -353,7 +458,10 @@ fn device_accept_committed_token_law() {
     let k = (cells - 1) as f64;
     let z = ((chi / k).cbrt() - (1.0 - 2.0 / (9.0 * k))) / (2.0 / (9.0 * k)).sqrt();
     println!("committed-token law: chi2 {chi:.1} over {cells} cells, WH z {z:.2}");
-    assert!(z < 4.0, "chi-square rejects the target law: chi2 {chi:.1}, {cells} cells, z {z:.2}");
+    assert!(
+        z < 4.0,
+        "chi-square rejects the target law: chi2 {chi:.1}, {cells} cells, z {z:.2}"
+    );
 }
 
 /// End to end: softmax + pre-drawn uniforms + upload + launch + readback.
@@ -365,7 +473,12 @@ fn device_accept_entry_is_twin_exact_and_deterministic() {
     let n = b - 1;
     let lg = logits(b, 5);
     let logits_gpu = gpu.upload_f32(&lg, &[b * vocab()]).unwrap();
-    let cfg = DflashSampleCfg { temp: 0.8, top_p: 0.9, top_k: 20, cactus_delta: 0.0 };
+    let cfg = DflashSampleCfg {
+        temp: 0.8,
+        top_p: 0.9,
+        top_k: 20,
+        cactus_delta: 0.0,
+    };
     let rows = softmax_rows(&mut gpu, &lg, b, 0.9, 20);
 
     let mut rng = Lcg(2024);
@@ -400,20 +513,62 @@ fn device_accept_entry_is_twin_exact_and_deterministic() {
         let u_fin = next();
         let mut payload = Vec::new();
         dflash_accept_pack_payload(
-            &mut payload, &draft.block[1..], &us, u_fin, max_accept, &draft.selected_q,
-            draft.sparse_q.offsets(), &draft.sparse_q.idx, &draft.sparse_q.val,
+            &mut payload,
+            &draft.block[1..],
+            &us,
+            u_fin,
+            max_accept,
+            &draft.selected_q,
+            draft.sparse_q.offsets(),
+            &draft.sparse_q.idx,
+            &draft.sparse_q.val,
         )
         .unwrap();
-        let twin = dflash_sampled_accept_reference(&rows.h_probs, &rows.h_tau, &rows.h_z, &payload, n, vocab());
+        let twin = dflash_sampled_accept_reference(
+            &rows.h_probs,
+            &rows.h_tau,
+            &rows.h_z,
+            &payload,
+            n,
+            vocab(),
+        );
 
         let mut r1 = seed;
-        let a = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, vocab(), cfg, max_accept, &mut r1, &mut slot)
-            .unwrap();
+        let a = dflash_sampled_accept_device(
+            &mut gpu,
+            &logits_gpu,
+            &draft.block,
+            &draft,
+            vocab(),
+            cfg,
+            max_accept,
+            &mut r1,
+            &mut slot,
+        )
+        .unwrap();
         let mut r2 = seed;
-        let c = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, vocab(), cfg, max_accept, &mut r2, &mut slot)
-            .unwrap();
-        assert_eq!((a.accepted_drafts, a.bonus_token), (twin.accept_len, twin.bonus), "case {case}");
-        assert_eq!((a.accepted_drafts, a.bonus_token, r1), (c.accepted_drafts, c.bonus_token, r2), "case {case}: not deterministic");
+        let c = dflash_sampled_accept_device(
+            &mut gpu,
+            &logits_gpu,
+            &draft.block,
+            &draft,
+            vocab(),
+            cfg,
+            max_accept,
+            &mut r2,
+            &mut slot,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.accepted_drafts, a.bonus_token),
+            (twin.accept_len, twin.bonus),
+            "case {case}"
+        );
+        assert_eq!(
+            (a.accepted_drafts, a.bonus_token, r1),
+            (c.accepted_drafts, c.bonus_token, r2),
+            "case {case}: not deterministic"
+        );
         assert_ne!(r1, seed, "the entry must advance the host RNG");
     }
 }

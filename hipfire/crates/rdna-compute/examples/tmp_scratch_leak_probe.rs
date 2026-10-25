@@ -96,8 +96,7 @@ fn main() {
     // Growth phases: prefill B, C, D — each larger, each outside capture.
     let mut prev = base;
     for &(_label, batch) in &SHAPES[1..] {
-        gpu.ensure_q8_1_mmq_x(&x, batch, K)
-            .expect("growth ensure");
+        gpu.ensure_q8_1_mmq_x(&x, batch, K).expect("growth ensure");
         gpu.hip.device_synchronize().expect("growth sync");
         let free = free_mb(&gpu);
         let step = prev - free;

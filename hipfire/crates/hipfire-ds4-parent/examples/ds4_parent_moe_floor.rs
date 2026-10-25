@@ -36,9 +36,7 @@ use hipfire_ds4_parent::layer_ref::{
 use hipfire_ds4_parent::moe::{
     parent_route, PARENT_MOE_INTER, PARENT_ROUTE_SCALE, PARENT_SWIGLU_LIMIT,
 };
-use hipfire_ds4_parent::weights::{
-    ParentLayerWeights, ParentLoadPlan, ParentWeights,
-};
+use hipfire_ds4_parent::weights::{ParentLayerWeights, ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::{Ds4ParentBackend, ParentQuantConfig};
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -185,16 +183,7 @@ fn run() -> Result<(), String> {
             }
             let hl = host[layer_i].as_ref().unwrap();
             calibrate_layer(
-                &mut gpu,
-                backend,
-                layer,
-                hl,
-                &cfg,
-                &scratch,
-                &token_ids,
-                rows,
-                layer_i,
-                &w_decode,
+                &mut gpu, backend, layer, hl, &cfg, &scratch, &token_ids, rows, layer_i, &w_decode,
             )?;
         }
         use_a = !use_a;
@@ -355,8 +344,10 @@ fn calibrate_layer(
     // Shared-only host vs (assembled − routed) is hard without GPU split; instead
     // report shared-only host magnitude on row0 for context.
     {
-        let gate = dense_linear_bf16_host(&moe_x_bf16[..dim], &hl.shared_w1, 1, PARENT_MOE_INTER, dim)?;
-        let up = dense_linear_bf16_host(&moe_x_bf16[..dim], &hl.shared_w3, 1, PARENT_MOE_INTER, dim)?;
+        let gate =
+            dense_linear_bf16_host(&moe_x_bf16[..dim], &hl.shared_w1, 1, PARENT_MOE_INTER, dim)?;
+        let up =
+            dense_linear_bf16_host(&moe_x_bf16[..dim], &hl.shared_w3, 1, PARENT_MOE_INTER, dim)?;
         let hid = expert_swiglu_ref(
             &gate,
             &up,
@@ -401,14 +392,7 @@ fn calibrate_layer(
         let ffn_norm_ref = rms_norm_ref(&y_ref, &hl.ffn_norm, PARENT_RMS_EPS as f64, dim);
         let norm_m = metrics(&ffn_norm_f32, &ffn_norm_ref);
         let x_m = metrics(&moe_x_bf16, &ffn_norm_ref);
-        let host_rt = route_host(
-            &ffn_norm_ref,
-            hl,
-            cfg,
-            layer_i,
-            rows,
-            Some(token_ids),
-        )?;
+        let host_rt = route_host(&ffn_norm_ref, hl, cfg, layer_i, rows, Some(token_ids))?;
         let y_b = moe_ref_assembled(gpu, layer, hl, &ffn_norm_ref, &host_rt, rows, w_decode)?;
         let m_b_all = metrics(&moe_gpu, &y_b);
         let m_b_r0 = metrics_row(&moe_gpu, &y_b, 0, dim);
@@ -516,14 +500,7 @@ fn moe_ref_assembled(
     // Shared.
     let gate = dense_linear_bf16_host(x_f32, &hl.shared_w1, rows, inter, dim)?;
     let up = dense_linear_bf16_host(x_f32, &hl.shared_w3, rows, inter, dim)?;
-    let hid = expert_swiglu_ref(
-        &gate,
-        &up,
-        rows,
-        inter,
-        PARENT_SWIGLU_LIMIT as f64,
-        None,
-    );
+    let hid = expert_swiglu_ref(&gate, &up, rows, inter, PARENT_SWIGLU_LIMIT as f64, None);
     let shared = dense_linear_bf16_host(&hid, &hl.shared_w2, rows, dim, inter)?;
     for i in 0..rows * dim {
         y[i] += shared[i];
@@ -703,11 +680,7 @@ impl HostLayer {
             hc_ffn_fn: download_f32(gpu, &layer.hc_ffn_fn, mix_hc * hc_flat)?,
             hc_ffn_base: download_f32(gpu, &layer.hc_ffn_base, mix_hc)?,
             hc_ffn_scale: download_f32(gpu, &layer.hc_ffn_scale, 3)?,
-            gate_weight: download_bf16_as_f32(
-                gpu,
-                &layer.gate_weight,
-                cfg.n_routed_experts * dim,
-            )?,
+            gate_weight: download_bf16_as_f32(gpu, &layer.gate_weight, cfg.n_routed_experts * dim)?,
             gate_bias,
             tid2eid,
             shared_w1: download_bf16_as_f32(gpu, layer.shared_w1.tensor(), inter * dim)?,
@@ -780,8 +753,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut data = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("f32 dtoh: {e:?}"))?;
@@ -817,8 +789,7 @@ fn download_i64(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<i64>, Str
         ));
     }
     let mut data = vec![0i64; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("i64 dtoh: {e:?}"))?;
@@ -869,9 +840,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--rows: {e}"))?;
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "ds4_parent_moe_floor [--model DIR] [--token-ids PATH] [--rows N]"
-                );
+                eprintln!("ds4_parent_moe_floor [--model DIR] [--token-ids PATH] [--rows N]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown arg {other}")),

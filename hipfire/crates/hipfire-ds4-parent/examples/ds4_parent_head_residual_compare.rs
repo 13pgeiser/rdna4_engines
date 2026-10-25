@@ -11,9 +11,7 @@
 //! ```
 
 use hipfire_ds4_parent::attention::PARENT_DIM;
-use hipfire_ds4_parent::head::{
-    parent_head, PARENT_HC_DIM, PARENT_HC_MULT, PARENT_VOCAB,
-};
+use hipfire_ds4_parent::head::{parent_head, PARENT_HC_DIM, PARENT_HC_MULT, PARENT_VOCAB};
 use hipfire_ds4_parent::inventory::ParentInventory;
 use hipfire_ds4_parent::weights::{ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::Ds4ParentBackend;
@@ -88,15 +86,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("alloc logits: {e:?}"))?;
 
     let t1 = Instant::now();
-    parent_head(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        &x,
-        n_pos,
-        &logits,
-    )?;
+    parent_head(&mut gpu, backend, &weights, &cfg, &x, n_pos, &logits)?;
     let head_ms = t1.elapsed().as_secs_f64() * 1e3;
     println!("parent_head {n_pos} rows: {head_ms:.1} ms");
 
@@ -142,7 +132,9 @@ fn run() -> Result<(), String> {
             }));
             println!(
                 "  pos={p:4} cos={:.8} rel={:.4e} top1_gpu={ta} top1_torch={tb} agree={}",
-                mm.0, mm.1, ta == tb
+                mm.0,
+                mm.1,
+                ta == tb
             );
         }
         report["per_pos_gpu_vs_torch_parent_res"] = serde_json::Value::Array(rows);
@@ -228,7 +220,7 @@ struct TorchStages {
 }
 
 fn load_torch_stages(path: &Path, n_pos: usize) -> Result<TorchStages, String> {
-    // Minimal NPZ reader for float32 arrays we need. Prefer npy crate-less: shell out? 
+    // Minimal NPZ reader for float32 arrays we need. Prefer npy crate-less: shell out?
     // Use a tiny pure-rust npz via flate2+zip if available, else require pre-extracted bins.
     // Simpler: call python to dump bins next to npz.
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -276,9 +268,8 @@ fn read_f32_bin(path: &Path, n: usize) -> Result<Vec<f32>, String> {
 }
 
 fn upload_f32(gpu: &mut Gpu, t: &GpuTensor, host: &[f32]) -> Result<(), String> {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
     gpu.hip
         .memcpy_htod(&t.buf, bytes)
         .map_err(|e| format!("htod: {e:?}"))
@@ -348,8 +339,7 @@ fn parse_args() -> Result<Args, String> {
                 torch_stages = Some(PathBuf::from(it.next().ok_or("--torch-stages value")?))
             }
             "--ref-residual-bin" => {
-                ref_residual_bin =
-                    Some(PathBuf::from(it.next().ok_or("--ref-residual-bin value")?))
+                ref_residual_bin = Some(PathBuf::from(it.next().ok_or("--ref-residual-bin value")?))
             }
             "--out" => out = Some(it.next().ok_or("--out value")?),
             "-h" | "--help" => {

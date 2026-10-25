@@ -139,7 +139,8 @@ fn bits_to_f32(v: &[u32]) -> Vec<f32> {
 }
 
 fn upload_bits(gpu: &mut Gpu, v: &[u32]) -> GpuTensor {
-    gpu.upload_f32(&bits_to_f32(v), &[v.len()]).expect("upload bits")
+    gpu.upload_f32(&bits_to_f32(v), &[v.len()])
+        .expect("upload bits")
 }
 
 fn poisoned(gpu: &mut Gpu, n: usize) -> GpuTensor {
@@ -213,7 +214,11 @@ fn gen_x(rng: &mut Rng, k: usize, mode: u64) -> Vec<f32> {
             1 => 0.0,
             2 => {
                 // (1 + 2^-12) or the exact F16 tie 1 + 2^-11, scaled by 2^e.
-                let m = if rng.next() & 1 == 0 { 1.0 + 2f32.powi(-12) } else { 1.0 + 2f32.powi(-11) };
+                let m = if rng.next() & 1 == 0 {
+                    1.0 + 2f32.powi(-12)
+                } else {
+                    1.0 + 2f32.powi(-11)
+                };
                 let e = (rng.next() % 13) as i32 - 6;
                 let s = if rng.next() & 1 == 0 { 1.0 } else { -1.0 };
                 s * m * 2f32.powi(e)
@@ -351,7 +356,11 @@ fn run_gather(
             cursor += r + 1;
         }
     }
-    let arena_rows = if overlap_src { *rows.iter().max().unwrap() + 1 } else { cursor + 1 };
+    let arena_rows = if overlap_src {
+        *rows.iter().max().unwrap() + 1
+    } else {
+        cursor + 1
+    };
     let arena: Vec<u32> = (0..arena_rows * width).map(|_| rng.bits()).collect();
     let pos_src: Vec<u32> = (0..arena_rows).map(|_| rng.bits()).collect();
     let d_arena = upload_bits(gpu, &arena);
@@ -366,7 +375,11 @@ fn run_gather(
             src: addr(&d_arena, src_off[i] * width),
             dst0: 0,
             dst1: 0,
-            positions: if with_pos { addr(&d_pos_src, src_off[i]) } else { 0 },
+            positions: if with_pos {
+                addr(&d_pos_src, src_off[i])
+            } else {
+                0
+            },
             packed_row0: p0[i] as i32,
             rows: r as i32,
         })
@@ -391,7 +404,10 @@ fn run_gather(
     let mut result = Ok(());
     let (n, first) = diff(&expect, &packed);
     if n != 0 {
-        result = Err(format!("{n} packed bits differ (first at word {})", first.unwrap()));
+        result = Err(format!(
+            "{n} packed bits differ (first at word {})",
+            first.unwrap()
+        ));
     }
     let (pn, pfirst) = diff(&expect_pos, &pos_out);
     if result.is_ok() && pn != 0 {
@@ -439,7 +455,11 @@ fn run_scatter(
         .map(|(i, &r)| DraftRowSpan {
             src: 0,
             dst0: addr(&d_k, dst_off[i] * width),
-            dst1: if with_v { addr(&d_v, dst_off[i] * width) } else { 0 },
+            dst1: if with_v {
+                addr(&d_v, dst_off[i] * width)
+            } else {
+                0
+            },
             positions: 0,
             packed_row0: p0[i] as i32,
             rows: r as i32,
@@ -465,11 +485,17 @@ fn run_scatter(
     let mut result = Ok(());
     let (n, first) = diff(&expect_k, &k_out);
     if n != 0 {
-        result = Err(format!("{n} K destination bits differ (first at word {})", first.unwrap()));
+        result = Err(format!(
+            "{n} K destination bits differ (first at word {})",
+            first.unwrap()
+        ));
     }
     let (vn, vfirst) = diff(&expect_v, &v_out);
     if result.is_ok() && vn != 0 {
-        result = Err(format!("{vn} V destination bits differ (first at word {})", vfirst.unwrap()));
+        result = Err(format!(
+            "{vn} V destination bits differ (first at word {})",
+            vfirst.unwrap()
+        ));
     }
     for t in [d_p0, d_p1, d_k, d_v] {
         gpu.free_tensor(t).expect("free");
@@ -497,8 +523,22 @@ fn validation(gpu: &mut Gpu, t: &mut Tally) {
     let dk = poisoned(gpu, 32 * width);
     let dv = poisoned(gpu, 32 * width);
     let ok_g = [
-        DraftRowSpan { src: addr(&arena, 0), dst0: 0, dst1: 0, positions: addr(&pos, 0), packed_row0: 0, rows: 3 },
-        DraftRowSpan { src: addr(&arena, 10 * width), dst0: 0, dst1: 0, positions: addr(&pos, 10), packed_row0: 3, rows: 2 },
+        DraftRowSpan {
+            src: addr(&arena, 0),
+            dst0: 0,
+            dst1: 0,
+            positions: addr(&pos, 0),
+            packed_row0: 0,
+            rows: 3,
+        },
+        DraftRowSpan {
+            src: addr(&arena, 10 * width),
+            dst0: 0,
+            dst1: 0,
+            positions: addr(&pos, 10),
+            packed_row0: 3,
+            rows: 2,
+        },
     ];
     t.cases += 1;
     match gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &ok_g, width) {
@@ -510,35 +550,92 @@ fn validation(gpu: &mut Gpu, t: &mut Tally) {
     }
     let mut bad = ok_g;
     bad[1].packed_row0 = 2;
-    expect_refused(t, "gather overlapping packed ranges", gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width));
+    expect_refused(
+        t,
+        "gather overlapping packed ranges",
+        gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width),
+    );
     let mut bad = ok_g;
     bad[0].rows = 0;
-    expect_refused(t, "gather zero-row span", gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width));
+    expect_refused(
+        t,
+        "gather zero-row span",
+        gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width),
+    );
     let mut bad = ok_g;
     bad[0].src = 0;
-    expect_refused(t, "gather null src", gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width));
+    expect_refused(
+        t,
+        "gather null src",
+        gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width),
+    );
     let mut bad = ok_g;
     bad[1].positions = 0;
-    expect_refused(t, "gather null positions with positions output", gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width));
-    expect_refused(t, "gather no spans", gpu.draft_rows_gather_f32(&packed, None, &[], width));
+    expect_refused(
+        t,
+        "gather null positions with positions output",
+        gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width),
+    );
+    expect_refused(
+        t,
+        "gather no spans",
+        gpu.draft_rows_gather_f32(&packed, None, &[], width),
+    );
     let many: Vec<DraftRowSpan> = (0..DRAFT_ROW_SPANS_MAX + 1)
-        .map(|i| DraftRowSpan { src: addr(&arena, 0), dst0: 0, dst1: 0, positions: 0, packed_row0: i as i32, rows: 1 })
+        .map(|i| DraftRowSpan {
+            src: addr(&arena, 0),
+            dst0: 0,
+            dst1: 0,
+            positions: 0,
+            packed_row0: i as i32,
+            rows: 1,
+        })
         .collect();
     let many_packed = poisoned(gpu, 40 * width);
-    expect_refused(t, "gather too many spans", gpu.draft_rows_gather_f32(&many_packed, None, &many, width));
+    expect_refused(
+        t,
+        "gather too many spans",
+        gpu.draft_rows_gather_f32(&many_packed, None, &many, width),
+    );
     gpu.free_tensor(many_packed).expect("free");
     let mut bad = ok_g;
     bad[1].packed_row0 = 15;
     bad[1].rows = 4;
-    expect_refused(t, "gather packed buffer too small", gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width));
-    expect_refused(t, "gather zero width", gpu.draft_rows_gather_f32(&packed, None, &ok_g, 0));
+    expect_refused(
+        t,
+        "gather packed buffer too small",
+        gpu.draft_rows_gather_f32(&packed, Some(&pos_out), &bad, width),
+    );
+    expect_refused(
+        t,
+        "gather zero width",
+        gpu.draft_rows_gather_f32(&packed, None, &ok_g, 0),
+    );
     let mut bad = ok_g;
     bad[0].src = addr(&packed, 0);
-    expect_refused(t, "gather src overlaps packed", gpu.draft_rows_gather_f32(&packed, None, &bad, width));
+    expect_refused(
+        t,
+        "gather src overlaps packed",
+        gpu.draft_rows_gather_f32(&packed, None, &bad, width),
+    );
 
     let ok_s = [
-        DraftRowSpan { src: 0, dst0: addr(&dk, 0), dst1: addr(&dv, 0), positions: 0, packed_row0: 0, rows: 3 },
-        DraftRowSpan { src: 0, dst0: addr(&dk, 8 * width), dst1: addr(&dv, 8 * width), positions: 0, packed_row0: 3, rows: 2 },
+        DraftRowSpan {
+            src: 0,
+            dst0: addr(&dk, 0),
+            dst1: addr(&dv, 0),
+            positions: 0,
+            packed_row0: 0,
+            rows: 3,
+        },
+        DraftRowSpan {
+            src: 0,
+            dst0: addr(&dk, 8 * width),
+            dst1: addr(&dv, 8 * width),
+            positions: 0,
+            packed_row0: 3,
+            rows: 2,
+        },
     ];
     t.cases += 1;
     match gpu.draft_rows_scatter_f32(&packed, Some(&packed), &ok_s, width) {
@@ -550,22 +647,46 @@ fn validation(gpu: &mut Gpu, t: &mut Tally) {
     }
     let mut bad = ok_s;
     bad[1].dst0 = addr(&dk, 2 * width);
-    expect_refused(t, "scatter overlapping destinations", gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width));
+    expect_refused(
+        t,
+        "scatter overlapping destinations",
+        gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width),
+    );
     let mut bad = ok_s;
     bad[0].dst1 = bad[1].dst0;
-    expect_refused(t, "scatter dst1 overlaps another dst0", gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width));
+    expect_refused(
+        t,
+        "scatter dst1 overlaps another dst0",
+        gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width),
+    );
     let mut bad = ok_s;
     bad[1].dst1 = 0;
-    expect_refused(t, "scatter null dst1 with packed1", gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width));
+    expect_refused(
+        t,
+        "scatter null dst1 with packed1",
+        gpu.draft_rows_scatter_f32(&packed, Some(&packed), &bad, width),
+    );
     let mut bad = ok_s;
     bad[0].dst0 = 0;
-    expect_refused(t, "scatter null dst0", gpu.draft_rows_scatter_f32(&packed, None, &bad, width));
+    expect_refused(
+        t,
+        "scatter null dst0",
+        gpu.draft_rows_scatter_f32(&packed, None, &bad, width),
+    );
     let mut bad = ok_s;
     bad[0].dst0 = addr(&packed, 0);
-    expect_refused(t, "scatter dst overlaps packed", gpu.draft_rows_scatter_f32(&packed, None, &bad, width));
+    expect_refused(
+        t,
+        "scatter dst overlaps packed",
+        gpu.draft_rows_scatter_f32(&packed, None, &bad, width),
+    );
     let mut bad = ok_s;
     bad[1].packed_row0 = 15;
-    expect_refused(t, "scatter packed buffer too small", gpu.draft_rows_scatter_f32(&packed, None, &bad, width));
+    expect_refused(
+        t,
+        "scatter packed buffer too small",
+        gpu.draft_rows_scatter_f32(&packed, None, &bad, width),
+    );
 
     // R2 lanes API.
     let (m, k) = (4usize, 256usize);
@@ -580,13 +701,41 @@ fn validation(gpu: &mut Gpu, t: &mut Tally) {
             println!("FAIL validation r2 baseline: valid call refused ({e})");
         }
     }
-    expect_refused(t, "r2 batch 0", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 0));
-    expect_refused(t, "r2 batch too large", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 73));
-    expect_refused(t, "r2 k not multiple of 256", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, 255, 1));
-    expect_refused(t, "r2 rotated too small", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 5));
-    expect_refused(t, "r2 y too small", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y.sub_offset(0, 3 * m), m, k, 4));
-    expect_refused(t, "r2 weight too small", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m + 1, k, 1));
-    expect_refused(t, "r2 y aliases rotated", gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &x.sub_offset(0, 4 * m), m, k, 4));
+    expect_refused(
+        t,
+        "r2 batch 0",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 0),
+    );
+    expect_refused(
+        t,
+        "r2 batch too large",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 73),
+    );
+    expect_refused(
+        t,
+        "r2 k not multiple of 256",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, 255, 1),
+    );
+    expect_refused(
+        t,
+        "r2 rotated too small",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m, k, 5),
+    );
+    expect_refused(
+        t,
+        "r2 y too small",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y.sub_offset(0, 3 * m), m, k, 4),
+    );
+    expect_refused(
+        t,
+        "r2 weight too small",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y, m + 1, k, 1),
+    );
+    expect_refused(
+        t,
+        "r2 y aliases rotated",
+        gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &x.sub_offset(0, 4 * m), m, k, 4),
+    );
     for tn in [arena, pos, packed, pos_out, dk, dv, w, x, y] {
         gpu.free_tensor(tn).expect("free");
     }
@@ -613,7 +762,8 @@ fn negative_control(gpu: &mut Gpu, rng: &mut Rng) -> Result<(), String> {
     let y_lanes = poisoned(gpu, m);
     let y_wmma = poisoned(gpu, 2 * m);
     gpu.gemv_mq4g256v2(&w, &x, &y_r2, m, k).expect("old r2");
-    gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y_lanes, m, k, 1).expect("lanes");
+    gpu.gemv_mq4g256v2_multirow_r2_lanes(&w, &x, &y_lanes, m, k, 1)
+        .expect("lanes");
     gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
     let admitted = gpu
         .gemm_mq4g256v2_overwrite_gfx12_dflash(&w, &x2, &y_wmma, m, k, 2)
@@ -637,7 +787,11 @@ fn negative_control(gpu: &mut Gpu, rng: &mut Rng) -> Result<(), String> {
         return Err("the overwrite WMMA class was not admitted (control inconclusive)".into());
     }
     if r2[0] != (256.0f32 + 0.0625).to_bits() {
-        return Err(format!("R2 row0 is {:#010x}, expected 256.0625 ({:#010x})", r2[0], (256.0f32 + 0.0625).to_bits()));
+        return Err(format!(
+            "R2 row0 is {:#010x}, expected 256.0625 ({:#010x})",
+            r2[0],
+            (256.0f32 + 0.0625).to_bits()
+        ));
     }
     if r2 != lanes {
         return Err("R2 lanes twin differs from old R2 on the control".into());
@@ -650,7 +804,9 @@ fn negative_control(gpu: &mut Gpu, rng: &mut Rng) -> Result<(), String> {
     let (m, k) = (1024usize, 5120usize);
     let wb = pack_mq4g256v2(m, k, rng);
     let w = gpu.upload_raw(&wb, &[wb.len()]).expect("w");
-    let xh: Vec<f32> = (0..k).map(|_| (rng.unit() + rng.unit() - 1.0) * 1.5).collect();
+    let xh: Vec<f32> = (0..k)
+        .map(|_| (rng.unit() + rng.unit() - 1.0) * 1.5)
+        .collect();
     let mut x2h = xh.clone();
     x2h.extend_from_slice(&xh);
     let x = gpu.upload_f32(&xh, &[k]).expect("x");
@@ -676,13 +832,21 @@ fn negative_control(gpu: &mut Gpu, rng: &mut Rng) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let golden_write = flag("--golden-write");
     let golden_check = flag("--golden-check");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     if gpu.arch != "gfx1201" {
-        eprintln!("draft_lane_rows_oracle: needs exact gfx1201, got {}", gpu.arch);
+        eprintln!(
+            "draft_lane_rows_oracle: needs exact gfx1201, got {}",
+            gpu.arch
+        );
         std::process::exit(2);
     }
     println!(
@@ -693,7 +857,10 @@ fn main() {
     );
 
     let mut rng = Rng(0xD0F1_C0A7_0B5E_1234);
-    let mut t = Tally { cases: 0, failures: 0 };
+    let mut t = Tally {
+        cases: 0,
+        failures: 0,
+    };
     let mut golden: Vec<(String, u64)> = Vec::new();
 
     // 1/2: R2 twin vs old R2.
@@ -731,7 +898,10 @@ fn main() {
 
     // Golden: the OLD singleton R2 output is unchanged.
     if let Some(path) = &golden_write {
-        let body: String = golden.iter().map(|(l, h)| format!("{l}\t{h:016x}\n")).collect();
+        let body: String = golden
+            .iter()
+            .map(|(l, h)| format!("{l}\t{h:016x}\n"))
+            .collect();
         std::fs::write(path, body).expect("write golden");
         println!("golden written: {} entries -> {path}", golden.len());
     }
@@ -754,7 +924,11 @@ fn main() {
         }
         t.report(
             &format!("old R2 unchanged vs golden {path} ({} cases)", golden.len()),
-            if bad == 0 { Ok(()) } else { Err(format!("{bad} case(s) changed")) },
+            if bad == 0 {
+                Ok(())
+            } else {
+                Err(format!("{bad} case(s) changed"))
+            },
         );
     } else if golden_write.is_none() {
         println!("note: no --golden-check FILE: old R2 'unchanged' is covered only by the old-vs-twin comparison above");
@@ -784,14 +958,17 @@ fn main() {
                     t.report(&label, r);
                 }
                 for &with_v in &[false, true] {
-                    let label = format!("scatter width={width} rows={rows:?} gap={gap} rev={rev} v={with_v}");
+                    let label = format!(
+                        "scatter width={width} rows={rows:?} gap={gap} rev={rev} v={with_v}"
+                    );
                     let r = run_scatter(&mut gpu, &mut rng, width, rows, gap, rev, with_v);
                     t.report(&label, r);
                 }
             }
         }
         for rows in [vec![3usize, 9, 1], vec![8; 8]] {
-            let label = format!("gather width={width} rows={rows:?} overlapping sources positions=true");
+            let label =
+                format!("gather width={width} rows={rows:?} overlapping sources positions=true");
             let r = run_gather(&mut gpu, &mut rng, width, &rows, 1, false, true, true);
             t.report(&label, r);
         }
@@ -800,7 +977,10 @@ fn main() {
     validation(&mut gpu, &mut t);
 
     // 4: negative control.
-    t.report("negative control: R2 class != overwrite WMMA class (F16-rounding counterexample)", negative_control(&mut gpu, &mut rng));
+    t.report(
+        "negative control: R2 class != overwrite WMMA class (F16-rounding counterexample)",
+        negative_control(&mut gpu, &mut rng),
+    );
 
     println!("{} cases, {} FAIL", t.cases, t.failures);
     if t.failures != 0 {

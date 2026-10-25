@@ -27,9 +27,19 @@ pub enum BuildError {
 
 /// `name operands` with `mods`; see the module docs.
 pub fn inst(name: &str, operands: Vec<Operand>, mods: Modifiers) -> Result<Inst, BuildError> {
-    let row = peacemaker_ir::isa::gfx12().iter().find(|r| r.name == name).ok_or_else(|| BuildError::UnknownMnemonic(name.into()))?;
-    let bad = |reason: String| BuildError::Invalid { name: name.into(), reason };
-    let example: Vec<u32> = row.encoding.split_whitespace().map(|w| u32::from_str_radix(w, 16).expect("table dword")).collect();
+    let row = peacemaker_ir::isa::gfx12()
+        .iter()
+        .find(|r| r.name == name)
+        .ok_or_else(|| BuildError::UnknownMnemonic(name.into()))?;
+    let bad = |reason: String| BuildError::Invalid {
+        name: name.into(),
+        reason,
+    };
+    let example: Vec<u32> = row
+        .encoding
+        .split_whitespace()
+        .map(|w| u32::from_str_radix(w, 16).expect("table dword"))
+        .collect();
     let (template, _) = gfx12::decode(&example).map_err(|e| bad(format!("table example: {e}")))?;
     let mut fields = template.fields;
     if let FormFields::Bits { honored, .. } = &mut fields {
@@ -42,27 +52,77 @@ pub fn inst(name: &str, operands: Vec<Operand>, mods: Modifiers) -> Result<Inst,
             }
         }
     }
-    let literal = operands.iter().find_map(|op| match op { Operand::Literal(v) => Some(*v), _ => None });
-    let built = Inst::from_parts(Arch::Gfx1201, row.op, row.form, fields, operands.into(), mods, literal, Provenance::default())
-        .map_err(|e| bad(e.to_string()))?;
+    let literal = operands.iter().find_map(|op| match op {
+        Operand::Literal(v) => Some(*v),
+        _ => None,
+    });
+    let built = Inst::from_parts(
+        Arch::Gfx1201,
+        row.op,
+        row.form,
+        fields,
+        operands.into(),
+        mods,
+        literal,
+        Provenance::default(),
+    )
+    .map_err(|e| bad(e.to_string()))?;
     let mut probe = built.clone();
     for op in probe.operands.iter_mut() {
-        if matches!(op, Operand::Label(_)) { *op = Operand::Imm(ImmField::Sopp(0)); }
+        if matches!(op, Operand::Label(_)) {
+            *op = Operand::Imm(ImmField::Sopp(0));
+        }
     }
     gfx12::encode(&probe).map_err(|e| bad(e.to_string()))?;
     Ok(built)
 }
 
 /// `name operands` without modifiers.
-pub fn op(name: &str, operands: Vec<Operand>) -> Result<Inst, BuildError> { inst(name, operands, Modifiers::default()) }
+pub fn op(name: &str, operands: Vec<Operand>) -> Result<Inst, BuildError> {
+    inst(name, operands, Modifiers::default())
+}
 
-pub fn s(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::S, base: n, len: 1 }) }
-pub fn s2(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::S, base: n, len: 2 }) }
-pub fn s4(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::S, base: n, len: 4 }) }
-pub fn v(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::V, base: n, len: 1 }) }
-pub fn ttmp(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::Ttmp, base: n, len: 1 }) }
-pub fn exec_lo() -> Operand { Operand::Special(Special::ExecLo) }
-pub fn label(block: BlockId) -> Operand { Operand::Label(block) }
+pub fn s(n: u16) -> Operand {
+    Operand::Reg(RegRef {
+        kind: Kind::S,
+        base: n,
+        len: 1,
+    })
+}
+pub fn s2(n: u16) -> Operand {
+    Operand::Reg(RegRef {
+        kind: Kind::S,
+        base: n,
+        len: 2,
+    })
+}
+pub fn s4(n: u16) -> Operand {
+    Operand::Reg(RegRef {
+        kind: Kind::S,
+        base: n,
+        len: 4,
+    })
+}
+pub fn v(n: u16) -> Operand {
+    Operand::Reg(RegRef {
+        kind: Kind::V,
+        base: n,
+        len: 1,
+    })
+}
+pub fn ttmp(n: u16) -> Operand {
+    Operand::Reg(RegRef {
+        kind: Kind::Ttmp,
+        base: n,
+        len: 1,
+    })
+}
+pub fn exec_lo() -> Operand {
+    Operand::Special(Special::ExecLo)
+}
+pub fn label(block: BlockId) -> Operand {
+    Operand::Label(block)
+}
 
 /// An immediate as the assembler encodes it: an inline constant in -16..=64, else a
 /// 32-bit literal.
@@ -74,13 +134,19 @@ pub fn imm(value: i64) -> Operand {
 }
 
 /// SOPP simm16 (`s_setprio`, `s_wait_alu`, `s_wait_*cnt` raw fields).
-pub fn simm16(value: u16) -> Operand { Operand::Imm(ImmField::Sopp(value as i16)) }
+pub fn simm16(value: u16) -> Operand {
+    Operand::Imm(ImmField::Sopp(value as i16))
+}
 
 /// SMEM immediate byte offset.
-pub fn smem_offset(offset: i32) -> Operand { Operand::Imm(ImmField::SmemOffset(offset)) }
+pub fn smem_offset(offset: i32) -> Operand {
+    Operand::Imm(ImmField::SmemOffset(offset))
+}
 
 /// VMEM immediate byte offset (`offset:-8`).
-pub fn vmem_offset(offset: i32) -> Operand { Operand::Imm(ImmField::VmemOffset(offset)) }
+pub fn vmem_offset(offset: i32) -> Operand {
+    Operand::Imm(ImmField::VmemOffset(offset))
+}
 
 /// `hwreg(id, offset, size)` as the SOPK simm16 the codec types it as.
 pub fn hwreg(id: u16, offset: u16, size: u16) -> Operand {
@@ -88,13 +154,18 @@ pub fn hwreg(id: u16, offset: u16, size: u16) -> Operand {
 }
 
 /// `s_sendmsg_rtn` message id (SSRC0 field).
-pub fn sendmsg_rtn(id: u8) -> Operand { Operand::SendMsg(Msg { id, op: 0 }) }
+pub fn sendmsg_rtn(id: u8) -> Operand {
+    Operand::SendMsg(Msg { id, op: 0 })
+}
 
 /// Modifiers of a `s_wait_*cnt` on one counter (the replay reads them).
 pub fn wait_mods(counter: peacemaker_ir::wait::Counter, count: u8) -> Modifiers {
     let mut wait = peacemaker_ir::wait::WaitImm::default();
     wait.per_counter[counter as usize] = Some(count);
-    Modifiers { wait: Some(wait), ..Modifiers::default() }
+    Modifiers {
+        wait: Some(wait),
+        ..Modifiers::default()
+    }
 }
 
 /// gfx12 `HW_REG_*` ids used by the M3 clients.

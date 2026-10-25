@@ -682,7 +682,5 @@ pub(crate) fn qnorm_rotate_fused_on(arch: &str, mq2r: bool) -> bool {
 }
 pub(crate) fn redline_ffn_split_on(arch: &str, mq2r: bool) -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    !mq2r
-        && arch == "gfx1151"
-        && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_REDLINE_FFN_SPLIT"))
+    !mq2r && arch == "gfx1151" && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_REDLINE_FFN_SPLIT"))
 }

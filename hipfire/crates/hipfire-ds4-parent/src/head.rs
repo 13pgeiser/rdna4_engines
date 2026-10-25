@@ -153,9 +153,7 @@ impl ParentHeadScratch {
     pub fn peak_logits_capture_bytes(n_tokens: usize, stream_rows: usize) -> usize {
         let rows = stream_rows.max(1);
         // Streaming design: keep at most `stream_rows` logit rows on device.
-        let logits = rows
-            .saturating_mul(PARENT_VOCAB)
-            .saturating_mul(4);
+        let logits = rows.saturating_mul(PARENT_VOCAB).saturating_mul(4);
         // Scratch sized for `stream_rows`.
         let scratch = stream_rows * PARENT_DIM * 4
             + stream_rows * PARENT_DIM * 4
@@ -744,7 +742,10 @@ mod tests {
             + PARENT_DIM * 2
             + PARENT_VOCAB * 4;
         // Constructor needs a GPU; validate the closed-form the constructor uses.
-        assert_eq!(expect, 16 * 4096 * 4 * 2 + 16 * 4096 * 2 + 4096 * 2 + 129_280 * 4);
+        assert_eq!(
+            expect,
+            16 * 4096 * 4 * 2 + 16 * 4096 * 2 + 4096 * 2 + 129_280 * 4
+        );
         // 1K-token capture streaming 16 rows at a time.
         let peak = ParentHeadScratch::peak_logits_capture_bytes(1024, 16);
         let logits_tile = 16 * PARENT_VOCAB * 4;
@@ -783,10 +784,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "ds4_parent_head_plog_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ds4_parent_head_plog_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("synth.plog");
 

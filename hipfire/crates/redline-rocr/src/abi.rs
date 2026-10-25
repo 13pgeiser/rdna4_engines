@@ -386,10 +386,7 @@ impl Symbols {
                 QueueAddWriteIndexRelaxedFn
             ),
             queue_cu_set_mask: symbol!("hsa_amd_queue_cu_set_mask", QueueCuSetMaskFn),
-            queue_cu_get_mask: optional_symbol!(
-                "hsa_amd_queue_cu_get_mask",
-                QueueCuGetMaskFn
-            ),
+            queue_cu_get_mask: optional_symbol!("hsa_amd_queue_cu_get_mask", QueueCuGetMaskFn),
             profiling_set_profiler_enabled: symbol!(
                 "hsa_amd_profiling_set_profiler_enabled",
                 ProfilingSetProfilerEnabledFn

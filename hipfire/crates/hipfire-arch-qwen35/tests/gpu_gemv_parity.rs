@@ -181,6 +181,8 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                     0x2c00, 0xb400, 0x3800, 0x3a00, // 0.0625, -0.25, 0.5, 0.75
                 ])),
                 CpuQuant::Mq4CG256 => bytes[..4].copy_from_slice(&f16s(&[0x2c00, 0xb400])),
+                // qt 53: 68 B / 128 group, `[f16 scale][f16 zero]` then 64 B of nibbles.
+                CpuQuant::Mq4G128V2 => bytes[..4].copy_from_slice(&f16s(&[0x2c00, 0xb400])),
                 CpuQuant::Hfq3G256
                 | CpuQuant::Hfq2G256
                 | CpuQuant::Hfq4G128
@@ -209,6 +211,14 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                 // The element formats are covered bit-exactly by the fixture
                 // tables in `hipfire-cpu` and by the cross-check over real norms.
                 CpuQuant::F16 | CpuQuant::F32 | CpuQuant::Bf16 => unreachable!("not in SYNTH"),
+                // The planar slab formats (qt 131/132/135/136) keep their scales in
+                // a separate plane after all code rows, so this per-row group
+                // synthesis cannot build them; they are covered by the planar
+                // tests in `hipfire-cpu` and the runtime cross-check.
+                CpuQuant::Mq3I4G128R256
+                | CpuQuant::Mq3I4G128R128
+                | CpuQuant::E8pI4G128R256
+                | CpuQuant::E8pI4G128R128 => unreachable!("planar: not in SYNTH"),
             }
             out.extend_from_slice(&bytes);
         }
@@ -667,7 +677,10 @@ fn gpu_cpu_gemv_parity_per_format() {
 #[test]
 #[ignore = "requires HIP GPU and HIPFIRE_OFFLOAD_EXEC=cpu"]
 fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(hipfire_dispatch::cpu_exec_enabled(), "run with HIPFIRE_OFFLOAD_EXEC=cpu");
+    assert!(
+        hipfire_dispatch::cpu_exec_enabled(),
+        "run with HIPFIRE_OFFLOAD_EXEC=cpu"
+    );
     let mut gpu = Gpu::init()?;
     for stream_case in 0..3 {
         if stream_case != 0 {
@@ -741,8 +754,11 @@ fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error
                     Some(stream) => gpu.hip.stream_synchronize(stream)?,
                     None => gpu.hip.stream_synchronize_default()?,
                 }
-                assert_eq!(gpu.download_f32(&out)?, want_out,
-                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output");
+                assert_eq!(
+                    gpu.download_f32(&out)?,
+                    want_out,
+                    "{q:?} stream {stream_case} k={k}: GPU consumer saw a stale CPU output"
+                );
                 assert_eq!(gpu.download_f32(&acc)?, want_acc,
                     "{q:?} stream {stream_case} k={k}: residual return/storage reuse changed arithmetic");
                 gpu.free_tensor(w)?;
@@ -775,6 +791,7 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::Mq2G256LloydU => "Mq2G256LloydU",
         CpuQuant::Mq4G256Lloyd => "Mq4G256Lloyd",
         CpuQuant::Mq4CG256 => "Mq4CG256",
+        CpuQuant::Mq4G128V2 => "Mq4G128V2",
         CpuQuant::Mq5G256 => "Mq5G256",
         CpuQuant::Mq5G256V2 => "Mq5G256V2",
         CpuQuant::Mq6G256V2 => "Mq6G256V2",
@@ -792,6 +809,10 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::Bf16 => "Bf16",
         CpuQuant::Q8F16 => "Q8F16",
         CpuQuant::Mfp4G32E8 => "Mfp4G32E8",
+        CpuQuant::Mq3I4G128R256 => "Mq3I4G128R256",
+        CpuQuant::Mq3I4G128R128 => "Mq3I4G128R128",
+        CpuQuant::E8pI4G128R256 => "E8pI4G128R256",
+        CpuQuant::E8pI4G128R128 => "E8pI4G128R128",
     }
 }
 
@@ -915,7 +936,10 @@ fn split_case(
     // agreed bitwise would be a mixture in name only (and this is the reference
     // against which the requirement "coherent output, plus a measured divergence"
     // is met at the element level rather than at the token level).
-    let arm_scale = cpu_full.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-30);
+    let arm_scale = cpu_full
+        .iter()
+        .fold(0.0f32, |a, b| a.max(b.abs()))
+        .max(1e-30);
     let arm_delta = full
         .iter()
         .zip(&cpu_full)
@@ -944,8 +968,7 @@ fn split_case(
     // (`dispatch_residual`'s set is `for_gemv_residual`'s): the gate must refuse
     // the rest rather than fail to launch, because the whole-CPU step handles
     // every format the CPU decodes.
-    let residual_covered =
-        hipfire_dispatch::types::KernelKey::for_gemv_residual(dtype).is_ok();
+    let residual_covered = hipfire_dispatch::types::KernelKey::for_gemv_residual(dtype).is_ok();
     // +8 rows of sentinel past `m`, so an over-long offset launch is caught.
     let mut seed = activation(m, 7919);
     seed.extend_from_slice(&[999.0f32; 8]);
@@ -999,7 +1022,10 @@ fn split_case(
         opts,
     )
     .unwrap_or_else(|e| panic!("{label}: residual split failed: {e:?}"));
-    assert!(ran, "{label}: the pass-back refused a covered residual shape");
+    assert!(
+        ran,
+        "{label}: the pass-back refused a covered residual shape"
+    );
     let after = hipfire_dispatch::split_counters();
     assert_eq!(
         (after.1 - before.1) as usize,

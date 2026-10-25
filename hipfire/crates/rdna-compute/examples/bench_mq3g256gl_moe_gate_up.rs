@@ -64,8 +64,7 @@ use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
-const MQ3GL_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip");
+const MQ3GL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip");
 const MQ3L_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip");
 
@@ -205,7 +204,11 @@ fn build_mq3gl(m: usize, k: usize, seed: u64) -> Vec<u8> {
                 let bs = pack3(&codes_for(seed, row, g, c));
                 out[off + 3 * c..off + 3 * c + 3].copy_from_slice(&bs);
             }
-            put_u16(&mut out, idx_bytes + (row * gpr + g) * 2, block_scale(seed, row, g));
+            put_u16(
+                &mut out,
+                idx_bytes + (row * gpr + g) * 2,
+                block_scale(seed, row, g),
+            );
         }
     }
     out
@@ -227,7 +230,11 @@ fn build_mq3gl_probe(m: usize, k: usize, pos: usize) -> Vec<u8> {
             for c in 0..32 {
                 out[off + 3 * c..off + 3 * c + 3].copy_from_slice(&bs);
             }
-            put_u16(&mut out, idx_bytes + (row * gpr + g) * 2, block_scale(0xB0BA, row, g));
+            put_u16(
+                &mut out,
+                idx_bytes + (row * gpr + g) * 2,
+                block_scale(0xB0BA, row, g),
+            );
         }
     }
     out
@@ -320,7 +327,11 @@ fn straddle_self_test() -> bool {
         let straddle = j == 2 || j == 5;
         println!(
             "   j={j}{} pack={:02X?} golden={:02X?} bytes={} reader={}",
-            if straddle { " (straddles byte boundary)" } else { "                          " },
+            if straddle {
+                " (straddles byte boundary)"
+            } else {
+                "                          "
+            },
             got,
             want,
             if bytes_ok { "ok " } else { "BAD" },
@@ -331,7 +342,11 @@ fn straddle_self_test() -> bool {
     // exhaustive round-trip over every 3-byte value: packer ∘ reader == identity
     let mut rt_ok = true;
     for v in 0u32..(1 << 24) {
-        let bytes = [(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8];
+        let bytes = [
+            (v & 0xff) as u8,
+            ((v >> 8) & 0xff) as u8,
+            ((v >> 16) & 0xff) as u8,
+        ];
         let mut q = [0u8; 8];
         for (j, qj) in q.iter_mut().enumerate() {
             *qj = bits3(&bytes, j) as u8;
@@ -349,7 +364,11 @@ fn straddle_self_test() -> bool {
     ok &= rt_ok;
     println!(
         "   phase A: {}\n",
-        if ok { "PASS" } else { "FAIL — bit layout disagreement on the HOST; GPU results below are meaningless" }
+        if ok {
+            "PASS"
+        } else {
+            "FAIL — bit layout disagreement on the HOST; GPU results below are meaningless"
+        }
     );
     ok
 }
@@ -516,6 +535,7 @@ fn upload(
     }
     blob.push_i32(m as i32);
     blob.push_i32(k as i32);
+    blob.push_i32((ptr_tab.buf.size() / 8) as i32);
 
     Uploaded {
         _experts: experts,
@@ -555,7 +575,11 @@ fn check(
     let gg = gpu.download_f32(&up.y_g).unwrap();
     let gu = gpu.download_f32(&up.y_u).unwrap();
 
-    let sentinel_left = gg.iter().chain(gu.iter()).filter(|v| **v == SENTINEL).count();
+    let sentinel_left = gg
+        .iter()
+        .chain(gu.iter())
+        .filter(|v| **v == SENTINEL)
+        .count();
     let min_gap = gg
         .iter()
         .zip(gu.iter())
@@ -576,7 +600,14 @@ fn check(
             } else {
                 (gu[krank * mi + (row - mi)] as f64, "y_up")
             };
-            samples.push(Sample { row, krank, side, got, want, sab });
+            samples.push(Sample {
+                row,
+                krank,
+                side,
+                got,
+                want,
+                sab,
+            });
         }
     }
     analyze(&samples, sentinel_left, min_gap)
@@ -667,7 +698,9 @@ fn main() {
 
     // ── phase B: on-GPU straddle probe, one code position per top-k rank ──
     println!("── phase B ── GPU straddle probe: expert p has code 7 only at in-span position p");
-    println!("   x[col] = 0.125*((col%8)+1) so every one of the 8 positions carries a distinct weight;");
+    println!(
+        "   x[col] = 0.125*((col%8)+1) so every one of the 8 positions carries a distinct weight;"
+    );
     println!("   a permuted / straddle-broken slice changes the answer for that position only.");
     let probe_blobs: Vec<Vec<u8>> = (0..8).map(|p| build_mq3gl_probe(m, k, p)).collect();
     let probe_topk: Vec<i32> = (0..8).collect();
@@ -693,7 +726,11 @@ fn main() {
         let rel = (got - want).abs() / sab.max(1e-30);
         println!(
             "   pos {p}{} row0 gpu={got:>13.6} cpu={want:>13.6} rel(cond)={rel:.2e} {}",
-            if p == 2 || p == 5 { " STRADDLE" } else { "         " },
+            if p == 2 || p == 5 {
+                " STRADDLE"
+            } else {
+                "         "
+            },
             if rel <= TOL { "ok" } else { "BAD" }
         );
     }
@@ -708,7 +745,11 @@ fn main() {
     }
     println!(
         "   positions produce distinct sums: {}  (if not, the probe has no discriminating power)",
-        if distinct { "yes" } else { "NO — probe is vacuous" }
+        if distinct {
+            "yes"
+        } else {
+            "NO — probe is vacuous"
+        }
     );
     split_report(&probe_blobs, &probe_topk, &probe_x, m, k, true, &pg, &pu);
     report("MQ3GL straddle probe", &st_probe);
@@ -729,7 +770,9 @@ fn main() {
     println!("   topk_indices = {topk:?}");
 
     let mut up_gl = upload(&mut gpu, &gl_blobs, &topk, &x, m, k, true);
-    let st_gl = check(&mut gpu, MQ3GL_FN, &mut up_gl, &gl_blobs, &topk, &x, m, k, true);
+    let st_gl = check(
+        &mut gpu, MQ3GL_FN, &mut up_gl, &gl_blobs, &topk, &x, m, k, true,
+    );
     let gg = gpu.download_f32(&up_gl.y_g).unwrap();
     let gu = gpu.download_f32(&up_gl.y_u).unwrap();
     split_report(&gl_blobs, &topk, &x, m, k, true, &gg, &gu);
@@ -747,7 +790,9 @@ fn main() {
         let xt: Vec<f32> = (0..kt)
             .map(|i| ((mix(0xC0FFEE ^ i as u64) % 20001) as f32 - 10000.0) * 1e-4)
             .collect();
-        let blobs: Vec<Vec<u8>> = (0..nexp).map(|e| build_mq3gl(mt, kt, 0x77 + e as u64)).collect();
+        let blobs: Vec<Vec<u8>> = (0..nexp)
+            .map(|e| build_mq3gl(mt, kt, 0x77 + e as u64))
+            .collect();
         let tk: Vec<i32> = (0..ktop as i32).map(|i| i * 2).collect();
         let mut u = upload(&mut gpu, &blobs, &tk, &xt, mt, kt, true);
         let s = check(&mut gpu, MQ3GL_FN, &mut u, &blobs, &tk, &xt, mt, kt, true);
@@ -767,7 +812,9 @@ fn main() {
     // ── phase D: MQ3-Lloyd baseline correctness ──────────────────────────
     println!("── phase D ── MQ3-Lloyd (speed baseline) vs its own independent CPU reference");
     let mut up_l = upload(&mut gpu, &l_blobs, &topk, &x, m, k, false);
-    let st_l = check(&mut gpu, MQ3L_FN, &mut up_l, &l_blobs, &topk, &x, m, k, false);
+    let st_l = check(
+        &mut gpu, MQ3L_FN, &mut up_l, &l_blobs, &topk, &x, m, k, false,
+    );
     let lg = gpu.download_f32(&up_l.y_g).unwrap();
     let lu = gpu.download_f32(&up_l.y_u).unwrap();
     split_report(&l_blobs, &topk, &x, m, k, false, &lg, &lu);

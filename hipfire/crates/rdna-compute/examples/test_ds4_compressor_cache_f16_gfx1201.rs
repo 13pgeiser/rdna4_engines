@@ -91,8 +91,7 @@ fn assert_raw_f16_eq(gpu: &Gpu, label: &str, reference: &GpuTensor, candidate: &
 fn deterministic(len: usize, multiplier: usize, modulus: usize, scale: f32) -> Vec<f32> {
     (0..len)
         .map(|index| {
-            let centered = (index.wrapping_mul(multiplier) % modulus) as i32
-                - (modulus as i32 / 2);
+            let centered = (index.wrapping_mul(multiplier) % modulus) as i32 - (modulus as i32 / 2);
             centered as f32 * scale
         })
         .collect()
@@ -154,17 +153,7 @@ fn test_staged_commit(gpu: &mut Gpu) {
     )
     .unwrap();
     gpu.rope_tail_yarn_interleaved_staged_buf(
-        &staged,
-        &pos,
-        &slot,
-        D as i32,
-        64,
-        10_000.0,
-        0.5,
-        1.0,
-        1.0,
-        8.0,
-        24.0,
+        &staged, &pos, &slot, D as i32, 64, 10_000.0, 0.5, 1.0, 1.0, 8.0, 24.0,
     )
     .unwrap();
 
@@ -244,15 +233,7 @@ fn test_readers(gpu: &mut Gpu) {
     )
     .unwrap();
     gpu.indexer_relu_score_batched_f16(
-        &q,
-        &cache_f16,
-        &weights,
-        &valid,
-        &batch_f16,
-        H as i32,
-        D as i32,
-        N as i32,
-        B as i32,
+        &q, &cache_f16, &weights, &valid, &batch_f16, H as i32, D as i32, N as i32, B as i32,
     )
     .unwrap();
     assert_raw_f32_eq(gpu, "batched_score", &batch_ref, &batch_f16);
@@ -272,15 +253,7 @@ fn test_readers(gpu: &mut Gpu) {
     )
     .unwrap();
     gpu.indexer_relu_score_wmma_batched_f16(
-        &q,
-        &cache_f16,
-        &weights,
-        &valid,
-        &wmma_f16,
-        H as i32,
-        D as i32,
-        N as i32,
-        B as i32,
+        &q, &cache_f16, &weights, &valid, &wmma_f16, H as i32, D as i32, N as i32, B as i32,
     )
     .unwrap();
     assert_raw_f32_eq(gpu, "batched_score_wmma", &wmma_ref, &wmma_f16);

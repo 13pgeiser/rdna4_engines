@@ -352,7 +352,9 @@ thin `hipfire quantize` wrapper does not expose it. Source: `crates/hipfire-quan
   response's reported revision must equal the pinned one and the source identity
   is re-checked before publication. The endpoint is `HIPFIRE_HF_BASE`, else
   `HF_ENDPOINT`, else `https://huggingface.co`; a bearer token is taken from
-  `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN`.
+  `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN` (an empty variable counts as unset).
+  A token holding a space, newline, quote or non-ASCII character is refused
+  before any request, with an error naming the variable.
 - **Production admission** is the pinned checkpoint: exactly 131 safetensors
   shards and 1,658 source tensors (1,655 BF16 + 3 I64); the 333 vision-tower tensors
   are not written, so the output has 1,325 entries.
@@ -421,9 +423,16 @@ hipfire pull <tag> --ple auto|q4|q8|all|none              # which sidecar(s) to 
 - `auto` (default) resolves to **q4 only when the GPU architecture is exactly
   `gfx1151`**, and to **q8 on every other architecture** (an unknown architecture
   resolves to q8). `auto` never derives and never downloads: if the preferred file
-  is absent it uses the other format when present and prints a note.
-- `q4` always uses the 4-bit rows, deriving `<model>.ple-q4` from the local Q8 rows on
-  first load when it is missing (`hipfire ple derive` does it ahead of time).
+  is absent it uses the other format when present and prints a note, so a split
+  base whose only sidecar is `.ple-q4` loads with it; the q4 table is never
+  derived automatically. The q8 preference off gfx1151 is deliberate: q4 is
+  lossy and its current evidence is a gfx1151 WT2 point estimate (KLD 0.104865
+  q4 vs 0.103252 q8), not a paired confidence interval on the XTX (gfx1100,
+  code24), and no performance bottleneck there is traced to the PLE format.
+- `q4` always uses the 4-bit rows. A load never derives `<model>.ple-q4`: when it is
+  missing the load is refused with both searched locations and the remedies
+  `hipfire pull <tag> --ple q4` / `hipfire ple derive --format q4 <model>` (the
+  explicit step that derives it from the local Q8 rows).
 - `q8` always uses the exact rows. This is the opt-out from the q4 default on
   gfx1151: set `HIPFIRE_PLE_FORMAT=q8` or `memory.ple_format = "q8"`. A split base
   then needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`); a missing file is
@@ -433,6 +442,14 @@ hipfire pull <tag> --ple auto|q4|q8|all|none              # which sidecar(s) to 
 the loader selects. Env and config reference:
 [CONFIG.md](CONFIG.md#qwen4-ple-row-tables), [env-vars.md](env-vars.md)
 (`HIPFIRE_PLE_FORMAT`).
+
+At run time the q4 sidecar's pages are warmed into the page cache by
+`memory.ple_prewarm_bytes` (`auto` by default). `auto` follows the host RAM left
+after the model is loaded (`MemAvailable` − CMA region − 8 GiB, capped at the
+table): it is additionally capped at 15 GiB on unified-memory GPUs and on
+discrete GPUs whose experts are all resident in VRAM, and uncapped only on a
+discrete GPU with host-placed experts. An explicit byte count is never capped
+at 15 GiB. See [CONFIG.md](CONFIG.md#qwen4-ple-row-tables).
 
 ### Trunk overlay sidecar (`.trunk-overlay`)
 

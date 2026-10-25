@@ -76,8 +76,12 @@ pub struct Symbol {
     pub st_size: u64,
 }
 impl Symbol {
-    pub fn kind(&self) -> u8 { self.st_info & 0xf }
-    pub fn binding(&self) -> u8 { self.st_info >> 4 }
+    pub fn kind(&self) -> u8 {
+        self.st_info & 0xf
+    }
+    pub fn binding(&self) -> u8 {
+        self.st_info >> 4
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,8 +125,15 @@ pub enum Fill {
     Bytes(Vec<u8>),
 }
 impl Fill {
-    pub fn len(&self) -> u64 { match self { Self::Zero(n) => *n, Self::Bytes(bytes) => bytes.len() as u64 } }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Zero(n) => *n,
+            Self::Bytes(bytes) => bytes.len() as u64,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

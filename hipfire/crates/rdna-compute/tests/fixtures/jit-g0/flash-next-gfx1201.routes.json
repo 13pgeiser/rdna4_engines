@@ -49,7 +49,7 @@
       "kind": "embedded",
       "module": "qwen4_moe_iu4_sym_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-      "sha256": "792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515",
+      "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
       "symbols": [
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -113,8 +113,9 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
-      "sha256": "36f07dd7cc1e80dbfa28b8d5710972ab335f231f082c0176a8ccd9afb7a19b1f",
+      "sha256": "3329205e119b0fa919300cfea160f376b8fc136618cab5b5e6b93beb141a8955",
       "symbols": [
+        "qwen4_mq6_x4_pm_gfx1201_w16",
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w8"
       ],
@@ -132,10 +133,18 @@
             "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-flash-next-gfx1201-native",
             "resolved_process_success": true
           }
+        ],
+        "qwen4_mq6_x4_pm_gfx1201_w16": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "mq6_x4_pm_gfx1201_entry (rdna-compute gemm.rs): M > 64 and ceil(M/256)*ceil(N/256) % 32 == 0; not yet observed in a module-load audit"
+          }
         ]
       },
       "repo_image": "kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
       "image_exports": [
+        "qwen4_mq6_x4_pm_gfx1201_w16",
+        "qwen4_mq6_x4_pm_gfx1201_w16.kd",
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w4.kd",
         "qwen4_mq6_x4_pm_gfx1201_w8",
@@ -297,7 +306,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "b82826f2644122c8cacece509ca2baf0955f1bf0398bd16e64368b25b7c31999",
+      "sha256": "6b9430e9463c21941227c90b457cb1c1c37a0c57ab2df813458fc318cc492ff4",
       "symbols": [
         "fn_gdn_dense_gate_rotate_bf16in",
         "fn_gdn_dense_producer"
@@ -500,7 +509,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "18f59f719b97c67bc4cf0d30b1a1ec8153da65db3b50e8f72f38199cd75ae564",
+      "sha256": "852671824c7ce850b71a05b911edfaaec863b1f6e13ccea6c3cebb43896f96fc",
       "symbols": [
         "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4"
       ],
@@ -545,7 +554,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "6f21ff296378b7b4855275e2460cdbd0844c5eb1e3bdcd83221899241c82068e",
+      "sha256": "a93dfdbcfeb46ebae8641177984abc1074eabe161041729b498dc5f18ac91abe",
       "symbols": [
         "gemm_mq6g256v2_f32_rows_r3",
         "gemm_mq6g256v2_f32_rows_r4",
@@ -819,7 +828,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "2326440b1210f8f069ab34c0246f8bf7af30969b44eb0f3c563660039fe93bdb",
+      "sha256": "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
       "symbols": [
         "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"
       ],
@@ -862,7 +871,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+      "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
       "symbols": [
         "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
         "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -1220,7 +1229,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+      "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
       "symbols": [
         "moe_combine_order_top10",
         "moe_down_combine_grouped_top10_bf16in_zinit"
@@ -1277,7 +1286,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+      "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
       "symbols": [
         "moe_down_combine_top10_batched"
       ],
@@ -1369,7 +1378,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+      "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
       "symbols": [
         "moe_router_softmax_top10_f32"
       ],
@@ -1412,7 +1421,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+      "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
       "symbols": [
         "moe_router_softmax_top10_f32_fast"
       ],
@@ -1455,7 +1464,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "aba7e396a4d5cc1d3570c4ead8152dc181d76ca86b881ae276886c9067a54c10",
+      "sha256": "47a0d58e48944ce33c5d2be507eb45008ac948a240dbdad08ebbdc02da5b2dd2",
       "symbols": [
         "moe_scatter_fused_top10"
       ],
@@ -1632,7 +1641,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b",
+      "sha256": "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25",
       "symbols": [
         "gemv_bf16_xf32_bf16_scaled_add",
         "gemv_bf16_xf32_k4",
@@ -1881,7 +1890,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
+      "sha256": "fb1fcae98660e1bad807d9fda24de3bab45a8cb0c5b951da9d1e4fd67e4c8b25",
       "symbols": [
         "topk8_partial_f32"
       ],
@@ -2042,7 +2051,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "c150ddb2cb0d30fea4a238637af57384391d0a8ffe0207962197cffb666541d9",
+      "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",
@@ -2250,7 +2259,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
+      "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -2678,12 +2687,7 @@
         "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/tensor_ops/rep-1/kernel.hsaco",
         "sha256": "8986bb3e28863f4e2f56a87c3928a5c1bfcdc784979f70607bad4d4eaeb08952"
       },
-      "registry_missing_symbols": [
-        "indexed_attention_attention_q8_batched",
-        "indexed_attention_attention_q8_batched_hg4",
-        "indexed_attention_cache_append_q8_batched",
-        "indexed_attention_decode_prologue_q8"
-      ]
+      "registry_missing_symbols": []
     },
     {
       "arch": "gfx1201",
@@ -2768,7 +2772,7 @@
           "kind": "embedded",
           "module": "qwen4_moe_iu4_sym_pm_gfx1201",
           "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-          "sha256": "792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515",
+          "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
           "symbols": [
             "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
             "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"
@@ -2960,7 +2964,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "b82826f2644122c8cacece509ca2baf0955f1bf0398bd16e64368b25b7c31999",
+          "sha256": "6b9430e9463c21941227c90b457cb1c1c37a0c57ab2df813458fc318cc492ff4",
           "symbols": [
             "fn_gdn_dense_gate_rotate_bf16in",
             "fn_gdn_dense_producer"
@@ -3299,7 +3303,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "2326440b1210f8f069ab34c0246f8bf7af30969b44eb0f3c563660039fe93bdb",
+          "sha256": "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
           "symbols": [
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"
           ],
@@ -3342,7 +3346,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+          "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
           "symbols": [
             "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -3657,7 +3661,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+          "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
           "symbols": [
             "moe_combine_order_top10",
             "moe_down_combine_grouped_top10_bf16in_zinit"
@@ -3714,7 +3718,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+          "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
           "symbols": [
             "moe_down_combine_top10_batched"
           ],
@@ -3757,7 +3761,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+          "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
           "symbols": [
             "moe_router_softmax_top10_f32"
           ],
@@ -3800,7 +3804,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+          "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
           "symbols": [
             "moe_router_softmax_top10_f32_fast"
           ],
@@ -4026,7 +4030,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b",
+          "sha256": "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25",
           "symbols": [
             "gemv_bf16_xf32_bf16_scaled_add",
             "gemv_bf16_xf32_k4",
@@ -4329,7 +4333,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "c150ddb2cb0d30fea4a238637af57384391d0a8ffe0207962197cffb666541d9",
+          "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
           "symbols": [
             "qwen4_moe_group_prefix",
             "qwen4_moe_group_ranks",
@@ -4480,7 +4484,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
+          "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
           "symbols": [
             "argmax_f32",
             "bf16_scaled_add_batched_f32",
@@ -4796,12 +4800,7 @@
             "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/tensor_ops/rep-1/kernel.hsaco",
             "sha256": "8986bb3e28863f4e2f56a87c3928a5c1bfcdc784979f70607bad4d4eaeb08952"
           },
-          "registry_missing_symbols": [
-            "indexed_attention_attention_q8_batched",
-            "indexed_attention_attention_q8_batched_hg4",
-            "indexed_attention_cache_append_q8_batched",
-            "indexed_attention_decode_prologue_q8"
-          ]
+          "registry_missing_symbols": []
         }
       ]
     }

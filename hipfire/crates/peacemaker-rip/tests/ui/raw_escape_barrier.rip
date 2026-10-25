@@ -12,7 +12,7 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     p.s::<8>("scalars", 0, Live::Whole)?;
     let mut b = Builder::new(kspec, p);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
-    op(wg.isa(), "s_barrier", &[], &[])?;
+    op(wg.isa(), if spec.arch.gfx12() { "s_barrier_signal -1" } else { "s_barrier" }, &[], &[])?;
     let end = wg.exit(".Lend")?;
     wg.end(end)?;
     b.finish()

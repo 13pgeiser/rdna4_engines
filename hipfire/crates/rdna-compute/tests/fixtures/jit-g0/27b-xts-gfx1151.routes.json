@@ -44,7 +44,7 @@
       "kind": "embedded",
       "module": "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151.hxaco",
-      "sha256": "09dbc6403013c7eab1b13e659faf6662f9c47477b64e2b5200be62e0f358b556",
+      "sha256": "4f3cc63475c709997e3f4bfb3dcb735098c24ca5a9976e916be22da143575eaf",
       "symbols": [
         "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151"
       ],
@@ -76,7 +76,7 @@
       "kind": "embedded",
       "module": "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco",
-      "sha256": "2395edabe77a58ba6ac8bbcb4f349d49a29f3c4e744eeb7889da498905778d2b",
+      "sha256": "c2890da64946418b3112565dcc0d8cd2d262fb6f085d63fc1265414822b517d1",
       "symbols": [
         "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151",
         "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151"

@@ -334,7 +334,8 @@ impl ContinuousBatchScheduler {
             return None;
         }
         self.next_generation += 1;
-        self.pending_sampling.insert(key.clone(), req.sampling.clone());
+        self.pending_sampling
+            .insert(key.clone(), req.sampling.clone());
         self.pending.insert(key.clone(), req);
         self.lanes[lane_idx] = BatchLane::Running(QwenBatchLane {
             key,
@@ -423,23 +424,18 @@ impl ContinuousBatchScheduler {
         if lane >= self.lanes.len() {
             return false;
         }
-        let (ticket, lane_generation) =
-            match &self.lanes[lane] {
-                BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
-                _ => return false,
-            };
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
+            _ => return false,
+        };
         if ticket.admission != admission {
             return false;
         }
         if !matches!(
             batch_poll_decision(&expected.id, expected.attempt_id, admission),
             Some(ClientTerminalDecision::Commit)
-        ) || !batch_ready_owner_matches(
-            &expected.id,
-            expected.attempt_id,
-            admission,
-            ticket,
-        ) {
+        ) || !batch_ready_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
+        {
             return false;
         }
         self.lanes[lane] = BatchLane::Empty {
@@ -467,23 +463,12 @@ impl ContinuousBatchScheduler {
             BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
                 (q.ticket, q.ticket.generation)
             }
-            BatchLane::AwaitingClient(t) if &t.key == expected => {
-                (t.ticket, t.ticket.generation)
-            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
             _ => return false,
         };
         if ticket.admission != admission
-            || (!batch_active_owner_matches(
-                &expected.id,
-                expected.attempt_id,
-                admission,
-                ticket,
-            ) && !batch_ready_owner_matches(
-                &expected.id,
-                expected.attempt_id,
-                admission,
-                ticket,
-            ))
+            || (!batch_active_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
+                && !batch_ready_owner_matches(&expected.id, expected.attempt_id, admission, ticket))
         {
             return false;
         }
@@ -518,18 +503,11 @@ impl ContinuousBatchScheduler {
             BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
                 (q.ticket, q.ticket.generation)
             }
-            BatchLane::AwaitingClient(t) if &t.key == expected => {
-                (t.ticket, t.ticket.generation)
-            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
             _ => return false,
         };
         if ticket.admission != admission
-            || !batch_active_owner_matches(
-                &expected.id,
-                expected.attempt_id,
-                admission,
-                ticket,
-            )
+            || !batch_active_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
         {
             return false;
         }
@@ -1017,15 +995,13 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
     {
         return 0;
     }
-    if !crate::terminal::batch_is_current(
-        &front_key.id,
-        front_key.attempt_id,
-        front_req.admission,
-    ) || crate::terminal::batch_check_abort(
-        &front_key.id,
-        front_key.attempt_id,
-        front_req.admission,
-    ) {
+    if !crate::terminal::batch_is_current(&front_key.id, front_key.attempt_id, front_req.admission)
+        || crate::terminal::batch_check_abort(
+            &front_key.id,
+            front_key.attempt_id,
+            front_req.admission,
+        )
+    {
         return 0;
     }
     let first_len = front_req.prompt_tokens.len();

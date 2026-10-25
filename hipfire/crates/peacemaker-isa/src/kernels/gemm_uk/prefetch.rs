@@ -2,21 +2,37 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use crate::{Builder, ledger::Counter};
-use peacemaker_author::{Free, LdsWrite, MmaIu4, Pending, Published, Ring, Workgroup, Writing, rotate};
+use crate::{ledger::Counter, Builder};
+use peacemaker_author::{
+    rotate, Free, LdsWrite, MmaIu4, Pending, Published, Ring, Workgroup, Writing,
+};
 
 /// Epoch distance and outstanding-load wait depth are part of the schedule type.
 pub struct Prefetch<const D: usize, const WAIT: u8 = 0>;
 /// A packet cannot be consumed before its declared epoch distance.
-pub struct InFlight<const D: usize, P> { epoch: usize, packet: P }
+pub struct InFlight<const D: usize, P> {
+    epoch: usize,
+    packet: P,
+}
 impl<const D: usize, const WAIT: u8> Prefetch<D, WAIT> {
-    pub fn issue<P>(epoch: usize, packet: P) -> InFlight<D, P> { InFlight { epoch, packet } }
+    pub fn issue<P>(epoch: usize, packet: P) -> InFlight<D, P> {
+        InFlight { epoch, packet }
+    }
     pub fn consume<P>(epoch: usize, packet: InFlight<D, P>) -> Result<P, String> {
-        if epoch.checked_sub(packet.epoch) != Some(D) { return Err("prefetch epoch distance differs from schedule type".into()) }
+        if epoch.checked_sub(packet.epoch) != Some(D) {
+            return Err("prefetch epoch distance differs from schedule type".into());
+        }
         Ok(packet.packet)
     }
     pub fn wait_load(b: &mut Builder) -> Result<(), String> {
-        b.wait(if b.spec.arch.gfx12() { Counter::Load } else { Counter::Vm }, WAIT)
+        b.wait(
+            if b.spec.arch.gfx12() {
+                Counter::Load
+            } else {
+                Counter::Vm
+            },
+            WAIT,
+        )
     }
 }
 impl<const WAIT: u8> Prefetch<1, WAIT> {

@@ -57,7 +57,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use hipfire_cpu::epilogue::{residual_add, silu_mul};
 use hipfire_cpu::gemv::gemv;
-use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
+use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, rotate_x_128_v2, CpuQuant, InputRotation};
 
 use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
@@ -76,13 +76,12 @@ enum HostExecMode {
 }
 
 fn host_exec_mode() -> HostExecMode {
-    static MODE: LazyLock<HostExecMode> = LazyLock::new(|| {
-        match hipfire_config::memory::offload_exec() {
+    static MODE: LazyLock<HostExecMode> =
+        LazyLock::new(|| match hipfire_config::memory::offload_exec() {
             hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
             hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
             hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
-        }
-    });
+        });
     *MODE
 }
 
@@ -115,6 +114,41 @@ pub fn moe_cpu_experts_enabled() -> bool {
                 != Some("0")
     });
     *ENABLED
+}
+
+/// The splice pool configuration. Knobs (both developer vars, read once when
+/// first needed): `HIPFIRE_CPU_EXPERT_THREADS` (worker count; `0`/unset = one
+/// per physical core in the process's allowed CPU set) and
+/// `HIPFIRE_CPU_EXPERT_PIN` (`0` = do not pin workers; default on).
+fn splice_pool_config() -> hipfire_cpu::splice_pool::SplicePoolConfig {
+    use hipfire_cpu::splice_pool::SplicePoolConfig;
+    static CFG: LazyLock<SplicePoolConfig> = LazyLock::new(|| SplicePoolConfig {
+        threads: hipfire_config::developer_var("HIPFIRE_CPU_EXPERT_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0),
+        pin: hipfire_config::developer_bool("HIPFIRE_CPU_EXPERT_PIN", true),
+    });
+    *CFG
+}
+
+/// The pinned physical-core pool the routed-expert splice runs on.
+pub(crate) fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    hipfire_cpu::splice_pool::install(splice_pool_config(), f)
+}
+
+/// Streaming-read bandwidth of host RAM measured on the splice pool: the
+/// pinned pool (one worker per physical core) the routed-expert splice runs
+/// on, so the figure is what that splice can actually pull from system
+/// memory. `hipfire calibrate` records it.
+pub fn splice_read_bandwidth(bytes: usize, reps: usize) -> hipfire_cpu::membw::ReadBandwidth {
+    in_splice_pool(|| hipfire_cpu::membw::read_bandwidth(bytes, reps))
+}
+
+/// Worker count of the splice pool (builds the pool on first call, with the
+/// same config every splice uses). For arming logs only.
+pub fn splice_pool_threads() -> usize {
+    hipfire_cpu::splice_pool::splice_pool(splice_pool_config()).current_num_threads()
 }
 
 /// Whether the expanded MoE timing trace is armed: the existing
@@ -363,9 +397,9 @@ static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize, usize, bool
 /// the format.
 ///
 /// Invariant, pinned by `cpu_quant_rotation_agrees_with_plan`: for every dtype
-/// here, [`CpuQuant::is_fwht_g256`] agrees with [`dtype_rotation_plan`], so the
-/// seam and the launcher cannot disagree about whether a `Raw` activation
-/// arrives rotated.
+/// here, [`CpuQuant::input_rotation`] agrees with [`dtype_rotation_plan`]
+/// (FWHT-256 <-> `FwhtG256`, FWHT-128 <-> `FwhtG128`), so the seam and the
+/// launcher cannot disagree about whether a `Raw` activation arrives rotated.
 
 /// Every `DType` [`cpu_quant_for`] maps to `Some`: the declaration for
 /// consumers and tests (both `cpu_quant_for` pins iterate this). The match in
@@ -386,6 +420,7 @@ pub const CPU_EXECUTED_DTYPES: &[DType] = &[
     DType::MQ2G256Lloyd,
     DType::MQ2G256LloydU,
     DType::MQ4G256Lloyd,
+    DType::MQ4G128V2,
     DType::MFP4G32E8,
     DType::HFQ6G256,
     DType::HFQ4G256,
@@ -400,6 +435,10 @@ pub const CPU_EXECUTED_DTYPES: &[DType] = &[
     DType::F16,
     DType::F32,
     DType::BF16,
+    DType::MQ3I4G128R256,
+    DType::MQ3I4G128R128,
+    DType::E8PI4G128R256,
+    DType::E8PI4G128R128,
 ];
 
 pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
@@ -419,6 +458,7 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::MQ2G256Lloyd => Some(CpuQuant::Mq2G256Lloyd),
         DType::MQ2G256LloydU => Some(CpuQuant::Mq2G256LloydU),
         DType::MQ4G256Lloyd => Some(CpuQuant::Mq4G256Lloyd),
+        DType::MQ4G128V2 => Some(CpuQuant::Mq4G128V2),
         DType::MFP4G32E8 => Some(CpuQuant::Mfp4G32E8),
         DType::HFQ6G256 => Some(CpuQuant::Hfq6G256),
         DType::HFQ4G256 => Some(CpuQuant::Hfq4G256),
@@ -433,7 +473,41 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::F16 => Some(CpuQuant::F16),
         DType::F32 => Some(CpuQuant::F32),
         DType::BF16 => Some(CpuQuant::Bf16),
+        // Planar expert-slab payloads (codes plane, then scales plane): routed
+        // experts only, never a row-addressed dense step ([`dense_cpu_quant_for`]).
+        DType::MQ3I4G128R256 => Some(CpuQuant::Mq3I4G128R256),
+        DType::MQ3I4G128R128 => Some(CpuQuant::Mq3I4G128R128),
+        DType::E8PI4G128R256 => Some(CpuQuant::E8pI4G128R256),
+        DType::E8PI4G128R128 => Some(CpuQuant::E8pI4G128R128),
         _ => None,
+    }
+}
+
+/// [`cpu_quant_for`] restricted to the row-addressed formats a dense host step
+/// can execute: the dense paths slice `w.buf` into `m` equal row strides, which
+/// a planar expert-slab payload (all code rows, then all scale rows) does not
+/// have, so its dtypes stay on the GPU there.
+pub fn dense_cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
+    cpu_quant_for(dtype).filter(|q| !q.is_planar())
+}
+
+/// The CPU row-dot kernel this host runs for `dtype`
+/// ([`hipfire_cpu::simd::row_dot_kernel`]: `avx2-fma-f16c`, `avx2-fma` or
+/// `scalar`); `None` for a dtype without a CPU decoder.
+pub fn cpu_kernel_for(dtype: DType) -> Option<&'static str> {
+    cpu_quant_for(dtype).map(hipfire_cpu::simd::row_dot_kernel)
+}
+
+/// Whether a `Raw` input of this dtype is rotated by the launcher — i.e. the
+/// CPU path must rotate it itself: `FwhtG256` (every FWHT-256 format) or, for
+/// the one CPU-executed FWHT-128 format (qt 53), `FwhtG128`.
+pub(crate) fn raw_input_is_rotated(dtype: DType) -> bool {
+    match dtype_rotation_plan(dtype) {
+        RotationPlan::FwhtG256 => true,
+        RotationPlan::FwhtG128 => {
+            cpu_quant_for(dtype).is_some_and(|q| q.input_rotation() == InputRotation::FwhtG128V2)
+        }
+        _ => false,
     }
 }
 
@@ -573,7 +647,10 @@ pub(crate) fn prepare_activation(
             let scale = download_f32(gpu, scale, w.k)?;
             divide_by_awq_scale(&mut host, &scale);
         }
-        rotate_x(&mut host);
+        match cpu_quant_for(w.dtype).map(CpuQuant::input_rotation) {
+            Some(InputRotation::FwhtG128V2) => rotate_x_128_v2(&mut host),
+            _ => rotate_x(&mut host),
+        }
     }
     Ok((host, t0.elapsed().as_nanos() as u64))
 }
@@ -693,7 +770,7 @@ pub fn run_host_mapped_gemv_residual(
     // unrotated activation (the SiLU output), so it rotates when the dtype says
     // the weights were encoded post-rotation — the same rule `run_step` derives
     // from a `Raw` input.
-    let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
+    let rotate_input = raw_input_is_rotated(w.dtype);
     let plan = CpuStep {
         w,
         x,
@@ -726,9 +803,10 @@ pub fn run_host_mapped_gemv_residual(
 /// / MQ4 mid / MQ3-Lloyd cold) resolve per expert, and an expert whose two
 /// projections differ is expressible too. The slices are the expert's *own*
 /// extents — no stride padding: `gate_up` is exactly
-/// `row_bytes(gate_up_quant, dim) * 2 * mi` bytes and `down` exactly
-/// `row_bytes(down_quant, mi) * dim`. The engine validates and refuses a short
-/// slice rather than reading past it.
+/// `tensor_bytes(gate_up_quant, 2 * mi, dim)` bytes and `down` exactly
+/// `tensor_bytes(down_quant, dim, mi)` (`hipfire_cpu::gemv::tensor_bytes`,
+/// which covers the planar expert-slab payloads too). The engine validates and
+/// refuses a short slice rather than reading past it.
 ///
 /// Owns nothing, so the splice can hold a whole window's resolved slots in a
 /// fixed-capacity stack array instead of a heap `Vec` (`Copy` is what makes
@@ -764,7 +842,7 @@ struct MoeScratch {
     /// `groups + 1` start offsets into [`Self::order`].
     group_start: Vec<u32>,
     /// The global expert id of each group.
-    group_id: Vec<u16>,
+    group_id: Vec<u32>,
     /// Group index of each slot.
     slot_group: Vec<u32>,
     /// Position of each slot within its group (its column in the group's
@@ -799,25 +877,53 @@ fn expert_id(raw: f32) -> usize {
     (raw.to_bits() as i32) as u16 as usize
 }
 
-/// `gate_up` extent of one expert: `row_bytes * 2 * mi`, checked.
+/// BF16 round-to-nearest-even of a finite `f32`, returned widened to `f32`;
+/// non-finite values pass through unchanged. Integer-bit arithmetic identical to
+/// the GPU `rt` helpers (`router_bf16_rt`, `rot128_bf16_rt`): add `0x7fff` plus
+/// the kept LSB, then truncate the low 16 bits. Signed zero and the sign of
+/// every finite value are preserved; a finite value that rounds past the BF16
+/// maximum carries into the exponent and becomes ±Inf, as on the GPU.
+#[inline]
+fn bf16_rt(x: f32) -> f32 {
+    if !x.is_finite() {
+        return x;
+    }
+    let bits = x.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    f32::from_bits(rounded & 0xffff_0000)
+}
+
+/// `gate_up` extent of one expert: `[2 * mi, dim]` in its format, checked.
 fn expert_gu_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
-    hipfire_cpu::gemv::row_bytes(q, dim)
-        .checked_mul(2 * mi)
+    let rows = mi
+        .checked_mul(2)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
+    tensor_extent(q, rows, dim)
         .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))
 }
 
-/// `down` extent of one expert: `row_bytes * dim`, checked.
+/// `down` extent of one expert: `[dim, mi]` in its format, checked.
 fn expert_down_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
-    hipfire_cpu::gemv::row_bytes(q, mi)
-        .checked_mul(dim)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))
+    tensor_extent(q, dim, mi).ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))
 }
 
-/// Cap on the slots (`rows × top_k`) [`moe_cpu_experts`] resolves into a stack
-/// array instead of a heap `Vec`. Decode (1 row) and the ≤4-row verify window
-/// keep `rows × top_k` far below this for every real `num_experts_per_tok`; a
-/// wider window still works through the `Vec` fallback.
-const MOE_STACK_SLOTS: usize = 256;
+/// `hipfire_cpu::gemv::tensor_bytes(q, m, k)` with the multiplication checked:
+/// one row's bytes (codes plus, for a planar format, its scales) times `m`.
+fn tensor_extent(q: CpuQuant, m: usize, k: usize) -> Option<usize> {
+    hipfire_cpu::gemv::tensor_bytes(q, 1, k).checked_mul(m)
+}
+
+/// Staging for [`moe_cpu_experts`]' borrowed-expert window: one preallocated
+/// stack of `64 * 10 = 640` slots (the full FN logical window at top_k 10),
+/// written exactly once per slot with no 640-zeroing and no per-window heap for
+/// 1..=640 slots. Resolver passes fill it in physical tiles of at most
+/// [`MOE_PHYS_TILE`] slots (4 rows × top_k 10), but the whole logical window's
+/// slots resolve in this single staging so the proven arithmetic sites run
+/// unchanged; the single window-wide `MoeScratch` reservation still covers the
+/// full logical window. Wider non-FN windows (>640) keep the heap fallback.
+const MOE_PHYS_SLOTS: usize = 64 * 10;
+/// Physical tile width (slots) one resolver pass fills: 4 rows × top_k 10.
+const MOE_PHYS_TILE: usize = 4 * 10;
 
 /// CPU FFN for a window of `rows` tokens' routed experts: recompute every
 /// selected expert (gate_up GEMV + SiLU + hidden-rotate + down GEMV) on the CPU
@@ -839,10 +945,25 @@ const MOE_STACK_SLOTS: usize = 256;
 /// front, may be asked for the same id more than once, and must be a pure
 /// function of the id.
 ///
+/// `bf16_round_trip` selects the GPU BF16 storage boundaries of the grouped
+/// QT44/QT53 decode route instead of plain f32 arithmetic. `false` is the
+/// original arithmetic, byte for byte. `true` applies
+/// `rt` = BF16 round-to-nearest-even (non-finite passes through) at exactly
+/// these points: each gathered gate and up value before SiLU; the activated
+/// hidden `rt(silu(rt g) * rt u)` before the FWHT (the rotated down input stays
+/// f32); and the combine, which starts every row at `rt(residual)` and then adds
+/// that row's selected experts in ASCENDING EXPERT ID (equal ids: lower rank
+/// first — not routing-rank order), each step
+/// `acc = rt(acc + rt(rt(down) * rt(weight)))`. The gate/up and down GEMVs stay
+/// f32 with the CPU kernels' own summation order, which intentionally differs
+/// from the GPU's reduction tree.
+///
 /// Fail-closed by construction: an unknown expert id, unavailable host bytes, an
 /// undecodable dtype, an AWQ sidecar (a bare `gemv` would ignore the per-expert
 /// scale), graph capture / replay recording (a CPU step is a host sync point), a
-/// `dim`/`mi` that is not a multiple of 256, or short scratch are all errors,
+/// `dim` that is not a multiple of 256, an `mi` that is not a multiple of 128 (or
+/// of the selected down format's group width: 256 for FWHT-256 formats, 128 for
+/// the QT53 `Mq4G128V2` down), or short scratch are all errors,
 /// never silent zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_cpu_experts<'a>(
@@ -856,6 +977,7 @@ pub fn moe_cpu_experts<'a>(
     topk_weights: &GpuTensor,
     residual: &GpuTensor,
     awq: bool,
+    bf16_round_trip: bool,
     resolve: impl Fn(usize) -> Result<CpuMoeExpert<'a>, DispatchError>,
 ) -> Result<(), DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
@@ -873,9 +995,9 @@ pub fn moe_cpu_experts<'a>(
             "moe cpu expert splice: rows and top_k must be non-zero",
         ));
     }
-    if dim % 256 != 0 || mi % 256 != 0 {
+    if dim % 256 != 0 || mi % 128 != 0 {
         return Err(cpu_err(&format!(
-            "moe cpu expert splice: dim={dim} mi={mi} must be multiples of 256"
+            "moe cpu expert splice: dim={dim} must be a multiple of 256 and mi={mi} of 128"
         )));
     }
     let slots = rows
@@ -897,7 +1019,8 @@ pub fn moe_cpu_experts<'a>(
     // The splice's whole wall time, started after validation and stopped just
     // before the trace print (which is not part of the call's cost).
     let t_total = Instant::now();
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
     let stage_bytes = n_x
         .checked_add(slots)
         .and_then(|n| n.checked_mul(8))
@@ -941,7 +1064,8 @@ pub fn moe_cpu_experts<'a>(
             download_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.d2h_enqueue_ns = t_enqueue.elapsed().as_nanos() as u64;
             let t_complete = Instant::now();
-            transfer.complete(&gpu.hip)
+            transfer
+                .complete(&gpu.hip)
                 .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
             timing.d2h_complete_ns = t_complete.elapsed().as_nanos() as u64;
             let values = transfer_values(transfer, stage_bytes / 4);
@@ -950,21 +1074,38 @@ pub fn moe_cpu_experts<'a>(
             let (tw, acc) = rest.split_at_mut(slots);
             // Resolve every selected slot up front: a bad id or a short span is
             // an error before arithmetic. Warm decode/verify resolves into a
-            // fixed stack array; wider windows retain the heap fallback.
+            // fixed stack array; the FN 5..64-row lab window resolves into one
+            // preallocated stack staging of 640 borrowed slots, written exactly
+            // once per slot (no 640-zeroing for row 1, no per-window heap), in
+            // physical <=40-slot tiles that reuse the proven numerical sites.
+            // Wider non-FN windows retain the heap fallback.
             let t_setup = Instant::now();
-            let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
-                gate_up_quant: CpuQuant::F32,
-                gate_up: &[],
-                down_quant: CpuQuant::F32,
-                down: &[],
-            };
-            let mut stack = [dummy; MOE_STACK_SLOTS];
+            let mut stack: [std::mem::MaybeUninit<CpuMoeExpert<'a>>; MOE_PHYS_SLOTS] =
+                [const { std::mem::MaybeUninit::uninit() }; MOE_PHYS_SLOTS];
             let heap: Vec<CpuMoeExpert<'a>>;
-            let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_STACK_SLOTS {
-                for s in 0..slots {
-                    stack[s] = resolve(expert_id(ti[s]))?;
+            let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_PHYS_TILE {
+                for (dst, s) in stack[..slots].iter_mut().zip(0..slots) {
+                    dst.write(resolve(expert_id(ti[s]))?);
                 }
-                &stack[..slots]
+                // SAFETY: every element 0..slots was just written exactly once.
+                unsafe {
+                    std::slice::from_raw_parts(stack.as_ptr() as *const CpuMoeExpert<'a>, slots)
+                }
+            } else if slots <= MOE_PHYS_SLOTS {
+                // Tile the resolve over physical <=40-slot passes; the staging
+                // lifetime is the whole call, not the tile loop.
+                let mut done = 0usize;
+                while done < slots {
+                    let n = (slots - done).min(MOE_PHYS_TILE);
+                    for (dst, s) in stack[done..done + n].iter_mut().zip(done..done + n) {
+                        dst.write(resolve(expert_id(ti[s]))?);
+                    }
+                    done += n;
+                }
+                // SAFETY: every element 0..slots was written exactly once above.
+                unsafe {
+                    std::slice::from_raw_parts(stack.as_ptr() as *const CpuMoeExpert<'a>, slots)
+                }
             } else {
                 heap = (0..slots)
                     .map(|s| resolve(expert_id(ti[s])))
@@ -979,9 +1120,25 @@ pub fn moe_cpu_experts<'a>(
                 timing.gu_mix[gi] = timing.gu_mix[gi].saturating_add(1);
                 timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
             }
-            moe_cpu_experts_host(
-                dim, mi, rows, top_k, experts, x, ti, tw, acc, &mut scratch, &mut timing,
-            )?;
+            // The whole CPU side of the splice (gate_up, the SwiGLU/rotate
+            // middle, down, combine) runs on the pinned physical-core pool.
+            let scratch_ref: &mut MoeScratch = &mut scratch;
+            in_splice_pool(|| {
+                moe_cpu_experts_host(
+                    dim,
+                    mi,
+                    rows,
+                    top_k,
+                    experts,
+                    x,
+                    ti,
+                    tw,
+                    acc,
+                    scratch_ref,
+                    &mut timing,
+                    bf16_round_trip,
+                )
+            })?;
             let t_h2d = Instant::now();
             upload_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;
@@ -1033,6 +1190,7 @@ fn moe_cpu_experts_host(
     residual_acc: &mut [f32],
     scratch: &mut MoeScratch,
     timing: &mut MoeStepTiming,
+    bf16_round_trip: bool,
 ) -> Result<(), DispatchError> {
     let slots = rows * top_k;
     if experts.len() != slots {
@@ -1044,7 +1202,194 @@ fn moe_cpu_experts_host(
     if x.len() < n_x || residual_acc.len() < n_x || ti.len() < slots || tw.len() < slots {
         return Err(cpu_err("moe cpu expert splice: scratch too small"));
     }
+    moe_slots_compute(
+        dim,
+        mi,
+        top_k,
+        slots,
+        None,
+        experts,
+        x,
+        |s| expert_id(ti[s]) as u32,
+        scratch,
+        timing,
+        bf16_round_trip,
+        None,
+    )?;
+    // The down outputs are row-major per group, so a token's vector is strided:
+    // `slot_group`/`slot_si` place each slot in its group's run, and the residual
+    // accumulates in the original row-major, rank-minor order.
+    let t_combine = Instant::now();
+    {
+        let dn = &scratch.dn[..dim * slots];
+        if bf16_round_trip {
+            // GPU `moe_down_combine_top10_batched` order: each row starts from
+            // rt(residual) and adds its selected ranks in ascending expert id
+            // (ties: lower rank, NOT routing-rank order), each step
+            // acc = rt(acc + rt(rt(down) * rt(weight))). The next rank is the
+            // smallest (expert id, rank) key strictly after the previous one — a
+            // tight O(top_k²) scan that needs no extra buffer.
+            for t in 0..rows {
+                let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
+                for a in accrow.iter_mut() {
+                    *a = bf16_rt(*a);
+                }
+                let mut prev: Option<(usize, usize)> = None;
+                for _ in 0..top_k {
+                    let mut best: Option<(usize, usize)> = None;
+                    for j in 0..top_k {
+                        let key = (expert_id(ti[t * top_k + j]), j);
+                        if prev.map_or(false, |p| key <= p) {
+                            continue;
+                        }
+                        if best.map_or(true, |b| key < b) {
+                            best = Some(key);
+                        }
+                    }
+                    let Some((_, j)) = best else { break };
+                    prev = best;
+                    let s = t * top_k + j;
+                    let gi = scratch.slot_group[s] as usize;
+                    let si = scratch.slot_si[s] as usize;
+                    let n = group_n(&scratch.group_start, gi);
+                    let base = scratch.group_off[gi];
+                    let w = bf16_rt(tw[s]);
+                    for (r, a) in accrow.iter_mut().enumerate() {
+                        let out = bf16_rt(dn[base + r * n + si]);
+                        *a = bf16_rt(*a + bf16_rt(out * w));
+                    }
+                }
+            }
+        } else {
+            for s in 0..slots {
+                let t = s / top_k;
+                let gi = scratch.slot_group[s] as usize;
+                let si = scratch.slot_si[s] as usize;
+                let n = group_n(&scratch.group_start, gi);
+                let base = scratch.group_off[gi];
+                let w = tw[s];
+                let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
+                for (r, a) in accrow.iter_mut().enumerate() {
+                    *a += w * dn[base + r * n + si];
+                }
+            }
+        }
+    }
+    timing.combine_ns = t_combine.elapsed().as_nanos() as u64;
+    Ok(())
+}
 
+/// One expert's span contract: both projections' group widths divide the
+/// shapes and both retained spans cover their extents.
+fn validate_expert_spans(dim: usize, mi: usize, e: &CpuMoeExpert<'_>) -> Result<(), DispatchError> {
+    if dim % e.gate_up_quant.k_multiple() != 0 || mi % e.down_quant.k_multiple() != 0 {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: dim={dim} / mi={mi} not a multiple of the expert's gate_up / down group width"
+        )));
+    }
+    let gu_need = expert_gu_bytes(e.gate_up_quant, dim, mi)?;
+    let dn_need = expert_down_bytes(e.down_quant, dim, mi)?;
+    if e.gate_up.len() < gu_need {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: expert gate_up span {} < {gu_need} bytes",
+            e.gate_up.len()
+        )));
+    }
+    if e.down.len() < dn_need {
+        return Err(cpu_err(&format!(
+            "moe cpu expert splice: expert down span {} < {dn_need} bytes",
+            e.down.len()
+        )));
+    }
+    Ok(())
+}
+/// Fixed-size per-call CPU-arm trace record for the opt-in
+/// `HIPFIRE_CPU_SPLIT_TRACE` diagnostic. Stack-owned; crosses the Rayon pool
+/// boundary as an owned return, never thread-local state. Inclusive totals
+/// (`cpu_total_ns`, `pool_install_ns`, `pool_body_ns`, `middle_ns`, `gu_ns`,
+/// `dn_ns`) overlap their disjoint children by design: reconciliation is
+/// `child_sum <= inclusive`, except `gu_ns == gu_prep_ns + gu_exec_ns` and
+/// `dn_ns == dn_prep_ns + dn_exec_ns` (exact: the traced GEMV measures its
+/// whole call as one outer span with `prep = total - exec`).
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct CpuArmTrace {
+    /// Same `Instant` origin as the split join's existing trace-entry clock.
+    /// Boundary fields are nanosecond offsets, not durations or GPU times.
+    trace_epoch: Option<Instant>,
+    /// Absent when no host slot reaches the corresponding phase.
+    pub middle_start_ns: Option<u64>,
+    pub middle_end_ns: Option<u64>,
+    pub scatter_start_ns: Option<u64>,
+    pub scatter_end_ns: Option<u64>,
+    /// Public-entry inclusive total (validation + pool install + return).
+    pub cpu_total_ns: u64,
+    /// Entry validation alone.
+    pub validate_ns: u64,
+    /// Pool install total (dispatch + body + return).
+    pub pool_install_ns: u64,
+    /// In-pool closure body total.
+    pub pool_body_ns: u64,
+    /// Grouping/scratch prep inside the grouped compute.
+    pub group_ns: u64,
+    pub gu_ns: u64,
+    pub gu_prep_ns: u64,
+    pub gu_exec_ns: u64,
+    pub middle_ns: u64,
+    pub gather_ns: u64,
+    pub silu_ns: u64,
+    pub fwht_ns: u64,
+    pub dn_ns: u64,
+    pub dn_prep_ns: u64,
+    pub dn_exec_ns: u64,
+    /// Output scatter of down values into the expanded layout.
+    pub scatter_ns: u64,
+    /// Distinct experts from the existing grouping (group count).
+    pub unique_experts: u32,
+}
+
+impl CpuArmTrace {
+    fn offset_ns(&self, stamp: Instant) -> Option<u64> {
+        self.trace_epoch.map(|epoch| {
+            stamp
+                .saturating_duration_since(epoch)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        })
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// The gate_up GEMV → SwiGLU → hidden rotation → down GEMV core shared by the
+/// full-residual splice ([`moe_cpu_experts_host`]) and the sparse per-slot
+/// entry ([`moe_cpu_host_slot_outputs`]).
+///
+/// `slots` entries are computed; entry `a` uses `experts[a]`, group key
+/// `group_key(a)` (entries with equal keys MUST share one expert's bytes) and
+/// the activation row `flat(a) / top_k`, where `flat(a)` is `flat_of[a]` or
+/// `a` itself when `flat_of` is `None`. On return `scratch` holds the down
+/// outputs (`dn`) with `slot_group` / `slot_si` / `group_start` / `group_off`
+/// locating entry `a`'s vector: `dn[group_off[g] + r * n(g) + slot_si[a]]`.
+/// Every span is validated before the first GEMV; only `scratch` is written.
+#[allow(clippy::too_many_arguments)]
+fn moe_slots_compute(
+    dim: usize,
+    mi: usize,
+    top_k: usize,
+    slots: usize,
+    flat_of: Option<&[u32]>,
+    experts: &[CpuMoeExpert<'_>],
+    x: &[f32],
+    group_key: impl Fn(usize) -> u32,
+    scratch: &mut MoeScratch,
+    timing: &mut MoeStepTiming,
+    bf16_round_trip: bool,
+    mut trace: Option<&mut CpuArmTrace>,
+) -> Result<(), DispatchError> {
+    debug_assert_eq!(experts.len(), slots);
+    let t_group = trace.is_some().then(Instant::now);
     // Group the selected slots by expert id, in first-seen order, validating each
     // expert's spans as we go. A counting sort into the reusable index vectors
     // keeps each group's members contiguous in `order` without a per-group `Vec`:
@@ -1054,22 +1399,8 @@ fn moe_cpu_experts_host(
     scratch.group_id.clear();
     scratch.slot_group.resize(slots, 0);
     for s in 0..slots {
-        let e = &experts[s];
-        let gu_need = expert_gu_bytes(e.gate_up_quant, dim, mi)?;
-        let dn_need = expert_down_bytes(e.down_quant, dim, mi)?;
-        if e.gate_up.len() < gu_need {
-            return Err(cpu_err(&format!(
-                "moe cpu expert splice: expert gate_up span {} < {gu_need} bytes",
-                e.gate_up.len()
-            )));
-        }
-        if e.down.len() < dn_need {
-            return Err(cpu_err(&format!(
-                "moe cpu expert splice: expert down span {} < {dn_need} bytes",
-                e.down.len()
-            )));
-        }
-        let eid = expert_id(ti[s]) as u16;
+        validate_expert_spans(dim, mi, &experts[s])?;
+        let eid = group_key(s);
         let gi = match scratch.group_id.iter().position(|&g| g == eid) {
             Some(gi) => gi,
             None => {
@@ -1105,6 +1436,9 @@ fn moe_cpu_experts_host(
         scratch.slot_si[s] = at as u32 - scratch.group_start[gi];
         scratch.group_off[gi] += 1;
     }
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.unique_experts = scratch.group_id.len() as u32;
+    }
 
     // gate_up: one shared-weight projection per group, every group in one rayon
     // region. Output is row-major per group (`out[r * n + t]`), so a weight row's
@@ -1115,6 +1449,9 @@ fn moe_cpu_experts_host(
     scratch.dn.resize(dim * slots, 0.0);
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.group_ns = t_group.map_or(0, elapsed_ns);
+    }
     let gu_split = {
         let src = MoeJobSource {
             experts,
@@ -1123,6 +1460,7 @@ fn moe_cpu_experts_host(
             act: x,
             row_len: dim,
             top_k,
+            flat_of,
             proj: MoeProj::GateUp,
         };
         hipfire_cpu::gemv::gemv_shared_sourced_traced(2 * mi, dim, &mut scratch.gu, &src, None)
@@ -1130,10 +1468,18 @@ fn moe_cpu_experts_host(
     timing.gu_ns = gu_split.total_ns;
     timing.gu_prep_ns = gu_split.prep_ns;
     timing.gu_exec_ns = gu_split.exec_ns;
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.gu_ns = gu_split.total_ns;
+        t.gu_prep_ns = gu_split.prep_ns;
+        t.gu_exec_ns = gu_split.exec_ns;
+    }
     // SwiGLU + hidden rotation, per token. The gate/up pair sits at strided
     // indices in the row-major output, so gather it; the rotation is the *down*
     // projection's contract (its weights are stored post-rotation).
     let t_middle = Instant::now();
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_start_ns = t.offset_ns(t_middle);
+    }
     let mut gather_ns: u64 = 0;
     let mut silu_ns: u64 = 0;
     let mut fwht_ns: u64 = 0;
@@ -1145,30 +1491,51 @@ fn moe_cpu_experts_host(
             let n = group_n(&scratch.group_start, gi);
             let base = scratch.group_off[gi];
             let first = scratch.order[scratch.group_start[gi] as usize] as usize;
-            let rotate = experts[first].down_quant.is_fwht_g256();
+            let down_rotation = experts[first].down_quant.input_rotation();
+            let rotate = down_rotation != InputRotation::None;
             for si in 0..n {
                 let s = scratch.order[scratch.group_start[gi] as usize + si] as usize;
                 let t_gather = Instant::now();
                 for (r, g) in gather.iter_mut().enumerate() {
-                    *g = gu[base + r * n + si];
+                    let v = gu[base + r * n + si];
+                    *g = if bf16_round_trip { bf16_rt(v) } else { v };
                 }
                 gather_ns += t_gather.elapsed().as_nanos() as u64;
                 let hid = &mut hidden[s * mi..(s + 1) * mi];
                 let t_silu = Instant::now();
                 silu_mul(gather, hid);
+                if bf16_round_trip {
+                    // The activated hidden is stored BF16 before the FWHT; the
+                    // rotated output below stays f32.
+                    for h in hid.iter_mut() {
+                        *h = bf16_rt(*h);
+                    }
+                }
                 silu_ns += t_silu.elapsed().as_nanos() as u64;
                 if rotate {
                     let t_fwht = Instant::now();
-                    rotate_x(hid);
+                    match down_rotation {
+                        InputRotation::FwhtG128V2 => rotate_x_128_v2(hid),
+                        _ => rotate_x(hid),
+                    }
                     fwht_ns += t_fwht.elapsed().as_nanos() as u64;
                 }
             }
         }
     }
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_end_ns = t.offset_ns(Instant::now());
+    }
     timing.middle_ns = t_middle.elapsed().as_nanos() as u64;
     timing.middle_gather_ns = gather_ns;
     timing.middle_silu_ns = silu_ns;
     timing.middle_fwht_ns = fwht_ns;
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_ns = timing.middle_ns;
+        t.gather_ns = gather_ns;
+        t.silu_ns = silu_ns;
+        t.fwht_ns = fwht_ns;
+    }
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, dim);
     let dn_split = {
@@ -1179,6 +1546,7 @@ fn moe_cpu_experts_host(
             act: &scratch.hidden[..mi * slots],
             row_len: mi,
             top_k,
+            flat_of,
             proj: MoeProj::Down,
         };
         hipfire_cpu::gemv::gemv_shared_sourced_traced(dim, mi, &mut scratch.dn, &src, None)
@@ -1186,27 +1554,529 @@ fn moe_cpu_experts_host(
     timing.dn_ns = dn_split.total_ns;
     timing.dn_prep_ns = dn_split.prep_ns;
     timing.dn_exec_ns = dn_split.exec_ns;
-    // The down outputs are row-major per group, so a token's vector is strided:
-    // `slot_group`/`slot_si` place each slot in its group's run, and the residual
-    // accumulates in the original row-major, rank-minor order.
-    let t_combine = Instant::now();
-    {
-        let dn = &scratch.dn[..dim * slots];
-        for s in 0..slots {
-            let t = s / top_k;
-            let gi = scratch.slot_group[s] as usize;
-            let si = scratch.slot_si[s] as usize;
-            let n = group_n(&scratch.group_start, gi);
-            let base = scratch.group_off[gi];
-            let w = tw[s];
-            let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
-            for (r, a) in accrow.iter_mut().enumerate() {
-                *a += w * dn[base + r * n + si];
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.dn_ns = dn_split.total_ns;
+        t.dn_prep_ns = dn_split.prep_ns;
+        t.dn_exec_ns = dn_split.exec_ns;
+    }
+    Ok(())
+}
+
+/// Validated `(rows × top_k, rows × dim, rows × top_k × dim)` of a host-slot call.
+fn host_slot_extents(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+) -> Result<(usize, usize, usize), DispatchError> {
+    if rows == 0 || top_k == 0 {
+        return Err(cpu_err(
+            "moe cpu host slots: rows and top_k must be non-zero",
+        ));
+    }
+    if dim % 256 != 0 || mi % 128 != 0 {
+        return Err(cpu_err(&format!(
+            "moe cpu host slots: dim={dim} must be a multiple of 256 and mi={mi} of 128"
+        )));
+    }
+    let slots = rows
+        .checked_mul(top_k)
+        .ok_or_else(|| cpu_err("moe cpu host slots: rows × top_k overflows"))?;
+    let n_x = rows
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu host slots: rows × dim overflows"))?;
+    let n_out = slots
+        .checked_mul(dim)
+        .ok_or_else(|| cpu_err("moe cpu host slots: rows × top_k × dim overflows"))?;
+    Ok((slots, n_x, n_out))
+}
+
+/// `true` when `id` names a real expert: the router's `-1` sentinel and any
+/// other out-of-range id are unrouted.
+#[inline]
+fn route_id_valid(id: i32, n_experts: usize) -> bool {
+    id >= 0 && (id as usize) < n_experts
+}
+
+/// Slot-ownership bitmask words kept on the stack (1024 slots) before a heap
+/// fallback.
+const HOST_SLOT_MASK_STACK_WORDS: usize = 16;
+
+/// Validate a sparse host-slot plan against the original route, with no
+/// arithmetic and no allocation for up to 1024 slots. This is the exact
+/// precondition [`moe_cpu_host_slot_outputs`] enforces first, so a caller can
+/// run it at prepare time (before any GPU tail is enqueued) and know the later
+/// arithmetic call cannot fail on the plan.
+///
+/// * `ids`: the ORIGINAL router ids, `[rows * top_k]` i32 (at least that many).
+///   An id outside `0..n_experts` (including `-1`) is an invalid slot.
+/// * `gpu_ids`: the masked GPU route, when the caller has it host-side. `Some`
+///   verifies the ownership partition: a host slot is exactly `-1` there, a
+///   valid non-host slot is unchanged (`== ids[s]`), an invalid slot is owned
+///   by neither arm (host-unlisted and invalid in `gpu_ids`).
+/// * `host_slots`: flat slots `row * top_k + rank`, any order, no duplicates,
+///   each with a valid id.
+/// * `experts[i]`: the retained spans of `host_slots[i]`. Slots naming the same
+///   expert id MUST carry the identical spans (same pointers, lengths and
+///   quants), so grouping by id can never mix weights.
+/// * Every span's group width and extent is checked; `awq` is refused.
+/// * `x_len` / `out_len`: the element counts of the rotated activation and the
+///   output extent the later arithmetic call will receive; they must cover
+///   `rows * dim` and `rows * top_k * dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_moe_cpu_host_slot_outputs(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+    n_experts: usize,
+    ids: &[i32],
+    gpu_ids: Option<&[i32]>,
+    host_slots: &[u32],
+    experts: &[CpuMoeExpert<'_>],
+    x_len: usize,
+    awq: bool,
+    out_len: usize,
+) -> Result<(), DispatchError> {
+    if awq {
+        return Err(cpu_err(
+            "moe cpu host slots refuse AWQ weights: a bare gemv would ignore the per-expert scale",
+        ));
+    }
+    let (slots, n_x, n_out) = host_slot_extents(dim, mi, rows, top_k)?;
+    if x_len < n_x || out_len < n_out {
+        return Err(cpu_err(&format!(
+            "moe cpu host slots: activation needs {n_x} and output {n_out} elements"
+        )));
+    }
+    if ids.len() < slots || gpu_ids.is_some_and(|g| g.len() < slots) {
+        return Err(cpu_err(&format!(
+            "moe cpu host slots: route ids need {slots} elements"
+        )));
+    }
+    if experts.len() != host_slots.len() {
+        return Err(cpu_err("moe cpu host slots: span count != host slot count"));
+    }
+    let words = slots.div_ceil(64);
+    let mut stack = [0u64; HOST_SLOT_MASK_STACK_WORDS];
+    let mut heap: Vec<u64>;
+    let owned: &mut [u64] = if words <= HOST_SLOT_MASK_STACK_WORDS {
+        &mut stack[..words]
+    } else {
+        heap = vec![0u64; words];
+        &mut heap
+    };
+    for (i, (&slot, e)) in host_slots.iter().zip(experts).enumerate() {
+        let s = slot as usize;
+        if s >= slots {
+            return Err(cpu_err(&format!(
+                "moe cpu host slots: host slot {s} out of range (rows × top_k = {slots})"
+            )));
+        }
+        if owned[s / 64] >> (s % 64) & 1 != 0 {
+            return Err(cpu_err(&format!(
+                "moe cpu host slots: host slot {s} listed twice"
+            )));
+        }
+        owned[s / 64] |= 1 << (s % 64);
+        let id = ids[s];
+        if !route_id_valid(id, n_experts) {
+            return Err(cpu_err(&format!(
+                "moe cpu host slots: host slot {s} has invalid expert id {id} (n_experts={n_experts})"
+            )));
+        }
+        validate_expert_spans(dim, mi, e)?;
+        for (&other, o) in host_slots[..i].iter().zip(experts) {
+            if ids[other as usize] == id
+                && (o.gate_up_quant != e.gate_up_quant
+                    || o.down_quant != e.down_quant
+                    || o.gate_up.as_ptr() != e.gate_up.as_ptr()
+                    || o.gate_up.len() != e.gate_up.len()
+                    || o.down.as_ptr() != e.down.as_ptr()
+                    || o.down.len() != e.down.len())
+            {
+                return Err(cpu_err(&format!(
+                    "moe cpu host slots: expert id {id} resolved to different spans (host slots {other} and {s})"
+                )));
             }
         }
     }
-    timing.combine_ns = t_combine.elapsed().as_nanos() as u64;
+    if let Some(g) = gpu_ids {
+        for s in 0..slots {
+            let host = owned[s / 64] >> (s % 64) & 1 != 0;
+            let valid = route_id_valid(ids[s], n_experts);
+            let ok = if host {
+                g[s] == -1
+            } else if valid {
+                g[s] == ids[s]
+            } else {
+                !route_id_valid(g[s], n_experts)
+            };
+            if !ok {
+                return Err(cpu_err(&format!(
+                    "moe cpu host slots: slot {s} ownership mismatch (original id {}, gpu id {}, host={host})",
+                    ids[s], g[s]
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+fn reserve_to<T>(v: &mut Vec<T>, n: usize) {
+    if v.capacity() < n {
+        v.reserve(n - v.len());
+    }
+}
+
+/// Pre-grow the calling thread's host-slot scratch for up to `max_slots`
+/// computed slots so a later [`moe_cpu_host_slot_outputs`] on the SAME thread
+/// grows nothing. (The GEMV's own per-thread activation-sum cache lives in
+/// `hipfire_cpu` and is not reserved here.) The D2 executor prewarms this once
+/// per layer at `prepare` time for its full allocated capacity (64 rows × 10 =
+/// 640 slots), so no logical 1..64 window regrows it on the hot path.
+pub fn reserve_moe_cpu_host_slot_scratch(
+    dim: usize,
+    mi: usize,
+    max_slots: usize,
+) -> Result<(), DispatchError> {
+    let ovf = || cpu_err("moe cpu host slots: scratch extent overflows");
+    let gu = max_slots.checked_mul(2 * mi).ok_or_else(ovf)?;
+    let hid = max_slots.checked_mul(mi).ok_or_else(ovf)?;
+    let dn = max_slots.checked_mul(dim).ok_or_else(ovf)?;
+    MOE_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        reserve_to(&mut s.gu, gu);
+        reserve_to(&mut s.hidden, hid);
+        reserve_to(&mut s.dn, dn);
+        reserve_to(&mut s.gather, 2 * mi);
+        reserve_to(&mut s.order, max_slots);
+        reserve_to(&mut s.group_start, max_slots + 1);
+        reserve_to(&mut s.group_id, max_slots);
+        reserve_to(&mut s.slot_group, max_slots);
+        reserve_to(&mut s.slot_si, max_slots);
+        reserve_to(&mut s.group_off, max_slots + 1);
+    });
+    Ok(())
+}
+
+/// Real host-slot scratch capacity (logical ROWS) of THIS thread for geometry
+/// `(dim, mi, top_k)`: `min_slots / top_k` where `min_slots` is the minimum
+/// over every reserved `MOE_SCRATCH` vector of `capacity /
+/// per-slot-component-stride` — i.e. the largest row count the current
+/// reservation can serve without any `Vec` growth on the hot path. Units are
+/// rows, not slots: a 640-slot reserve at top_k 10 reports 64, and the legacy
+/// 40-slot reserve reports 4. `moe_cpu_host_slot_outputs` needs per computed
+/// slot: `2*mi` gu + `mi` hidden + `dim` dn elements, one
+/// `order`/`group_id`/`slot_group`/`slot_si` entry each, one
+/// `group_start`/`group_off` entry each (the `+1` trailing offset is covered
+/// by the same reservation), and a `2*mi`-element `gather` shared across slots.
+/// Pure reader: no allocation, no growth, no mutation; `0` when `dim/mi/top_k`
+/// is zero, when any stride divides nothing, when `top_k` exceeds the slot
+/// minimum, or when the thread holds no reservation yet; `usize::MAX` is never
+/// returned (every quotient is bounded by a real `Vec::capacity`). Callers
+/// MUST NOT clamp a slots-scale value into this rows-scale result.
+pub fn moe_cpu_host_slot_scratch_capacity_rows(dim: usize, mi: usize, top_k: usize) -> usize {
+    if dim == 0 || mi == 0 || top_k == 0 {
+        return 0;
+    }
+    let stride_2mi = match (2usize).checked_mul(mi) {
+        Some(v) if v > 0 => v,
+        _ => return 0,
+    };
+    MOE_SCRATCH.with(|cell| {
+        let s = cell.borrow();
+        let mut slots = usize::MAX;
+        // f32 arithmetic buffers: capacity elements / per-slot elements.
+        slots = slots.min(s.gu.capacity() / stride_2mi);
+        slots = slots.min(s.hidden.capacity() / mi);
+        slots = slots.min(s.dn.capacity() / dim);
+        // Shared gather: must hold one full 2*mi row to run at all.
+        if s.gather.capacity() < stride_2mi {
+            return 0;
+        }
+        // Per-slot index metadata: one entry per computed slot.
+        slots = slots.min(s.order.capacity());
+        slots = slots.min(s.group_id.capacity());
+        slots = slots.min(s.slot_group.capacity());
+        slots = slots.min(s.slot_si.capacity());
+        // group_start/group_off reserve max_slots+1 entries (groups+1 offsets);
+        // the trailing offset consumes one, the rest cover one group each, and
+        // one group always covers >=1 slot, so capacity-1 bounds the slots.
+        slots = slots.min(s.group_start.capacity().saturating_sub(1));
+        slots = slots.min(s.group_off.capacity().saturating_sub(1));
+        if slots == usize::MAX {
+            0
+        } else {
+            slots / top_k
+        }
+    })
+}
+
+/// Host-only per-slot expert outputs for a split (CPU cold / GPU hot) MoE
+/// layer. Validates the whole plan first ([`validate_moe_cpu_host_slot_outputs`], same
+/// arguments), then computes, for each listed host slot, the expert's
+/// UNWEIGHTED down-projection output on the pinned splice pool:
+/// gate_up GEMV → `rt(g)`, `rt(u)` → SiLU·mul → `rt(hidden)` → down-format
+/// FWHT → down GEMV, i.e. D1's `bf16_round_trip=true` arithmetic up to the
+/// down output.
+///
+/// `x_rot` is the rotated F32 activation `[rows, dim]` (rows without host
+/// slots are never read). `out` is the GPU expanded layout `[rows, top_k, dim]`:
+/// host slot `s` receives RAW F32 down values at `out[s * dim .. (s + 1) * dim]`
+/// (no BF16 rounding of the output — the canonical combine applies it), exactly
+/// the representation `gemv_*_moe_down_*_indexed_batched_expanded` stores.
+/// Every other `out` element is neither read nor written, so the caller may
+/// leave stale data (even NaN) there. No weights, residual or GPU memory is
+/// touched; no router weight is applied.
+///
+/// Each element is the same per-element dot the single-row GEMV computes, so
+/// the bytes of a slot depend only on its expert and its activation row — not
+/// on `host_slots` order, which slots share an expert, or the worker count
+/// (under one CPU ISA policy).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_cpu_host_slot_outputs(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+    n_experts: usize,
+    ids: &[i32],
+    gpu_ids: Option<&[i32]>,
+    host_slots: &[u32],
+    experts: &[CpuMoeExpert<'_>],
+    x_rot: &[f32],
+    awq: bool,
+    out: &mut [f32],
+) -> Result<(), DispatchError> {
+    validate_moe_cpu_host_slot_outputs(
+        dim,
+        mi,
+        rows,
+        top_k,
+        n_experts,
+        ids,
+        gpu_ids,
+        host_slots,
+        experts,
+        x_rot.len(),
+        awq,
+        out.len(),
+    )?;
+    if host_slots.is_empty() {
+        return Ok(());
+    }
+    MOE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let scratch: &mut MoeScratch = &mut guard;
+        in_splice_pool(|| {
+            host_slot_outputs_core(
+                dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out, None,
+            )
+        })
+    })
+}
+/// Crate-private timed entry sharing the checked implementation of
+/// [`moe_cpu_host_slot_outputs`]: same validation, same core, same pool.
+/// Normal callers keep the public API; the CPU-split trace calls this so the
+/// fixed-size [`CpuArmTrace`] crosses the Rayon install as an owned return,
+/// never thread-local state. No allocation, no output; timing only.
+/// `trace_epoch` is the caller's existing join-entry `Instant`; all optional
+/// phase boundaries use nanosecond offsets from that same origin. An empty
+/// host set leaves boundaries absent rather than manufacturing zero stamps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_cpu_host_slot_outputs_traced(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+    n_experts: usize,
+    ids: &[i32],
+    gpu_ids: Option<&[i32]>,
+    host_slots: &[u32],
+    experts: &[CpuMoeExpert<'_>],
+    x_rot: &[f32],
+    awq: bool,
+    out: &mut [f32],
+    trace_epoch: Instant,
+) -> Result<CpuArmTrace, DispatchError> {
+    let mut trace = CpuArmTrace {
+        trace_epoch: Some(trace_epoch),
+        ..CpuArmTrace::default()
+    };
+    let t_total = Instant::now();
+    let t_validate = Instant::now();
+    validate_moe_cpu_host_slot_outputs(
+        dim,
+        mi,
+        rows,
+        top_k,
+        n_experts,
+        ids,
+        gpu_ids,
+        host_slots,
+        experts,
+        x_rot.len(),
+        awq,
+        out.len(),
+    )?;
+    trace.validate_ns = elapsed_ns(t_validate);
+    if host_slots.is_empty() {
+        trace.cpu_total_ns = elapsed_ns(t_total);
+        return Ok(trace);
+    }
+    let t_install = Instant::now();
+    let result = MOE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let scratch: &mut MoeScratch = &mut guard;
+        // Owned fixed-size record across the Rayon install: the pool body
+        // timer runs INSIDE the install closure, so dispatch/return overhead
+        // stays in `pool_install_ns`, not `pool_body_ns`.
+        in_splice_pool(|| {
+            let t_body = Instant::now();
+            let result = host_slot_outputs_core(
+                dim,
+                mi,
+                top_k,
+                ids,
+                host_slots,
+                experts,
+                x_rot,
+                scratch,
+                out,
+                Some(&mut trace),
+            );
+            let body_ns = elapsed_ns(t_body);
+            (result, body_ns, trace)
+        })
+    });
+    let (result, body_ns, returned) = result;
+    trace = returned;
+    trace.pool_install_ns = elapsed_ns(t_install);
+    trace.pool_body_ns = body_ns;
+    result?;
+    trace.cpu_total_ns = elapsed_ns(t_total);
+    Ok(trace)
+}
+
+/// The validated arithmetic of [`moe_cpu_host_slot_outputs`], run in whatever
+/// rayon pool is current. Split out so tests can pin the worker count.
+#[allow(clippy::too_many_arguments)]
+fn host_slot_outputs_core(
+    dim: usize,
+    mi: usize,
+    top_k: usize,
+    ids: &[i32],
+    host_slots: &[u32],
+    experts: &[CpuMoeExpert<'_>],
+    x_rot: &[f32],
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+    mut trace: Option<&mut CpuArmTrace>,
+) -> Result<(), DispatchError> {
+    let mut timing = MoeStepTiming::default();
+    moe_slots_compute(
+        dim,
+        mi,
+        top_k,
+        host_slots.len(),
+        Some(host_slots),
+        experts,
+        x_rot,
+        |a| ids[host_slots[a] as usize] as u32,
+        scratch,
+        &mut timing,
+        true,
+        trace.as_mut().map(|t| &mut **t),
+    )?;
+    let t_scatter = trace.is_some().then(Instant::now);
+    if let (Some(t), Some(s0)) = (trace.as_mut(), t_scatter) {
+        t.scatter_start_ns = t.offset_ns(s0);
+    }
+    for (a, &slot) in host_slots.iter().enumerate() {
+        let gi = scratch.slot_group[a] as usize;
+        let si = scratch.slot_si[a] as usize;
+        let n = group_n(&scratch.group_start, gi);
+        let base = scratch.group_off[gi];
+        let dst = &mut out[slot as usize * dim..(slot as usize + 1) * dim];
+        for (r, o) in dst.iter_mut().enumerate() {
+            *o = scratch.dn[base + r * n + si];
+        }
+    }
+    if let Some(t) = trace.as_mut() {
+        t.scatter_end_ns = t.offset_ns(Instant::now());
+    }
+    if let (Some(t), Some(s0)) = (trace.as_mut(), t_scatter) {
+        t.scatter_ns = elapsed_ns(s0);
+    }
+    Ok(())
+}
+
+/// Host twin of the canonical BF16 MoE combine
+/// (`moe_down_combine_top10_batched` / `_grouped_top10`, generalized to any
+/// `top_k`): the reducer that owns route weighting, fed by UNWEIGHTED raw F32
+/// per-slot down values in the GPU expanded layout.
+///
+/// `expanded` is `[rows, top_k, dim]` (slot `s` at `s * dim`); `target` is
+/// `[rows, dim]`, the residual on entry and the combined result on return. Per
+/// row every element starts at `rt(target)` and each LIVE slot (id in
+/// `0..n_experts`) is added in ascending `(expert id, rank)` order as
+/// `acc = rt(acc + rt(rt(down) * rt(weight)))`, `rt` = BF16 round-to-nearest-even.
+/// Slots with an invalid / sentinel id contribute nothing and neither their
+/// `expanded` range nor their weight is read, so stale or NaN data there is
+/// harmless.
+///
+/// # Panics
+/// If an input is shorter than its extent.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_canonical_combine_reference(
+    dim: usize,
+    rows: usize,
+    top_k: usize,
+    n_experts: usize,
+    ids: &[i32],
+    weights: &[f32],
+    expanded: &[f32],
+    target: &mut [f32],
+) {
+    let slots = rows * top_k;
+    assert!(
+        ids.len() >= slots
+            && weights.len() >= slots
+            && expanded.len() >= slots * dim
+            && target.len() >= rows * dim,
+        "moe_canonical_combine_reference: an input is shorter than its extent"
+    );
+    for t in 0..rows {
+        let row = &mut target[t * dim..(t + 1) * dim];
+        for a in row.iter_mut() {
+            *a = bf16_rt(*a);
+        }
+        let mut prev: Option<(i32, usize)> = None;
+        loop {
+            let mut best: Option<(i32, usize)> = None;
+            for j in 0..top_k {
+                let id = ids[t * top_k + j];
+                if !route_id_valid(id, n_experts) {
+                    continue;
+                }
+                let key = (id, j);
+                if prev.is_some_and(|p| key <= p) {
+                    continue;
+                }
+                if best.map_or(true, |b| key < b) {
+                    best = Some(key);
+                }
+            }
+            let Some((_, j)) = best else { break };
+            prev = best;
+            let s = t * top_k + j;
+            let w = bf16_rt(weights[s]);
+            for (a, &d) in row.iter_mut().zip(&expanded[s * dim..(s + 1) * dim]) {
+                *a = bf16_rt(*a + bf16_rt(bf16_rt(d) * w));
+            }
+        }
+    }
 }
 
 /// Close out an executed step: count it, charge a whole-CPU step's wall time to
@@ -1232,8 +2102,7 @@ pub(crate) fn finish_step(
     match exec {
         HostExec::Cpu => {
             CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-            CPU_STEP_WALL_NS
-                .fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CPU_STEP_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         HostExec::Split { gpu_rows } => {
             SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -1283,6 +2152,9 @@ struct MoeJobSource<'a, 's> {
     /// Row width of `act`: `dim` for gate_up, `mi` for down.
     row_len: usize,
     top_k: usize,
+    /// `Some`: entry `a`'s activation row is `flat_of[a] / top_k` (sparse host
+    /// slots); `None`: entry `a` is flat slot `a`.
+    flat_of: Option<&'s [u32]>,
     proj: MoeProj,
 }
 
@@ -1320,7 +2192,7 @@ impl<'a, 's> hipfire_cpu::gemv::SharedJobSource for MoeJobSource<'a, 's> {
         // gate_up consumes token `slot / top_k`'s activation row; down consumes
         // the slot's own post-SiLU hidden row.
         let row = match self.proj {
-            MoeProj::GateUp => slot / self.top_k,
+            MoeProj::GateUp => self.flat_of.map_or(slot, |f| f[slot] as usize) / self.top_k,
             MoeProj::Down => slot,
         };
         &self.act[row * self.row_len..(row + 1) * self.row_len]
@@ -1348,7 +2220,9 @@ fn trace_moe_step(
     let Ok(mut shapes) = MOE_SHAPES.lock() else {
         return;
     };
-    let stats = shapes.entry((q as u8, dim, mi, k, rows, graded)).or_default();
+    let stats = shapes
+        .entry((q as u8, dim, mi, k, rows, graded))
+        .or_default();
     stats.calls += 1;
     stats.d2h_enqueue_ns += timing.d2h_enqueue_ns;
     stats.d2h_complete_ns += timing.d2h_complete_ns;
@@ -1508,7 +2382,7 @@ struct MoeStepTiming {
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
 /// this weight: host-mapped *and* a decodable format.
 pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
-    cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
+    cpu_exec_enabled() && gpu.host_located(w.buf) && dense_cpu_quant_for(w.dtype).is_some()
 }
 
 /// `HIPFIRE_MOE_CPU_ORACLE=1`: run the same host-mapped expert bytes that fed the
@@ -1568,8 +2442,8 @@ pub fn moe_cpu_oracle_report(
     let blobs = hipfire_cpu::moe::ExpertBlobs {
         gate_up: gu,
         down: dn,
-        gate_up_stride: hipfire_cpu::gemv::row_bytes(quant, dim) * 2 * mi,
-        down_stride: hipfire_cpu::gemv::row_bytes(quant, mi) * dim,
+        gate_up_stride: hipfire_cpu::gemv::tensor_bytes(quant, 2 * mi, dim),
+        down_stride: hipfire_cpu::gemv::tensor_bytes(quant, dim, mi),
         quant,
         dim,
         mi,
@@ -1658,7 +2532,7 @@ fn host_mapped_quant(gpu: &Gpu, w: &WeightRef) -> Result<CpuQuant, DispatchError
     if !gpu.host_located(w.buf) {
         return Err(cpu_err("weight tensor is not host-mapped"));
     }
-    cpu_quant_for(w.dtype).ok_or_else(|| {
+    dense_cpu_quant_for(w.dtype).ok_or_else(|| {
         cpu_err(&format!(
             "no CPU decoder for dtype {:?}; this step must stay on the GPU",
             w.dtype
@@ -1699,14 +2573,13 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
         } => (*w, input, *out, Some(*residual)),
         _ => return None,
     };
-    if !gpu.host_located(w.buf) || cpu_quant_for(w.dtype).is_none() {
+    if !gpu.host_located(w.buf) || dense_cpu_quant_for(w.dtype).is_none() {
         return None;
     }
     // Mirror `GemvFamily::run_input`: a `Raw` input is rotated by the launcher
     // *and only when* the dtype's plan is `FwhtG256`; a `Prerotated` input is
     // never touched again.
-    let rotate_input = matches!(input, GemvInput::Raw(_))
-        && dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
+    let rotate_input = matches!(input, GemvInput::Raw(_)) && raw_input_is_rotated(w.dtype);
     Some(CpuStep {
         w,
         x: match input {
@@ -1788,8 +2661,7 @@ fn download_into_f32(
     );
     // Safety: `out[..n]` is a live `n`-element f32 buffer; the slice covers
     // exactly those bytes and does not outlive the call.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
 }
@@ -1815,19 +2687,29 @@ fn with_cpu_transfer<R>(
     run: impl FnOnce(&mut hip_bridge::PinnedTransferBuffer) -> Result<R, DispatchError>,
 ) -> Result<R, DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
-        return Err(cpu_err("CPU transfer cannot run during capture or retained recording"));
+        return Err(cpu_err(
+            "CPU transfer cannot run during capture or retained recording",
+        ));
     }
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
-    let bytes = values.checked_mul(4)
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    let bytes = values
+        .checked_mul(4)
         .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
     CPU_TRANSFER.with(|cell| {
         let mut owner = cell.borrow_mut();
-        if owner.as_ref().is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id) {
+        if owner
+            .as_ref()
+            .is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id)
+        {
             // Retire the old allocation before binding/allocating the new one.
             // Its destructor restores this caller's current device.
             drop(owner.take());
-            *owner = Some(gpu.hip.transfer_buffer(bytes)
-                .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?);
+            *owner = Some(
+                gpu.hip
+                    .transfer_buffer(bytes)
+                    .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?,
+            );
         }
         let result = run(owner.as_mut().expect("stage allocated above"));
         // Earlier enqueues can survive a later error. Protect their device
@@ -1836,6 +2718,32 @@ fn with_cpu_transfer<R>(
             std::mem::forget(owner.take());
         }
         result
+    })
+}
+
+/// Prewarm the calling thread's owned pinned transfer stage for `values` f32
+/// elements (checked `values*4` bytes) on `gpu`'s device, reusing the existing
+/// [`with_cpu_transfer`] allocation/reuse/drain lifecycle without running any
+/// math: growth or a device transition drops an owner that drains pending
+/// accesses; the warm same-device path keeps the existing owner untouched (no
+/// hot allocation). Admission calls this at load/prewarm after memory
+/// admission; refuses capture/retained-recording like every other transfer use.
+pub fn reserve_cpu_transfer_values(gpu: &Gpu, values: usize) -> Result<(), DispatchError> {
+    with_cpu_transfer(gpu, values, |_| Ok(()))
+}
+
+/// Real pinned-transfer capacity (bytes) of the calling thread's stage for
+/// `device_id`: `0` when no stage exists, when it belongs to another device,
+/// or while it is pending (an in-flight transfer the caller must not reuse),
+/// otherwise its actual [`hip_bridge::PinnedTransferBuffer::size`]. Pure
+/// reader: no allocation, no growth, no mutation.
+pub fn cpu_transfer_capacity_bytes(device_id: i32) -> usize {
+    CPU_TRANSFER.with(|cell| {
+        let owner = cell.borrow();
+        match owner.as_ref() {
+            Some(b) if b.device() == device_id && !b.is_pending() => b.size(),
+            _ => 0,
+        }
     })
 }
 
@@ -1856,7 +2764,14 @@ fn download_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("D2H tensor extent too small"));
     }
-    transfer.download_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .download_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("D2H enqueue: {e}")))
 }
 
@@ -1870,7 +2785,14 @@ fn upload_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("H2D tensor extent too small"));
     }
-    transfer.upload_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .upload_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("H2D enqueue: {e}")))
 }
 
@@ -2029,7 +2951,9 @@ fn moe_layer_trace_inner(layer_idx: usize, is_full_attn: bool, timing: MoeLayerT
     let Ok(mut layers) = MOE_LAYERS.lock() else {
         return;
     };
-    let stats = layers.entry((layer_idx, is_full_attn, timing.rows)).or_default();
+    let stats = layers
+        .entry((layer_idx, is_full_attn, timing.rows))
+        .or_default();
     stats.calls += 1;
     stats.total_ns += timing.total_ns;
     stats.attn_ns += timing.attn_ns;
@@ -2263,11 +3187,23 @@ mod moe_splice_tests {
             o
         };
         match q {
+            CpuQuant::Mq4G256V2 => {
+                // fp16 [s0 z0 s1 z1] = 0.0625, -0.25, 0.5, 0.75.
+                for (i, v) in [0x2c00u16, 0xb400, 0x3800, 0x3a00].iter().enumerate() {
+                    b[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            CpuQuant::Mq4G128V2 => {
+                // fp16 [scale][zero] = 0.0625, -0.25.
+                b[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+                b[2..4].copy_from_slice(&0xb400u16.to_le_bytes());
+            }
             CpuQuant::Mq4G256 => b[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
             CpuQuant::Mq6G256 => b[..8].copy_from_slice(&f32x2(0.0078125, -0.125)),
             CpuQuant::Mq3G256Lloyd => {
-                const CB: [u16; 8] =
-                    [0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00];
+                const CB: [u16; 8] = [
+                    0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
+                ];
                 for (k, v) in CB.iter().enumerate() {
                     b[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
                 }
@@ -2277,8 +3213,29 @@ mod moe_splice_tests {
         b
     }
 
-    /// A `[m, k]` weight tensor's bytes, group by group.
+    /// A `[m, k]` weight tensor's bytes, group by group. Planar formats
+    /// (`[codes plane][f16 scale plane]`, `tensor_bytes(q, m, k)` long): an
+    /// LCG-derived code plane (every E8P word / 3-bit code is legal) and finite,
+    /// normal, positive f16 scales.
     fn weight_bytes(q: CpuQuant, m: usize, k: usize, salt: usize) -> Vec<u8> {
+        if q.is_planar() {
+            let codes = m * hipfire_cpu::gemv::row_bytes(q, k);
+            let mut s = (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+            let mut next = move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u32
+            };
+            let mut out = Vec::with_capacity(hipfire_cpu::gemv::tensor_bytes(q, m, k));
+            out.extend((0..codes).map(|_| next() as u8));
+            for _ in 0..m * (k / 128) {
+                let scale = 0x2800u16 + (next() % 0x1400) as u16;
+                out.extend_from_slice(&scale.to_le_bytes());
+            }
+            assert_eq!(out.len(), hipfire_cpu::gemv::tensor_bytes(q, m, k));
+            return out;
+        }
         let groups = k / q.group_elems();
         let mut out = Vec::with_capacity(m * groups * q.group_bytes());
         for row in 0..m {
@@ -2347,6 +3304,7 @@ mod moe_splice_tests {
             &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .unwrap();
 
@@ -2435,6 +3393,7 @@ mod moe_splice_tests {
             &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .unwrap();
 
@@ -2444,7 +3403,14 @@ mod moe_splice_tests {
                 let s = t * top_k + j;
                 let e = idx[s];
                 let mut gv = vec![0.0f32; 2 * mi];
-                gemv(gu_q[e], &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                gemv(
+                    gu_q[e],
+                    &gu[e],
+                    2 * mi,
+                    dim,
+                    &x[t * dim..(t + 1) * dim],
+                    &mut gv,
+                );
                 let mut hid = vec![0.0f32; mi];
                 silu_mul(&gv, &mut hid);
                 if dn_q[e].is_fwht_g256() {
@@ -2488,6 +3454,7 @@ mod moe_splice_tests {
             &mut vec![0.0f32; dim],
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .expect_err("a short expert span must fail");
         assert!(format!("{err}").contains("span"), "unexpected error: {err}");
@@ -2508,21 +3475,1925 @@ mod moe_splice_tests {
         }];
         let mut scratch = MoeScratch::default();
         // rows=2, top_k=1 needs 2 experts; only 1 supplied.
-        assert!(
+        assert!(moe_cpu_experts_host(
+            dim,
+            mi,
+            2,
+            1,
+            &experts,
+            &vec![0.0f32; 2 * dim],
+            &[id_bits(0), id_bits(0)],
+            &[1.0, 1.0],
+            &mut vec![0.0f32; 2 * dim],
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+            false,
+        )
+        .is_err());
+    }
+
+    /// Flash-Next's shape: gate_up in qt 44 (`k = dim`), down in qt 53 with
+    /// `k = mi = 640` — not a multiple of 256, rotated with the 128-wide
+    /// transform. The splice must equal the per-expert reference built from
+    /// `gemv` + `rotate_x_128_v2` bit for bit, and agree with the original-basis
+    /// product (dequantized, inverse-rotated weights · the *unrotated* hidden),
+    /// which a wrong or missing down rotation would not.
+    #[test]
+    fn qt53_down_k640_uses_the_g128_rotation() {
+        assert_eq!(cpu_quant_for(DType::MQ4G128V2), Some(CpuQuant::Mq4G128V2));
+        assert!(CPU_EXECUTED_DTYPES.contains(&DType::MQ4G128V2));
+        let (dim, mi) = (256usize, 640usize);
+        let (rows, top_k, n_exp) = (2usize, 3usize, 3usize);
+        let (gq, dq) = (CpuQuant::Mq4G256V2, CpuQuant::Mq4G128V2);
+        let gu: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(gq, 2 * mi, dim, 500 + e))
+            .collect();
+        let dn: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(dq, dim, mi, 600 + e))
+            .collect();
+        let idx: [usize; 6] = [0, 1, 2, 2, 0, 1];
+        let wts: [f32; 6] = [0.4, 0.35, 0.25, 0.5, 0.3, 0.2];
+        let x = x_of(rows * dim);
+        let seed: Vec<f32> = (0..rows * dim).map(|i| 0.05 * (i % 5) as f32).collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| CpuMoeExpert {
+                gate_up_quant: gq,
+                gate_up: &gu[idx[s]],
+                down_quant: dq,
+                down: &dn[idx[s]],
+            })
+            .collect();
+        let mut scratch = MoeScratch::default();
+        let mut acc = seed.clone();
+        moe_cpu_experts_host(
+            dim,
+            mi,
+            rows,
+            top_k,
+            &experts,
+            &x,
+            &ti,
+            &wts,
+            &mut acc,
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+            false,
+        )
+        .unwrap();
+
+        let mut reference = seed.clone();
+        let mut original_basis = seed.clone();
+        // Σ |w||h| per element: the f32 rounding scale. The fixture's hidden is
+        // large with heavy cancellation, so the tolerance is relative to this,
+        // not to the (small) result.
+        let mut mag = vec![0.0f64; rows * dim];
+        for t in 0..rows {
+            for j in 0..top_k {
+                let s = t * top_k + j;
+                let e = idx[s];
+                let mut gv = vec![0.0f32; 2 * mi];
+                gemv(gq, &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                let mut hid = vec![0.0f32; mi];
+                silu_mul(&gv, &mut hid);
+                let unrotated = hid.clone();
+                rotate_x_128_v2(&mut hid);
+                let mut dout = vec![0.0f32; dim];
+                gemv(dq, &dn[e], dim, mi, &hid, &mut dout);
+                for (a, v) in reference[t * dim..(t + 1) * dim].iter_mut().zip(dout) {
+                    *a += wts[s] * v;
+                }
+                // Original-basis product: inverse-rotated weights · unrotated hidden.
+                let rb = hipfire_cpu::gemv::row_bytes(dq, mi);
+                for r in 0..dim {
+                    let mut dot = 0.0f64;
+                    let mut abs = 0.0f64;
+                    for g in 0..mi / 128 {
+                        let mut w = [0.0f32; 128];
+                        hipfire_cpu::quant::dequant_group(dq, &dn[e][r * rb + g * 68..], &mut w);
+                        for i in 0..128 {
+                            let term = w[i] as f64 * unrotated[g * 128 + i] as f64;
+                            dot += term;
+                            abs += term.abs();
+                        }
+                    }
+                    original_basis[t * dim + r] += wts[s] * dot as f32;
+                    mag[t * dim + r] += wts[s] as f64 * abs;
+                }
+            }
+        }
+        assert_eq!(acc, reference, "qt53 splice != per-expert gemv reference");
+        for (i, (a, b)) in acc.iter().zip(&original_basis).enumerate() {
+            let tol = 1e-4 * (mag[i] as f32).max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "element {i}: rotated-basis {a} vs original-basis {b} (tol {tol})"
+            );
+        }
+    }
+
+    /// `bf16_rt` is the GPU `rt`: ties-to-even on the dropped 16 bits, sign and
+    /// signed zero preserved, ±Inf and NaN (payload included) passed through, and
+    /// a finite value past the BF16 maximum carries into ±Inf.
+    #[test]
+    fn bf16_rt_rounds_ties_to_even_and_passes_nonfinite() {
+        let rt_bits = |bits: u32| bf16_rt(f32::from_bits(bits)).to_bits();
+        // Exactly half way: even kept mantissa stays, odd kept mantissa rounds up.
+        assert_eq!(rt_bits(0x3f80_8000), 0x3f80_0000);
+        assert_eq!(rt_bits(0x3f81_8000), 0x3f82_0000);
+        // Just below / above half way.
+        assert_eq!(rt_bits(0x3f80_7fff), 0x3f80_0000);
+        assert_eq!(rt_bits(0x3f80_8001), 0x3f81_0000);
+        // Negative mirrors positive (magnitude rounding, sign kept).
+        assert_eq!(rt_bits(0xbf80_8000), 0xbf80_0000);
+        assert_eq!(rt_bits(0xbf81_8000), 0xbf82_0000);
+        assert_eq!(rt_bits(0xbf80_8001), 0xbf81_0000);
+        // Signed zero, and a negative denormal that rounds to -0.
+        assert_eq!(rt_bits(0x0000_0000), 0x0000_0000);
+        assert_eq!(rt_bits(0x8000_0000), 0x8000_0000);
+        assert_eq!(rt_bits(0x8000_0001), 0x8000_0000);
+        // Already-BF16 values are fixed points.
+        assert_eq!(rt_bits(0x4049_0000), 0x4049_0000);
+        // Non-finite: unchanged bit for bit.
+        for bits in [
+            0x7f80_0000u32,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7f80_0001,
+            0xffc1_2345,
+        ] {
+            assert_eq!(rt_bits(bits), bits);
+        }
+        // Largest finite f32 rounds up into +Inf / -Inf.
+        assert_eq!(bf16_rt(f32::MAX), f32::INFINITY);
+        assert_eq!(bf16_rt(f32::MIN), f32::NEG_INFINITY);
+    }
+
+    /// Scalar reference for the BF16 route: plain `gemv` projections with explicit
+    /// BF16 boundaries — rt(gate), rt(up), rt(activated hidden) before the FWHT,
+    /// the rotated down input left f32, rt(residual) at the start of each row, and
+    /// per step `acc = rt(acc + rt(rt(down) * rt(weight)))`. `rank_order` and
+    /// `round_rotated` switch in the two WRONG variants the real route must not
+    /// match: routing-rank combine order and a BF16 round of the rotated hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn bf16_reference(
+        q: CpuQuant,
+        gu: &[Vec<u8>],
+        dn: &[Vec<u8>],
+        idx: &[usize],
+        wts: &[f32],
+        x: &[f32],
+        seed: &[f32],
+        (dim, mi, rows, top_k): (usize, usize, usize, usize),
+        rank_order: bool,
+        round_rotated: bool,
+    ) -> Vec<f32> {
+        let mut out: Vec<f32> = seed.iter().map(|&v| bf16_rt(v)).collect();
+        for t in 0..rows {
+            let mut order: Vec<usize> = (0..top_k).collect();
+            if !rank_order {
+                order.sort_by_key(|&j| (idx[t * top_k + j], j));
+            }
+            for j in order {
+                let s = t * top_k + j;
+                let e = idx[s];
+                let mut gv = vec![0.0f32; 2 * mi];
+                gemv(q, &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                for g in gv.iter_mut() {
+                    *g = bf16_rt(*g);
+                }
+                let mut hid = vec![0.0f32; mi];
+                silu_mul(&gv, &mut hid);
+                for h in hid.iter_mut() {
+                    *h = bf16_rt(*h);
+                }
+                if q.is_fwht_g256() {
+                    rotate_x(&mut hid);
+                }
+                if round_rotated {
+                    for h in hid.iter_mut() {
+                        *h = bf16_rt(*h);
+                    }
+                }
+                let mut dout = vec![0.0f32; dim];
+                gemv(q, &dn[e], dim, mi, &hid, &mut dout);
+                let w = bf16_rt(wts[s]);
+                for (a, v) in out[t * dim..(t + 1) * dim].iter_mut().zip(dout) {
+                    *a = bf16_rt(*a + bf16_rt(bf16_rt(v) * w));
+                }
+            }
+        }
+        out
+    }
+
+    /// The `bf16_round_trip = true` host path equals the scalar BF16-boundary
+    /// reference bit for bit, on a window whose routing ranks are NOT in expert-id
+    /// order (including a repeated id in one row, which must tie-break by rank).
+    /// The two wrong variants — routing-rank combine order, and rounding the
+    /// rotated hidden — must differ, and the false route must differ from true
+    /// while staying plain f32.
+    #[test]
+    fn bf16_route_matches_scalar_reference_with_expert_id_combine_order() {
+        let (dim, mi) = (256usize, 256usize);
+        let (rows, top_k, n_exp) = (2usize, 3usize, 4usize);
+        let q = CpuQuant::Mq4G256;
+        let gu: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(q, 2 * mi, dim, 700 + e))
+            .collect();
+        let dn: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(q, dim, mi, 800 + e))
+            .collect();
+        // Row 0 ranks are 3, 0, 2 (descending/unsorted); row 1 repeats id 2.
+        let idx: [usize; 6] = [3, 0, 2, 2, 2, 1];
+        let wts: [f32; 6] = [0.4, 0.35, 0.25, 0.5, 0.3, 0.2];
+        let x = x_of(rows * dim);
+        // Not BF16-exact, so the initial rt(residual) is observable.
+        let seed: Vec<f32> = (0..rows * dim)
+            .map(|i| 0.1234567 * (i % 7) as f32 + 1.0001)
+            .collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| CpuMoeExpert {
+                gate_up_quant: q,
+                gate_up: &gu[idx[s]],
+                down_quant: q,
+                down: &dn[idx[s]],
+            })
+            .collect();
+        let run = |bf16: bool| {
+            let mut scratch = MoeScratch::default();
+            let mut acc = seed.clone();
             moe_cpu_experts_host(
                 dim,
                 mi,
-                2,
-                1,
+                rows,
+                top_k,
                 &experts,
-                &vec![0.0f32; 2 * dim],
-                &[id_bits(0), id_bits(0)],
-                &[1.0, 1.0],
-                &mut vec![0.0f32; 2 * dim],
+                &x,
+                &ti,
+                &wts,
+                &mut acc,
                 &mut scratch,
-                &mut MoeStepTiming::default()
+                &mut MoeStepTiming::default(),
+                bf16,
             )
-            .is_err()
+            .unwrap();
+            acc
+        };
+        let geom = (dim, mi, rows, top_k);
+        let reference = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, false, false);
+        let acc = run(true);
+        assert_eq!(
+            acc, reference,
+            "bf16 splice != scalar BF16-boundary reference"
         );
+        assert!(
+            acc.iter().all(|v| bf16_rt(*v) == *v),
+            "every stored element must be BF16-exact"
+        );
+        let rank_order = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, true, false);
+        assert_ne!(acc, rank_order, "fixture is not sensitive to combine order");
+        let round_rotated = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, false, true);
+        assert_ne!(
+            acc, round_rotated,
+            "rotated hidden must not be rounded before the down GEMV"
+        );
+        assert_ne!(run(false), acc, "true and false routes must differ");
+    }
+
+    // ── sparse host-slot arithmetic (D2 split) ─────────────────────────────
+
+    const HS_DIM: usize = 256;
+    const HS_MI: usize = 128;
+    /// QT53's down format: 128-element groups admit `mi = 128`.
+    const HS_Q: CpuQuant = CpuQuant::Mq4G128V2;
+    /// A quiet-NaN payload standing in for stale scratch.
+    const STALE_BITS: u32 = 0x7fc0_dead;
+
+    fn stale(n: usize) -> Vec<f32> {
+        vec![f32::from_bits(STALE_BITS); n]
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn all_stale(v: &[f32]) -> bool {
+        v.iter().all(|x| x.to_bits() == STALE_BITS)
+    }
+
+    struct HostFixture {
+        gu: Vec<Vec<u8>>,
+        dn: Vec<Vec<u8>>,
+    }
+
+    fn host_fixture(n_exp: usize) -> HostFixture {
+        HostFixture {
+            gu: (0..n_exp)
+                .map(|e| weight_bytes(HS_Q, 2 * HS_MI, HS_DIM, 5000 + 131 * e))
+                .collect(),
+            dn: (0..n_exp)
+                .map(|e| weight_bytes(HS_Q, HS_DIM, HS_MI, 9000 + 257 * e))
+                .collect(),
+        }
+    }
+
+    impl HostFixture {
+        fn expert(&self, id: i32) -> CpuMoeExpert<'_> {
+            CpuMoeExpert {
+                gate_up_quant: HS_Q,
+                gate_up: &self.gu[id as usize],
+                down_quant: HS_Q,
+                down: &self.dn[id as usize],
+            }
+        }
+
+        fn spans(&self, ids: &[i32], host: &[u32]) -> Vec<CpuMoeExpert<'_>> {
+            host.iter().map(|&s| self.expert(ids[s as usize])).collect()
+        }
+    }
+
+    /// The host route with every host slot masked to the `-1` sentinel.
+    fn masked_route(ids: &[i32], host: &[u32]) -> Vec<i32> {
+        let mut g = ids.to_vec();
+        for &s in host {
+            g[s as usize] = -1;
+        }
+        g
+    }
+
+    /// Run the host-slot entry: `pool = None` through the public API (the
+    /// splice pool), `Some` through the same validated arithmetic in a pool of
+    /// a chosen worker count.
+    #[allow(clippy::too_many_arguments)]
+    fn hs_run(
+        pool: Option<&rayon::ThreadPool>,
+        rows: usize,
+        top_k: usize,
+        n_exp: usize,
+        ids: &[i32],
+        gpu_ids: Option<&[i32]>,
+        host: &[u32],
+        experts: &[CpuMoeExpert<'_>],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), DispatchError> {
+        match pool {
+            None => moe_cpu_host_slot_outputs(
+                HS_DIM, HS_MI, rows, top_k, n_exp, ids, gpu_ids, host, experts, x, false, out,
+            ),
+            Some(pool) => {
+                validate_moe_cpu_host_slot_outputs(
+                    HS_DIM,
+                    HS_MI,
+                    rows,
+                    top_k,
+                    n_exp,
+                    ids,
+                    gpu_ids,
+                    host,
+                    experts,
+                    x.len(),
+                    false,
+                    out.len(),
+                )?;
+                if host.is_empty() {
+                    return Ok(());
+                }
+                let mut scratch = MoeScratch::default();
+                pool.install(|| {
+                    host_slot_outputs_core(
+                        HS_DIM,
+                        HS_MI,
+                        top_k,
+                        ids,
+                        host,
+                        experts,
+                        x,
+                        &mut scratch,
+                        out,
+                        None,
+                    )
+                })
+            }
+        }
+    }
+    /// The crate-private timed entry is byte-equal to the public entry and
+    /// rejects the same bad plans with the same errors, over the existing
+    /// fixture. Inclusive totals overlap their disjoint children by design:
+    /// GU/DN equal prep + exec exactly, every other child sum reconciles
+    /// against its inclusive total with slack.
+    #[test]
+    fn traced_host_slot_entry_is_byte_equal_and_validates_like_public() {
+        let (rows, top_k, n_exp) = (2usize, 3usize, 5usize);
+        let fx = host_fixture(n_exp);
+        let slots = rows * top_k;
+        let ids: Vec<i32> = vec![4, 1, 3, 1, 0, 2];
+        let host: Vec<u32> = vec![0, 2, 3, 5];
+        let gpu = masked_route(&ids, &host);
+        let experts = fx.spans(&ids, &host);
+        let x = x_of(rows * HS_DIM);
+        let mut out_plain = stale(slots * HS_DIM);
+        let mut out_traced = stale(slots * HS_DIM);
+        moe_cpu_host_slot_outputs(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &host,
+            &experts,
+            &x,
+            false,
+            &mut out_plain,
+        )
+        .unwrap();
+        let trace_epoch = Instant::now();
+        let trace = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &host,
+            &experts,
+            &x,
+            false,
+            &mut out_traced,
+            trace_epoch,
+        )
+        .unwrap();
+        assert_eq!(
+            bits(&out_plain),
+            bits(&out_traced),
+            "traced entry bytes != public entry bytes"
+        );
+        assert_eq!(trace.gu_ns, trace.gu_prep_ns + trace.gu_exec_ns);
+        assert_eq!(trace.dn_ns, trace.dn_prep_ns + trace.dn_exec_ns);
+        assert!(trace.gather_ns + trace.silu_ns + trace.fwht_ns <= trace.middle_ns);
+        assert!(
+            trace.group_ns + trace.gu_ns + trace.middle_ns + trace.dn_ns + trace.scatter_ns
+                <= trace.pool_body_ns
+        );
+        assert!(trace.pool_body_ns <= trace.pool_install_ns);
+        assert!(trace.validate_ns + trace.pool_install_ns <= trace.cpu_total_ns);
+        let middle_start = trace.middle_start_ns.expect("nonempty middle start");
+        let middle_end = trace.middle_end_ns.expect("nonempty middle end");
+        let scatter_start = trace.scatter_start_ns.expect("nonempty scatter start");
+        let scatter_end = trace.scatter_end_ns.expect("nonempty scatter end");
+        assert!(middle_start <= middle_end);
+        assert!(middle_end <= scatter_start);
+        assert!(scatter_start <= scatter_end);
+        assert!(scatter_end <= elapsed_ns(trace_epoch));
+        // Host slots name experts {4, 3, 1, 2}: four distinct groups.
+        assert_eq!(trace.unique_experts, 4);
+        // The same bad plan fails the same way, leaving `out` untouched.
+        let dup = [0u32, 0];
+        let mut dup_plain = stale(slots * HS_DIM);
+        let mut dup_traced = stale(slots * HS_DIM);
+        let plain_err = moe_cpu_host_slot_outputs(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &dup,
+            &fx.spans(&ids, &dup),
+            &x,
+            false,
+            &mut dup_plain,
+        )
+        .map(|_| ())
+        .expect_err("duplicate host slot must fail");
+        let traced_err = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &dup,
+            &fx.spans(&ids, &dup),
+            &x,
+            false,
+            &mut dup_traced,
+            Instant::now(),
+        )
+        .map(|_| ())
+        .expect_err("duplicate host slot must fail");
+        assert_eq!(format!("{plain_err}"), format!("{traced_err}"));
+        assert!(all_stale(&dup_plain) && all_stale(&dup_traced));
+        // Exact-single-slot unit case (no env, no global state): one host
+        // slot naming expert 2, one group, hierarchy exact where required.
+        let one_ids: Vec<i32> = vec![2, 0, 1, 0, 1, 2];
+        let one_host: Vec<u32> = vec![0];
+        let one_gpu = masked_route(&one_ids, &one_host);
+        let one_experts = fx.spans(&one_ids, &one_host);
+        let mut one_out = stale(slots * HS_DIM);
+        let one = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &one_ids,
+            Some(&one_gpu),
+            &one_host,
+            &one_experts,
+            &x,
+            false,
+            &mut one_out,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(one.unique_experts, 1);
+        assert_eq!(one.gu_ns, one.gu_prep_ns + one.gu_exec_ns);
+        assert_eq!(one.dn_ns, one.dn_prep_ns + one.dn_exec_ns);
+        // Empty host set: valid plan, writes nothing, zero child stages.
+        let empty_host: Vec<u32> = vec![];
+        let empty_experts: Vec<CpuMoeExpert<'_>> = vec![];
+        let mut empty_out = stale(slots * HS_DIM);
+        let empty = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&ids),
+            &empty_host,
+            &empty_experts,
+            &x,
+            false,
+            &mut empty_out,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(empty.unique_experts, 0);
+        assert_eq!(empty.group_ns, 0);
+        assert_eq!(empty.gu_ns, 0);
+        assert_eq!(empty.middle_ns, 0);
+        assert_eq!(empty.dn_ns, 0);
+        assert_eq!(empty.scatter_ns, 0);
+        assert_eq!(empty.pool_body_ns, 0);
+        assert_eq!(empty.middle_start_ns, None);
+        assert_eq!(empty.middle_end_ns, None);
+        assert_eq!(empty.scatter_start_ns, None);
+        assert_eq!(empty.scatter_end_ns, None);
+        assert!(all_stale(&empty_out));
+    }
+
+    /// Scalar per-slot reference: plain `gemv` projections with the GPU's BF16
+    /// points (rt(gate), rt(up), rt(activated hidden) before the FWHT) and RAW
+    /// F32 down output.
+    fn slot_reference(fx: &HostFixture, id: i32, x_row: &[f32]) -> Vec<f32> {
+        let e = id as usize;
+        let mut gv = vec![0.0f32; 2 * HS_MI];
+        gemv(HS_Q, &fx.gu[e], 2 * HS_MI, HS_DIM, x_row, &mut gv);
+        for g in gv.iter_mut() {
+            *g = bf16_rt(*g);
+        }
+        let mut hid = vec![0.0f32; HS_MI];
+        silu_mul(&gv, &mut hid);
+        for h in hid.iter_mut() {
+            *h = bf16_rt(*h);
+        }
+        match HS_Q.input_rotation() {
+            InputRotation::FwhtG128V2 => rotate_x_128_v2(&mut hid),
+            InputRotation::FwhtG256 => rotate_x(&mut hid),
+            InputRotation::None => {}
+        }
+        let mut dout = vec![0.0f32; HS_DIM];
+        gemv(HS_Q, &fx.dn[e], HS_DIM, HS_MI, &hid, &mut dout);
+        dout
+    }
+
+    /// `rows` tokens of `top_k` slots (`ids`/`w` are `[rows * top_k]`, `x` is
+    /// `[rows, HS_DIM]`) under the given host/GPU slot masks (bit `s` = slot
+    /// `s` is cold/host). The host values are installed into the GPU expanded
+    /// layout (masked and invalid slots hold the kernel's zeros, then invalid
+    /// slots are NaN-poisoned) and the canonical combine runs ONCE over the
+    /// window with the original route. Every row's bytes must equal BOTH the
+    /// combine over the unsplit window AND the one-row AR combine (`rows = 1`
+    /// host-slot values + combine of that row alone) — the row-invariance
+    /// contract D2 admits widths 2..4 under. Returns whether a two-partial
+    /// (GPU arm first, then host arm) accumulation ever differed, which proves
+    /// the fixture can see an ordering error.
+    fn run_mask_case_rows(
+        rows: usize,
+        top_k: usize,
+        ids: &[i32],
+        w: &[f32],
+        x: &[f32],
+        masks: &[u64],
+    ) -> bool {
+        let (slots, n_exp) = (rows * top_k, 12usize);
+        assert!(slots <= 640 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
+        let fx = host_fixture(n_exp);
+        let valid = |s: usize| route_id_valid(ids[s], n_exp);
+        let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
+        let every: Vec<u32> = (0..slots as u32).filter(|&s| valid(s as usize)).collect();
+        let mut full = stale(slots * HS_DIM);
+        let full_route = masked_route(ids, &every);
+        hs_run(
+            None,
+            rows,
+            top_k,
+            n_exp,
+            ids,
+            Some(&full_route),
+            &every,
+            &fx.spans(ids, &every),
+            x,
+            &mut full,
+        )
+        .unwrap();
+        for s in 0..slots {
+            if valid(s) {
+                let row = s / top_k;
+                assert_eq!(
+                    bits(&full[range(s)]),
+                    bits(&slot_reference(
+                        &fx,
+                        ids[s],
+                        &x[row * HS_DIM..(row + 1) * HS_DIM]
+                    )),
+                    "slot {s} != scalar reference"
+                );
+            } else {
+                assert!(all_stale(&full[range(s)]), "invalid slot {s} was written");
+            }
+        }
+        let residual0: Vec<f32> = (0..HS_DIM).map(|c| 1.0 + 0.013 * c as f32).collect();
+        let mut reference = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            reference[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+        }
+        moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &full, &mut reference);
+        // One-row AR per token: its own host-slot run and its own combine.
+        let mut ar = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            let r_ids = &ids[t * top_k..(t + 1) * top_k];
+            let r_host: Vec<u32> = (0..top_k as u32)
+                .filter(|&s| route_id_valid(r_ids[s as usize], n_exp))
+                .collect();
+            let mut r_full = stale(top_k * HS_DIM);
+            hs_run(
+                None,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                None,
+                &r_host,
+                &fx.spans(r_ids, &r_host),
+                &x[t * HS_DIM..(t + 1) * HS_DIM],
+                &mut r_full,
+            )
+            .unwrap();
+            for &s in &r_host {
+                assert_eq!(
+                    bits(&r_full[s as usize * HS_DIM..(s as usize + 1) * HS_DIM]),
+                    bits(&full[range(t * top_k + s as usize)]),
+                    "row {t} slot {s}: window host value != one-row AR"
+                );
+            }
+            let mut row = residual0.clone();
+            moe_canonical_combine_reference(
+                HS_DIM,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                &w[t * top_k..(t + 1) * top_k],
+                &r_full,
+                &mut row,
+            );
+            ar[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&row);
+            assert_eq!(
+                bits(&row),
+                bits(&reference[t * HS_DIM..(t + 1) * HS_DIM]),
+                "row {t}: one-row AR combine != window combine of the unsplit values"
+            );
+        }
+        let mut partial_differs = false;
+        for &mask in masks {
+            let host: Vec<u32> = (0..slots as u32)
+                .filter(|&s| (mask >> s) & 1 == 1 && valid(s as usize))
+                .collect();
+            let gpu_route = masked_route(ids, &host);
+            let mut host_out = stale(slots * HS_DIM);
+            hs_run(
+                None,
+                rows,
+                top_k,
+                n_exp,
+                ids,
+                Some(&gpu_route),
+                &host,
+                &fx.spans(ids, &host),
+                x,
+                &mut host_out,
+            )
+            .unwrap();
+            // GPU arm: valid unmasked slots carry their value; masked and
+            // invalid slots are the kernel's zero stores.
+            let mut expanded = vec![0.0f32; slots * HS_DIM];
+            for s in 0..slots {
+                if valid(s) && !host.contains(&(s as u32)) {
+                    expanded[range(s)].copy_from_slice(&full[range(s)]);
+                }
+            }
+            // Slot install, after the GPU down.
+            for s in 0..slots {
+                if host.contains(&(s as u32)) {
+                    assert_eq!(
+                        bits(&host_out[range(s)]),
+                        bits(&full[range(s)]),
+                        "mask {mask:#b}: host slot {s} differs from its unsplit value"
+                    );
+                    expanded[range(s)].copy_from_slice(&host_out[range(s)]);
+                } else {
+                    assert!(
+                        all_stale(&host_out[range(s)]),
+                        "mask {mask:#b}: non-host slot {s} was written"
+                    );
+                }
+            }
+            for s in 0..slots {
+                if !valid(s) {
+                    expanded[range(s)].fill(f32::NAN);
+                }
+            }
+            let mut got = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                got[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got,
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&reference),
+                "mask {mask:#b}: split join != unsplit"
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&ar),
+                "mask {mask:#b}: split join != per-row one-row AR"
+            );
+
+            // Two-partial: the GPU arm reduces first (host slots masked to -1),
+            // then the host arm reduces over its result.
+            let mut host_only = ids.to_vec();
+            for s in 0..slots {
+                if !host.contains(&(s as u32)) {
+                    host_only[s] = -1;
+                }
+            }
+            let mut two = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                two[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, &gpu_route, w, &expanded, &mut two,
+            );
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, &host_only, w, &expanded, &mut two,
+            );
+            if bits(&two) != bits(&reference) {
+                partial_differs = true;
+            }
+        }
+        partial_differs
+    }
+
+    /// One ten-slot, one-row route under all 1024 host/GPU masks.
+    fn run_mask_case(ids: [i32; 10], w: [f32; 10]) -> bool {
+        let masks: Vec<u64> = (0..1024).collect();
+        run_mask_case_rows(1, 10, &ids, &w, &x_of(HS_DIM), &masks)
+    }
+
+    /// Wide oracle: `masks` are bit-vectors over slots (1 = cold/host), one
+    /// `u64` word per 64 slots, so the full 640-slot logical window is covered
+    /// without enumerating 2^640 subsets. Same invariant as
+    /// [`run_mask_case_rows`]: every row's joined bytes equal the one-row AR of
+    /// that token.
+    fn run_mask_case_rows_wide(
+        rows: usize,
+        top_k: usize,
+        ids: &[i32],
+        w: &[f32],
+        x: &[f32],
+        masks: &[Vec<u64>],
+    ) {
+        let (slots, n_exp) = (rows * top_k, 12usize);
+        assert!(slots <= 640 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
+        let fx = host_fixture(n_exp);
+        let valid = |s: usize| route_id_valid(ids[s], n_exp);
+        let is_host = |mask: &[u64], s: usize| (mask[s / 64] >> (s % 64)) & 1 == 1;
+        let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
+        let every: Vec<u32> = (0..slots as u32).filter(|&s| valid(s as usize)).collect();
+        let mut full = stale(slots * HS_DIM);
+        let full_route = masked_route(ids, &every);
+        hs_run(
+            None,
+            rows,
+            top_k,
+            n_exp,
+            ids,
+            Some(&full_route),
+            &every,
+            &fx.spans(ids, &every),
+            x,
+            &mut full,
+        )
+        .unwrap();
+        // Every slot equals the scalar per-slot reference; invalid slots stay stale.
+        for s in 0..slots {
+            if valid(s) {
+                let row = s / top_k;
+                assert_eq!(
+                    bits(&full[range(s)]),
+                    bits(&slot_reference(
+                        &fx,
+                        ids[s],
+                        &x[row * HS_DIM..(row + 1) * HS_DIM]
+                    )),
+                    "wide slot {s} != scalar reference"
+                );
+            } else {
+                assert!(
+                    all_stale(&full[range(s)]),
+                    "wide invalid slot {s} was written"
+                );
+            }
+        }
+        let residual0: Vec<f32> = (0..HS_DIM).map(|c| 1.0 + 0.013 * c as f32).collect();
+        let mut reference = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            reference[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+        }
+        moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &full, &mut reference);
+        // One-row AR per token: its own host-slot run and its own combine.
+        let mut ar = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            let r_ids = &ids[t * top_k..(t + 1) * top_k];
+            let r_host: Vec<u32> = (0..top_k as u32)
+                .filter(|&s| route_id_valid(r_ids[s as usize], n_exp))
+                .collect();
+            let mut r_full = stale(top_k * HS_DIM);
+            hs_run(
+                None,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                None,
+                &r_host,
+                &fx.spans(r_ids, &r_host),
+                &x[t * HS_DIM..(t + 1) * HS_DIM],
+                &mut r_full,
+            )
+            .unwrap();
+            for &s in &r_host {
+                assert_eq!(
+                    bits(&r_full[s as usize * HS_DIM..(s as usize + 1) * HS_DIM]),
+                    bits(&full[range(t * top_k + s as usize)]),
+                    "wide row {t} slot {s}: window host value != one-row AR"
+                );
+            }
+            let mut row = residual0.clone();
+            moe_canonical_combine_reference(
+                HS_DIM,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                &w[t * top_k..(t + 1) * top_k],
+                &r_full,
+                &mut row,
+            );
+            ar[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&row);
+            assert_eq!(
+                bits(&row),
+                bits(&reference[t * HS_DIM..(t + 1) * HS_DIM]),
+                "wide row {t}: one-row AR combine != window combine of the unsplit values"
+            );
+        }
+        // Split join under every wide mask: host slots installed into the GPU
+        // expanded layout, invalid slots NaN-poisoned, joined once over the
+        // window; must equal BOTH the unsplit combine and the per-row AR.
+        for mask in masks {
+            let host: Vec<u32> = (0..slots as u32)
+                .filter(|&s| is_host(mask, s as usize) && valid(s as usize))
+                .collect();
+            let gpu_route = masked_route(ids, &host);
+            let mut host_out = stale(slots * HS_DIM);
+            hs_run(
+                None,
+                rows,
+                top_k,
+                n_exp,
+                ids,
+                Some(&gpu_route),
+                &host,
+                &fx.spans(ids, &host),
+                x,
+                &mut host_out,
+            )
+            .unwrap();
+            let mut expanded = vec![0.0f32; slots * HS_DIM];
+            for s in 0..slots {
+                if valid(s) && !host.contains(&(s as u32)) {
+                    expanded[range(s)].copy_from_slice(&full[range(s)]);
+                }
+            }
+            for s in 0..slots {
+                if host.contains(&(s as u32)) {
+                    assert_eq!(
+                        bits(&host_out[range(s)]),
+                        bits(&full[range(s)]),
+                        "wide mask: host slot {s} differs from its unsplit value"
+                    );
+                    expanded[range(s)].copy_from_slice(&host_out[range(s)]);
+                } else {
+                    assert!(
+                        all_stale(&host_out[range(s)]),
+                        "wide mask: non-host slot {s} was written"
+                    );
+                }
+            }
+            for s in 0..slots {
+                if !valid(s) {
+                    expanded[range(s)].fill(f32::NAN);
+                }
+            }
+            let mut got = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                got[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got,
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&reference),
+                "wide mask: split join != unsplit"
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&ar),
+                "wide mask: split join != per-row one-row AR"
+            );
+        }
+    }
+
+    /// Deterministic masks for windows too wide to enumerate; the all-cold,
+    /// all-hot and per-row-only / per-row-excluded masks are always included.
+    /// Narrow windows (<=64 slots) keep the exact legacy `u64` cover.
+    fn sampled_masks(slots: usize, top_k: usize, n: usize) -> Vec<u64> {
+        assert!(slots <= 64, "narrow masks cover at most 64 slots");
+        let all = if slots == 64 {
+            u64::MAX
+        } else {
+            (1u64 << slots) - 1
+        };
+        let mut row0 = 0u64;
+        for s in 0..top_k {
+            row0 |= 1 << s;
+        }
+        let mut masks = vec![0, all];
+        for t in 0..slots / top_k {
+            masks.push(row0 << (t * top_k));
+            masks.push(all & !(row0 << (t * top_k)));
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while masks.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            masks.push((state >> 7) & all);
+        }
+        masks
+    }
+
+    /// Wide deterministic masks: one `u64` word per 64 slots (10 words for the
+    /// full 640-slot logical window). The all-cold, all-hot and strided
+    /// per-row masks are always included, then the LCG fills to `n` masks;
+    /// every mask word beyond `slots` stays zero.
+    fn sampled_masks_wide(slots: usize, top_k: usize, n: usize) -> Vec<Vec<u64>> {
+        assert!(slots <= 640, "logical window is at most 640 slots");
+        let words = slots.div_ceil(64);
+        let mut set = |mask: &mut Vec<u64>, s: usize| {
+            mask[s / 64] |= 1 << (s % 64);
+        };
+        let mut full = vec![0u64; words];
+        for s in 0..slots {
+            set(&mut full, s);
+        }
+        let rows = slots / top_k;
+        // All single-row masks only for narrow windows; wide windows sample a
+        // strided subset (row 0, middle, last) to keep the mask count bounded.
+        let stride = (rows / 8).max(1);
+        let mut masks = vec![vec![0u64; words], full.clone()];
+        let mut t = 0usize;
+        while t < rows {
+            let mut row = vec![0u64; words];
+            for s in 0..top_k {
+                set(&mut row, (t * top_k + s) % slots);
+            }
+            let mut excl = full.clone();
+            for (e, r) in excl.iter_mut().zip(&row) {
+                *e &= !r;
+            }
+            masks.push(row);
+            masks.push(excl);
+            t += stride;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while masks.len() < n {
+            let mut mask = vec![0u64; words];
+            for w in 0..words {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                mask[w] = (state >> 7) | (state << 57);
+            }
+            for s in slots..words * 64 {
+                mask[s / 64] &= !(1 << (s % 64));
+            }
+            masks.push(mask);
+        }
+        masks
+    }
+
+    /// Interleaved ids, a repeated id, cancelling and extreme weights (a ±1e30
+    /// pair on one expert, a ±1e37 pair on another, a sub-normal, ±0).
+    #[test]
+    fn canonical_join_is_byte_identical_for_all_1024_masks() {
+        let ids = [7, 2, 9, 2, 8, 5, 0, 5, 3, 4];
+        let w = [
+            0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+        ];
+        assert!(
+            run_mask_case(ids, w),
+            "fixture cannot distinguish a two-partial combine from the canonical one"
+        );
+    }
+
+    /// A sentinel (`-1`) and an out-of-range id: owned by neither arm, their
+    /// weights NaN/inf and their expanded ranges NaN, never read.
+    #[test]
+    fn canonical_join_ignores_sentinel_and_invalid_slots_for_all_1024_masks() {
+        let ids = [7, -1, 9, 2, 8, 5, 40, 5, 3, 2];
+        let w = [
+            0.5,
+            f32::NAN,
+            0.35,
+            1.0e30,
+            0.3,
+            1.0e37,
+            f32::INFINITY,
+            -1.0e37,
+            0.0,
+            -1.0e30,
+        ];
+        assert!(
+            run_mask_case(ids, w),
+            "fixture cannot distinguish a two-partial combine from the canonical one"
+        );
+    }
+
+    /// A 2..4-row, ten-slot-per-row window under sampled host/GPU masks
+    /// (per-row cold subsets differ inside one window), distinct and identical
+    /// tokens, with and without invalid slots. Rows repeat experts across ranks
+    /// and across rows.
+    fn multirow_join(rows: usize, n_masks: usize, identical_tokens: bool, with_invalid: bool) {
+        let top_k = 10;
+        let base_ids: [[i32; 10]; 4] = [
+            [7, 2, 9, 2, 8, 5, 0, 5, 3, 4],
+            [2, 7, 5, 9, 0, 8, 3, 4, 5, 2],
+            [9, 9, 1, 11, 6, 6, 10, 2, 7, 0],
+            [4, 3, 5, 0, 8, 9, 2, 7, 2, 5],
+        ];
+        let base_w: [[f32; 10]; 4] = [
+            [
+                0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+            ],
+            [
+                0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01,
+            ],
+            [
+                0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37,
+            ],
+            [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
+        ];
+        assert!(rows >= 1 && rows <= 4, "narrow harness covers 1..4 rows");
+        let mut ids = Vec::new();
+        let mut w = Vec::new();
+        for t in 0..rows {
+            let mut row = base_ids[t];
+            let mut wr = base_w[t];
+            if with_invalid {
+                row[(1 + 3 * t) % 10] = -1;
+                wr[(1 + 3 * t) % 10] = f32::NAN;
+                row[(4 + 5 * t) % 10] = 40;
+                wr[(4 + 5 * t) % 10] = f32::INFINITY;
+            }
+            ids.extend_from_slice(&row);
+            w.extend_from_slice(&wr);
+        }
+        let mut x = x_of(rows * HS_DIM);
+        if identical_tokens {
+            for t in 1..rows {
+                let (head, tail) = x.split_at_mut(t * HS_DIM);
+                tail[..HS_DIM].copy_from_slice(&head[..HS_DIM]);
+            }
+        }
+        let slots = rows * top_k;
+        let masks = if rows == 1 {
+            (0..1024u64).collect()
+        } else {
+            sampled_masks(slots, top_k, n_masks)
+        };
+        assert!(
+            run_mask_case_rows(rows, top_k, &ids, &w, &x, &masks),
+            "fixture cannot distinguish a two-partial combine from the canonical one"
+        );
+    }
+
+    #[test]
+    fn canonical_join_multirow_windows_match_one_row_ar_for_sampled_masks() {
+        for rows in 2..=4usize {
+            for identical in [false, true] {
+                for invalid in [false, true] {
+                    multirow_join(rows, 1024, identical, invalid);
+                }
+            }
+        }
+    }
+
+    /// Wide row builder behind [`multirow_join_wide`]: the same interleaved /
+    /// repeated / sentinel / extreme-weight fixture, row `t` cycling the four
+    /// proven narrow rows so every 1..64 width repeats established cover.
+    fn multirow_join_wide(rows: usize, n_masks: usize, identical_tokens: bool, with_invalid: bool) {
+        let top_k = 10;
+        let base_ids: [[i32; 10]; 4] = [
+            [7, 2, 9, 2, 8, 5, 0, 5, 3, 4],
+            [2, 7, 5, 9, 0, 8, 3, 4, 5, 2],
+            [9, 9, 1, 11, 6, 6, 10, 2, 7, 0],
+            [4, 3, 5, 0, 8, 9, 2, 7, 2, 5],
+        ];
+        let base_w: [[f32; 10]; 4] = [
+            [
+                0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+            ],
+            [
+                0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01,
+            ],
+            [
+                0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37,
+            ],
+            [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
+        ];
+        assert!(rows >= 1 && rows <= 64, "logical window is 1..64 rows");
+        let mut ids = Vec::new();
+        let mut w = Vec::new();
+        for t in 0..rows {
+            let mut row = base_ids[t % 4];
+            let mut wr = base_w[t % 4];
+            if with_invalid {
+                row[(1 + 3 * t) % 10] = -1;
+                wr[(1 + 3 * t) % 10] = f32::NAN;
+                row[(4 + 5 * t) % 10] = 40;
+                wr[(4 + 5 * t) % 10] = f32::INFINITY;
+            }
+            ids.extend_from_slice(&row);
+            w.extend_from_slice(&wr);
+        }
+        let mut x = x_of(rows * HS_DIM);
+        if identical_tokens {
+            for t in 1..rows {
+                let (head, tail) = x.split_at_mut(t * HS_DIM);
+                tail[..HS_DIM].copy_from_slice(&head[..HS_DIM]);
+            }
+        }
+        let masks = sampled_masks_wide(rows * top_k, top_k, n_masks);
+        run_mask_case_rows_wide(rows, top_k, &ids, &w, &x, &masks);
+    }
+
+    /// Logical window 1..64: every width's rows are byte-identical to the
+    /// one-row AR of each token (distinct and identical tokens, with and
+    /// without invalid slots), over sampled host/GPU masks including the
+    /// all-cold, all-hot and per-row masks. Widths 2..=4 repeat the proven
+    /// legacy cover; 5..=64 are the new lab-wide storage widths (no device
+    /// needed: the same device-free host-slot entry the D2 join runs).
+    #[test]
+    fn logical_window_1_to_64_matches_one_row_ar() {
+        for rows in 1..=64usize {
+            // Narrow widths keep the legacy 256-mask density; wide widths use
+            // 40 masks (all-cold, all-hot, strided per-row, LCG) — every one of
+            // the 64 widths still runs the full three-way byte check.
+            let n_masks = if rows <= 8 { 256 } else { 40 };
+            for identical in [false, true] {
+                for invalid in [false, true] {
+                    multirow_join_wide(rows, n_masks, identical, invalid);
+                }
+            }
+        }
+    }
+
+    /// Exhaustive 2^10 masks over a two-row, five-slot window (every cold
+    /// subset of both rows), with a repeated expert inside and across rows.
+    #[test]
+    fn canonical_join_two_row_window_is_byte_identical_for_all_1024_masks() {
+        let ids = [7, 2, 7, 2, 5, 2, 7, 5, -1, 40];
+        let w = [
+            0.5,
+            1.0e30,
+            0.35,
+            -1.0e30,
+            0.3,
+            1.0e37,
+            1.0e-38,
+            -1.0e37,
+            f32::NAN,
+            f32::INFINITY,
+        ];
+        let masks: Vec<u64> = (0..1024).collect();
+        for identical in [false, true] {
+            let mut x = x_of(2 * HS_DIM);
+            if identical {
+                let (a, b) = x.split_at_mut(HS_DIM);
+                b.copy_from_slice(a);
+            }
+            assert!(
+                run_mask_case_rows(2, 5, &ids, &w, &x, &masks),
+                "fixture cannot distinguish a two-partial combine from the canonical one"
+            );
+        }
+    }
+
+    // ── D2 row-invariance oracle across formats ────────────────────────────
+
+    /// An expert pool of shape `(dim, mi)` with separate gate_up (`gq`) and down
+    /// (`dq`) formats: the row formats (D2's placement is per expert, a graded
+    /// split is its own case in `graded_multirow_matches_per_expert_gemv`) and
+    /// the planar E8P-I4 / W3 slab pairs (R256 gate_up, R128 down).
+    struct QFix {
+        gq: CpuQuant,
+        dq: CpuQuant,
+        dim: usize,
+        mi: usize,
+        gu: Vec<Vec<u8>>,
+        dn: Vec<Vec<u8>>,
+    }
+
+    fn qfix(gq: CpuQuant, dq: CpuQuant, dim: usize, mi: usize, n_exp: usize) -> QFix {
+        QFix {
+            gq,
+            dq,
+            dim,
+            mi,
+            gu: (0..n_exp)
+                .map(|e| weight_bytes(gq, 2 * mi, dim, 3100 + 173 * e))
+                .collect(),
+            dn: (0..n_exp)
+                .map(|e| weight_bytes(dq, dim, mi, 7700 + 311 * e))
+                .collect(),
+        }
+    }
+
+    impl QFix {
+        fn expert(&self, id: i32) -> CpuMoeExpert<'_> {
+            CpuMoeExpert {
+                gate_up_quant: self.gq,
+                gate_up: &self.gu[id as usize],
+                down_quant: self.dq,
+                down: &self.dn[id as usize],
+            }
+        }
+
+        fn run(
+            &self,
+            rows: usize,
+            top_k: usize,
+            ids: &[i32],
+            host: &[u32],
+            x: &[f32],
+            out: &mut [f32],
+        ) {
+            let spans: Vec<_> = host.iter().map(|&s| self.expert(ids[s as usize])).collect();
+            moe_cpu_host_slot_outputs(
+                self.dim,
+                self.mi,
+                rows,
+                top_k,
+                self.gu.len(),
+                ids,
+                None,
+                host,
+                &spans,
+                x,
+                false,
+                out,
+            )
+            .unwrap();
+        }
+
+        /// Plain per-slot reference: single-row `gemv` projections with the
+        /// GPU's BF16 points and raw F32 down output. The input rotation is the
+        /// DOWN quant's contract (as in `moe_slots_compute`).
+        fn reference(&self, id: i32, x_row: &[f32]) -> Vec<f32> {
+            let e = id as usize;
+            let mut gv = vec![0.0f32; 2 * self.mi];
+            gemv(self.gq, &self.gu[e], 2 * self.mi, self.dim, x_row, &mut gv);
+            for g in gv.iter_mut() {
+                *g = bf16_rt(*g);
+            }
+            let mut hid = vec![0.0f32; self.mi];
+            silu_mul(&gv, &mut hid);
+            for h in hid.iter_mut() {
+                *h = bf16_rt(*h);
+            }
+            match self.dq.input_rotation() {
+                InputRotation::FwhtG128V2 => rotate_x_128_v2(&mut hid),
+                InputRotation::FwhtG256 => rotate_x(&mut hid),
+                InputRotation::None => {}
+            }
+            let mut dout = vec![0.0f32; self.dim];
+            gemv(self.dq, &self.dn[e], self.dim, self.mi, &hid, &mut dout);
+            dout
+        }
+    }
+
+    /// D2 admits windows of 2..4 rows; each token's host slots (the cold
+    /// experts of ITS route) and the canonically joined row must be byte
+    /// identical to the one-row AR of that token at every row position, across
+    /// formats (cached-Σx MQ4/MQ6, uncached, and the planar E8P-I4 / W3 slab
+    /// pairs with a distinct gate_up and down quant), identical vs distinct
+    /// tokens, repeated experts across rows, changing cold sets, invalid slots,
+    /// accepted prefix replays (narrower windows, run in both orders so a wide
+    /// window's scratch is reused by a narrow one) and AR calls in between.
+    #[test]
+    fn d2_window_rows_are_byte_identical_to_one_row_ar_for_every_position() {
+        let (top_k, n_exp) = (3usize, 8usize);
+        let scenarios: [[[i32; 3]; 4]; 4] = [
+            [[2, 0, 4]; 4],
+            [[2, 0, 4], [0, 4, 2], [4, 2, 1], [1, 2, 0]],
+            [[2, -1, 4], [40, 0, 4], [2, 0, -1], [-1, -1, 3]],
+            [[0, 1, 1], [3, 4, 5], [6, 7, 0], [1, 3, 5]],
+        ];
+        // Cold experts per call (bit e = expert e is cold).
+        let cold_sets = [0xFFu8, 0x55, 0xAA, 0x05, 0x00, 0x24, 0x81, 0x1B];
+        let shapes = [
+            (CpuQuant::Mq4G128V2, CpuQuant::Mq4G128V2, 256usize, 128usize),
+            (CpuQuant::Mq4G256, CpuQuant::Mq4G256, 256, 256),
+            (CpuQuant::Mq6G256, CpuQuant::Mq6G256, 256, 256),
+            (CpuQuant::Mq4G256V2, CpuQuant::Mq4G256V2, 256, 256),
+            // Planar slab formats: gate_up and down use distinct row widths.
+            (CpuQuant::E8pI4G128R256, CpuQuant::E8pI4G128R128, 256, 128),
+            (CpuQuant::Mq3I4G128R256, CpuQuant::Mq3I4G128R128, 256, 128),
+        ];
+        for (gq, dq, dim, mi) in shapes {
+            let fx = qfix(gq, dq, dim, mi, n_exp);
+            let wts: Vec<f32> = (0..12)
+                .map(|s| (0.11 + 0.063 * s as f32) * if s % 3 == 1 { -1.0 } else { 1.0 })
+                .collect();
+            for (si, scenario) in scenarios.iter().enumerate() {
+                for identical in [false, true] {
+                    let mut x = x_of(4 * dim);
+                    if identical {
+                        for t in 1..4 {
+                            let (head, tail) = x.split_at_mut(t * dim);
+                            tail[..dim].copy_from_slice(&head[..dim]);
+                        }
+                    }
+                    for &cold in &cold_sets {
+                        let is_host = |id: i32| route_id_valid(id, n_exp) && (cold >> id) & 1 == 1;
+                        // One-row AR per token (its own call, its own cold slots).
+                        let ar: Vec<(Vec<u32>, Vec<f32>)> = (0..4)
+                            .map(|t| {
+                                let r_ids = &scenario[t];
+                                let host: Vec<u32> = (0..top_k as u32)
+                                    .filter(|&s| is_host(r_ids[s as usize]))
+                                    .collect();
+                                let mut out = stale(top_k * dim);
+                                fx.run(
+                                    1,
+                                    top_k,
+                                    r_ids,
+                                    &host,
+                                    &x[t * dim..(t + 1) * dim],
+                                    &mut out,
+                                );
+                                (host, out)
+                            })
+                            .collect();
+                        // Narrow widths keep the proven legacy cover; 5..8 extend
+                        // it one row at a time and 64 is the full logical window
+                        // (same row-cycled scenario rows, same one-row AR oracle).
+                        let mut window_outs: Vec<(usize, Vec<f32>)> = Vec::new();
+                        for width in [2usize, 3, 4, 3, 2, 5, 6, 7, 8, 64] {
+                            let ids: Vec<i32> = (0..width)
+                                .flat_map(|t| scenario[t % 4].iter().copied())
+                                .collect();
+                            let host: Vec<u32> = (0..(width * top_k) as u32)
+                                .filter(|&s| is_host(ids[s as usize]))
+                                .collect();
+                            let xw: Vec<f32> = (0..width)
+                                .flat_map(|t| x[t % 4 * dim..(t % 4 + 1) * dim].to_vec())
+                                .collect();
+                            let mut out = stale(width * top_k * dim);
+                            fx.run(width, top_k, &ids, &host, &xw, &mut out);
+                            let ctx = format!(
+                                "{gq:?}/{dq:?} scenario {si} identical={identical} cold={cold:#04x} width={width}"
+                            );
+                            for t in 0..width {
+                                // Row `t` cycles the 4 proven scenario rows; the
+                                // one-row AR oracle (`ar`) and scalar reference
+                                // index the same cycled row.
+                                let cyc = t % 4;
+                                for j in 0..top_k {
+                                    let s = t * top_k + j;
+                                    let range = s * dim..(s + 1) * dim;
+                                    if host.contains(&(s as u32)) {
+                                        let one = &ar[cyc].1[j * dim..(j + 1) * dim];
+                                        assert_eq!(
+                                            bits(&out[range.clone()]),
+                                            bits(one),
+                                            "{ctx}: row {t} rank {j} host value != one-row AR"
+                                        );
+                                        assert_eq!(
+                                            bits(&out[range]),
+                                            bits(
+                                                &fx.reference(ids[s], &xw[t * dim..(t + 1) * dim])
+                                            ),
+                                            "{ctx}: row {t} rank {j} != scalar reference"
+                                        );
+                                    } else {
+                                        assert!(all_stale(&out[range]), "{ctx}: slot {s} written");
+                                    }
+                                }
+                            }
+                            // Accepted-prefix replay: a narrower window over the
+                            // same leading rows reproduces the wider one's bytes,
+                            // restricted to widths the legacy harness recorded
+                            // (2..4 over the first 4 scenario rows).
+                            for (pw, pout) in &window_outs {
+                                if width > 4 || *pw > 4 {
+                                    continue;
+                                }
+                                let n = (*pw).min(width) * top_k * dim;
+                                assert_eq!(
+                                    bits(&out[..n]),
+                                    bits(&pout[..n]),
+                                    "{ctx}: width {width} prefix != width {pw}"
+                                );
+                            }
+                            window_outs.push((width, out.clone()));
+
+                            // Canonical join: GPU arm values for non-host valid
+                            // slots (scalar reference), host slots from the
+                            // window, invalid slots NaN; combined over the
+                            // window vs per-row one-row AR joins. Weights cycle
+                            // with the rows (`wts` covers the 4-row harness).
+                            let residual: Vec<f32> =
+                                (0..dim).map(|c| 1.0 + 0.013 * c as f32).collect();
+                            let mut expanded = vec![0.0f32; width * top_k * dim];
+                            let mut ar_expanded = vec![vec![0.0f32; top_k * dim]; width];
+                            for t in 0..width {
+                                for j in 0..top_k {
+                                    let s = t * top_k + j;
+                                    let id = ids[s];
+                                    let dst = s * dim..(s + 1) * dim;
+                                    let r_dst = j * dim..(j + 1) * dim;
+                                    if !route_id_valid(id, n_exp) {
+                                        expanded[dst].fill(f32::NAN);
+                                        ar_expanded[t][r_dst].fill(f32::NAN);
+                                    } else if is_host(id) {
+                                        expanded[dst.clone()].copy_from_slice(&out[dst]);
+                                        ar_expanded[t][r_dst.clone()]
+                                            .copy_from_slice(&ar[t % 4].1[r_dst]);
+                                    } else {
+                                        let v = fx.reference(id, &xw[t * dim..(t + 1) * dim]);
+                                        expanded[dst].copy_from_slice(&v);
+                                        ar_expanded[t][r_dst].copy_from_slice(&v);
+                                    }
+                                }
+                            }
+                            let mut joined = vec![0.0f32; width * dim];
+                            for t in 0..width {
+                                joined[t * dim..(t + 1) * dim].copy_from_slice(&residual);
+                            }
+                            // Row-cycled weights for the wide combine.
+                            let wts_wide: Vec<f32> = (0..width)
+                                .flat_map(|t| {
+                                    let cyc = t % 4;
+                                    wts[cyc * top_k..(cyc + 1) * top_k].to_vec()
+                                })
+                                .collect();
+                            moe_canonical_combine_reference(
+                                dim,
+                                width,
+                                top_k,
+                                n_exp,
+                                &ids,
+                                &wts_wide,
+                                &expanded,
+                                &mut joined,
+                            );
+                            for t in 0..width {
+                                let cyc = t % 4;
+                                let mut row = residual.clone();
+                                moe_canonical_combine_reference(
+                                    dim,
+                                    1,
+                                    top_k,
+                                    n_exp,
+                                    &scenario[cyc],
+                                    &wts[cyc * top_k..(cyc + 1) * top_k],
+                                    &ar_expanded[t],
+                                    &mut row,
+                                );
+                                assert_eq!(
+                                    bits(&joined[t * dim..(t + 1) * dim]),
+                                    bits(&row),
+                                    "{ctx}: row {t} joined != one-row AR join"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same slot ⇒ same bytes, whatever the window grouping, host-slot order,
+    /// number of rows per call, or worker count; and they match the scalar
+    /// per-slot reference. Rows with no host slot are never read.
+    #[test]
+    fn host_slot_bytes_independent_of_grouping_order_and_worker_count() {
+        let (rows, top_k, n_exp) = (4usize, 3usize, 5usize);
+        let fx = host_fixture(n_exp);
+        let ids: Vec<i32> = vec![4, 1, 3, 1, 1, 0, 3, 2, 4, 0, 2, 1];
+        let x = x_of(rows * HS_DIM);
+        let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
+        let every: Vec<u32> = (0..12).collect();
+        let run = |pool: Option<&rayon::ThreadPool>, host: &[u32], x: &[f32]| {
+            let mut out = stale(12 * HS_DIM);
+            hs_run(
+                pool,
+                rows,
+                top_k,
+                n_exp,
+                &ids,
+                None,
+                host,
+                &fx.spans(&ids, host),
+                x,
+                &mut out,
+            )
+            .unwrap();
+            out
+        };
+        let full = run(None, &every, &x);
+        assert!(full.iter().all(|v| v.is_finite()));
+        for s in 0..12 {
+            let row = s / top_k;
+            assert_eq!(
+                bits(&full[range(s)]),
+                bits(&slot_reference(
+                    &fx,
+                    ids[s],
+                    &x[row * HS_DIM..(row + 1) * HS_DIM]
+                )),
+                "slot {s} != scalar reference"
+            );
+        }
+        // Host-slot order.
+        let mut reversed = every.clone();
+        reversed.reverse();
+        let interleaved: Vec<u32> = (0..12u32)
+            .filter(|s| s % 2 == 0)
+            .chain((0..12u32).filter(|s| s % 2 == 1))
+            .collect();
+        for order in [&reversed, &interleaved] {
+            assert_eq!(
+                bits(&run(None, order, &x)),
+                bits(&full),
+                "host-slot order changed bytes"
+            );
+        }
+        // Each slot alone (group size 1): only that slot is written.
+        for s in 0..12u32 {
+            let out = run(None, &[s], &x);
+            assert_eq!(
+                bits(&out[range(s as usize)]),
+                bits(&full[range(s as usize)]),
+                "slot {s} alone"
+            );
+            for o in 0..12 {
+                if o != s as usize {
+                    assert!(
+                        all_stale(&out[range(o)]),
+                        "slot {o} written by a call for slot {s}"
+                    );
+                }
+            }
+        }
+        // One row per call.
+        for t in 0..rows {
+            let mut out = stale(top_k * HS_DIM);
+            let host = [0u32, 1, 2];
+            let row_ids = &ids[t * top_k..(t + 1) * top_k];
+            hs_run(
+                None,
+                1,
+                top_k,
+                n_exp,
+                row_ids,
+                None,
+                &host,
+                &fx.spans(row_ids, &host),
+                &x[t * HS_DIM..(t + 1) * HS_DIM],
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(
+                bits(&out),
+                bits(&full[t * top_k * HS_DIM..(t + 1) * top_k * HS_DIM]),
+                "row {t} window"
+            );
+        }
+        // Worker count.
+        for threads in [1usize, 2, 3, 7] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            assert_eq!(
+                bits(&run(Some(&pool), &every, &x)),
+                bits(&full),
+                "{threads} workers"
+            );
+            assert_eq!(
+                bits(&run(Some(&pool), &reversed, &x)),
+                bits(&full),
+                "{threads} workers, reversed"
+            );
+        }
+        // Row 1 has no host slot: NaN there must never be read.
+        let mut poisoned = x.clone();
+        poisoned[HS_DIM..2 * HS_DIM].fill(f32::NAN);
+        let sparse = [10u32, 2, 7];
+        let out = run(None, &sparse, &poisoned);
+        for s in 0..12usize {
+            if sparse.contains(&(s as u32)) {
+                assert_eq!(
+                    bits(&out[range(s)]),
+                    bits(&full[range(s)]),
+                    "sparse slot {s}"
+                );
+            } else {
+                assert!(all_stale(&out[range(s)]), "slot {s} written");
+            }
+        }
+    }
+
+    fn expect_err(r: Result<(), DispatchError>, needle: &str) {
+        let e = r.expect_err(needle);
+        assert!(
+            format!("{e}").contains(needle),
+            "expected {needle:?}, got: {e}"
+        );
+    }
+
+    /// Every defect of the plan is an error from the validator, before any
+    /// arithmetic; the arithmetic entry leaves `out` untouched on failure.
+    #[test]
+    fn host_slot_plan_validation_rejects_bad_plans() {
+        let (rows, top_k, n_exp) = (2usize, 2usize, 4usize);
+        let fx = host_fixture(n_exp);
+        let ids = [0i32, 1, 2, 3];
+        let (xl, ol) = (rows * HS_DIM, rows * top_k * HS_DIM);
+        let val = |ids: &[i32],
+                   gpu: Option<&[i32]>,
+                   host: &[u32],
+                   ex: &[CpuMoeExpert<'_>],
+                   xl: usize,
+                   awq: bool,
+                   ol: usize| {
+            validate_moe_cpu_host_slot_outputs(
+                HS_DIM, HS_MI, rows, top_k, n_exp, ids, gpu, host, ex, xl, awq, ol,
+            )
+        };
+        let host = [0u32, 3];
+        let ex = fx.spans(&ids, &host);
+        val(&ids, Some(&[-1, 1, 2, -1]), &host, &ex, xl, false, ol).unwrap();
+        val(&ids, None, &host, &ex, xl, false, ol).unwrap();
+        val(&ids, None, &[], &[], xl, false, ol).unwrap();
+        // A router-invalid slot owned by neither arm is a valid plan.
+        let bad = [0i32, -1, 2, 3];
+        let bad_ex = fx.spans(&bad, &host);
+        val(&bad, Some(&[-1, -1, 2, -1]), &host, &bad_ex, xl, false, ol).unwrap();
+        val(&bad, Some(&[-1, 77, 2, -1]), &host, &bad_ex, xl, false, ol).unwrap();
+
+        let dup = [1u32, 1];
+        expect_err(
+            val(&ids, None, &dup, &fx.spans(&ids, &dup), xl, false, ol),
+            "twice",
+        );
+        expect_err(
+            val(&ids, None, &[4], &[fx.expert(0)], xl, false, ol),
+            "out of range",
+        );
+        expect_err(
+            val(&bad, None, &[1], &[fx.expert(0)], xl, false, ol),
+            "invalid expert id",
+        );
+        let big = [0i32, 9, 2, 3];
+        expect_err(
+            val(&big, None, &[1], &[fx.expert(0)], xl, false, ol),
+            "invalid expert id",
+        );
+        expect_err(
+            val(&ids, None, &host, &ex[..1], xl, false, ol),
+            "span count",
+        );
+        let short = CpuMoeExpert {
+            gate_up_quant: HS_Q,
+            gate_up: &fx.gu[0][..16],
+            down_quant: HS_Q,
+            down: &fx.dn[0],
+        };
+        expect_err(val(&ids, None, &[0], &[short], xl, false, ol), "span");
+        expect_err(val(&ids, None, &host, &ex, xl, true, ol), "AWQ");
+        let same = [1i32, 1, 2, 3];
+        let h2 = [0u32, 1];
+        expect_err(
+            val(
+                &same,
+                None,
+                &h2,
+                &[fx.expert(1), fx.expert(2)],
+                xl,
+                false,
+                ol,
+            ),
+            "different spans",
+        );
+        // Ownership partition against the masked GPU route.
+        expect_err(
+            val(&ids, Some(&[0, 1, 2, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&ids, Some(&[-1, -1, 2, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&ids, Some(&[-1, 1, 3, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&bad, Some(&[-1, 1, 2, -1]), &host, &bad_ex, xl, false, ol),
+            "ownership",
+        );
+        // Extents.
+        expect_err(val(&ids, None, &host, &ex, xl - 1, false, ol), "activation");
+        expect_err(val(&ids, None, &host, &ex, xl, false, ol - 1), "activation");
+        expect_err(val(&ids[..3], None, &host, &ex, xl, false, ol), "route ids");
+        expect_err(
+            validate_moe_cpu_host_slot_outputs(
+                HS_DIM,
+                HS_MI,
+                0,
+                top_k,
+                n_exp,
+                &ids,
+                None,
+                &[],
+                &[],
+                0,
+                false,
+                0,
+            ),
+            "non-zero",
+        );
+        expect_err(
+            validate_moe_cpu_host_slot_outputs(
+                255,
+                HS_MI,
+                rows,
+                top_k,
+                n_exp,
+                &ids,
+                None,
+                &[],
+                &[],
+                xl,
+                false,
+                ol,
+            ),
+            "multiple of 256",
+        );
+
+        // The arithmetic entry refuses the same plans without writing.
+        let x = x_of(xl);
+        let mut out = stale(ol);
+        let e = moe_cpu_host_slot_outputs(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            None,
+            &dup,
+            &fx.spans(&ids, &dup),
+            &x,
+            false,
+            &mut out,
+        )
+        .expect_err("duplicate host slot");
+        assert!(format!("{e}").contains("twice"));
+        assert!(all_stale(&out));
+        let e = moe_cpu_host_slot_outputs(
+            HS_DIM, HS_MI, rows, top_k, n_exp, &ids, None, &host, &ex, &x, true, &mut out,
+        )
+        .expect_err("awq");
+        assert!(format!("{e}").contains("AWQ"));
+        assert!(all_stale(&out));
+    }
+
+    /// After `reserve_moe_cpu_host_slot_scratch`, a call within that slot count
+    /// grows no scratch buffer, and the capacity getter reports rows, not slots.
+    #[test]
+    fn reserved_scratch_is_not_regrown_by_the_host_slot_call() {
+        reserved_scratch_holds(4, 3);
+        // Full logical-window prewarm: one 640-slot reserve, then a 64-row call
+        // covering the whole window grows nothing.
+        reserved_scratch_holds(64, 10);
+    }
+
+    fn reserved_scratch_holds(rows: usize, top_k: usize) {
+        let n_exp = 5usize;
+        reserve_moe_cpu_host_slot_scratch(HS_DIM, HS_MI, rows * top_k).unwrap();
+        // Row units, not slots: legacy 40-slot reserve reports 4 rows at
+        // top_k 10; the 640-slot prewarm reports 64.
+        assert_eq!(
+            moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, HS_MI, top_k),
+            rows
+        );
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(0, HS_MI, top_k), 0);
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, 0, top_k), 0);
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, HS_MI, 0), 0);
+        let caps = || {
+            MOE_SCRATCH.with(|c| {
+                let s = c.borrow();
+                [
+                    s.gu.capacity(),
+                    s.hidden.capacity(),
+                    s.dn.capacity(),
+                    s.gather.capacity(),
+                    s.order.capacity(),
+                    s.group_start.capacity(),
+                    s.group_id.capacity(),
+                    s.slot_group.capacity(),
+                    s.slot_si.capacity(),
+                    s.group_off.capacity(),
+                ]
+            })
+        };
+        let before = caps();
+        let fx = host_fixture(n_exp);
+        let slots = rows * top_k;
+        let ids: Vec<i32> = (0..slots).map(|s| (s % n_exp) as i32).collect();
+        let host: Vec<u32> = (0..slots as u32).collect();
+        let x = x_of(rows * HS_DIM);
+        let mut out = stale(slots * HS_DIM);
+        hs_run(
+            None,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            None,
+            &host,
+            &fx.spans(&ids, &host),
+            &x,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(caps(), before);
     }
 }

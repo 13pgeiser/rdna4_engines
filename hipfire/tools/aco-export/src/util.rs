@@ -16,7 +16,10 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn sha256_file(path: &Path) -> Res<String> {
@@ -52,25 +55,35 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> Res<()> {
 pub fn jget<'a>(v: &'a Value, path: &str) -> Res<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
-        cur = cur.get(part).ok_or_else(|| format!("required field `{path}` is absent"))?;
+        cur = cur
+            .get(part)
+            .ok_or_else(|| format!("required field `{path}` is absent"))?;
     }
     Ok(cur)
 }
 
 pub fn jstr<'a>(v: &'a Value, path: &str) -> Res<&'a str> {
-    jget(v, path)?.as_str().ok_or_else(|| format!("field `{path}` must be a string"))
+    jget(v, path)?
+        .as_str()
+        .ok_or_else(|| format!("field `{path}` must be a string"))
 }
 
 pub fn ju64(v: &Value, path: &str) -> Res<u64> {
-    jget(v, path)?.as_u64().ok_or_else(|| format!("field `{path}` must be an unsigned integer"))
+    jget(v, path)?
+        .as_u64()
+        .ok_or_else(|| format!("field `{path}` must be an unsigned integer"))
 }
 
 pub fn jbool(v: &Value, path: &str) -> Res<bool> {
-    jget(v, path)?.as_bool().ok_or_else(|| format!("field `{path}` must be a boolean"))
+    jget(v, path)?
+        .as_bool()
+        .ok_or_else(|| format!("field `{path}` must be a boolean"))
 }
 
 pub fn jarr<'a>(v: &'a Value, path: &str) -> Res<&'a Vec<Value>> {
-    jget(v, path)?.as_array().ok_or_else(|| format!("field `{path}` must be an array"))
+    jget(v, path)?
+        .as_array()
+        .ok_or_else(|| format!("field `{path}` must be an array"))
 }
 
 /// Repository root: tools/aco-export/../..
@@ -97,12 +110,16 @@ impl Args {
         let mut i = 0;
         while i < argv.len() {
             let a = &argv[i];
-            let key = a.strip_prefix("--").ok_or_else(|| format!("unexpected argument `{a}`"))?;
+            let key = a
+                .strip_prefix("--")
+                .ok_or_else(|| format!("unexpected argument `{a}`"))?;
             if flags.contains(&key) {
                 map.entry(key.to_owned()).or_default().push(String::new());
                 i += 1;
             } else {
-                let v = argv.get(i + 1).ok_or_else(|| format!("missing value for --{key}"))?;
+                let v = argv
+                    .get(i + 1)
+                    .ok_or_else(|| format!("missing value for --{key}"))?;
                 map.entry(key.to_owned()).or_default().push(v.clone());
                 i += 2;
             }
@@ -124,12 +141,18 @@ impl Args {
 
     pub fn path(&self, k: &str) -> Res<PathBuf> {
         let p = PathBuf::from(self.req(k)?);
-        Ok(if p.is_absolute() { p } else { std::env::current_dir().map_err(err)?.join(p) })
+        Ok(if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().map_err(err)?.join(p)
+        })
     }
 }
 
 pub fn run(cmd: &mut Command) -> Res<Output> {
-    let out = cmd.output().map_err(|e| format!("spawn {:?}: {e}", cmd.get_program()))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("spawn {:?}: {e}", cmd.get_program()))?;
     if !out.status.success() {
         return Err(format!(
             "{:?} failed ({}):\n{}{}",
@@ -159,9 +182,17 @@ pub fn which(name: &str) -> Res<PathBuf> {
 /// Identity of an external tool: resolved path, SHA-256 of the executable, and the first
 /// `max_lines` lines of `<tool> <version_arg>`.
 pub fn tool_identity(path: &Path, version_arg: &str, max_lines: usize) -> Res<Value> {
-    let real = fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
-    let out = Command::new(&real).arg(version_arg).output().map_err(|e| format!("{}: {e}", real.display()))?;
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let real =
+        fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
+    let out = Command::new(&real)
+        .arg(version_arg)
+        .output()
+        .map_err(|e| format!("{}: {e}", real.display()))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let version: Vec<&str> = text.lines().take(max_lines).collect();
     Ok(serde_json::json!({
         "path": real.display().to_string(),

@@ -13,8 +13,8 @@
 //! verdict. Exit 0 on PASS (loaded + compat), 1 on tokenizer mismatch, 2 on
 //! load failure.
 
-use hipfire_pflash::pflash::{self, PflashConfig, PflashState};
 use hipfire_arch_qwen35::qwen35;
+use hipfire_pflash::pflash::{self, PflashConfig, PflashState};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;

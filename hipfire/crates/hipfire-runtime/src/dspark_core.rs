@@ -2,6 +2,7 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::dspark_block_controller::WindowCost;
 use crate::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecRequestConfig,
     SpecScratch, SpecTarget, Speculator,
@@ -1169,7 +1170,7 @@ impl MtpDrafter for DsparkDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<crate::spec::PrefillOutcome, String> {
         if !cache_hit {
             target.reset_recurrent(gpu)?;
         }
@@ -1200,10 +1201,12 @@ impl MtpDrafter for DsparkDrafter {
         // already reset above on cache_miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
         match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
-            crate::spec::SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-            crate::spec::SpecAdvance::Aborted => {
-                Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
+            crate::spec::SpecAdvance::Ready { last_argmax, .. } => {
+                Ok(crate::spec::PrefillOutcome::Ready {
+                    first_token: last_argmax,
+                })
             }
+            crate::spec::SpecAdvance::Aborted => Ok(crate::spec::PrefillOutcome::Aborted),
         }
     }
 
@@ -1737,6 +1740,8 @@ impl MtpDrafter for DsparkDrafter {
 /// `mtp_final_norm`; qwen3: drafter `norm`); `lm_head` is `[vocab, hidden]`.
 /// `supports_temp` enables distribution-preserving sampled verify at temp>0
 /// (requires the target to implement `verify_block_sampled_capture_gpu`).
+/// `window_cost` feeds the adaptive block controller; only
+/// [`WindowCost::Fixed`] keeps greedy output reproducible across processes.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dspark_speculator(
     body: Box<dyn DsparkBody>,
@@ -1747,7 +1752,7 @@ pub fn build_dspark_speculator(
     ctx_capacity: usize,
     conf_threshold: f32,
     supports_temp: bool,
-    max_cost_ratio: f32,
+    window_cost: WindowCost,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     let persistent_verify_context_scratch = body.persistent_verify_context_scratch();
@@ -1766,7 +1771,7 @@ pub fn build_dspark_speculator(
             1,
             block,
             0.18,
-            max_cost_ratio,
+            window_cost,
         )
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {

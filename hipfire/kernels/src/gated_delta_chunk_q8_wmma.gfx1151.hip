@@ -26,6 +26,13 @@ static __device__ __forceinline__ float gc_bf16r(float v) { return (float)(hip_b
 static __device__ __forceinline__ unsigned int gc_pack(float a, float b) {
     return __builtin_bit_cast(unsigned int, gc_h2{(_Float16)a, (_Float16)b});
 }
+// Lane `src`'s value of `v`, as a wave-uniform (scalar) operand.
+static __device__ __forceinline__ float gc_lane(float v, int src) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), src));
+}
+// `v` unchanged but opaque, so rounding it to F16 stays F32-then-F16 (cvt) instead of folding
+// the fma that produced it into one F16-rounded v_fma_mix.
+static __device__ __forceinline__ float gc_opaque(float v) { asm("" : "+v"(v)); return v; }
 // C-layout tile (lane: column l16, rows 2r + hi) -> the B operand of that
 // matrix (lane: column l16, all 16 rows), by swapping half-waves.
 static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
@@ -58,7 +65,11 @@ static __device__ __forceinline__ float gc_q8_scale(float peak) { return peak > 
 // the Q8 path plus a capture of the final F32 state ([head][key][value]) right after the slot
 // (slot bytes = value_heads * 128 * 132), for tests.  Arguments are gated_delta_chunk_gate_wmma's
 // with `float* state` -> `void* state`, then `int state_q8, unsigned int frame` appended.
+// Six waves per SIMD on gfx1151, as gated_delta_chunk_gate_wmma: all 48 value-head blocks resident.
 __launch_bounds__(256)
+#if defined(__gfx1151__)
+__attribute__((amdgpu_waves_per_eu(6)))
+#endif
 extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
     const unsigned short* __restrict__ projection, const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn,
     const float* __restrict__ gate, const float* __restrict__ beta, void* __restrict__ state,
@@ -217,35 +228,30 @@ extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
 #pragma unroll
             for (int s = 0; s < 8; ++s)
                 c = GC_WMMA(*(const gc_h16*)&k_s[l16][16 * s], *(const gc_h16*)&k_s[l16][16 * s], c);
-            // L strictly lower; T = (I - L)^-1 = (I + L)(I + L^2)(I + L^4)(I + L^8).
-            gc_f8 T, P;
+            // L strictly lower, F32, in registers (C layout: lane l16 = column j, rows 2r + hi).
+            // T = (I - L)^-1 by F32 forward substitution T_i = e_i + sum_{m<i} L_im T_m, m
+            // ascending (T_m[j] = 0 for m < j); lane l16 owns column j, both half-waves compute
+            // and store it (the same value).  L_im is lane m + 16 (i & 1) of register i / 2, read
+            // as a scalar operand: no LDS round trip per row, and row i waits only on the T_m it
+            // consumes, so rows overlap.  The F16 WMMA product form overflowed F16 partial
+            // products when k_i . k_j ~ 1 (repeated tokens).
+            float Lr[8];
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
-                P[r] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
-                T[r] = P[r] + (i == j ? 1.f : 0.f);
+                Lr[r] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
             }
+            float Tc[16];
 #pragma unroll
-            for (int s = 0; s < 3; ++s) {
-                // P as A: rows via LDS (t_s scratch), as B: half-wave swap.
+            for (int i = 0; i < 16; ++i) {
+                float acc = i == l16 ? 1.f : 0.f;
 #pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)P[r];
-                GC_WAVE_SYNC();
-                const gc_h16 pa = *(const gc_h16*)&t_s[l16][0];
-                const gc_h16 pbv = gc_c_to_b(P, hi);
-                GC_WAVE_SYNC();
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
-                GC_WAVE_SYNC();
-                const gc_h16 ta = *(const gc_h16*)&t_s[l16][0];
-                gc_f8 P2 = {0, 0, 0, 0, 0, 0, 0, 0};
-                P2 = GC_WMMA(pa, pbv, P2);
-                T = GC_WMMA(ta, gc_c_to_b(P2, hi), T);
-                P = P2;
-                GC_WAVE_SYNC();
+                for (int m = 0; m < i; ++m) acc = fmaf(gc_lane(Lr[i >> 1], m + 16 * (i & 1)), Tc[m], acc);
+                Tc[i] = acc;
+                // Rows 0..14 round F32 then F16; row 15's last fma has no other use and rounds
+                // straight to F16 (v_fma_mix), exactly as the landed per-row-store kernel did.
+                t_s[i][l16] = (_Float16)(i < 15 ? gc_opaque(acc) : acc);
             }
-#pragma unroll
-            for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll

@@ -62,7 +62,10 @@ fn main() -> io::Result<()> {
             }
             "--suffix" => suffixes.push(args[index + 1].clone()),
             "--qt44-payload-dir" => {
-                if qt44_payload_dir.replace(PathBuf::from(&args[index + 1])).is_some() {
+                if qt44_payload_dir
+                    .replace(PathBuf::from(&args[index + 1]))
+                    .is_some()
+                {
                     return Err(invalid("duplicate --qt44-payload-dir"));
                 }
             }
@@ -126,13 +129,19 @@ fn main() -> io::Result<()> {
     if let Some(directory) = &qt44_payload_dir {
         for tensor in &mut selected {
             if tensor.shape.len() != 2 || tensor.shape[1] % 256 != 0 {
-                return Err(invalid(format!("{}: QT44 requires rank 2 and K divisible by 256", tensor.name)));
+                return Err(invalid(format!(
+                    "{}: QT44 requires rank 2 and K divisible by 256",
+                    tensor.name
+                )));
             }
             let path = directory.join(format!("{}.bin", tensor.name));
             let expected = u64::from(tensor.shape[0]) * u64::from(tensor.shape[1] / 256) * 136;
             let actual = std::fs::metadata(&path)?.len();
             if actual != expected {
-                return Err(invalid(format!("{}: {actual} bytes != QT44 expected {expected}", path.display())));
+                return Err(invalid(format!(
+                    "{}: {actual} bytes != QT44 expected {expected}",
+                    path.display()
+                )));
             }
             tensor.quant_type = 44;
             tensor.group_size = 256;

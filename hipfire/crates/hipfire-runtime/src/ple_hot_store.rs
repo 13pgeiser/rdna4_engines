@@ -24,9 +24,10 @@
 //! ready, a prewarm reads the pack's data from its start (hottest tier
 //! first), then reads tier 0 a second time so its pages are promoted to the
 //! active list and outlive the colder ones when the cache is reclaimed.  It
-//! runs while no request is being served: every PLE fetch holds the row
-//! store's [`FetchActivity`] busy (bound by `RowStore::attach_hot_store`), and
-//! the prewarm resumes `FETCH_QUIET` after the last one.
+//! runs while no request is being served: every request holds the row store's
+//! [`FetchActivity`] busy for its whole duration (a `ServingGuard`, and each PLE
+//! fetch its own guard; bound by `RowStore::attach_hot_store`), and the prewarm
+//! resumes `FETCH_QUIET` after the last guard dropped.
 //!
 //! A rank-ordered table's worker can also start while the model is still
 //! loading ([`LoadFill`]): it reads the hottest prefix of the table at a
@@ -78,10 +79,18 @@
 //! payload padded_rows bytes, one bucket per global PLE row (0 = hottest)
 //! ```
 
+// Outside Unix the store cannot be constructed: its pack reads, `posix_fadvise`
+// advice, `mincore` residency view and `O_DIRECT` model reads have no
+// implementation here, so the constructors and the worker chain are gated and
+// what only they use is dead code.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -150,6 +159,15 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[usize::from(byte & 15)] as char);
     }
     out
+}
+
+/// The error text of a hot-row store path that needs Unix-only file I/O.
+#[cfg(not(unix))]
+fn unsupported(what: &str) -> String {
+    format!(
+        "{TAG}: {what} is unsupported on Windows: the hot-row store needs Unix \
+         positional reads (pread), posix_fadvise and mincore; run on Linux"
+    )
 }
 
 fn is_hex64(text: &str) -> bool {
@@ -437,6 +455,7 @@ pub(crate) trait ShardRead: Sync {
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize>;
 }
 
+#[cfg(unix)]
 /// Open `path` for O_DIRECT reads, falling back to buffered reads on a
 /// filesystem that refuses the flag.
 pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
@@ -456,21 +475,14 @@ pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
     }
 }
 
-/// `/proc/meminfo` `MemAvailable` in bytes (page cache counts as available,
-/// so a prewarmed pack does not lower it).
+/// `/proc/meminfo` `MemAvailable - CMA` in bytes (page cache counts as
+/// available, so a prewarmed pack does not lower it; CMA pageblocks do not
+/// serve pinned allocations).
 pub fn mem_available_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kib: u64 = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .ok()?;
-    Some(kib * 1024)
+    rdna_compute::uma_memory::mem_available_bytes()
 }
 
+#[cfg(unix)]
 /// Read exactly `dst.len()` bytes at `offset`, retrying interrupted and short
 /// reads; a read that hits end of file is a `ShortRead`.
 fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
@@ -493,11 +505,120 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceE
     Ok(())
 }
 
+/// Unsupported outside Unix: errs without reading.
+#[cfg(not(unix))]
+fn read_exact_at(_file: &File, offset: u64, _dst: &mut [u8]) -> Result<(), SourceError> {
+    Err(SourceError::Io {
+        offset,
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            unsupported("positional pack read"),
+        ),
+    })
+}
+
+/// Result of a non-blocking positional read ([`read_nowait_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NowaitRead {
+    /// `dst` was filled completely from data already in memory.
+    Done,
+    /// Nothing usable was read: the bytes are not in the page cache (`EAGAIN`),
+    /// the read was short (including end of file), or the kernel/filesystem has
+    /// no `RWF_NOWAIT` support.  `dst` content is unspecified; the caller redoes
+    /// the whole read through its blocking path, which also reports a genuine
+    /// short read or error.
+    WouldBlock,
+}
+
+/// Set once the kernel or filesystem reported no `RWF_NOWAIT` support, so later
+/// reads skip the doomed syscall.  Capability only: real I/O errors never set it.
+static NOWAIT_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Read `dst.len()` bytes at `offset` with `preadv2(RWF_NOWAIT)`: the read
+/// completes only when every byte is already in the page cache, and never
+/// waits for the device.  `Ok(WouldBlock)` (see [`NowaitRead`]) covers a cache
+/// miss, a short read and missing `RWF_NOWAIT` support (`ENOSYS`,
+/// `EOPNOTSUPP`, `EINVAL`); every other errno is a real I/O error and is
+/// returned.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_nowait_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<NowaitRead> {
+    if dst.is_empty() {
+        return Ok(NowaitRead::Done);
+    }
+    if NOWAIT_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Ok(NowaitRead::WouldBlock);
+    }
+    let Ok(at) = libc::off_t::try_from(offset) else {
+        return Ok(NowaitRead::WouldBlock);
+    };
+    match nowait_probe(file, at, dst)? {
+        NowaitProbe::Read(read) => Ok(read),
+        NowaitProbe::Unsupported => {
+            NOWAIT_UNSUPPORTED.store(true, Ordering::Relaxed);
+            Ok(NowaitRead::WouldBlock)
+        }
+    }
+}
+
+/// One `preadv2(RWF_NOWAIT)` of a non-empty `dst` (see [`read_nowait_at`]),
+/// without the process-wide capability flag.
+#[cfg(target_os = "linux")]
+fn nowait_probe(file: &File, at: libc::off_t, dst: &mut [u8]) -> io::Result<NowaitProbe> {
+    let iov = libc::iovec {
+        iov_base: dst.as_mut_ptr().cast(),
+        iov_len: dst.len(),
+    };
+    loop {
+        // SAFETY: `iov` describes `dst`, exclusively borrowed for the call; the
+        // descriptor is open for the duration of the borrow of `file`.
+        let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, at, libc::RWF_NOWAIT) };
+        if n >= 0 {
+            return Ok(NowaitProbe::Read(if n as usize == dst.len() {
+                NowaitRead::Done
+            } else {
+                NowaitRead::WouldBlock
+            }));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) => return Ok(NowaitProbe::Read(NowaitRead::WouldBlock)),
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => {
+                return Ok(NowaitProbe::Unsupported)
+            }
+            _ => return Err(error),
+        }
+    }
+}
+
+/// Outcome of [`nowait_probe`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum NowaitProbe {
+    Read(NowaitRead),
+    /// The kernel or filesystem has no `RWF_NOWAIT` (`ENOSYS`, `EOPNOTSUPP`,
+    /// `EINVAL`).
+    Unsupported,
+}
+
+/// `RWF_NOWAIT` is Linux-only: elsewhere every read takes the blocking path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_nowait_at(_: &File, _: u64, _: &mut [u8]) -> io::Result<NowaitRead> {
+    Ok(NowaitRead::WouldBlock)
+}
+
+/// Test hook of [`HotRowStore::read_pack_nowait`]: `policy(offset)` true =
+/// served as if cached, false = would block.
+#[cfg(test)]
+pub(crate) type NowaitPolicy = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
+#[cfg(unix)]
 fn fadvise(file: &File, advice: libc::c_int) {
     // SAFETY: a valid open descriptor; advice only.
     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) };
 }
 
+#[cfg(unix)]
 /// Page-cache residency of a file's first bytes, through `mincore` on a
 /// shared read-only mapping that is never read through (mapping a file does
 /// not read it).
@@ -508,6 +629,7 @@ struct Residency {
     pages: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl Residency {
     /// Map the first `len` bytes of `file`.
     fn map(file: &File, len: u64) -> io::Result<Residency> {
@@ -562,7 +684,11 @@ impl Residency {
             // (`last` <= its page count), and `pages` holds `count` bytes.
             let rc = unsafe {
                 libc::mincore(
-                    self.addr.as_ptr().cast::<u8>().add((first * page) as usize).cast(),
+                    self.addr
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add((first * page) as usize)
+                        .cast(),
                     count * page as usize,
                     self.pages.as_mut_ptr(),
                 )
@@ -579,6 +705,7 @@ impl Residency {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Residency {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` created, unmapped once.
@@ -692,9 +819,14 @@ pub struct HotRowStore {
     retouched: AtomicU64,
     /// The row store's fetch activity (see [`HotRowStore::bind_activity`]).
     activity: OnceLock<std::sync::Arc<FetchActivity>>,
+    /// Test hook: once set, [`HotRowStore::read_pack_nowait`] answers from the
+    /// policy instead of the kernel.
+    #[cfg(test)]
+    nowait_policy: OnceLock<NowaitPolicy>,
 }
 
 impl HotRowStore {
+    #[cfg(unix)]
     /// Open the hot-row pack at `pack_path` for `rank` and build the row ->
     /// pack-offset index.  Errors when the pack was not cut from this model
     /// (PLE fingerprint, shard offsets, model file size), from this rank
@@ -838,9 +970,30 @@ impl HotRowStore {
             load_filled: AtomicU64::new(0),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
+            #[cfg(test)]
+            nowait_policy: OnceLock::new(),
         }))
     }
 
+    /// Unsupported outside Unix: errs before opening or reading anything.
+    #[cfg(not(unix))]
+    pub fn open(
+        _rank: PleHotRank,
+        pack_path: &Path,
+        _rows_per_shard: usize,
+        _encoding: RowEncoding,
+        _encoded_row_bytes: usize,
+        _shard_offsets: &[u64],
+        _model_file_bytes: u64,
+    ) -> Result<std::sync::Arc<HotRowStore>, String> {
+        Err(format!(
+            "ple hot pack {}: {}",
+            pack_path.display(),
+            unsupported("opening a hot-row pack")
+        ))
+    }
+
+    #[cfg(unix)]
     /// Open a rank-ordered PLE table (a `ple-table` of `order rank`, the
     /// `<model>.ple-q4` derived with a rank): every row of the PLE table in
     /// tier order, with the rank embedded.  Reads the header and the rank
@@ -938,7 +1091,19 @@ impl HotRowStore {
             load_filled: AtomicU64::new(0),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
+            #[cfg(test)]
+            nowait_policy: OnceLock::new(),
         }))
+    }
+
+    /// Unsupported outside Unix: errs before opening or reading anything.
+    #[cfg(not(unix))]
+    pub fn open_table(path: &Path) -> Result<std::sync::Arc<HotRowStore>, String> {
+        Err(format!(
+            "ple table {}: {}",
+            path.display(),
+            unsupported("opening a rank-ordered PLE table")
+        ))
     }
 
     /// Values per row (the row store's `row_width`).
@@ -1035,8 +1200,9 @@ impl HotRowStore {
     }
 
     /// Use `activity` (the row store's [`FetchActivity`]) to pause the
-    /// prewarm: it waits while a PLE fetch (a prefill chunk or a decode step)
-    /// is in flight and for [`BUSY_QUIET`] after the last one, so it never
+    /// prewarm: it waits while a request is being served or a PLE fetch (a
+    /// prefill chunk or a decode step) is in flight, and for [`BUSY_QUIET`]
+    /// after the last guard dropped, so it never
     /// competes with a request for the SSD.  Binding the same activity again
     /// is a no-op; another one errs.  Until bound, nothing pauses the
     /// prewarm.
@@ -1087,20 +1253,55 @@ impl HotRowStore {
 
     /// Read `dst.len()` bytes of the pack at absolute `offset`.
     pub fn read_pack(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        self.check_pack_range(offset, dst.len())?;
+        read_exact_at(&self.pack, offset, dst)
+    }
+
+    /// [`HotRowStore::read_pack`] that only completes from the page cache
+    /// (`RWF_NOWAIT`, see [`read_nowait_at`]): the same range check, then
+    /// `Done` with `dst` filled or `WouldBlock` with `dst` unspecified.
+    pub(crate) fn read_pack_nowait(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        self.check_pack_range(offset, dst.len())?;
+        #[cfg(test)]
+        if let Some(policy) = self.nowait_policy.get() {
+            return if policy(offset) {
+                read_exact_at(&self.pack, offset, dst).map(|()| NowaitRead::Done)
+            } else {
+                dst.fill(0xA5);
+                Ok(NowaitRead::WouldBlock)
+            };
+        }
+        read_nowait_at(&self.pack, offset, dst).map_err(|source| SourceError::Io { offset, source })
+    }
+
+    fn check_pack_range(&self, offset: u64, len: usize) -> Result<(), SourceError> {
         let end = offset
-            .checked_add(dst.len() as u64)
+            .checked_add(len as u64)
             .ok_or(SourceError::Overflow {
                 offset,
-                length: dst.len() as u64,
+                length: len as u64,
             })?;
         if offset < self.data_offset || end > self.data_offset + self.data_bytes {
             return Err(SourceError::RangeOutOfBounds {
                 offset,
-                length: dst.len() as u64,
+                length: len as u64,
                 source_len: self.data_offset + self.data_bytes,
             });
         }
-        read_exact_at(&self.pack, offset, dst)
+        Ok(())
+    }
+
+    /// Install the test hook of [`HotRowStore::read_pack_nowait`] (once).
+    #[cfg(test)]
+    pub(crate) fn set_nowait_policy(&self, policy: NowaitPolicy) {
+        assert!(
+            self.nowait_policy.set(policy).is_ok(),
+            "nowait policy already installed"
+        );
     }
 
     /// Index of `row` inside tier `tier` (rows of the tier in ascending global
@@ -1126,6 +1327,7 @@ impl HotRowStore {
             .store(bytes.min(self.data_bytes), Ordering::Release);
     }
 
+    #[cfg(unix)]
     /// Start the worker: check the sidecar payload hash and spot-check
     /// [`VERIFY_SAMPLES`] kept rows of the pack against the model file
     /// (`shard_offsets[s]` = file offset of PLE shard `s`), then serve; once
@@ -1146,6 +1348,7 @@ impl HotRowStore {
             .expect("spawn ple hot pack thread")
     }
 
+    #[cfg(unix)]
     fn run_worker(&self, model_path: &Path, shard_offsets: &[u64]) {
         match self.verify(model_path, shard_offsets) {
             Ok(summary) => {
@@ -1164,6 +1367,7 @@ impl HotRowStore {
         self.prewarm(budget, 0);
     }
 
+    #[cfg(unix)]
     /// Start the worker of a table store ([`HotRowStore::open_table`]): it
     /// verifies nothing (the table serves from the start).  With `load_fill`
     /// it first reads the table's hottest prefix while the model loads (see
@@ -1176,10 +1380,13 @@ impl HotRowStore {
         load_fill: Option<LoadFill>,
     ) -> JoinHandle<()> {
         let store = self.clone();
+        // The load this worker was spawned in: a fill that outlives it must
+        // not record into a later load's receipt.
+        let load_generation = rdna_compute::load_phases::generation();
         std::thread::Builder::new()
             .name("ple-table".to_string())
             .spawn(move || {
-                let filled = load_fill.map_or(0, |fill| store.load_fill(fill));
+                let filled = load_fill.map_or(0, |fill| store.load_fill(fill, load_generation));
                 if let Some(budget) = store.wait_for_budget() {
                     store.prewarm(budget, filled);
                 }
@@ -1187,6 +1394,7 @@ impl HotRowStore {
             .expect("spawn ple table thread")
     }
 
+    #[cfg(unix)]
     /// Read the first `fill.bytes` of the data (hottest tier first) into the
     /// page cache at no more than `fill.bytes_per_sec`, until the prewarm
     /// budget is set (the model is ready) or the store stops.  The weight
@@ -1197,7 +1405,7 @@ impl HotRowStore {
     /// Once the whole prefix is resident it keeps repairing it until ready.
     /// Returns the resident prefix (from `data_offset`) at the end, where the
     /// prewarm after ready continues.
-    fn load_fill(&self, fill: LoadFill) -> u64 {
+    fn load_fill(&self, fill: LoadFill, load_generation: u64) -> u64 {
         let target = fill.bytes.min(self.data_bytes);
         if target == 0 || fill.bytes_per_sec == 0 {
             return 0;
@@ -1282,7 +1490,10 @@ impl HotRowStore {
             }
             let len = ((end - at) as usize).min(chunk);
             if let Err(error) = read_exact_at(&file, at, &mut buffer[..len]) {
-                eprintln!("{TAG}: load fill: read at {:.2} GiB failed: {error}", gib(at - begin));
+                eprintln!(
+                    "{TAG}: load fill: read at {:.2} GiB failed: {error}",
+                    gib(at - begin)
+                );
                 ended = "stopped by a read error";
                 break;
             }
@@ -1293,9 +1504,9 @@ impl HotRowStore {
                 // A view that still shows the page just read as a hole cannot
                 // see the page cache (`mincore` needs the file's owner or
                 // write access): read on in order without it.
-                let blind = residency
-                    .as_mut()
-                    .is_some_and(|view| !matches!(view.first_hole(at, at + 1), Ok(hole) if hole > at));
+                let blind = residency.as_mut().is_some_and(
+                    |view| !matches!(view.first_hole(at, at + 1), Ok(hole) if hole > at),
+                );
                 if blind {
                     eprintln!("{TAG}: load fill: the residency view is blind; reading on in order");
                     residency = None;
@@ -1308,12 +1519,21 @@ impl HotRowStore {
                 }
             }
         }
-        let filled = match residency.as_mut().map(|view| view.first_hole(begin, cursor)) {
+        let filled = match residency
+            .as_mut()
+            .map(|view| view.first_hole(begin, cursor))
+        {
             Some(Ok(hole)) => hole,
             _ => cursor,
         } - begin;
         self.load_filled.store(filled, Ordering::Relaxed);
         let secs = started.elapsed().as_secs_f64();
+        rdna_compute::load_phases::add_overlapped_for(
+            load_generation,
+            "ple_load_fill",
+            (secs * 1e9) as u64,
+            read_bytes,
+        );
         eprintln!(
             "{TAG}: load fill {ended}: {:.2} GiB resident from the hottest row on ({:.2} GiB read \
              of {:.2}); {:.2} GiB read in {secs:.1} s, {:.2} of it re-reading evicted pages, {:.2} GB/s \
@@ -1343,6 +1563,7 @@ impl HotRowStore {
         }
     }
 
+    #[cfg(unix)]
     /// Sidecar payload hash, then [`VERIFY_SAMPLES`] kept rows compared byte
     /// for byte between the pack and the model file.
     fn verify(&self, model_path: &Path, shard_offsets: &[u64]) -> Result<String, String> {
@@ -1424,6 +1645,7 @@ impl HotRowStore {
         ))
     }
 
+    #[cfg(unix)]
     /// Prewarm the pack's hottest `budget` bytes into the page cache while no
     /// request is being served.  Reads only the pack (`pack_path`,
     /// `data_offset`, `tier_base`), never the source model file.
@@ -1473,7 +1695,7 @@ impl HotRowStore {
         eprintln!(
             "{TAG}: prewarm complete: {:.2} GiB of {:.2} GiB (hottest first; {:.2} GiB of it read \
              during load) in {:.1} s, then tier 0 re-touched ({:.2} GiB, {:.1} s); {:.2} GB/s \
-             reading, {:.1} s paused for requests, MemAvailable {:.1} GiB",
+             reading, {:.1} s paused for requests, MemAvailable - CMA {:.1} GiB",
             gib(budget),
             gib(self.data_bytes),
             gib(skipped),
@@ -1486,6 +1708,7 @@ impl HotRowStore {
         );
     }
 
+    #[cfg(unix)]
     /// Read the pack bytes `span` (absolute offsets) in [`PREWARM_CHUNK`]
     /// reads, publishing the bytes of the data read so far (from
     /// `data_offset`) in `progress`, pausing while a
@@ -1563,6 +1786,7 @@ impl LoadFill {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     /// A model "file" in memory.
@@ -1631,6 +1855,7 @@ pub(crate) mod test_support {
     pub(crate) const FINGERPRINT: &str =
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
+    #[cfg(unix)]
     /// A model file and its hot-row pack on disk, and the opened store.
     pub(crate) struct PackFixture {
         pub dir: tempfile::TempDir,
@@ -1642,6 +1867,7 @@ pub(crate) mod test_support {
         pub worker: Option<JoinHandle<()>>,
     }
 
+    #[cfg(unix)]
     impl PackFixture {
         /// Write `shards` as a model file, pack its rows of buckets
         /// `0..kept` (tiers of `group`) under a pseudo-random rank, open the
@@ -1726,6 +1952,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for PackFixture {
         fn drop(&mut self) {
             self.store.stop();
@@ -1736,7 +1963,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::test_support::*;
     use super::*;
@@ -1795,6 +2022,93 @@ mod tests {
         assert!(store
             .read_pack(end - ENCODED_ROW_BYTES as u64, &mut bytes)
             .is_ok());
+    }
+
+    /// `preadv2(RWF_NOWAIT)` completes a read with the file's bytes or reports
+    /// `WouldBlock` (a cache miss, or no kernel/filesystem support: the host
+    /// decides which); it never returns other bytes and never completes a read
+    /// that runs past the end of the file.
+    #[test]
+    fn read_nowait_at_completes_with_the_file_bytes_or_would_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let data: Vec<u8> = (0..20_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = File::open(&path).unwrap();
+        for (offset, len) in [(0usize, 1usize), (3, 4093), (4096, 8192), (19_000, 1000)] {
+            let mut dst = vec![0xA5u8; len];
+            match read_nowait_at(&file, offset as u64, &mut dst).unwrap() {
+                NowaitRead::Done => assert_eq!(dst, data[offset..offset + len], "{offset}+{len}"),
+                NowaitRead::WouldBlock => {}
+            }
+        }
+        let mut dst = vec![0u8; 100];
+        assert_eq!(
+            read_nowait_at(&file, 19_950, &mut dst).unwrap(),
+            NowaitRead::WouldBlock,
+            "50 bytes remain: a short read is not a completed one"
+        );
+        assert_eq!(
+            read_nowait_at(&file, u64::MAX, &mut dst).unwrap(),
+            NowaitRead::WouldBlock
+        );
+        assert_eq!(read_nowait_at(&file, 0, &mut []).unwrap(), NowaitRead::Done);
+    }
+
+    /// A failure that is not "no `RWF_NOWAIT` here" is returned, not turned
+    /// into a fallback that would hide it (`EBADF`: a descriptor not open for
+    /// reading).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nowait_probe_returns_real_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, [7u8; 64]).unwrap();
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut dst = [0u8; 16];
+        let error = nowait_probe(&write_only, 0, &mut dst).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        let readable = File::open(&path).unwrap();
+        assert!(nowait_probe(&readable, 0, &mut dst).is_ok());
+    }
+
+    /// `read_pack_nowait` bounds-checks like `read_pack`, and under the test
+    /// hook serves (with the pack's bytes) or would block as the policy says.
+    #[test]
+    fn read_pack_nowait_checks_the_range_and_follows_the_policy() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 64, 5, 3);
+        let store = &fixture.store;
+        let mut bytes = vec![0u8; ENCODED_ROW_BYTES];
+        assert!(store.read_pack_nowait(0, &mut bytes).is_err());
+        let end = store.data_offset + store.data_bytes();
+        assert!(store.read_pack_nowait(end - 10, &mut bytes).is_err());
+
+        let serve = std::sync::Arc::new(AtomicBool::new(true));
+        let seen = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        {
+            let (serve, seen) = (serve.clone(), seen.clone());
+            store.set_nowait_policy(std::sync::Arc::new(move |offset: u64| {
+                seen.store(offset, Ordering::Release);
+                serve.load(Ordering::Acquire)
+            }));
+        }
+        let at = end - ENCODED_ROW_BYTES as u64;
+        let mut want = vec![0u8; ENCODED_ROW_BYTES];
+        store.read_pack(at, &mut want).unwrap();
+        assert_eq!(
+            store.read_pack_nowait(at, &mut bytes).unwrap(),
+            NowaitRead::Done
+        );
+        assert_eq!(bytes, want);
+        assert_eq!(seen.load(Ordering::Acquire), at);
+        serve.store(false, Ordering::Release);
+        assert_eq!(
+            store.read_pack_nowait(at, &mut bytes).unwrap(),
+            NowaitRead::WouldBlock
+        );
     }
 
     /// A pack cut from another rank, another model size, or other shard
@@ -1935,6 +2249,42 @@ mod tests {
         assert_eq!(store.retouched_bytes(), tier0, "phase 2 reads tier 0");
     }
 
+    /// A whole-request serving guard pauses the prewarm across the compute
+    /// gaps between its fetches; a request that fails releases it on every
+    /// path, and the prewarm then completes after [`BUSY_QUIET`].
+    #[test]
+    fn prewarm_pauses_for_a_whole_request_then_completes() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
+        let store = &fixture.store;
+        let tier0 = store.tier_base[1] - store.data_offset;
+        let activity = std::sync::Arc::new(FetchActivity::new());
+        store.bind_activity(activity.clone()).unwrap();
+        let budget = store.data_bytes() / 2;
+        // A request that fails after its fetches; the guard unwinds with it.
+        // The budget is set while the request is being served.
+        let request = |activity: &std::sync::Arc<FetchActivity>| -> Result<(), String> {
+            let _serving = activity.serving();
+            store.set_prewarm_budget(budget);
+            drop(activity.busy());
+            // A compute gap with no fetch in flight.
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(store.prewarmed_bytes(), 0, "paused across the gap");
+            drop(activity.busy());
+            Err("request failed".to_string())
+        };
+        assert!(request(&activity).is_err());
+        assert_eq!(activity.in_flight(), 0, "guard released on the error path");
+        assert_eq!(store.prewarmed_bytes(), 0, "quiet period not over yet");
+        let deadline = Instant::now() + BUSY_QUIET + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(store.prewarm_complete());
+        assert_eq!(store.prewarmed_bytes(), budget);
+        assert_eq!(store.retouched_bytes(), tier0);
+    }
+
     /// A budget inside tier 0 re-reads only that much of it; a budget of 0
     /// reads nothing.
     #[test]
@@ -1987,7 +2337,13 @@ mod tests {
 
     #[test]
     fn load_fill_reads_about_a_slice_of_its_rate_per_read() {
-        let chunk = |bytes_per_sec| LoadFill { bytes: 1, bytes_per_sec }.chunk();
+        let chunk = |bytes_per_sec| {
+            LoadFill {
+                bytes: 1,
+                bytes_per_sec,
+            }
+            .chunk()
+        };
         assert_eq!(chunk(200_000_000), PREWARM_CHUNK.min(10_000_000));
         assert_eq!(chunk(100_000), 5_000);
         assert_eq!(chunk(1), LOAD_FILL_MIN_CHUNK);
@@ -2235,7 +2591,11 @@ mod tests {
             bytes_per_sec: u64::MAX,
         }));
         wait_for(|| small.load_filled_bytes() == small.data_bytes());
-        assert_eq!(small.load_filled_bytes(), small.data_bytes(), "capped at the data");
+        assert_eq!(
+            small.load_filled_bytes(),
+            small.data_bytes(),
+            "capped at the data"
+        );
         small.set_prewarm_budget(prefix);
         wait_for(|| small.prewarm_complete());
         assert_eq!(small.prewarmed_bytes(), prefix);

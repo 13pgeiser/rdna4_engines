@@ -6,10 +6,11 @@
 //! API maps a shard lazily only when explicitly requested.
 
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, QuantConfig,
-    SourceError, SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor,
-    SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
+    capture_file_identity, read_file_exact_at, read_file_nowait_at, verify_path_identity,
+    ModelSource, QuantConfig, SourceError, SourceFileIdentity, SourceFormat, SourceIdentity,
+    SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
 };
+use crate::ple_hot_store::NowaitRead;
 use half::bf16;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -317,6 +318,13 @@ impl SourceReaderImpl for SafetensorsRangeReader {
             verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+
+    fn read_nowait_at(&self, offset: u64, dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+        for expected in &self.identity.files {
+            verify_path_identity(expected)?;
+        }
+        read_file_nowait_at(&self.file, &self.file_identity, offset, dst)
     }
 }
 
@@ -1024,11 +1032,12 @@ mod tests {
         // name discriminates.
         assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3_5" })), 5);
         assert_eq!(
-            derive_arch_id(&json!({ "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5" })),
+            derive_arch_id(
+                &json!({ "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5" })
+            ),
             5
         );
     }
-
 
     #[test]
     fn bf16_to_f32_basic_values() {

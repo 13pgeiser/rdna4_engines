@@ -104,8 +104,7 @@ fn main() {
     let mut state = Gemma4State::new_with_max_seq(&mut gpu, &cfg, n_ctx + 16).expect("state");
 
     // ---- per-token forward with per-layer capture ----
-    let mut capture: Vec<Vec<f32>> =
-        vec![Vec::with_capacity(n_ctx * cfg.dim); cfg.n_layers];
+    let mut capture: Vec<Vec<f32>> = vec![Vec::with_capacity(n_ctx * cfg.dim); cfg.n_layers];
     let t0 = std::time::Instant::now();
     for (pos, &tok) in tokens.iter().enumerate() {
         decode_step_capture(

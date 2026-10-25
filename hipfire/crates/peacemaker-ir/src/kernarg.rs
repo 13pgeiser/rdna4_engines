@@ -25,21 +25,41 @@ pub enum KernelStatus {
 
 /// `RegionEffect.bound` (design §1.1). A1 never proves extents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RegionBound { AllocationWide }
+pub enum RegionBound {
+    AllocationWide,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum AccessMode { Read, Write, ReadWrite }
+pub enum AccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
 impl AccessMode {
-    pub fn reads(self) -> bool { matches!(self, Self::Read | Self::ReadWrite) }
-    pub fn writes(self) -> bool { matches!(self, Self::Write | Self::ReadWrite) }
+    pub fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+    pub fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
     pub fn join(self, other: Self) -> Self {
-        if self == other { self } else { Self::ReadWrite }
+        if self == other {
+            self
+        } else {
+            Self::ReadWrite
+        }
     }
 }
 
 /// `RegionEffect.class` (design §1.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum AccessClass { VmemLoad, VmemStore, SmemLoad, Atomic { commutative: bool }, LdsDma }
+pub enum AccessClass {
+    VmemLoad,
+    VmemStore,
+    SmemLoad,
+    Atomic { commutative: bool },
+    LdsDma,
+}
 impl AccessClass {
     pub fn mode(self) -> AccessMode {
         match self {
@@ -52,13 +72,26 @@ impl AccessClass {
 
 /// The instruction family that issued the access.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum MemPath { Global, Buffer, Flat, Smem, SmemBuffer }
+pub enum MemPath {
+    Global,
+    Buffer,
+    Flat,
+    Smem,
+    SmemBuffer,
+}
 
 /// Raw cache-policy bits of the access (gfx12: `th`/`scope`; gfx10/11:
 /// `glc`/`slc`/`dlc`). Recorded, not interpreted: the per-arch cache table
 /// (design §1.3, G4) maps them to visibility rungs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct CacheBits { pub th: u8, pub scope: u8, pub glc: bool, pub slc: bool, pub dlc: bool, pub nv: bool }
+pub struct CacheBits {
+    pub th: u8,
+    pub scope: u8,
+    pub glc: bool,
+    pub slc: bool,
+    pub dlc: bool,
+    pub nv: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArgAccess {
@@ -113,11 +146,23 @@ impl Sinks {
     pub const STORED: u8 = 1 << 5;
     /// Part of an LDS address.
     pub const LDS_ADDRESS: u8 = 1 << 6;
-    pub fn has(self, bit: u8) -> bool { self.0 & bit != 0 }
+    pub fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
     pub fn names(self) -> Vec<&'static str> {
-        [(Self::ADDRESS_BASE, "address_base"), (Self::ADDRESS_OFFSET, "address_offset"), (Self::LOOP_BOUND, "loop_bound"),
-         (Self::GUARD, "guard"), (Self::GRID_TERM, "grid_term"), (Self::STORED, "stored"), (Self::LDS_ADDRESS, "lds_address")]
-            .into_iter().filter(|(bit, _)| self.has(*bit)).map(|(_, name)| name).collect()
+        [
+            (Self::ADDRESS_BASE, "address_base"),
+            (Self::ADDRESS_OFFSET, "address_offset"),
+            (Self::LOOP_BOUND, "loop_bound"),
+            (Self::GUARD, "guard"),
+            (Self::GRID_TERM, "grid_term"),
+            (Self::STORED, "stored"),
+            (Self::LDS_ADDRESS, "lds_address"),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| self.has(*bit))
+        .map(|(_, name)| name)
+        .collect()
     }
 }
 
@@ -161,15 +206,25 @@ impl ArgFacts {
         out.dedup();
         out
     }
-    pub fn is_hidden(&self) -> bool { self.value_kind.starts_with("hidden_") }
+    pub fn is_hidden(&self) -> bool {
+        self.value_kind.starts_with("hidden_")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DwordFacts { pub offset: u32, pub loaded: bool, pub sinks: Sinks }
+pub struct DwordFacts {
+    pub offset: u32,
+    pub loaded: bool,
+    pub sinks: Sinks,
+}
 
 /// Why a kernel is `Unknown`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Unresolved { pub inst: Option<InstId>, pub rule: &'static str, pub detail: String }
+pub struct Unresolved {
+    pub inst: Option<InstId>,
+    pub rule: &'static str,
+    pub detail: String,
+}
 
 /// Reads that are not argument effects: they cannot participate in an
 /// inter-kernel hazard (the kernel may not write them; a write is `Unknown`).
@@ -216,13 +271,21 @@ pub struct KernargFacts {
     pub taint_overflow: bool,
 }
 impl KernargFacts {
-    pub fn arg_at(&self, offset: u32) -> Option<&ArgFacts> { self.args.iter().find(|a| a.offset == offset) }
+    pub fn arg_at(&self, offset: u32) -> Option<&ArgFacts> {
+        self.args.iter().find(|a| a.offset == offset)
+    }
 }
 
 /// Hidden argument kinds that carry launch geometry (code object v5).
 pub const HIDDEN_GRID_KINDS: &[&str] = &[
-    "hidden_block_count_x", "hidden_block_count_y", "hidden_block_count_z",
-    "hidden_group_size_x", "hidden_group_size_y", "hidden_group_size_z",
-    "hidden_remainder_x", "hidden_remainder_y", "hidden_remainder_z",
+    "hidden_block_count_x",
+    "hidden_block_count_y",
+    "hidden_block_count_z",
+    "hidden_group_size_x",
+    "hidden_group_size_y",
+    "hidden_group_size_z",
+    "hidden_remainder_x",
+    "hidden_remainder_y",
+    "hidden_remainder_z",
     "hidden_grid_dims",
 ];

@@ -5,6 +5,6 @@
   {"content": "Add parallelism with rayon, but cap concurrency so we don't thrash the disk with too many simultaneous reads. Show the updated code."},
   {"content": "Switch gears: explain the difference between content-defined chunking (FastCDC) and fixed-size chunking for dedup ratio, and when each wins."},
   {"content": "Write me a short haiku about deduplication to lighten the mood."},
-  {"content": "Back to the code — what was the FIRST function I asked you to write earlier in this conversation? Refactor it to return a Result<_, std::io::Error> instead of panicking on a read failure.", "expect": ["dedupe", "hash", "Result"]},
-  {"content": "Summarize everything we've built across this whole session and the key design decisions we made along the way.", "expect": ["dedupe", "rayon", "chunk"]}
+  {"content": "Back to the code — what was the FIRST function I asked you to write earlier in this conversation? Refactor it to return a Result<_, std::io::Error> instead of panicking on a read failure.", "expect": ["blake3", "hash", "Result"]},
+  {"content": "Summarize everything we've built across this whole session and the key design decisions we made along the way.", "expect": ["dedup", "rayon", "chunk"]}
 ]

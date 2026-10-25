@@ -28,14 +28,14 @@
 pub mod fused_gate_up_hfq4g256_mq4v2;
 pub mod fused_qkv_hfq4g256_mq4v2;
 pub mod fused_qkvza_hfq4g256_mq4v2;
-pub mod gemv_hfq4g256_residual_mq4v2;
+pub mod gemm_hfq4g256_rows_pm;
 pub mod gemv_hfq4g256_multirow_default_mq4v2;
+pub mod gemv_hfq4g256_residual_mq4v2;
 pub mod gemv_hfq4g256_residual_xbatch_mq4v2;
 pub mod gemv_hfq4g256_xbatch_mq4v2;
-pub mod gemm_hfq4g256_rows_pm;
 
-use crate::Emitted;
 use super::iu4_gemm::ModuleProof;
+use crate::Emitted;
 
 /// One HIP module this tree twins: its name, the frozen selected exports in
 /// appendix order, and the author's builder.
@@ -48,14 +48,46 @@ pub struct Module {
 /// Every PM decode module: the five W1 twins in PLAN W1 order, then new
 /// batched symbols that replace no incumbent export.
 pub const MODULES: [Module; 8] = [
-    Module { name: "fused_gate_up_hfq4g256_mq4v2", symbols: &["fused_gate_up_mq4g256v2"], build: fused_gate_up_hfq4g256_mq4v2::build_gfx1201 },
-    Module { name: "gemv_hfq4g256_residual_mq4v2", symbols: &["gemv_mq4g256v2_residual"], build: gemv_hfq4g256_residual_mq4v2::build_gfx1201 },
-    Module { name: "fused_qkvza_hfq4g256_mq4v2", symbols: &["fused_qkvza_mq4g256v2"], build: fused_qkvza_hfq4g256_mq4v2::build_gfx1201 },
-    Module { name: "gemv_hfq4g256_multirow_default_mq4v2", symbols: &["gemv_mq4g256v2_multirow_r2"], build: gemv_hfq4g256_multirow_default_mq4v2::build_gfx1201 },
-    Module { name: "fused_qkv_hfq4g256_mq4v2", symbols: &["fused_qkv_mq4g256v2"], build: fused_qkv_hfq4g256_mq4v2::build_gfx1201 },
-    Module { name: "gemv_hfq4g256_residual_xbatch_mq4v2", symbols: &["gemv_mq4g256v2_residual_xbatch"], build: gemv_hfq4g256_residual_xbatch_mq4v2::build_gfx1201 },
-    Module { name: "gemv_hfq4g256_xbatch_mq4v2", symbols: &["gemv_mq4g256v2_xbatch_pm"], build: gemv_hfq4g256_xbatch_mq4v2::build_gfx1201 },
-    Module { name: "gemm_hfq4g256_rows_pm", symbols: &["gemm_hfq4g256_rows_pm"], build: gemm_hfq4g256_rows_pm::build_gfx1201 },
+    Module {
+        name: "fused_gate_up_hfq4g256_mq4v2",
+        symbols: &["fused_gate_up_mq4g256v2"],
+        build: fused_gate_up_hfq4g256_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "gemv_hfq4g256_residual_mq4v2",
+        symbols: &["gemv_mq4g256v2_residual"],
+        build: gemv_hfq4g256_residual_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "fused_qkvza_hfq4g256_mq4v2",
+        symbols: &["fused_qkvza_mq4g256v2"],
+        build: fused_qkvza_hfq4g256_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "gemv_hfq4g256_multirow_default_mq4v2",
+        symbols: &["gemv_mq4g256v2_multirow_r2"],
+        build: gemv_hfq4g256_multirow_default_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "fused_qkv_hfq4g256_mq4v2",
+        symbols: &["fused_qkv_mq4g256v2"],
+        build: fused_qkv_hfq4g256_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "gemv_hfq4g256_residual_xbatch_mq4v2",
+        symbols: &["gemv_mq4g256v2_residual_xbatch"],
+        build: gemv_hfq4g256_residual_xbatch_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "gemv_hfq4g256_xbatch_mq4v2",
+        symbols: &["gemv_mq4g256v2_xbatch_pm"],
+        build: gemv_hfq4g256_xbatch_mq4v2::build_gfx1201,
+    },
+    Module {
+        name: "gemm_hfq4g256_rows_pm",
+        symbols: &["gemm_hfq4g256_rows_pm"],
+        build: gemm_hfq4g256_rows_pm::build_gfx1201,
+    },
 ];
 
 pub fn module(name: &str) -> Result<&'static Module, String> {
@@ -66,7 +98,10 @@ pub fn module(name: &str) -> Result<&'static Module, String> {
 }
 
 fn exported(e: &Emitted) -> Option<&str> {
-    e.s_text.lines().find_map(|l| l.trim().strip_prefix(".amdhsa_kernel ")).map(str::trim)
+    e.s_text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(".amdhsa_kernel "))
+        .map(str::trim)
 }
 
 /// Build `name`'s exports and combine them into one module source and proof.
@@ -77,10 +112,20 @@ pub fn emit_module(name: &str) -> Result<(Vec<Emitted>, String, ModuleProof), St
     let emitted = (m.build)().map_err(|e| format!("{name}: {e}"))?;
     let got: Vec<&str> = emitted.iter().map(|e| exported(e).unwrap_or("")).collect();
     if got != m.symbols {
-        return Err(format!("{name}: builder exports {got:?}, the frozen selected exports are {:?}", m.symbols));
+        return Err(format!(
+            "{name}: builder exports {got:?}, the frozen selected exports are {:?}",
+            m.symbols
+        ));
     }
-    if let Some(e) = emitted.iter().find(|e| e.proof.arch != crate::Arch::Gfx1201) {
-        return Err(format!("{name}: {} built for {:?}, not exact gfx1201", exported(e).unwrap_or(""), e.proof.arch));
+    if let Some(e) = emitted
+        .iter()
+        .find(|e| e.proof.arch != crate::Arch::Gfx1201)
+    {
+        return Err(format!(
+            "{name}: {} built for {:?}, not exact gfx1201",
+            exported(e).unwrap_or(""),
+            e.proof.arch
+        ));
     }
     let (text, proof) = super::iu4_gemm::module(&emitted, name)?;
     Ok((emitted, text, proof))
@@ -91,7 +136,12 @@ pub fn emit_module(name: &str) -> Result<(Vec<Emitted>, String, ModuleProof), St
 /// dynamic LDS). One contract certifies one symbol.
 pub fn shape_contract(name: &str) -> Result<serde_json::Value, String> {
     let m = module(name)?;
-    let [symbol] = m.symbols else { return Err(format!("{name}: a shape contract covers one symbol, module has {}", m.symbols.len())) };
+    let [symbol] = m.symbols else {
+        return Err(format!(
+            "{name}: a shape contract covers one symbol, module has {}",
+            m.symbols.len()
+        ));
+    };
     Ok(serde_json::json!({
         "symbol": symbol, "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
         "launch_dynamic_lds_bytes": 0, "group_segment_fixed_bytes": 0,
@@ -108,7 +158,10 @@ mod tests {
         assert_eq!(names.len(), super::MODULES.len());
         assert!(super::module("nope").is_err());
         for m in &super::MODULES {
-            assert_eq!(super::shape_contract(m.name).unwrap()["symbol"], m.symbols[0]);
+            assert_eq!(
+                super::shape_contract(m.name).unwrap()["symbol"],
+                m.symbols[0]
+            );
         }
     }
 }

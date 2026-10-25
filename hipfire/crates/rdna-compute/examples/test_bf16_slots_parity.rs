@@ -106,7 +106,9 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
 /// Compare raw IEEE bits, including the sign of zero.
 fn same_f32_bits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
 }
 
 #[cfg(test)]
@@ -191,10 +193,10 @@ fn bf16_attn_slots(
         N_HEADS,
         N_KV_HEADS,
         HEAD_DIM,
-        SLAB_TOKENS,   // max_seq (arena cap)
-        MAX_CTX,       // max_ctx_len
+        SLAB_TOKENS, // max_seq (arena cap)
+        MAX_CTX,     // max_ctx_len
         BATCH,
-        None,          // tree_bias
+        None, // tree_bias
         0,
         0,
         descs,
@@ -241,7 +243,10 @@ fn fp8_attn_slots(
     rows: Option<&GpuTensor>,
 ) {
     let max_tiles = MAX_CTX.div_ceil(gpu.attn_tile_size());
-    let partials = upload_f32(gpu, &vec![0.0f32; BATCH * N_HEADS * max_tiles * (2 + HEAD_DIM)]);
+    let partials = upload_f32(
+        gpu,
+        &vec![0.0f32; BATCH * N_HEADS * max_tiles * (2 + HEAD_DIM)],
+    );
     gpu.attention_flash_fp8_e4m3_batched_masked_slots(
         q,
         k,
@@ -281,22 +286,49 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     fp8_attn_slots(gpu, q, &k_plain, &v_plain, &out_ref, pos, None, None);
     let descs_zero = slab_descs(gpu, [0; SLOTS]);
     let out_zero = out_dev(gpu);
-    fp8_attn_slots(gpu, q, &k_plain, &v_plain, &out_zero, pos, Some(&descs_zero), Some(&rows1));
+    fp8_attn_slots(
+        gpu,
+        q,
+        &k_plain,
+        &v_plain,
+        &out_zero,
+        pos,
+        Some(&descs_zero),
+        Some(&rows1),
+    );
     let dr = download_f32(gpu, &out_ref);
-    assert!(dr.iter().all(|x| x.is_finite()), "check 4a: fp8 reference output is not finite");
-    assert!(dr.iter().any(|x| *x != 0.0), "check 4a: fp8 reference output is all zero");
+    assert!(
+        dr.iter().all(|x| x.is_finite()),
+        "check 4a: fp8 reference output is not finite"
+    );
+    assert!(
+        dr.iter().any(|x| *x != 0.0),
+        "check 4a: fp8 reference output is all zero"
+    );
     assert!(
         same_f32_bits(&dr, &download_f32(gpu, &out_zero)),
         "check 4a: fp8 zero-base descriptor launch diverged from the legacy path"
     );
-    eprintln!("check 4a fp8 zero-base parity: BIT-EXACT ({} elements)", dr.len());
+    eprintln!(
+        "check 4a fp8 zero-base parity: BIT-EXACT ({} elements)",
+        dr.len()
+    );
 
     // 4b: slot-1 base honored over a NaN-poisoned slot-0 slab.
     let k_arena = upload_raw(gpu, &[fp8_poisoned_slab(), k_real.clone()].concat());
     let v_arena = upload_raw(gpu, &[fp8_poisoned_slab(), v_real.clone()].concat());
     let descs_off = slab_descs(gpu, [0, slab as u64]);
     let out_under = out_dev(gpu);
-    fp8_attn_slots(gpu, q, &k_arena, &v_arena, &out_under, pos, Some(&descs_off), Some(&rows1));
+    fp8_attn_slots(
+        gpu,
+        q,
+        &k_arena,
+        &v_arena,
+        &out_under,
+        pos,
+        Some(&descs_off),
+        Some(&rows1),
+    );
     assert!(
         same_f32_bits(&download_f32(gpu, &out_under), &dr),
         "check 4b: fp8 slot-1 base honoring diverged from the plain-cache run"
@@ -311,7 +343,16 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     let v_mix = upload_raw(gpu, &[v0.clone(), v_real.clone()].concat());
     let rows_alt = row_slot(gpu, [0, 1, 0, 1]);
     let out_mix = out_dev(gpu);
-    fp8_attn_slots(gpu, q, &k_mix, &v_mix, &out_mix, pos, Some(&descs_off), Some(&rows_alt));
+    fp8_attn_slots(
+        gpu,
+        q,
+        &k_mix,
+        &v_mix,
+        &out_mix,
+        pos,
+        Some(&descs_off),
+        Some(&rows_alt),
+    );
     let k_slot0 = upload_raw(gpu, &k0);
     let v_slot0 = upload_raw(gpu, &v0);
     let out_ref0 = out_dev(gpu);
@@ -321,7 +362,10 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     for row in 0..BATCH {
         let want = if row % 2 == 0 { &d0 } else { &dr };
         assert!(
-            same_f32_bits(&d_mix[row * stride..(row + 1) * stride], &want[row * stride..(row + 1) * stride]),
+            same_f32_bits(
+                &d_mix[row * stride..(row + 1) * stride],
+                &want[row * stride..(row + 1) * stride]
+            ),
             "check 4c: fp8 row {row} (slot {}) diverged from its plain-cache reference",
             row % 2
         );
@@ -348,7 +392,10 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     )
     .expect("fp8 slots write");
     let (ref_bytes, cand_bytes) = (download_raw(gpu, &k_ref), download_raw(gpu, &k_cand));
-    assert!(ref_bytes.iter().any(|b| *b != 0), "check 4d: fp8 legacy write wrote nothing");
+    assert!(
+        ref_bytes.iter().any(|b| *b != 0),
+        "check 4d: fp8 legacy write wrote nothing"
+    );
     assert!(
         cand_bytes[slab..] == ref_bytes[..],
         "check 4d: fp8 descriptor write bytes at the slot base differ from the legacy write"
@@ -396,7 +443,10 @@ fn main() {
         same_f32_bits(&dr, &dz),
         "check 1a: zero-base descriptor launch diverged from the legacy path"
     );
-    eprintln!("check 1a zero-base parity: BIT-EXACT ({} elements)", dr.len());
+    eprintln!(
+        "check 1a zero-base parity: BIT-EXACT ({} elements)",
+        dr.len()
+    );
 
     // ── Check 1b: non-zero-base understudy ───────────────────────────────
     // Arena = [NaN-poisoned slot-0 slabs][real data at slab_bytes]; every
@@ -418,7 +468,10 @@ fn main() {
         Some(&rows1),
     );
     let du = download_f32(&gpu, &out_under);
-    assert!(same_f32_bits(&du, &dr), "check 1b: slot-1 base honoring diverged from the plain-cache run");
+    assert!(
+        same_f32_bits(&du, &dr),
+        "check 1b: slot-1 base honoring diverged from the plain-cache run"
+    );
     eprintln!("check 1b non-zero-base understudy: BIT-EXACT, poison untouched");
 
     // ── Check 1c: two-slot mix ───────────────────────────────────────────
@@ -447,9 +500,13 @@ fn main() {
     let k_slot0 = upload_raw(&gpu, &k0);
     let v_slot0 = upload_raw(&gpu, &v0);
     let out_ref0 = out_dev(&mut gpu);
-    bf16_attn_slots(&mut gpu, &q, &k_slot0, &v_slot0, &out_ref0, &pos, None, None);
+    bf16_attn_slots(
+        &mut gpu, &q, &k_slot0, &v_slot0, &out_ref0, &pos, None, None,
+    );
     let out_ref1 = out_dev(&mut gpu);
-    bf16_attn_slots(&mut gpu, &q, &k_plain, &v_plain, &out_ref1, &pos, None, None);
+    bf16_attn_slots(
+        &mut gpu, &q, &k_plain, &v_plain, &out_ref1, &pos, None, None,
+    );
     let d_mix = download_f32(&gpu, &out_mix);
     let d0 = download_f32(&gpu, &out_ref0);
     let d1 = download_f32(&gpu, &out_ref1);
@@ -475,17 +532,8 @@ fn main() {
     let src = upload_f32(&mut gpu, &src_data);
     let ref_slab = vec![0u8; SLAB_TOKENS * row_bytes()];
     let k_ref = upload_raw(&gpu, &ref_slab);
-    gpu.kv_cache_write_bf16_batched(
-        &k_ref,
-        &src,
-        &pos,
-        N_KV_HEADS,
-        HEAD_DIM,
-        BATCH,
-        None,
-        None,
-    )
-    .expect("bf16 plain write");
+    gpu.kv_cache_write_bf16_batched(&k_ref, &src, &pos, N_KV_HEADS, HEAD_DIM, BATCH, None, None)
+        .expect("bf16 plain write");
     let cand_arena = [poisoned_slab(), vec![0u8; SLAB_TOKENS * row_bytes()]].concat();
     let k_cand = upload_raw(&gpu, &cand_arena);
     gpu.kv_cache_write_bf16_batched(
@@ -508,7 +556,10 @@ fn main() {
     );
     let cand0 = &cand_bytes[..slab];
     let poison = poisoned_slab();
-    assert!(cand0 == &poison[..], "check 2: slot-0 poison slab was written through");
+    assert!(
+        cand0 == &poison[..],
+        "check 2: slot-0 poison slab was written through"
+    );
     eprintln!("check 2 bf16 slots write parity: BIT-EXACT, slot 0 untouched");
 
     // ── Check 3: fp8 fail-closed off gfx1201 ─────────────────────────────
@@ -521,42 +572,44 @@ fn main() {
         fp8_slots_parity(&mut gpu, &q, &pos, &mut rng);
     } else {
         let fp8_cache = upload_raw(&gpu, &vec![0u8; SLAB_TOKENS * row_bytes()]);
-        let err = gpu.kv_cache_write_fp8_e4m3_batched_slots(
-            &fp8_cache,
-            &src,
-            &pos,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(&descs_off),
-            Some(&rows1),
-        )
-        .err()
-        .expect("check 3: fp8 slots write must fail closed off gfx1201");
+        let err = gpu
+            .kv_cache_write_fp8_e4m3_batched_slots(
+                &fp8_cache,
+                &src,
+                &pos,
+                N_KV_HEADS,
+                HEAD_DIM,
+                BATCH,
+                Some(&descs_off),
+                Some(&rows1),
+            )
+            .err()
+            .expect("check 3: fp8 slots write must fail closed off gfx1201");
         eprintln!("check 3 fp8 slots write refused: {err}");
         let fp8_out = out_dev(&mut gpu);
         let fp8_partials = out_dev(&mut gpu);
-        let err = gpu.attention_flash_fp8_e4m3_batched_masked_slots(
-            &q,
-            &fp8_cache,
-            &fp8_cache,
-            &fp8_out,
-            &pos,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            SLAB_TOKENS,
-            MAX_CTX,
-            BATCH,
-            &fp8_partials,
-            None,
-            0,
-            0,
-            Some(&descs_off),
-            Some(&rows1),
-        )
-        .err()
-        .expect("check 3: fp8 slots attend must fail closed off gfx1201");
+        let err = gpu
+            .attention_flash_fp8_e4m3_batched_masked_slots(
+                &q,
+                &fp8_cache,
+                &fp8_cache,
+                &fp8_out,
+                &pos,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                SLAB_TOKENS,
+                MAX_CTX,
+                BATCH,
+                &fp8_partials,
+                None,
+                0,
+                0,
+                Some(&descs_off),
+                Some(&rows1),
+            )
+            .err()
+            .expect("check 3: fp8 slots attend must fail closed off gfx1201");
         eprintln!("check 3 fp8 slots attend refused: {err}");
     }
 

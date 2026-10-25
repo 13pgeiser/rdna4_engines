@@ -13,7 +13,8 @@ use crate::{Gpu, GpuTensor};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-pub(crate) const COLLAPSE_SRC: &str = include_str!("../../../kernels/src/dflash_draft_collapse.gfx1100.hip");
+pub(crate) const COLLAPSE_SRC: &str =
+    include_str!("../../../kernels/src/dflash_draft_collapse.gfx1100.hip");
 
 /// Which overwrite GEMM the S7 fast path may use for one MQ4G256 dispatch.
 ///
@@ -168,8 +169,7 @@ impl Gpu {
             || self.flags.draft_collapse_off
             || self.fp8_verify_scope
             || self.iu4_verify_scope
-            || (!(2..=63).contains(&batch_size)
-                && !(batch_size == 64 && self.draft_rows64_scope))
+            || (!(2..=63).contains(&batch_size) && !(batch_size == 64 && self.draft_rows64_scope))
             || k % 256 != 0
             || !self.arch_caps.has_wmma_w32_gfx12()
             || self.flags.fp16_disabled

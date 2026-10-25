@@ -9,8 +9,21 @@
 //! persistence, validation, and field-level provenance. Runtime crates consume
 //! resolved values; they do not parse user configuration in hot paths.
 
+pub mod calibration;
 pub mod devices;
+pub mod effective;
+pub mod emu;
+pub mod emu_budget;
+pub mod emu_model;
+pub mod evidence;
+pub mod host_memory;
+pub mod http_auth;
+pub mod intent;
 pub mod rocm;
+pub mod secret;
+pub mod tuning;
+
+pub use host_memory::{host_memory, HostMemory};
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -58,6 +71,11 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0}")]
+    Home(String),
+    /// Catalog state that cannot be edited as requested.
+    #[error("{0}")]
+    Catalog(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -248,6 +266,16 @@ impl ConfigValue {
         }
     }
 
+    /// Render as a TOML scalar (`"q8"`, `4096`, `true`, `0.42`), the form a
+    /// user would see in `config.toml`. `Null` has no TOML form and renders as
+    /// `null`.
+    pub fn to_toml_string(&self) -> String {
+        match self.clone().into_toml() {
+            Some(value) => value.to_string(),
+            None => "null".to_owned(),
+        }
+    }
+
     fn from_toml(value: &toml::Value) -> Option<Self> {
         match value {
             toml::Value::Boolean(v) => Some(Self::Bool(*v)),
@@ -337,6 +365,7 @@ pub enum ValueRule {
     NonEmptyString,
     Host,
     PathOrEmpty,
+    AbsolutePathOrEmpty,
     Enum(&'static [&'static str]),
     AutoBool,
     NullableString,
@@ -417,6 +446,8 @@ impl ConfigField {
                     expand_tilde(v).is_file()
                 }
             }),
+            ValueRule::AbsolutePathOrEmpty => matches!(value, ConfigValue::String(v)
+                if v.is_empty() || (v.trim() == v && Path::new(v).is_absolute())),
             ValueRule::Enum(values) => {
                 matches!(value, ConfigValue::String(v) if values.contains(&v.as_str()))
             }
@@ -601,6 +632,11 @@ const KV_MODES: &[&str] = &[
     "fp8",
     "legacy-asym3",
 ];
+// GDN/DeltaNet recurrent-state storage names accepted by `memory.state_quant`.
+// A schema allow-list only: the Qwen3.5 (`parse_state_quant`) and Qwen4
+// (`resolve_state_format`) loaders each honor or refuse what they cannot serve
+// (`q4`/`int4` are Qwen3.5-only).
+const STATE_QUANT_MODES: &[&str] = &["auto", "q8", "int8", "q8_ef", "fp32", "f32", "q4", "int4"];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
 const IMAGE_DECODE_MODES: &[&str] = &["cpu", "vcn", "auto"];
@@ -620,7 +656,10 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
 pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
-const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
+/// Values of `memory.ple_format`; exported so the TUI offers exactly this list.
+pub const PLE_FORMATS: &[&str] = &["auto", "q4", "q8"];
+/// Values of `speculation.mode`; exported so the TUI offers exactly this list.
+pub const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
     ($key:literal, $legacy:literal, $category:ident, $scope:ident, $default:expr, $rule:expr, $registry:expr, $experimental:expr, $env:expr, $help:literal) => {
@@ -761,6 +800,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Runtime VRAM-fit KV precision policy."
     ),
     field!(
+        "memory.state_quant",
+        "state_quant",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(STATE_QUANT_MODES),
+        true,
+        false,
+        Some("HIPFIRE_STATE_QUANT"),
+        "GDN/DeltaNet recurrent-state storage; auto = per-model/arch default (Qwen3.8-Flash-Next: F32 on gfx1151, Q8 elsewhere; Qwen3.5: Q8). Explicit values are honored or refused, never rewritten; set q8 to keep Q8 state on gfx1151. q8_ef (Qwen3.8-Flash-Next only, explicit opt-in) is Q8 plus a live f16 error-feedback residual that resets on rollback/restore. q4/int4 are Qwen3.5-only."
+    ),
+    field!(
         "memory.gpu_layer_budget",
         "gpu_layer_budget",
         Memory,
@@ -784,18 +835,25 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MOE_EXPERT_BUDGET"),
         "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset/null keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. Explicit 'auto' (-1) opts into placement by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
-    field!(
-        "memory.offload_exec",
-        "offload_exec",
-        Memory,
-        ModelLoad,
-        DefaultValue::String("pcie"),
-        ValueRule::Enum(OFFLOAD_EXECS),
-        true,
-        false,
-        Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
-    ),
+    // Sparse in the process config (like `replay.backend`): when the user,
+    // registry or a compatibility env never set it, the key is absent, so the
+    // loader can tell "unset" (a Flash-Next load then picks the engine from a
+    // measured decode-cost comparison, see `memory::offload_exec_explicit`) from an
+    // explicit `pcie`. The built-in `pcie` stays the raw value
+    // ([`memory::offload_exec`]) every other consumer reads.
+    ConfigField {
+        key: "memory.offload_exec",
+        legacy_key: "offload_exec",
+        category: ConfigCategory::Memory,
+        scope: ConfigScope::ModelLoad,
+        default: DefaultValue::String("pcie"),
+        rule: ValueRule::Enum(OFFLOAD_EXECS),
+        registry_allowed: true,
+        experimental: false,
+        env_compat: Some("HIPFIRE_OFFLOAD_EXEC"),
+        include_builtin_in_process_config: false,
+        help: "Which engine executes the ops that read a spilled layer's weights: 'pcie' runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset behaves as 'pcie' everywhere except one measured default: a Flash-Next (qwen4) load whose host-placed routed experts the D2 CPU split can serve (hot-set tier layers, or un-tiered aggregate layers whose allocations are host-mapped QT44/QT53) runs only that D2 split (decode and <=4-row verify of the host-mapped experts) when its predicted per-layer decode cost is at least 15% below PCIe's: the production CPU arm timed on this model's real host experts plus the copy-transport handoff, against the live zero-copy host-link rate plus a launch floor, compared pessimistically (the slowest of 5 CPU arm samples against the fastest of 5 link samples); unified-memory devices, a failed or inconclusive measurement and links the CPU does not beat by that margin stay on the link, and prefill, placement and host allocations never change. The typed developer key developer.qwen4_d2_default forces or vetoes that comparison. An explicit value, 'pcie' included, always wins. Empty and unknown values fall back to 'pcie'.",
+    },
     field!(
         "memory.offload_passback_share",
         "offload_passback_share",
@@ -895,7 +953,11 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         "HIPFIRE_SERVE_MULTI_SLOT",
-        "Serve requests concurrently on the multi-slot engine instead of one at a time."
+        "Serve requests concurrently on the multi-slot engine instead of one at a time. \
+         Concurrency is per arch: the qwen3.5 generation engine needs memory.kv_cache=q8 \
+         (it refuses every other value, including the default auto), while the arch-17 \
+         embedding encoder has no KV cache at all and merges concurrent encodes into one \
+         batched forward."
     ),
     field!(
         "serve.multi_slot_slots",
@@ -1392,6 +1454,18 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_ALLOW_REQUEST_PATHS",
         "Let a chat request load any readable file it names. Off: requests may name only installed models (models directory, catalog, pre-warm model)."
     ),
+    field!(
+        "serve.api_key_file",
+        "api_key_file",
+        Serve,
+        Process,
+        DefaultValue::String(""),
+        ValueRule::AbsolutePathOrEmpty,
+        false,
+        false,
+        Some("HIPFIRE_SERVE_API_KEY_FILE"),
+        "Absolute path of a file holding the serve bearer token (at least 32 bytes after trimming trailing whitespace; Unix mode must grant no group/other access). Empty (unset) keeps serve keyless; the token itself is never stored in configuration."
+    ),
     // --- Serving cache/scheduler contract keys (spec §9.1) -----------------
     // All experimental: the cache/scheduler route is planned and has not
     // passed release gates (spec §9.1). Defaults are conservative
@@ -1516,6 +1590,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DFLASH_BLOCK"),
         "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). Default `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; `16` restores the previous fixed width. Legacy DFlash drafts keep their declared width."
+    ),
+    field!(
+        "speculation.dflash_lookup",
+        "dflash_lookup",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_LOOKUP"),
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
     ),
     field!(
         "speculation.dflash",
@@ -1765,17 +1851,17 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_HOT_STORE_BYTES",
-        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
+        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus the CMA region (the larger of CmaFree and the CMA pageblocks: CmaTotal or /proc/zoneinfo cma; only movable allocations can use them) minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
     ),
     process_field!(
         "memory.ple_format",
         "ple_format",
         Memory,
         DefaultValue::String("auto"),
-        ValueRule::Enum(&["auto", "q4", "q8"]),
+        ValueRule::Enum(PLE_FORMATS),
         false,
         "HIPFIRE_PLE_FORMAT",
-        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, derived from the Q8 rows on first load when missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
+        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, created ahead of time with `hipfire ple derive --format q4 <model>` or `hipfire pull`; a load never derives it and refuses when it is missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
     ),
     process_field!(
         "memory.ple_prewarm_bytes",
@@ -1788,7 +1874,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_PREWARM_BYTES",
-        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = MemAvailable minus the CMA region minus 8 GiB, sampled once after the pinned experts and the model are loaded, capped at the table's data bytes; on a unified-memory GPU and on a discrete GPU with every expert resident in VRAM it is also capped at 15 GiB (the smaller of the two), and only a discrete GPU with host-placed experts takes the uncapped figure; an unreadable MemAvailable gives 0. `0` turns the prewarm off; an explicit N is that many bytes, is never capped at 15 GiB, and overrides the derivation (the table still caps it). The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
     ),
     process_field!(
         "memory.ple_load_fill_bytes",
@@ -1801,7 +1887,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_LOAD_FILL_BYTES",
-        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
     ),
     process_field!(
         "memory.session_cache_disk_bytes",
@@ -2040,7 +2126,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MTP_MODE"),
-        "MTP eligibility policy."
+        "MTP eligibility policy. `auto` (default) arms the native MTP head only for a producer that declares a measured autoregressive floor (native Qwen4 MTP, Flash-Next); every other producer (Qwen3.5/3.6, DeepSeek V4) keeps plain AR and does not load the head. `on` arms the head wherever one exists (also over a host-mapped expert spill); `off` never arms it."
     ),
     field!(
         "speculation.mtp_k",
@@ -2048,11 +2134,11 @@ pub static FIELDS: &[ConfigField] = &[
         Speculation,
         ModelLoad,
         DefaultValue::String("auto"),
-        ValueRule::AutoInteger { min: 1, max: 10 },
+        ValueRule::AutoInteger { min: 1, max: 63 },
         true,
         false,
         Some("HIPFIRE_MTP_K"),
-        "MTP draft window. Default `auto` = 4 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3; an explicit 1-10 overrides; `3` restores the previous gfx1151 cap."
+        "MTP draft window. Default `auto` = one below the qualified row-exact verify rows for native Qwen4 MTP (Flash-Next, arch 16), narrowed to the CPU-owned expert window after placement; else 3. Explicit 1-63 overrides the default, not executor/qualified-row/CPU constraints. Other producers retain their own limits."
     ),
     field!(
         "speculation.mtp_ngram",
@@ -2065,6 +2151,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_MTP_NGRAM"),
         "N-gram takeover windows inside native MTP (greedy and sampled, thinking on or off). auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves other producers off; on/1 arms every MTP producer that supports it; off/0 disables it."
+    ),
+    field!(
+        "speculation.mtp_ngram_copy",
+        "mtp_ngram_copy",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_MTP_NGRAM_COPY"),
+        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover; auto (default) is off on every GPU for now."
     ),
     field!(
         "speculation.mtp_sampled",
@@ -2108,11 +2206,11 @@ pub static FIELDS: &[ConfigField] = &[
         Speculation,
         ModelLoad,
         DefaultValue::String("off"),
-        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0", "true", "false"]),
         true,
         false,
         Some("HIPFIRE_NGRAM_DRAFT"),
-        "Model-free n-gram speculation policy."
+        "Model-free n-gram speculation policy: on/1/true arms it, off/0/false (default) disables it, auto arms it wherever the loader has an n-gram speculator for the arch; any other value is a config error."
     ),
     field!(
         "speculation.ngram_k",
@@ -2211,11 +2309,23 @@ pub static FIELDS: &[ConfigField] = &[
         Hardware,
         ModelLoad,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 4 },
+        ValueRule::Integer { min: 1, max: 8 },
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_EP"),
-        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1201: 1 (default, single device), 2 or 4. Experts shard e % N across N visible gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1100 or gfx1201: 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous gfx1100 or gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+    ),
+    field!(
+        "topology.pp",
+        "pp",
+        Hardware,
+        ModelLoad,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 8 },
+        false,
+        true,
+        Some("HIPFIRE_TOPOLOGY_PP"),
+        "Pipeline-parallel degree: 1 (default, single device) or 2..=8. Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or Qwen4 expert parallelism."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2479,7 +2589,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its default is 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Resident Qwen3.5/3.6 MoE models (fully resident, single device, grouped MQ4 producers) take one widened rung instead: unset requests 4096 rows, admitted only when the projected prefill batch scratch plus grouped/projection workspace plus the 1 GiB margin fit the free VRAM, else the incumbent 512 (arch default) ceiling with no intermediate rung; an explicit value below 4096 or HIPFIRE_PREFILL_MAX_BATCH keeps the incumbent, one at or above 4096 requests the admitted rung (the actual admitted chunk is logged as `prefill_chunk: requested=… admitted=…`). Dense Qwen3.5/3.6 keeps the 8192 ladder above. Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -2876,10 +2986,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx1100_fa2_split_verify",
         "gfx1100_fa2_split_verify",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX1100_FA2_SPLIT_VERIFY",
-        "Opt in to the exact-gfx1100 Q8 FA2 split-KV VerifyAttn route (default off; applies only on exact gfx1100 inside the dense H24/KV4/HD256 long-context envelope with VMM KV, and a load that resolves legacy KV is refused). Off keeps the established VerifyAttn/R4-R8/batched route. The parent kernel.verify_attn switch takes precedence."
+        "Use the Q8 FA2 split-KV VerifyAttn route by default on exact gfx1100 inside the existing dense H24/KV4/HD256 long-context VMM-KV envelope (false or HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0 restores the established VerifyAttn/R4-R8/batched route). The independent parent kernel.verify_attn=false / HIPFIRE_VERIFY_ATTN=0 also opts out. Other architectures remain off."
     ),
     process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
@@ -2959,6 +3069,15 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_IU4_SYMFOLD",
         "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_a8_prefill",
+        "gfx11_a8_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_A8_PREFILL",
+        "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM: about 43% lower KLD than IU4 W4A4 on Strix Halo, prompts about 1.5-1.6x slower. Default off on every architecture (IU4 W4A4 stays the default); other architectures ignore it."
     ),
     process_bool_field!(
         "kernel.npu_spillover",
@@ -3384,7 +3503,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         "HIPFIRE_AR_GRAPH",
-        "Allow autoregressive forward graph capture when otherwise eligible."
+        "Allow autoregressive forward graph capture when otherwise eligible. Default on, except Windows gfx1100, where it defaults off (opt-in) because graph replay silently produced wrong output (#655); an explicit true/false or HIPFIRE_AR_GRAPH always wins."
     ),
     process_bool_field!(
         "experimental.graph.moe",
@@ -3781,13 +3900,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
         "gfx1151 compute-resource-limits packet policy."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CU masking on RDNA hung the R9700 MES (2026-10-14); refused
     diagnostic_field!(
         "diagnostic.replay.gfx1151_cu_count",
         "gfx1151_redline_cu_count",
         DefaultValue::String("all"),
         ValueRule::String,
         "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
-        "Even gfx1151 CU count below 40, or all."
+        "Refused: any value other than all fails PM4 replay preparation (CU masks on RDNA hung the R9700 MES on 2026-10-14). Default all."
     ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_entry_acquire",
@@ -3873,6 +3993,77 @@ pub fn is_developer_key(key: &str) -> bool {
         .is_some_and(valid_developer_suffix)
 }
 
+/// `developer.*` keys with a typed boolean value: `true`, `false`, `1` or `0`
+/// in the `HIPFIRE_*` environment variable, `config set`, or TOML (a native
+/// boolean, a string spelling, or the integers 0/1). Anything else is
+/// rejected when the layer is built, never silently ignored. Every other
+/// developer key keeps its free-form legacy spelling.
+const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
+    "developer.qwen4_moe_sym_iu4",
+    "developer.qwen4_d2_default",
+    "developer.moe_sym_iu4",
+    "developer.qwen4_slowlink_prefill",
+    "developer.gdn_qk_indexed",
+    "developer.gdn_moe_pre_fused",
+    "developer.gdn_moe_chunk_scan",
+    "developer.moe_router_fused_prefill",
+    "developer.moe_shared_prepared_iu4",
+    "developer.fa_prefill_pm",
+    "developer.moe_router_topk_multirow",
+    "developer.moe_combine_v2",
+    "developer.moe_iu4_wide_tiles",
+    "developer.prefill_iu4_producer_fused",
+    "developer.fa_prefill_pm_qprep",
+    "developer.moe_rotate_i4_pm",
+    "developer.prefill_iu4_c8_pm",
+    "developer.gdn_chunk_prep_pm",
+    "developer.moe_shared_down_sigmoid_epi",
+];
+
+pub fn is_typed_bool_developer_key(key: &str) -> bool {
+    TYPED_BOOL_DEVELOPER_KEYS.contains(&key)
+}
+
+/// The typed-boolean spellings: `1`/`true` and `0`/`false` (`true`/`false`
+/// ASCII case-insensitive). No other word (`on`, `yes`, `2`, empty) parses.
+pub fn parse_typed_bool(raw: &str) -> Option<bool> {
+    match raw {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ if raw.eq_ignore_ascii_case("true") => Some(true),
+        _ if raw.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Normalise `value` for the typed-boolean developer key `key` to
+/// [`ConfigValue::Bool`] (rendered `1`/`0` to every `HIPFIRE_*` reader), or
+/// fail with the accepted spellings.
+fn typed_bool_developer_value(key: &str, value: ConfigValue) -> Result<ConfigValue> {
+    let parsed = match &value {
+        ConfigValue::Bool(value) => Some(*value),
+        ConfigValue::Integer(0) => Some(false),
+        ConfigValue::Integer(1) => Some(true),
+        ConfigValue::String(raw) => parse_typed_bool(raw),
+        _ => None,
+    };
+    parsed
+        .map(ConfigValue::Bool)
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: format!(
+                "expected a boolean: true, false, 1 or 0 (got {})",
+                match &value {
+                    ConfigValue::String(raw) => format!("'{raw}'"),
+                    ConfigValue::Integer(raw) => raw.to_string(),
+                    ConfigValue::Float(raw) => raw.to_string(),
+                    ConfigValue::Bool(raw) => raw.to_string(),
+                    ConfigValue::Null => "null".to_owned(),
+                }
+            ),
+        })
+}
+
 pub fn developer_key_for_env(name: &str) -> Option<String> {
     let suffix = name.strip_prefix("HIPFIRE_")?.to_ascii_lowercase();
     valid_developer_suffix(&suffix).then(|| format!("{DEVELOPER_PREFIX}{suffix}"))
@@ -3883,6 +4074,21 @@ fn valid_developer_suffix(suffix: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Key prefixes (canonical names) of the CASK and PFlash research features,
+/// deprecated since 0.4.0 with removal in 0.5.0.
+const DEPRECATED_KEY_PREFIXES: &[&str] =
+    &["memory.cask.", "speculation.prefill.", "diagnostic.pflash."];
+
+/// True when `key` (canonical or legacy flat name) belongs to a deprecated
+/// CASK/PFlash family: `memory.cask.*`, `speculation.prefill.*` or
+/// `diagnostic.pflash.*`.
+pub fn is_deprecated_key(key: &str) -> bool {
+    let canonical = field(key).map_or(key, |schema| schema.key);
+    DEPRECATED_KEY_PREFIXES
+        .iter()
+        .any(|prefix| canonical.starts_with(prefix))
 }
 
 pub fn canonical_config_key(key: &str) -> Option<String> {
@@ -3964,6 +4170,11 @@ impl ConfigLayer {
             field.validate(&value)?;
             self.values.insert(field.key.to_owned(), value);
         } else if is_developer_key(key) {
+            let value = if is_typed_bool_developer_key(key) {
+                typed_bool_developer_value(key, value)?
+            } else {
+                value
+            };
             self.values.insert(key.to_owned(), value);
         } else {
             return Err(unknown_key(key));
@@ -3996,7 +4207,11 @@ impl ConfigLayer {
         for (key, value) in &self.values {
             if let Some(field) = field(key) {
                 field.validate(value)?;
-            } else if !is_developer_key(key) {
+            } else if is_developer_key(key) {
+                if is_typed_bool_developer_key(key) {
+                    typed_bool_developer_value(key, value.clone())?;
+                }
+            } else {
                 return Err(ConfigError::UnknownKey(key.clone()));
             }
         }
@@ -4168,7 +4383,7 @@ pub fn active_process_config() -> Option<&'static ProcessConfig> {
 /// and developer-tool invocation. Native CLI launches install their already
 /// resolved policy explicitly and never take this fallback.
 pub fn load_local_process_config() -> Result<ProcessConfig> {
-    let paths = ConfigPaths::discover();
+    let paths = ConfigPaths::try_discover()?;
     let loaded = load_global(&paths)?;
     let mut layers = vec![NamedLayer {
         source: ConfigSource::GlobalUser { path: loaded.path },
@@ -4310,20 +4525,11 @@ pub fn is_discrete_memory_arch(arch: &str) -> bool {
         .any(|known| arch.eq_ignore_ascii_case(known))
 }
 
-/// `SwapTotal` (kB) from a /proc/meminfo body; `None` when absent/unreadable.
-fn swap_total_kb_from_meminfo(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-/// Host swap size in kB; `None` when /proc/meminfo cannot be read.
+/// Whether the host has swap; `None` when the host memory snapshot or its
+/// swap size is unavailable. On Linux this is `SwapTotal > 0`; on Windows the
+/// swap size is the pagefile approximation from [`host_memory::host_memory`].
 fn host_has_swap() -> Option<bool> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    Some(swap_total_kb_from_meminfo(&meminfo)? > 0)
+    Some(host_memory::host_memory()?.swap_total_bytes? > 0)
 }
 
 /// Pure auto decision, testable without pinning host state. With a known GPU
@@ -4407,6 +4613,23 @@ pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
 pub fn developer_bool(name: &str, default: bool) -> bool {
     parse_developer_bool(process_value(name).as_deref(), default)
 }
+/// Typed-boolean developer read for the keys in `TYPED_BOOL_DEVELOPER_KEYS`:
+/// `None` when unset, else the value of one of the spellings
+/// [`parse_typed_bool`] accepts (`true`/`false`/`1`/`0`). The process snapshot
+/// rejects any other spelling when it is built, so reaching one here is a bug
+/// in the caller (a name not declared typed) and fails loudly instead of being
+/// read as unset.
+pub fn developer_typed_bool(name: &str) -> Option<bool> {
+    typed_developer_bool_value(name, process_value(name).as_deref())
+}
+/// Pure body of [`developer_typed_bool`] for unit tests.
+fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
+    let raw = raw?;
+    match parse_typed_bool(raw) {
+        Some(value) => Some(value),
+        None => panic!("{name}={raw:?} is not a boolean: expected true, false, 1 or 0"),
+    }
+}
 /// Pure truth table behind [`developer_bool`], split out so unit tests can
 /// pin the contract without touching the process-global snapshot.
 fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
@@ -4427,11 +4650,32 @@ pub fn parse_tri_state(mode: &str) -> Option<bool> {
         _ => None,
     }
 }
+/// Strict form of [`parse_tri_state`] for the speculation selectors the schema
+/// accepts with boolean aliases (`speculation.ngram`, `mtp_ngram`,
+/// `mtp_ngram_copy`): `on`/`1`/`true` → `Some(true)`, `off`/`0`/`false` →
+/// `Some(false)`, `auto` → `None` (defer). Any other spelling is an error, never
+/// a silent off — a typed consumer that matched only `"on"` once turned
+/// `HIPFIRE_NGRAM_DRAFT=1` into off. Exact, lower-case.
+pub fn parse_tri_state_alias(mode: &str) -> std::result::Result<Option<bool>, String> {
+    match mode {
+        "1" | "true" => Ok(Some(true)),
+        "0" | "false" => Ok(Some(false)),
+        "auto" => Ok(None),
+        other => match parse_tri_state(other) {
+            Some(value) => Ok(Some(value)),
+            None => Err(format!(
+                "invalid value {other:?}: expected on, 1, true, off, 0, false or auto"
+            )),
+        },
+    }
+}
 /// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
-/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it
-/// except over a host-mapped expert spill (the shared [`mtp_host_spill_policy`]
-/// decline). `Default = Off`: the slots `mtp_mode` param defaults to `"off"`
-/// unless the operator opted in, and the daemon parse keeps that default
+/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it only
+/// for a producer that declared a measured AR floor ([`mtp_mode_admits`]) and,
+/// even then, not over a host-mapped expert spill (the shared
+/// [`mtp_host_spill_policy`] decline). `Default = Off`: the slots `mtp_mode`
+/// param defaults to `"off"` unless the operator opted in, and the daemon
+/// parse keeps that default
 /// verbatim — only the `auto`-vs-`on` distinction now survives beside `mtp_k`.
 /// Exact, lower-case; anything unrecognized (including `auto` and the empty
 /// string, which the slots `mtp_k` rule already treats as off) resolves as
@@ -4441,7 +4685,8 @@ pub enum MtpMode {
     /// Never arm the head (today's behaviour, unchanged).
     #[default]
     Off,
-    /// Arm unless the host-spill policy declines (today's `auto`).
+    /// Arm only for a producer with a measured AR floor, and not over a
+    /// host-mapped expert spill the host-spill policy declines.
     Auto,
     /// Arm even over a host-mapped expert spill (explicit opt-in).
     On,
@@ -4460,6 +4705,71 @@ impl MtpMode {
             _ => Self::Auto,
         }
     }
+}
+
+impl MtpMode {
+    /// Lift the typed load tri-state (`SpecLoadCfg::mtp`: `Some(true)` = `on`,
+    /// `Some(false)` = `off`, `None` = `auto`) into the mode every MTP arming
+    /// site shares, so no consumer re-spells the three-way match.
+    pub fn from_tri_state(mtp: Option<bool>) -> Self {
+        match mtp {
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+            None => Self::Auto,
+        }
+    }
+
+    /// The exact lower-case spelling [`MtpMode::parse`] reads back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
+/// The one producer-capability gate every MTP consumer applies before it loads,
+/// attaches or routes a native MTP head: `measured_ar_floor` is the producer's
+/// declaration that its drafter ships a measured autoregressive floor (a
+/// per-request AR-vs-draft pricing that retires drafting when it loses to AR).
+/// `On` is an explicit opt-in and always admits; `Off` never does; `Auto`
+/// admits only a producer that declared the floor, so an unmeasured drafter
+/// never speculates by default and the model keeps its plain AR route. Pure
+/// and arch-blind: the capability, not the model tag or the card, decides.
+/// Host-spill and head-presence policies ([`mtp_host_spill_policy`]) apply on
+/// top of this verdict.
+pub fn mtp_mode_admits(mode: MtpMode, measured_ar_floor: bool) -> bool {
+    match mode {
+        MtpMode::Off => false,
+        MtpMode::On => true,
+        MtpMode::Auto => measured_ar_floor,
+    }
+}
+
+/// `mode` after the producer-capability gate: `Auto` on a producer without a
+/// measured AR floor resolves to `Off` (consumers that read the mode see AR,
+/// never a rearm from head or weights presence); `On`, `Off` and an `Auto`
+/// with a declared floor are unchanged.
+pub fn mtp_effective_mode(mode: MtpMode, measured_ar_floor: bool) -> MtpMode {
+    match mode {
+        MtpMode::Auto if !measured_ar_floor => MtpMode::Off,
+        other => other,
+    }
+}
+
+/// [`mtp_effective_mode`] over the raw `params.mtp_mode` spelling, as the
+/// lower-case name string consumers compare against. Spelling follows
+/// [`MtpMode::parse`] (an unrecognized value defers to `auto`, an empty one is
+/// `off`).
+pub fn mtp_effective_mode_name(raw: &str, measured_ar_floor: bool) -> &'static str {
+    mtp_effective_mode(MtpMode::parse(raw), measured_ar_floor).name()
+}
+
+/// The shared log line for an `auto` MTP that a producer without a measured AR
+/// floor declines, worded once for every route (sequential, slots, daemon).
+pub fn mtp_no_floor_decline_line(model: &str) -> String {
+    format!("  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp")
 }
 
 /// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
@@ -4608,16 +4918,54 @@ fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_ar
 fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
     model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
-/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model/GPU pair
-/// except [`mtp_k_default_for_arch`]'s admitted one.
+/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model that
+/// does not report a row-exact verify capability (see [`mtp_k_default`]).
 pub const MTP_K_DEFAULT: usize = 3;
-/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next) on
-/// gfx1151 drafts 4; every other model/GPU keeps [`MTP_K_DEFAULT`]. An explicit
-/// `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load param (including `3`)
-/// overrides this; callers apply it only when no explicit value is present.
-pub fn mtp_k_default_for_arch(model_arch: u32, gpu_arch: &str) -> usize {
-    if model_arch == 16 && gpu_arch == "gfx1151" {
-        4
+/// Physical capacity of a Qwen4 verify window, including its seed row.
+///
+/// This is a storage/executor bound, not a row-exactness certificate or a
+/// shipping admission limit. The proven per-architecture tables below remain
+/// authoritative until byte, state, ID and cost qualification permits widening.
+pub const QWEN4_VERIFY_MAX_ROWS: usize = 64;
+/// Verify rows a Qwen4 forward runs bitwise like the single-row decode on a
+/// GPU whose row-exactness oracle has not proven a wider block: the historic
+/// few-row route limit (`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`,
+/// which re-exports this value).
+pub const QWEN4_FEW_ROW_ROUTE_ROWS: usize = 8;
+/// gfx1151 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows (`rdna_compute::prefill_invariant`
+/// re-exports this value).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
+/// gfx1201 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows (`rdna_compute::prefill_invariant`
+/// re-exports this value).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+/// Per-arch proven row-exact Qwen4 verify rows without the developer/oracle
+/// overrides (other arches [`QWEN4_FEW_ROW_ROUTE_ROWS`]). The runtime value is
+/// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`, which layers
+/// those overrides over this table; the config view of `speculation.mtp_k`
+/// reads the table because `rdna-compute` depends on this crate.
+pub fn qwen4_row_exact_verify_rows_table(gpu_arch: &str) -> usize {
+    match gpu_arch {
+        "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
+        "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        _ => QWEN4_FEW_ROW_ROUTE_ROWS,
+    }
+}
+/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next)
+/// drafts up to one below the GPU's row-exact verify rows
+/// (`row_exact_verify_rows`, the rows a verify forward runs bitwise like the
+/// single-row decode): the adaptive depth chooser picks each window's depth
+/// from this request's measured window costs and agreement, so the cap is the
+/// proven capability, not a per-GPU tuning guess. Other models keep
+/// [`MTP_K_DEFAULT`]. An explicit `HIPFIRE_MTP_K` / `speculation.mtp_k` /
+/// `mtp_k` load param (including `3`) overrides this; callers apply it only
+/// when no explicit value is present. Callers pass
+/// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch)`;
+/// the config view passes [`qwen4_row_exact_verify_rows_table`].
+pub fn mtp_k_default(model_arch: u32, row_exact_verify_rows: usize) -> usize {
+    if model_arch == 16 {
+        row_exact_verify_rows.saturating_sub(1).max(1)
     } else {
         MTP_K_DEFAULT
     }
@@ -4643,11 +4991,15 @@ pub fn ngram_mod_triple() -> (usize, usize, usize) {
     ngram_mod_triple_with_defaults((24, 48, 64))
 }
 /// Arch-aware `(n_match, n_min, n_max)` triple. `5/3/3` is the approved
-/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; every other
-/// family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
-/// N_MIN,N_MAX}` override wins per component. Validation stays with the
-/// consumer.
+/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; with the copy
+/// lane armed ([`mtp_ngram_copy_enabled_for_arch`]) arch 16 resolves
+/// [`NGRAM_MOD_COPY_TRIPLE`] instead. Every other family keeps the
+/// production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}`
+/// override wins per component. Validation stays with the consumer.
 pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    if model_arch == 16 && mtp_ngram_copy_enabled_for_arch(model_arch, gpu_arch) {
+        return ngram_mod_copy_triple();
+    }
     ngram_mod_triple_with_defaults(ngram_mod_default_triple(model_arch, gpu_arch))
 }
 fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
@@ -4656,6 +5008,65 @@ fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, u
     } else {
         (24, 48, 64)
     }
+}
+/// The native Qwen4 MTP n-gram copy lane's default triple: `n_max` is the
+/// proposal and shadow-observation length, not the takeover cap (the drafter
+/// takes at most `min(n_max, row-exact verify rows - 1)` candidates, chosen
+/// per window from the request's own measured acceptance and costs), and a
+/// one-candidate take is allowed.
+pub const NGRAM_MOD_COPY_TRIPLE: (usize, usize, usize) = (5, 1, 63);
+/// [`NGRAM_MOD_COPY_TRIPLE`] with the `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,
+/// N_MAX}` overrides applied per component: the triple of an armed copy lane.
+pub fn ngram_mod_copy_triple() -> (usize, usize, usize) {
+    ngram_mod_triple_with_defaults(NGRAM_MOD_COPY_TRIPLE)
+}
+/// Native Qwen4 MTP n-gram copy lane arming (`speculation.mtp_ngram_copy`,
+/// env override `HIPFIRE_MTP_NGRAM_COPY`). `on`/`1` arms it wherever the
+/// native Qwen4 n-gram source is armed ([`mtp_ngram_enabled_for_arch`]),
+/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover,
+/// and `auto` (the schema default; an unset key also resolves to `auto`) is
+/// off on every GPU until a GPU's own receipts flip it.
+pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
+    mtp_ngram_copy_enabled_for_arch_value(
+        process_value("HIPFIRE_MTP_NGRAM_COPY").as_deref(),
+        model_arch,
+        gpu_arch,
+    )
+}
+fn mtp_ngram_copy_enabled_for_arch_value(
+    value: Option<&str>,
+    _model_arch: u32,
+    _gpu_arch: &str,
+) -> bool {
+    match value {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => false,
+    }
+}
+/// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
+/// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
+/// `auto` (the schema default; an unset key also resolves to `auto`) and
+/// `on`/`1` arm it; only `off`/`0` disables it (CHANGELOG 0.4.3: +39.8%
+/// copy-heavy decode on R9700; non-copy requests run the incumbent window).
+/// This only resolves the user policy; the consumer (`DflashSpeculator`)
+/// additionally requires a singleton DFlash2 selector chain and reports the
+/// reason it declined.
+pub fn dflash_lookup_enabled() -> bool {
+    dflash_lookup_enabled_value(process_value("HIPFIRE_DFLASH_LOOKUP").as_deref())
+}
+fn dflash_lookup_enabled_value(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "off"))
+}
+/// Developer kill switch for the Tail windows of the DFlash lookup
+/// (`HIPFIRE_SPEC_LOOKUP_TAIL=0`, read through the `[developer]` namespace):
+/// an exact `0` disables only the Tail windows (Copy windows stay); anything
+/// else, including unset, leaves them on.
+pub fn dflash_lookup_tail_enabled() -> bool {
+    dflash_lookup_tail_enabled_value(process_value("HIPFIRE_SPEC_LOOKUP_TAIL").as_deref())
+}
+fn dflash_lookup_tail_enabled_value(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
     ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
@@ -4875,19 +5286,94 @@ pub struct ConfigPaths {
     pub models_toml: PathBuf,
     pub models_json: PathBuf,
     pub legacy_per_model_json: PathBuf,
+    /// Tuning-preset ownership and undo state (`tuning.toml`), a control-plane
+    /// file beside `config.toml`; see [`tuning`].
+    pub tuning_toml: PathBuf,
+}
+
+/// The hipfire state root every crate shares (`ConfigPaths::root`,
+/// `RegistryPaths::cache`'s parent). Selection order:
+///
+/// - Unix: `HIPFIRE_HOME`, else `$HOME/.hipfire`, else the relative `.hipfire`.
+/// - Windows: `HIPFIRE_HOME`, else `%USERPROFILE%\.hipfire` (the root
+///   `scripts/install.ps1` installs into), else `%HOME%\.hipfire`. A Windows
+///   root is never CWD-relative: a missing home or a non-absolute value is an
+///   actionable [`ConfigError::Home`].
+pub fn hipfire_home() -> Result<PathBuf> {
+    hipfire_home_from(cfg!(windows), |name| env::var_os(name))
+}
+
+/// Pure core of [`hipfire_home`]: `windows` selects the rule set and `get`
+/// supplies environment values, so tests inject both without touching the
+/// process environment.
+fn hipfire_home_from(
+    windows: bool,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if !windows {
+        return Ok(get("HIPFIRE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .unwrap_or_else(|| PathBuf::from(".hipfire")));
+    }
+    if let Some(raw) = get("HIPFIRE_HOME") {
+        return require_windows_absolute("HIPFIRE_HOME", PathBuf::from(raw));
+    }
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(profile) = get(var).filter(|value| !value.is_empty()) {
+            return require_windows_absolute(var, PathBuf::from(profile))
+                .map(|profile| profile.join(".hipfire"));
+        }
+    }
+    Err(ConfigError::Home(
+        "cannot locate the hipfire home: neither HIPFIRE_HOME nor USERPROFILE is set \
+         (and HOME is unset); set HIPFIRE_HOME to an absolute directory such as \
+         C:\\Users\\<you>\\.hipfire"
+            .to_string(),
+    ))
+}
+
+fn require_windows_absolute(var: &str, path: PathBuf) -> Result<PathBuf> {
+    if is_windows_absolute(&path) {
+        Ok(path)
+    } else {
+        Err(ConfigError::Home(format!(
+            "{var}={} is not an absolute Windows path; hipfire will not use a \
+             current-directory-relative home. Set {var} to a full path such as \
+             C:\\Users\\<you>\\.hipfire",
+            path.display()
+        )))
+    }
+}
+
+/// Windows absoluteness decided textually so it is the same on every host:
+/// `C:\` / `C:/` drive roots, or `\\server\share` / `\\?\` style prefixes.
+/// Drive-relative (`C:foo`) and rooted-without-drive (`\foo`) paths are not
+/// absolute.
+fn is_windows_absolute(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2]) {
+        return true;
+    }
+    bytes.len() >= 3 && is_sep(bytes[0]) && is_sep(bytes[1]) && !is_sep(bytes[2])
 }
 
 impl ConfigPaths {
+    /// Infallible form of [`ConfigPaths::try_discover`]; panics with the
+    /// actionable message when no usable Windows home exists. Fallible callers
+    /// use `try_discover`.
     pub fn discover() -> Self {
-        let root = env::var_os("HIPFIRE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
-            .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        let mut paths = Self::under(root);
+        Self::try_discover().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_discover() -> Result<Self> {
+        let mut paths = Self::under(hipfire_home()?);
         if let Some(models) = env::var_os("HIPFIRE_MODELS_DIR") {
             paths.models = PathBuf::from(models);
         }
-        paths
+        Ok(paths)
     }
 
     pub fn under(root: impl Into<PathBuf>) -> Self {
@@ -4900,6 +5386,7 @@ impl ConfigPaths {
             models_toml: root.join("models.toml"),
             models_json: root.join("models.json"),
             legacy_per_model_json: root.join("per_model_config.json"),
+            tuning_toml: root.join("tuning.toml"),
             root,
         }
     }
@@ -5135,27 +5622,146 @@ pub fn write_catalog_toml(paths: &ConfigPaths, catalog: &ModelCatalog) -> Result
     atomic_write(&paths.models_toml, rendered.as_bytes())
 }
 
+/// Whether `key` may appear in a per-model override layer.
+///
+/// Developer keys are global process policy; process/diagnostic scoped fields
+/// are not valid per model. This is the per-key rule `models.toml` validation
+/// applies to every override.
+pub fn model_override_allowed(key: &str) -> Result<()> {
+    if is_developer_key(key) {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: "developer fields are global process policy and not valid per-model".into(),
+        });
+    }
+    let Some(schema) = field(key) else {
+        return Err(unknown_key(key));
+    };
+    if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: "field is not valid in a per-model override".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
     layer.validate()?;
     for key in layer.values.keys() {
-        if is_developer_key(key) {
-            return Err(ConfigError::InvalidValue {
-                key: key.clone(),
-                message: "developer fields are global process policy and not valid per-model"
-                    .into(),
-            });
-        }
-        let Some(schema) = field(key) else {
-            return Err(unknown_key(key));
-        };
-        if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
-            return Err(ConfigError::InvalidValue {
-                key: key.clone(),
-                message: "field is not valid in a per-model override".into(),
-            });
-        }
+        model_override_allowed(key)?;
     }
     Ok(())
+}
+
+/// What [`set_model_override`] saved, for the caller to report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetModelOverride {
+    /// Catalog identity the override was written under.
+    pub id: String,
+    /// Canonical key that was set.
+    pub key: &'static str,
+    /// Value as stored in the override layer.
+    pub value: ConfigValue,
+    /// The catalog was read from legacy JSON and has now been written as TOML.
+    pub migrated_legacy_json: bool,
+}
+
+/// Outcome of [`remove_model_override`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveModelOverride {
+    /// The catalog has no entry for the model; nothing was written.
+    NoOverrides,
+    /// The key's override was removed.
+    KeyRemoved { id: String, key: &'static str },
+    /// The key had no override; the catalog was rewritten unchanged.
+    KeyInherited { id: String, key: &'static str },
+    /// Every override of the model was removed.
+    AllRemoved { id: String },
+}
+
+/// Set one per-model override and write `models.toml`.
+///
+/// The catalog id is the existing identity for `model`, else `registry_tag`,
+/// else `model` itself. `local_path` and `registry_tag` backfill the record
+/// only when it has none.
+pub fn set_model_override(
+    paths: &ConfigPaths,
+    registry_tag: Option<&str>,
+    local_path: Option<PathBuf>,
+    model: &str,
+    key: &str,
+    raw: &str,
+) -> Result<SetModelOverride> {
+    let mut loaded = load_catalog(paths)?;
+    let id = loaded
+        .catalog
+        .model_id(model)
+        .map(str::to_owned)
+        .unwrap_or_else(|| registry_tag.unwrap_or(model).to_owned());
+    let (canonical, saved) = {
+        let record = loaded.catalog.models.entry(id.clone()).or_default();
+        if record.path.is_none() {
+            record.path = local_path;
+        }
+        if record.registry_tag.is_none() {
+            record.registry_tag = registry_tag.map(str::to_owned);
+        }
+        record.overrides.set_cli(key, raw)?;
+        let schema = field(key).ok_or_else(|| unknown_key(key))?;
+        let saved = record
+            .overrides
+            .get(schema.key)
+            .ok_or_else(|| {
+                ConfigError::Catalog(format!("configuration key '{}' is not set", schema.key))
+            })?
+            .clone();
+        (schema.key, saved)
+    };
+    write_catalog_toml(paths, &loaded.catalog)?;
+    Ok(SetModelOverride {
+        id,
+        key: canonical,
+        value: saved,
+        migrated_legacy_json: loaded.format == CatalogFormat::LegacyJson,
+    })
+}
+
+/// Remove one per-model override (`key`) or all of them (`None`) and write
+/// `models.toml`. A model with no catalog entry writes nothing.
+pub fn remove_model_override(
+    paths: &ConfigPaths,
+    model: &str,
+    key: Option<&str>,
+) -> Result<RemoveModelOverride> {
+    let mut loaded = load_catalog(paths)?;
+    let Some(id) = loaded.catalog.model_id(model).map(str::to_owned) else {
+        return Ok(RemoveModelOverride::NoOverrides);
+    };
+    let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
+        ConfigError::Catalog(format!(
+            "model '{model}' has no catalog entry for id '{id}'"
+        ))
+    })?;
+    let outcome = if let Some(key) = key {
+        let schema = field(key).ok_or_else(|| unknown_key(key))?;
+        if record.overrides.remove(schema.key)?.is_some() {
+            RemoveModelOverride::KeyRemoved {
+                id,
+                key: schema.key,
+            }
+        } else {
+            RemoveModelOverride::KeyInherited {
+                id,
+                key: schema.key,
+            }
+        }
+    } else {
+        record.overrides = ConfigLayer::default();
+        RemoveModelOverride::AllRemoved { id }
+    };
+    write_catalog_toml(paths, &loaded.catalog)?;
+    Ok(outcome)
 }
 
 fn load_legacy_catalog(paths: &ConfigPaths) -> Result<(ModelCatalog, Vec<String>)> {
@@ -5468,7 +6074,7 @@ fn flatten_toml(
     path: &Path,
 ) -> Result<()> {
     for (key, value) in table {
-        if prefix.is_empty() && key == "schema_version" {
+        if prefix.is_empty() && (key == "schema_version" || key == calibration::SECTION) {
             continue;
         }
         let dotted = if prefix.is_empty() {
@@ -5512,6 +6118,14 @@ pub fn load_legacy_json_layer(path: &Path) -> Result<(ConfigLayer, Vec<String>)>
             warnings.push(format!("ignored unsupported legacy value for {key}"));
             continue;
         };
+        // 32768 was the TypeScript CLI's built-in default, which it always sent.
+        // Carrying it over would pin 32K on carriers that size their own context.
+        if field.key == "memory.max_seq" && value == ConfigValue::Integer(32768) {
+            warnings.push(format!(
+                "dropped legacy {key} = 32768 (the old built-in default); an omitted max_seq sizes the context automatically"
+            ));
+            continue;
+        }
         if let Err(error) = layer.set(field.key, value) {
             warnings.push(format!("ignored invalid legacy {key}: {error}"));
         }
@@ -5532,11 +6146,36 @@ fn from_json_value(value: &serde_json::Value) -> Option<ConfigValue> {
     }
 }
 
+/// Write the user layer to `config.toml`. The top-level `calibration` table
+/// (`hipfire calibrate`'s measured record, see [`calibration`]) is not part of
+/// the layer, so it is carried over from the file being overwritten; an
+/// unreadable or unparsable existing file contributes nothing.
 pub fn write_global_toml(paths: &ConfigPaths, layer: &ConfigLayer) -> Result<()> {
-    write_layer_toml(&paths.config_toml, layer)
+    let existing = fs::read_to_string(&paths.config_toml)
+        .ok()
+        .and_then(|raw| toml::from_str::<toml::Table>(&raw).ok())
+        .and_then(|mut root| root.remove(calibration::SECTION));
+    write_global_with_calibration(paths, layer, existing)
+}
+
+/// Write `config.toml` as the user layer plus an optional `calibration` table.
+pub(crate) fn write_global_with_calibration(
+    paths: &ConfigPaths,
+    layer: &ConfigLayer,
+    table: Option<toml::Value>,
+) -> Result<()> {
+    let mut root = layer_toml_root(layer)?;
+    if let Some(table) = table {
+        root.insert(calibration::SECTION.to_owned(), table);
+    }
+    write_toml_root(&paths.config_toml, root)
 }
 
 fn write_layer_toml(path: &Path, layer: &ConfigLayer) -> Result<()> {
+    write_toml_root(path, layer_toml_root(layer)?)
+}
+
+fn layer_toml_root(layer: &ConfigLayer) -> Result<toml::map::Map<String, toml::Value>> {
     layer.validate()?;
     let mut root = toml::map::Map::new();
     root.insert(
@@ -5549,6 +6188,10 @@ fn write_layer_toml(path: &Path, layer: &ConfigLayer) -> Result<()> {
         };
         insert_toml_path(&mut root, key, value)?;
     }
+    Ok(root)
+}
+
+fn write_toml_root(path: &Path, root: toml::map::Map<String, toml::Value>) -> Result<()> {
     let rendered =
         toml::to_string_pretty(&toml::Value::Table(root)).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
@@ -5688,17 +6331,64 @@ pub fn load_config_profile(paths: &ConfigPaths, name: &str) -> Result<ConfigLaye
     load_toml_layer(&path)
 }
 
-/// Replace `layer` entirely with the selected profile contents.
+/// Merge the selected profile into `layer`.
 ///
-/// Selection is a deterministic full cutover of the sparse global config: every
-/// previous override is discarded and only the profile layer remains.
+/// Every key the profile sets is written to `layer`, overwriting that key's
+/// previous value. Every key the profile does not set is left untouched, so
+/// applying a profile never drops unrelated global overrides (devices, ports,
+/// default model, kernel flags, ...). Returns the number of keys the profile
+/// sets. On error `layer` is unchanged.
 pub fn apply_config_profile(
     layer: &mut ConfigLayer,
     paths: &ConfigPaths,
     name: &str,
-) -> Result<()> {
-    *layer = load_config_profile(paths, name)?;
-    Ok(())
+) -> Result<usize> {
+    let profile = load_config_profile(paths, name)?;
+    let count = profile.values.len();
+    layer.values.extend(profile.values);
+    Ok(count)
+}
+
+/// Key-level difference between two layers, in key order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigLayerDiff {
+    /// Keys present only in the new layer: `(key, new)`.
+    pub added: Vec<(String, ConfigValue)>,
+    /// Keys present in both with different values: `(key, old, new)`.
+    pub changed: Vec<(String, ConfigValue, ConfigValue)>,
+    /// Keys present only in the old layer: `(key, old)`.
+    pub removed: Vec<(String, ConfigValue)>,
+}
+
+impl ConfigLayerDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.added.len() + self.changed.len() + self.removed.len()
+    }
+}
+
+/// Compute what changing `old` into `new` adds, overwrites, and removes.
+pub fn diff_config_layers(old: &ConfigLayer, new: &ConfigLayer) -> ConfigLayerDiff {
+    let mut diff = ConfigLayerDiff::default();
+    for (key, value) in &new.values {
+        match old.values.get(key) {
+            None => diff.added.push((key.clone(), value.clone())),
+            Some(previous) if previous != value => {
+                diff.changed
+                    .push((key.clone(), previous.clone(), value.clone()))
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, value) in &old.values {
+        if !new.values.contains_key(key) {
+            diff.removed.push((key.clone(), value.clone()));
+        }
+    }
+    diff
 }
 
 /// Snapshot `layer` as a new custom profile. Fails when the name is a built-in,
@@ -5761,33 +6451,47 @@ pub fn list_config_profiles(paths: &ConfigPaths) -> Result<Vec<ConfigProfileEntr
     Ok(entries)
 }
 
-/// Detect which named profile, if any, exactly matches `layer`.
+/// Detect which named profile, if any, is currently applied to `layer`.
 ///
-/// Built-ins are checked first; custom profiles are matched by exact layer
-/// equality against files under `paths.profiles`.
+/// Profiles merge into the global layer, so a profile counts as applied when
+/// every key it sets is present and equal in `layer` (a subset match; extra
+/// keys in `layer` are fine). Empty profiles never match. When several
+/// profiles match, the one that sets the most keys wins; ties go to the
+/// earlier entry (built-ins first, then custom profiles sorted by name).
 pub fn detect_config_profile(paths: &ConfigPaths, layer: &ConfigLayer) -> Option<String> {
+    let applied = |profile: &ConfigLayer| {
+        !profile.values.is_empty()
+            && profile
+                .values
+                .iter()
+                .all(|(key, value)| layer.values.get(key) == Some(value))
+    };
+    let mut best: Option<(usize, String)> = None;
+    let mut consider = |name: &str, profile: &ConfigLayer| {
+        if !applied(profile) {
+            return;
+        }
+        let size = profile.values.len();
+        if best.as_ref().is_none_or(|(best_size, _)| size > *best_size) {
+            best = Some((size, name.to_owned()));
+        }
+    };
     for name in CONFIG_PROFILE_NAMES {
         if let Some(bundle) = builtin_config_profile_layer(name) {
-            if &bundle == layer {
-                return Some((*name).to_owned());
+            consider(name, &bundle);
+        }
+    }
+    if let Ok(entries) = list_config_profiles(paths) {
+        for entry in entries {
+            if entry.kind != ConfigProfileKind::Custom {
+                continue;
+            }
+            if let Ok(candidate) = load_config_profile(paths, &entry.name) {
+                consider(&entry.name, &candidate);
             }
         }
     }
-    let Ok(entries) = list_config_profiles(paths) else {
-        return None;
-    };
-    for entry in entries {
-        if entry.kind != ConfigProfileKind::Custom {
-            continue;
-        }
-        let Ok(candidate) = load_config_profile(paths, &entry.name) else {
-            continue;
-        };
-        if &candidate == layer {
-            return Some(entry.name);
-        }
-    }
-    None
+    best.map(|(_, name)| name)
 }
 
 fn builtin_config_profile_layer(name: &str) -> Option<ConfigLayer> {
@@ -5801,27 +6505,27 @@ fn builtin_config_profile_layer(name: &str) -> Option<ConfigLayer> {
     Some(layer)
 }
 
+/// Built-in profile contents.
+///
+/// The "default" bundle pins nothing that has a per-architecture, per-model, or
+/// registry-card default. Rule: a key is excluded when its schema field is
+/// `registry_allowed` (the registry recommendation may supply the value, e.g.
+/// `memory.kv_cache` resolves per arch, `speculation.dflash` per registry
+/// card). Pinning such a key here would shadow the card/arch default for every
+/// model. Dropped for that reason: `generation.max_tokens`, `reasoning.mode`,
+/// `reasoning.budget`, `reasoning.max_total_tokens`, `memory.kv_cache`,
+/// `memory.max_seq`, `attention.flash`, `prompt.normalize`,
+/// `prompt.default_chatml`, `speculation.mode`, `speculation.dflash`,
+/// `speculation.mtp`, `speculation.mtp_k`, `speculation.ngram`. What remains is
+/// process-level policy with one fixed default. Enforced by
+/// `default_profile_pins_nothing_registry_or_arch_resolved`.
 fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>> {
     Some(match name {
         "default" => vec![
-            ("generation.max_tokens", ConfigValue::Integer(4096)),
             ("generation.loop_guard_threshold", ConfigValue::Integer(0)),
             ("generation.loop_guard_window", ConfigValue::Integer(256)),
-            ("reasoning.mode", ConfigValue::String("on".to_owned())),
-            ("reasoning.budget", ConfigValue::String("xhigh".to_owned())),
-            ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
-            ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
-            ("memory.max_seq", ConfigValue::Integer(32768)),
             ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
             ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
-            ("attention.flash", ConfigValue::String("auto".to_owned())),
-            ("prompt.normalize", ConfigValue::Bool(true)),
-            ("prompt.default_chatml", ConfigValue::Bool(true)),
-            ("speculation.mode", ConfigValue::String("auto".to_owned())),
-            ("speculation.dflash", ConfigValue::String("off".to_owned())),
-            ("speculation.mtp", ConfigValue::String("auto".to_owned())),
-            ("speculation.mtp_k", ConfigValue::String("auto".to_owned())),
-            ("speculation.ngram", ConfigValue::String("off".to_owned())),
             ("serve.host", ConfigValue::String("127.0.0.1".to_owned())),
             ("serve.port", ConfigValue::Integer(11435)),
             ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
@@ -5910,10 +6614,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 ConfigValue::String("legacy".to_owned()),
             ),
             (
-                "diagnostic.replay.gfx1151_cu_count",
-                ConfigValue::String("all".to_owned()),
-            ),
-            (
                 "diagnostic.replay.gfx1151_entry_acquire",
                 ConfigValue::String("system".to_owned()),
             ),
@@ -5926,8 +6626,155 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
 mod tests {
     use super::*;
 
+    #[test]
+    fn deprecated_key_covers_cask_and_pflash_families() {
+        for key in [
+            "memory.cask.enabled",
+            "cask",
+            "cask_sidecar",
+            "speculation.prefill.mode",
+            "prefill_compression",
+            "prefill_drafter",
+            "prefill_threshold",
+            "diagnostic.pflash.score_layer",
+            "pflash_score_layer",
+        ] {
+            assert!(is_deprecated_key(key), "{key} must be deprecated");
+        }
+        for key in [
+            "kv_cache",
+            "speculation.mode",
+            "speculation",
+            "ple_format",
+            "memory.ple_format",
+            "max_seq",
+            "nonexistent.key",
+        ] {
+            assert!(!is_deprecated_key(key), "{key} must not be deprecated");
+        }
+        for field in fields() {
+            let family = ["memory.cask.", "speculation.prefill.", "diagnostic.pflash."]
+                .iter()
+                .any(|prefix| field.key.starts_with(prefix));
+            assert_eq!(is_deprecated_key(field.key), family, "{}", field.key);
+            assert_eq!(
+                is_deprecated_key(field.legacy_key),
+                family,
+                "{}",
+                field.legacy_key
+            );
+        }
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    fn home_env<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn unix_home_selection_is_unchanged() {
+        let both = [("HIPFIRE_HOME", "/srv/hf"), ("HOME", "/home/u")];
+        assert_eq!(
+            hipfire_home_from(false, home_env(&both)).unwrap(),
+            PathBuf::from("/srv/hf")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("HOME", "/home/u")])).unwrap(),
+            PathBuf::from("/home/u/.hipfire")
+        );
+        // USERPROFILE is a Windows-only input.
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("USERPROFILE", "C:\\Users\\u")])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_selection_order() {
+        let all = [
+            ("HIPFIRE_HOME", "D:\\hf"),
+            ("USERPROFILE", "C:\\Users\\u"),
+            ("HOME", "E:\\home"),
+        ];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&all)).unwrap(),
+            PathBuf::from("D:\\hf")
+        );
+        let no_override = [("USERPROFILE", "C:\\Users\\u"), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&no_override)).unwrap(),
+            PathBuf::from("C:\\Users\\u").join(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(true, home_env(&[("HOME", "E:\\home")])).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+        // An empty USERPROFILE falls through to HOME.
+        let empty_profile = [("USERPROFILE", ""), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&empty_profile)).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_never_falls_back_to_relative() {
+        let missing = hipfire_home_from(true, home_env(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("HIPFIRE_HOME") && missing.contains("USERPROFILE"));
+        for bad in [
+            ("HIPFIRE_HOME", ".hipfire"),
+            ("HIPFIRE_HOME", ""),
+            ("HIPFIRE_HOME", "\\rooted"),
+            ("HIPFIRE_HOME", "C:drive-relative"),
+            ("USERPROFILE", "Users\\u"),
+            ("HOME", "/c/Users/u"),
+        ] {
+            let pairs = [bad];
+            let error = hipfire_home_from(true, home_env(&pairs)).unwrap_err();
+            assert!(
+                error.to_string().contains(bad.0),
+                "{bad:?} must name its variable: {error}"
+            );
+        }
+        // A bad HIPFIRE_HOME or USERPROFILE does not silently fall through.
+        let bad_override = [("HIPFIRE_HOME", "rel"), ("USERPROFILE", "C:\\Users\\u")];
+        assert!(hipfire_home_from(true, home_env(&bad_override)).is_err());
+        let bad_profile = [("USERPROFILE", "rel"), ("HOME", "E:\\home")];
+        assert!(hipfire_home_from(true, home_env(&bad_profile)).is_err());
+    }
+
+    #[test]
+    fn windows_absolute_classification() {
+        for ok in [
+            "C:\\",
+            "c:/Users/u",
+            "\\\\server\\share\\hf",
+            "//server/share",
+            "\\\\?\\C:\\Users\\u",
+        ] {
+            assert!(is_windows_absolute(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x",
+        ] {
+            assert!(!is_windows_absolute(Path::new(bad)), "{bad}");
+        }
     }
 
     #[test]
@@ -5946,6 +6793,895 @@ mod tests {
             assert_eq!(parse_developer_bool(Some(""), default), default);
             assert_eq!(parse_developer_bool(Some("2"), default), default);
         }
+    }
+
+    const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
+    const SYM_IU4_ENV: &str = "HIPFIRE_QWEN4_MOE_SYM_IU4";
+
+    #[test]
+    fn typed_bool_spellings_parse_and_everything_else_is_rejected() {
+        for (raw, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("False", false),
+        ] {
+            assert_eq!(parse_typed_bool(raw), Some(want), "{raw}");
+        }
+        for bad in [
+            "", " ", "2", "-1", "01", "00", "on", "off", "yes", "no", "t", "f", "maybe", " 1",
+            "0 ", "truee", "null",
+        ] {
+            assert_eq!(parse_typed_bool(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_set_cli_accepts_each_spelling() {
+        assert!(is_typed_bool_developer_key(SYM_IU4_KEY));
+        assert!(!is_typed_bool_developer_key("developer.experimental_mode"));
+        for (raw, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("0", false),
+            ("TRUE", true),
+            ("False", false),
+        ] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(SYM_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+    }
+
+    /// S1 slow-link prefill selector: `1` lab candidate, `0` incumbent kill
+    /// switch, unset automatic. Typed so a stray spelling is a loud load
+    /// error, never a silent unset.
+    #[test]
+    fn developer_slowlink_prefill_is_a_typed_tristate_key() {
+        const KEY: &str = "developer.qwen4_slowlink_prefill";
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_QWEN4_SLOWLINK_PREFILL").as_deref(),
+            Some(KEY)
+        );
+        assert_eq!(
+            developer_env_for_key(KEY).as_deref(),
+            Some("HIPFIRE_QWEN4_SLOWLINK_PREFILL")
+        );
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("False", false)] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+            assert_eq!(typed_developer_bool_value(KEY, Some(raw)), Some(want));
+        }
+        assert_eq!(typed_developer_bool_value(KEY, None), None);
+        for bad in ["", "2", "on", "off", "auto", "yes"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_rejects_invalid_values_with_a_clear_message() {
+        for bad in ["", "2", "on", "off", "yes", "no", "maybe", "-1", "10"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(SYM_IU4_KEY, bad).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == SYM_IU4_KEY),
+                "{bad:?}: {text}"
+            );
+            assert!(text.contains("developer.qwen4_moe_sym_iu4"), "{text}");
+            assert!(text.contains("true, false, 1 or 0"), "{text}");
+            assert!(text.contains(&format!("'{bad}'")), "{text}");
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        for bad in [
+            ConfigValue::Integer(2),
+            ConfigValue::Integer(-1),
+            ConfigValue::Float(1.0),
+            ConfigValue::Null,
+            ConfigValue::String("on".into()),
+        ] {
+            let mut layer = ConfigLayer::default();
+            assert!(layer.set(SYM_IU4_KEY, bad.clone()).is_err(), "{bad:?}");
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_normalizes_every_input_to_the_legacy_one_zero() {
+        for (value, want) in [
+            (ConfigValue::Bool(true), "1"),
+            (ConfigValue::Bool(false), "0"),
+            (ConfigValue::Integer(1), "1"),
+            (ConfigValue::Integer(0), "0"),
+            (ConfigValue::String("true".into()), "1"),
+            (ConfigValue::String("false".into()), "0"),
+            (ConfigValue::String("1".into()), "1"),
+            (ConfigValue::String("0".into()), "0"),
+        ] {
+            let mut layer = ConfigLayer::default();
+            layer.set(SYM_IU4_KEY, value.clone()).unwrap();
+            let process = ProcessConfig {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                values: layer,
+            };
+            assert_eq!(
+                process.legacy_value(SYM_IU4_ENV).as_deref(),
+                Some(want),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_is_revalidated_for_deserialized_layers() {
+        let mut layer = ConfigLayer::default();
+        for ok in ["true", "false", "1", "0"] {
+            layer
+                .values
+                .insert(SYM_IU4_KEY.into(), ConfigValue::String(ok.into()));
+            layer.validate().unwrap();
+        }
+        layer
+            .values
+            .insert(SYM_IU4_KEY.into(), ConfigValue::String("maybe".into()));
+        assert!(layer.validate().is_err());
+    }
+
+    #[test]
+    fn typed_bool_developer_key_toml_accepts_bool_and_string_spellings() {
+        let root = temp_root("typed-bool-toml");
+        fs::create_dir_all(&root).unwrap();
+        for (literal, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("0", false),
+            ("\"true\"", true),
+            ("\"false\"", false),
+            ("\"1\"", true),
+            ("\"0\"", false),
+        ] {
+            let path = root.join("config.toml");
+            fs::write(
+                &path,
+                format!("schema_version = {CONFIG_SCHEMA_VERSION}\n[developer]\nqwen4_moe_sym_iu4 = {literal}\n"),
+            )
+            .unwrap();
+            let layer = load_toml_layer(&path).unwrap();
+            assert_eq!(
+                layer.get(SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{literal}"
+            );
+        }
+        for literal in ["2", "\"on\"", "\"\"", "1.5"] {
+            let path = root.join("config.toml");
+            fs::write(
+                &path,
+                format!("schema_version = {CONFIG_SCHEMA_VERSION}\n[developer]\nqwen4_moe_sym_iu4 = {literal}\n"),
+            )
+            .unwrap();
+            let error = load_toml_layer(&path).unwrap_err().to_string();
+            assert!(error.contains("true, false, 1 or 0"), "{literal}: {error}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn other_developer_keys_keep_their_free_form_spelling() {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("developer.experimental_mode", "on").unwrap();
+        layer.set_cli("developer.qwen4_moe_x_lds", "auto").unwrap();
+        assert_eq!(
+            layer.get("developer.experimental_mode"),
+            Some(&ConfigValue::String("on".into()))
+        );
+        assert_eq!(
+            layer.get("developer.qwen4_moe_x_lds"),
+            Some(&ConfigValue::String("auto".into()))
+        );
+    }
+
+    #[test]
+    fn developer_typed_bool_reads_each_spelling_and_fails_loudly_on_others() {
+        assert_eq!(typed_developer_bool_value(SYM_IU4_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(SYM_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+    }
+
+    const MOE_SYM_IU4_KEY: &str = "developer.moe_sym_iu4";
+    const MOE_SYM_IU4_ENV: &str = "HIPFIRE_MOE_SYM_IU4";
+
+    #[test]
+    fn moe_sym_iu4_is_a_typed_bool_developer_key_independent_of_the_flash_next_key() {
+        assert!(is_developer_key(MOE_SYM_IU4_KEY));
+        assert!(is_typed_bool_developer_key(MOE_SYM_IU4_KEY));
+        assert_ne!(MOE_SYM_IU4_KEY, SYM_IU4_KEY);
+        assert_ne!(MOE_SYM_IU4_ENV, SYM_IU4_ENV);
+        // Unset is None (the route's default is OFF); each spelling reads as a bool.
+        assert_eq!(typed_developer_bool_value(MOE_SYM_IU4_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(MOE_SYM_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(MOE_SYM_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(MOE_SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(MOE_SYM_IU4_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == MOE_SYM_IU4_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting one key never writes the other.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(MOE_SYM_IU4_KEY, "1").unwrap();
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    const GDN_QK_INDEXED_KEY: &str = "developer.gdn_qk_indexed";
+    const GDN_QK_INDEXED_ENV: &str = "HIPFIRE_GDN_QK_INDEXED";
+
+    #[test]
+    fn gdn_qk_indexed_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_QK_INDEXED_KEY));
+        assert!(is_typed_bool_developer_key(GDN_QK_INDEXED_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_QK_INDEXED_ENV).as_deref(),
+            Some(GDN_QK_INDEXED_KEY)
+        );
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(typed_developer_bool_value(GDN_QK_INDEXED_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_QK_INDEXED_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_QK_INDEXED_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_QK_INDEXED_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_QK_INDEXED_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_QK_INDEXED_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    const GDN_MOE_PRE_FUSED_KEY: &str = "developer.gdn_moe_pre_fused";
+    const GDN_MOE_PRE_FUSED_ENV: &str = "HIPFIRE_GDN_MOE_PRE_FUSED";
+
+    #[test]
+    fn gdn_moe_pre_fused_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_MOE_PRE_FUSED_KEY));
+        assert!(is_typed_bool_developer_key(GDN_MOE_PRE_FUSED_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_MOE_PRE_FUSED_ENV).as_deref(),
+            Some(GDN_MOE_PRE_FUSED_KEY)
+        );
+        // Distinct from the indexed flag.
+        assert_ne!(GDN_MOE_PRE_FUSED_KEY, GDN_QK_INDEXED_KEY);
+        assert_ne!(GDN_MOE_PRE_FUSED_ENV, GDN_QK_INDEXED_ENV);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(GDN_MOE_PRE_FUSED_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_MOE_PRE_FUSED_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_MOE_PRE_FUSED_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_MOE_PRE_FUSED_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_MOE_PRE_FUSED_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_MOE_PRE_FUSED_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting one key never writes the other.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(GDN_MOE_PRE_FUSED_KEY, "1").unwrap();
+        assert_eq!(layer.get(GDN_QK_INDEXED_KEY), None);
+    }
+
+    const GDN_MOE_CHUNK_SCAN_KEY: &str = "developer.gdn_moe_chunk_scan";
+    const GDN_MOE_CHUNK_SCAN_ENV: &str = "HIPFIRE_GDN_MOE_CHUNK_SCAN";
+
+    #[test]
+    fn gdn_moe_chunk_scan_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_MOE_CHUNK_SCAN_KEY));
+        assert!(is_typed_bool_developer_key(GDN_MOE_CHUNK_SCAN_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_MOE_CHUNK_SCAN_ENV).as_deref(),
+            Some(GDN_MOE_CHUNK_SCAN_KEY)
+        );
+        // Distinct from the two MoE GDN preamble flags it supersedes.
+        assert_ne!(GDN_MOE_CHUNK_SCAN_KEY, GDN_MOE_PRE_FUSED_KEY);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_KEY, GDN_QK_INDEXED_KEY);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_ENV, GDN_MOE_PRE_FUSED_ENV);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_ENV, GDN_QK_INDEXED_ENV);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(GDN_MOE_CHUNK_SCAN_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_MOE_CHUNK_SCAN_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_MOE_CHUNK_SCAN_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_MOE_CHUNK_SCAN_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting the chunk-scan key never writes the flags it supersedes.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, "1").unwrap();
+        assert_eq!(layer.get(GDN_MOE_PRE_FUSED_KEY), None);
+        assert_eq!(layer.get(GDN_QK_INDEXED_KEY), None);
+    }
+
+    #[test]
+    fn moe_router_fused_prefill_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_router_fused_prefill";
+        const ENV: &str = "HIPFIRE_MOE_ROUTER_FUSED_PREFILL";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("false", false),
+            ("False", false),
+        ] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Independent of the other MoE typed keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.moe_sym_iu4"), None);
+        assert_eq!(layer.get("developer.qwen4_moe_sym_iu4"), None);
+    }
+
+    const MOE_SHARED_PREPARED_IU4_KEY: &str = "developer.moe_shared_prepared_iu4";
+    const MOE_SHARED_PREPARED_IU4_ENV: &str = "HIPFIRE_MOE_SHARED_PREPARED_IU4";
+
+    #[test]
+    fn moe_shared_prepared_iu4_is_a_typed_bool_developer_key() {
+        assert!(is_developer_key(MOE_SHARED_PREPARED_IU4_KEY));
+        assert!(is_typed_bool_developer_key(MOE_SHARED_PREPARED_IU4_KEY));
+        // Independent of the symmetric IU4 keys.
+        assert_ne!(MOE_SHARED_PREPARED_IU4_KEY, MOE_SYM_IU4_KEY);
+        assert_ne!(MOE_SHARED_PREPARED_IU4_KEY, SYM_IU4_KEY);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(MOE_SHARED_PREPARED_IU4_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(MOE_SHARED_PREPARED_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(MOE_SHARED_PREPARED_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == MOE_SHARED_PREPARED_IU4_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting it never writes the symmetric IU4 keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, "1").unwrap();
+        assert_eq!(layer.get(MOE_SYM_IU4_KEY), None);
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    #[test]
+    fn fa_prefill_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.fa_prefill_pm";
+        const ENV: &str = "HIPFIRE_FA_PREFILL_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_combine_v2_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_combine_v2";
+        const ENV: &str = "HIPFIRE_MOE_COMBINE_V2";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_ne!(KEY, "developer.moe_sym_iu4");
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+    #[test]
+    fn moe_router_topk_multirow_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_router_topk_multirow";
+        const ENV: &str = "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Distinct from the fused-prefill key it nests under.
+        assert_ne!(KEY, "developer.moe_router_fused_prefill");
+        // The raw typed lookup of an unset variable is None (the architecture default is
+        // resolved later by qualification, not a schema default); explicit `1`/`true` opts in,
+        // `0`/`false` kills.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Setting it never writes the fused-prefill key.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.moe_router_fused_prefill"), None);
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_iu4_wide_tiles";
+        const ENV: &str = "HIPFIRE_MOE_IU4_WIDE_TILES";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Independent of the symmetric IU4 route keys and of the FA PM key.
+        for other in [MOE_SYM_IU4_KEY, SYM_IU4_KEY, MOE_SHARED_PREPARED_IU4_KEY] {
+            assert_ne!(KEY, other);
+        }
+        assert_ne!(ENV, MOE_SYM_IU4_ENV);
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Setting it never writes the route's own keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get(MOE_SYM_IU4_KEY), None);
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    #[test]
+    fn prefill_iu4_producer_fused_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.prefill_iu4_producer_fused";
+        const ENV: &str = "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // The raw typed lookup of an unset variable is None: qualification resolves the
+        // architecture default later, never a schema default.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.fa_prefill_pm_qprep";
+        const ENV: &str = "HIPFIRE_FA_PREFILL_PM_QPREP";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_rotate_i4_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_rotate_i4_pm";
+        const ENV: &str = "HIPFIRE_MOE_ROTATE_I4_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn prefill_iu4_c8_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.prefill_iu4_c8_pm";
+        const ENV: &str = "HIPFIRE_PREFILL_IU4_C8_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None: the capability table (raw inventory, no qualified row) resolves it
+        // off; the schema never supplies a default.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Independent of the F3 flag it nests under at the consumer.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.prefill_iu4_producer_fused"), None);
+    }
+
+    #[test]
+    fn gdn_chunk_prep_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.gdn_chunk_prep_pm";
+        const ENV: &str = "HIPFIRE_GDN_CHUNK_PREP_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None: the consumer resolves it with `PrefillRoute::GdnChunkPrepPm`, which
+        // has no qualified row, so unset is off.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_shared_down_sigmoid_epi_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_shared_down_sigmoid_epi";
+        const ENV: &str = "HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None and no schema default exists: the capability table has no
+        // qualified row, so the route is off everywhere unless explicitly `1`.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        assert_eq!(developer_env_for_key(KEY).as_deref(), Some(ENV));
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a boolean: expected true, false, 1 or 0")]
+    fn developer_typed_bool_panics_on_an_unparseable_snapshot_value() {
+        typed_developer_bool_value(SYM_IU4_ENV, Some("2"));
+    }
+
+    #[test]
+    fn iu4_prefill_is_process_wide_and_rejected_in_a_model_layer() {
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set("kernel.iu4_prefill", ConfigValue::Bool(false))
+            .unwrap();
+        let error = validate_model_layer(&overrides).unwrap_err().to_string();
+        assert!(error.contains("kernel.iu4_prefill"), "{error}");
+        assert!(
+            error.contains("not valid in a per-model override"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn model_override_allowed_applies_the_per_model_key_rule() {
+        assert!(model_override_allowed("reasoning.effort").is_ok());
+        let process = model_override_allowed("kernel.iu4_prefill")
+            .unwrap_err()
+            .to_string();
+        assert!(process.contains("kernel.iu4_prefill"), "{process}");
+        assert!(
+            process.contains("not valid in a per-model override"),
+            "{process}"
+        );
+        let developer = model_override_allowed("developer.qwen4_moe_sym_iu4")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            developer
+                .contains("developer fields are global process policy and not valid per-model"),
+            "{developer}"
+        );
+        assert!(matches!(
+            model_override_allowed("no.such.key"),
+            Err(ConfigError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn set_and_remove_model_override_round_trip() {
+        let root = temp_root("model-override-round-trip");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+
+        let saved = set_model_override(
+            &paths,
+            Some("qwen3:8b"),
+            Some(PathBuf::from("/models/qwen3-8b.mq4")),
+            "qwen3:8b",
+            "reasoning.effort",
+            "high",
+        )
+        .unwrap();
+        assert_eq!(saved.id, "qwen3:8b");
+        assert_eq!(saved.key, "reasoning.effort");
+        assert_eq!(saved.value, ConfigValue::String("high".into()));
+        assert!(!saved.migrated_legacy_json);
+
+        let loaded = load_catalog(&paths).unwrap();
+        let record = &loaded.catalog.models["qwen3:8b"];
+        assert_eq!(record.registry_tag.as_deref(), Some("qwen3:8b"));
+        assert_eq!(
+            record.path.as_deref(),
+            Some(Path::new("/models/qwen3-8b.mq4"))
+        );
+        assert_eq!(
+            record.overrides.get("reasoning.effort"),
+            Some(&ConfigValue::String("high".into()))
+        );
+
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", Some("reasoning.effort")).unwrap(),
+            RemoveModelOverride::KeyRemoved {
+                id: "qwen3:8b".into(),
+                key: "reasoning.effort"
+            }
+        );
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", Some("reasoning.effort")).unwrap(),
+            RemoveModelOverride::KeyInherited {
+                id: "qwen3:8b".into(),
+                key: "reasoning.effort"
+            }
+        );
+        set_model_override(&paths, None, None, "qwen3:8b", "reasoning.effort", "low").unwrap();
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", None).unwrap(),
+            RemoveModelOverride::AllRemoved {
+                id: "qwen3:8b".into()
+            }
+        );
+        assert!(load_catalog(&paths).unwrap().catalog.models["qwen3:8b"]
+            .overrides
+            .values
+            .is_empty());
+        assert_eq!(
+            remove_model_override(&paths, "never-seen", None).unwrap(),
+            RemoveModelOverride::NoOverrides
+        );
+        assert!(matches!(
+            remove_model_override(&paths, "qwen3:8b", Some("no.such.key")),
+            Err(ConfigError::UnknownKey(_))
+        ));
+
+        // A process-scoped key is rejected when the catalog is written.
+        assert!(
+            set_model_override(&paths, None, None, "qwen3:8b", "kernel.iu4_prefill", "0").is_err()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The cached lookup behind `process_value` answers exactly what the
@@ -5996,6 +7732,43 @@ mod tests {
     }
 
     #[test]
+    fn ngram_schema_accepts_exactly_the_tri_state_alias_spellings() {
+        let field = field("speculation.ngram").expect("ngram schema field");
+        for raw in ["auto", "on", "off", "1", "0", "true", "false"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+            assert!(parse_tri_state_alias(raw).is_ok(), "{raw}");
+        }
+        for raw in ["", "maybe", "yes", "ON", "2"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn tri_state_alias_accepts_on_off_auto_spellings_and_rejects_the_rest() {
+        for on in ["on", "1", "true"] {
+            assert_eq!(parse_tri_state_alias(on), Ok(Some(true)), "{on:?}");
+        }
+        for off in ["off", "0", "false"] {
+            assert_eq!(parse_tri_state_alias(off), Ok(Some(false)), "{off:?}");
+        }
+        assert_eq!(parse_tri_state_alias("auto"), Ok(None));
+        for bad in [
+            "", " ", "ON", "Off", "yes", "no", "2", "-1", "01", "1 ", "maybe",
+        ] {
+            let error = parse_tri_state_alias(bad).unwrap_err();
+            assert!(
+                error.contains("expected on, 1, true, off, 0, false or auto"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+    #[test]
     fn tri_state_truth_table() {
         // Only the exact lower-case modes force; everything else, including
         // "auto" and the boolean spellings other parsers accept, defers.
@@ -6016,6 +7789,84 @@ mod tests {
         assert_eq!(MtpMode::parse("on"), MtpMode::On);
         assert_eq!(MtpMode::parse("anything-else"), MtpMode::Auto);
         assert_eq!(MtpMode::default(), MtpMode::Off);
+    }
+
+    #[test]
+    fn mtp_mode_from_tri_state_matches_the_parse_spelling() {
+        assert_eq!(MtpMode::from_tri_state(Some(true)), MtpMode::parse("on"));
+        assert_eq!(MtpMode::from_tri_state(Some(false)), MtpMode::parse("off"));
+        assert_eq!(MtpMode::from_tri_state(None), MtpMode::parse("auto"));
+    }
+
+    #[test]
+    fn mtp_mode_admits_truth_table_on_off_auto_by_declared_floor() {
+        // (mode, producer declared a measured AR floor) -> admitted.
+        for floor in [false, true] {
+            assert!(!mtp_mode_admits(MtpMode::Off, floor), "off never admits");
+            assert!(
+                mtp_mode_admits(MtpMode::On, floor),
+                "explicit on always admits"
+            );
+        }
+        assert!(
+            !mtp_mode_admits(MtpMode::Auto, false),
+            "auto without a measured floor stays AR"
+        );
+        assert!(
+            mtp_mode_admits(MtpMode::Auto, true),
+            "auto with a measured floor admits"
+        );
+    }
+
+    #[test]
+    fn mtp_effective_mode_name_resolves_auto_by_declared_floor() {
+        assert_eq!(mtp_effective_mode_name("auto", false), "off");
+        assert_eq!(mtp_effective_mode_name("auto", true), "auto");
+        assert_eq!(mtp_effective_mode_name("on", false), "on");
+        assert_eq!(mtp_effective_mode_name("on", true), "on");
+        for floor in [false, true] {
+            assert_eq!(mtp_effective_mode_name("off", floor), "off");
+            assert_eq!(mtp_effective_mode_name("", floor), "off");
+        }
+        // An unrecognized spelling defers to auto, so it follows the floor.
+        assert_eq!(mtp_effective_mode_name("bogus", false), "off");
+        assert_eq!(mtp_effective_mode_name("bogus", true), "auto");
+    }
+
+    #[test]
+    fn mtp_effective_mode_and_name_round_trip() {
+        for mode in [MtpMode::Off, MtpMode::Auto, MtpMode::On] {
+            assert_eq!(MtpMode::parse(mode.name()), mode);
+            for floor in [false, true] {
+                let effective = mtp_effective_mode(mode, floor);
+                // The effective mode admits exactly what the gate admits.
+                assert_eq!(effective != MtpMode::Off, mtp_mode_admits(mode, floor));
+                assert_eq!(
+                    mtp_effective_mode_name(mode.name(), floor),
+                    effective.name()
+                );
+            }
+        }
+        assert_eq!(mtp_effective_mode(MtpMode::Auto, false), MtpMode::Off);
+        assert_eq!(mtp_effective_mode(MtpMode::Auto, true), MtpMode::Auto);
+        assert_eq!(mtp_effective_mode(MtpMode::On, false), MtpMode::On);
+    }
+
+    #[test]
+    fn mtp_floor_gate_composes_with_the_host_spill_policy() {
+        // The floor verdict gates first; the spill policy only narrows an
+        // admitted mode. Auto + floor + fully resident arms; auto + floor +
+        // spill on a non-admitted arch declines; explicit on arms over both.
+        let arms = |mode: MtpMode, floor: bool, blobs: usize, arch: &str, admitted: &[&str]| {
+            mtp_mode_admits(mode, floor)
+                && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
+        };
+        assert!(arms(MtpMode::Auto, true, 0, "gfx1100", &[]));
+        assert!(!arms(MtpMode::Auto, true, 8, "gfx1100", &[]));
+        assert!(arms(MtpMode::Auto, true, 8, "gfx1201", &["gfx1201"]));
+        assert!(!arms(MtpMode::Auto, false, 0, "gfx1201", &["gfx1201"]));
+        assert!(arms(MtpMode::On, false, 8, "gfx1100", &[]));
+        assert!(!arms(MtpMode::Off, true, 0, "gfx1201", &["gfx1201"]));
     }
 
     #[test]
@@ -6045,8 +7896,14 @@ mod tests {
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
-        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
-        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason,
+            ""
+        );
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason,
+            ""
+        );
         let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
@@ -6131,20 +7988,116 @@ mod tests {
     }
 
     #[test]
+    fn mtp_ngram_copy_key_and_arch_resolver() {
+        let field = field("speculation.mtp_ngram_copy").expect("mtp_ngram_copy schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM_COPY"));
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        for raw in ["auto", "on", "off", "1", "0"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+        }
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+        let cases: [(u32, &str); 4] = [
+            (16, "gfx1151"),
+            (16, "gfx1201"),
+            (16, "gfx1100"),
+            (5, "gfx1151"),
+        ];
+        // auto/unset: off on every GPU until a GPU's receipts flip it.
+        let auto = [false; 4];
+        for (raw, expect) in [
+            (Some("on"), [true; 4]),
+            (Some("1"), [true; 4]),
+            (Some("off"), [false; 4]),
+            (Some("0"), [false; 4]),
+            (Some("auto"), auto),
+            (None, auto),
+        ] {
+            for (i, (model_arch, gpu)) in cases.iter().enumerate() {
+                assert_eq!(
+                    mtp_ngram_copy_enabled_for_arch_value(raw, *model_arch, gpu),
+                    expect[i],
+                    "{raw:?} arch={model_arch} gpu={gpu}"
+                );
+            }
+        }
+        let none = |_: &str| None;
+        assert_eq!(
+            ngram_mod_triple_resolve(NGRAM_MOD_COPY_TRIPLE, none),
+            (5, 1, 63)
+        );
+    }
+
+    #[test]
+    fn dflash_lookup_key_and_resolver() {
+        let field = field("speculation.dflash_lookup").expect("dflash_lookup schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_DFLASH_LOOKUP"));
+        assert_eq!(field.legacy_key, "dflash_lookup");
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        for raw in ["auto", "on", "off", "1", "0"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+        }
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+        assert!(field.validate(&ConfigValue::String("true".into())).is_err());
+        // Default on: only an explicit off/0 disables; anything else is the default.
+        for (raw, expect) in [
+            (Some("on"), true),
+            (Some("1"), true),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("auto"), true),
+            (Some(""), true),
+            (Some("yes"), true),
+            (None, true),
+        ] {
+            assert_eq!(dflash_lookup_enabled_value(raw), expect, "{raw:?}");
+        }
+        // The live (unset) snapshot resolves to the auto default: on.
+        assert!(dflash_lookup_enabled());
+    }
+
+    #[test]
+    fn dflash_lookup_tail_kill_switch_is_strict_zero() {
+        // Default on (lookup itself is gated by `speculation.dflash_lookup`);
+        // only an exact `0` disables the Tail windows.
+        assert!(dflash_lookup_tail_enabled_value(None));
+        assert!(dflash_lookup_tail_enabled_value(Some("1")));
+        assert!(dflash_lookup_tail_enabled_value(Some("")));
+        assert!(dflash_lookup_tail_enabled_value(Some("off")));
+        assert!(!dflash_lookup_tail_enabled_value(Some("0")));
+        assert!(dflash_lookup_tail_enabled());
+    }
+
+    #[test]
     fn mtp_k_default_per_arch_and_auto_rule() {
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 4);
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1201"), MTP_K_DEFAULT);
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1100"), MTP_K_DEFAULT);
-        assert_eq!(mtp_k_default_for_arch(5, "gfx1151"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default(16, 8), 7);
+        assert_eq!(mtp_k_default(16, 16), 15);
+        assert_eq!(mtp_k_default(16, 64), 63);
+        assert_eq!(mtp_k_default(16, 4), 3);
+        assert_eq!(mtp_k_default(16, 1), 1);
+        assert_eq!(mtp_k_default(16, 0), 1);
+        assert_eq!(mtp_k_default(5, 8), MTP_K_DEFAULT);
         assert_eq!(MTP_K_DEFAULT, 3);
+        for gpu in ["gfx1151", "gfx1201", "gfx1100", "gfx1150", ""] {
+            assert_eq!(
+                mtp_k_default(16, qwen4_row_exact_verify_rows_table(gpu)),
+                7,
+                "{gpu}"
+            );
+        }
 
         let field = field("speculation.mtp_k").expect("speculation.mtp_k field");
         assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
-        for k in 1..=10 {
+        for k in 1..=63 {
             assert!(field.validate(&ConfigValue::Integer(k)).is_ok(), "k={k}");
         }
         assert!(field.validate(&ConfigValue::Integer(0)).is_err());
-        assert!(field.validate(&ConfigValue::Integer(11)).is_err());
+        assert!(field.validate(&ConfigValue::Integer(64)).is_err());
         assert!(field.validate(&ConfigValue::String("fast".into())).is_err());
     }
 
@@ -6209,15 +8162,6 @@ mod tests {
     }
 
     #[test]
-    fn swap_total_parses_from_meminfo() {
-        let with_swap = "MemTotal:       130000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        2000000 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(with_swap), Some(2_000_000));
-        let no_swap = "MemTotal:       130000000 kB\nSwapTotal:             0 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(no_swap), Some(0));
-        assert_eq!(swap_total_kb_from_meminfo("MemTotal: 100 kB\n"), None);
-    }
-
-    #[test]
     fn oom_guard_schema_field_is_process_scoped_with_env_compat() {
         let field = field("memory.oom_guard").expect("oom_guard schema field");
         assert_eq!(field.env_compat, Some("HIPFIRE_OOM_GUARD"));
@@ -6241,6 +8185,19 @@ mod tests {
     }
 
     #[test]
+    fn offload_exec_is_absent_from_the_process_config_until_set() {
+        // The measured Flash-Next default needs "unset" distinguishable from an
+        // explicit `pcie`: the built-in value must not be carried.
+        let field = field("memory.offload_exec").expect("offload_exec schema field");
+        assert!(!field.include_builtin_in_process_config);
+        assert_eq!(field.env_compat, Some("HIPFIRE_OFFLOAD_EXEC"));
+        assert!(matches!(
+            field.default.to_value(),
+            ConfigValue::String(v) if v == "pcie"
+        ));
+    }
+
+    #[test]
     fn schema_has_unique_keys_and_legacy_keys() {
         let mut canonical = std::collections::BTreeSet::new();
         let mut legacy = std::collections::BTreeSet::new();
@@ -6260,16 +8217,21 @@ mod tests {
             }
             if !field.include_builtin_in_process_config {
                 assert!(field.env_compat.is_some(), "bridge without env alias");
-                assert!(
-                    matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
-                    "non-process bridge {}",
-                    field.key
-                );
-                assert!(
-                    !field.registry_allowed,
-                    "registry-backed bridge {}",
-                    field.key
-                );
+                // `memory.offload_exec` is the one registry-backed, model-load
+                // field whose built-in is represented by absence: its unset
+                // default is a measured per-device choice, not the value `pcie`.
+                if field.key != "memory.offload_exec" {
+                    assert!(
+                        matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
+                        "non-process bridge {}",
+                        field.key
+                    );
+                    assert!(
+                        !field.registry_allowed,
+                        "registry-backed bridge {}",
+                        field.key
+                    );
+                }
             }
             field
                 .validate(&field.default.to_value())
@@ -6462,6 +8424,81 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         );
     }
     #[test]
+    fn gfx11_a8_prefill_defaults_off_and_round_trips() {
+        let field = field("kernel.gfx11_a8_prefill").expect("gfx11_a8_prefill schema field");
+        assert_eq!(field.legacy_key, "gfx11_a8_prefill");
+        assert_eq!(field.env_compat, Some("HIPFIRE_GFX11_A8_PREFILL"));
+        // Off by default on every architecture: the schema default is the
+        // only default, there is no per-arch variant.
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert_eq!(field.parse_cli("1").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("true").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("0").unwrap(), ConfigValue::Bool(false));
+        assert!(field.parse_cli("sometimes").is_err());
+        // An empty resolve leaves the bridge value absent, which the runtime
+        // parses as off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value("HIPFIRE_GFX11_A8_PREFILL"), None);
+
+        // The key is process-wide: a per-model override is refused.
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set("kernel.gfx11_a8_prefill", ConfigValue::Bool(true))
+            .unwrap();
+        let error = validate_model_layer(&overrides).unwrap_err().to_string();
+        assert!(error.contains("kernel.gfx11_a8_prefill"), "{error}");
+        assert!(
+            error.contains("not valid in a per-model override"),
+            "{error}"
+        );
+
+        // Global TOML round trip under [kernel].
+        let root = temp_root("gfx11-a8-prefill");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_a8_prefill", "true").unwrap();
+        write_global_toml(&paths, &layer).unwrap();
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("[kernel]"), "{rendered}");
+        assert!(rendered.contains("gfx11_a8_prefill = true"), "{rendered}");
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.layer, layer);
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: paths.config_toml.clone(),
+            },
+            layer: loaded.layer,
+        }])
+        .expect("global resolve");
+        let process = ProcessConfig::from_resolved(&resolved).expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_GFX11_A8_PREFILL").as_deref(),
+            Some("1")
+        );
+        let _ = fs::remove_dir_all(root);
+
+        // Env spelling flows through the env layer into the same snapshot.
+        // HIPFIRE_GFX11_A8_PREFILL is unique to this test; no other test reads it.
+        std::env::set_var("HIPFIRE_GFX11_A8_PREFILL", "1");
+        let env_layer = load_env_layer().expect("env layer");
+        std::env::remove_var("HIPFIRE_GFX11_A8_PREFILL");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_GFX11_A8_PREFILL".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_GFX11_A8_PREFILL").as_deref(),
+            Some("1")
+        );
+    }
+    #[test]
     fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {
         let field = field("image.decode").expect("image.decode schema field");
         assert_eq!(field.legacy_key, "image_decode");
@@ -6534,6 +8571,20 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         );
         assert_eq!(loaded.warnings.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_json_drops_only_the_old_default_max_seq() {
+        for (raw, kept) in [(32768, None), (65536, Some(ConfigValue::Integer(65536)))] {
+            let root = temp_root(&format!("legacy-max-seq-{raw}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_json, format!(r#"{{"max_seq":{raw}}}"#)).unwrap();
+            let loaded = load_global(&paths).unwrap();
+            assert_eq!(loaded.layer.get("memory.max_seq"), kept.as_ref());
+            assert_eq!(loaded.warnings.len(), usize::from(kept.is_none()));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -7065,14 +9116,11 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             Some(&ConfigValue::String("lloyd3".into()))
         );
 
-        // Default profile still authors only memory.kv_cache = q8, not K/V axes.
+        // Default profile authors no KV keys at all (kv_cache stays at auto).
         let default =
             load_config_profile(&ConfigPaths::under(temp_root("profile-kv-axes")), "default")
                 .unwrap();
-        assert_eq!(
-            default.get("memory.kv_cache"),
-            Some(&ConfigValue::String("q8".into()))
-        );
+        assert!(default.get("memory.kv_cache").is_none());
         assert!(default.get("memory.kv_k").is_none());
         assert!(default.get("memory.kv_v").is_none());
     }
@@ -7089,31 +9137,173 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn apply_config_profile_replaces_entire_sparse_layer() {
-        let root = temp_root("profile-replace");
+    fn apply_config_profile_merges_and_keeps_unrelated_keys() {
+        let root = temp_root("profile-merge");
         let paths = ConfigPaths::under(&root);
         let mut layer = ConfigLayer::default();
+        layer.set_cli("hardware.devices", "1,2").unwrap();
+        layer.set_cli("serve.port", "11527").unwrap();
+        layer.set_cli("serve.default_model", "qwen3.6:27b").unwrap();
+        layer.set_cli("kernel.prefill_batched", "false").unwrap();
+        layer.set_cli("memory.max_seq", "262144").unwrap();
         layer
             .set("generation.temperature", ConfigValue::Float(0.42))
             .unwrap();
         layer
             .set(
                 "developer.custom_experiment",
-                ConfigValue::String("drop-me".into()),
+                ConfigValue::String("keep-me".into()),
             )
             .unwrap();
+        let before = layer.clone();
 
-        apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        // "dev" overwrites kernel.prefill_batched and sets hardware.devices.
+        let count = apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        let dev = load_config_profile(&paths, "dev").unwrap();
+        assert_eq!(count, dev.values.len());
 
-        let expected = load_config_profile(&paths, "dev").unwrap();
-        assert_eq!(layer, expected);
-        assert!(layer.get("generation.temperature").is_none());
-        assert!(layer.get("developer.custom_experiment").is_none());
+        for (key, value) in &dev.values {
+            assert_eq!(layer.values.get(key), Some(value), "{key}");
+        }
+        for key in [
+            "serve.port",
+            "serve.default_model",
+            "memory.max_seq",
+            "generation.temperature",
+            "developer.custom_experiment",
+        ] {
+            assert_eq!(layer.values.get(key), before.values.get(key), "{key}");
+        }
+        assert_eq!(
+            layer.get("hardware.devices"),
+            Some(&ConfigValue::String("0".into())),
+            "profile key overwrites the old value"
+        );
+        assert_eq!(
+            layer.get("kernel.prefill_batched"),
+            Some(&ConfigValue::Bool(true))
+        );
+        assert_eq!(
+            layer.values.len(),
+            before.values.len() + dev.values.len() - 2,
+            "only hardware.devices and kernel.prefill_batched overlap"
+        );
         assert_eq!(
             detect_config_profile(&paths, &layer).as_deref(),
             Some("dev")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_profile_pins_nothing_registry_or_arch_resolved() {
+        let bundle = config_profile_bundle("default").unwrap();
+        assert!(!bundle.is_empty());
+        for (key, _) in &bundle {
+            let field = field(key).unwrap_or_else(|| panic!("{key} is not a schema field"));
+            assert!(
+                !field.registry_allowed,
+                "default profile pins registry-overridable key {key}"
+            );
+        }
+        let layer = builtin_config_profile_layer("default").unwrap();
+        assert!(layer.get("memory.kv_cache").is_none());
+        assert!(layer.get("speculation.dflash").is_none());
+    }
+
+    #[test]
+    fn detect_config_profile_matches_subsets_and_prefers_largest() {
+        let root = temp_root("profile-detect");
+        let paths = ConfigPaths::under(&root);
+
+        // Empty layer: nothing applied.
+        assert_eq!(detect_config_profile(&paths, &ConfigLayer::default()), None);
+
+        // Extra unrelated keys do not defeat a match.
+        let mut layer = ConfigLayer::default();
+        apply_config_profile(&mut layer, &paths, "redline").unwrap();
+        layer.set_cli("serve.port", "11527").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("redline")
+        );
+
+        // A profile whose key has a different value is not applied.
+        layer.set_cli("replay.transport", "aql").unwrap();
+        assert_eq!(detect_config_profile(&paths, &layer), None);
+
+        // hip and redline both set replay.backend; the layer holds hip's.
+        let mut layer = ConfigLayer::default();
+        apply_config_profile(&mut layer, &paths, "hip").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("hip")
+        );
+
+        // Most keys wins: dev (16 keys) over hip when both are subsets.
+        apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("dev")
+        );
+
+        // Custom profile with more keys than every built-in subset wins; an
+        // empty custom profile never matches; ties keep list order.
+        let mut small = ConfigLayer::default();
+        small.set_cli("serve.port", "12000").unwrap();
+        create_config_profile(&paths, "aaa-empty", &ConfigLayer::default()).unwrap();
+        create_config_profile(&paths, "alpha", &small).unwrap();
+        create_config_profile(&paths, "beta", &small).unwrap();
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("serve.port", "12000").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("alpha")
+        );
+        let mut big = small.clone();
+        big.set_cli("serve.host", "0.0.0.0").unwrap();
+        create_config_profile(&paths, "big", &big).unwrap();
+        layer.set_cli("serve.host", "0.0.0.0").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("big")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diff_config_layers_reports_added_changed_removed_in_toml_form() {
+        let mut old = ConfigLayer::default();
+        old.set_cli("serve.port", "11527").unwrap();
+        old.set_cli("memory.kv_cache", "q8").unwrap();
+        old.set_cli("serve.local", "true").unwrap();
+        let mut new = old.clone();
+        new.set_cli("serve.port", "11435").unwrap();
+        new.set_cli("serve.host", "127.0.0.1").unwrap();
+        new.remove("serve.local").unwrap();
+        let diff = diff_config_layers(&old, &new);
+        assert_eq!(
+            diff.added,
+            vec![("serve.host".into(), ConfigValue::String("127.0.0.1".into()))]
+        );
+        assert_eq!(
+            diff.changed,
+            vec![(
+                "serve.port".into(),
+                ConfigValue::Integer(11527),
+                ConfigValue::Integer(11435)
+            )]
+        );
+        assert_eq!(
+            diff.removed,
+            vec![("serve.local".into(), ConfigValue::Bool(true))]
+        );
+        assert_eq!(diff.len(), 3);
+        assert!(diff_config_layers(&new, &new).is_empty());
+        assert_eq!(ConfigValue::String("q8".into()).to_toml_string(), "\"q8\"");
+        assert_eq!(ConfigValue::Integer(7).to_toml_string(), "7");
+        assert_eq!(ConfigValue::Bool(false).to_toml_string(), "false");
+        assert_eq!(ConfigValue::Float(0.42).to_toml_string(), "0.42");
     }
 
     #[test]
@@ -7201,6 +9391,53 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn serve_api_key_file_schema_is_an_absolute_path_defaulting_to_unset() {
+        let field = field("serve.api_key_file").unwrap();
+        assert_eq!(field.env_compat, Some("HIPFIRE_SERVE_API_KEY_FILE"));
+        assert_eq!(field.scope, ConfigScope::Process);
+        assert_eq!(field.category, ConfigCategory::Serve);
+        assert!(!field.registry_allowed);
+        assert_eq!(field.default.to_value(), ConfigValue::String(String::new()));
+
+        let absolute = env::temp_dir().join("serve.key");
+        let absolute = absolute.to_str().unwrap();
+        let mut layer = ConfigLayer::default();
+        layer
+            .set("serve.api_key_file", ConfigValue::String(String::new()))
+            .unwrap();
+        layer.set_cli("serve.api_key_file", absolute).unwrap();
+        assert_eq!(
+            layer.get("serve.api_key_file"),
+            Some(&ConfigValue::String(absolute.to_owned()))
+        );
+        // Existence is not a schema concern: the token loader owns file checks.
+        layer
+            .set_cli("serve.api_key_file", &format!("{absolute}.missing"))
+            .unwrap();
+
+        let padded_left = format!(" {absolute}");
+        let padded_right = format!("{absolute} ");
+        for bad in [
+            "serve.key",
+            "./serve.key",
+            "~/serve.key",
+            " ",
+            padded_left.as_str(),
+            padded_right.as_str(),
+        ] {
+            let err = layer.set_cli("serve.api_key_file", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("serve.api_key_file"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(layer
+            .set("serve.api_key_file", ConfigValue::Integer(1))
+            .is_err());
+        assert!(layer.set("serve.api_key_file", ConfigValue::Null).is_err());
     }
 
     #[test]
@@ -7309,7 +9546,8 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
 }
 
 /// Device topology policy: expert-parallel degree (`topology.ep`, compat env
-/// `HIPFIRE_TOPOLOGY_EP`) and the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`.
+/// `HIPFIRE_TOPOLOGY_EP`), the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`, and
+/// pipeline-parallel degree (`topology.pp`, compat env `HIPFIRE_TOPOLOGY_PP`).
 /// Pure and GPU-independent; the loader resolves the degree once, before any
 /// teardown or allocation.
 pub mod topology {
@@ -7320,19 +9558,24 @@ pub mod topology {
     pub const QWEN4_EP_KILL_SWITCH_ENV: &str = "HIPFIRE_QWEN4_EP";
     /// Compatibility spelling of `topology.ep`.
     pub const EP_ENV: &str = "HIPFIRE_TOPOLOGY_EP";
-    /// Expert-parallel degrees the schema admits (512 experts divide evenly).
-    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+    /// Largest expert-parallel degree the schema admits. Experts shard
+    /// `e % N`, so uneven splits (e.g. 512 over 6 ranks) are admitted.
+    pub const EP_MAX_DEGREE: usize = 8;
+    /// Compatibility spelling of `topology.pp`.
+    pub const PP_ENV: &str = "HIPFIRE_TOPOLOGY_PP";
+    /// Largest pipeline-parallel degree the schema admits.
+    pub const PP_MAX_DEGREE: usize = 8;
 
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
-    /// integer outside [`EP_DEGREES`] is a refusal naming the allowed set.
+    /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
     pub fn parse_ep(raw: Option<&str>) -> Result<usize, String> {
         let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(1);
         };
         match raw.parse::<usize>() {
-            Ok(n) if EP_DEGREES.contains(&n) => Ok(n),
+            Ok(n) if (1..=EP_MAX_DEGREE).contains(&n) => Ok(n),
             _ => Err(format!(
-                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: 1, 2, 4)"
+                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: integers 1..=8)"
             )),
         }
     }
@@ -7368,6 +9611,81 @@ pub mod topology {
         )
     }
 
+    /// Pure parser behind [`pp`]: unset or empty is 1 (the default); an
+    /// integer outside `1..=`[`PP_MAX_DEGREE`] is a refusal naming the range.
+    pub fn parse_pp(raw: Option<&str>) -> Result<usize, String> {
+        let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(1);
+        };
+        match raw.parse::<usize>() {
+            Ok(n) if (1..=PP_MAX_DEGREE).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "topology.pp = {raw:?} is not a valid pipeline-parallel degree (allowed: integers 1..=8)"
+            )),
+        }
+    }
+
+    /// Effective pipeline-parallel degree from raw inputs: an explicit
+    /// request `requested > 1` wins and the configured value is not read;
+    /// otherwise (`requested` 0 or 1) `topology.pp` applies.
+    pub fn resolve_pp(requested: usize, configured: Option<&str>) -> Result<usize, String> {
+        if requested > 1 {
+            return Ok(requested);
+        }
+        parse_pp(configured)
+    }
+
+    /// Configured `topology.pp` from the process snapshot.
+    pub fn pp() -> Result<usize, String> {
+        parse_pp(process_value(PP_ENV).as_deref())
+    }
+
+    /// Effective pipeline-parallel degree for a load request of `requested`:
+    /// the request when it is above 1, else `topology.pp` from the process
+    /// snapshot.
+    pub fn effective_pp(requested: usize) -> Result<usize, String> {
+        resolve_pp(requested, process_value(PP_ENV).as_deref())
+    }
+
+    /// Pipeline degree of a `load` request: explicit `params.pp` > 1 wins,
+    /// else `topology.pp` (`effective`, which also validates the configured
+    /// value). The resolved degree is written back into `params.pp` so the
+    /// weight-host envelope, slot caps and every later pp gate read one
+    /// value. A refusal always names `topology.pp`.
+    pub fn resolve_load_pp_with(
+        msg: &mut serde_json::Value,
+        effective: impl FnOnce(usize) -> Result<usize, String>,
+    ) -> Result<usize, String> {
+        let requested = msg
+            .get("params")
+            .and_then(|p| p.get("pp"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let pp = effective(requested).map_err(|error| {
+            if error.contains("topology.pp") {
+                format!("load refused: {error}")
+            } else {
+                format!("load refused: invalid topology.pp: {error}")
+            }
+        })?;
+        if pp != requested {
+            if let Some(object) = msg.as_object_mut() {
+                let params = object
+                    .entry("params")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(params) = params.as_object_mut() {
+                    params.insert("pp".to_owned(), serde_json::json!(pp));
+                }
+            }
+        }
+        Ok(pp)
+    }
+
+    /// [`resolve_load_pp_with`] against the process snapshot.
+    pub fn resolve_load_pp(msg: &mut serde_json::Value) -> Result<usize, String> {
+        resolve_load_pp_with(msg, effective_pp)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -7378,11 +9696,13 @@ pub mod topology {
             assert_eq!(parse_ep(Some("")), Ok(1));
             assert_eq!(parse_ep(Some("1")), Ok(1));
             assert_eq!(parse_ep(Some(" 2 ")), Ok(2));
-            assert_eq!(parse_ep(Some("4")), Ok(4));
-            for bad in ["0", "3", "5", "8", "-1", "two", "2.0"] {
+            for n in 1..=8usize {
+                assert_eq!(parse_ep(Some(&n.to_string())), Ok(n));
+            }
+            for bad in ["0", "9", "16", "-1", "two", "2.0"] {
                 let err = parse_ep(Some(bad)).unwrap_err();
                 assert!(
-                    err.contains("topology.ep") && err.contains("1, 2, 4"),
+                    err.contains("topology.ep") && err.contains("1..=8"),
                     "{bad}: {err}"
                 );
             }
@@ -7393,13 +9713,14 @@ pub mod topology {
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
             assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
             // Even an invalid configured value is moot under the kill switch.
-            assert_eq!(resolve_qwen4_ep(Some("3"), Some("0")), Ok(1));
+            assert_eq!(resolve_qwen4_ep(Some("9"), Some("0")), Ok(1));
             // Any other kill-switch spelling leaves the config in charge.
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
             assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
             assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
-            assert!(resolve_qwen4_ep(Some("3"), None).is_err());
+            assert_eq!(resolve_qwen4_ep(Some("6"), None), Ok(6));
+            assert!(resolve_qwen4_ep(Some("9"), None).is_err());
         }
 
         #[test]
@@ -7410,14 +9731,114 @@ pub mod topology {
                 .expect("topology.ep is in the schema");
             assert_eq!(field.env_compat, Some(EP_ENV));
             assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
-            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_ok());
+            for n in 1..=8 {
+                assert!(field.validate(&crate::ConfigValue::Integer(n)).is_ok());
+            }
             assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
-            assert!(field.validate(&crate::ConfigValue::Integer(5)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(9)).is_err());
             assert!(matches!(
                 field.parse_cli("2"),
                 Ok(crate::ConfigValue::Integer(2))
             ));
             assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
+        }
+
+        #[test]
+        fn parse_pp_defaults_and_allowed_set() {
+            assert_eq!(parse_pp(None), Ok(1));
+            assert_eq!(parse_pp(Some("")), Ok(1));
+            assert_eq!(parse_pp(Some("   ")), Ok(1));
+            assert_eq!(parse_pp(Some("1")), Ok(1));
+            assert_eq!(parse_pp(Some(" 2 ")), Ok(2));
+            for n in 1..=8usize {
+                assert_eq!(parse_pp(Some(&n.to_string())), Ok(n));
+            }
+            for bad in ["0", "9", "16", "-1", "two", "2.0"] {
+                let err = parse_pp(Some(bad)).unwrap_err();
+                assert!(
+                    err.contains("topology.pp") && err.contains("1..=8"),
+                    "{bad}: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn resolve_pp_explicit_request_above_one_wins_over_config() {
+            assert_eq!(resolve_pp(2, Some("4")), Ok(2));
+            assert_eq!(resolve_pp(3, None), Ok(3));
+            assert_eq!(resolve_pp(8, Some("2")), Ok(8));
+            // An explicit request makes the configured value moot, even an invalid one.
+            assert_eq!(resolve_pp(2, Some("9")), Ok(2));
+            assert_eq!(resolve_pp(2, Some("two")), Ok(2));
+        }
+
+        #[test]
+        fn resolve_pp_request_one_or_zero_defers_to_config() {
+            for requested in [0usize, 1] {
+                assert_eq!(resolve_pp(requested, None), Ok(1));
+                assert_eq!(resolve_pp(requested, Some("")), Ok(1));
+                assert_eq!(resolve_pp(requested, Some("4")), Ok(4));
+                assert_eq!(resolve_pp(requested, Some(" 8 ")), Ok(8));
+                let err = resolve_pp(requested, Some("9")).unwrap_err();
+                assert!(
+                    err.contains("topology.pp") && err.contains("1..=8"),
+                    "{err}"
+                );
+                assert!(resolve_pp(requested, Some("0")).is_err());
+            }
+        }
+
+        #[test]
+        fn pp_schema_field_validates_range_and_defaults_to_one() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.pp")
+                .expect("topology.pp is in the schema");
+            assert_eq!(field.env_compat, Some(PP_ENV));
+            assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
+            for n in 1..=8 {
+                assert!(field.validate(&crate::ConfigValue::Integer(n)).is_ok());
+            }
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(9)).is_err());
+            assert!(matches!(
+                field.parse_cli("2"),
+                Ok(crate::ConfigValue::Integer(2))
+            ));
+            assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
+        }
+
+        #[test]
+        fn load_pp_resolves_config_fallback_and_writes_back() {
+            let config_pp = |requested: usize| Ok(if requested > 1 { requested } else { 2 });
+            let mut msg = serde_json::json!({"type": "load", "params": {"tp": 1}});
+            assert_eq!(resolve_load_pp_with(&mut msg, config_pp), Ok(2));
+            assert_eq!(msg["params"]["pp"], 2);
+            let mut no_params = serde_json::json!({"type": "load"});
+            assert_eq!(resolve_load_pp_with(&mut no_params, config_pp), Ok(2));
+            assert_eq!(no_params["params"]["pp"], 2);
+            let mut explicit = serde_json::json!({"params": {"pp": 4}});
+            assert_eq!(resolve_load_pp_with(&mut explicit, config_pp), Ok(4));
+            assert_eq!(explicit["params"]["pp"], 4);
+            let mut single = serde_json::json!({"params": {}});
+            assert_eq!(resolve_load_pp_with(&mut single, |_| Ok(1)), Ok(1));
+            assert!(single["params"].get("pp").is_none());
+        }
+
+        #[test]
+        fn load_pp_invalid_config_names_topology_pp() {
+            let mut msg = serde_json::json!({"params": {}});
+            let error = resolve_load_pp_with(&mut msg, |_| {
+                Err("\"9\" is not a valid pipeline degree".to_owned())
+            })
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "load refused: invalid topology.pp: \"9\" is not a valid pipeline degree"
+            );
+            let named = resolve_load_pp_with(&mut msg, |_| Err("topology.pp = \"9\"".to_owned()))
+                .unwrap_err();
+            assert_eq!(named, "load refused: topology.pp = \"9\"");
         }
     }
 }
@@ -7506,7 +9927,7 @@ pub mod memory {
     /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PleHotStoreBudget {
-        /// `auto`: the carrier picks the budget from `MemAvailable` when the
+        /// `auto`: the carrier picks the budget from `MemAvailable` minus the CMA region when the
         /// device, model, sidecar and pack allow it.
         Auto,
         /// An explicit byte budget; `0` (the default) is off.
@@ -7576,7 +9997,7 @@ pub mod memory {
         /// q4 on the unified-memory Strix Halo (`gfx1151`), q8 elsewhere; never
         /// derives or downloads a missing sidecar.
         Auto,
-        /// 4-bit rows; derived from the Q8 rows on first load when missing.
+        /// 4-bit rows; created ahead of time (`hipfire ple derive`), never derived by a load.
         Q4,
         /// Exact Q8 rows.
         Q8,
@@ -7639,8 +10060,12 @@ pub mod memory {
 
     /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
     /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
-    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus 8 GiB at ready
-    /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
+    /// `Auto` (default) = `MemAvailable` minus the CMA region minus 8 GiB, sampled once after
+    /// the pinned experts and the model are loaded, capped at the sidecar's data bytes and, on a
+    /// unified-memory GPU or a discrete GPU with every expert resident in VRAM, at 15 GiB; only
+    /// a discrete GPU with host-placed experts takes the uncapped figure. 0 when `MemAvailable`
+    /// is unreadable; `Bytes(0)` = off; `Bytes(n)` = that many bytes (an explicit override of
+    /// the derivation, never capped at 15 GiB, still capped at the table).
     pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
         parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
     }
@@ -7675,6 +10100,19 @@ pub mod memory {
     pub fn trunk_overlay_sidecar_path(model: &Path) -> PathBuf {
         let mut path = model.as_os_str().to_owned();
         path.push(TRUNK_OVERLAY_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    /// Suffix of a Flash-Next expert hot set sidecar: the decode-ranked
+    /// per-expert VRAM placement of a Qwen4 aggregate-MQ4 base (JSON, bound to
+    /// its base by size and index sha256).
+    pub const EXPERT_HOTSET_SIDECAR_SUFFIX: &str = ".expert-hotset";
+
+    /// Path of the expert hot set sidecar of `model`: `<model file
+    /// name>.expert-hotset`, the same placement as [`trunk_overlay_sidecar_path`].
+    pub fn expert_hotset_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EXPERT_HOTSET_SIDECAR_SUFFIX);
         PathBuf::from(path)
     }
 
@@ -7778,7 +10216,8 @@ pub mod memory {
     /// same reason in their fail-closed refusal).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SpillRefusal {
-        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        /// Neither Qwen3.5 dense (5) / MoE (6) nor LFM2.5 (11); carries the
+        /// arch id.
         Arch(u32),
         /// Tensor-parallel ranks each load every layer; carries tp.
         Tp(usize),
@@ -7807,10 +10246,11 @@ pub mod memory {
         is_vl: bool,
     ) -> SpillSupport {
         use SpillRefusal::*;
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in
-        // host RAM. Qwen4 has its own expert-residency route and the other
-        // arches have none, so either knob is a request this loader cannot honour.
-        if !matches!(arch_id, 5 | 6) {
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6 | 11) {
             return SpillSupport::Refused(Arch(arch_id));
         }
         if tp > 1 {
@@ -7894,6 +10334,200 @@ pub mod memory {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
     }
 
+    /// Pure truth table behind [`offload_exec_explicit`]: `None` when the user
+    /// (config, registry or `HIPFIRE_OFFLOAD_EXEC`) never chose a mode — unset
+    /// or blank — and the parsed mode otherwise, so an explicit `pcie` is
+    /// distinguishable from the unset default and an unknown spelling is an
+    /// explicit (fail-closed) `pcie`.
+    pub fn parse_offload_exec_explicit(raw: Option<&str>) -> Option<OffloadExec> {
+        raw.filter(|v| !v.trim().is_empty())
+            .map(|v| parse_offload_exec(Some(v)))
+    }
+
+    /// The explicitly configured [`OffloadExec`], `None` when nothing set it
+    /// (`memory.offload_exec` is absent from the process snapshot until the
+    /// user, registry or env sets it). [`offload_exec`] stays the raw value
+    /// with the built-in `pcie` for every consumer that has no measured
+    /// default.
+    pub fn offload_exec_explicit() -> Option<OffloadExec> {
+        parse_offload_exec_explicit(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
+    }
+
+    /// `developer.qwen4_d2_default` (env `HIPFIRE_QWEN4_D2_DEFAULT`), a typed
+    /// boolean: `Some(true)` forces the Flash-Next un-tiered whole-layer D2
+    /// split on for a load that has host-placed experts (skipping only the
+    /// measured decode-cost comparison), `Some(false)` never arms the default,
+    /// `None` (unset) takes the measured selector. An explicit
+    /// `memory.offload_exec` still wins over every value.
+    pub fn qwen4_d2_default() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
+    }
+
+    /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU
+    /// Qwen4 direct weight reader (parallel `O_DIRECT`/buffered file reads
+    /// straight into pinned or staged device memory). Default on; exactly `0`
+    /// restores the unchanged mmap + single-thread copy path. Unified-memory
+    /// devices never take the direct reader regardless of this value.
+    pub fn qwen4_direct_load() -> bool {
+        parse_qwen4_direct_load(process_value("HIPFIRE_QWEN4_DIRECT_LOAD").as_deref())
+    }
+
+    /// Pure truth table behind [`qwen4_direct_load`]: only a trimmed `0` is
+    /// off; unset, empty and every other spelling keep the default (on).
+    pub fn parse_qwen4_direct_load(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,
+    /// the Qwen4 loader appends one JSONL record per fulfilled weight
+    /// (`name`, `layer`, `residency`, `dtype`, `logical_bytes`, `sha256` of the
+    /// logical bytes: host-owner hash or device download) to that file after a
+    /// successful fulfillment. Unset or blank writes nothing.
+    pub fn load_weight_digest_path() -> Option<PathBuf> {
+        developer_var("HIPFIRE_LOAD_WEIGHT_DIGEST")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Cold-result transport of the D2 CPU split (`developer.qwen4_d2_return`,
+    /// env `HIPFIRE_QWEN4_D2_RETURN`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Return {
+        /// The cold slots are copied host-to-device behind the GPU tail
+        /// (today's transport, the default and the kill value).
+        #[default]
+        Copy,
+        /// The CPU writes the cold slots into a mapped, coherent host
+        /// allocation that the canonical combine reads directly. Honoured only
+        /// on all-cold layers; a mixed layer stays on `Copy`.
+        Mapped,
+    }
+
+    impl D2Return {
+        /// The spelling [`parse_d2_return`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Copy => "copy",
+                Self::Mapped => "mapped",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_return`]: unset is `Copy`; `copy` and `mapped`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values. A mistyped
+    /// transport must refuse the load, never silently run the other one.
+    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+        match raw {
+            None => Ok(D2Return::Copy),
+            Some("copy") => Ok(D2Return::Copy),
+            Some("mapped") => Ok(D2Return::Mapped),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_RETURN={other:?} is not a D2 return mode: expected `mapped` or `copy`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_return` (env `HIPFIRE_QWEN4_D2_RETURN`): the D2
+    /// cold-result transport, read from the process snapshot. Resolve it once
+    /// per load; an invalid value is an `Err` the loader must propagate.
+    pub fn qwen4_d2_return() -> std::result::Result<D2Return, String> {
+        parse_d2_return(process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref())
+    }
+
+    /// Input-readiness mechanism of the D2 CPU split (`developer.qwen4_d2_ready`,
+    /// env `HIPFIRE_QWEN4_D2_READY`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Ready {
+        /// `prepare` blocks on a stream synchronization after the input
+        /// downloads (today's boundary, the default and the kill value).
+        #[default]
+        Sync,
+        /// `prepare` records an event after the input downloads and polls it,
+        /// falling back to the blocking synchronization after a bounded spin.
+        Event,
+    }
+
+    impl D2Ready {
+        /// The spelling [`parse_d2_ready`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Sync => "sync",
+                Self::Event => "event",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_ready`]: unset is `Sync`; `sync` and `event`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values.
+    pub fn parse_d2_ready(raw: Option<&str>) -> std::result::Result<D2Ready, String> {
+        match raw {
+            None => Ok(D2Ready::Sync),
+            Some("sync") => Ok(D2Ready::Sync),
+            Some("event") => Ok(D2Ready::Event),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_READY={other:?} is not a D2 readiness mode: expected `event` or `sync`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_ready` (env `HIPFIRE_QWEN4_D2_READY`): how the D2 CPU
+    /// split learns its inputs reached the host, read from the process snapshot.
+    /// Resolve it once per load; an invalid value is an `Err` the loader must
+    /// propagate.
+    pub fn qwen4_d2_ready() -> std::result::Result<D2Ready, String> {
+        parse_d2_ready(process_value("HIPFIRE_QWEN4_D2_READY").as_deref())
+    }
+
+    /// Join mechanism of the D2 CPU split (`developer.qwen4_d2_join`, env
+    /// `HIPFIRE_QWEN4_D2_JOIN`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Join {
+        /// The canonical combine is enqueued after the CPU arithmetic finished
+        /// (today's order, the default and the kill value).
+        #[default]
+        Host,
+        /// The canonical combine is enqueued BEFORE the CPU arithmetic behind a
+        /// command-processor `hipStreamWaitValue32` that the CPU releases with a
+        /// generation store. Needs the mapped return on an all-cold layer and
+        /// the device's stream-wait-value capability; otherwise a logged
+        /// refusal keeps `Host`.
+        CpWait,
+    }
+
+    impl D2Join {
+        /// The spelling [`parse_d2_join`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Host => "host",
+                Self::CpWait => "cpwait",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_join`]: unset is `Host`; `host` and `cpwait`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values.
+    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+        match raw {
+            None => Ok(D2Join::Host),
+            Some("host") => Ok(D2Join::Host),
+            Some("cpwait") => Ok(D2Join::CpWait),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_JOIN={other:?} is not a D2 join mode: expected `cpwait` or `host`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_join` (env `HIPFIRE_QWEN4_D2_JOIN`): the D2 join
+    /// mechanism, read from the process snapshot. Resolve it once per load; an
+    /// invalid value is an `Err` the loader must propagate.
+    pub fn qwen4_d2_join() -> std::result::Result<D2Join, String> {
+        parse_d2_join(process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref())
+    }
+
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
     /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
@@ -7957,6 +10591,63 @@ pub mod memory {
         use super::*;
 
         #[test]
+        fn d2_return_parses_mapped_copy_and_refuses_everything_else() {
+            assert_eq!(parse_d2_return(None), Ok(D2Return::Copy));
+            assert_eq!(D2Return::default(), D2Return::Copy);
+            assert_eq!(parse_d2_return(Some("copy")), Ok(D2Return::Copy));
+            assert_eq!(parse_d2_return(Some("mapped")), Ok(D2Return::Mapped));
+            for bad in [
+                "", "Mapped", "COPY", " mapped", "1", "0", "true", "pinned", "mapped ",
+            ] {
+                let error = parse_d2_return(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_RETURN"),
+                    "{bad:?}: {error}"
+                );
+                assert!(error.contains("`mapped` or `copy`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Return::Copy, D2Return::Mapped] {
+                assert_eq!(parse_d2_return(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_ready_parses_sync_event_and_refuses_everything_else() {
+            assert_eq!(parse_d2_ready(None), Ok(D2Ready::Sync));
+            assert_eq!(D2Ready::default(), D2Ready::Sync);
+            assert_eq!(parse_d2_ready(Some("sync")), Ok(D2Ready::Sync));
+            assert_eq!(parse_d2_ready(Some("event")), Ok(D2Ready::Event));
+            for bad in [
+                "", "Event", "SYNC", " event", "1", "0", "true", "cpwait", "event ",
+            ] {
+                let error = parse_d2_ready(Some(bad)).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_READY"), "{bad:?}: {error}");
+                assert!(error.contains("`event` or `sync`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Ready::Sync, D2Ready::Event] {
+                assert_eq!(parse_d2_ready(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_join_parses_host_cpwait_and_refuses_everything_else() {
+            assert_eq!(parse_d2_join(None), Ok(D2Join::Host));
+            assert_eq!(D2Join::default(), D2Join::Host);
+            assert_eq!(parse_d2_join(Some("host")), Ok(D2Join::Host));
+            assert_eq!(parse_d2_join(Some("cpwait")), Ok(D2Join::CpWait));
+            for bad in [
+                "", "CpWait", "HOST", " cpwait", "1", "0", "true", "event", "cpwait ",
+            ] {
+                let error = parse_d2_join(Some(bad)).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_JOIN"), "{bad:?}: {error}");
+                assert!(error.contains("`cpwait` or `host`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Join::Host, D2Join::CpWait] {
+                assert_eq!(parse_d2_join(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
         fn offload_exec_roundtrip() {
             // Only "cpu" (trimmed, case-insensitive) selects CPU execution;
             // everything else — including the absent value — is the pcie default,
@@ -7985,6 +10676,47 @@ pub mod memory {
         }
 
         #[test]
+        fn qwen4_direct_load_is_default_on_and_only_zero_is_off() {
+            assert!(parse_qwen4_direct_load(None));
+            assert!(parse_qwen4_direct_load(Some("")));
+            assert!(parse_qwen4_direct_load(Some("1")));
+            assert!(parse_qwen4_direct_load(Some(" 1 ")));
+            assert!(parse_qwen4_direct_load(Some("true")));
+            assert!(!parse_qwen4_direct_load(Some("0")));
+            assert!(!parse_qwen4_direct_load(Some(" 0 ")));
+        }
+
+        #[test]
+        fn offload_exec_explicit_truth_table() {
+            // Unset and blank are "not chosen": the loader may pick by
+            // measurement. Any spelling the user did type is chosen, and an
+            // unknown one still fails closed to `pcie` (never to the CPU).
+            assert_eq!(parse_offload_exec_explicit(None), None);
+            assert_eq!(parse_offload_exec_explicit(Some("")), None);
+            assert_eq!(parse_offload_exec_explicit(Some("  ")), None);
+            assert_eq!(
+                parse_offload_exec_explicit(Some("pcie")),
+                Some(OffloadExec::Pcie)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some(" PCIE ")),
+                Some(OffloadExec::Pcie)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("cpu")),
+                Some(OffloadExec::Cpu)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("passback")),
+                Some(OffloadExec::Passback)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("banana")),
+                Some(OffloadExec::Pcie)
+            );
+        }
+
+        #[test]
         fn passback_share_roundtrip() {
             // Absent/empty/unknown all schedule.
             assert_eq!(parse_passback_share(None), PassbackShare::Auto);
@@ -7992,18 +10724,12 @@ pub mod memory {
             assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
             assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
             // Both ends of the legal range are pinned shares; 0 disables.
-            assert_eq!(
-                parse_passback_share(Some("0")),
-                PassbackShare::Share(0.0)
-            );
+            assert_eq!(parse_passback_share(Some("0")), PassbackShare::Share(0.0));
             assert_eq!(
                 parse_passback_share(Some("0.375")),
                 PassbackShare::Share(0.375)
             );
-            assert_eq!(
-                parse_passback_share(Some("0.5")),
-                PassbackShare::Share(0.5)
-            );
+            assert_eq!(parse_passback_share(Some("0.5")), PassbackShare::Share(0.5));
             // Out of range and garbage fail closed to scheduling (the schema
             // rejects them earlier; this is the second guard).
             assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
@@ -8141,6 +10867,18 @@ pub mod memory {
             assert_eq!(
                 trunk_overlay_sidecar_path(Path::new("model")),
                 PathBuf::from("model.trunk-overlay")
+            );
+        }
+
+        #[test]
+        fn expert_hotset_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                expert_hotset_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.expert-hotset")
+            );
+            assert_eq!(
+                expert_hotset_sidecar_path(Path::new("model")),
+                PathBuf::from("model.expert-hotset")
             );
         }
 
@@ -8309,13 +11047,20 @@ pub mod memory {
         #[test]
         fn budget_keys_default_to_full_and_preserve_explicit_placement() {
             use OffloadBudget::{Auto, Full, Layers};
-            let defaults = crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
             for (key, env) in [
                 ("memory.gpu_layer_budget", "HIPFIRE_GPU_LAYER_BUDGET"),
                 ("memory.moe_expert_budget", "HIPFIRE_MOE_EXPERT_BUDGET"),
             ] {
-                assert_eq!(crate::field(key).unwrap().default.to_value(), crate::ConfigValue::Null);
-                assert_eq!(parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()), Full);
+                assert_eq!(
+                    crate::field(key).unwrap().default.to_value(),
+                    crate::ConfigValue::Null
+                );
+                assert_eq!(
+                    parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()),
+                    Full
+                );
                 for (spelling, expected) in [
                     ("null", Full),
                     ("auto", Auto),
@@ -8330,7 +11075,8 @@ pub mod memory {
                             argument: format!("{key}={spelling}"),
                         },
                         layer,
-                    }]).unwrap();
+                    }])
+                    .unwrap();
                     let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
                     for budget_env in ["HIPFIRE_GPU_LAYER_BUDGET", "HIPFIRE_MOE_EXPERT_BUDGET"] {
                         assert_eq!(
@@ -8374,7 +11120,7 @@ pub mod memory {
             use SpillSupport::{Refused, Supported};
             // Clean single-GPU non-VL non-paged non-REAP MoE: the only
             // supported shape (dense included — the policy is MoE-blind).
-            for arch_id in [5u32, 6] {
+            for arch_id in [5u32, 6, 11] {
                 assert_eq!(
                     spill_support(arch_id, 1, 1, None, false, false, false),
                     Supported,

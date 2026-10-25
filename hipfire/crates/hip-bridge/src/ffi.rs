@@ -10,8 +10,11 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(feature = "kernel-timing")]
+pub mod kernel_timing;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -105,11 +108,13 @@ pub mod launch_counters {
     counter!(graph_launch);
 }
 
-/// Per-thread tally of the HIP memory operations issued on this thread.
+/// Per-thread tally of the HIP memory operations and kernel launches issued
+/// on this thread.
 ///
 /// A retained Redline tape replays recorded kernel dispatches only, so a
 /// device copy, readback or memset issued inside its capture window is state
-/// the tape cannot reproduce. The replay controller differences two snapshots
+/// the tape cannot reproduce, and so is a kernel launched past the recorder.
+/// The replay controller differences two snapshots
 /// around the window. Unlike [`launch_counters`] this tally is never reset, so
 /// a profiler resetting its counters mid-window cannot hide an effect, and
 /// every synchronous and asynchronous variant counts.
@@ -126,6 +131,9 @@ pub mod memory_effects {
         pub dtoh: u64,
         /// Memsets.
         pub memset: u64,
+        /// Kernel launches (`hipModuleLaunchKernel`, both argument paths). A
+        /// launch the replay recorder did not see is missing from the tape.
+        pub launches: u64,
     }
 
     impl MemoryEffects {
@@ -136,6 +144,7 @@ pub mod memory_effects {
                 dtod: self.dtod - earlier.dtod,
                 dtoh: self.dtoh - earlier.dtoh,
                 memset: self.memset - earlier.memset,
+                launches: self.launches - earlier.launches,
             }
         }
 
@@ -149,7 +158,7 @@ pub mod memory_effects {
 
     thread_local! {
         static TALLY: Cell<MemoryEffects> = const {
-            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0 })
+            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0, launches: 0 })
         };
     }
 
@@ -177,6 +186,9 @@ pub mod memory_effects {
     }
     pub(crate) fn memset() {
         bump(|value| value.memset += 1);
+    }
+    pub(crate) fn launch() {
+        bump(|value| value.launches += 1);
     }
 }
 
@@ -329,8 +341,32 @@ pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// enough for offloaded weights — the GEMV/GEMM kernels read them directly.
 pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
+/// `hipHostMalloc` flag: fine-grained, coherent host memory. Overrides
+/// `HIP_HOST_COHERENT` for this allocation, so device system-scope stores are
+/// visible to the host without waiting for a kernel-boundary release.
+pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
+
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
+
+/// `hipDeviceAttributeCanUseStreamWaitValue` in the `hipDeviceAttribute_t` enum
+/// of the ROCm header this bridge targets (`hip_runtime_api.h`:
+/// `hipDeviceAttributeAmdSpecificBegin = 10000`, thirteen enumerators later).
+pub const HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE: i32 = 10013;
+
+/// `hipStreamWaitValueGte`: wait until `(*ptr & mask) >= (value & mask)`.
+pub const HIP_STREAM_WAIT_VALUE_GTE: u32 = 0x0;
+
+/// `hipStreamWriteValueDefault`.
+pub const HIP_STREAM_WRITE_VALUE_DEFAULT: u32 = 0x0;
+
+/// `hipMallocSignalMemory` payload of a [`SignalWord`] allocation.
+const SIGNAL_WORD_BYTES: usize = 8;
+
+const STREAM_WAIT_CAP_SLOTS: usize = 16;
+const STREAM_WAIT_CAP_UNKNOWN: u8 = 0;
+const STREAM_WAIT_CAP_NO: u8 = 1;
+const STREAM_WAIT_CAP_YES: u8 = 2;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -524,13 +560,13 @@ pub struct HipRuntime {
         Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
     fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
     /// `hipMemExportToShareableHandle(void *out, handle, type, flags)`.
-    fn_mem_export_to_shareable_handle: Option<
-        unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32,
-    >,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn_mem_export_to_shareable_handle:
+        Option<unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32>,
     /// `hipMemImportFromShareableHandle(handle *out, void *osHandle, type)`.
-    fn_mem_import_from_shareable_handle: Option<
-        unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32,
-    >,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn_mem_import_from_shareable_handle:
+        Option<unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32>,
     /// `hipMemGetAccess(unsigned long long *flags, const hipMemLocation *, void *ptr)`.
     fn_mem_get_access:
         Option<unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32>,
@@ -597,6 +633,10 @@ pub struct HipRuntime {
     /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
     /// configures is unguarded.
     launch_grid_yz_limit: AtomicU32,
+    /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
+    stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
+    #[cfg(feature = "kernel-timing")]
+    kernel_timing_control: std::sync::OnceLock<Arc<kernel_timing::TimingControl>>,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -710,7 +750,10 @@ pub fn keep_host_memory_out_of_reclaim(reason: &str) {
         }
     }
     if !set.is_empty() {
-        eprintln!("[hip-bridge] {} ({reason}): host memory out of reclaim", set.join(" "));
+        eprintln!(
+            "[hip-bridge] {} ({reason}): host memory out of reclaim",
+            set.join(" ")
+        );
     }
 }
 
@@ -755,7 +798,9 @@ fn pageable_copy_staging(opt_out: Option<&OsStr>, preset: Option<&OsStr>) -> Pag
 /// it is safe before the HIP runtime loads.
 fn pinned_xfer_default_opt_out() -> Option<OsString> {
     match hipfire_config::active_process_config() {
-        Some(config) => config.legacy_value(PINNED_XFER_DEFAULT_ENV).map(OsString::from),
+        Some(config) => config
+            .legacy_value(PINNED_XFER_DEFAULT_ENV)
+            .map(OsString::from),
         None => std::env::var_os(PINNED_XFER_DEFAULT_ENV),
     }
 }
@@ -813,6 +858,10 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // CU masks on RDNA hung the R9700 MES (2026-10-14): refuse before any
+        // ROCm library is mapped.
+        hipfire_config::devices::cu_mask_env_guard()
+            .map_err(|message| HipError::new(0, &message))?;
         keep_pageable_copies_out_of_reclaim();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
@@ -866,66 +915,83 @@ impl HipRuntime {
         };
 
         let runtime = Self {
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_init: unsafe { load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_runtime_get_version: unsafe { load_fn!(
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_init: unsafe { load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32) },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_runtime_get_version: unsafe {
+                load_fn!(
                     lib,
                     "hipRuntimeGetVersion",
                     unsafe extern "C" fn(*mut c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_device_count: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_device_count: unsafe {
+                load_fn!(
                     lib,
                     "hipGetDeviceCount",
                     unsafe extern "C" fn(*mut c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_set_device: unsafe { load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_set_device_flags: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_set_device: unsafe {
+                load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_set_device_flags: unsafe {
+                load_fn!(
                     lib,
                     "hipSetDeviceFlags",
                     unsafe extern "C" fn(c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_device: unsafe { load_fn!(
-                    lib,
-                    "hipGetDevice",
-                    unsafe extern "C" fn(*mut c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_device_get_uuid: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_device: unsafe {
+                load_fn!(lib, "hipGetDevice", unsafe extern "C" fn(*mut c_int) -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_device_get_uuid: unsafe {
+                load_fn!(
                     lib,
                     "hipDeviceGetUuid",
                     unsafe extern "C" fn(*mut u8, c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_device_get_pci_bus_id: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_device_get_pci_bus_id: unsafe {
+                load_fn!(
                     lib,
                     "hipDeviceGetPCIBusId",
                     unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_device_can_access_peer: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_device_can_access_peer: unsafe {
+                load_fn!(
                     lib,
                     "hipDeviceCanAccessPeer",
                     unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_device_enable_peer_access: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_device_enable_peer_access: unsafe {
+                load_fn!(
                     lib,
                     "hipDeviceEnablePeerAccess",
                     unsafe extern "C" fn(c_int, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy_peer: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy_peer: unsafe {
+                load_fn!(
                     lib,
                     "hipMemcpyPeer",
                     unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy_peer_async: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy_peer_async: unsafe {
+                load_fn!(
                     lib,
                     "hipMemcpyPeerAsync",
                     unsafe extern "C" fn(
@@ -936,59 +1002,73 @@ impl HipRuntime {
                         usize,
                         HipStream,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_pointer_get_attributes: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_pointer_get_attributes: unsafe {
+                load_fn!(
                     lib,
                     "hipPointerGetAttributes",
                     unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_malloc: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_malloc: unsafe {
+                load_fn!(
                     lib,
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_ext_malloc_with_flags: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_ext_malloc_with_flags: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipExtMallocWithFlags",
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_free: unsafe { load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_host_malloc: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_free: unsafe { load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32) },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_host_malloc: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipHostMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_host_get_device_pointer: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_host_get_device_pointer: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipHostGetDevicePointer",
                     unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_host_free: unsafe { load_optional_fn!(
-                    lib,
-                    "hipHostFree",
-                    unsafe extern "C" fn(*mut c_void) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_get_address_range: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_host_free: unsafe {
+                load_optional_fn!(lib, "hipHostFree", unsafe extern "C" fn(*mut c_void) -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_get_address_range: unsafe {
+                load_fn!(
                     lib,
                     "hipMemGetAddressRange",
                     unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy: unsafe {
+                load_fn!(
                     lib,
                     "hipMemcpy",
                     unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy_async: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy_async: unsafe {
+                load_fn!(
                     lib,
                     "hipMemcpyAsync",
                     unsafe extern "C" fn(
@@ -998,9 +1078,11 @@ impl HipRuntime {
                         c_uint,
                         HipStream,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy_2d_async: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy_2d_async: unsafe {
+                load_fn!(
                     lib,
                     "hipMemcpy2DAsync",
                     unsafe extern "C" fn(
@@ -1013,39 +1095,51 @@ impl HipRuntime {
                         c_uint,
                         HipStream,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memcpy_dtod: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memcpy_dtod: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemcpyDtoD",
                     unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memset: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memset: unsafe {
+                load_fn!(
                     lib,
                     "hipMemset",
                     unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memset_async: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memset_async: unsafe {
+                load_fn!(
                     lib,
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_memset_d32_async: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_memset_d32_async: unsafe {
+                load_fn!(
                     lib,
                     "hipMemsetD32Async",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_address_reserve: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_address_reserve: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemAddressReserve",
                     unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_create: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_create: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemCreate",
                     unsafe extern "C" fn(
@@ -1054,24 +1148,30 @@ impl HipRuntime {
                         *const HipMemAllocationProp,
                         u64,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_get_allocation_granularity: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_get_allocation_granularity: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemGetAllocationGranularity",
                     unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_get_handle_properties: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_get_handle_properties: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemGetAllocationPropertiesFromHandle",
                     unsafe extern "C" fn(
                         *mut HipMemAllocationProp,
                         HipMemGenericAllocationHandle,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_map: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_map: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemMap",
                     unsafe extern "C" fn(
@@ -1081,27 +1181,35 @@ impl HipRuntime {
                         HipMemGenericAllocationHandle,
                         u64,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_unmap: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_unmap: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemUnmap",
                     unsafe extern "C" fn(*mut c_void, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_set_access: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_set_access: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemSetAccess",
                     unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_release: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_release: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemRelease",
                     unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_export_to_shareable_handle: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_export_to_shareable_handle: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemExportToShareableHandle",
                     unsafe extern "C" fn(
@@ -1110,9 +1218,11 @@ impl HipRuntime {
                         u32,
                         u64,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_import_from_shareable_handle: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_import_from_shareable_handle: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemImportFromShareableHandle",
                     unsafe extern "C" fn(
@@ -1120,57 +1230,75 @@ impl HipRuntime {
                         *mut c_void,
                         u32,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_get_access: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_get_access: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipMemGetAccess",
                     unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_create: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_create: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamCreate",
                     unsafe extern "C" fn(*mut HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_create_with_flags: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_create_with_flags: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamCreateWithFlags",
                     unsafe extern "C" fn(*mut HipStream, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_synchronize: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_synchronize: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamSynchronize",
                     unsafe extern "C" fn(HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_destroy: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_destroy: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamDestroy",
                     unsafe extern "C" fn(HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_module_load: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_module_load: unsafe {
+                load_fn!(
                     lib,
                     "hipModuleLoad",
                     unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_module_load_data: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_module_load_data: unsafe {
+                load_fn!(
                     lib,
                     "hipModuleLoadData",
                     unsafe extern "C" fn(*mut HipModule, *const c_void) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_module_get_function: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_module_get_function: unsafe {
+                load_fn!(
                     lib,
                     "hipModuleGetFunction",
                     unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_module_launch_kernel: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_module_launch_kernel: unsafe {
+                load_fn!(
                     lib,
                     "hipModuleLaunchKernel",
                     unsafe extern "C" fn(
@@ -1186,89 +1314,115 @@ impl HipRuntime {
                         *mut *mut c_void,
                         *mut *mut c_void,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_module_occupancy_max_active_blocks: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_module_occupancy_max_active_blocks: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
                     unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_create: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_create: unsafe {
+                load_fn!(
                     lib,
                     "hipEventCreate",
                     unsafe extern "C" fn(*mut HipEvent) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_create_with_flags: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_create_with_flags: unsafe {
+                load_fn!(
                     lib,
                     "hipEventCreateWithFlags",
                     unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_record: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_record: unsafe {
+                load_fn!(
                     lib,
                     "hipEventRecord",
                     unsafe extern "C" fn(HipEvent, HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_query: unsafe { load_fn!(
-                    lib,
-                    "hipEventQuery",
-                    unsafe extern "C" fn(HipEvent) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_synchronize: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_query: unsafe {
+                load_fn!(lib, "hipEventQuery", unsafe extern "C" fn(HipEvent) -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_synchronize: unsafe {
+                load_fn!(
                     lib,
                     "hipEventSynchronize",
                     unsafe extern "C" fn(HipEvent) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_elapsed_time: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_elapsed_time: unsafe {
+                load_fn!(
                     lib,
                     "hipEventElapsedTime",
                     unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_event_destroy: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_event_destroy: unsafe {
+                load_fn!(
                     lib,
                     "hipEventDestroy",
                     unsafe extern "C" fn(HipEvent) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_wait_event: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_wait_event: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamWaitEvent",
                     unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_error_string: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_error_string: unsafe {
+                load_fn!(
                     lib,
                     "hipGetErrorString",
                     unsafe extern "C" fn(u32) -> *const i8
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_last_error: unsafe { load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_begin_capture: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_last_error: unsafe {
+                load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_begin_capture: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamBeginCapture",
                     unsafe extern "C" fn(HipStream, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_end_capture: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_end_capture: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamEndCapture",
                     unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_is_capturing: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_is_capturing: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamIsCapturing",
                     unsafe extern "C" fn(HipStream, *mut c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_graph_instantiate: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_graph_instantiate: unsafe {
+                load_fn!(
                     lib,
                     "hipGraphInstantiate",
                     unsafe extern "C" fn(
@@ -1278,63 +1432,81 @@ impl HipRuntime {
                         *mut c_void,
                         usize,
                     ) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_graph_launch: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_graph_launch: unsafe {
+                load_fn!(
                     lib,
                     "hipGraphLaunch",
                     unsafe extern "C" fn(HipGraphExec, HipStream) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_graph_exec_destroy: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_graph_exec_destroy: unsafe {
+                load_fn!(
                     lib,
                     "hipGraphExecDestroy",
                     unsafe extern "C" fn(HipGraphExec) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_graph_destroy: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_graph_destroy: unsafe {
+                load_fn!(
                     lib,
                     "hipGraphDestroy",
                     unsafe extern "C" fn(HipGraph) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_write_value32: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_write_value32: unsafe {
+                load_fn!(
                     lib,
                     "hipStreamWriteValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_stream_wait_value32: unsafe { load_optional_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_stream_wait_value32: unsafe {
+                load_optional_fn!(
                     lib,
                     "hipStreamWaitValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_device_synchronize: unsafe { load_fn!(
-                    lib,
-                    "hipDeviceSynchronize",
-                    unsafe extern "C" fn() -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_device_properties: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_device_synchronize: unsafe {
+                load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32)
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_device_properties: unsafe {
+                load_fn!(
                     lib,
                     "hipGetDeviceProperties",
                     unsafe extern "C" fn(*mut u8, c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_get_device_attribute: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_get_device_attribute: unsafe {
+                load_fn!(
                     lib,
                     "hipDeviceGetAttribute",
                     unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
-                ) },
-                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
-                fn_mem_get_info: unsafe { load_fn!(
+                )
+            },
+            // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+            fn_mem_get_info: unsafe {
+                load_fn!(
                     lib,
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
-                ) },
-                _lib: Arc::new(lib),
-                launch_grid_yz_limit: AtomicU32::new(u32::MAX),
+                )
+            },
+            _lib: Arc::new(lib),
+            launch_grid_yz_limit: AtomicU32::new(u32::MAX),
+            stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_control: std::sync::OnceLock::new(),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -1569,6 +1741,19 @@ impl HipRuntime {
     // ── Memory management ───────────────────────────────────────
 
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.malloc_raw(size);
+        };
+        let (buf, token) = crate::emu_budget::charged_alloc(
+            &budget,
+            crate::emu_budget::Class::Device,
+            size,
+            || self.malloc_raw(size),
+        )?;
+        Ok(buf.with_charge(token))
+    }
+
+    fn malloc_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: FFI out-params are stack locals with valid writable provenance;
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
@@ -1579,6 +1764,7 @@ impl HipRuntime {
             ptr,
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
+            token: None,
         })
     }
 
@@ -1588,6 +1774,19 @@ impl HipRuntime {
     /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
     /// callers receive a scoped error only when they request signal memory.
     pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.malloc_signal_raw(size);
+        };
+        let (buf, token) = crate::emu_budget::charged_alloc(
+            &budget,
+            crate::emu_budget::Class::Device,
+            size,
+            || self.malloc_signal_raw(size),
+        )?;
+        Ok(buf.with_charge(token))
+    }
+
+    fn malloc_signal_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
         let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
             return Err(HipError::new(
@@ -1605,24 +1804,30 @@ impl HipRuntime {
             ptr,
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
+            token: None,
         })
     }
 
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
-    pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
+    pub fn free(&self, mut buf: DeviceBuffer) -> HipResult<()> {
         if !buf.is_hip_allocation() {
             return Err(HipError::new(
                 0,
                 "hipFree rejected a borrowed or VMM DeviceBuffer",
             ));
         }
-        // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
-        // caller must ensure GPU work on it is quiesced (documented on free).
-        let code = unsafe { (self.fn_free)(buf.ptr) };
-        self.check(code, "hipFree")?;
-        crate::registry::forget(buf.ptr as usize);
-        Ok(())
+        // Emu charge (None when off): released only if hipFree succeeds; a
+        // failed free drops the token without releasing, keeping the charge.
+        let token = buf.take_charge();
+        crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
+            // caller must ensure GPU work on it is quiesced (documented on free).
+            let code = unsafe { (self.fn_free)(buf.ptr) };
+            self.check(code, "hipFree")?;
+            crate::registry::forget(buf.ptr as usize);
+            Ok(())
+        })
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -1632,6 +1837,20 @@ impl HipRuntime {
     /// is then the *host* pointer — use [`Self::host_get_device_pointer`] for the
     /// address to hand a kernel.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.host_malloc_raw(size, flags);
+        };
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::HOST_TOKENS,
+            crate::emu_budget::Class::HostPinned,
+            size,
+            |ptr: &*mut c_void| *ptr as usize,
+            || self.host_malloc_raw(size, flags),
+        )
+    }
+
+    fn host_malloc_raw(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -1662,10 +1881,43 @@ impl HipRuntime {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(host) };
-        self.check(code, "hipHostFree")
+        let raw = || {
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(host) };
+            self.check(code, "hipHostFree")
+        };
+        if crate::emu_budget::active().is_none() {
+            return raw();
+        }
+        // Release the pinned-host charge only if hipHostFree succeeds.
+        crate::emu_budget::release_keyed::<crate::emu_budget::Process>(
+            &crate::emu_budget::HOST_TOKENS,
+            host as usize,
+            raw,
+        )
+    }
+
+    /// Take shared ownership of a `hipHostMalloc`'d allocation so a stream-held lease can
+    /// outlive both the registry that allocated it and this runtime.  The returned
+    /// [`HostAllocOwner`] frees it (once, on last drop); nothing else may.
+    ///
+    /// # Safety
+    /// `host` must be non-null, must have been returned by this runtime's `host_malloc`, must
+    /// not have been freed, must be adopted AT MOST ONCE, and after adoption nothing but the
+    /// returned owner (and the references cloned from it) may call `host_free` on it — the
+    /// caller must stop freeing it directly (the registry that held it drops its record
+    /// without freeing).
+    pub unsafe fn adopt_host_allocation(&self, host: *mut c_void) -> HipResult<HostAllocOwner> {
+        if host.is_null() {
+            return Err(HipError::new(0, "adopt_host_allocation: null host pointer"));
+        }
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        Ok(HostAllocOwner {
+            ptr: host,
+            free,
+            _lib: Some(Arc::clone(&self._lib)),
+        })
     }
 
     /// Own reusable pinned host storage, portable across devices. The library
@@ -1677,7 +1929,17 @@ impl HipRuntime {
         let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         // hipHostMallocPortable: this thread-local stage may outlive a Gpu or
         // be reused with another device after a model swap.
-        let ptr = self.host_malloc(size, 1)?;
+        let (ptr, token) = match crate::emu_budget::active() {
+            None => (self.host_malloc_raw(size, 1)?, None),
+            // The buffer owns its token (not the pointer-keyed table): its
+            // Drop calls the raw free function directly.
+            Some(budget) => crate::emu_budget::charged_alloc(
+                &budget,
+                crate::emu_budget::Class::HostPinned,
+                size,
+                || self.host_malloc_raw(size, 1),
+            )?,
+        };
         // SAFETY: hipHostMalloc succeeded with a non-zero extent. Initialize
         // once so as_bytes_mut can expose ordinary initialized Rust bytes.
         unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
@@ -1685,6 +1947,7 @@ impl HipRuntime {
             ptr,
             size,
             free,
+            token,
             _lib: Arc::clone(&self._lib),
         })
     }
@@ -1696,11 +1959,74 @@ impl HipRuntime {
             storage: Some(self.host_buffer(size)?),
             device: self.current_device()?,
             stream: ptr::null_mut(),
-            pending: false,
+            ledger: TransferLedger::new(),
+            ready_event: None,
             get_device: self.fn_get_device,
             set_device: self.fn_set_device,
             synchronize: self.fn_device_synchronize,
+            event_destroy: self.fn_event_destroy,
         })
+    }
+
+    /// Mapped + coherent host storage with a non-owning device alias, for CPU
+    /// results the GPU reads in place. See [`MappedHostBuffer`].
+    ///
+    /// Refuses a zero/oversized extent and any alias failure (including a null
+    /// alias); there is no host-pointer fallback. Starts zeroed, `Retired`,
+    /// generation 0. The library stays loaded until the allocation is freed.
+    pub fn mapped_host_buffer(&self, size: usize) -> HipResult<MappedHostBuffer> {
+        check_mapped_extent(size)?;
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        let device = self.current_device()?;
+        let retire_event = self.event_create_with_flags(HIP_EVENT_DISABLE_TIMING)?;
+        let flags = HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT;
+        let allocated = match crate::emu_budget::active() {
+            None => self.host_malloc_raw(size, flags).map(|p| (p, None)),
+            Some(budget) => crate::emu_budget::charged_alloc(
+                &budget,
+                crate::emu_budget::Class::HostPinned,
+                size,
+                || self.host_malloc_raw(size, flags),
+            ),
+        };
+        let (host, token) = match allocated {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.event_destroy(retire_event);
+                return Err(e);
+            }
+        };
+        // SAFETY: hipHostMalloc succeeded with a non-zero extent; initialize
+        // once so the host slices handed out are ordinary initialized bytes.
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, size) };
+        // From here the buffer owns the allocation: any refusal below drops
+        // it in the Retired phase, which frees the host memory and the charge.
+        let mut buffer = MappedHostBuffer {
+            host,
+            // SAFETY: placeholder null view of extent 0, replaced below
+            // before the buffer escapes; never dereferenced.
+            device_view: unsafe { DeviceBuffer::from_raw(ptr::null_mut(), 0) },
+            size,
+            ledger: MappedLedger::new(),
+            retire_event,
+            device,
+            free,
+            token,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+            event_synchronize: self.fn_event_synchronize,
+            event_destroy: self.fn_event_destroy,
+            _lib: Arc::clone(&self._lib),
+        };
+        let alias = self
+            .host_get_device_pointer(host, 0)
+            .and_then(|alias| checked_alias(alias, size))?;
+        // SAFETY: `alias` is the non-null device address of the live `size`-byte
+        // mapped allocation owned by `buffer`; the view is Borrowed (never
+        // freed) and `buffer` outlives every use of it.
+        buffer.device_view = unsafe { DeviceBuffer::from_raw(alias, size) };
+        Ok(buffer)
     }
 
     pub fn mem_get_allocation_granularity(
@@ -1767,12 +2093,27 @@ impl HipRuntime {
         prop: &HipMemAllocationProp,
     ) -> HipResult<HipMemGenericAllocationHandle> {
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
-        let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
-        self.check(code, "hipMemCreate")?;
-        Ok(handle)
+        let raw = || {
+            let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
+            self.check(code, "hipMemCreate")?;
+            Ok(handle)
+        };
+        let Some(budget) = crate::emu_budget::active() else {
+            return raw();
+        };
+        // Charged at physical backing creation, by placement.
+        let class = crate::emu_budget::vmm_class(prop.location.type_)?;
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::VMM_TOKENS,
+            class,
+            size,
+            |handle: &HipMemGenericAllocationHandle| *handle as usize,
+            raw,
+        )
     }
 
     /// # Safety
@@ -1789,7 +2130,11 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
         self.check(code, "hipMemMap")?;
-        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::VmmChunk);
+        crate::registry::record(
+            ptr as usize,
+            size,
+            crate::registry::AllocationKind::VmmChunk,
+        );
         Ok(())
     }
 
@@ -1826,10 +2171,21 @@ impl HipRuntime {
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(handle) };
-        self.check(code, "hipMemRelease")
+        let raw = || {
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(handle) };
+            self.check(code, "hipMemRelease")
+        };
+        if crate::emu_budget::active().is_none() {
+            return raw();
+        }
+        // One token per physical handle; released only on a successful release.
+        crate::emu_budget::release_keyed::<crate::emu_budget::Process>(
+            &crate::emu_budget::VMM_TOKENS,
+            handle as usize,
+            raw,
+        )
     }
 
     /// Export a live exportable (POSIX-FD) physical allocation handle as a new
@@ -1839,6 +2195,7 @@ impl HipRuntime {
     /// `handle` with `HipMemAllocationProp::device_pinned_posix_fd`.
     ///
     /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[cfg(unix)]
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn mem_export_posix(
         &self,
@@ -1879,7 +2236,41 @@ impl HipRuntime {
     /// the caller keeps ownership and may close it after import. The returned
     /// handle is owned by the caller and must be released with `mem_release`
     /// after every mapping of it is unmapped.
+    #[cfg(unix)]
     pub fn mem_import_posix(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        // Untyped: no byte/placement metadata to charge, so refuse under emu.
+        crate::emu_budget::untyped_import_gate(crate::emu_budget::active().is_some())?;
+        self.mem_import_posix_raw(fd)
+    }
+
+    /// Import with caller-supplied physical size: under emu the `Device`
+    /// charge is reserved before the raw import, committed on success and kept
+    /// with the handle until a successful `mem_release`. Off state is the
+    /// plain raw import.
+    #[cfg(unix)]
+    pub(crate) fn mem_import_posix_charged(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        physical_bytes: usize,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.mem_import_posix_raw(fd);
+        };
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::VMM_TOKENS,
+            crate::emu_budget::Class::Device,
+            physical_bytes,
+            |handle: &HipMemGenericAllocationHandle| *handle as usize,
+            || self.mem_import_posix_raw(fd),
+        )
+    }
+
+    #[cfg(unix)]
+    fn mem_import_posix_raw(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> HipResult<HipMemGenericAllocationHandle> {
@@ -2387,7 +2778,10 @@ impl HipRuntime {
         let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
         if module_load_audit_enabled() {
-            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t{:p}\t{name}", module.0);
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t{:p}\t{name}",
+                module.0
+            );
         }
         Ok(Function(func))
     }
@@ -2429,12 +2823,16 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
+        #[cfg(feature = "kernel-timing")]
+        timing.record_start(stream_raw)?;
         let code = (self.fn_module_launch_kernel)(
             func.0,
             grid[0],
@@ -2448,7 +2846,12 @@ impl HipRuntime {
             params.as_mut_ptr(),
             ptr::null_mut(),
         );
+        #[cfg(feature = "kernel-timing")]
+        let timing_result = timing.record_stop(code);
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        memory_effects::launch();
+        #[cfg(feature = "kernel-timing")]
+        timing_result?;
         self.check(code, "hipModuleLaunchKernel")
     }
 
@@ -2485,6 +2888,8 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
@@ -2507,6 +2912,8 @@ impl HipRuntime {
 
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
+        #[cfg(feature = "kernel-timing")]
+        timing.record_start(stream_raw)?;
         let code = (self.fn_module_launch_kernel)(
             func.0,
             grid[0],
@@ -2520,7 +2927,12 @@ impl HipRuntime {
             ptr::null_mut(), // kernelParams = null (we use extra)
             extra.as_mut_ptr(),
         );
+        #[cfg(feature = "kernel-timing")]
+        let timing_result = timing.record_stop(code);
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        memory_effects::launch();
+        #[cfg(feature = "kernel-timing")]
+        timing_result?;
         self.check(code, "hipModuleLaunchKernel(extra blob)")
     }
     /// Max active blocks per multiprocessor for a loaded module function
@@ -2648,7 +3060,9 @@ impl HipRuntime {
     pub fn last_error(&self) -> u32 {
         // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
         // stack locals (or caller-provided device ids). No host pointer aliasing.
-        unsafe { (self.fn_get_last_error)() }
+        let code = unsafe { (self.fn_get_last_error)() };
+        crate::error::observe_raw_code(code);
+        code
     }
 
     // ── Async memory ops ────────────────────────────────────────
@@ -2833,8 +3247,14 @@ impl HipRuntime {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        assert!(width <= dst_pitch, "memcpy_dtod_2d: width exceeds dst pitch");
-        assert!(width <= src_pitch, "memcpy_dtod_2d: width exceeds src pitch");
+        assert!(
+            width <= dst_pitch,
+            "memcpy_dtod_2d: width exceeds dst pitch"
+        );
+        assert!(
+            width <= src_pitch,
+            "memcpy_dtod_2d: width exceeds src pitch"
+        );
         let dst_end = (height - 1)
             .checked_mul(dst_pitch)
             .and_then(|v| v.checked_add(width))
@@ -2845,8 +3265,14 @@ impl HipRuntime {
             .and_then(|v| v.checked_add(width))
             .and_then(|v| v.checked_add(src_offset))
             .expect("memcpy_dtod_2d: src span overflows usize");
-        assert!(dst_end <= dst.size, "memcpy_dtod_2d: dst span exceeds buffer");
-        assert!(src_end <= src.size, "memcpy_dtod_2d: src span exceeds buffer");
+        assert!(
+            dst_end <= dst.size,
+            "memcpy_dtod_2d: dst span exceeds buffer"
+        );
+        assert!(
+            src_end <= src.size,
+            "memcpy_dtod_2d: src span exceeds buffer"
+        );
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
         // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
@@ -2882,6 +3308,8 @@ impl HipRuntime {
     /// Begin capturing all operations on `stream` into a graph.
     /// mode=0 is hipStreamCaptureModeGlobal.
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        kernel_timing::reject_active(self, "graph capture unsupported by kernel timing")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -2927,6 +3355,8 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        kernel_timing::reject_active(self, "graph replay unsupported by kernel timing")?;
         let t = std::time::Instant::now();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2970,8 +3400,43 @@ impl HipRuntime {
         self.check(code, "hipStreamWriteValue32")
     }
 
+    /// Whether `device` reports `hipDeviceAttributeCanUseStreamWaitValue`.
+    ///
+    /// Symbol presence alone is not capability: a runtime may export
+    /// `hipStreamWaitValue32` on a device whose queues cannot execute it. The
+    /// answer is cached per device (a query error is not cached).
+    pub fn can_use_stream_wait_value(&self, device: i32) -> HipResult<bool> {
+        let slot = usize::try_from(device)
+            .ok()
+            .and_then(|d| self.stream_wait_caps.get(d));
+        if let Some(slot) = slot {
+            match slot.load(Ordering::Relaxed) {
+                STREAM_WAIT_CAP_NO => return Ok(false),
+                STREAM_WAIT_CAP_YES => return Ok(true),
+                _ => {}
+            }
+        }
+        let capable = if self.fn_stream_wait_value32.is_none() {
+            false
+        } else {
+            self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, device)? != 0
+        };
+        if let Some(slot) = slot {
+            let cached = if capable {
+                STREAM_WAIT_CAP_YES
+            } else {
+                STREAM_WAIT_CAP_NO
+            };
+            slot.store(cached, Ordering::Relaxed);
+        }
+        Ok(capable)
+    }
+
     /// Wait until a 32-bit signal-memory value satisfies the requested condition.
     /// Operations submitted later to `stream` remain blocked until it does.
+    ///
+    /// Refused unless the current device reports
+    /// `hipDeviceAttributeCanUseStreamWaitValue` ([`Self::can_use_stream_wait_value`]).
     pub fn stream_wait_value32(
         &self,
         stream: &Stream,
@@ -2986,10 +3451,97 @@ impl HipRuntime {
                 "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
             ));
         };
+        let device = self.current_device()?;
+        if !self.can_use_stream_wait_value(device)? {
+            return Err(HipError::new(
+                0,
+                "hipDeviceAttributeCanUseStreamWaitValue is 0; stream signal waits are unsupported",
+            ));
+        }
         // SAFETY: ptr is a live device signal/buffer address from DeviceBuffer; stream
         // is a live handle. Value wait/write races are ordered by the stream.
         let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
         self.check(code, "hipStreamWaitValue32")
+    }
+
+    /// Allocate one [`SignalWord`] (8 bytes of `hipMallocSignalMemory`),
+    /// initialized to 0. Refused unless the current device can use stream
+    /// value operations.
+    pub fn signal_word(&self) -> HipResult<SignalWord> {
+        let device = self.current_device()?;
+        if !self.can_use_stream_wait_value(device)? {
+            return Err(HipError::new(
+                0,
+                "hipDeviceAttributeCanUseStreamWaitValue is 0; signal words are unsupported",
+            ));
+        }
+        let owner = self.malloc_signal(SIGNAL_WORD_BYTES)?;
+        let host = owner.as_ptr().cast::<u32>();
+        if host.is_null() || !(host as usize).is_multiple_of(std::mem::align_of::<u32>()) {
+            let _ = self.free(owner);
+            return Err(mapped_err(
+                "signal memory returned a null or misaligned host pointer",
+            ));
+        }
+        // SAFETY: the Borrowed view never outlives `owner`, which the word owns.
+        let view = unsafe { owner.alias() };
+        let word = SignalWord {
+            owner: Some(owner),
+            view,
+            host,
+            device,
+            free: self.fn_free,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+            _lib: Arc::clone(&self._lib),
+        };
+        word.store(0);
+        Ok(word)
+    }
+
+    /// Enqueue `hipStreamWriteValue32(word, generation)` on `stream`: a
+    /// GPU-ordered release of everything queued before it (`None` = the default
+    /// stream). `value` must be a generation, never [`SIGNAL_ABORT`].
+    pub fn stream_write_signal(
+        &self,
+        stream: Option<&Stream>,
+        word: &SignalWord,
+        value: u32,
+    ) -> HipResult<()> {
+        if !SignalGen::is_generation(value) {
+            return Err(mapped_err("signal write value is not a generation"));
+        }
+        let raw = Stream(stream.map_or(ptr::null_mut(), |s| s.0));
+        self.stream_write_value32(
+            &raw,
+            word.device_buffer(),
+            value,
+            HIP_STREAM_WRITE_VALUE_DEFAULT,
+        )
+    }
+
+    /// Enqueue `hipStreamWaitValue32(word >= generation)` on `stream`. Later
+    /// work on the stream stays blocked until the word reaches `generation` or
+    /// holds [`SIGNAL_ABORT`]. Every error path of a caller that queued this
+    /// wait must store the abort value before any synchronize.
+    pub fn stream_wait_signal_gte(
+        &self,
+        stream: Option<&Stream>,
+        word: &SignalWord,
+        generation: u32,
+    ) -> HipResult<()> {
+        if !SignalGen::is_generation(generation) {
+            return Err(mapped_err("signal wait value is not a generation"));
+        }
+        let raw = Stream(stream.map_or(ptr::null_mut(), |s| s.0));
+        self.stream_wait_value32(
+            &raw,
+            word.device_buffer(),
+            generation,
+            HIP_STREAM_WAIT_VALUE_GTE,
+            u32::MAX,
+        )
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
@@ -3008,8 +3560,8 @@ impl HipRuntime {
     /// Allocates a large buffer for hipDeviceProp_t, reads gcnArchName from offset 0.
     pub fn get_arch(&self, device_id: i32) -> HipResult<String> {
         let mut buf = vec![0u8; 1024]; // hipDeviceProp_t varies by ROCm version, 1024 is safe
-        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
-        // stack locals (or caller-provided device ids). No host pointer aliasing.
+                                       // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+                                       // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_get_device_properties)(buf.as_mut_ptr(), device_id as c_int) };
         self.check(code, "hipGetDeviceProperties")?;
         // gcnArchName is a null-terminated C string at the start of the struct
@@ -3053,6 +3605,10 @@ impl HipRuntime {
     }
 
     /// Get VRAM info: (free_bytes, total_bytes).
+    ///
+    /// RAW hardware query (`hipMemGetInfo`): never capped by an emu profile.
+    /// The application-visible, capped query is `Gpu::device_mem_info` in
+    /// rdna-compute.
     pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
         let mut free: usize = 0;
         let mut total: usize = 0;
@@ -3073,6 +3629,9 @@ pub struct PinnedHostBuffer {
     ptr: *mut c_void,
     size: usize,
     free: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// Emu `HostPinnedGtt` charge; `None` when emu is off. Released only after
+    /// `free` succeeds in `Drop`; a failed free keeps the charge.
+    token: Option<crate::emu_budget::Token>,
     _lib: Arc<Library>,
 }
 
@@ -3091,27 +3650,320 @@ impl PinnedHostBuffer {
 
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
-        // SAFETY: unique hipHostMalloc owner; its library is still live. The
-        // caller must have drained async copies before dropping the owner.
-        let _ = unsafe { (self.free)(self.ptr) };
+        let Some(token) = self.token.take() else {
+            // SAFETY: unique hipHostMalloc owner; its library is still live. The
+            // caller must have drained async copies before dropping the owner.
+            let code = unsafe { (self.free)(self.ptr) };
+            crate::error::observe_raw_code(code);
+            return;
+        };
+        // SAFETY: as above.
+        let code = unsafe { (self.free)(self.ptr) };
+        crate::error::observe_raw_code(code);
+        let _ = crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
+            if code == HIP_SUCCESS {
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipHostFree"))
+            }
+        });
+    }
+}
+
+// ── Pinned transfer storage and input readiness ─────────────────
+
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide enqueue order across every transfer buffer. Each enqueue (and
+/// each readiness arm) draws the next value; the cross-buffer retirement proof
+/// compares them.
+static NEXT_TRANSFER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// What proves an [`InputReady`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyKind {
+    /// An event recorded on the buffer's stream after its queued downloads.
+    Event,
+    /// A `hipStreamWriteValue32` of this generation to a [`SignalWord`].
+    Word(u32),
+}
+
+/// Proof obligation of one armed readiness point of a [`PinnedTransferBuffer`].
+///
+/// Minted by [`PinnedTransferBuffer::arm_ready`] /
+/// [`PinnedTransferBuffer::arm_ready_word`] after the downloads are queued;
+/// only the buffer that minted it, while the arm is still current, can complete
+/// it. A completed token proves host readiness of that buffer and, through
+/// [`PinnedTransferBuffer::retire_behind`], of earlier same-stream buffers.
+/// Not `Clone`/`Copy`. It is a different type from [`MappedPublished`]: the
+/// two cannot be exchanged.
+///
+/// ```compile_fail
+/// fn takes_published(_: hip_bridge::MappedPublished) {}
+/// fn forge(ready: hip_bridge::InputReady) {
+///     takes_published(ready)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn takes_ready(_: hip_bridge::InputReady) {}
+/// fn forge(published: hip_bridge::MappedPublished) {
+///     takes_ready(published)
+/// }
+/// ```
+#[must_use = "an armed readiness point must be completed before host access"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct InputReady {
+    buffer: u64,
+    arm: u64,
+    kind: ReadyKind,
+    stream: usize,
+    seq: u64,
+    complete: bool,
+}
+
+impl InputReady {
+    /// Whether the proof has been completed (by a query, a word or a blocking
+    /// fallback) on the buffer that minted it.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The process-wide sequence number drawn when this readiness was armed.
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retire {
+    Retired,
+    /// The proof does not cover this buffer: complete it separately.
+    NotCovered,
+}
+
+/// Pure, HIP-free ledger of one [`PinnedTransferBuffer`]: pending accesses,
+/// the stream and sequence of the last enqueue, and the armed readiness.
+#[derive(Debug)]
+struct TransferLedger {
+    id: u64,
+    pending: bool,
+    stream: usize,
+    last_seq: u64,
+    armed: Option<(u64, ReadyKind)>,
+    next_arm: u64,
+}
+
+impl TransferLedger {
+    fn new() -> Self {
+        Self {
+            id: NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed),
+            pending: false,
+            stream: 0,
+            last_seq: 0,
+            armed: None,
+            next_arm: 1,
+        }
+    }
+
+    /// A stream change while accesses are pending needs a device drain first.
+    fn needs_drain(&self, raw: usize) -> bool {
+        self.pending && self.stream != raw
+    }
+
+    /// Every pending access is retired.
+    fn drained(&mut self) {
+        self.pending = false;
+        self.armed = None;
+    }
+
+    /// Mark before submission: even a failed API call must not expose storage
+    /// while an earlier copy might still be using it. A new enqueue
+    /// invalidates the armed readiness, which no longer covers it.
+    fn enqueued(&mut self, raw: usize) {
+        self.enqueued_at(raw, NEXT_TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed));
+    }
+
+    fn enqueued_at(&mut self, raw: usize, seq: u64) {
+        self.stream = raw;
+        self.pending = true;
+        self.last_seq = seq;
+        self.armed = None;
+    }
+
+    fn arm(&mut self, kind: ReadyKind) -> Result<InputReady, &'static str> {
+        self.arm_at(kind, NEXT_TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn arm_at(&mut self, kind: ReadyKind, seq: u64) -> Result<InputReady, &'static str> {
+        if !self.pending {
+            return Err("no pending transfer to arm readiness for");
+        }
+        let arm = self.next_arm;
+        self.next_arm += 1;
+        self.armed = Some((arm, kind));
+        Ok(InputReady {
+            buffer: self.id,
+            arm,
+            kind,
+            stream: self.stream,
+            seq,
+            complete: false,
+        })
+    }
+
+    fn check(&self, token: &InputReady) -> Result<(), &'static str> {
+        if token.buffer != self.id {
+            return Err("readiness token belongs to a different transfer buffer");
+        }
+        if token.complete {
+            return Err("readiness token was already completed");
+        }
+        match self.armed {
+            Some((arm, kind)) if arm == token.arm && kind == token.kind => Ok(()),
+            Some(_) => Err("readiness token is stale: the buffer was re-armed"),
+            None => {
+                Err("readiness token no longer covers the buffer (later enqueue or completion)")
+            }
+        }
+    }
+
+    /// Whether a word observation proves a `Word` token.
+    fn observe_word(&self, token: &InputReady, observed: u32) -> Result<bool, &'static str> {
+        self.check(token)?;
+        match token.kind {
+            ReadyKind::Word(want) => Ok(observed >= want),
+            ReadyKind::Event => Err("an event readiness token is not proved by a signal word"),
+        }
+    }
+
+    fn complete(&mut self, token: &mut InputReady) -> Result<(), &'static str> {
+        self.check(token)?;
+        self.drained();
+        token.complete = true;
+        Ok(())
+    }
+
+    /// A completed proof retires this buffer only when its last enqueue was on
+    /// the proof's stream with a smaller sequence: same-stream FIFO then puts
+    /// that access before the proof's marker.
+    fn retire_behind(&mut self, proof: &InputReady) -> Result<Retire, &'static str> {
+        if !proof.complete {
+            return Err("readiness proof is not complete");
+        }
+        if !self.pending {
+            return Ok(Retire::Retired);
+        }
+        if self.stream == proof.stream && self.last_seq < proof.seq {
+            self.drained();
+            Ok(Retire::Retired)
+        } else {
+            Ok(Retire::NotCovered)
+        }
+    }
+}
+
+/// Sole owner of one `hipHostMalloc`'d allocation, shared by `Arc` between the registry that
+/// allocated it and any stream-held lease.  The LAST holder's `Drop` runs the original
+/// `hipHostFree` exactly once (releasing the pointer-keyed emu pinned-host charge only if
+/// the free succeeds; a failed free keeps the charge and leaks, never frees twice).  It holds
+/// the free function and an `Arc<Library>` — never the [`HipRuntime`] — so it stays freeable
+/// after the runtime that adopted it is gone.  Created only by
+/// [`HipRuntime::adopt_host_allocation`].  Async users must have drained every GPU access
+/// before the last reference drops.
+pub struct HostAllocOwner {
+    ptr: *mut c_void,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// `None` only for the CPU tests' fake free function.
+    _lib: Option<Arc<Library>>,
+}
+
+// SAFETY: the owner is the unique owner of an opaque host allocation that Rust never
+// dereferences; it holds a plain function pointer and an `Arc<Library>` (Send + Sync).
+unsafe impl Send for HostAllocOwner {}
+unsafe impl Sync for HostAllocOwner {}
+
+impl HostAllocOwner {
+    /// The host pointer `hipHostFree` will receive.
+    pub fn host_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    #[cfg(test)]
+    fn for_test(ptr: *mut c_void, free: unsafe extern "C" fn(*mut c_void) -> u32) -> Self {
+        Self {
+            ptr,
+            free,
+            _lib: None,
+        }
+    }
+}
+
+impl Drop for HostAllocOwner {
+    fn drop(&mut self) {
+        let raw = || {
+            // SAFETY: the unique owner of the allocation (see `adopt_host_allocation`); its
+            // library is still loaded (`_lib`). The caller drained async GPU access.
+            let code = unsafe { (self.free)(self.ptr) };
+            crate::error::observe_raw_code(code);
+            if code == HIP_SUCCESS {
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipHostFree"))
+            }
+        };
+        // Same release rule as `HipRuntime::host_free`: the keyed charge is released only
+        // if the free succeeds.
+        let _ = if crate::emu_budget::active().is_none() {
+            raw()
+        } else {
+            crate::emu_budget::release_keyed::<crate::emu_budget::Process>(
+                &crate::emu_budget::HOST_TOKENS,
+                self.ptr as usize,
+                raw,
+            )
+        };
     }
 }
 
 /// Pinned transfer storage whose outstanding GPU accesses survive a CPU call.
 ///
-/// Host access is available only after `complete` drains the queued downloads.
-/// Uploads and following downloads on the same stream reuse the allocation
-/// without an intervening host wait. Stream changes and teardown must retire
-/// the old accesses first; a failed teardown retains the allocation.
+/// Host access is available only after `complete` (or a completed readiness
+/// token) drains the queued downloads. Uploads and following downloads on the
+/// same stream reuse the allocation without an intervening host wait. Stream
+/// changes and teardown must retire the old accesses first; a failed teardown
+/// retains the allocation.
+///
+/// Event readiness: after the queued downloads, [`Self::arm_ready`] records an
+/// event on the buffer's stream and returns an [`InputReady`];
+/// [`Self::try_complete_ready`] polls it without a stream synchronization. A
+/// completed token also retires other buffers whose last enqueue was on the
+/// same stream earlier ([`Self::retire_behind`]).
 pub struct PinnedTransferBuffer {
     storage: Option<PinnedHostBuffer>,
     device: i32,
     stream: HipStream,
-    pending: bool,
+    ledger: TransferLedger,
+    ready_event: Option<Event>,
     get_device: unsafe extern "C" fn(*mut c_int) -> u32,
     set_device: unsafe extern "C" fn(c_int) -> u32,
     synchronize: unsafe extern "C" fn() -> u32,
+    event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
 }
+
+// SAFETY: this is the unique owner of its pinned allocation. Moving it does
+// not move the allocation, expose host aliases, or change stream ordering.
+// Submission, completion and host access all require exclusive `&mut self`;
+// the caller must bind the recorded device before HIP operations. Drop binds
+// that device itself, drains pending accesses and restores the prior binding,
+// retaining storage if retirement fails. HIP stream and event handles are not
+// thread-affine. Deliberately NOT Sync: concurrent access is not supported.
+unsafe impl Send for PinnedTransferBuffer {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<PinnedTransferBuffer>();
+};
 
 impl PinnedTransferBuffer {
     pub fn size(&self) -> usize {
@@ -3120,6 +3972,11 @@ impl PinnedTransferBuffer {
 
     pub fn device(&self) -> i32 {
         self.device
+    }
+
+    /// Whether queued accesses are not yet proved complete.
+    pub fn is_pending(&self) -> bool {
+        self.ledger.pending
     }
 
     /// The runtime must be bound to this buffer's device, and the stream and
@@ -3190,20 +4047,136 @@ impl PinnedTransferBuffer {
 
     /// Complete the caller's existing D2H readiness boundary.
     pub fn complete(&mut self, hip: &HipRuntime) -> HipResult<()> {
-        if self.pending {
-            if self.stream.is_null() {
-                hip.stream_synchronize_default()?;
-            } else {
-                hip.stream_synchronize(&Stream(self.stream))?;
-            }
-            self.pending = false;
+        if self.ledger.pending {
+            self.sync_stream(hip)?;
+            self.ledger.drained();
         }
         Ok(())
     }
 
+    fn sync_stream(&self, hip: &HipRuntime) -> HipResult<()> {
+        if self.stream.is_null() {
+            hip.stream_synchronize_default()
+        } else {
+            hip.stream_synchronize(&Stream(self.stream))
+        }
+    }
+
+    /// Record an event on this buffer's stream after its queued transfers and
+    /// return the token that [`Self::try_complete_ready`] polls. The event is
+    /// created on first use and reused. A failed record returns no token and
+    /// leaves the accesses pending.
+    pub fn arm_ready(&mut self, hip: &HipRuntime) -> HipResult<InputReady> {
+        if !self.ledger.pending {
+            return Err(mapped_err("no pending transfer to arm readiness for"));
+        }
+        if self.ready_event.is_none() {
+            self.ready_event = Some(hip.event_create_with_flags(HIP_EVENT_DISABLE_TIMING)?);
+        }
+        let event = self
+            .ready_event
+            .as_ref()
+            .expect("ready event was just created");
+        hip.event_record(event, Some(&Stream(self.stream)))?;
+        self.ledger.arm(ReadyKind::Event).map_err(mapped_err)
+    }
+
+    /// Enqueue `hipStreamWriteValue32(word, value)` on this buffer's stream
+    /// after its queued transfers and return the token that
+    /// [`Self::try_complete_ready_word`] checks. `value` must be a generation.
+    pub fn arm_ready_word(
+        &mut self,
+        hip: &HipRuntime,
+        word: &SignalWord,
+        value: u32,
+    ) -> HipResult<InputReady> {
+        if !self.ledger.pending {
+            return Err(mapped_err("no pending transfer to arm readiness for"));
+        }
+        hip.stream_write_signal(Some(&Stream(self.stream)), word, value)?;
+        self.ledger.arm(ReadyKind::Word(value)).map_err(mapped_err)
+    }
+
+    /// Non-blocking completion of an event token: `Ok(true)` once the event
+    /// completed (the accesses are then retired and `ready` is a completed
+    /// proof), `Ok(false)` while outstanding. A foreign, stale or wrong-kind
+    /// token and any query error leave the accesses pending.
+    pub fn try_complete_ready(
+        &mut self,
+        hip: &HipRuntime,
+        ready: &mut InputReady,
+    ) -> HipResult<bool> {
+        self.ledger.check(ready).map_err(mapped_err)?;
+        if ready.kind != ReadyKind::Event {
+            return Err(mapped_err(
+                "a signal-word readiness token is not an event token",
+            ));
+        }
+        let event = self
+            .ready_event
+            .as_ref()
+            .ok_or_else(|| mapped_err("event readiness without a recorded event"))?;
+        if hip.event_query(event)? {
+            self.ledger.complete(ready).map_err(mapped_err)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Non-blocking completion of a signal-word token: an acquire load of
+    /// `word` at or above the armed generation completes it. An observed
+    /// [`SIGNAL_ABORT`] also compares `>=` but is refused: the ready word is
+    /// never aborted, so seeing the reserved value means the word is dead.
+    pub fn try_complete_ready_word(
+        &mut self,
+        ready: &mut InputReady,
+        word: &SignalWord,
+    ) -> HipResult<bool> {
+        let observed = word.load_acquire();
+        if observed == SIGNAL_ABORT {
+            return Err(mapped_err(
+                "input ready word holds the reserved abort value",
+            ));
+        }
+        if self
+            .ledger
+            .observe_word(ready, observed)
+            .map_err(mapped_err)?
+        {
+            self.ledger.complete(ready).map_err(mapped_err)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Blocking fallback for an armed token: synchronize the stream, then mark
+    /// the token complete. A foreign or stale token is refused before any wait.
+    pub fn complete_ready(&mut self, hip: &HipRuntime, ready: &mut InputReady) -> HipResult<()> {
+        self.ledger.check(ready).map_err(mapped_err)?;
+        self.sync_stream(hip)?;
+        self.ledger.complete(ready).map_err(mapped_err)
+    }
+
+    /// Retire this buffer's pending accesses using another buffer's completed
+    /// proof: `Ok(true)` when they are retired (including when none were
+    /// pending), `Ok(false)` when the proof does not cover this buffer (a
+    /// different stream, or an enqueue not earlier than the proof) and the
+    /// caller must [`Self::complete`] it. An incomplete proof is an error.
+    pub fn retire_behind(&mut self, proof: &InputReady) -> HipResult<bool> {
+        Ok(self.ledger.retire_behind(proof).map_err(mapped_err)? == Retire::Retired)
+    }
+
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        assert!(!self.pending, "host access before pinned transfer completion");
-        self.storage.as_mut().expect("live transfer storage").as_bytes_mut()
+        assert!(
+            !self.ledger.pending,
+            "host access before pinned transfer completion"
+        );
+        self.storage
+            .as_mut()
+            .expect("live transfer storage")
+            .as_bytes_mut()
     }
 
     fn check_span(&self, offset: usize, size: usize) -> HipResult<()> {
@@ -3215,44 +4188,756 @@ impl PinnedTransferBuffer {
 
     fn begin(&mut self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
         let raw = stream.map_or(ptr::null_mut(), |s| s.0);
-        if self.pending && self.stream != raw {
+        if self.ledger.needs_drain(raw as usize) {
             // The old stream may have been destroyed already. Drain the owning
             // device, not a potentially stale handle, on this rare transition.
             hip.device_synchronize()?;
-            self.pending = false;
+            self.ledger.drained();
         }
         self.stream = raw;
-        // Mark before submission: even a failed API call must not release or
-        // expose storage while an earlier copy might still be using it.
-        self.pending = true;
+        self.ledger.enqueued(raw as usize);
         Ok(())
     }
 }
 
 impl Drop for PinnedTransferBuffer {
     fn drop(&mut self) {
-        if !self.pending {
+        let event = self.ready_event.take();
+        let pending = self.ledger.pending;
+        if !pending && event.is_none() {
             return;
         }
-        let mut previous = 0;
-        // SAFETY: the pinned owner keeps the function-pointer library live.
-        // Bind its device before draining; restore the caller's device so
-        // cached thread binding remains valid outside this destructor.
-        let drained = unsafe {
-            if (self.get_device)(&mut previous) != HIP_SUCCESS {
-                false
-            } else if (self.set_device)(self.device) != HIP_SUCCESS {
-                false
-            } else {
-                let code = (self.synchronize)();
-                let restored = (self.set_device)(previous);
-                code == HIP_SUCCESS && restored == HIP_SUCCESS
+        // Bind the owning device before draining; restore the caller's device
+        // so cached thread binding remains valid outside this destructor.
+        let drained = call_on_device(self.get_device, self.set_device, self.device, || {
+            let mut code = HIP_SUCCESS;
+            if pending {
+                // SAFETY: the pinned owner keeps the function-pointer library live.
+                code = unsafe { (self.synchronize)() };
             }
-        };
-        if !drained {
+            if code == HIP_SUCCESS {
+                if let Some(event) = event.as_ref() {
+                    // SAFETY: the live event handle is owned by this buffer; the
+                    // stream was drained above, so the record is complete.
+                    let destroyed = unsafe { (self.event_destroy)(event.0) };
+                    crate::error::observe_raw_code(destroyed);
+                }
+            }
+            code
+        });
+        if !drained && pending {
             // Retain both allocation and library rather than freeing memory
             // that the device may still access after a failed drain.
             std::mem::forget(self.storage.take());
+        }
+    }
+}
+
+// ── Mapped host result buffer ───────────────────────────────────
+
+/// Lifecycle phase of a [`MappedHostBuffer`].
+///
+/// `Retired → CpuWriting → Published → GpuReading → Retired`. Host bytes are
+/// writable only in `CpuWriting`, which is reachable only from `Retired`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappedPhase {
+    /// No GPU consumer can be reading; the host may begin a write.
+    Retired,
+    /// The host holds the unique [`MappedWrite`].
+    CpuWriting,
+    /// The host finished writing; the consumer has not been recorded yet.
+    Published,
+    /// A consumer was enqueued; the host must not write until retirement.
+    GpuReading,
+}
+
+static NEXT_MAPPED_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Proof that one generation of a [`MappedHostBuffer`] was published.
+///
+/// Carries the buffer identity and generation; consumed by
+/// [`MappedHostBuffer::mark_gpu_reading`]. Not `Clone`/`Copy`, so one
+/// publication can be marked in flight at most once.
+#[must_use = "a published generation must be passed to mark_gpu_reading"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct MappedPublished {
+    buffer: u64,
+    generation: u64,
+}
+
+impl MappedPublished {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// How a quiescence request must be satisfied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappedQuiesce {
+    /// Nothing can be in flight.
+    Done,
+    /// Wait on (or query) the recorded retirement event.
+    Event,
+    /// No event covers the consumer; only a device synchronize proves it.
+    Device,
+}
+
+/// Pure, HIP-free phase ledger embedded in [`MappedHostBuffer`].
+#[derive(Debug)]
+struct MappedLedger {
+    id: u64,
+    phase: MappedPhase,
+    generation: u64,
+    /// `GpuReading` entered without a recorded retirement event (the record
+    /// call failed). Retirable only by device synchronization.
+    unfenced: bool,
+}
+
+impl MappedLedger {
+    fn new() -> Self {
+        Self {
+            id: NEXT_MAPPED_ID.fetch_add(1, Ordering::Relaxed),
+            phase: MappedPhase::Retired,
+            generation: 0,
+            unfenced: false,
+        }
+    }
+
+    fn begin_write(&mut self) -> Result<(), &'static str> {
+        if self.phase != MappedPhase::Retired {
+            return Err("mapped buffer is not retired; cannot begin a host write");
+        }
+        if self.generation == u64::MAX {
+            return Err("mapped buffer generation counter exhausted");
+        }
+        self.phase = MappedPhase::CpuWriting;
+        Ok(())
+    }
+
+    /// An unpublished write returns to `Retired`; the generation is unchanged.
+    fn abandon_write(&mut self) {
+        if self.phase == MappedPhase::CpuWriting {
+            self.phase = MappedPhase::Retired;
+        }
+    }
+
+    /// `begin_write` guarantees `generation < u64::MAX` while `CpuWriting`.
+    fn publish(&mut self) -> Result<MappedPublished, &'static str> {
+        if self.phase != MappedPhase::CpuWriting {
+            return Err("mapped buffer is not being written; cannot publish");
+        }
+        self.generation += 1;
+        self.phase = MappedPhase::Published;
+        Ok(MappedPublished {
+            buffer: self.id,
+            generation: self.generation,
+        })
+    }
+
+    fn check_token(&self, token: &MappedPublished) -> Result<(), &'static str> {
+        if token.buffer != self.id {
+            return Err("published token belongs to a different mapped buffer");
+        }
+        if self.phase != MappedPhase::Published {
+            return Err("mapped buffer is not in the Published phase");
+        }
+        if token.generation != self.generation {
+            return Err("published token is stale (generation mismatch)");
+        }
+        Ok(())
+    }
+
+    fn enter_gpu_reading(
+        &mut self,
+        token: &MappedPublished,
+        fenced: bool,
+    ) -> Result<(), &'static str> {
+        self.check_token(token)?;
+        self.phase = MappedPhase::GpuReading;
+        self.unfenced = !fenced;
+        Ok(())
+    }
+
+    fn retire_plan(&self) -> Result<MappedQuiesce, &'static str> {
+        match self.phase {
+            MappedPhase::Retired => Ok(MappedQuiesce::Done),
+            MappedPhase::GpuReading if self.unfenced => Ok(MappedQuiesce::Device),
+            MappedPhase::GpuReading => Ok(MappedQuiesce::Event),
+            MappedPhase::CpuWriting => Err("mapped buffer is being written; nothing to retire"),
+            MappedPhase::Published => {
+                Err("mapped buffer was published but never marked GpuReading; refusing to retire")
+            }
+        }
+    }
+
+    /// Drop must assume any non-`Retired` phase may have a consumer in flight.
+    fn drop_plan(&self) -> MappedQuiesce {
+        match self.phase {
+            MappedPhase::Retired => MappedQuiesce::Done,
+            MappedPhase::GpuReading if !self.unfenced => MappedQuiesce::Event,
+            _ => MappedQuiesce::Device,
+        }
+    }
+
+    fn complete_retirement(&mut self) {
+        debug_assert_eq!(self.phase, MappedPhase::GpuReading);
+        self.phase = MappedPhase::Retired;
+        self.unfenced = false;
+    }
+}
+
+/// Reject extents that cannot back a Rust byte slice or a HIP allocation.
+fn check_mapped_extent(size: usize) -> HipResult<()> {
+    if size == 0 {
+        return Err(HipError::new(
+            0,
+            "mapped_host_buffer requires non-zero size",
+        ));
+    }
+    if size > isize::MAX as usize {
+        return Err(HipError::new(
+            0,
+            "mapped_host_buffer size exceeds isize::MAX",
+        ));
+    }
+    Ok(())
+}
+
+/// A mapped allocation is usable only with a non-null device alias. Never fall
+/// back to the host pointer: the GPU is not guaranteed to dereference it.
+fn checked_alias(alias: *mut c_void, size: usize) -> HipResult<*mut c_void> {
+    if alias.is_null() {
+        return Err(HipError::new(
+            0,
+            &format!("hipHostGetDevicePointer returned a null alias for {size} mapped bytes"),
+        ));
+    }
+    Ok(alias)
+}
+
+/// `f32` view legality: a whole number of elements at an aligned address.
+fn check_f32_extent(host_addr: usize, size: usize) -> HipResult<()> {
+    if !size.is_multiple_of(4) {
+        return Err(HipError::new(
+            0,
+            &format!("mapped buffer of {size} bytes is not a whole number of f32"),
+        ));
+    }
+    if !host_addr.is_multiple_of(std::mem::align_of::<f32>()) {
+        return Err(mapped_err("mapped host pointer is not f32-aligned"));
+    }
+    Ok(())
+}
+
+fn mapped_err(msg: &'static str) -> HipError {
+    HipError::new(0, msg)
+}
+
+/// Host-written, GPU-read result storage: one
+/// `hipHostMalloc(Mapped | Coherent)` allocation plus its device alias.
+///
+/// The allocation is owned here exactly once; [`MappedHostBuffer::device_buffer`]
+/// is a non-owning (`Borrowed`) view that must never be freed or registered
+/// as a second owner. Host bytes are reachable only through
+/// [`MappedHostBuffer::begin_write`] from the `Retired` phase. After the
+/// consumer is enqueued, [`MappedHostBuffer::mark_gpu_reading`] records a
+/// retirement event; the host may write again only after
+/// [`MappedHostBuffer::retire`] / [`MappedHostBuffer::try_retire`] prove that
+/// event complete. Drop retires before freeing and retains the allocation if
+/// retirement fails.
+///
+/// The runtime used by `mark_gpu_reading`/`retire`/`try_retire` must be bound
+/// to [`MappedHostBuffer::device`], and the stream must outlive its work.
+pub struct MappedHostBuffer {
+    host: *mut c_void,
+    device_view: DeviceBuffer,
+    size: usize,
+    ledger: MappedLedger,
+    retire_event: Event,
+    device: i32,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// Emu `HostPinned` charge; `None` when emu is off. Released only after
+    /// `free` succeeds in `Drop`; a failed free keeps the charge.
+    token: Option<crate::emu_budget::Token>,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+    event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
+    event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
+    _lib: Arc<Library>,
+}
+
+// SAFETY: this is the unique owner of its mapped host allocation; moving it
+// does not move the allocation. Host access requires `&mut self` in the
+// Retired phase, and every GPU-facing operation requires exclusive
+// `&mut self`; the caller must bind the recorded device before HIP calls.
+// Drop binds that device itself, quiesces the consumer and restores the prior
+// binding, retaining the allocation and library if quiescence fails. The
+// non-owning device view is only a pointer value. Deliberately NOT Sync.
+unsafe impl Send for MappedHostBuffer {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MappedHostBuffer>();
+};
+
+/// Unique host writer for one generation. Dropping it unpublished returns the
+/// buffer to `Retired` without advancing the generation.
+pub struct MappedWrite<'a> {
+    buf: &'a mut MappedHostBuffer,
+    published: bool,
+}
+
+impl MappedWrite<'_> {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the buffer holds `size` initialized bytes until Drop, the
+        // ledger is CpuWriting (no consumer in flight), and `&mut self` plus
+        // the buffer's `&mut` borrow exclude other host access.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.host.cast::<u8>(), self.buf.size) }
+    }
+
+    /// The whole buffer as `f32`; refuses when the size is not a multiple of 4.
+    pub fn f32_mut(&mut self) -> HipResult<&mut [f32]> {
+        let size = self.buf.size;
+        check_f32_extent(self.buf.host as usize, size)?;
+        // SAFETY: extent is a checked multiple of 4, the pointer is checked
+        // aligned, bytes are initialized, and exclusivity is as `bytes_mut`.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.buf.host.cast::<f32>(), size / 4) })
+    }
+
+    /// Finish the write and advance the generation.
+    ///
+    /// Issues `fence(SeqCst)`: this orders the host stores for other *host*
+    /// threads only. It is NOT a proof that the GPU observes the bytes; GPU
+    /// visibility is established only by an oracle on real hardware.
+    pub fn publish(mut self) -> MappedPublished {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let token = self
+            .buf
+            .ledger
+            .publish()
+            .expect("MappedWrite exists only in the CpuWriting phase");
+        self.published = true;
+        token
+    }
+}
+
+impl Drop for MappedWrite<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.buf.ledger.abandon_write();
+        }
+    }
+}
+
+impl MappedHostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    pub fn phase(&self) -> MappedPhase {
+        self.ledger.phase
+    }
+
+    /// Number of completed publications (0 until the first `publish`).
+    pub fn generation(&self) -> u64 {
+        self.ledger.generation
+    }
+
+    /// Non-owning device alias. It is `Borrowed`: never free it, never
+    /// register it as an owner, and do not let it outlive this buffer.
+    pub fn device_buffer(&self) -> &DeviceBuffer {
+        &self.device_view
+    }
+
+    /// Start a host write. Only legal from `Retired`.
+    pub fn begin_write(&mut self) -> HipResult<MappedWrite<'_>> {
+        self.ledger.begin_write().map_err(mapped_err)?;
+        Ok(MappedWrite {
+            buf: self,
+            published: false,
+        })
+    }
+
+    /// Record that the consumer of `token`'s generation was just enqueued on
+    /// `stream` (`None` = the default stream). Call it right after the launch.
+    ///
+    /// Refuses a foreign or stale token without changing the phase. If the
+    /// event record fails the consumer may still be in flight, so the phase
+    /// becomes `GpuReading` *without* an event: [`Self::try_retire`] then
+    /// never succeeds and [`Self::retire`] uses a device synchronize.
+    pub fn mark_gpu_reading(
+        &mut self,
+        hip: &HipRuntime,
+        token: MappedPublished,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.ledger.check_token(&token).map_err(mapped_err)?;
+        let recorded = hip.event_record(&self.retire_event, stream);
+        self.ledger
+            .enter_gpu_reading(&token, recorded.is_ok())
+            .map_err(mapped_err)?;
+        recorded
+    }
+
+    /// Block until the recorded consumer finished, then return to `Retired`.
+    /// No-op when already `Retired`; refuses `Published`/`CpuWriting`. On error
+    /// the phase is unchanged.
+    pub fn retire(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        match self.ledger.retire_plan().map_err(mapped_err)? {
+            MappedQuiesce::Done => return Ok(()),
+            MappedQuiesce::Event => hip.event_synchronize(&self.retire_event)?,
+            MappedQuiesce::Device => hip.device_synchronize()?,
+        }
+        self.ledger.complete_retirement();
+        Ok(())
+    }
+
+    /// Non-blocking [`Self::retire`]: `Ok(true)` once retired, `Ok(false)`
+    /// while the consumer is outstanding (always `false` after a failed event
+    /// record: use `retire`). On error the phase is unchanged.
+    pub fn try_retire(&mut self, hip: &HipRuntime) -> HipResult<bool> {
+        match self.ledger.retire_plan().map_err(mapped_err)? {
+            MappedQuiesce::Done => Ok(true),
+            MappedQuiesce::Device => Ok(false),
+            MappedQuiesce::Event => {
+                if hip.event_query(&self.retire_event)? {
+                    self.ledger.complete_retirement();
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Run `call` with this buffer's device bound, restoring the caller's
+    /// binding afterwards. `true` only if every HIP step succeeded.
+    fn quiesce_on_device(&self, call: impl FnOnce() -> u32) -> bool {
+        let mut previous = 0;
+        // SAFETY: the owner keeps the function-pointer library live; out-param
+        // is a stack local.
+        let got = unsafe { (self.get_device)(&mut previous) };
+        crate::error::observe_raw_code(got);
+        if got != HIP_SUCCESS {
+            return false;
+        }
+        // SAFETY: as above; binds the device recorded at construction.
+        let bound = unsafe { (self.set_device)(self.device) };
+        crate::error::observe_raw_code(bound);
+        if bound != HIP_SUCCESS {
+            return false;
+        }
+        let code = call();
+        crate::error::observe_raw_code(code);
+        // SAFETY: as above; restores the caller's device binding.
+        let restored = unsafe { (self.set_device)(previous) };
+        crate::error::observe_raw_code(restored);
+        code == HIP_SUCCESS && restored == HIP_SUCCESS
+    }
+}
+
+impl Drop for MappedHostBuffer {
+    fn drop(&mut self) {
+        let event_raw = self.retire_event.0;
+        let quiesced = match self.ledger.drop_plan() {
+            MappedQuiesce::Done => true,
+            MappedQuiesce::Event => self.quiesce_on_device(|| {
+                // SAFETY: live event owned by this buffer; device is bound.
+                unsafe { (self.event_synchronize)(event_raw) }
+            }),
+            MappedQuiesce::Device => self.quiesce_on_device(|| {
+                // SAFETY: device synchronize takes no arguments; device is bound.
+                unsafe { (self.synchronize)() }
+            }),
+        };
+        if !quiesced {
+            // Retain allocation, event and library rather than freeing memory
+            // the device may still read after a failed drain. The unreleased
+            // emu token stays charged.
+            std::mem::forget(Arc::clone(&self._lib));
+            return;
+        }
+        // SAFETY: the consumer is quiesced, so the event is idle and unshared.
+        let destroyed = unsafe { (self.event_destroy)(event_raw) };
+        crate::error::observe_raw_code(destroyed);
+        // SAFETY: unique hipHostMalloc owner of `host`; library still live.
+        let code = unsafe { (self.free)(self.host) };
+        crate::error::observe_raw_code(code);
+        if let Some(token) = self.token.take() {
+            let _ =
+                crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
+                    if code == HIP_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(HipError::new(code, "hipHostFree"))
+                    }
+                });
+        }
+    }
+}
+
+// ── Signal words (CP-side waits) ────────────────────────────────
+
+/// Largest generation a [`SignalWord`] may carry: 31 bits. Generations count
+/// up from 1; the word starts at 0.
+pub const SIGNAL_GEN_MAX: u32 = 0x7FFF_FFFF;
+
+/// Reserved release value. It compares `>=` every generation, so a
+/// `Gte` wait on any generation is released by a store of `SIGNAL_ABORT`. It
+/// is never a generation and is never reused: a word that holds it is dead.
+pub const SIGNAL_ABORT: u32 = u32::MAX;
+
+/// Pure monotonic generation source of one signal word pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalGen {
+    last: u32,
+}
+
+impl SignalGen {
+    pub const fn new() -> Self {
+        Self { last: 0 }
+    }
+
+    #[cfg(test)]
+    fn at(last: u32) -> Self {
+        Self { last }
+    }
+
+    /// The most recently issued generation (0 before the first).
+    pub const fn last(&self) -> u32 {
+        self.last
+    }
+
+    /// Whether `value` may be written to / waited on as a generation.
+    pub const fn is_generation(value: u32) -> bool {
+        value >= 1 && value <= SIGNAL_GEN_MAX
+    }
+
+    /// The next generation. A counter that would pass [`SIGNAL_GEN_MAX`] is
+    /// refused instead of wrapping: a wrapped (smaller) generation would be
+    /// already satisfied by the stale word value.
+    pub fn next(&mut self) -> HipResult<u32> {
+        if self.last >= SIGNAL_GEN_MAX {
+            return Err(mapped_err(
+                "signal generation counter exhausted; wrap refused",
+            ));
+        }
+        self.last += 1;
+        Ok(self.last)
+    }
+}
+
+impl Default for SignalGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Steps of destroying a signal word, in the only safe order.
+trait SignalTeardown {
+    /// Release any wait that may still be pending on the word.
+    fn store_abort(&mut self);
+    /// Drain the device; `false` when quiescence is not proved.
+    fn quiesce(&mut self) -> bool;
+    /// Release the allocation; `false` when it failed.
+    fn free(&mut self) -> bool;
+}
+
+/// Abort FIRST (a drain with a pending wait never finishes), drain second,
+/// free only after a proved drain. `false` means the allocation must be
+/// retained.
+fn teardown_signal(t: &mut impl SignalTeardown) -> bool {
+    t.store_abort();
+    if !t.quiesce() {
+        return false;
+    }
+    t.free()
+}
+
+/// Run `call` with `device` bound, restoring the caller's binding. `true` only
+/// if every HIP step succeeded.
+fn call_on_device(
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    device: i32,
+    call: impl FnOnce() -> u32,
+) -> bool {
+    let mut previous = 0;
+    // SAFETY: the caller's owner keeps the function-pointer library live; the
+    // out-param is a stack local.
+    let got = unsafe { get_device(&mut previous) };
+    crate::error::observe_raw_code(got);
+    if got != HIP_SUCCESS {
+        return false;
+    }
+    // SAFETY: as above; binds the device recorded at construction.
+    let bound = unsafe { set_device(device) };
+    crate::error::observe_raw_code(bound);
+    if bound != HIP_SUCCESS {
+        return false;
+    }
+    let code = call();
+    crate::error::observe_raw_code(code);
+    // SAFETY: as above; restores the caller's device binding.
+    let restored = unsafe { set_device(previous) };
+    crate::error::observe_raw_code(restored);
+    code == HIP_SUCCESS && restored == HIP_SUCCESS
+}
+
+/// Host pointer of a [`SignalWord`] for a thread that must store
+/// [`SIGNAL_ABORT`] (the join watchdog).
+#[derive(Clone, Copy, Debug)]
+pub struct SignalHostPtr(*mut u32);
+
+// SAFETY: the pointee is signal memory accessed only through volatile
+// loads/stores of one aligned 32-bit word; the holder's contract (see
+// `SignalHostPtr::store`) keeps the owning word alive.
+unsafe impl Send for SignalHostPtr {}
+// SAFETY: as above; concurrent volatile stores of a u32 are the protocol.
+unsafe impl Sync for SignalHostPtr {}
+
+impl SignalHostPtr {
+    /// Volatile store of `value` after a release fence.
+    ///
+    /// # Safety
+    /// The [`SignalWord`] this pointer came from must still be alive. A holder
+    /// must stop using the pointer (disarm) before the word is dropped.
+    pub unsafe fn store(self, value: u32) {
+        std::sync::atomic::fence(Ordering::Release);
+        // SAFETY: the caller guarantees the word is live; it is an aligned u32.
+        unsafe { ptr::write_volatile(self.0, value) }
+    }
+}
+
+/// One 32-bit word of `hipMallocSignalMemory` storage: GPU-writable by
+/// `hipStreamWriteValue32`, GPU-waitable by `hipStreamWaitValue32`, and
+/// host-accessible only through volatile loads/stores plus explicit fences.
+///
+/// The allocation is owned here exactly once (`hipFree` after quiescence); the
+/// device view is a non-owning `Borrowed` alias. Drop stores
+/// [`SIGNAL_ABORT`] first, drains the device, and retains the allocation if
+/// the drain is not proved: freeing signal memory that a queued wait may still
+/// poll is never allowed.
+pub struct SignalWord {
+    owner: Option<DeviceBuffer>,
+    view: DeviceBuffer,
+    host: *mut u32,
+    device: i32,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+    _lib: Arc<Library>,
+}
+
+// SAFETY: unique owner of its signal allocation; the host pointer is used only
+// through volatile accesses of one aligned word. Moving it does not move the
+// allocation. Deliberately NOT Sync: other threads get `SignalHostPtr`.
+unsafe impl Send for SignalWord {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SignalWord>();
+};
+
+impl SignalWord {
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    /// Non-owning device view: pass it to the stream value operations. Never
+    /// free it and do not let it outlive the word.
+    pub fn device_buffer(&self) -> &DeviceBuffer {
+        &self.view
+    }
+
+    /// Volatile load of the word.
+    pub fn load(&self) -> u32 {
+        // SAFETY: `host` is the live, aligned 4-byte signal allocation.
+        unsafe { ptr::read_volatile(self.host) }
+    }
+
+    /// Volatile load followed by an acquire fence: bytes the GPU wrote before
+    /// the value it just read are visible after this returns.
+    pub fn load_acquire(&self) -> u32 {
+        let value = self.load();
+        std::sync::atomic::fence(Ordering::Acquire);
+        value
+    }
+
+    /// Volatile store with no ordering of earlier stores.
+    pub fn store(&self, value: u32) {
+        // SAFETY: as `load`.
+        unsafe { ptr::write_volatile(self.host, value) }
+    }
+
+    /// Release fence, then a volatile store: every earlier host store is
+    /// ordered before `value` for any observer that acquires it. This is a
+    /// host-side order only; GPU visibility is established by a hardware oracle.
+    pub fn store_release(&self, value: u32) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.store(value);
+    }
+
+    /// Pointer for the watchdog thread; see [`SignalHostPtr::store`].
+    pub fn host_ptr(&self) -> SignalHostPtr {
+        SignalHostPtr(self.host)
+    }
+}
+
+struct SignalWordTeardown<'a>(&'a mut SignalWord);
+
+impl SignalTeardown for SignalWordTeardown<'_> {
+    fn store_abort(&mut self) {
+        self.0.store_release(SIGNAL_ABORT);
+    }
+
+    fn quiesce(&mut self) -> bool {
+        let word = &*self.0;
+        call_on_device(word.get_device, word.set_device, word.device, || {
+            // SAFETY: device synchronize takes no arguments; the device is bound.
+            unsafe { (word.synchronize)() }
+        })
+    }
+
+    fn free(&mut self) -> bool {
+        let word = &mut *self.0;
+        let Some(mut owner) = word.owner.take() else {
+            return true;
+        };
+        let raw = owner.as_ptr();
+        let token = owner.take_charge();
+        let free = word.free;
+        let freed = crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            // SAFETY: unique hipExtMallocWithFlags owner; the drain was proved
+            // and the abort value releases any wait, so nothing polls it.
+            let code = unsafe { free(raw) };
+            crate::error::observe_raw_code(code);
+            if code == HIP_SUCCESS {
+                crate::registry::forget(raw as usize);
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipFree"))
+            }
+        });
+        freed.is_ok()
+    }
+}
+
+impl Drop for SignalWord {
+    fn drop(&mut self) {
+        if self.owner.is_none() {
+            return;
+        }
+        if !teardown_signal(&mut SignalWordTeardown(self)) {
+            // Retain the allocation and the library: a queued wait may still
+            // poll the word. The unreleased emu charge stays.
+            std::mem::forget(Arc::clone(&self._lib));
         }
     }
 }
@@ -3268,6 +4953,15 @@ impl Stream {
     pub fn raw_ptr(&self) -> *mut c_void {
         self.0
     }
+    /// Non-owning copy of this handle, for borrowing a stream where an owned
+    /// `Stream` is expected (e.g. `Gpu::active_stream`).
+    ///
+    /// # Safety
+    /// The alias must not outlive the stream and must never reach
+    /// `stream_destroy`; the owner destroys the stream exactly once.
+    pub unsafe fn alias(&self) -> Stream {
+        Stream(self.0)
+    }
 }
 // SAFETY: Stream is an opaque HIP handle (*mut c_void). Sending the handle
 // between threads is fine; it is not Sync. Concurrent use needs
@@ -3280,6 +4974,13 @@ pub struct Module(HipModule);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for Module {}
+
+impl Module {
+    /// Raw `hipModule_t` handle, for identity keys only (never dereferenced).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
 
 /// Handle to a specific kernel function within a module.
 pub struct Function(HipFunction);
@@ -3331,16 +5032,741 @@ mod pageable_copy_staging_tests {
     #[test]
     fn any_other_opt_out_value_still_arms() {
         for value in ["1", "", "00", "false", " 0", "0 "] {
-            assert_eq!(decide(Some(value), None), PageableCopyStaging::Arm, "opt-out {value:?}");
+            assert_eq!(
+                decide(Some(value), None),
+                PageableCopyStaging::Arm,
+                "opt-out {value:?}"
+            );
         }
     }
 
     #[test]
     fn a_preset_switch_is_always_respected() {
         for preset in ["0", "100000", "64", ""] {
-            assert_eq!(decide(None, Some(preset)), PageableCopyStaging::Preset, "preset {preset:?}");
-            assert_eq!(decide(Some("0"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with opt-out");
-            assert_eq!(decide(Some("1"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with =1");
+            assert_eq!(
+                decide(None, Some(preset)),
+                PageableCopyStaging::Preset,
+                "preset {preset:?}"
+            );
+            assert_eq!(
+                decide(Some("0"), Some(preset)),
+                PageableCopyStaging::Preset,
+                "preset {preset:?} with opt-out"
+            );
+            assert_eq!(
+                decide(Some("1"), Some(preset)),
+                PageableCopyStaging::Preset,
+                "preset {preset:?} with =1"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapped_ledger_tests {
+    use super::{
+        check_f32_extent, check_mapped_extent, checked_alias, MappedLedger, MappedPhase,
+        MappedPublished, MappedQuiesce,
+    };
+    use std::ffi::c_void;
+
+    /// Drive a ledger through one write → publish.
+    fn publish_one(l: &mut MappedLedger) -> MappedPublished {
+        l.begin_write().unwrap();
+        l.publish().unwrap()
+    }
+
+    fn full_cycle(l: &mut MappedLedger) {
+        let t = publish_one(l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        l.complete_retirement();
+    }
+
+    #[test]
+    fn starts_retired_generation_zero() {
+        let l = MappedLedger::new();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert_eq!(l.generation, 0);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Done));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Done);
+    }
+
+    #[test]
+    fn legal_cycle_walks_every_phase() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert_eq!(l.phase, MappedPhase::CpuWriting);
+        let t = l.publish().unwrap();
+        assert_eq!(l.phase, MappedPhase::Published);
+        assert_eq!(t.generation(), 1);
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Event);
+        l.complete_retirement();
+        assert_eq!(l.phase, MappedPhase::Retired);
+    }
+
+    #[test]
+    fn begin_write_only_from_retired() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert!(l.begin_write().is_err(), "CpuWriting");
+        let t = l.publish().unwrap();
+        assert!(l.begin_write().is_err(), "Published");
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert!(l.begin_write().is_err(), "GpuReading");
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        l.complete_retirement();
+        l.begin_write().unwrap();
+    }
+
+    #[test]
+    fn publish_only_from_cpu_writing() {
+        let mut l = MappedLedger::new();
+        assert!(l.publish().is_err(), "Retired");
+        let t = publish_one(&mut l);
+        assert!(l.publish().is_err(), "Published");
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert!(l.publish().is_err(), "GpuReading");
+        assert_eq!(l.generation, 1);
+    }
+
+    #[test]
+    fn mark_requires_published_phase() {
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        // Already GpuReading: a same-generation token (forged for the test) is refused.
+        let again = MappedPublished {
+            buffer: l.id,
+            generation: l.generation,
+        };
+        assert!(l.enter_gpu_reading(&again, true).is_err());
+        l.complete_retirement();
+        assert!(l.enter_gpu_reading(&again, true).is_err(), "Retired");
+        l.begin_write().unwrap();
+        assert!(l.enter_gpu_reading(&again, true).is_err(), "CpuWriting");
+        assert_eq!(l.phase, MappedPhase::CpuWriting);
+    }
+
+    #[test]
+    fn generation_is_monotonic_one_per_publication() {
+        let mut l = MappedLedger::new();
+        for want in 1..=64u64 {
+            let t = publish_one(&mut l);
+            assert_eq!(t.generation(), want);
+            assert_eq!(l.generation, want);
+            l.enter_gpu_reading(&t, true).unwrap();
+            l.complete_retirement();
+        }
+    }
+
+    #[test]
+    fn foreign_token_refused_without_state_change() {
+        let mut a = MappedLedger::new();
+        let mut b = MappedLedger::new();
+        assert_ne!(a.id, b.id);
+        let ta = publish_one(&mut a);
+        let tb = publish_one(&mut b);
+        assert_eq!(ta.generation(), tb.generation());
+        assert!(a.enter_gpu_reading(&tb, true).is_err());
+        assert_eq!(a.phase, MappedPhase::Published);
+        assert!(b.enter_gpu_reading(&ta, true).is_err());
+        assert_eq!(b.phase, MappedPhase::Published);
+        a.enter_gpu_reading(&ta, true).unwrap();
+        b.enter_gpu_reading(&tb, true).unwrap();
+    }
+
+    #[test]
+    fn stale_token_refused() {
+        let mut l = MappedLedger::new();
+        let first = publish_one(&mut l);
+        l.enter_gpu_reading(&first, true).unwrap();
+        l.complete_retirement();
+        let _second = publish_one(&mut l);
+        assert!(l.check_token(&first).is_err());
+        assert!(l.enter_gpu_reading(&first, true).is_err());
+        assert_eq!(l.phase, MappedPhase::Published);
+        assert_eq!(l.generation, 2);
+    }
+
+    #[test]
+    fn abandoned_write_returns_retired_without_generation_bump() {
+        let mut l = MappedLedger::new();
+        full_cycle(&mut l);
+        assert_eq!(l.generation, 1);
+        l.begin_write().unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert_eq!(l.generation, 1);
+        // abandon is inert outside CpuWriting.
+        let t = publish_one(&mut l);
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Published);
+        l.enter_gpu_reading(&t, true).unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+    }
+
+    #[test]
+    fn retire_plan_refuses_published_and_writing() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert!(l.retire_plan().is_err(), "CpuWriting");
+        let _t = l.publish().unwrap();
+        assert!(l.retire_plan().is_err(), "Published without mark");
+        assert_eq!(l.phase, MappedPhase::Published);
+        // Drop must still quiesce an unmarked Published buffer by device sync.
+        assert_eq!(l.drop_plan(), MappedQuiesce::Device);
+    }
+
+    #[test]
+    fn failed_event_record_fails_closed_to_device_sync() {
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, false).unwrap();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Device));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Device);
+        assert!(l.begin_write().is_err());
+        l.complete_retirement();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert!(!l.unfenced);
+        // The next fenced cycle is event-based again.
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+    }
+
+    #[test]
+    fn retire_error_keeps_phase_because_completion_is_explicit() {
+        // retire/try_retire call complete_retirement only after the HIP wait
+        // succeeds; planning alone never changes the phase.
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        for _ in 0..3 {
+            assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+            assert_eq!(l.phase, MappedPhase::GpuReading);
+        }
+        assert_eq!(l.generation, 1);
+    }
+
+    #[test]
+    fn generation_exhaustion_refuses_new_write() {
+        let mut l = MappedLedger::new();
+        l.generation = u64::MAX - 1;
+        full_cycle(&mut l);
+        assert_eq!(l.generation, u64::MAX);
+        assert!(l.begin_write().is_err());
+        assert_eq!(l.phase, MappedPhase::Retired);
+    }
+
+    #[test]
+    fn extent_guards() {
+        assert!(check_mapped_extent(0).is_err());
+        assert!(check_mapped_extent(usize::MAX).is_err());
+        assert!(check_mapped_extent(isize::MAX as usize + 1).is_err());
+        assert!(check_mapped_extent(1).is_ok());
+        assert!(check_mapped_extent(isize::MAX as usize).is_ok());
+    }
+
+    #[test]
+    fn f32_extent_refusal() {
+        assert!(check_f32_extent(4096, 0).is_ok());
+        assert!(check_f32_extent(4096, 4).is_ok());
+        assert!(check_f32_extent(4096, 102_400).is_ok());
+        for bad in [1usize, 2, 3, 5, 102_401, 102_403] {
+            assert!(check_f32_extent(4096, bad).is_err(), "size {bad}");
+        }
+        assert!(check_f32_extent(4097, 8).is_err(), "misaligned");
+    }
+
+    #[test]
+    fn null_alias_refused() {
+        assert!(checked_alias(std::ptr::null_mut(), 64).is_err());
+        let mut byte = 0u8;
+        let p = (&mut byte as *mut u8).cast::<c_void>();
+        assert_eq!(checked_alias(p, 64).unwrap(), p);
+    }
+
+    #[test]
+    fn token_is_not_clone_or_copy() {
+        // Inherent-const-priority probe: resolves to `true` only if Clone.
+        trait NotClone {
+            const IS_CLONE: bool = false;
+        }
+        impl<T> NotClone for T {}
+        struct Probe<T>(std::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: Clone> Probe<T> {
+            const IS_CLONE: bool = true;
+        }
+        assert!(!<Probe<MappedPublished>>::IS_CLONE);
+    }
+}
+
+#[cfg(test)]
+mod transfer_ready_tests {
+    use super::{InputReady, ReadyKind, Retire, TransferLedger};
+
+    const S1: usize = 0x10;
+    const S2: usize = 0x20;
+
+    /// A ledger with one enqueue on `stream` at `seq`.
+    fn enqueued(stream: usize, seq: u64) -> TransferLedger {
+        let mut l = TransferLedger::new();
+        l.enqueued_at(stream, seq);
+        l
+    }
+
+    #[test]
+    fn arm_requires_pending_work() {
+        let mut l = TransferLedger::new();
+        assert!(l.arm_at(ReadyKind::Event, 5).is_err(), "nothing queued");
+        l.enqueued_at(S1, 1);
+        assert!(l.arm_at(ReadyKind::Event, 2).is_ok());
+    }
+
+    #[test]
+    fn only_the_matching_token_completes_the_buffer() {
+        let mut a = enqueued(S1, 1);
+        let mut b = enqueued(S1, 2);
+        let mut ta = a.arm_at(ReadyKind::Event, 3).unwrap();
+        let mut tb = b.arm_at(ReadyKind::Event, 4).unwrap();
+        // A token of another buffer is refused and changes nothing.
+        assert!(a.complete(&mut tb).is_err());
+        assert!(b.pending && a.pending);
+        a.complete(&mut ta).unwrap();
+        assert!(!a.pending && ta.is_complete());
+        assert!(b.pending, "the other buffer is untouched");
+        b.complete(&mut tb).unwrap();
+        assert!(!b.pending);
+    }
+
+    #[test]
+    fn a_stale_or_replaced_token_cannot_complete() {
+        let mut l = enqueued(S1, 1);
+        let mut old = l.arm_at(ReadyKind::Event, 2).unwrap();
+        let mut new = l.arm_at(ReadyKind::Event, 3).unwrap();
+        assert!(
+            l.complete(&mut old).is_err(),
+            "re-armed: the old token is stale"
+        );
+        assert!(l.pending);
+        // A later enqueue also invalidates the armed token: the event no
+        // longer covers the buffer.
+        l.enqueued_at(S1, 4);
+        assert!(l.complete(&mut new).is_err(), "later enqueue");
+        assert!(l.pending);
+        let mut fresh = l.arm_at(ReadyKind::Event, 5).unwrap();
+        l.complete(&mut fresh).unwrap();
+        assert!(
+            l.complete(&mut fresh).is_err(),
+            "a completed token completes once"
+        );
+    }
+
+    #[test]
+    fn a_token_kind_must_match_the_armed_kind() {
+        let mut l = enqueued(S1, 1);
+        let mut ev = l.arm_at(ReadyKind::Event, 2).unwrap();
+        let mut forged = InputReady {
+            kind: ReadyKind::Word(7),
+            ..l.arm_at(ReadyKind::Event, 3).unwrap()
+        };
+        assert!(l.complete(&mut forged).is_err(), "armed Event, token Word");
+        assert!(
+            l.complete(&mut ev).is_err(),
+            "the first token was replaced by the second arm"
+        );
+    }
+
+    #[test]
+    fn a_word_token_completes_only_after_its_value_is_observed() {
+        let mut l = enqueued(S1, 1);
+        let mut t = l.arm_at(ReadyKind::Word(9), 2).unwrap();
+        assert_eq!(l.observe_word(&t, 8), Ok(false));
+        assert!(l.pending);
+        assert_eq!(l.observe_word(&t, 9), Ok(true));
+        l.complete(&mut t).unwrap();
+        assert!(!l.pending);
+        let mut e = enqueued(S1, 3);
+        let ev = e.arm_at(ReadyKind::Event, 4).unwrap();
+        assert!(
+            e.observe_word(&ev, u32::MAX).is_err(),
+            "an event token never reads a word"
+        );
+    }
+
+    #[test]
+    fn a_completed_proof_retires_an_earlier_buffer_on_the_same_stream() {
+        let mut input = enqueued(S1, 10);
+        let mut mask = enqueued(S1, 4);
+        let mut proof = input.arm_at(ReadyKind::Event, 11).unwrap();
+        assert!(
+            mask.retire_behind(&proof).is_err(),
+            "an uncompleted proof retires nothing"
+        );
+        input.complete(&mut proof).unwrap();
+        assert_eq!(mask.retire_behind(&proof), Ok(Retire::Retired));
+        assert!(!mask.pending);
+        assert_eq!(
+            mask.retire_behind(&proof),
+            Ok(Retire::Retired),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn a_stream_mismatch_or_a_later_sequence_is_not_covered() {
+        let mut input = enqueued(S1, 10);
+        let mut proof = input.arm_at(ReadyKind::Event, 11).unwrap();
+        input.complete(&mut proof).unwrap();
+        let mut other_stream = enqueued(S2, 4);
+        assert_eq!(other_stream.retire_behind(&proof), Ok(Retire::NotCovered));
+        assert!(other_stream.pending);
+        let mut later = enqueued(S1, 12);
+        assert_eq!(
+            later.retire_behind(&proof),
+            Ok(Retire::NotCovered),
+            "enqueued after the arm"
+        );
+        assert!(later.pending);
+        let mut equal = enqueued(S1, 11);
+        assert_eq!(
+            equal.retire_behind(&proof),
+            Ok(Retire::NotCovered),
+            "same sequence is not smaller"
+        );
+    }
+
+    #[test]
+    fn real_sequences_are_process_wide_and_monotonic() {
+        let mut a = TransferLedger::new();
+        let mut b = TransferLedger::new();
+        a.enqueued(S1);
+        b.enqueued(S1);
+        a.enqueued(S1);
+        assert!(a.last_seq > b.last_seq && b.last_seq > 0);
+        let mut proof = a.arm(ReadyKind::Event).unwrap();
+        a.complete(&mut proof).unwrap();
+        assert!(proof.sequence() > a.last_seq);
+        assert_eq!(b.retire_behind(&proof), Ok(Retire::Retired));
+    }
+
+    #[test]
+    fn a_stream_change_requires_a_drain_only_while_pending() {
+        let mut l = TransferLedger::new();
+        assert!(!l.needs_drain(S2));
+        l.enqueued_at(S1, 1);
+        assert!(!l.needs_drain(S1));
+        assert!(l.needs_drain(S2));
+        l.drained();
+        assert!(!l.needs_drain(S2));
+    }
+
+    #[test]
+    fn readiness_tokens_are_not_clone_or_copy() {
+        trait NotClone {
+            const IS_CLONE: bool = false;
+        }
+        impl<T> NotClone for T {}
+        struct Probe<T>(std::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: Clone> Probe<T> {
+            const IS_CLONE: bool = true;
+        }
+        // Compile-time: the trait default is chosen only when `InputReady` is
+        // not `Clone` (the inherent constant needs `T: Clone`).
+        const _: () = assert!(!<Probe<InputReady>>::IS_CLONE);
+    }
+}
+
+#[cfg(test)]
+mod signal_word_tests {
+    use super::{teardown_signal, SignalGen, SignalTeardown, SIGNAL_ABORT, SIGNAL_GEN_MAX};
+
+    #[test]
+    fn generations_are_31_bit_monotonic_and_start_at_one() {
+        let mut g = SignalGen::new();
+        assert_eq!(g.last(), 0);
+        for want in 1..=1000u32 {
+            assert_eq!(g.next().unwrap(), want);
+        }
+        assert_eq!(SIGNAL_GEN_MAX, (1u32 << 31) - 1);
+    }
+
+    /// The abort sentinel sits strictly above every generation: a store of it
+    /// releases a `Gte` wait on any generation and can never be mistaken for
+    /// one. Checked at compile time.
+    const _: () = assert!(SIGNAL_GEN_MAX < SIGNAL_ABORT);
+
+    #[test]
+    fn the_counter_never_issues_the_abort_value_up_to_exhaustion() {
+        // Drive the real counter across its last generations to the refusal
+        // boundary: every issued value is a valid generation strictly below
+        // the abort sentinel (so an abort store releases a wait on it), and
+        // the counter refuses instead of ever reaching or wrapping past it.
+        let mut g = SignalGen::at(SIGNAL_GEN_MAX - 3);
+        let mut issued = Vec::new();
+        while let Ok(gen) = g.next() {
+            issued.push(gen);
+        }
+        assert_eq!(
+            issued,
+            [SIGNAL_GEN_MAX - 2, SIGNAL_GEN_MAX - 1, SIGNAL_GEN_MAX]
+        );
+        for &gen in &issued {
+            assert!(SignalGen::is_generation(gen));
+            assert!(
+                gen < SIGNAL_ABORT,
+                "an abort store releases a Gte wait on {gen}"
+            );
+        }
+        assert_eq!(g.last(), SIGNAL_GEN_MAX);
+        assert!(!SignalGen::is_generation(SIGNAL_ABORT));
+        assert!(
+            !SignalGen::is_generation(0),
+            "the initial word value is never a generation"
+        );
+        assert!(!SignalGen::is_generation(SIGNAL_GEN_MAX + 1));
+    }
+
+    #[test]
+    fn wrap_is_refused_and_leaves_the_counter_unchanged() {
+        let mut g = SignalGen::at(SIGNAL_GEN_MAX - 1);
+        assert_eq!(g.next().unwrap(), SIGNAL_GEN_MAX);
+        assert!(g.next().is_err());
+        assert_eq!(g.last(), SIGNAL_GEN_MAX);
+        assert!(g.next().is_err(), "stays refused");
+    }
+
+    #[derive(Default)]
+    struct Rec {
+        log: Vec<&'static str>,
+        sync_ok: bool,
+        free_ok: bool,
+    }
+
+    impl SignalTeardown for Rec {
+        fn store_abort(&mut self) {
+            self.log.push("abort");
+        }
+        fn quiesce(&mut self) -> bool {
+            self.log.push("sync");
+            self.sync_ok
+        }
+        fn free(&mut self) -> bool {
+            self.log.push("free");
+            self.free_ok
+        }
+    }
+
+    #[test]
+    fn teardown_stores_abort_before_the_drain_and_frees_last() {
+        let mut r = Rec {
+            sync_ok: true,
+            free_ok: true,
+            ..Rec::default()
+        };
+        assert!(teardown_signal(&mut r));
+        assert_eq!(r.log, ["abort", "sync", "free"]);
+    }
+
+    #[test]
+    fn teardown_never_frees_after_a_failed_drain() {
+        let mut r = Rec {
+            sync_ok: false,
+            free_ok: true,
+            ..Rec::default()
+        };
+        assert!(!teardown_signal(&mut r));
+        assert_eq!(
+            r.log,
+            ["abort", "sync"],
+            "a pending wait may still poll the word"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_alloc_owner_tests {
+    use super::{HostAllocOwner, HIP_SUCCESS};
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    /// Pointers the fake `hipHostFree` was called with, in order.
+    static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    /// The pointer whose fake free reports a HIP error.
+    const FAILING: usize = 0x7000_0000;
+    /// The same, for the test that holds a real emu pinned-host charge on it.
+    const FAILING_CHARGED: usize = 0x7000_1000;
+
+    unsafe extern "C" fn fake_free(ptr: *mut c_void) -> u32 {
+        FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ptr as usize);
+        if ptr as usize == FAILING || ptr as usize == FAILING_CHARGED {
+            1
+        } else {
+            HIP_SUCCESS
+        }
+    }
+
+    fn freed(ptr: usize) -> usize {
+        FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&p| p == ptr)
+            .count()
+    }
+
+    fn owner(ptr: usize) -> HostAllocOwner {
+        HostAllocOwner::for_test(ptr as *mut c_void, fake_free)
+    }
+
+    #[test]
+    fn host_alloc_owner_drop_frees_exactly_once() {
+        let ptr = 0x1000_0000;
+        let o = owner(ptr);
+        assert_eq!(o.host_ptr() as usize, ptr);
+        assert_eq!(freed(ptr), 0, "adopting frees nothing");
+        drop(o);
+        assert_eq!(freed(ptr), 1);
+    }
+
+    #[test]
+    fn host_alloc_owner_last_arc_holder_frees_after_every_other_owner_is_gone() {
+        let ptr = 0x1000_1000;
+        // The registry's reference, a stream-held lease and a quarantined ring page.
+        let registry = Arc::new(owner(ptr));
+        let lease = Arc::clone(&registry);
+        let quarantined = Arc::clone(&registry);
+        // `free_tensor` / Gpu drop releases the registry's reference: nothing is freed yet.
+        drop(registry);
+        assert_eq!(freed(ptr), 0);
+        drop(lease);
+        assert_eq!(
+            freed(ptr),
+            0,
+            "a quarantined page still holds the allocation"
+        );
+        // Quarantine-then-drain: the drain drops the last holder, which frees once.
+        drop(quarantined);
+        assert_eq!(freed(ptr), 1);
+    }
+
+    #[test]
+    fn host_alloc_owner_outlives_the_structure_that_adopted_it() {
+        // The owner holds its own free function and library reference, never the runtime:
+        // dropping every other structure first leaves it freeable.
+        let ptr = 0x1000_2000;
+        let holders: Vec<Arc<HostAllocOwner>> = vec![Arc::new(owner(ptr))];
+        let moved = holders.into_iter().next().unwrap();
+        assert_eq!(freed(ptr), 0);
+        drop(moved);
+        assert_eq!(freed(ptr), 1);
+    }
+
+    #[test]
+    fn host_alloc_owner_failed_free_is_not_retried_or_repeated() {
+        // A failing hipHostFree leaks (the keyed emu charge is kept by `release_keyed`); the
+        // owner never frees a second time.
+        drop(owner(FAILING));
+        assert_eq!(freed(FAILING), 1);
+    }
+
+    #[test]
+    fn host_alloc_owner_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HostAllocOwner>();
+        assert_send_sync::<Arc<HostAllocOwner>>();
+    }
+
+    /// Committed pinned-host bytes of the process emu ledger.
+    fn committed_host_bytes(id: hipfire_config::emu_budget::BudgetId) -> u64 {
+        hipfire_config::emu_budget::snapshot(id)
+            .committed
+            .host_bytes
+    }
+
+    #[test]
+    fn host_alloc_owner_token_release_happens_once_and_only_after_a_successful_free() {
+        use crate::emu_budget::{charged_alloc_keyed, release_keyed, Class, HOST_TOKENS};
+        use hipfire_config::emu_budget::{install, BudgetLimits};
+        let limits = BudgetLimits {
+            device_bytes: 1 << 40,
+            gtt_bytes: Some(1 << 40),
+            shared_host_bytes: None,
+            uma: false,
+        };
+        let id = install("0000:0f:00.0", limits).expect("the test ledger installs");
+        let process = crate::emu_budget::active().expect("a budget is installed");
+        let base = committed_host_bytes(id);
+
+        // Success: the pointer-keyed charge of the adopted allocation is released exactly
+        // once, by the last holder's free, and only after that free returned success.
+        let ok_ptr = 0x2000_0000usize;
+        charged_alloc_keyed(
+            &process,
+            &HOST_TOKENS,
+            Class::HostPinned,
+            4096,
+            |p: &usize| *p,
+            || Ok(ok_ptr),
+        )
+        .expect("the charge commits");
+        assert_eq!(
+            committed_host_bytes(id),
+            base + 4096,
+            "the allocation is charged"
+        );
+        let registry = Arc::new(owner(ok_ptr));
+        let lease = Arc::clone(&registry);
+        drop(registry);
+        assert_eq!(
+            committed_host_bytes(id),
+            base + 4096,
+            "a held lease keeps the charge"
+        );
+        assert_eq!(freed(ok_ptr), 0);
+        drop(lease);
+        assert_eq!(freed(ok_ptr), 1);
+        assert_eq!(
+            committed_host_bytes(id),
+            base,
+            "released once by the successful free"
+        );
+
+        // Failure: the free reports an error, so the charge is retained (restored under its
+        // key), and a second drop path cannot release it.
+        charged_alloc_keyed(
+            &process,
+            &HOST_TOKENS,
+            Class::HostPinned,
+            8192,
+            |p: &usize| *p,
+            || Ok(FAILING_CHARGED),
+        )
+        .expect("the charge commits");
+        assert_eq!(committed_host_bytes(id), base + 8192);
+        drop(owner(FAILING_CHARGED));
+        assert_eq!(
+            committed_host_bytes(id),
+            base + 8192,
+            "a failed free keeps the charge"
+        );
+        // The retained token is still keyed: a later successful release (a retry by
+        // whoever can free it) releases it exactly once.
+        release_keyed::<crate::emu_budget::Process>(&HOST_TOKENS, FAILING_CHARGED, || Ok(()))
+            .expect("the retry succeeds");
+        assert_eq!(committed_host_bytes(id), base);
+        release_keyed::<crate::emu_budget::Process>(&HOST_TOKENS, FAILING_CHARGED, || Ok(()))
+            .expect("a second release is a no-op");
+        assert_eq!(committed_host_bytes(id), base, "no double release");
     }
 }

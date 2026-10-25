@@ -43,6 +43,8 @@ pub struct Int4MmqReservation {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane: records per K128 group (`m_total`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqReservation {
@@ -77,6 +79,8 @@ pub struct Int4MmqPrepared {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane (record `g * plane_rows + position`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqPrepared {
@@ -88,6 +92,7 @@ impl Int4MmqPrepared {
             k: res.k,
             n: res.n,
             generation: res.generation,
+            plane_rows: res.plane_rows,
         }
     }
 
@@ -117,6 +122,27 @@ impl Int4MmqPrepared {
         Ok(self.ptr)
     }
 
+    /// Seal the CURRENT live `int4_mmq_x_scratch` (generation + pointer from
+    /// [`ScratchState::int4_mmq_live`]) after a successful standalone
+    /// `ensure_int4_mmq_x` quantize. Host only; crate-private so external
+    /// callers cannot forge a handle.
+    pub(crate) fn from_live(generation: u64, ptr: *mut c_void, k: usize, n: usize) -> Self {
+        Self {
+            ptr,
+            k,
+            n,
+            generation,
+            plane_rows: 0,
+        }
+    }
+
+    /// Records per K128 group when this is a grouped-position down plane, `None` for the flat-slot sidecar
+    /// (consumed only by the position-indexed `..._gp` down entries).
+    #[inline]
+    pub fn grouped_plane_rows(&self) -> Option<usize> {
+        (self.plane_rows != 0).then_some(self.plane_rows)
+    }
+
     #[inline]
     pub fn k(&self) -> usize {
         self.k
@@ -130,6 +156,12 @@ impl Int4MmqPrepared {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Records per K128 group of a grouped-position down plane (`m_total`), 0 for the flat-slot layout.
+    #[inline]
+    pub fn plane_rows(&self) -> usize {
+        self.plane_rows
     }
 }
 
@@ -243,9 +275,15 @@ pub struct Int8MmqReservation {
 }
 
 impl Int8MmqReservation {
-    pub fn ptr(&self) -> *mut c_void { self.ptr }
-    pub fn k(&self) -> usize { self.k }
-    pub fn n(&self) -> usize { self.n }
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+    pub fn k(&self) -> usize {
+        self.k
+    }
+    pub fn n(&self) -> usize {
+        self.n
+    }
 }
 
 /// Valid only until the next int8 sidecar reservation or quantization.
@@ -259,12 +297,31 @@ pub struct Int8MmqPrepared {
 
 impl Int8MmqPrepared {
     pub fn from_reservation(res: Int8MmqReservation) -> Self {
-        Self { ptr: res.ptr, k: res.k, n: res.n, generation: res.generation }
+        Self {
+            ptr: res.ptr,
+            k: res.k,
+            n: res.n,
+            generation: res.generation,
+        }
     }
 
-    pub fn checked_ptr(&self, generation: u64, ptr: *mut c_void, k: usize, n: usize) -> HipResult<*mut c_void> {
-        if ptr.is_null() || ptr != self.ptr || generation != self.generation || k != self.k || n != self.n {
-            return Err(hip_bridge::HipError::new(0, "Int8MmqPrepared: stale or mismatched A8 sidecar"));
+    pub fn checked_ptr(
+        &self,
+        generation: u64,
+        ptr: *mut c_void,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        if ptr.is_null()
+            || ptr != self.ptr
+            || generation != self.generation
+            || k != self.k
+            || n != self.n
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Int8MmqPrepared: stale or mismatched A8 sidecar",
+            ));
         }
         Ok(ptr)
     }
@@ -301,6 +358,10 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// Dedicated F32 `x_out` operand for `Gpu::mq6_fp8_prepare_x` (the MQ4v2 FP8
+    /// producer's rotated-row output, `[batch * k]`; the in-register producer
+    /// never writes it). Lazily allocated, grown on demand, never shrunk.
+    pub mq6_fp8_x_rot: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -315,7 +376,7 @@ pub struct ScratchState {
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
     pub qsa_select_scores: Option<DeviceBuffer>,
     pub qsa_select_scores_bytes: usize,
-    /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
+    /// F32 dequantization of one Q8 / Q8Ef GDN state for the chunked prefill route.
     pub gdn_state_f32: Option<DeviceBuffer>,
     pub gdn_state_f32_bytes: usize,
     /// F16 K and block-transposed V of the QSA cache rows the gathered WMMA
@@ -383,6 +444,14 @@ pub struct ScratchState {
     /// `int4_mmq_x_scratch`; generation-checked like it.
     pub qwen4_moe_down_i4_scratch: Option<DeviceBuffer>,
     pub qwen4_moe_down_i4_scratch_bytes: usize,
+    /// Sealed expert-slab route: the decode lane-union descriptor words
+    /// (`Gpu::qwen4_slab_union_plan`) and the two codec-masked tile-id arrays
+    /// of the K2 prefill. Fixed or grows-never-shrinks; reserved before capture
+    /// by `Gpu::reserve_qwen4_slab`.
+    pub qwen4_slab_union_scratch: Option<DeviceBuffer>,
+    pub qwen4_slab_union_scratch_bytes: usize,
+    pub qwen4_slab_tiles_scratch: Option<DeviceBuffer>,
+    pub qwen4_slab_tiles_scratch_bytes: usize,
     pub qwen4_moe_down_i4_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
@@ -445,14 +514,35 @@ pub struct ScratchState {
 
 // ── Planned-route kernel barrier ─────────────────────────────────────────
 
+/// Counters of one begun route's kernel preload, for the loader's log. A
+/// module counts as compiled when its object is in the kernel cache before
+/// ready; `lazy_during_load` counts kernels the route did not cover that a
+/// dispatch requested between begin and ready.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteKernelStats {
+    /// Predicted-family modules requested for compilation.
+    pub predicted_modules: usize,
+    /// Of those, modules with a compiled object before ready.
+    pub predicted_compiled: usize,
+    /// Modules with at least one symbol bound.
+    pub predicted_bound_modules: usize,
+    /// Symbols bound from predicted modules (conflict-free subset only).
+    pub predicted_bound_symbols: usize,
+    /// Unplanned kernels requested while the model was loading.
+    pub lazy_during_load: usize,
+}
+
 /// Load-time kernel state of a planner-closed route.
 ///
 /// `Pending` holds the frozen plan while its missing HIP modules compile on
 /// CPU workers; nothing of it is on the GPU yet. The first kernel request or
 /// launch drains it ([`prepare_route_modules`]) into `Prepared`: every
 /// planned HIP and embedded image loaded and every planned symbol bound.
-/// `Sealed` follows a successful model load: an unplanned module request then
-/// fails instead of compiling or loading between dispatches.
+/// After a successful model load a route without an `open` label is
+/// `Sealed`: an unplanned module request then fails instead of compiling or
+/// loading between dispatches. A route with one (walked plans, and every
+/// predicted-family fallback) is `Open`: an unplanned kernel still loads
+/// lazily, with one warning line naming it and the route, and is counted.
 #[derive(Default)]
 pub(crate) enum RouteLoad {
     #[default]
@@ -460,9 +550,50 @@ pub(crate) enum RouteLoad {
     Pending {
         plan: crate::kernel_registry::RouteKernelPlan,
         batch: Option<crate::compiler::KernelBatch>,
+        /// Predicted-family modules compiled in the same batch as `plan`
+        /// and bound after it. Their compile or bind failure fails the load
+        /// exactly like a planned module's. Empty for a plan-only route; only
+        /// an `open` route has any.
+        predicted: Vec<crate::kernel_registry::PredictedModule>,
+        open: Option<String>,
     },
-    Prepared,
+    Prepared {
+        open: Option<String>,
+        stats: RouteKernelStats,
+    },
     Sealed,
+    Open {
+        route: String,
+        unplanned: usize,
+        stats: RouteKernelStats,
+    },
+}
+
+/// What an unplanned kernel request does, so the warning never claims a
+/// compile that did not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyKind {
+    /// A native embedded image: loaded and bound, never compiled.
+    EmbeddedImage,
+    /// A HIP module whose object the compiler already holds from before the
+    /// request (planned/predicted compile, or an earlier load): bound only.
+    HipPrecompiled,
+    /// A HIP module with no pre-request module record under this name. It
+    /// compiles only if its cache entry is missing; a module compiled
+    /// earlier under a compiler-family alias name only loads and binds.
+    HipNoRecord,
+}
+
+impl LazyKind {
+    fn what(self) -> &'static str {
+        match self {
+            Self::EmbeddedImage => "native image loaded lazily (embedded; no compile)",
+            Self::HipPrecompiled => "bound lazily (module already compiled)",
+            Self::HipNoRecord => {
+                "loaded lazily (no pre-ready module record; compiled now only if not in the kernel cache)"
+            }
+        }
+    }
 }
 
 impl RouteLoad {
@@ -470,15 +601,124 @@ impl RouteLoad {
     pub(crate) fn pending(&self) -> bool {
         matches!(self, Self::Pending { .. })
     }
+
+    /// Gate a kernel request the preloaded plan did not bind: a sealed route
+    /// refuses it, an open route counts it and warns once per request with
+    /// the module, route, phase (during load / after ready) and what the
+    /// request does ([`LazyKind`]), and any other state loads it silently.
+    /// The counters count unplanned requests, not compiles: a bind of an
+    /// already compiled or embedded module counts like any other miss.
+    pub(crate) fn admit_unplanned(
+        &mut self,
+        module_name: &str,
+        func_name: &str,
+        kind: LazyKind,
+    ) -> HipResult<()> {
+        let what = kind.what();
+        match self {
+            Self::Sealed => Err(unplanned_route_kernel(module_name, func_name)),
+            Self::Open {
+                route, unplanned, ..
+            } => {
+                *unplanned += 1;
+                eprintln!(
+                    "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) {what} after \
+                     ready on the {route} route plan [{unplanned} unplanned after ready]"
+                );
+                Ok(())
+            }
+            Self::Prepared { open, stats } => {
+                stats.lazy_during_load += 1;
+                if let Some(route) = open {
+                    eprintln!(
+                        "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) {what} during \
+                         load on the {route} route plan [{} unplanned during load]",
+                        stats.lazy_during_load
+                    );
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A begun route. Predicted-family modules are only ever speculative
+    /// coverage, never a closure, so they require an `open` label: a
+    /// fallback route can not seal.
+    pub(crate) fn pending_route(
+        plan: crate::kernel_registry::RouteKernelPlan,
+        batch: Option<crate::compiler::KernelBatch>,
+        predicted: Vec<crate::kernel_registry::PredictedModule>,
+        open: Option<String>,
+    ) -> HipResult<Self> {
+        if !predicted.is_empty() && open.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "predicted kernels need an open route (a predicted fallback can never be sealed)",
+            ));
+        }
+        Ok(Self::Pending {
+            plan,
+            batch,
+            predicted,
+            open,
+        })
+    }
+
+    /// The state a drained route takes once its model loaded: `Open` (counting
+    /// from zero) when it has an `open` label, else `Sealed`.
+    pub(crate) fn finished(self) -> Self {
+        match self {
+            Self::Prepared {
+                open: Some(route),
+                stats,
+            } => Self::Open {
+                route,
+                unplanned: 0,
+                stats,
+            },
+            _ => Self::Sealed,
+        }
+    }
+
+    /// Complete a drained route as `Open` under `route` whatever its plan's
+    /// label was: a route whose model left the closed plan keeps every
+    /// predictable module compiled and bound and its counters, and can no
+    /// longer seal. Any other state is unchanged.
+    pub(crate) fn finished_open(self, route: String) -> Self {
+        match self {
+            Self::Prepared { stats, .. } => Self::Open {
+                route,
+                unplanned: 0,
+                stats,
+            },
+            other => other,
+        }
+    }
+
+    /// Counters of the begun route (zero when none was begun).
+    pub(crate) fn stats(&self) -> RouteKernelStats {
+        match self {
+            Self::Prepared { stats, .. } | Self::Open { stats, .. } => *stats,
+            Self::Pending { predicted, .. } => RouteKernelStats {
+                predicted_modules: predicted.len(),
+                ..RouteKernelStats::default()
+            },
+            _ => RouteKernelStats::default(),
+        }
+    }
 }
 
 /// Drain a pending route plan: join the whole compile batch, then load every
 /// planned HIP and embedded module and bind every planned symbol to it. All
 /// on the GPU owner thread, before the first dispatch. Planned bindings
 /// replace any same-named function cached by an earlier load, so one entry
-/// name resolves to the one image this plan selected. Idempotent; a no-op
-/// unless `Pending`. On error the route returns to `Idle` (the caller's load
-/// fails and unwinds).
+/// name resolves to the one image this plan selected. Predicted-family
+/// modules then bind only their proven conflict-free symbols and never
+/// replace an existing binding. A compile or bind failure of a planned or a
+/// predicted module is a load error: a known module is predictable work, not
+/// a lazy miss. Idempotent; a no-op unless `Pending`. On error the route
+/// returns to `Idle` (the caller's load fails and unwinds).
 pub(crate) fn prepare_route_modules(
     route: &mut RouteLoad,
     compiler: &mut crate::compiler::KernelCompiler,
@@ -490,7 +730,13 @@ pub(crate) fn prepare_route_modules(
     if !route.pending() {
         return Ok(());
     }
-    let RouteLoad::Pending { plan, batch } = std::mem::take(route) else {
+    let RouteLoad::Pending {
+        plan,
+        batch,
+        predicted,
+        open,
+    } = std::mem::take(route)
+    else {
         unreachable!("checked pending");
     };
     if let Some(batch) = batch {
@@ -501,21 +747,92 @@ pub(crate) fn prepare_route_modules(
             crate::kernel_registry::PlannedKernel::Hip(entry) => {
                 for &symbol in entry.symbols {
                     load_kernel_module(
-                        compiler, hip, modules, functions, pm_decode, entry.module, entry.source(), symbol,
+                        compiler,
+                        hip,
+                        modules,
+                        functions,
+                        pm_decode,
+                        entry.module,
+                        entry.source(),
+                        symbol,
                     )?;
                 }
             }
-            crate::kernel_registry::PlannedKernel::Embedded { module, image, radiowave_json, symbols } => {
+            crate::kernel_registry::PlannedKernel::Embedded {
+                module,
+                image,
+                radiowave_json,
+                symbols,
+            } => {
                 for &symbol in *symbols {
                     load_embedded_module(
-                        compiler, hip, modules, functions, module, image, *radiowave_json, symbol,
+                        compiler,
+                        hip,
+                        modules,
+                        functions,
+                        module,
+                        image,
+                        *radiowave_json,
+                        symbol,
                     )?;
                 }
             }
         }
     }
-    *route = RouteLoad::Prepared;
+    let stats = bind_predicted_modules(compiler, hip, modules, functions, pm_decode, &predicted)?;
+    *route = RouteLoad::Prepared { open, stats };
     Ok(())
+}
+
+/// Bind the proven conflict-free symbols of each predicted module. Every
+/// predicted module must have a compiled object after the batch joined; a
+/// symbol already in the function cache keeps its binding.
+fn bind_predicted_modules(
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
+    predicted: &[crate::kernel_registry::PredictedModule],
+) -> HipResult<RouteKernelStats> {
+    let mut stats = RouteKernelStats {
+        predicted_modules: predicted.len(),
+        ..RouteKernelStats::default()
+    };
+    for module in predicted {
+        let name = module.entry.module;
+        if !compiler.compiled_kernels().contains_key(name) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "predicted kernel module {name} has no compiled object after the route compile"
+                ),
+            ));
+        }
+        stats.predicted_compiled += 1;
+        let mut bound = 0;
+        for &symbol in &module.bind {
+            if functions.contains_key(symbol) {
+                continue;
+            }
+            load_kernel_module(
+                compiler,
+                hip,
+                modules,
+                functions,
+                pm_decode,
+                name,
+                module.entry.source(),
+                symbol,
+            )?;
+            bound += 1;
+        }
+        if bound > 0 {
+            stats.predicted_bound_modules += 1;
+            stats.predicted_bound_symbols += bound;
+        }
+    }
+    Ok(stats)
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -525,7 +842,8 @@ pub(crate) fn prepare_route_modules(
 /// A pending planned route is drained first, before the cached-function
 /// early return, so no request can run ahead of the whole-plan barrier. A
 /// sealed route refuses an unplanned module instead of compiling or loading
-/// it between dispatches.
+/// it between dispatches; an open one loads it with a warning
+/// ([`RouteLoad::admit_unplanned`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_and_load_kernel(
     compiler: &mut crate::compiler::KernelCompiler,
@@ -542,10 +860,25 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    if matches!(route, RouteLoad::Sealed) {
-        return Err(unplanned_route_kernel(module_name, func_name));
-    }
-    load_kernel_module(compiler, hip, modules, functions, pm_decode, module_name, source, func_name)
+    route.admit_unplanned(
+        module_name,
+        func_name,
+        if compiler.compiled_kernels().contains_key(module_name) {
+            LazyKind::HipPrecompiled
+        } else {
+            LazyKind::HipNoRecord
+        },
+    )?;
+    load_kernel_module(
+        compiler,
+        hip,
+        modules,
+        functions,
+        pm_decode,
+        module_name,
+        source,
+        func_name,
+    )
 }
 
 /// Error for a kernel outside a sealed route plan.
@@ -574,7 +907,9 @@ fn load_kernel_module(
     source: &str,
     func_name: &str,
 ) -> HipResult<()> {
-    if let Some(twin) = crate::pm_decode_twins::pm_decode_module(compiler.arch(), pm_decode, module_name) {
+    if let Some(twin) =
+        crate::pm_decode_twins::pm_decode_module(compiler.arch(), pm_decode, module_name)
+    {
         if !modules.contains_key(module_name) {
             twin.verify(source, func_name)
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
@@ -582,17 +917,27 @@ fn load_kernel_module(
         } else if !twin.symbols.contains(&func_name) {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("pm_decode twin {module_name}: symbol {func_name:?} is not an accepted export"),
+                &format!(
+                    "pm_decode twin {module_name}: symbol {func_name:?} is not an accepted export"
+                ),
             ));
         }
         return load_embedded_module(
-            compiler, hip, modules, functions, twin.module, twin.image, Some(twin.radiowave_json), func_name,
+            compiler,
+            hip,
+            modules,
+            functions,
+            twin.module,
+            twin.image,
+            Some(twin.radiowave_json),
+            func_name,
         );
     }
     let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
     if !modules.contains_key(module_name) {
-        let module = module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
+        let module =
+            module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
@@ -628,9 +973,12 @@ pub(crate) fn load_embedded_module(
     if !modules.contains_key(module_name) {
         // An accepted pm_decode twin is re-verified against its pinned digest
         // at admission, whichever path (lazy funnel or route preload) loads it.
-        let twin = crate::pm_decode_twins::GFX1201_TWINS.iter().find(|t| t.image.as_ptr() == image.as_ptr());
+        let twin = crate::pm_decode_twins::GFX1201_TWINS
+            .iter()
+            .find(|t| t.image.as_ptr() == image.as_ptr());
         if let Some(twin) = twin {
-            twin.verify_image().map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            twin.verify_image()
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
         }
         if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
             // Developer-only route-closure audit: every embedded image load,
@@ -649,13 +997,21 @@ pub(crate) fn load_embedded_module(
             );
         }
         let module = hip.module_load_data(image)?;
+        qsa_code_check_register(compiler.arch(), &module, module_name, image);
         compiler
             .code_objects_mut()
             .admit_module(
                 module_name,
-                crate::code_object::CodeObjectArtifact::native_embedded(module_name, image.into(), radiowave_json),
+                crate::code_object::CodeObjectArtifact::native_embedded(
+                    module_name,
+                    image.into(),
+                    radiowave_json,
+                ),
             )
-            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            .map_err(|reason| {
+                qsa_code_check_unregister(&module);
+                hip_bridge::HipError::new(0, &reason)
+            })?;
         modules.insert(module_name.to_owned(), module);
     } else if let Some(bound) = compiler.code_objects().module(module_name) {
         if bound.id() != crate::code_object::CodeObjectId::of(image) {
@@ -679,11 +1035,111 @@ pub(crate) fn bind_loaded_function(
 ) -> HipResult<()> {
     let registry = compiler.code_objects_mut();
     let artifact = registry.module(module_name).cloned().ok_or_else(|| {
-        hip_bridge::HipError::new(0, &format!("module {module_name:?} has no admitted code object"))
+        hip_bridge::HipError::new(
+            0,
+            &format!("module {module_name:?} has no admitted code object"),
+        )
     })?;
     registry
         .bind_function(func_name, &artifact)
         .map_err(|reason| hip_bridge::HipError::new(0, &reason))
+}
+
+/// Process-wide `qwen4_qsa_code_check` switch, set once at `Gpu` init from the
+/// parsed feature flag. Default off: every site below is one relaxed load.
+static QSA_CODE_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QSA_CODE_CHECK_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Enable the loaded-code check for this process when `flags` asks for it and
+/// install the bridge's first-illegal-address capture hook exactly once. Must
+/// run before the first module load. A disabled flag touches nothing.
+pub(crate) fn enable_qsa_code_check(flags: &crate::FeatureFlags) {
+    if !flags.qwen4_qsa_code_check {
+        return;
+    }
+    QSA_CODE_CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+    QSA_CODE_CHECK_HOOK.call_once(|| {
+        hip_bridge::register_first_illegal_address_hook(|| {
+            crate::loaded_code_check::capture_after_700();
+        });
+    });
+}
+
+#[inline]
+fn qsa_code_check_enabled() -> bool {
+    QSA_CODE_CHECK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The device code object HIP loads from `image`: a raw ELF as is, or the
+/// `arch` entry (`hipv4-amdgcn-amd-amdhsa--<arch>[:features]`) of an
+/// uncompressed clang offload bundle. `None` for anything else (compressed
+/// bundle, missing arch entry, malformed header).
+pub(crate) fn device_code_object<'a>(image: &'a [u8], arch: &str) -> Option<&'a [u8]> {
+    const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    if image.starts_with(&ELF_MAGIC) {
+        return Some(image);
+    }
+    if !image.starts_with(BUNDLE_MAGIC) {
+        return None;
+    }
+    let u64_at = |at: usize| -> Option<usize> {
+        let bytes: [u8; 8] = image.get(at..at.checked_add(8)?)?.try_into().ok()?;
+        usize::try_from(u64::from_le_bytes(bytes)).ok()
+    };
+    let wanted = format!("hipv4-amdgcn-amd-amdhsa--{arch}");
+    let mut cursor = BUNDLE_MAGIC.len() + 8;
+    let mut found: Option<&[u8]> = None;
+    for _ in 0..u64_at(BUNDLE_MAGIC.len())? {
+        let (offset, size, len) = (u64_at(cursor)?, u64_at(cursor + 8)?, u64_at(cursor + 16)?);
+        let triple = image.get(cursor + 24..cursor.checked_add(24)?.checked_add(len)?)?;
+        cursor += 24 + len;
+        let matches = triple == wanted.as_bytes()
+            || (triple.starts_with(wanted.as_bytes()) && triple[wanted.len()] == b':');
+        if matches {
+            let payload = image.get(offset..offset.checked_add(size)?)?;
+            if found.replace(payload).is_some() {
+                return None;
+            }
+        }
+    }
+    found.filter(|elf| elf.starts_with(&ELF_MAGIC))
+}
+
+/// Register a just-loaded module with the loaded-code registry (flag on only).
+/// `image` is the exact byte slice passed to `hipModuleLoadData`; the caller
+/// invokes this immediately after that call succeeds, at every load site in
+/// this crate. The registry receives the `arch` device ELF extracted from a
+/// bundle; when no ELF can be extracted (compressed or malformed bundle,
+/// missing arch entry) it receives the original image unchanged so it records
+/// the module as unavailable rather than dropping it.
+pub(crate) fn qsa_code_check_register(arch: &str, module: &Module, name: &str, image: &[u8]) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    let image = device_code_object(image, arch).unwrap_or(image);
+    crate::loaded_code_check::register_module(module.raw_ptr() as usize, name, image);
+}
+
+/// Unregister one module handle (flag on only), for a load whose admission
+/// failed after it was registered.
+pub(crate) fn qsa_code_check_unregister(module: &Module) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    crate::loaded_code_check::unregister_module(module.raw_ptr() as usize);
+}
+
+/// Unregister every cached module handle (flag on only). `Gpu` teardown calls
+/// this before the runtime and module map drop. HIP modules are never
+/// unloaded in this crate, so this is the only lifetime event.
+pub(crate) fn qsa_code_check_unregister_all(modules: &HashMap<String, Module>) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    for module in modules.values() {
+        crate::loaded_code_check::unregister_module(module.raw_ptr() as usize);
+    }
 }
 
 /// Load a compiled module from its immutable image, self-healing a
@@ -742,16 +1198,23 @@ pub(crate) fn module_load_or_recompile(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            path = compiler.recompile(module_name, source, symbol)?;
+            path = compiler.recompile(module_name, source)?;
             image = read(&path)?;
             hip.module_load_data(&image)?
         }
         Err(e) => return Err(e),
     };
+    qsa_code_check_register(compiler.arch(), &module, module_name, &image);
     compiler
         .code_objects_mut()
-        .admit_module(module_name, crate::code_object::CodeObjectArtifact::hip_file(&path, image))
-        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        .admit_module(
+            module_name,
+            crate::code_object::CodeObjectArtifact::hip_file(&path, image),
+        )
+        .map_err(|reason| {
+            qsa_code_check_unregister(&module);
+            hip_bridge::HipError::new(0, &reason)
+        })?;
     Ok(module)
 }
 
@@ -788,10 +1251,13 @@ pub(crate) fn launch_maybe_blob(
         let mut blob = blob_builder();
         blob.pad_to(16);
         if observe {
-            replay
-                .as_mut()
-                .unwrap()
-                .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+            replay.as_mut().unwrap().observe_g0_launch(
+                func_name,
+                grid,
+                block,
+                shared_mem,
+                blob.as_bytes(),
+            );
         }
         if record {
             // Single decision point for how a launch is recorded: the artifact
@@ -974,6 +1440,39 @@ fn grow_scratch_buffer(
 }
 
 /// [`grow_scratch_buffer`] for slots owned outside this module's helpers.
+/// Words of the sealed expert-slab lane-union descriptor of `lanes` decode
+/// lanes (`S = 10 * lanes` slots): two buckets of `S` expert ids, `S + 1`
+/// offsets and `S` slot ids.
+pub const fn qwen4_slab_union_words(lanes: usize) -> usize {
+    match qwen4_slab_union_words_checked(lanes) {
+        Some(words) => words,
+        None => panic!("qwen4_slab_union_words: lane count overflows"),
+    }
+}
+
+/// [`qwen4_slab_union_words`] with checked arithmetic; `None` on overflow.
+pub const fn qwen4_slab_union_words_checked(lanes: usize) -> Option<usize> {
+    let slots = match lanes.checked_mul(10) {
+        Some(slots) => slots,
+        None => return None,
+    };
+    match slots.checked_mul(6) {
+        Some(words) => words.checked_add(2),
+        None => None,
+    }
+}
+
+/// Words of the native eight-row slab descriptors: `ceil(lanes / 8) * 482`.
+/// Each descriptor reserves all 80 slots, including an incomplete tail tile.
+/// Zero lanes need no descriptors; `None` on overflow.
+pub const fn qwen4_slab_rowtile_words_checked(lanes: usize) -> Option<usize> {
+    let tiles = match (lanes / 8).checked_add(if lanes % 8 == 0 { 0 } else { 1 }) {
+        Some(tiles) => tiles,
+        None => return None,
+    };
+    tiles.checked_mul(482)
+}
+
 pub(crate) fn grow_scratch_slot(
     hip: &HipRuntime,
     slot: &mut Option<DeviceBuffer>,
@@ -990,11 +1489,7 @@ pub(crate) fn grow_scratch_slot(
 /// `slot_is_some` matters: a never-allocated slot with a stale non-zero byte
 /// count must still allocate.
 #[inline]
-pub(crate) fn scratch_will_grow(
-    have_bytes: usize,
-    slot_is_some: bool,
-    needed: usize,
-) -> bool {
+pub(crate) fn scratch_will_grow(have_bytes: usize, slot_is_some: bool, needed: usize) -> bool {
     !(have_bytes >= needed && slot_is_some)
 }
 
@@ -1030,7 +1525,9 @@ pub(crate) fn vmm_prefix_growth(
     if needed <= mapped {
         return Some(0);
     }
-    needed.checked_next_multiple_of(granularity)?.checked_sub(mapped)
+    needed
+        .checked_next_multiple_of(granularity)?
+        .checked_sub(mapped)
 }
 
 /// Byte size of the `q8_1_mmq_x_scratch` slot for `(k, batch_size)`: one 144 B
@@ -1092,6 +1589,33 @@ pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     blocks_k * n * 72
 }
 
+/// Checked byte size of the IU4 sidecar of a producer reservation `(k, rows)`:
+/// the extent `reserve_int4_mmq` / `reserve_int4_mmq_down` allocate (one 72 B
+/// `block_i4_128` per [K/128 block, row]). Applies the allocators' admission
+/// (`k % 256 == 0`, `k > 0`, `rows > 0`); `None` for a rejected shape or on
+/// overflow.
+pub fn int4_mmq_reservation_bytes(k: usize, rows: usize) -> Option<usize> {
+    if k == 0 || rows == 0 || k % 256 != 0 {
+        return None;
+    }
+    int4_mmq_blocks_bytes(k, rows)
+}
+
+/// [`int4_mmq_reservation_bytes`] for the Qwen4 symmetric MoE down sidecar,
+/// whose allocator (`reserve_qwen4_moe_down_i4`) admits `k % 128 == 0`.
+pub fn qwen4_moe_down_i4_bytes(k: usize, rows: usize) -> Option<usize> {
+    if k == 0 || rows == 0 || k % 128 != 0 {
+        return None;
+    }
+    int4_mmq_blocks_bytes(k, rows)
+}
+
+/// `k / 128 * rows * 72` with checked arithmetic (same value as
+/// [`int4_mmq_reserve_needed`] for admitted shapes).
+fn int4_mmq_blocks_bytes(k: usize, rows: usize) -> Option<usize> {
+    (k / 128).checked_mul(rows)?.checked_mul(72)
+}
+
 /// Byte offsets of the stable-grouping scratch for `slots` routed slots over
 /// `experts` experts: `[slots]` ranks, `[experts, chunks]` counts, then
 /// `[experts, chunks + 1]` chunk prefixes, `chunks = ceil(slots / 256)`.
@@ -1104,15 +1628,197 @@ pub struct Qwen4MoeGroupLayout {
 }
 
 pub fn qwen4_moe_group_layout(slots: usize, experts: usize) -> Qwen4MoeGroupLayout {
+    qwen4_moe_group_layout_checked(slots, experts)
+        .expect("qwen4_moe_group_layout: slot/expert counts overflow the layout")
+}
+
+/// [`qwen4_moe_group_layout`] with checked arithmetic; `None` on `usize` overflow.
+pub fn qwen4_moe_group_layout_checked(slots: usize, experts: usize) -> Option<Qwen4MoeGroupLayout> {
     let chunks = slots.div_ceil(256);
-    let partial_offset = slots * 4;
-    let prefix_offset = partial_offset + experts * chunks * 4;
-    Qwen4MoeGroupLayout {
+    let partial_offset = slots.checked_mul(4)?;
+    let prefix_offset = partial_offset.checked_add(experts.checked_mul(chunks)?.checked_mul(4)?)?;
+    let bytes = prefix_offset.checked_add(
+        experts
+            .checked_mul(chunks.checked_add(1)?)?
+            .checked_mul(4)?,
+    )?;
+    Some(Qwen4MoeGroupLayout {
         chunks,
         partial_offset,
         prefix_offset,
-        bytes: prefix_offset + experts * (chunks + 1) * 4,
-    }
+        bytes,
+    })
+}
+
+/// Upper bound on the grouped (per-expert 16-row padded) row count of `slots`
+/// routed slots over `experts` experts: every slot, plus at most 15 pad rows
+/// for each non-empty expert (`min(slots, experts)` of them), rounded up to a
+/// 16-row tile. `None` on overflow.
+pub fn qwen4_grouped_rows_bound(slots: usize, experts: usize) -> Option<usize> {
+    let padded = slots
+        .checked_add(slots.min(experts).checked_mul(15)?)?
+        .checked_add(15)?;
+    Some(padded / 16 * 16)
+}
+
+/// Bytes of the Qwen4 slab route's two codec-masked tile-id arrays for
+/// `tiles` grouped tiles (`2 * tiles` u32), the extent `reserve_qwen4_slab`
+/// allocates. `None` on overflow.
+pub fn qwen4_slab_tiles_bytes(tiles: usize) -> Option<usize> {
+    tiles.checked_mul(2)?.checked_mul(4)
+}
+
+/// Bytes of the slab lane-union descriptor for `lanes` decode lanes
+/// ([`qwen4_slab_union_words_checked`] words of u32). `None` on overflow.
+pub fn qwen4_slab_union_bytes(lanes: usize) -> Option<usize> {
+    qwen4_slab_union_words_checked(lanes)?.checked_mul(4)
+}
+
+/// Bytes of the native eight-row slab descriptors; zero for zero lanes and
+/// `None` on overflow. Each physical tile occupies 1928 bytes.
+pub fn qwen4_slab_rowtile_bytes(lanes: usize) -> Option<usize> {
+    qwen4_slab_rowtile_words_checked(lanes)?.checked_mul(4)
+}
+
+/// Shared descriptor allocation required by both the legacy lane union and
+/// native row tiles. Both representations must fit; `None` on either overflow.
+/// Reservation, replay-growth checks and admission must use this same extent.
+pub fn qwen4_slab_descriptor_bytes(lanes: usize) -> Option<usize> {
+    let union = qwen4_slab_union_bytes(lanes)?;
+    let rowtiles = qwen4_slab_rowtile_bytes(lanes)?;
+    Some(union.max(rowtiles))
+}
+
+/// Bytes of the FP16 X scratch for `n_elems` F16 elements; `None` on overflow.
+pub fn fp16_x_bytes(n_elems: usize) -> Option<usize> {
+    n_elems.checked_mul(2)
+}
+
+/// FWHT sign-table lengths (f32 elements each, two tables per group size).
+pub const MQ_FWHT_SIGNS_G256: usize = 256;
+pub const MQ_FWHT_SIGNS_G128: usize = 128;
+/// Shared F32 rotation scratch elements (covers K up to 32768).
+pub const MQ_X_ROT_ELEMS: usize = 32768;
+/// INT8 dp4a activation scratch bytes.
+pub const MQ_X_Q8_BYTES: usize = 32768;
+/// Per-group F32 activation scales (up to 128 groups).
+pub const MQ_X_SCALES_BYTES: usize = 128 * 4;
+/// The fixed MagnumQuant allocations once both `ensure_mq_signs` and
+/// `ensure_mq_signs_128` have run: two G256 and two G128 sign tables, the
+/// shared rotation scratch, the INT8 scratch and the scales.
+pub const MQ_FIXED_WORKSPACE_BYTES: usize =
+    (2 * MQ_FWHT_SIGNS_G256 + 2 * MQ_FWHT_SIGNS_G128 + MQ_X_ROT_ELEMS) * std::mem::size_of::<f32>()
+        + MQ_X_Q8_BYTES
+        + MQ_X_SCALES_BYTES;
+
+/// Whether the exact-gfx1201 dense GDN scan (`fn_gdn_dense`) admits a GDN state stored in
+/// `format`: plain Q8 and live-EF Q8Ef; never F32 and never another architecture (gfx942 is
+/// F32-only). Geometry, row floor and flags are the route's own checks.
+pub fn qwen4_dense_gdn_admits(arch: &str, format: crate::tensor_ops::GdnStateFormat) -> bool {
+    arch == "gfx1201"
+        && matches!(
+            format,
+            crate::tensor_ops::GdnStateFormat::Q8 | crate::tensor_ops::GdnStateFormat::Q8Ef
+        )
+}
+
+/// Model dimensions the Qwen4 prefill workspace census reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4PrefillWorkspaceDims {
+    pub hidden_size: usize,
+    pub moe_intermediate_size: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    /// GDN state format whose dense-scan scratch is reachable (exact gfx1201 route,
+    /// [`qwen4_dense_gdn_admits`]); `None` when the route is not. `Q8` and `Q8Ef` charge the A
+    /// scratch; only `Q8` also charges the thread-local zero-entry EF scratch (`Q8Ef` scans
+    /// against the owner's live residual, which the state owner charges, not this census). Needs
+    /// the `deltanet` feature: without it the scratch cannot be sized and `Some` yields `None`.
+    pub gdn_format: Option<crate::tensor_ops::GdnStateFormat>,
+    /// Include the GDN head-pair counters the short-tail remainder steps
+    /// allocate.
+    pub include_short_tails: bool,
+    /// The routed-expert IU4 path exists (MoE profile whose `hidden_size` and
+    /// `moe_intermediate_size` the IU4 allocators admit). The `int4_xq`,
+    /// `moe_group`, `down_i4q`, `slab_tiles` and `slab_union` terms are also 0
+    /// whenever `num_experts == 0` or `top_k == 0` (no MoE owner reachable).
+    /// When they are 0 none of their dimension checks can make the query
+    /// return `None`.
+    pub routed_i4: bool,
+}
+
+/// Reusable prefill workspace terms for `rows` rows, in allocation-census
+/// order: `fp16_x`, `ksplit_det`, `int4_xq`, `moe_group`, `down_i4q`,
+/// `slab_tiles`, `slab_union`, `mq_fixed`, `gdn_dense_a`, `gdn_dense_ef`,
+/// `gdn_pair_counters`. Every term is the owning allocator's size query, not a
+/// copy of its formula. Excludes F16 weight shadows, `State::device_bytes`, the
+/// QSA selector / gather scratch and stage buffers. `None` on overflow, a
+/// dimension an owning allocator rejects, or `gdn_format` without `deltanet`.
+pub fn qwen4_prefill_workspace_terms(
+    rows: usize,
+    dims: &Qwen4PrefillWorkspaceDims,
+) -> Option<[(&'static str, u64); 11]> {
+    let hc_wide = dims.hc_count.checked_mul(dims.hidden_size)?;
+    let fp16_x = fp16_x_bytes(rows.checked_mul(hc_wide.max(dims.hidden_size))?)?;
+    let ksplit_det = if hc_wide == 0 || dims.hc_lowrank == 0 {
+        0
+    } else {
+        crate::Gpu::qwen4_prefill_ksplit_bytes(rows, dims.hc_lowrank, hc_wide)?
+    };
+    let routed = dims.routed_i4 && dims.num_experts != 0 && dims.top_k != 0;
+    let (int4_xq, moe_group, down_i4q, slab_tiles) = if routed {
+        let slots = rows.checked_mul(dims.top_k)?;
+        (
+            int4_mmq_reservation_bytes(dims.hidden_size, rows)?,
+            qwen4_moe_group_layout_checked(slots, dims.num_experts)?.bytes,
+            qwen4_moe_down_i4_bytes(dims.moe_intermediate_size, slots)?,
+            qwen4_slab_tiles_bytes(
+                qwen4_grouped_rows_bound(slots, dims.num_experts)?.div_ceil(16),
+            )?,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let slab_union = if routed {
+        qwen4_slab_descriptor_bytes(crate::slab_moe::SLAB_MAX_LANES)?
+    } else {
+        0
+    };
+    #[cfg(feature = "deltanet")]
+    let (gdn_a, gdn_ef) = match dims.gdn_format {
+        Some(format) => (
+            crate::fn_gdn_dense::workspace_a_bytes_for(format, rows)?,
+            crate::fn_gdn_dense::workspace_ef_bytes_for(format, rows),
+        ),
+        None => (0, 0),
+    };
+    #[cfg(not(feature = "deltanet"))]
+    let (gdn_a, gdn_ef) = if dims.gdn_format.is_some() {
+        return None;
+    } else {
+        (0usize, 0usize)
+    };
+    let pair_counters = if dims.include_short_tails {
+        crate::tensor_ops::GDN_PAIR_COUNTERS_BYTES
+    } else {
+        0
+    };
+    let term = |name: &'static str, bytes: usize| Some((name, u64::try_from(bytes).ok()?));
+    Some([
+        term("fp16_x", fp16_x)?,
+        term("ksplit_det", ksplit_det)?,
+        term("int4_xq", int4_xq)?,
+        term("moe_group", moe_group)?,
+        term("down_i4q", down_i4q)?,
+        term("slab_tiles", slab_tiles)?,
+        term("slab_union", slab_union)?,
+        term("mq_fixed", MQ_FIXED_WORKSPACE_BYTES)?,
+        term("gdn_dense_a", gdn_a)?,
+        term("gdn_dense_ef", gdn_ef)?,
+        term("gdn_pair_counters", pair_counters)?,
+    ])
 }
 
 #[inline]
@@ -1156,7 +1862,12 @@ impl ScratchState {
         hip: &HipRuntime,
         needed: usize,
     ) -> HipResult<*mut c_void> {
-        grow_scratch_buffer(hip, &mut self.fp8_f2_weights, &mut self.fp8_f2_weights_bytes, needed)?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.fp8_f2_weights,
+            &mut self.fp8_f2_weights_bytes,
+            needed,
+        )?;
         Ok(self.fp8_f2_weights.as_ref().unwrap().as_ptr())
     }
 
@@ -1264,6 +1975,35 @@ impl ScratchState {
         Ok(self.gemv_residual_tmp.as_ref().unwrap())
     }
 
+    /// Ensure the MQ6 FP8 producer `x_out` scratch holds at least `min_elems` F32
+    /// values (same grow-on-demand contract as [`Self::ensure_gemv_residual_tmp`]:
+    /// the `Gpu` caller invalidated captured graphs first when it will grow).
+    pub fn ensure_mq6_fp8_x_rot(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .mq6_fp8_x_rot
+            .as_ref()
+            .map_or(true, |t| t.buf.size() < needed_bytes);
+        if needs_grow {
+            if let Some(old) = self.mq6_fp8_x_rot.take() {
+                hip.device_synchronize()?;
+                let _ = hip.free(old.buf);
+            }
+            self.mq6_fp8_x_rot = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(())
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(
         &mut self,
@@ -1275,18 +2015,18 @@ impl ScratchState {
         if self.mq_signs1.is_some() {
             return Ok(());
         }
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
+        let s1 = gen_fwht_signs(42, MQ_FWHT_SIGNS_G256);
+        let s2 = gen_fwht_signs(1042, MQ_FWHT_SIGNS_G256);
         let s1b: Vec<u8> = s1.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1t = alloc_tensor_on(hip, pool, device_id, &[256], DType::F32)?;
-        let s2t = alloc_tensor_on(hip, pool, device_id, &[256], DType::F32)?;
+        let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
+        let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
         hip.memcpy_htod(&s1t.buf, &s1b)?;
         hip.memcpy_htod(&s2t.buf, &s2b)?;
         // Allocate scratch buffers — 32K elements covers K up to 32768
-        let x_rot = alloc_tensor_on(hip, pool, device_id, &[32768], DType::F32)?;
-        let x_q8 = hip.malloc(32768)?; // INT8 buffer for dp4a
-        let x_scales = hip.malloc(128 * 4)?; // up to 128 groups × f32
+        let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
+        let x_q8 = hip.malloc(MQ_X_Q8_BYTES)?; // INT8 buffer for dp4a
+        let x_scales = hip.malloc(MQ_X_SCALES_BYTES)?; // up to 128 groups × f32
         self.mq_signs1 = Some(s1t);
         self.mq_signs2 = Some(s2t);
         self.mq_x_rot = Some(x_rot);
@@ -1346,12 +2086,12 @@ impl ScratchState {
             return Ok(());
         }
         if self.mq_signs1_128.is_none() {
-            let signs1 = gen_fwht_signs(43, 128);
-            let signs2 = gen_fwht_signs(1043, 128);
+            let signs1 = gen_fwht_signs(43, MQ_FWHT_SIGNS_G128);
+            let signs2 = gen_fwht_signs(1043, MQ_FWHT_SIGNS_G128);
             let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let s1t = alloc_tensor_on(hip, pool, device_id, &[128], DType::F32)?;
-            let s2t = alloc_tensor_on(hip, pool, device_id, &[128], DType::F32)?;
+            let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
+            let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
             hip.memcpy_htod(&s1t.buf, &s1b)?;
             hip.memcpy_htod(&s2t.buf, &s2b)?;
             self.mq_signs1_128 = Some(s1t);
@@ -1359,7 +2099,7 @@ impl ScratchState {
         }
         // Allocate shared rotation scratch if ensure_mq_signs (G256 path) has not run yet.
         if self.mq_x_rot.is_none() {
-            let x_rot = alloc_tensor_on(hip, pool, device_id, &[32768], DType::F32)?;
+            let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
             self.mq_x_rot = Some(x_rot);
         }
         Ok(())
@@ -1478,7 +2218,8 @@ impl ScratchState {
         )?;
 
         let src_ptr = x.buf.as_ptr();
-        let needed = n_elems * 2;
+        let needed = fp16_x_bytes(n_elems)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "ensure_fp16_x: extent overflow"))?;
 
         // Grow scratch if needed (never shrinks), releasing the old buffer.
         if self.fp16_x_scratch_bytes < needed {
@@ -1546,7 +2287,9 @@ impl ScratchState {
         hip: &HipRuntime,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
-        let needed = n_elems * 2;
+        let needed = fp16_x_bytes(n_elems).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "fp16_x_scratch_writable: extent overflow")
+        })?;
         if self.fp16_x_scratch_bytes < needed {
             grow_scratch_buffer(
                 hip,
@@ -1746,12 +2489,22 @@ impl ScratchState {
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
         self.prepare_mq4v2_fp8_x_impl(
-            hip, compiler, modules, functions, stream, capture_blobs, capture_mode,
-            force_blob_path, replay,
+            hip,
+            compiler,
+            modules,
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            replay,
             "pack_f16_to_fp8_mq4v2_gfx12",
             kernels::PACK_F16_TO_FP8_MQ4V2_GFX12_SRC,
             "pack_f16_to_fp8_mq4v2_gfx12",
-            x_f16, n, k, scale_mode,
+            x_f16,
+            n,
+            k,
+            scale_mode,
         )
     }
 
@@ -1777,12 +2530,22 @@ impl ScratchState {
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
         self.prepare_mq4v2_fp8_x_impl(
-            hip, compiler, modules, functions, stream, capture_blobs, capture_mode,
-            force_blob_path, replay,
+            hip,
+            compiler,
+            modules,
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            replay,
             "pack_f32_to_fp8_mq4v2_gfx12",
             kernels::PACK_F32_TO_FP8_MQ4V2_GFX12_SRC,
             "pack_f32_to_fp8_mq4v2_gfx12",
-            x_f32, n, k, scale_mode,
+            x_f32,
+            n,
+            k,
+            scale_mode,
         )
     }
 
@@ -1811,7 +2574,15 @@ impl ScratchState {
     ) -> HipResult<Mq4v2Fp8Prepared> {
         let mut row_scale_shift = crate::gemv::fp8_row_scale_shift()?;
         compile_and_load_kernel(
-            compiler, hip, modules, functions, &mut self.route_load, self.pm_decode, module, ksrc, symbol,
+            compiler,
+            hip,
+            modules,
+            functions,
+            &mut self.route_load,
+            self.pm_decode,
+            module,
+            ksrc,
+            symbol,
         )?;
 
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
@@ -2320,6 +3091,7 @@ impl ScratchState {
             k,
             n,
             generation: self.int4_mmq_generation,
+            plane_rows: 0,
         })
     }
 
@@ -2375,6 +3147,38 @@ impl ScratchState {
         )
     }
 
+    /// Reserve the sealed expert-slab scratch: enough descriptor space for both
+    /// representations of `max_lanes` lanes and `tiles` masked tile ids per codec.
+    /// Preflight all size arithmetic before either allocation can change.
+    pub fn reserve_qwen4_slab(
+        &mut self,
+        hip: &HipRuntime,
+        max_lanes: usize,
+        tiles: usize,
+    ) -> HipResult<()> {
+        let union_bytes = qwen4_slab_descriptor_bytes(max_lanes).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_slab: union descriptor extent overflow")
+        })?;
+        let tile_bytes = qwen4_slab_tiles_bytes(tiles).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_slab: tile mask extent overflow")
+        })?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.qwen4_slab_union_scratch,
+            &mut self.qwen4_slab_union_scratch_bytes,
+            union_bytes,
+        )?;
+        if tiles != 0 {
+            grow_scratch_buffer(
+                hip,
+                &mut self.qwen4_slab_tiles_scratch,
+                &mut self.qwen4_slab_tiles_scratch_bytes,
+                tile_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Grow the Qwen4 symmetric IU4 MoE down sidecar for `[k/128, n]`
     /// `block_i4_128` and bump its generation (`k % 128 == 0`). The producer
     /// writes every live slot's blocks; the reservation launches nothing.
@@ -2384,17 +3188,34 @@ impl ScratchState {
         k: usize,
         n: usize,
     ) -> HipResult<Int4MmqReservation> {
+        self.reserve_qwen4_moe_down_i4_plane(hip, k, n, 0)
+    }
+
+    /// [`Self::reserve_qwen4_moe_down_i4`] for either layout: `plane_rows == 0` is the flat-slot
+    /// sidecar `[k/128, n]`; otherwise the grouped-position plane `[k/128, plane_rows]` (`plane_rows`
+    /// = the grouped row count), whose handle still reports `n` real slots.
+    pub fn reserve_qwen4_moe_down_i4_plane(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+        plane_rows: usize,
+    ) -> HipResult<Int4MmqReservation> {
         if k == 0 || n == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "reserve_qwen4_moe_down_i4: need k%128==0 and n>0",
             ));
         }
+        let needed = qwen4_moe_down_i4_bytes(k, if plane_rows == 0 { n } else { plane_rows })
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
+            })?;
         grow_scratch_buffer(
             hip,
             &mut self.qwen4_moe_down_i4_scratch,
             &mut self.qwen4_moe_down_i4_scratch_bytes,
-            k / 128 * n * 72,
+            needed,
         )?;
         self.qwen4_moe_down_i4_generation = self.qwen4_moe_down_i4_generation.wrapping_add(1);
         Ok(Int4MmqReservation {
@@ -2402,6 +3223,7 @@ impl ScratchState {
             k,
             n,
             generation: self.qwen4_moe_down_i4_generation,
+            plane_rows,
         })
     }
 
@@ -2436,6 +3258,18 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
+        // The quantizer ships in each arch's A8 GEMM module (one compile).
+        let (module, source) = if compiler.arch() == "gfx1201" {
+            (
+                "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_mq4g256v2_residual_mmq_i8_gfx11",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC,
+            )
+        };
         compile_and_load_kernel(
             compiler,
             hip,
@@ -2443,12 +3277,17 @@ impl ScratchState {
             functions,
             &mut self.route_load,
             self.pm_decode,
-            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            module,
+            source,
             "quantize_int8_mmq_ds128",
         )?;
         let needed = int8_mmq_x_needed(k, n);
-        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_x_scratch,
+            &mut self.int8_mmq_x_scratch_bytes,
+            needed,
+        )?;
         self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
         let xp = x.buf.as_ptr();
         let yp = self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr();
@@ -2457,47 +3296,100 @@ impl ScratchState {
         let mut k_val = k as i32;
         let mut n_val = n as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut x_ptr as *mut _ as *mut c_void, &mut y_ptr as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void, &mut n_val as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
         ];
         let grid = fold_rows_into_x(k.div_ceil(1024), n)?;
-        let timer = crate::profile::begin_timer(hip, "quantize", "quantize_int8_mmq_ds128", n*k*4 + needed);
+        let timer = crate::profile::begin_timer(
+            hip,
+            "quantize",
+            "quantize_int8_mmq_ds128",
+            n * k * 4 + needed,
+        );
         launch_maybe_blob(
-            hip, Some(&*compiler), functions, stream, capture_blobs, capture_mode,
-            force_blob_path, Some(replay), "quantize_int8_mmq_ds128",
-            grid, [256, 1, 1], 0, &mut params,
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "quantize_int8_mmq_ds128",
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(yp); b.push_i32(k_val); b.push_i32(n_val); b
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
             },
         )?;
-        if let Some(t) = timer { t.finish(hip); }
+        if let Some(t) = timer {
+            t.finish(hip);
+        }
         Ok(yp)
     }
 
     /// Reserve the existing 144-byte DS4 slot without issuing a quantizer.
     /// Caller must invalidate graphs before growth and overwrite every block.
-    pub(crate) fn reserve_packed_mq4(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<*mut c_void> {
+    pub(crate) fn reserve_packed_mq4(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
         let needed = q8_1_mmq_x_needed(k, n);
-        grow_scratch_buffer(hip, &mut self.q8_1_mmq_x_scratch, &mut self.q8_1_mmq_x_scratch_bytes, needed)?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_1_mmq_x_scratch,
+            &mut self.q8_1_mmq_x_scratch_bytes,
+            needed,
+        )?;
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
-    pub fn reserve_int8_mmq(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<Int8MmqReservation> {
+    pub fn reserve_int8_mmq(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int8MmqReservation> {
         if k == 0 || n == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(0, "reserve_int8_mmq: need k%256==0 and n>0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int8_mmq: need k%256==0 and n>0",
+            ));
         }
         let needed = int8_mmq_x_needed(k, n);
-        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_x_scratch,
+            &mut self.int8_mmq_x_scratch_bytes,
+            needed,
+        )?;
         self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
         Ok(Int8MmqReservation {
             ptr: self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr(),
-            k, n, generation: self.int8_mmq_generation,
+            k,
+            n,
+            generation: self.int8_mmq_generation,
         })
     }
 
     pub fn int8_mmq_live(&self) -> (u64, *mut c_void) {
-        (self.int8_mmq_generation, self.int8_mmq_x_scratch.as_ref().map_or(std::ptr::null_mut(), |b| b.as_ptr()))
+        (
+            self.int8_mmq_generation,
+            self.int8_mmq_x_scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
+        )
     }
     /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
     /// stream and return their device pointers `(x_fp8, half_sums,
@@ -3131,6 +4023,172 @@ fn alloc_tensor_on(
 }
 
 #[cfg(test)]
+mod route_load_tests {
+    use super::*;
+
+    /// A kernel a walked (open) route did not plan loads lazily and is
+    /// counted; a sealed route refuses it; an unplanned route loads silently.
+    #[test]
+    fn unwalked_kernel_warns_and_loads_on_an_open_route() {
+        let mut open = RouteLoad::Open {
+            route: "Flash-Next gfx1201 NativeMtp".into(),
+            unplanned: 0,
+            stats: RouteKernelStats::default(),
+        };
+        assert!(open
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
+            .is_ok());
+        assert!(open
+            .admit_unplanned(
+                "topk8_rescore_mq6g256v2",
+                "topk8_rescore_mq6g256v2_k2560",
+                LazyKind::EmbeddedImage
+            )
+            .is_ok());
+        assert!(matches!(open, RouteLoad::Open { unplanned: 2, .. }));
+        let mut sealed = RouteLoad::Sealed;
+        let error = sealed
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside this load's planned kernel route"));
+        for mut lazy in [
+            RouteLoad::Idle,
+            RouteLoad::Prepared {
+                open: None,
+                stats: RouteKernelStats::default(),
+            },
+        ] {
+            assert!(lazy
+                .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
+                .is_ok());
+        }
+    }
+
+    fn predicted_module(module: &'static str) -> crate::kernel_registry::PredictedModule {
+        let entry = crate::kernel_registry::entries("gfx1151", "")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.module == module)
+            .unwrap();
+        crate::kernel_registry::PredictedModule {
+            bind: entry.symbols.to_vec(),
+            entry,
+        }
+    }
+
+    /// A predicted-family fallback can never be sealed: predicted modules
+    /// need an open label, and only an open `Prepared` route finishes `Open`.
+    #[test]
+    fn predicted_route_is_always_open() {
+        let empty = || crate::kernel_registry::RouteKernelPlan {
+            entries: Vec::new(),
+        };
+        let refused = RouteLoad::pending_route(empty(), None, vec![predicted_module("add")], None);
+        assert!(refused.err().unwrap().to_string().contains("open route"));
+        let route = RouteLoad::pending_route(
+            empty(),
+            None,
+            vec![predicted_module("add")],
+            Some("qwen3.5 gfx1151 predicted".into()),
+        )
+        .unwrap();
+        assert!(route.pending());
+        assert_eq!(route.stats().predicted_modules, 1);
+        // Sealing is only reachable for a plan without predicted modules.
+        let sealed = RouteLoad::pending_route(empty(), None, Vec::new(), None).unwrap();
+        assert!(matches!(sealed, RouteLoad::Pending { open: None, .. }));
+        let stats = RouteKernelStats {
+            predicted_modules: 3,
+            predicted_compiled: 2,
+            ..Default::default()
+        };
+        let prepared = RouteLoad::Prepared {
+            open: Some("fallback".into()),
+            stats,
+        };
+        assert!(matches!(
+            prepared.finished(),
+            RouteLoad::Open { unplanned: 0, stats: s, .. } if s == stats
+        ));
+        assert!(matches!(
+            RouteLoad::Prepared { open: None, stats }.finished(),
+            RouteLoad::Sealed
+        ));
+    }
+
+    /// Kernels requested between begin and ready and after ready are
+    /// counted in separate phases; the open counter is unchanged by load.
+    #[test]
+    fn lazy_misses_count_per_phase() {
+        let mut route = RouteLoad::Prepared {
+            open: Some("qwen3.8-flash-next gfx1100 predicted".into()),
+            stats: RouteKernelStats::default(),
+        };
+        route
+            .admit_unplanned("a", "a_f32", LazyKind::HipNoRecord)
+            .unwrap();
+        route
+            .admit_unplanned("b", "b_f32", LazyKind::HipPrecompiled)
+            .unwrap();
+        route
+            .admit_unplanned("n", "n_f32", LazyKind::EmbeddedImage)
+            .unwrap();
+        assert_eq!(route.stats().lazy_during_load, 3);
+        let mut open = route.finished();
+        assert!(matches!(open, RouteLoad::Open { unplanned: 0, .. }));
+        open.admit_unplanned("c", "c_f32", LazyKind::HipNoRecord)
+            .unwrap();
+        assert!(matches!(open, RouteLoad::Open { unplanned: 1, .. }));
+        assert_eq!(open.stats().lazy_during_load, 3);
+    }
+
+    /// A model that left its closed plan finishes open with the preload's
+    /// counters kept (never sealed, never reset), even from a sealed plan.
+    #[test]
+    fn model_leaving_the_plan_finishes_open_and_keeps_stats() {
+        let stats = RouteKernelStats {
+            predicted_modules: 4,
+            predicted_compiled: 4,
+            ..Default::default()
+        };
+        for open in [None, Some("walked".to_owned())] {
+            let route =
+                RouteLoad::Prepared { open, stats }.finished_open("left the planned route".into());
+            assert!(matches!(
+                &route,
+                RouteLoad::Open { route, unplanned: 0, stats: s } if route == "left the planned route" && *s == stats
+            ));
+        }
+        assert!(matches!(
+            RouteLoad::Sealed.finished_open("x".into()),
+            RouteLoad::Sealed
+        ));
+    }
+}
+
+#[cfg(test)]
+mod int4_mmq_from_live_tests {
+    use super::*;
+
+    #[test]
+    fn from_live_token_is_fail_closed() {
+        let ptr = 0x1000usize as *mut c_void;
+        let other = 0x2000usize as *mut c_void;
+        let token = Int4MmqPrepared::from_live(7, ptr, 2048, 128);
+        assert_eq!(token.checked_ptr(7, ptr, 2048, 128).unwrap(), ptr);
+        assert!(token.checked_ptr(8, ptr, 2048, 128).is_err());
+        assert!(token.checked_ptr(7, other, 2048, 128).is_err());
+        assert!(token
+            .checked_ptr(7, std::ptr::null_mut(), 2048, 128)
+            .is_err());
+        assert!(token.checked_ptr(7, ptr, 1024, 128).is_err());
+        assert!(token.checked_ptr(7, ptr, 2048, 64).is_err());
+    }
+}
+
+#[cfg(test)]
 mod scratch_growth_tests {
     use super::*;
 
@@ -3215,8 +4273,7 @@ mod scratch_growth_tests {
         for &batch in &[1usize, 7, 8, 9, 512] {
             for &splits in &[1usize, 8] {
                 for &with_plane in &[false, true] {
-                    let (total, sq_off, scale_off) =
-                        fa2_fp8_q_needed(batch, splits, with_plane);
+                    let (total, sq_off, scale_off) = fa2_fp8_q_needed(batch, splits, with_plane);
                     let codes_bytes = batch * 24 * 256;
                     let sq_bytes = batch * 24 * 4;
                     // Sections tile the buffer exactly, in order.
@@ -3260,5 +4317,425 @@ mod scratch_growth_tests {
             fa2_fp8_q_needed(512, 8, true),
             (3_719_168, 512 * 24 * 256, 512 * 24 * 256 + 512 * 24 * 4)
         );
+    }
+}
+
+#[cfg(test)]
+mod prefill_workspace_tests {
+    use super::*;
+
+    fn flash_next(
+        gdn_format: Option<crate::tensor_ops::GdnStateFormat>,
+        include_short_tails: bool,
+    ) -> Qwen4PrefillWorkspaceDims {
+        Qwen4PrefillWorkspaceDims {
+            hidden_size: 2560,
+            moe_intermediate_size: 640,
+            num_experts: 512,
+            top_k: 10,
+            hc_count: 4,
+            hc_lowrank: 320,
+            gdn_format,
+            include_short_tails,
+            routed_i4: true,
+        }
+    }
+
+    #[test]
+    fn size_queries_match_allocator_geometry() {
+        assert_eq!(int4_mmq_reservation_bytes(2560, 4096), Some(5_898_240));
+        assert_eq!(
+            int4_mmq_reservation_bytes(2560, 4096),
+            Some(int4_mmq_reserve_needed(2560, 4096))
+        );
+        assert_eq!(int4_mmq_reservation_bytes(640, 4096), None); // k % 256 != 0
+        assert_eq!(int4_mmq_reservation_bytes(2560, 0), None);
+        assert_eq!(qwen4_moe_down_i4_bytes(640, 40960), Some(14_745_600));
+        assert_eq!(qwen4_moe_down_i4_bytes(641, 40960), None);
+        assert_eq!(
+            qwen4_moe_group_layout_checked(40960, 512).map(|l| l.bytes),
+            Some(821_248)
+        );
+        assert_eq!(
+            qwen4_moe_group_layout_checked(40960, 512),
+            Some(qwen4_moe_group_layout(40960, 512))
+        );
+        assert_eq!(qwen4_moe_group_layout_checked(usize::MAX, 512), None);
+        assert_eq!(qwen4_grouped_rows_bound(40960, 512), Some(48_640));
+        assert_eq!(qwen4_slab_tiles_bytes(3040), Some(24_320));
+        assert_eq!(qwen4_slab_union_bytes(16), Some(3848));
+        assert_eq!(qwen4_slab_union_bytes(32), Some(7688));
+        assert_eq!(qwen4_slab_union_bytes(64), Some(15_368));
+        assert_eq!(
+            qwen4_slab_descriptor_bytes(crate::slab_moe::SLAB_MAX_LANES),
+            Some(15_424)
+        );
+        assert_eq!(qwen4_slab_union_bytes(usize::MAX), None);
+        assert_eq!(fp16_x_bytes(4096 * 10240), Some(83_886_080));
+        assert_eq!(fp16_x_bytes(usize::MAX), None);
+        assert_eq!(MQ_FIXED_WORKSPACE_BYTES, 167_424);
+    }
+
+    #[test]
+    fn slab_rowtile_sizes_cover_every_width_and_fixed_tail() {
+        const ONE_TILE_WORDS: Option<usize> = qwen4_slab_rowtile_words_checked(1);
+        assert_eq!(ONE_TILE_WORDS, Some(482));
+        assert_eq!(qwen4_slab_rowtile_words_checked(0), Some(0));
+        assert_eq!(qwen4_slab_rowtile_bytes(0), Some(0));
+        // The legacy representation retains its two terminal offsets at zero.
+        assert_eq!(qwen4_slab_union_words_checked(0), Some(2));
+        assert_eq!(qwen4_slab_union_bytes(0), Some(8));
+        assert_eq!(qwen4_slab_descriptor_bytes(0), Some(8));
+        for lanes in 1usize..=64 {
+            let tiles = lanes.div_ceil(8);
+            let words = tiles * 482;
+            assert_eq!(qwen4_slab_rowtile_words_checked(lanes), Some(words));
+            assert_eq!(qwen4_slab_rowtile_bytes(lanes), Some(words * 4));
+            assert_eq!(
+                qwen4_slab_rowtile_bytes(lanes),
+                qwen4_slab_rowtile_bytes(tiles * 8),
+                "tail descriptor must remain full-sized at R={lanes}"
+            );
+            assert_eq!(qwen4_slab_union_words_checked(lanes), Some(lanes * 60 + 2));
+            assert_eq!(qwen4_slab_union_words(lanes), lanes * 60 + 2);
+            assert_eq!(qwen4_slab_union_bytes(lanes), Some((lanes * 60 + 2) * 4));
+            assert_eq!(
+                qwen4_slab_descriptor_bytes(lanes),
+                Some(((lanes * 60 + 2) * 4).max(words * 4))
+            );
+            if lanes % 8 == 1 && lanes > 1 {
+                assert_eq!(
+                    qwen4_slab_rowtile_bytes(lanes).unwrap()
+                        - qwen4_slab_rowtile_bytes(lanes - 1).unwrap(),
+                    1928
+                );
+            }
+        }
+        assert_eq!(qwen4_slab_rowtile_words_checked(64), Some(3856));
+        assert_eq!(qwen4_slab_rowtile_bytes(64), Some(15_424));
+        assert_eq!(qwen4_slab_descriptor_bytes(64), Some(15_424));
+    }
+
+    #[test]
+    fn slab_descriptor_size_overflows_are_checked() {
+        let max_word_tiles = usize::MAX / 482;
+        let max_word_lanes = max_word_tiles * 8;
+        assert_eq!(
+            qwen4_slab_rowtile_words_checked(max_word_lanes),
+            Some(max_word_tiles * 482)
+        );
+        assert_eq!(qwen4_slab_rowtile_words_checked(max_word_lanes + 1), None);
+        let max_byte_tiles = usize::MAX / 1928;
+        let max_byte_lanes = max_byte_tiles * 8;
+        assert_eq!(
+            qwen4_slab_rowtile_bytes(max_byte_lanes),
+            Some(max_byte_tiles * 1928)
+        );
+        // Word sizing still fits when conversion to bytes first overflows.
+        assert!(qwen4_slab_rowtile_words_checked(max_byte_lanes + 1).is_some());
+        assert_eq!(qwen4_slab_rowtile_bytes(max_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(max_byte_lanes + 1), None);
+        let max_union_lanes = (usize::MAX - 2) / 60;
+        assert!(qwen4_slab_union_words_checked(max_union_lanes).is_some());
+        assert_eq!(qwen4_slab_union_words_checked(max_union_lanes + 1), None);
+        let max_union_byte_lanes = (usize::MAX / 4 - 2) / 60;
+        assert!(qwen4_slab_union_bytes(max_union_byte_lanes).is_some());
+        assert_eq!(qwen4_slab_union_bytes(max_union_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(max_union_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_rowtile_words_checked(usize::MAX), None);
+        assert_eq!(qwen4_slab_rowtile_bytes(usize::MAX), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(usize::MAX), None);
+        assert_eq!(qwen4_slab_tiles_bytes(0), Some(0));
+        let max_mask_tiles = usize::MAX / 8;
+        assert_eq!(
+            qwen4_slab_tiles_bytes(max_mask_tiles),
+            Some(max_mask_tiles * 8)
+        );
+        assert_eq!(qwen4_slab_tiles_bytes(max_mask_tiles + 1), None);
+        assert_eq!(qwen4_slab_tiles_bytes(usize::MAX), None);
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn flash_next_4096_workspace_terms() {
+        let sum = |terms: [(&str, u64); 11]| terms.iter().map(|t| t.1).sum::<u64>();
+        let terms = qwen4_prefill_workspace_terms(
+            4096,
+            &flash_next(Some(crate::tensor_ops::GdnStateFormat::Q8), true),
+        )
+        .unwrap();
+        let names: Vec<&str> = terms.iter().map(|t| t.0).collect();
+        assert_eq!(
+            names,
+            [
+                "fp16_x",
+                "ksplit_det",
+                "int4_xq",
+                "moe_group",
+                "down_i4q",
+                "slab_tiles",
+                "slab_union",
+                "mq_fixed",
+                "gdn_dense_a",
+                "gdn_dense_ef",
+                "gdn_pair_counters",
+            ]
+        );
+        let values: Vec<u64> = terms.iter().map(|t| t.1).collect();
+        assert_eq!(
+            values,
+            [
+                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 15_424, 167_424,
+                25_165_824, 1_572_864, 1_024,
+            ]
+        );
+        assert_eq!(sum(terms), 153_269_568);
+        let no_tails = qwen4_prefill_workspace_terms(
+            4096,
+            &flash_next(Some(crate::tensor_ops::GdnStateFormat::Q8), false),
+        )
+        .unwrap();
+        assert_eq!(sum(no_tails), 153_268_544);
+        let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(None, false)).unwrap();
+        assert_eq!(sum(no_gdn), 153_268_544 - 25_165_824 - 1_572_864);
+    }
+
+    /// The dense scan's A scratch is charged for every admitted GDN state (Q8, Q8Ef); the
+    /// 1.5 MiB thread-local zero-entry EF scratch only for plain Q8 (Q8Ef scans against the
+    /// live residual, charged by the state owner); F32 never reaches the route.
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn dense_gdn_workspace_terms_charge_by_format() {
+        use crate::tensor_ops::GdnStateFormat;
+        let terms =
+            |format| qwen4_prefill_workspace_terms(4096, &flash_next(format, true)).unwrap();
+        let gdn = |format| {
+            let t = terms(format);
+            assert_eq!(t[8].0, "gdn_dense_a");
+            assert_eq!(t[9].0, "gdn_dense_ef");
+            (t[8].1, t[9].1)
+        };
+        assert_eq!(gdn(Some(GdnStateFormat::Q8)), (25_165_824, 1_572_864));
+        assert_eq!(gdn(Some(GdnStateFormat::Q8Ef)), (25_165_824, 0));
+        assert_eq!(gdn(Some(GdnStateFormat::F32)), (0, 0));
+        assert_eq!(gdn(None), (0, 0));
+        // Every other term is format-independent.
+        for format in [
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+            GdnStateFormat::F32,
+        ] {
+            let (with, without) = (terms(Some(format)), terms(None));
+            for index in (0..11).filter(|index| *index != 8 && *index != 9) {
+                assert_eq!(with[index], without[index], "{format:?} term {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gdn_admission_is_exact_gfx1201_q8_family() {
+        use crate::tensor_ops::GdnStateFormat::{Q8Ef, F32, Q8};
+        for arch in ["gfx1100", "gfx1151", "gfx942", "gfx1200", "gfx12010", ""] {
+            for format in [F32, Q8, Q8Ef] {
+                assert!(!qwen4_dense_gdn_admits(arch, format), "{arch} {format:?}");
+            }
+        }
+        assert!(qwen4_dense_gdn_admits("gfx1201", Q8));
+        assert!(qwen4_dense_gdn_admits("gfx1201", Q8Ef));
+        assert!(!qwen4_dense_gdn_admits("gfx1201", F32));
+    }
+
+    #[test]
+    fn workspace_terms_overflow_and_invalid_dims_are_none() {
+        assert!(qwen4_prefill_workspace_terms(usize::MAX, &flash_next(None, false)).is_none());
+        let mut dims = flash_next(None, false);
+        dims.hidden_size = 2561; // int4 sidecar needs k % 256 == 0
+        assert!(qwen4_prefill_workspace_terms(4096, &dims).is_none());
+    }
+
+    #[test]
+    fn dense_profile_without_routed_i4_charges_only_generic_terms() {
+        let mut dims = flash_next(None, false);
+        dims.num_experts = 0;
+        dims.top_k = 0;
+        dims.moe_intermediate_size = 0;
+        dims.routed_i4 = false;
+        let terms = qwen4_prefill_workspace_terms(4096, &dims).unwrap();
+        for (name, bytes) in terms {
+            if [
+                "int4_xq",
+                "moe_group",
+                "down_i4q",
+                "slab_tiles",
+                "slab_union",
+            ]
+            .contains(&name)
+            {
+                assert_eq!(bytes, 0, "{name}");
+            }
+        }
+        assert_eq!(terms[1], ("ksplit_det", 20_971_520));
+        assert_eq!(terms[0], ("fp16_x", 83_886_080));
+        assert_eq!(terms[7], ("mq_fixed", 167_424));
+        // Routed dims that the i4 allocators reject stay ignored when the gate is off.
+        dims.hidden_size = 2561;
+        dims.hc_count = 0;
+        dims.hc_lowrank = 0;
+        assert!(qwen4_prefill_workspace_terms(4096, &dims).is_some());
+    }
+
+    #[test]
+    fn dense_ffn_profile_is_not_none_even_with_routed_i4_set() {
+        // Dense FFN / synthetic: no experts, small non-256 hidden, routed_i4 left true.
+        let dims = Qwen4PrefillWorkspaceDims {
+            hidden_size: 64,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            top_k: 0,
+            hc_count: 4,
+            hc_lowrank: 32,
+            gdn_format: None,
+            include_short_tails: true,
+            routed_i4: true,
+        };
+        let terms = qwen4_prefill_workspace_terms(4096, &dims).unwrap();
+        for index in [2, 3, 4, 5, 6] {
+            assert_eq!(terms[index].1, 0, "{}", terms[index].0);
+        }
+        assert_eq!(terms[0], ("fp16_x", 4096 * 256 * 2));
+        assert_eq!(terms[7], ("mq_fixed", 167_424));
+        assert_eq!(terms[10], ("gdn_pair_counters", 1024));
+    }
+}
+
+#[cfg(test)]
+mod device_code_object_tests {
+    use super::device_code_object;
+
+    const ELF: &[u8] = &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40];
+    const MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+
+    /// Uncompressed clang offload bundle: header, entry table, payloads.
+    fn bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let table: usize = entries.iter().map(|(triple, _)| 24 + triple.len()).sum();
+        let mut payload_at = MAGIC.len() + 8 + table;
+        let mut out = MAGIC.to_vec();
+        out.extend((entries.len() as u64).to_le_bytes());
+        for (triple, payload) in entries {
+            out.extend((payload_at as u64).to_le_bytes());
+            out.extend((payload.len() as u64).to_le_bytes());
+            out.extend((triple.len() as u64).to_le_bytes());
+            out.extend(triple.as_bytes());
+            payload_at += payload.len();
+        }
+        for (_, payload) in entries {
+            out.extend(*payload);
+        }
+        out
+    }
+
+    #[test]
+    fn raw_elf_is_returned_unchanged() {
+        assert_eq!(device_code_object(ELF, "gfx1201"), Some(ELF));
+    }
+
+    #[test]
+    fn bundle_yields_the_requested_arch_payload() {
+        let other = [0x7f, b'E', b'L', b'F', 9, 9];
+        let image = bundle(&[
+            ("host-x86_64-unknown-linux-gnu-", &b"HOST"[..]),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1100", &other[..]),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        assert_eq!(device_code_object(&image, "gfx1201"), Some(&ELF[..]));
+        assert_eq!(device_code_object(&image, "gfx1100"), Some(&other[..]));
+    }
+
+    #[test]
+    fn bundle_arch_entry_with_feature_suffix_matches_but_longer_arch_does_not() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201:xnack-", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), Some(&ELF[..]));
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx12010", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn wrong_arch_bundle_is_none() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1100", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn duplicate_arch_entries_are_none() {
+        let image = bundle(&[
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn arch_payload_that_is_not_an_elf_is_none() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", &b"not an elf"[..])]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn malformed_inputs_are_none() {
+        assert_eq!(device_code_object(&[], "gfx1201"), None);
+        assert_eq!(device_code_object(b"junk", "gfx1201"), None);
+        assert_eq!(device_code_object(MAGIC, "gfx1201"), None);
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        for cut in [
+            MAGIC.len() + 4,
+            MAGIC.len() + 8,
+            MAGIC.len() + 20,
+            image.len() - 1,
+        ] {
+            assert_eq!(
+                device_code_object(&image[..cut], "gfx1201"),
+                None,
+                "truncated at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_fields_are_none_without_panicking() {
+        let base = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        let header = MAGIC.len();
+        let entry = header + 8;
+        for (at, label) in [
+            (header, "count"),
+            (entry, "offset"),
+            (entry + 8, "size"),
+            (entry + 16, "triple len"),
+        ] {
+            for value in [u64::MAX, u64::MAX - 7, 1 << 63] {
+                let mut image = base.clone();
+                image[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                assert_eq!(
+                    device_code_object(&image, "gfx1201"),
+                    None,
+                    "{label} = {value:#x}"
+                );
+            }
+        }
+        let mut image = base;
+        image[entry..entry + 8].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        image[entry + 8..entry + 16].copy_from_slice(&8u64.to_le_bytes());
+        assert_eq!(
+            device_code_object(&image, "gfx1201"),
+            None,
+            "offset + size wraps"
+        );
+    }
+
+    #[test]
+    fn compressed_bundle_is_none() {
+        let mut image = b"CCOB".to_vec();
+        image.extend([2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        image.extend(ELF);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
     }
 }

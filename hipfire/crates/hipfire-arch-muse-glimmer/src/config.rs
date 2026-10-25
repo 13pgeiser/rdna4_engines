@@ -23,25 +23,25 @@ pub enum GlimmerLayerType {
 /// Typed Muse Glimmer dense-text shape constants.
 #[derive(Debug, Clone)]
 pub struct GlimmerConfig {
-    pub dim: usize,                // hidden_size = 6656
-    pub n_layers: usize,           // num_hidden_layers = 52
-    pub vocab_size: usize,         // 202048
-    pub n_heads: usize,            // num_attention_heads = 32
-    pub n_kv_heads: usize,         // num_key_value_heads = 2
-    pub head_dim: usize,           // 128 (uniform)
-    pub sliding_window: usize,     // 2048
+    pub dim: usize,                     // hidden_size = 6656
+    pub n_layers: usize,                // num_hidden_layers = 52
+    pub vocab_size: usize,              // 202048
+    pub n_heads: usize,                 // num_attention_heads = 32
+    pub n_kv_heads: usize,              // num_key_value_heads = 2
+    pub head_dim: usize,                // 128 (uniform)
+    pub sliding_window: usize,          // 2048
     pub max_position_embeddings: usize, // 131072
-    pub hidden_dim: usize,         // intermediate_size = 19968
-    pub rms_norm_eps: f32,         // 1e-5 for pre-norms
-    pub post_norm_eps: f32,        // 1e-8 for post-norms — SEPARATE value
-    pub qk_scale_factor: f32,      // 3.87 (scale-less QK-norm, no weight tensors)
-    pub output_multiplier: f32,    // 0.196116135 == 1/sqrt(6656/256)
-    pub final_logit_softcapping: f32, // 20.0
-    pub hidden_activation: String, // "silu"
-    pub attention_bias: bool,      // false
-    pub tie_word_embeddings: bool, // false (untied lm_head)
-    pub bos_token: u32,            // 200000
-    pub eos_token: u32,            // 200001
+    pub hidden_dim: usize,              // intermediate_size = 19968
+    pub rms_norm_eps: f32,              // 1e-5 for pre-norms
+    pub post_norm_eps: f32,             // 1e-8 for post-norms — SEPARATE value
+    pub qk_scale_factor: f32,           // 3.87 (scale-less QK-norm, no weight tensors)
+    pub output_multiplier: f32,         // 0.196116135 == 1/sqrt(6656/256)
+    pub final_logit_softcapping: f32,   // 20.0
+    pub hidden_activation: String,      // "silu"
+    pub attention_bias: bool,           // false
+    pub tie_word_embeddings: bool,      // false (untied lm_head)
+    pub bos_token: u32,                 // 200000
+    pub eos_token: u32,                 // 200001
     pub pad_token: Option<u32>,
     pub layer_types: Vec<GlimmerLayerType>,
     /// Per-layer RoPE theta. 500000.0 on sliding layers, 0.0 on full (NoPE).
@@ -53,7 +53,13 @@ impl GlimmerConfig {
     /// Parse from the HFQ metadata envelope.
     /// Mirrors `Gemma4Config::from_hfq` but with Glimmer-specific fields.
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
-        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        Self::from_metadata_json(&hfq.metadata_json)
+    }
+
+    /// Parse the HFQ `metadata_json` text. Refuses any declared semantics the
+    /// decoder does not implement instead of computing them silently wrong.
+    pub fn from_metadata_json(metadata_json: &str) -> Result<Self, String> {
+        let meta: serde_json::Value = serde_json::from_str(metadata_json)
             .map_err(|e| format!("glimmer: metadata_json not valid JSON: {e}"))?;
         let config = meta
             .get("config")
@@ -65,8 +71,8 @@ impl GlimmerConfig {
         let getb = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_bool());
 
         let dim = getu(tc, "hidden_size").ok_or("glimmer: missing hidden_size")? as usize;
-        let n_layers = getu(tc, "num_hidden_layers")
-            .ok_or("glimmer: missing num_hidden_layers")? as usize;
+        let n_layers =
+            getu(tc, "num_hidden_layers").ok_or("glimmer: missing num_hidden_layers")? as usize;
         let vocab_size = getu(tc, "vocab_size").ok_or("glimmer: missing vocab_size")? as usize;
         // split eps — using one value for both is silently wrong (brief RESOLVED)
         let rms_norm_eps = getf(tc, "rms_norm_eps").unwrap_or(1e-5) as f32;
@@ -84,9 +90,10 @@ impl GlimmerConfig {
 
         let n_heads =
             getu(tc, "num_attention_heads").ok_or("glimmer: missing num_attention_heads")? as usize;
-        let n_kv_heads =
-            getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
-        let head_dim = getu(tc, "head_dim").map(|v| v as usize).unwrap_or(dim / n_heads);
+        let n_kv_heads = getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
+        let head_dim = getu(tc, "head_dim")
+            .map(|v| v as usize)
+            .unwrap_or(dim / n_heads);
 
         let sliding_window = getu(tc, "sliding_window").unwrap_or(2048) as usize;
         let max_position_embeddings =
@@ -158,6 +165,30 @@ impl GlimmerConfig {
                 layer_rope_theta.len(),
                 n_layers
             ));
+        }
+        // Semantic checkpoint: the layer program implements SiLU SwiGLU, bias-free
+        // projections, and exactly two layer kinds — sliding layers rotate (theta
+        // != 0) and read the sliding cache through a window; full layers are NoPE
+        // (theta == 0) and read the full cache causally. The window keys off the
+        // theta and the cache off the type, so a disagreement would attend the
+        // wrong span.
+        if hidden_activation != "silu" {
+            return Err(format!(
+                "glimmer: hidden_activation {hidden_activation:?} unsupported (only \"silu\")"
+            ));
+        }
+        if attention_bias {
+            return Err(
+                "glimmer: attention_bias=true unsupported (bias-free projections only)".into(),
+            );
+        }
+        for (i, (&kind, &theta)) in layer_types.iter().zip(&layer_rope_theta).enumerate() {
+            if (kind == GlimmerLayerType::Full) != (theta == 0.0) {
+                return Err(format!(
+                    "glimmer: layer {i} is {kind:?} with rope theta {theta}; full layers must be \
+                     NoPE (theta 0) and sliding layers must rotate"
+                ));
+            }
         }
 
         Ok(GlimmerConfig {
@@ -234,5 +265,49 @@ impl GlimmerConfig {
     #[inline]
     pub fn kv_dim(&self) -> usize {
         self.n_kv_heads * self.head_dim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A four-layer `[L, L, L, G]` text config with `patch` merged in.
+    fn parse(patch: serde_json::Value) -> Result<GlimmerConfig, String> {
+        let mut tc = serde_json::json!({
+            "hidden_size": 512, "num_hidden_layers": 4, "vocab_size": 1000,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 128,
+            "intermediate_size": 1024, "rms_norm_eps": 1e-5, "post_norm_eps": 1e-8,
+            "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+            "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0.0],
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            tc[k] = v.clone();
+        }
+        GlimmerConfig::from_metadata_json(
+            &serde_json::json!({ "config": { "text_config": tc } }).to_string(),
+        )
+    }
+
+    #[test]
+    fn layer_kinds_and_declared_semantics_fail_closed() {
+        let cfg = parse(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.window_for(0), 2048);
+        assert_eq!(cfg.window_for(3), 0);
+        assert!(cfg.has_rope(2) && !cfg.has_rope(3));
+
+        let theta = |t: [f64; 4]| serde_json::json!({ "layer_rope_theta": t });
+        let gelu = serde_json::json!({ "hidden_activation": "gelu_pytorch_tanh" });
+        let bias = serde_json::json!({ "attention_bias": true });
+        for (patch, needle) in [
+            // A rotating full layer, and a NoPE sliding layer.
+            (theta([5e5, 5e5, 5e5, 1e4]), "layer 3"),
+            (theta([5e5, 0.0, 5e5, 0.0]), "layer 1"),
+            (gelu, "hidden_activation"),
+            (bias, "attention_bias"),
+        ] {
+            let err = parse(patch.clone()).unwrap_err();
+            assert!(err.contains(needle), "{patch}: {err}");
+        }
     }
 }

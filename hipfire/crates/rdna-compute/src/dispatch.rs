@@ -50,7 +50,7 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// (`ReservedSharedMemPerBlock` was inserted ahead of
 /// `MaxSharedMemoryPerBlock`, moving it 74 → 75), so re-verify on any ROCm
 /// bump — see [`Gpu::is_uma`], the only consumer.
-const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
+pub(crate) const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
 /// Process-wide host→device upload counter, read through [`Gpu::htod_uploads`].
 /// Diagnostics only: a per-call constant upload in a hot loop is invisible in a
@@ -245,7 +245,11 @@ pub(crate) fn kernarg_value_bytes<T: KernargValue>(v: &T) -> &[u8] {
 /// params-built kernargs and the captured blob are byte-identical.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_params_match(params: &[*mut c_void], values: &[&[u8]]) {
-    assert_eq!(params.len(), values.len(), "kernarg count: params vs blob values");
+    assert_eq!(
+        params.len(),
+        values.len(),
+        "kernarg count: params vs blob values"
+    );
     for (i, (p, v)) in params.iter().zip(values).enumerate() {
         // SAFETY: each params entry points at a live local at least as large
         // as the matching blob value (both lists name the same locals).
@@ -294,20 +298,18 @@ pub(crate) fn recorded_launch_artifact(
             name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
                 module("gemv_hfq4g256_residual_scaled")
             }
-            "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
-                module("gemv_hfq4g256_moe_gate_up_indexed")
+            "gemv_hfq4g256_moe_gate_up_k8_indexed" => module("gemv_hfq4g256_moe_gate_up_indexed"),
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => {
+                module("gemv_hfq4g256_multirow_default")
+                    .or_else(|| module("gemv_hfq4g256_multirow_rdna3"))
             }
-            name if name.starts_with("gemv_hfq4g256_multirow_r") => module("gemv_hfq4g256_multirow_default")
-                .or_else(|| module("gemv_hfq4g256_multirow_rdna3")),
-            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => module("gemv_hfq4g256_residual_multirow_default")
-                .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => {
+                module("gemv_hfq4g256_residual_multirow_default")
+                    .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3"))
+            }
             _ => None,
         })
-        .or_else(|| {
-            func_name
-                .strip_suffix("_f32")
-                .and_then(module)
-        })
+        .or_else(|| func_name.strip_suffix("_f32").and_then(module))
         .cloned()
 }
 
@@ -430,6 +432,86 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Host-visible QSA depth associated with a checked kernel launch.
+#[derive(Clone, Copy, Debug)]
+pub struct QsaExtentDepth {
+    pub rows: usize,
+    pub end_position: usize,
+    pub block_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct QsaExtent {
+    numel: usize,
+    elem_bytes: usize,
+    mapped_bytes: usize,
+    /// Checked `bias + offset + len`; `None` when it overflows `usize` or the
+    /// storage is unknown (fail closed).
+    required_end: Option<usize>,
+    valid_blocks: usize,
+}
+
+/// Rejected QSA extent: the arena label, the byte limit (VMM mapped prefix or
+/// allocation size) and the required end offset. `overflow` means the end could
+/// not be computed (`required_end == usize::MAX`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QsaExtentFailure {
+    pub arena: &'static str,
+    pub limit_bytes: usize,
+    pub required_end: usize,
+    pub overflow: bool,
+}
+
+/// Checked `bias + offset + len`; `None` on `usize` overflow.
+pub(crate) fn qsa_required_end(bias: usize, offset: usize, len: usize) -> Option<usize> {
+    bias.checked_add(offset).and_then(|n| n.checked_add(len))
+}
+
+/// View bias and byte limit for a buffer at `ptr`. `owners` yields
+/// `(base, reserved_bytes, mapped_bytes)` of each registered VMM owner: a view
+/// inside an owner's reserved range is limited to that owner's MAPPED prefix
+/// (the view's logical size is not proof the pages are mapped); anything else is
+/// limited to its own allocation size.
+pub(crate) fn qsa_extent_limit(
+    ptr: usize,
+    owners: impl IntoIterator<Item = (usize, usize, usize)>,
+    allocation_bytes: usize,
+) -> (usize, usize) {
+    owners
+        .into_iter()
+        .find_map(|(base, reserved, mapped)| {
+            ptr.checked_sub(base)
+                .filter(|&n| n < reserved)
+                .map(|n| (n, mapped))
+        })
+        .unwrap_or((0, allocation_bytes))
+}
+
+/// Pure extent decision: `Ok(required_end)` when the end fits `limit_bytes`;
+/// otherwise (including overflow or unknown storage, `required_end == None`) the
+/// failure carries arena, limit and required end.
+pub(crate) fn qsa_extent_verdict(
+    arena: &'static str,
+    required_end: Option<usize>,
+    limit_bytes: usize,
+) -> Result<usize, QsaExtentFailure> {
+    match required_end {
+        Some(end) if end <= limit_bytes => Ok(end),
+        Some(end) => Err(QsaExtentFailure {
+            arena,
+            limit_bytes,
+            required_end: end,
+            overflow: false,
+        }),
+        None => Err(QsaExtentFailure {
+            arena,
+            limit_bytes,
+            required_end: usize::MAX,
+            overflow: true,
+        }),
+    }
+}
+
 impl GpuTensor {
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
@@ -508,7 +590,10 @@ impl GpuTensor {
     /// free it.
     pub fn prefix_as_f16(&self, len_elems: usize) -> GpuTensor {
         let byte_len = len_elems.checked_mul(2).expect("F16 view length overflow");
-        assert!(byte_len <= self.buf.size(), "F16 view exceeds accessible buffer prefix");
+        assert!(
+            byte_len <= self.buf.size(),
+            "F16 view exceeds accessible buffer prefix"
+        );
         GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), byte_len) },
             shape: vec![len_elems],
@@ -662,10 +747,16 @@ fn validate_vmm_move_ranges(moves: &[VmmResourceMove]) -> Result<(), String> {
             ));
         }
         let old_end = mv.old_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
-            format!("VMM move {index}: old range 0x{:x}+{} overflows", mv.old_base, mv.reserved_bytes)
+            format!(
+                "VMM move {index}: old range 0x{:x}+{} overflows",
+                mv.old_base, mv.reserved_bytes
+            )
         })?;
         let new_end = mv.new_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
-            format!("VMM move {index}: new range 0x{:x}+{} overflows", mv.new_base, mv.reserved_bytes)
+            format!(
+                "VMM move {index}: new range 0x{:x}+{} overflows",
+                mv.new_base, mv.reserved_bytes
+            )
         })?;
         old_ranges.push((mv.old_base, old_end));
         new_ranges.push((mv.new_base, new_end));
@@ -821,7 +912,44 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
+    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
+    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
+    // reverse); `paro_group_size` is the one place either width is read from.
+    /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
+    /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
+    /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
+    /// row-major, then `s_inv bf16[ceil(R/128)*ceil(K/128)]` row-major (raw bits),
+    /// zero-padded to a multiple of 256 bytes. Decode:
+    /// `bf16_rne(f32(e4m3(q)) * f32(bf16 s_inv))`. NOT FWHT-rotated (natural
+    /// basis). Generic GPU consumers must reject it; only the gfx942 FP8 MoE
+    /// route reads it. See `docs/quant-formats/fp8-e4m3.md`.
+    FP8E4M3B128,
+    /// OCP FP8 E4M3 (e4m3fn) with ONE bf16 scale per tensor (qt=56 `FP8E4M3PT`):
+    /// logical `[rows, K]`; payload = 16-byte header (bf16 scale bits LE at byte 0,
+    /// bytes 2..16 zero) then `codes u8[rows*K]` row-major. Row `r` at `16 + r*K`.
+    /// Arch-loaded (Qwen4 PLE row store); `row_bytes(k)` is the code bytes of one
+    /// row, the header is the reader's. See `docs/quant-formats/fp8-e4m3.md`.
+    FP8E4M3PT,
     Raw, // raw bytes, no element interpretation
+    /// MQ3-I4 gate/up (qt=131): typed-qwen4 expert-slab format, W3 grid
+    /// `±{1,3,5,7}`, R256 FWHT. PLANAR layout — `[M*K*3/8 B codes][M*K/128 f16
+    /// scales]` — so there is no per-row stride (`row_bytes()` is `None`; the
+    /// size needs both M and K). No GPU kernel yet: generic consumers must
+    /// reject it. See `hipfire_runtime::mq_i4`.
+    MQ3I4G128R256,
+    /// MQ3-I4 down (qt=132): W3 codec, R128 FWHT. Same planar layout as qt=131.
+    MQ3I4G128R128,
+    /// MQ2-I4 gate/up (qt=133): W2 grid `±{1,3}`, R256 FWHT. Planar like qt=131.
+    MQ2I4G128R256,
+    /// MQ2-I4 down (qt=134): W2 codec, R128 FWHT. Planar like qt=131.
+    MQ2I4G128R128,
+    /// E8P-I4 gate/up (qt=135): E8P codebook words (`u16` = `idx | sign7 << 8 | shift << 15`
+    /// per eight weights) with FP16 per-128 scales, R256 FWHT. PLANAR like qt=131
+    /// (`[M*K/8 u16 words][M*K/128 f16 scales]`): no per-row stride, typed-qwen4 only.
+    E8PI4G128R256,
+    /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
+    E8PI4G128R128,
 }
 
 impl DType {
@@ -848,6 +976,8 @@ impl DType {
             | DType::MQ4G256V2
             | DType::MQ4G128V2
             | DType::MQ4G256V2Lloyd
+            | DType::FP8E4M3B128
+            | DType::FP8E4M3PT
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -875,7 +1005,14 @@ impl DType {
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
             | DType::ParoQ4G128
-            | DType::Raw => 1, // byte-level
+            | DType::ParoQ4G64
+            | DType::Raw
+            | DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => 1, // byte-level
         }
     }
 
@@ -897,6 +1034,10 @@ impl DType {
             DType::Q8_0 => grouped(32, 34),
             DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => grouped(256, 136),
             DType::MQ4G128V2 => grouped(128, 68),
+            // qt=56: one byte per code; the 16-byte tensor header is not per-row.
+            // qt=55 (`FP8E4M3B128`) is expert-blocked, not row-strided: `None`;
+            // use `crate::fp8_e4m3::b128_tensor_bytes`.
+            DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
             DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
@@ -904,6 +1045,7 @@ impl DType {
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
             DType::ParoQ4G128 => grouped(128, 72),
+            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -914,8 +1056,47 @@ impl DType {
                 .map(|scales| scales & !15)?
                 .checked_add(blocks.checked_mul(16)?)?
                 .checked_add(16),
+            // MQ-I4 is planar (codes plane, then scale plane): no per-row
+            // stride exists, and the size needs M as well as K.
+            DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => None,
             _ => None,
         }
+    }
+
+    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
+    /// block of its activation rotation (the two are the same in ParoQuant).
+    /// `None` for every non-Paro dtype.
+    pub fn paro_group_size(self) -> Option<usize> {
+        match self {
+            DType::ParoQ4G128 => Some(128),
+            DType::ParoQ4G64 => Some(64),
+            _ => None,
+        }
+    }
+
+    /// Canonical name of the typed-qwen4-only planar MQ3-I4 / MQ2-I4 / E8P-I4 formats
+    /// (qt=131..=136); `None` for every other dtype. Generic consumers use
+    /// this to refuse them with a named error instead of a generic fallback.
+    pub fn mq_i4_name(self) -> Option<&'static str> {
+        match self {
+            DType::MQ3I4G128R256 => Some("MQ3I4G128R256"),
+            DType::MQ3I4G128R128 => Some("MQ3I4G128R128"),
+            DType::MQ2I4G128R256 => Some("MQ2I4G128R256"),
+            DType::MQ2I4G128R128 => Some("MQ2I4G128R128"),
+            DType::E8PI4G128R256 => Some("E8PI4G128R256"),
+            DType::E8PI4G128R128 => Some("E8PI4G128R128"),
+            _ => None,
+        }
+    }
+
+    /// Whether this is one of the typed-qwen4-only planar MQ-I4 formats.
+    pub fn is_mq_i4(self) -> bool {
+        self.mq_i4_name().is_some()
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
@@ -1116,6 +1297,270 @@ static IU4_VERIFY_SCOPE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static IU4_VERIFY_SCOPE_F16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static IU4_VERIFY_SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Borrowed actual operands at a loaded projection's eager launch boundary.
+/// The observer may download them synchronously but must not retain references.
+#[cfg(feature = "lab")]
+pub struct LabProjectionLaunch<'a> {
+    pub symbol: &'a str,
+    pub family: crate::gemv::WideTwinFamily,
+    pub form: &'static str,
+    pub weights: [Option<(&'a GpuTensor, usize)>; 4],
+    pub x: &'a GpuTensor,
+    pub rows: usize,
+    pub k: usize,
+    pub scale: Option<f32>,
+    pub hc_act: bool,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+}
+#[cfg(feature = "lab")]
+pub type LabProjectionObserver =
+    dyn for<'a> Fn(&Gpu, &LabProjectionLaunch<'a>) -> HipResult<()> + Send + Sync;
+
+#[cfg(feature = "lab")]
+pub struct LabLaunchWitness<'a> {
+    pub symbol: &'a str,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+}
+
+#[cfg(feature = "lab")]
+pub type LabLaunchObserver =
+    dyn for<'a> Fn(&Gpu, &LabLaunchWitness<'a>) -> HipResult<()> + Send + Sync;
+
+/// Borrowed gate/up launch operands at a legacy G1 aggregation launch site.
+/// `#[cfg(lab)]`-only neutral metadata: per-GPU borrowed observer pattern,
+/// existing borrowed-field style — every pointer borrows the owner and the
+/// observer downloads synchronously without retaining references or copying
+/// weight payload. Both MQ4 aggregate weights stay in place in their
+/// admitted resident/host-mapped owners; this struct carries no payload copy.
+#[cfg(feature = "lab")]
+pub struct LabG1GateUpBorrow<'a> {
+    /// Resident G1 expert pointer table (device pointers per expert).
+    pub expert_ptrs: &'a GpuTensor,
+    /// Per-token top-10 expert indices (u32/i32 words, rows x k_top).
+    pub topk_indices: &'a GpuTensor,
+    /// Per-token FWHT-rotated input rows (F32, rows x 2560).
+    pub x: &'a GpuTensor,
+    /// Gate output rows (F32, rows x k_top x mi); the observer downloads
+    /// the per-row reference words synchronously at the launch boundary.
+    pub y_gate: &'a GpuTensor,
+    /// Up output rows (F32, rows x k_top x mi).
+    pub y_up: &'a GpuTensor,
+    /// Output dim (M = 2*mi; canonical 1280). NOT the token count.
+    pub m: usize,
+    /// Sealed top-k (canonical 10).
+    pub k_top: usize,
+    /// Logical token rows 1..=64 covered by this G1 window.
+    pub rows: usize,
+    /// Number of resident experts (table extent `n_exp`).
+    pub n_exp: usize,
+}
+
+/// Borrowed down launch operands at a legacy G1 aggregation launch site.
+/// Same neutral borrowed-observer contract as [`LabG1GateUpBorrow`].
+#[cfg(feature = "lab")]
+pub struct LabG1DownBorrow<'a> {
+    /// Resident G1 down expert pointer table.
+    pub expert_ptrs: &'a GpuTensor,
+    /// Per-token top-10 expert indices.
+    pub topk_indices: &'a GpuTensor,
+    /// Unweighted native expanded outputs, observed after successful launch.
+    pub expert_outputs: &'a GpuTensor,
+    /// FWHT-rotated activations (F32, rows x down_k = 640); small
+    /// activation values are allowed reads.
+    pub hidden: &'a GpuTensor,
+    /// Output dim (canonical hidden 2560).
+    pub m: usize,
+    /// Activation width (canonical down_k 640).
+    pub k: usize,
+    /// Logical token rows 1..=64 (original N semantics = total R).
+    pub rows: usize,
+    /// Number of resident experts.
+    pub n_exp: usize,
+    /// Runtime k_top actually launched (canonical 10).
+    pub k_top: usize,
+}
+
+/// Neutral lab G1 witness: borrowed per-GPU G1 launch observation.
+/// The `Gpu` reference gives the observer `lab_kernel_identity`,
+/// `lab_kernel_device_identity`, and `lab_kernel_device_bytes` for the
+/// actually loaded owner; the variant borrows the launch operands in place.
+/// The observer must not alter production selection, recording, or math:
+/// with no hook installed the launch path is byte-identical (zero overhead).
+
+/// Neutral lab actual grouped SymIU4 launch record: per-phase grouped GU/down
+/// evidence from actual successful launches. Owned std data only (no borrowed
+/// device memory): symbol, width, grid/block shapes, slots/experts/rows, the
+/// loaded owner module, the admitted container SHA-256 and the per-arch raw
+/// device SHA-256 resolved at the launch boundary via the existing
+/// [`Gpu::lab_kernel_identity`] / [`Gpu::lab_kernel_device_identity`] proofs —
+/// never a source or container substitution. A missing launch exports an
+/// absent (`None`) witness, never a pass.
+#[cfg(any(feature = "lab", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabFnRecord {
+    /// Actually launched symbol.
+    pub symbol: String,
+    /// Grid actually launched.
+    pub grid: [u32; 3],
+    /// Block actually launched.
+    pub block: [u32; 3],
+    /// Output width `m` of the stage (gate/up `2*mi`, down `down_m`).
+    pub width: usize,
+    /// True for the grouped down stage, false for gate/up.
+    pub down: bool,
+    /// Actual grouped rows launched.
+    pub grouped_rows: usize,
+    /// Actual expert-table extent (`n_exp` owner count).
+    pub n_experts: usize,
+    /// Actual total routed slots (`x_row_div * x_src_rows`).
+    pub total_slots: usize,
+    /// Actual source rows (`x_src_rows`).
+    pub source_rows: usize,
+    /// Loaded owner module of the actually launched symbol.
+    pub module: String,
+    /// Admitted container SHA-256 (hex) of the actually launched symbol.
+    pub container_sha256: String,
+    /// Per-arch raw device SHA-256 (hex) of the actually launched symbol.
+    pub device_sha256: String,
+    /// Placement proven on this launch (host-mapped bit).
+    pub host_mapped: bool,
+    /// Recipe proven on this launch (symmetric IU4 arm is always BF16
+    /// round-trip; carried explicitly so absent/non-pass exports name it).
+    pub bf16_round_trip: bool,
+    /// Scratch chunk rows of the call (`chunk_rows` bound).
+    pub chunk_rows: usize,
+}
+
+/// Bounded capacity of the opaque lab carve (collector bound only, not a
+/// launch cap and not a claim about trunk depth). Overflow never changes
+/// launch execution: the launch still returns `Ok`, the collector only marks
+/// the window incomplete/non-pass and stops collecting further records.
+#[cfg(feature = "lab")]
+pub const LAB_FN_CARVE_CAP: usize = 97;
+
+/// Overflow marker drained alongside records: `Some(count)` means the window
+/// observed more actual grouped launches than the finite cap holds; the
+/// export must render non-pass and name the overflow.
+#[cfg(any(feature = "lab", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabFnOverflow(pub usize);
+
+#[cfg(feature = "lab")]
+pub enum LabG1Witness<'a> {
+    GateUp(LabG1GateUpBorrow<'a>),
+    Down(LabG1DownBorrow<'a>),
+}
+#[cfg(feature = "lab")]
+pub type LabG1Observer = dyn for<'a> Fn(&Gpu, &LabG1Witness<'a>) -> HipResult<()> + Send + Sync;
+
+/// Current production G1 stage seal, bound only while an observer is active.
+/// The pipeline supplies its immutable routed-owner identity, admitted count,
+/// placement, recipe and actual router probability words. Each singleton AR
+/// stage refreshes the seal; the consumer requires the same immutable owner
+/// across its 64 positions. No observer means no identity work or readback.
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabG1WindowSeal {
+    /// `RoutedExpertWeights::immutable_identity` of the bound expert set.
+    pub expert_set_identity: u64,
+    /// Admitted resident expert count (`n_exp`).
+    pub n_exp: usize,
+    /// Admitted placement of the expert tables.
+    pub experts_host_mapped: bool,
+    /// Actual pipeline-selected router probability words for this singleton.
+    pub router_probability_words: [u32; 10],
+    pub bf16_round_trip: bool,
+}
+
+/// One-shot scoped fault evidence. Successful launches are HIP submissions that
+/// returned success through the dispatch funnels, not attempts or host calls.
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabKernelFaultReceipt {
+    pub successful_launches: usize,
+    pub injected: bool,
+}
+
+#[cfg(feature = "lab")]
+struct LabKernelFaultCountdown {
+    remaining: AtomicUsize,
+    successful: AtomicUsize,
+    injected: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "lab")]
+impl Default for LabKernelFaultCountdown {
+    fn default() -> Self {
+        Self {
+            remaining: AtomicUsize::new(usize::MAX),
+            successful: AtomicUsize::new(0),
+            injected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(feature = "lab")]
+impl LabKernelFaultCountdown {
+    fn arm(&self, successful_launches: usize) -> HipResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if successful_launches == usize::MAX || self.remaining.load(Relaxed) != usize::MAX {
+            return Err(HipError::new(
+                1,
+                "kernel fault countdown is active or count is unrepresentable",
+            ));
+        }
+        self.successful.store(0, Relaxed);
+        self.injected.store(false, Relaxed);
+        self.remaining.store(successful_launches, Relaxed);
+        Ok(())
+    }
+
+    fn before_launch(&self) -> HipResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self
+            .remaining
+            .compare_exchange(0, usize::MAX, Relaxed, Relaxed)
+            .is_ok()
+        {
+            self.injected.store(true, Relaxed);
+            return Err(HipError::new(
+                999,
+                &format!(
+                    "lab: injected one-shot kernel launch failure after {} successful launches",
+                    self.successful.load(Relaxed),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn launched_successfully(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self
+            .remaining
+            .fetch_update(Relaxed, Relaxed, |n| {
+                (n != usize::MAX && n != 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            self.successful.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn disarm(&self) -> LabKernelFaultReceipt {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.remaining.store(usize::MAX, Relaxed);
+        LabKernelFaultReceipt {
+            successful_launches: self.successful.swap(0, Relaxed),
+            injected: self.injected.swap(false, Relaxed),
+        }
+    }
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -1134,6 +1579,9 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
+    /// no locking, bumped after a successful launch submission.
+    pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -1165,6 +1613,20 @@ pub struct Gpu {
     /// reconstructed. Stored as `usize` (not a raw pointer) to leave `Gpu`'s
     /// auto-traits exactly as they were for the VMM arena map.
     host_mapped: HashMap<usize, usize>,
+    /// S1: host-mapped allocations whose physical ownership is shared with a stream-held
+    /// lease ([`Gpu::lease_host_owner`]). Empty (no allocation, no lock) on every other path;
+    /// keys are a subset of `host_mapped`'s.
+    host_leases: HostLeaseTable<hip_bridge::HostAllocOwner>,
+    /// Host-mapped error block of the bounded device spin waits
+    /// (`crate::device_wait`). Allocated by the first launch of such a kernel
+    /// and kept for the `Gpu`'s lifetime, because captured graphs bake in its
+    /// device address. Read after each step by
+    /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
+    device_wait: Option<crate::device_wait::DeviceWaitMapping>,
+    /// Host-mapped router non-finite fault word (`crate::router_fault`), allocated
+    /// at `Gpu` init and kept for the `Gpu`'s lifetime because captured graphs bake
+    /// in its device address. Folded into [`Gpu::take_device_wait_error`].
+    router_fault: Option<crate::router_fault::RouterFaultMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
@@ -1173,6 +1635,37 @@ pub struct Gpu {
     /// when a sync times out. Scratch-helper converts and the optional CK
     /// path bypass this funnel and are deliberately not tracked here.
     last_kernel: Option<String>,
+    #[cfg(feature = "lab")]
+    lab_kernel_fault: LabKernelFaultCountdown,
+    #[cfg(feature = "lab")]
+    lab_projection_observer: Option<Arc<LabProjectionObserver>>,
+    #[cfg(feature = "lab")]
+    lab_launch_observer: Option<Arc<LabLaunchObserver>>,
+    #[cfg(feature = "lab")]
+    lab_g1_observer: Option<Arc<LabG1Observer>>,
+    /// LAB-only opaque grouped SymIU4 carve: bounded begin/end lifetime.
+    /// `None` = disarmed (production default: no hook, no collection, no
+    /// overhead). `Some((records, overflowed))` = armed window collecting
+    /// owned records up to [`LAB_FN_CARVE_CAP`]; `overflowed` counts actual
+    /// launches beyond the cap (honest non-pass, never truncation as pass).
+    #[cfg(feature = "lab")]
+    lab_fn_carve: Option<(Vec<LabFnRecord>, usize)>,
+    /// Current G1 window seal bound by the dispatch pipeline (`#[cfg(lab)]`
+    /// only). `None` outside a sealed G1 window; launch-site borrows read
+    /// this binding and the observer fails closed on mismatch.
+    #[cfg(feature = "lab")]
+    pub(crate) lab_g1_window: Option<LabG1WindowSeal>,
+    /// Strict HIP kernel-timing pool (cfg `kernel-timing` only). Allocated by
+    /// `lab_prepare_kernel_timing` outside the measured window; owned here so
+    /// no borrow of `Gpu`/runtime crosses `begin`. `None` until prepared or
+    /// after `lab_close_kernel_timing`.
+    #[cfg(feature = "kernel-timing")]
+    pub(crate) kernel_timing_pool: Option<hip_bridge::KernelTimingPool>,
+    /// `replay.replay_observation()` latched by `lab_begin_kernel_timing`;
+    /// `lab_finish_kernel_timing` rejects any drift (actual native work inside
+    /// a HIP-only timing claim invalidates the claim, never reports zero).
+    #[cfg(feature = "kernel-timing")]
+    pub(crate) kernel_timing_replay_baseline: crate::replay::ReplayObservation,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -1253,6 +1746,12 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// S1 F16-shadow arena: the installed shared plan, the planned source-pointer
+    /// bindings and the lazily exact-allocated roots that back the borrowed views
+    /// stored in `fp16_shadow_cache`. Inactive (and allocation-free) off S1; the
+    /// views are always cleared from the cache before their roots are released.
+    f16_shadow_arena: crate::byte_arena::ShadowRootSet<DeviceBuffer>,
+
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms resolve their weight buffer pointer
     /// to a tensor name via `capture_names` and invoke `capture()` with the
@@ -1281,7 +1780,8 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
-    /// True while the Flash-Next lane step runs (set by the lane-step driver):
+    /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
+    /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
     /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
     /// ([`Gpu::lane_rows_pm_enabled`]).
@@ -1290,7 +1790,27 @@ pub struct Gpu {
     /// profile (`HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151): every row-count
     /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
     /// via `Gpu::route_rows` while launches keep the real row count.
+    /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
+    /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
     pub prefill_invariant_scope: bool,
+    /// Row-exact rows of the verify forward in flight (`0` = not a verify
+    /// forward). Widens the few-row routes (`Gpu::few_row_limit`) so an
+    /// n-row verify is bitwise the sequential decode rows; prefill and every
+    /// non-verify forward keep it `0`.
+    pub wide_verify_rows: usize,
+    /// Actual singleton AR arithmetic for an eager verify window. The forward
+    /// owner restores this host scope binding after success or error; it never
+    /// changes recorder/graph state.
+    pub(crate) qwen4_verify_reference: Option<crate::prefill_invariant::Qwen4VerifyReference>,
+    /// SKU-emulation state (`HIPFIRE_EMU`): profile, host facts and the
+    /// installed budget id. `None` when emulation is off (the default).
+    pub(crate) emu: Option<crate::emu::EmuGpuState>,
+    /// True while a Qwen4 prefill tile runs on the agent-turn append route
+    /// (`HIPFIRE_QWEN4_APPEND_WMMA`, see
+    /// `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
+    /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
+    /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
+    pub qwen4_append_f16_moe_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -1549,15 +2069,20 @@ impl Gpu {
 
     /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
     /// with the free figure of a GTT-backed unified-memory APU clamped to
-    /// the host RAM a GTT allocation can take (`MemAvailable` plus TTM's
-    /// page pool estimate); see [`crate::uma_memory::device_free_from`].
+    /// the host RAM a GTT allocation can take (`MemAvailable - CMA` plus
+    /// TTM's page pool estimate); see [`crate::uma_memory::device_free_from`].
     /// Discrete GPUs and carve-out APUs get `hipMemGetInfo` unchanged. Every
     /// free-memory sizing site uses this, not `hip.get_vram_info` directly.
+    ///
+    /// Under a `HIPFIRE_EMU` profile the UMA-safe figure is then capped by the
+    /// profile ([`crate::uma_memory::emu_capped_mem_info`]): the same
+    /// managed-allocation ledger the allocators charge. Off-state unchanged.
     pub fn device_mem_info(&self) -> HipResult<(usize, usize)> {
         self.bind_thread()?;
         let (free, total) = self.hip.get_vram_info()?;
+        // Emu cap applies after the UMA-safe clamp; identity without an installed profile.
         if !self.is_uma() {
-            return Ok((free, total));
+            return Ok(self.emu_cap_mem_info(free, total));
         }
         use crate::uma_memory;
         let carveout_total = self
@@ -1580,7 +2105,7 @@ impl Gpu {
                 "unified-memory free bytes: /proc/meminfo has no readable MemAvailable",
             )
         })?;
-        Ok((free.min(usize::MAX as u64) as usize, total))
+        Ok(self.emu_cap_mem_info(free.min(usize::MAX as u64) as usize, total))
     }
 
     /// Install a real stream if launches are still going to the null stream.
@@ -1646,6 +2171,307 @@ impl Gpu {
     /// if any. Used to attribute a timed-out sync to the suspect kernel.
     pub fn last_launched_kernel(&self) -> Option<&str> {
         self.last_kernel.as_deref()
+    }
+
+    /// Install/restore the lab operand observer without changing calibration
+    /// capture. Launch owners call it only after the actual symbol is loaded.
+    #[cfg(feature = "lab")]
+    pub fn set_lab_projection_observer(
+        &mut self,
+        observer: Option<Arc<LabProjectionObserver>>,
+    ) -> Option<Arc<LabProjectionObserver>> {
+        std::mem::replace(&mut self.lab_projection_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_observe_projection(&self, launch: LabProjectionLaunch<'_>) -> HipResult<()> {
+        if let Some(observer) = &self.lab_projection_observer {
+            observer(self, &launch)?;
+        }
+        Ok(())
+    }
+
+    /// Install/restore the neutral per-launch code-object witness observer.
+    /// Same install/restore contract as the projection observer; observes
+    /// every actual bound launch funnel, projections and K1 alike, with only
+    /// borrowed launch metadata (symbol, grid, block, shared memory).
+    #[cfg(feature = "lab")]
+    pub fn set_lab_launch_observer(
+        &mut self,
+        observer: Option<Arc<LabLaunchObserver>>,
+    ) -> Option<Arc<LabLaunchObserver>> {
+        std::mem::replace(&mut self.lab_launch_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    fn lab_observe_launch(
+        &self,
+        symbol: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+    ) -> HipResult<()> {
+        if let Some(observer) = &self.lab_launch_observer {
+            observer(
+                self,
+                &LabLaunchWitness {
+                    symbol,
+                    grid,
+                    block,
+                    shared_mem,
+                },
+            )?;
+        }
+        Ok(())
+    }
+    /// Neutral per-GPU G1 observer (`cfg(lab)` only). Same install/restore
+    /// contract as the projection observer: `None` by default so the launch
+    /// path is untouched (zero overhead, byte-identical math/selection/
+    /// recording) when no hook is installed. Launch owners call the notify
+    /// entry only after the actual original symbol is loaded, with the
+    /// borrowed in-place operands.
+    /// Named borrowed type the parent may root-export: [`LabG1Witness`].
+    #[cfg(feature = "lab")]
+    pub fn set_lab_g1_observer(
+        &mut self,
+        observer: Option<Arc<LabG1Observer>>,
+    ) -> Option<Arc<LabG1Observer>> {
+        std::mem::replace(&mut self.lab_g1_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_g1_observer_active(&self) -> bool {
+        self.lab_g1_observer.is_some()
+    }
+
+    /// Notify the installed G1 observer of one actual launch boundary.
+    /// The witness borrows; the observer must download synchronously and
+    /// retain nothing. Any observer error fails the launch closed.
+    #[cfg(feature = "lab")]
+    pub fn lab_observe_g1(&self, witness: LabG1Witness<'_>) -> HipResult<()> {
+        if let Some(observer) = &self.lab_g1_observer {
+            observer(self, &witness)?;
+        }
+        Ok(())
+    }
+
+    /// LAB-only opaque grouped SymIU4 carve (`cfg(lab)` only): explicit
+    /// opt-in with a bounded reset/begin/end lifetime. `reset` clears and
+    /// disarms. `begin` arms an empty window of capacity [`LAB_FN_CARVE_CAP`].
+    /// `end` drains the owned records plus the overflow count and disarms;
+    /// `None` is the absent/non-pass export (no actual launch observed) with
+    /// ordinary success untouched. `None` by default so production installs
+    /// no hook and the launch path is byte-identical.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_reset(&mut self) {
+        self.lab_fn_carve = None;
+    }
+
+    /// Arm an empty collection window.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_begin(&mut self) {
+        self.lab_fn_carve = Some((Vec::new(), 0));
+    }
+
+    /// Drain the window and disarm. `None` when disarmed or armed-but-empty
+    /// (absent/non-pass). Consumes the window.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_end(&mut self) -> Option<(Vec<LabFnRecord>, LabFnOverflow)> {
+        Self::lab_fn_split(self.lab_fn_carve.take()?)
+    }
+
+    /// Real production drain helper: split an armed window's owned records +
+    /// overflow count into the export pair. `None` = absent/non-pass (empty
+    /// and no overflow); otherwise the launch list plus the overflow marker
+    /// (incomplete/non-pass when nonzero). `end` and the tests both call
+    /// this — no mirrored logic.
+    #[cfg(any(feature = "lab", test))]
+    pub(crate) fn lab_fn_split(
+        window: (Vec<LabFnRecord>, usize),
+    ) -> Option<(Vec<LabFnRecord>, LabFnOverflow)> {
+        let (records, overflowed) = window;
+        if records.is_empty() && overflowed == 0 {
+            return None;
+        }
+        Some((records, LabFnOverflow(overflowed)))
+    }
+
+    /// Whether a collection window is currently armed.
+    #[cfg(feature = "lab")]
+    pub(crate) fn lab_fn_armed(&self) -> bool {
+        self.lab_fn_carve.is_some()
+    }
+
+    /// Record one actual grouped launch (owned data only). Called only after
+    /// the grouped symbol launched successfully; resolves the loaded owner
+    /// via the existing identity proofs. Not collected when disarmed.
+    /// Any identity error fails the launch closed. Beyond
+    /// [`LAB_FN_CARVE_CAP`] the collector only marks the window
+    /// incomplete/non-pass and stops collecting: the successful launch still
+    /// returns `Ok`, quality execution is unchanged.
+    #[cfg(feature = "lab")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lab_note_fn(
+        &mut self,
+        symbol: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        width: usize,
+        down: bool,
+        grouped_rows: usize,
+        n_experts: usize,
+        total_slots: usize,
+        source_rows: usize,
+        host_mapped: bool,
+        bf16_round_trip: bool,
+        chunk_rows: usize,
+    ) -> HipResult<()> {
+        if self.lab_fn_carve.is_none() {
+            return Ok(());
+        }
+        let (module, container) = self.lab_kernel_identity(symbol)?;
+        let (_, _, device) = self.lab_kernel_device_identity(symbol)?;
+        let Some((records, overflowed)) = self.lab_fn_carve.as_mut() else {
+            return Ok(());
+        };
+        if records.len() >= LAB_FN_CARVE_CAP {
+            *overflowed += 1;
+            return Ok(());
+        }
+        records.push(LabFnRecord {
+            symbol: symbol.to_string(),
+            grid,
+            block,
+            width,
+            down,
+            grouped_rows,
+            n_experts,
+            total_slots,
+            source_rows,
+            module,
+            container_sha256: container,
+            device_sha256: device,
+            host_mapped,
+            bf16_round_trip,
+            chunk_rows,
+        });
+        Ok(())
+    }
+
+    /// Install/replace the active stage seal; returns the previous seal.
+    /// The dispatch pipeline refreshes it before observed legacy stages.
+    /// `None` clears the binding.
+    #[cfg(feature = "lab")]
+    pub fn set_lab_g1_window(&mut self, seal: Option<LabG1WindowSeal>) -> Option<LabG1WindowSeal> {
+        std::mem::replace(&mut self.lab_g1_window, seal)
+    }
+    /// Current G1 window seal, if the pipeline bound one (`#[cfg(lab)]` only).
+    /// Launch-site borrows read this; the oracle fails closed when `None`.
+    #[cfg(feature = "lab")]
+    pub fn lab_g1_window(&self) -> Option<LabG1WindowSeal> {
+        self.lab_g1_window
+    }
+
+    /// Arm after the transaction snapshot. N means N successful submissions
+    /// followed by one failure, not N repeated failures. Caller owns this Gpu
+    /// exclusively until disarming, and must disarm before rollback/restoration.
+    #[cfg(feature = "lab")]
+    pub fn lab_arm_kernel_fault_after(&mut self, successful_launches: usize) -> HipResult<()> {
+        self.lab_kernel_fault.arm(successful_launches)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_disarm_kernel_fault(&mut self) -> LabKernelFaultReceipt {
+        self.lab_kernel_fault.disarm()
+    }
+
+    /// Allocate the strict kernel-timing event pool outside the measured
+    /// window. Errors when a pool is already held so a prepared pool is never
+    /// silently dropped (event-destroy errors would be unobservable under Drop).
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_prepare_kernel_timing(&mut self, capacity: usize) -> HipResult<()> {
+        if self.kernel_timing_pool.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing pool already prepared",
+            ));
+        }
+        self.kernel_timing_pool = Some(self.hip.kernel_timing_pool(capacity)?);
+        Ok(())
+    }
+
+    /// Activate collection on the prepared pool. Refuses an ACTIVE replay
+    /// recording, G0 observation or graph capture — a merely prepared retained
+    /// AR is fine — then latches the replay observation for the finish check.
+    /// Slice C rejects native enqueue while the scope is live.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_begin_kernel_timing(&mut self) -> HipResult<()> {
+        if self.replay.is_recording() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: replay recording is active",
+            ));
+        }
+        if self.replay.is_g0_observing() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: G0 observation is active",
+            ));
+        }
+        if self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: graph capture is active",
+            ));
+        }
+        let pool = self.kernel_timing_pool.as_mut().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "kernel timing begin without a prepared pool")
+        })?;
+        pool.begin()?;
+        self.kernel_timing_replay_baseline = self.replay.replay_observation();
+        Ok(())
+    }
+
+    /// Detach collection and publish the strict report. Any drift of the replay
+    /// observation since begin (actual native work entered the claim) cancels
+    /// the scope and errors instead of reporting. On error the poisoned pool
+    /// stays held; `lab_close_kernel_timing` still applies and its error must
+    /// reach publication before any claim is made.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_finish_kernel_timing(&mut self) -> HipResult<hip_bridge::KernelTimingReport> {
+        let pool = self.kernel_timing_pool.as_mut().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "kernel timing finish without a prepared pool")
+        })?;
+        if self.replay.replay_observation() != self.kernel_timing_replay_baseline {
+            let _ = pool.cancel();
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing invalidated: replay observation changed during scope",
+            ));
+        }
+        pool.finish()
+    }
+
+    /// Cancel and drain on a host forward error. The pool is permanently
+    /// poisoned (see `KernelTimingPool::cancel`); close and re-prepare before
+    /// any new scope. Safe with no pool held.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_cancel_kernel_timing(&mut self) -> HipResult<()> {
+        match self.kernel_timing_pool.as_mut() {
+            Some(pool) => pool.cancel(),
+            None => Ok(()),
+        }
+    }
+
+    /// Destroy all timing events. Consumes the held pool; destroy errors
+    /// propagate here because `Drop` alone cannot report them. Call before
+    /// publishing a strict timing claim. Idempotent: `Ok` when no pool held.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_close_kernel_timing(&mut self) -> HipResult<()> {
+        match self.kernel_timing_pool.take() {
+            Some(pool) => pool.close(),
+            None => Ok(()),
+        }
     }
 
     /// Every kernel name currently loaded on this device, sorted.
@@ -1810,7 +2636,10 @@ impl Gpu {
         // Honor HIPFIRE_DEVICES for every direct entry point before the HIP
         // runtime initializes; a no-op when unset or already applied (daemon).
         match hipfire_config::devices::apply_entry_point_device_visibility() {
-            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved { devices, visibility })) => {
+            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved {
+                devices,
+                visibility,
+            })) => {
                 eprintln!(
                     "[devices] HIPFIRE_DEVICES -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
                     devices
@@ -1824,7 +2653,10 @@ impl Gpu {
             }
             Ok(_) => {}
             Err(error) => {
-                return Err(hip_bridge::HipError::new(0, &format!("HIPFIRE_DEVICES: {error}")));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_DEVICES: {error}"),
+                ));
             }
         }
         let hip = HipRuntime::load()?;
@@ -1878,6 +2710,11 @@ impl Gpu {
         // Set once here: this `Gpu` owns its `HipRuntime` for exactly one
         // device, so the per-runtime limit is race-free.
         hip.set_launch_grid_limit_for_arch(&detected_arch);
+        // SKU emulation (capacity-only): install the process budget now, after
+        // set_device and the real-arch read and before any pool, model,
+        // scratch, CK workspace or rocBLAS allocation. No-op when HIPFIRE_EMU
+        // is unset; any failure is a hard init error (no uncapped fallback).
+        let emu = crate::emu::install_for_device(&hip, id, &detected_arch)?;
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -1911,6 +2748,7 @@ impl Gpu {
         );
 
         let flags = Arc::new(FeatureFlags::from_active_config(&arch));
+        crate::scratch::enable_qsa_code_check(&flags);
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
@@ -1971,6 +2809,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -1981,8 +2820,27 @@ impl Gpu {
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
+            host_leases: HostLeaseTable::new(),
+            device_wait: None,
+            router_fault: None,
             active_stream: None,
             last_kernel: None,
+            #[cfg(feature = "lab")]
+            lab_kernel_fault: LabKernelFaultCountdown::default(),
+            #[cfg(feature = "lab")]
+            lab_projection_observer: None,
+            #[cfg(feature = "lab")]
+            lab_launch_observer: None,
+            #[cfg(feature = "lab")]
+            lab_g1_observer: None,
+            #[cfg(feature = "lab")]
+            lab_fn_carve: None,
+            #[cfg(feature = "lab")]
+            lab_g1_window: None,
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_pool: None,
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_replay_baseline: crate::replay::ReplayObservation::default(),
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -1999,6 +2857,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -2031,6 +2890,10 @@ impl Gpu {
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
                 qwen4_moe_down_i4_scratch_bytes: 0,
+                qwen4_slab_union_scratch: None,
+                qwen4_slab_union_scratch_bytes: 0,
+                qwen4_slab_tiles_scratch: None,
+                qwen4_slab_tiles_scratch_bytes: 0,
                 qwen4_moe_down_i4_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
@@ -2103,21 +2966,34 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            f16_shadow_arena: crate::byte_arena::ShadowRootSet::new(),
             active_capture: None,
             capture_names: HashMap::new(),
             hessian_capture: None,
             qwen4_scope: false,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            wide_verify_rows: 0,
+            qwen4_verify_reference: None,
+            emu,
+            qwen4_append_f16_moe_scope: false,
         })
-        .map(|mut gpu| {
+        .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
-            gpu
+            // The opt-in gfx1100 wavegrid rendezvous kernels are bounded waits
+            // that decode graphs may capture; allocate their error block now.
+            if gpu.arch_caps.is_gfx1100()
+                && (gpu.flags.rdna3_rmsnorm_wavegrid || crate::gemv::awq_norm_wavegrid_requested())
+            {
+                gpu.ensure_device_wait_block()?;
+            }
+            gpu.ensure_router_fault_word()?;
+            Ok(gpu)
         })
     }
 
@@ -3217,78 +4093,91 @@ impl Gpu {
                 self.replay.rearm_after_layout_growth();
             }
         }
-        let result: HipResult<()> =
-            if record || observe || self.graphs.capture_mode || self.flags.force_blob_path {
-                let mut blob = blob_builder();
-                blob.pad_to(16);
-                if observe {
-                    self.replay
-                        .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
-                }
-                if record {
-                    let artifact = recorded_launch_artifact(&self.compiler, func_name);
-                    self.replay.record_hip_launch_typed_bound(
-                        &self.hip,
-                        func_name,
-                        artifact,
-                        grid,
-                        block,
-                        shared_mem,
-                        blob.as_bytes(),
-                        bindings.grid,
-                        bindings.kernargs,
-                        Some(&self.compiler),
-                        railgun_words,
-                    );
-                }
-                let func = &self.functions[func_name];
-                if self.graphs.capture_mode {
-                    self.graphs.capture_blobs.push(blob.into_vec());
-                    let buf = self.graphs.capture_blobs.last_mut().unwrap();
-                    // SAFETY: every caller's builder encodes the same argument
-                    // values supplied by `params`; graph-owned storage stays live
-                    // through graph instantiation and replay.
-                    unsafe {
-                        self.hip.launch_kernel_blob(
-                            func,
-                            grid,
-                            block,
-                            shared_mem,
-                            self.active_stream.as_ref(),
-                            buf.as_mut_slice(),
-                        )
-                    }
-                } else {
-                    let mut bytes = blob.into_vec();
-                    // SAFETY: HIP consumes the contiguous argument bytes during
-                    // this one-shot launch; `bytes` remains live across the call.
-                    unsafe {
-                        self.hip.launch_kernel_blob(
-                            func,
-                            grid,
-                            block,
-                            shared_mem,
-                            self.active_stream.as_ref(),
-                            bytes.as_mut_slice(),
-                        )
-                    }
-                }
-            } else {
-                let func = &self.functions[func_name];
-                // SAFETY: forwarded from the typed launch wrapper that assembled
-                // `params` for this kernel signature.
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
+        let result: HipResult<()> = if record
+            || observe
+            || self.graphs.capture_mode
+            || self.flags.force_blob_path
+        {
+            let mut blob = blob_builder();
+            blob.pad_to(16);
+            if observe {
+                self.replay
+                    .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+            }
+            if record {
+                let artifact = recorded_launch_artifact(&self.compiler, func_name);
+                self.replay.record_hip_launch_typed_bound(
+                    &self.hip,
+                    func_name,
+                    artifact,
+                    grid,
+                    block,
+                    shared_mem,
+                    blob.as_bytes(),
+                    bindings.grid,
+                    bindings.kernargs,
+                    Some(&self.compiler),
+                    railgun_words,
+                );
+            }
+            let func = &self.functions[func_name];
+            if self.graphs.capture_mode {
+                self.graphs.capture_blobs.push(blob.into_vec());
+                let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                // SAFETY: every caller's builder encodes the same argument
+                // values supplied by `params`; graph-owned storage stays live
+                // through graph instantiation and replay.
                 unsafe {
-                    self.hip.launch_kernel(
+                    self.hip.launch_kernel_blob(
                         func,
                         grid,
                         block,
                         shared_mem,
                         self.active_stream.as_ref(),
-                        params,
+                        buf.as_mut_slice(),
                     )
                 }
-            };
+            } else {
+                let mut bytes = blob.into_vec();
+                // SAFETY: HIP consumes the contiguous argument bytes during
+                // this one-shot launch; `bytes` remains live across the call.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        bytes.as_mut_slice(),
+                    )
+                }
+            }
+        } else {
+            let func = &self.functions[func_name];
+            // SAFETY: forwarded from the typed launch wrapper that assembled
+            // `params` for this kernel signature.
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    params,
+                )
+            }
+        };
         if result.is_ok() {
+            #[cfg(feature = "lab")]
+            if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
+                return Err(e.with_kernel(func_name));
+            }
+            #[cfg(feature = "lab")]
+            self.lab_kernel_fault.launched_successfully();
             self.last_kernel = Some(func_name.to_string());
         }
         result.map_err(|e| e.with_kernel(func_name))
@@ -3433,11 +4322,19 @@ impl Gpu {
                 &format!("launch_kernel_blob: function '{func_name}' not loaded"),
             )
         })?;
-        unsafe {
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
+        let result = unsafe {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
+        };
+        #[cfg(feature = "lab")]
+        if result.is_ok() {
+            self.lab_kernel_fault.launched_successfully();
         }
-        .map_err(|e| e.with_kernel(func_name))
+        result.map_err(|e| e.with_kernel(func_name))
     }
     /// Occupancy probe for a pre-loaded kernel by name (oracle metadata gate).
     pub fn occupancy_max_active_blocks(
@@ -3502,6 +4399,10 @@ impl Gpu {
                 &[],
             );
         }
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
         let result = if self.graphs.capture_mode {
             // Retain the exact bytes for graph instantiation: HIP records the
             // blob pointer, so graph-owned storage must outlive the capture.
@@ -3547,6 +4448,12 @@ impl Gpu {
             }
         };
         if result.is_ok() {
+            #[cfg(feature = "lab")]
+            if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
+                return Err(e.with_kernel(func_name));
+            }
+            #[cfg(feature = "lab")]
+            self.lab_kernel_fault.launched_successfully();
             self.last_kernel = Some(func_name.to_string());
         }
         result.map_err(|e| e.with_kernel(func_name))
@@ -3562,6 +4469,90 @@ impl Gpu {
             ));
         }
         Ok(())
+    }
+
+    /// Actual loaded module and SHA-256 of its admitted object for a lab oracle.
+    /// Refuse unloaded/unbound symbols rather than substituting a source hash,
+    /// an expected embedded pin, or a module-name heuristic.
+    pub fn lab_kernel_identity(&self, symbol: &str) -> HipResult<(String, String)> {
+        let (module, artifact) = self.loaded_owner(symbol)?;
+        Ok((module, artifact.id().to_hex()))
+    }
+
+    /// Actual loaded module, container SHA-256 and per-arch raw device
+    /// SHA-256 of its admitted object (`#[cfg(lab)]`-only). Reuses the exact
+    /// loaded-symbol/Arc-owner proof of [`Self::lab_kernel_identity`] so
+    /// ownership cannot differ; the container return is byte-identical to the
+    /// frozen getter. The device digest is the SHA-256 of the `arch` ELF
+    /// extracted from the admitted bytes (cached per artifact/arch); a
+    /// refused extraction is a typed error, never the container fallback.
+    #[cfg(feature = "lab")]
+    pub fn lab_kernel_device_identity(&self, symbol: &str) -> HipResult<(String, String, String)> {
+        let (module, artifact) = self.loaded_owner(symbol)?;
+        let device = artifact.device_id(&self.arch).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel device identity: symbol {symbol:?} has no decodable device image"),
+            )
+        })?;
+        Ok((module, artifact.id().to_hex(), device.to_hex()))
+    }
+    /// Borrowed raw device bytes of the actually loaded symbol's admitted
+    /// object (`#[cfg(lab)]`-only). Same [`Self::loaded_owner`] Arc-owner
+    /// proof as the identity getters, then the `arch` ELF slice of the
+    /// borrowed admitted payload via the existing
+    /// `scratch::device_code_object` decoder — no container bytes, no
+    /// model/weight read or copy, no fresh decode beyond that helper.
+    /// The slice borrows the admitted artifact retained by `self`'s registry;
+    /// the borrow prevents a load from mutating that owner while it is live.
+    #[cfg(feature = "lab")]
+    pub fn lab_kernel_device_bytes(&self, symbol: &str) -> HipResult<&[u8]> {
+        let (_, artifact) = self.loaded_owner(symbol)?;
+        let image = artifact.image().as_bytes();
+        crate::scratch::device_code_object(image, &self.arch).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel device bytes: symbol {symbol:?} has no decodable device image"),
+            )
+        })
+    }
+
+    /// Shared loaded-symbol/Arc-owner proof, borrowing the registry's owner.
+    fn loaded_owner(
+        &self,
+        symbol: &str,
+    ) -> HipResult<(String, &crate::code_object::RecordedArtifact)> {
+        if !self.functions.contains_key(symbol) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("kernel identity: symbol {symbol:?} is not loaded"),
+            ));
+        }
+        let registry = self.compiler.code_objects();
+        let artifact = registry.function(symbol).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel identity: loaded symbol {symbol:?} has no object binding"),
+            )
+        })?;
+        // Function bindings retain the exact Arc admitted for their module,
+        // including HIP cache loads. Equal digests alone cannot name an owner:
+        // two separately loaded modules may contain identical object bytes.
+        let module = self
+            .modules
+            .keys()
+            .find(|name| {
+                registry
+                    .module(name)
+                    .is_some_and(|bound| Arc::ptr_eq(bound, artifact))
+            })
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("kernel identity: symbol {symbol:?} has no loaded owner module"),
+                )
+            })?;
+        Ok((module.clone(), artifact))
     }
 
     /// Compile and load a kernel, caching the result. A pending planned route
@@ -3607,18 +4598,46 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        if matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed) {
-            return Err(crate::scratch::unplanned_route_kernel(module_name, func_name));
-        }
+        self.scratch.route_load.admit_unplanned(
+            module_name,
+            func_name,
+            crate::scratch::LazyKind::EmbeddedImage,
+        )?;
         if !self.modules.contains_key(module_name) {
+            if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+                // Developer-only route-closure audit, as `scratch::load_embedded_module`.
+                eprintln!(
+                    "HIPFIRE_MODULE_LOAD_AUDIT\tembedded\t{}",
+                    serde_json::json!({
+                        "arch": self.arch,
+                        "module": module_name,
+                        "symbol": func_name,
+                        "origin": "native_embedded",
+                        "image_sha256": crate::code_object::CodeObjectId::of(image.as_bytes()).to_hex(),
+                    })
+                );
+            }
             let module = self.hip.module_load_data(image.as_bytes())?;
+            crate::scratch::qsa_code_check_register(
+                &self.arch,
+                &module,
+                module_name,
+                image.as_bytes(),
+            );
             self.compiler
                 .code_objects_mut()
                 .admit_module(
                     module_name,
-                    crate::code_object::CodeObjectArtifact::native_embedded(module_name, image, None),
+                    crate::code_object::CodeObjectArtifact::native_embedded(
+                        module_name,
+                        image,
+                        None,
+                    ),
                 )
-                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                .map_err(|reason| {
+                    crate::scratch::qsa_code_check_unregister(&module);
+                    hip_bridge::HipError::new(0, &reason)
+                })?;
             self.modules.insert(module_name.to_owned(), module);
         } else if let Some(bound) = self.compiler.code_objects().module(module_name) {
             if bound.id() != crate::code_object::CodeObjectId::of(image.as_bytes()) {
@@ -3641,38 +4660,56 @@ impl Gpu {
     /// Start loading a planner-closed route's kernels: freeze the plan and
     /// start its missing HIP compiles on at most `jobs` CPU workers, so they
     /// overlap the caller's non-dispatching weight read/upload. Nothing is
-    /// loaded on the GPU here. Replaces any earlier route state.
+    /// loaded on the GPU here. Replaces any earlier route state. `open`
+    /// names a route that stays unsealed after load: an unplanned kernel
+    /// then loads lazily with a warning instead of failing (`None` seals).
     pub fn begin_route_kernel_load(
         &mut self,
         plan: crate::kernel_registry::RouteKernelPlan,
         jobs: usize,
+        open: Option<String>,
+    ) -> HipResult<()> {
+        self.begin_route_kernel_load_predicted(plan, None, jobs, open)
+    }
+
+    /// [`Self::begin_route_kernel_load`] plus a predicted family set: its
+    /// exact registry recipes compile in the same bounded batch as `plan`
+    /// (an empty `plan` is a pure fallback route), and at the first dispatch
+    /// barrier only their proven conflict-free symbols bind. Predicted
+    /// modules are speculative coverage, so a route carrying any must have
+    /// an `open` label (it can never seal); their compile or bind failure
+    /// fails the load like a planned module's, since a known predicted
+    /// module is predictable work, not a lazy miss.
+    pub fn begin_route_kernel_load_predicted(
+        &mut self,
+        plan: crate::kernel_registry::RouteKernelPlan,
+        predicted: Option<crate::kernel_registry::PredictedKernels>,
+        jobs: usize,
+        open: Option<String>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.abort_route_kernel_load()?;
         crate::kernel_registry::validate_route_plan(&plan)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
-        let hip_entries: Vec<crate::kernel_registry::KernelEntry> = plan
+        let predicted = predicted.map(|p| p.modules).unwrap_or_default();
+        if !predicted.is_empty() && open.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "predicted kernels need an open route (a predicted fallback can never be sealed)",
+            ));
+        }
+        let mut batch_entries: Vec<crate::kernel_registry::KernelEntry> = plan
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                crate::kernel_registry::PlannedKernel::Hip(entry) => {
-                    Some(crate::kernel_registry::KernelEntry {
-                        arch: entry.arch,
-                        module: entry.module,
-                        symbols: entry.symbols,
-                        source: entry.source.clone(),
-                        flags: entry.flags.clone(),
-                        scheduler_profile: entry.scheduler_profile.clone(),
-                    })
-                }
+                crate::kernel_registry::PlannedKernel::Hip(entry) => Some(entry.clone()),
                 crate::kernel_registry::PlannedKernel::Embedded { .. } => None,
             })
             .collect();
-        let batch = self.compiler.begin_batch(hip_entries, jobs)?;
-        self.scratch.route_load = crate::scratch::RouteLoad::Pending {
-            plan,
-            batch: Some(batch),
-        };
+        batch_entries.extend(predicted.iter().map(|m| m.entry.clone()));
+        let batch = self.compiler.begin_batch(batch_entries, jobs)?;
+        self.scratch.route_load =
+            crate::scratch::RouteLoad::pending_route(plan, Some(batch), predicted, open)?;
         Ok(())
     }
 
@@ -3697,19 +4734,41 @@ impl Gpu {
         )
     }
 
-    /// Seal a route after its weights loaded: preload if no dispatch has yet,
-    /// then refuse any unplanned kernel compile/module load. No-op when no
-    /// route was begun (lazy loading stays).
+    /// Finish a route after its weights loaded: preload if no dispatch has
+    /// yet, then seal it (refuse any unplanned kernel compile/module load)
+    /// or, for an open route, keep loading unplanned kernels lazily with a
+    /// warning and a count. No-op when no route was begun (lazy loading stays).
     pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        match self.scratch.route_load {
-            crate::scratch::RouteLoad::Idle | crate::scratch::RouteLoad::Sealed => Ok(()),
-            _ => {
-                self.ensure_route_modules_preloaded()?;
-                self.scratch.route_load = crate::scratch::RouteLoad::Sealed;
-                Ok(())
-            }
+        use crate::scratch::RouteLoad;
+        if matches!(
+            self.scratch.route_load,
+            RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }
+        ) {
+            return Ok(());
         }
+        self.ensure_route_modules_preloaded()?;
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished();
+        Ok(())
+    }
+
+    /// [`Self::finish_route_kernel_load`] for a model that left its closed
+    /// plan: the pending compile still completes (every planned and
+    /// predicted module compiled and bound, counters kept) and the route
+    /// finishes `Open` under `route`, never sealed. No-op when no route was
+    /// begun or it already finished.
+    pub fn finish_route_kernel_load_open(&mut self, route: String) -> HipResult<()> {
+        self.bind_thread()?;
+        use crate::scratch::RouteLoad;
+        if matches!(
+            self.scratch.route_load,
+            RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }
+        ) {
+            return Ok(());
+        }
+        self.ensure_route_modules_preloaded()?;
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished_open(route);
+        Ok(())
     }
 
     /// Drop any route state and return to lazy loading, joining every
@@ -3724,10 +4783,43 @@ impl Gpu {
         }
     }
 
+    /// Preload counters of the begun route: predicted modules compiled,
+    /// bound and failed, and unplanned kernels loaded lazily during load.
+    /// Zero when no route was begun.
+    pub fn route_kernel_stats(&self) -> crate::scratch::RouteKernelStats {
+        // bind_thread: skip — pure state query.
+        self.scratch.route_load.stats()
+    }
+
     /// True while a begun route's modules are not yet on the GPU.
     pub fn route_kernels_pending(&self) -> bool {
         // bind_thread: skip — pure state query.
         self.scratch.route_load.pending()
+    }
+
+    /// True once a planned route finished loading (sealed or open): its
+    /// preload covers only the planned kernels.
+    pub fn route_kernels_finished(&self) -> bool {
+        // bind_thread: skip — pure state query.
+        matches!(
+            self.scratch.route_load,
+            crate::scratch::RouteLoad::Sealed | crate::scratch::RouteLoad::Open { .. }
+        )
+    }
+
+    /// True once a planned route is sealed: unplanned kernels are refused.
+    pub fn route_kernels_sealed(&self) -> bool {
+        // bind_thread: skip — pure state query.
+        matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed)
+    }
+
+    /// Unplanned kernels an open route loaded lazily since it finished.
+    pub fn unplanned_route_kernels(&self) -> usize {
+        // bind_thread: skip — pure state query.
+        match self.scratch.route_load {
+            crate::scratch::RouteLoad::Open { unplanned, .. } => unplanned,
+            _ => 0,
+        }
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
@@ -3878,16 +4970,17 @@ impl Gpu {
     fn map_qsa_gather_prefix(&mut self, workspace: &mut GpuTensor, bytes: usize) -> HipResult<()> {
         let mapped = self.vmm_mapped_bytes(workspace).unwrap_or(0);
         let granularity = self.vmm_granularity(workspace).unwrap_or(0);
-        let grow = crate::scratch::vmm_prefix_growth(mapped, workspace.byte_size(), granularity, bytes)
-            .ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
+        let grow =
+            crate::scratch::vmm_prefix_growth(mapped, workspace.byte_size(), granularity, bytes)
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
                         "QSA gather workspace cannot map {bytes} bytes of a {}-byte reservation",
                         workspace.byte_size()
                     ),
-                )
-            })?;
+                    )
+                })?;
         if grow > 0 {
             self.grow_vmm_tensor(workspace, grow, &[])?;
         }
@@ -4420,7 +5513,10 @@ impl Gpu {
     /// iff `dflash_block == 8` (a batching serve) and `HIPFIRE_CB_VERIFY_FP8`
     /// is off. `Err` when both verify opt-ins are forced on (two different
     /// verify arithmetics).
-    pub fn iu4_verify_load_decision(flags: &crate::FeatureFlags, dflash_block: usize) -> Result<bool, String> {
+    pub fn iu4_verify_load_decision(
+        flags: &crate::FeatureFlags,
+        dflash_block: usize,
+    ) -> Result<bool, String> {
         // bind_thread: skip — pure flag decision, no HIP call or device state.
         match flags.cb_verify_iu4 {
             Some(true) if flags.cb_verify_fp8 => Err(
@@ -4709,9 +5805,9 @@ impl Gpu {
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(Some(shadow.buf.as_ptr()));
         }
-        // Allocate + dequantize. Use alloc_tensor so the shadow follows the
-        // same GpuTensor hygiene (tracked in pool if applicable).
-        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        // Allocate + dequantize. The destination is the source's planned arena span
+        // when registered, else a pooled GpuTensor (same hygiene as before).
+        let fp16 = self.alloc_f16_shadow_dest(key, m * k, "ensure_fp16_shadow")?;
         self.dequantize_hfq4g256_to_f16(&w_mq4.buf, &fp16.buf, m, k)?;
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
@@ -4733,7 +5829,7 @@ impl Gpu {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
-        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        let fp16 = self.alloc_f16_shadow_dest(key, n, "ensure_bf16_f16_shadow")?;
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
@@ -4791,25 +5887,38 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        let err = |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
+        let err =
+            |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
         if self.arch != "gfx1151" {
-            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+            return Err(err(format!(
+                "requires exact gfx1151 (device is {})",
+                self.arch
+            )));
         }
         if weight.dtype != DType::Q8_0 {
             return Err(err(format!("needs a Q8_0 weight (got {:?})", weight.dtype)));
         }
         if m == 0 || k == 0 || k % 64 != 0 || (m as u128) * (k as u128) * 2 >= (1u128 << 31) {
-            return Err(err(format!("shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31")));
+            return Err(err(format!(
+                "shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31"
+            )));
         }
         let elems = m * k;
         let packed = elems / 32 * 34;
         if weight.buf.size() < packed {
-            return Err(err(format!("packed capacity {} is below M*K/32*34 = {packed} bytes", weight.buf.size())));
+            return Err(err(format!(
+                "packed capacity {} is below M*K/32*34 = {packed} bytes",
+                weight.buf.size()
+            )));
         }
         let key = weight.buf.as_ptr() as usize;
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             if shadow.buf.size() != elems * 2 {
-                return Err(err(format!("cached shadow is {} bytes, M*K*2 = {}", shadow.buf.size(), elems * 2)));
+                return Err(err(format!(
+                    "cached shadow is {} bytes, M*K*2 = {}",
+                    shadow.buf.size(),
+                    elems * 2
+                )));
             }
             return Ok(shadow.buf.as_ptr());
         }
@@ -4818,7 +5927,7 @@ impl Gpu {
             kernels::MTP_Q8_DET_PM_GFX1151,
             crate::gemm::MTP_Q8_DET_PM_ENTRY,
         )?;
-        let fp16 = self.alloc_tensor(&[elems], DType::F16)?;
+        let fp16 = self.alloc_f16_shadow_dest(key, elems, "ensure_q8_0_f16_shadow")?;
         let ip = weight.buf.as_ptr();
         let op = fp16.buf.as_ptr();
         let nv = elems as i32;
@@ -4863,7 +5972,8 @@ impl Gpu {
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(Some(shadow.buf.as_ptr()));
         }
-        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        let fp16 =
+            self.alloc_f16_shadow_dest(key, m * k, "ensure_mfp4e8_soa_fp16_shadow_gfx942")?;
         self.dequantize_mfp4g32_e8_soa_to_f16_gfx942(&weight.buf, &fp16.buf, m, k)?;
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
@@ -4922,8 +6032,6 @@ impl Gpu {
         self.flags.slots_attn_crossover
     }
 
-
-
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
@@ -4953,6 +6061,169 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// Allocate a tensor with a direct, EXACT-size `hipMalloc` (owning, non-VMM),
+    /// bypassing the pool so a larger reusable buffer can never be handed back.
+    /// The request is `max(bytes, 256)` (the pool's existing minimum); the shape and
+    /// byte size are overflow-checked and the allocator's actual capacity must equal
+    /// the request, else the buffer is released and an error returned.
+    pub fn alloc_tensor_exact(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "alloc_tensor_exact: element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "alloc_tensor_exact: byte size overflowed"))?;
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        let buf = crate::byte_arena::exact_alloc(&mut device, byte_size)
+            .map_err(|e| exact_alloc_hip_error("alloc_tensor_exact", e))?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Install the S1 F16-shadow arena: metadata only, no GPU allocation. `plan` is
+    /// the model's shared plan and `source_ptrs[i]` is the device pointer of the BF16
+    /// source weight of `plan.f16_shadows.members[i]` (sorted order). Rejects a bad
+    /// plan or bindings, an existing arena, held quarantined roots, and any bound
+    /// source that already has a cached shadow (a stale entry is never accepted).
+    /// After this, every `ensure_*` F16 shadow arm (BF16, HFQ4, Q8_0, MFP4) serves a
+    /// registered source from its planned span of a lazily exact-allocated root,
+    /// and leaves unknown sources on the legacy path.
+    pub fn install_f16_shadow_arena(
+        &mut self,
+        plan: Arc<crate::byte_arena::ModelWeightArenaPlan>,
+        source_ptrs: &[usize],
+    ) -> HipResult<()> {
+        let err = |msg: String| HipError::new(0, &format!("install_f16_shadow_arena: {msg}"));
+        for &ptr in source_ptrs {
+            if self.fp16_shadow_cache.contains_key(&ptr) {
+                return Err(err(format!(
+                    "source 0x{ptr:x} already has a cached F16 shadow"
+                )));
+            }
+        }
+        self.f16_shadow_arena.bind(plan, source_ptrs).map_err(err)
+    }
+
+    /// Clear the S1 F16-shadow arena: drop every borrowed shadow view and binding
+    /// FIRST, then quiesce the device and release the real roots exactly once. A
+    /// failed quiesce quarantines the roots (they are never freed behind it) and
+    /// returns the error; a later call retries. With no arena this is a no-op.
+    pub fn clear_f16_shadow_arena(&mut self) -> HipResult<()> {
+        if !self.f16_shadow_arena.is_active()
+            && self.f16_shadow_arena.live_roots() == 0
+            && self.f16_shadow_arena.quarantined_roots() == 0
+        {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        crate::byte_arena::clear_shadow_arena(
+            &mut self.fp16_shadow_cache,
+            |t| t.buf.is_borrowed(),
+            &mut self.f16_shadow_arena,
+            &mut device,
+        )
+        .map(|_| ())
+        .map_err(|msg| HipError::new(0, &format!("clear_f16_shadow_arena: {msg}")))
+    }
+
+    /// Prepare an in-place rewrite (bytes and/or format, same pointer) of one weight
+    /// owned by the S1 arena. With an active arena the device is quiesced ONCE —
+    /// even when the weight has no cached F16 shadow or only direct readers — and
+    /// only after that succeeds is anything mutated: the weight's `fp16_shadow_cache`
+    /// entry (an arena view is dropped; an owning shadow is released to the pool) and
+    /// its `mmq_screen` verdict (the other pointer-keyed, value-dependent cache
+    /// `invalidate_weight_caches` clears) are forgotten. The F16 arena plan, source
+    /// bindings and roots are NEVER cleared, so the next `ensure_*` conversion for the
+    /// same pointer re-fills the SAME planned span with no allocation. A failed
+    /// quiesce returns the error and changes nothing. Returns `Ok(true)` when the
+    /// arena was active (the fence ran), `Ok(false)` with no arena (no fence, no
+    /// lock, no mutation: legacy behaviour).
+    pub fn invalidate_arena_weight_source(&mut self, source_ptr: usize) -> HipResult<bool> {
+        if !self.f16_shadow_arena.is_active() {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        let screen_cache = &mut self.mmq_screen.cache;
+        let outcome = crate::byte_arena::invalidate_weight_source(
+            &mut self.fp16_shadow_cache,
+            &self.f16_shadow_arena,
+            &mut device,
+            source_ptr,
+            || {
+                screen_cache.remove(&source_ptr);
+            },
+        )
+        .map_err(|msg| HipError::new(0, &format!("invalidate_arena_weight_source: {msg}")))?;
+        match outcome {
+            None => Ok(false),
+            Some(removed) => {
+                // An arena view is non-owning (dropped); an owning shadow returns to
+                // the pool through the normal free path, now that the device is idle.
+                if let Some(shadow) = removed.filter(|t| !t.buf.is_borrowed()) {
+                    self.free_tensor(shadow)?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Destination of a model-lifetime F16 shadow of `n` elements for the source at
+    /// `key`. A source registered with the S1 arena gets a borrowed view of its
+    /// planned span (root exact-allocated lazily, once; the span bounds the view and
+    /// an allocation failure is the caller's error, never an individual fallback);
+    /// every other source keeps the legacy pooled allocation. Shared by every
+    /// `ensure_*` shadow arm, so a source whose format changes in place keeps using
+    /// the one planned span whatever conversion arm fills it. Cache keys and
+    /// conversion kernels are the arms' own and unchanged.
+    fn alloc_f16_shadow_dest(
+        &mut self,
+        key: usize,
+        n: usize,
+        context: &str,
+    ) -> HipResult<GpuTensor> {
+        let Some(member) = self.f16_shadow_arena.lookup(key) else {
+            return self.alloc_tensor(&[n], DType::F16);
+        };
+        self.bind_thread()?;
+        let bytes = n
+            .checked_mul(2)
+            .ok_or_else(|| HipError::new(0, &format!("{context}: F16 shadow too large")))?;
+        let view = {
+            let mut device = DirectHipRuntime { hip: &self.hip };
+            let (root, offset) = self
+                .f16_shadow_arena
+                .ensure_member(&mut device, member, bytes)
+                .map_err(|e| exact_alloc_hip_error(context, e))?;
+            root.byte_view(offset, bytes)
+        };
+        Ok(GpuTensor {
+            buf: view,
+            shape: vec![n],
+            dtype: DType::F16,
+        })
+    }
+
+    /// The installed F16-shadow arena plan, if any.
+    pub fn f16_shadow_arena_plan(&self) -> Option<&Arc<crate::byte_arena::ModelWeightArenaPlan>> {
+        // bind_thread: skip — pure host metadata read.
+        self.f16_shadow_arena.plan()
+    }
+
+    /// Per planned F16-shadow root, in plan order: `None` for a lazy root not yet
+    /// allocated, `Some(actual allocator capacity)` for an allocated one. Empty
+    /// without an arena.
+    pub fn f16_shadow_arena_root_capacities(&self) -> Vec<Option<usize>> {
+        // bind_thread: skip — pure host metadata read.
+        self.f16_shadow_arena.root_capacities(DeviceBuffer::size)
     }
 
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
@@ -5047,7 +6318,8 @@ impl Gpu {
             return Err(self.retain_failed_vmm_arena(arena, duplicate));
         }
         self.vmm_generation_counter += 1;
-        self.vmm_generations.insert(key, self.vmm_generation_counter);
+        self.vmm_generations
+            .insert(key, self.vmm_generation_counter);
         self.vmm_arenas.insert(key, arena);
         Ok(GpuTensor {
             buf,
@@ -5086,9 +6358,9 @@ impl Gpu {
         }
         // Producer streams may still be writing the source.
         self.hip.device_synchronize()?;
-        let reserve_bytes = logical.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES).ok_or_else(|| {
-            HipError::new(0, "exportable weight size plus tail pad overflows")
-        })?;
+        let reserve_bytes = logical
+            .checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES)
+            .ok_or_else(|| HipError::new(0, "exportable weight size plus tail pad overflows"))?;
         let mut arena = VmmArena::reserve_exportable(&self.hip, self.device_id, reserve_bytes)?;
         let fd = match self.fill_exportable_weight_arena(&mut arena, &source.buf, logical) {
             Ok(fd) => fd,
@@ -5269,6 +6541,192 @@ impl Gpu {
         self.host_mapped.len()
     }
 
+    /// Share the physical ownership of a host-mapped OWNER tensor (the tensor returned by
+    /// the host-mapped allocation, not a view of it) with the caller: the returned lease keeps
+    /// the `hipHostMalloc` allocation alive until it and every clone are dropped, even after
+    /// [`Self::free_tensor`] or this `Gpu`'s drop released the registry's own reference.
+    /// The first call per allocation adopts it (once); later calls clone the same owner.
+    /// Nothing changes for allocations never leased. The caller must have drained every GPU
+    /// access before dropping the last lease.
+    pub fn lease_host_owner(&mut self, tensor: &GpuTensor) -> HipResult<HostAllocLease> {
+        self.bind_thread()?;
+        if !tensor.buf.is_host_mapped() {
+            return Err(HipError::new(
+                0,
+                "lease_host_owner: not a host-mapped tensor",
+            ));
+        }
+        let key = tensor.buf.as_ptr() as usize;
+        let host_ptr = *self.host_mapped.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("lease_host_owner: 0x{key:x} is not a registered host-mapped owner"),
+            )
+        })?;
+        let hip = &self.hip;
+        let owner = self.host_leases.lease_with(key, || {
+            // SAFETY: `host_ptr` is the registry's own `hipHostMalloc` pointer for `key`, not
+            // yet freed; `lease_with` adopts a key at most once, and from then on the
+            // registry's frees go through `host_leases` (free_tensor / release_registered_*),
+            // never `host_free`.
+            unsafe { hip.adopt_host_allocation(host_ptr as *mut std::ffi::c_void) }
+        })?;
+        Ok(HostAllocLease {
+            owner,
+            device_alias: key,
+        })
+    }
+
+    /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
+    /// if it does not exist yet. Allocation (`hipDeviceGetAttribute`,
+    /// `hipHostMalloc`, `hipHostGetDevicePointer`) is not capture-safe, so
+    /// every route that can capture a bounded-wait kernel calls this before
+    /// capture: `Gpus::prepare_tp_graph_signals` for each TP rank, `Gpu`
+    /// init when a gfx1100 wavegrid route is requested, and the DS4
+    /// `rsqrt_once` control-state setup.
+    pub fn ensure_device_wait_block(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.device_wait.is_some() {
+            return Ok(());
+        }
+        self.device_wait = Some(crate::device_wait::DeviceWaitMapping::alloc(
+            &self.hip,
+            self.device_id,
+        )?);
+        Ok(())
+    }
+
+    /// Device address of this GPU's bounded-wait error block, for the
+    /// `hf_device_wait_block*` kernarg of every bounded spin-wait kernel.
+    /// Outside capture, the first call allocates the block. Under graph
+    /// capture the block must already exist ([`Self::ensure_device_wait_block`]),
+    /// so this fails closed rather than allocate mid-capture. Every call
+    /// first reports a timeout an earlier step left unread, so a stale code
+    /// can never make a new wait stop early without failing.
+    pub(crate) fn device_wait_block(&mut self) -> HipResult<*mut c_void> {
+        if self.device_wait.is_none() {
+            if self.graphs.capture_mode {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "GPU {}: bounded-wait kernel captured before its wait-error block was \
+                         allocated; call Gpu::ensure_device_wait_block before graph capture",
+                        self.device_id
+                    ),
+                ));
+            }
+            self.ensure_device_wait_block()?;
+        }
+        let mapping = self.device_wait.as_ref().expect("allocated above");
+        if let Some(timeout) = mapping.take(self.device_id) {
+            return Err(timeout.to_hip_error());
+        }
+        Ok(mapping.device_ptr())
+    }
+
+    /// The timeout a bounded device spin wait on this GPU recorded since the
+    /// last check, if any, clearing the record. See
+    /// [`Self::take_device_wait_error`]; multi-GPU callers combine ranks
+    /// with this.
+    pub fn take_device_wait_timeout(&self) -> Option<crate::device_wait::DeviceWaitTimeout> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.device_wait
+            .as_ref()
+            .and_then(|mapping| mapping.take(self.device_id))
+    }
+
+    /// Fail if a bounded device spin wait on this GPU stopped on its deadline
+    /// since the last check, and clear the record. Call after the step's work
+    /// has completed: a stalled peer GPU or non-co-resident workgroups
+    /// invalidate that step's results. The `download_*` readers call this
+    /// after their copy. This is a single host-memory read, and a no-op on a
+    /// GPU that never launched a bounded wait.
+    pub fn take_device_wait_error(&self) -> HipResult<()> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        if let Some(timeout) = self.take_device_wait_timeout() {
+            return Err(timeout.to_hip_error());
+        }
+        self.take_router_fault_error()
+    }
+
+    /// Allocate this GPU's router fault word (`crate::router_fault`) if it does
+    /// not exist yet. `Gpu` init calls this, so the word exists before any graph
+    /// capture bakes its address into a router producer's kernargs.
+    pub fn ensure_router_fault_word(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.router_fault.is_some() {
+            return Ok(());
+        }
+        self.router_fault = Some(crate::router_fault::RouterFaultMapping::alloc(
+            &self.hip,
+            self.device_id,
+        )?);
+        Ok(())
+    }
+
+    /// Device address of the router fault word: the `fault` kernarg of every Qwen4
+    /// router producer. Null before [`Self::ensure_router_fault_word`] (producers
+    /// treat null as "do not record").
+    pub fn router_fault_ptr(&self) -> *mut c_void {
+        // bind_thread: skip — pure field read.
+        self.router_fault
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |mapping| mapping.device_ptr())
+    }
+
+    /// The router fault recorded since the last take, without clearing it.
+    pub fn peek_router_fault(&self) -> Option<crate::router_fault::RouterFault> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.router_fault
+            .as_ref()
+            .and_then(|mapping| mapping.peek(self.device_id))
+    }
+
+    /// The router fault (earliest row, then earliest layer) recorded since the
+    /// last take, clearing the record. Call after the step's work has completed.
+    pub fn take_router_fault(&self) -> Option<crate::router_fault::RouterFault> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.router_fault
+            .as_ref()
+            .and_then(|mapping| mapping.take(self.device_id))
+    }
+
+    /// [`Self::take_router_fault`] as the request-failing error, naming layer and row.
+    pub fn take_router_fault_error(&self) -> HipResult<()> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        match self.take_router_fault() {
+            Some(fault) => Err(fault.to_hip_error()),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop a stale router fault. Request entry points call this once the device
+    /// is idle (never mid-pipeline: that would lose an earlier row's report).
+    pub fn clear_router_fault(&self) {
+        // bind_thread: skip — host memory only.
+        if let Some(mapping) = self.router_fault.as_ref() {
+            mapping.clear();
+        }
+    }
+
+    /// Global row of row 0 of the router launches encoded next: the arch sets the
+    /// prefill chunk's first token position before enqueuing it (0 for decode and
+    /// for lane steps) and dispatch passes it as the producer's `row_base`.
+    pub fn set_router_row_base(&self, row: usize) {
+        // bind_thread: skip — host-side value only.
+        if let Some(mapping) = self.router_fault.as_ref() {
+            mapping.set_row_base(row);
+        }
+    }
+
+    /// See [`Self::set_router_row_base`].
+    pub fn router_row_base(&self) -> usize {
+        // bind_thread: skip — host-side value only.
+        self.router_fault
+            .as_ref()
+            .map_or(0, |mapping| mapping.row_base())
+    }
+
     /// Release every registered host-mapped allocation, mirroring
     /// [`Self::release_registered_vmm`]. Returns the number still registered.
     fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
@@ -5279,6 +6737,13 @@ impl Gpu {
         // leak that `host_mapped_count()` could no longer report.
         let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
         for key in keys {
+            // Leased by S1: release the registry's reference; a lease still held by a
+            // stream (or a quarantined ring page) frees it when it drops, never this loop.
+            if let Some(owner) = self.host_leases.release(key) {
+                self.host_mapped.remove(&key);
+                drop(owner);
+                continue;
+            }
             let host_ptr = self.host_mapped[&key];
             match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
                 Ok(()) => {
@@ -5420,6 +6885,267 @@ impl Gpu {
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::mapped_bytes)
+    }
+
+    /// Developer-only mapped extent check. Callers gate argument computation on
+    /// `qwen4_qsa_extent_check`; no allocation, FFI or formatting on the off path.
+    pub fn qsa_extent_check(
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_tensor_extent(t, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_pooled(
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+        valid_blocks: usize,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            let mut extent = self.qsa_tensor_extent(t, offset_bytes, len_bytes);
+            extent.valid_blocks = valid_blocks;
+            self.qsa_extent_assert(arena, extent, depth, site);
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_pooled(
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+        valid_blocks: usize,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            let mut extent = self.qsa_tensor_extent(t, offset_bytes, len_bytes);
+            extent.valid_blocks = valid_blocks;
+            self.qsa_extent_sync(arena, extent, depth, site);
+        }
+    }
+
+    fn qsa_tensor_extent(&self, t: &GpuTensor, offset: usize, len: usize) -> QsaExtent {
+        let mut extent = self.qsa_buffer_extent(&t.buf, offset, len);
+        extent.numel = t.numel();
+        extent.elem_bytes = t.dtype.size();
+        extent
+    }
+
+    fn qsa_buffer_extent(&self, buf: &DeviceBuffer, offset: usize, len: usize) -> QsaExtent {
+        // Views may start inside a VMM owner; a view's buffer size is logical,
+        // not proof that the owner has mapped the range.
+        let (bias, limit) = qsa_extent_limit(
+            buf.as_ptr() as usize,
+            self.vmm_arenas
+                .iter()
+                .map(|(&base, owner)| (base, owner.reserved_bytes(), owner.mapped_bytes())),
+            buf.size(),
+        );
+        QsaExtent {
+            numel: buf.size(),
+            elem_bytes: 1,
+            mapped_bytes: limit,
+            required_end: qsa_required_end(bias, offset, len),
+            valid_blocks: 0,
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_buffer(
+        &self,
+        arena: &'static str,
+        buf: &DeviceBuffer,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_buffer_extent(buf, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_buffer(
+        &self,
+        arena: &'static str,
+        buf: &DeviceBuffer,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_buffer_extent(buf, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    fn qsa_scratch_extent(&self, ptr: *mut c_void, offset: usize, len: usize) -> QsaExtent {
+        let address = ptr as usize;
+        if let Some(t) = self.scratch.qsa_gather_vmm.as_ref() {
+            let base = t.buf.as_ptr() as usize;
+            if let Some(bias) = address.checked_sub(base).filter(|&n| n < t.buf.size()) {
+                return self.qsa_tensor_extent(t, bias.saturating_add(offset), len);
+            }
+        }
+        for (slot, elem_bytes) in [
+            (&self.scratch.fp16_x_scratch, 2),
+            (&self.scratch.qsa_select_scores, 4),
+            (&self.scratch.qsa_gather_f16, 2),
+        ] {
+            if let Some(buf) = slot.as_ref() {
+                let bytes = buf.size();
+                if let Some(bias) = address
+                    .checked_sub(buf.as_ptr() as usize)
+                    .filter(|&n| n < bytes)
+                {
+                    return QsaExtent {
+                        numel: bytes / elem_bytes,
+                        elem_bytes,
+                        mapped_bytes: bytes,
+                        required_end: qsa_required_end(bias, offset, len),
+                        valid_blocks: 0,
+                    };
+                }
+            }
+        }
+        // Unknown raw storage must fail closed, never silently bless an extent.
+        QsaExtent {
+            numel: 0,
+            elem_bytes: 1,
+            mapped_bytes: 0,
+            required_end: None,
+            valid_blocks: 0,
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_ptr(
+        &self,
+        arena: &'static str,
+        ptr: *mut c_void,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_scratch_extent(ptr, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    fn qsa_extent_assert(
+        &self,
+        arena: &'static str,
+        e: QsaExtent,
+        d: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        if let Err(f) = qsa_extent_verdict(arena, e.required_end, e.mapped_bytes) {
+            eprintln!("qsa-extent-check FAIL arena={} numel={} elem_bytes={} mapped_bytes={} need_bytes={} overflow={} rows={} end_position={} block_count={} valid_blocks={} site={site}",
+                f.arena, e.numel, e.elem_bytes, f.limit_bytes, f.required_end, f.overflow, d.rows, d.end_position, d.block_count, e.valid_blocks);
+            std::process::abort();
+        }
+    }
+
+    /// Mode 2 deliberately synchronizes the device after each checked launch.
+    pub fn qsa_extent_post_launch(
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_tensor_extent(t, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_ptr(
+        &self,
+        arena: &'static str,
+        ptr: *mut c_void,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_scratch_extent(ptr, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
+        }
+    }
+
+    fn qsa_extent_sync(
+        &self,
+        arena: &'static str,
+        e: QsaExtent,
+        d: QsaExtentDepth,
+        site: &'static str,
+    ) {
+        let result = self.bind_thread().and_then(|()| {
+            self.hip.device_synchronize()?;
+            let code = self.hip.last_error();
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipGetLastError after QSA launch"))
+            }
+        });
+        if let Err(err) = result {
+            eprintln!("qsa-extent-check FAULT after site={site} arena={arena} numel={} elem_bytes={} mapped_bytes={} need_bytes={} rows={} end_position={} block_count={} valid_blocks={} error={err}",
+                e.numel, e.elem_bytes, e.mapped_bytes, e.required_end.unwrap_or(usize::MAX), d.rows, d.end_position, d.block_count, e.valid_blocks);
+            std::process::abort();
+        }
     }
 
     /// Return the physical allocation granularity for a registered VMM tensor.
@@ -5750,9 +7476,9 @@ impl Gpu {
         // call; they are never freed.
         let mut targets: Vec<DeviceBuffer> = Vec::with_capacity(forks.len());
         for fork in forks {
-            let mapped = self.vmm_mapped_bytes(fork).ok_or_else(|| {
-                HipError::new(0, "forked tensor is not a registered VMM owner")
-            })?;
+            let mapped = self
+                .vmm_mapped_bytes(fork)
+                .ok_or_else(|| HipError::new(0, "forked tensor is not a registered VMM owner"))?;
             targets.push(unsafe { DeviceBuffer::from_raw(fork.buf.as_ptr(), mapped) });
         }
         if let Some(slab) = prefix.slab.as_ref() {
@@ -6068,6 +7794,28 @@ impl Gpu {
         }
     }
 
+    /// Allocate a raw host-mapped owner without copying its payload.
+    ///
+    /// The returned host pointer is writable through the logical length plus
+    /// `HOST_TAIL_PAD_BYTES`, and remains valid until `free_tensor`. The caller
+    /// must initialize the payload and zero the tail before publishing it.
+    pub fn alloc_raw_host_mapped(
+        &mut self,
+        byte_size: usize,
+        shape: &[usize],
+    ) -> HipResult<(GpuTensor, *mut u8)> {
+        self.bind_thread()?;
+        let started = std::time::Instant::now();
+        let tensor = self.alloc_host_mapped_tensor(byte_size, shape, DType::Raw)?;
+        crate::load_phases::add(
+            "weights.host_alloc",
+            crate::load_phases::ns_since(started),
+            (byte_size + HOST_TAIL_PAD_BYTES) as u64,
+        );
+        let host = self.host_mapped[&(tensor.buf.as_ptr() as usize)] as *mut u8;
+        Ok((tensor, host))
+    }
+
     /// Upload raw bytes into a **host-mapped** tensor: pinned system RAM the
     /// kernels read directly over PCIe (zero-copy), charged to no device heap.
     ///
@@ -6076,7 +7824,14 @@ impl Gpu {
     /// but the bytes are copied on the CPU through the host pointer and the pad
     /// is zeroed. Qwen4 host-mapped routed experts load through this path.
     pub fn upload_raw_host_mapped(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        let alloc_started = std::time::Instant::now();
         let tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+        crate::load_phases::add(
+            "weights.host_alloc",
+            crate::load_phases::ns_since(alloc_started),
+            (data.len() + HOST_TAIL_PAD_BYTES) as u64,
+        );
+        let copy_started = std::time::Instant::now();
         let host_ptr = self.host_mapped[&(tensor.buf.as_ptr() as usize)] as *mut u8;
         // SAFETY: `alloc_host_mapped_tensor` registered `host_ptr` as a live
         // allocation of `data.len() + HOST_TAIL_PAD_BYTES` bytes that nothing
@@ -6085,6 +7840,11 @@ impl Gpu {
             std::ptr::copy_nonoverlapping(data.as_ptr(), host_ptr, data.len());
             std::ptr::write_bytes(host_ptr.add(data.len()), 0, HOST_TAIL_PAD_BYTES);
         }
+        crate::load_phases::add(
+            "weights.host_copy",
+            crate::load_phases::ns_since(copy_started),
+            data.len() as u64,
+        );
         Ok(tensor)
     }
 
@@ -6210,6 +7970,9 @@ impl Gpu {
     /// caller can compare device bytes bit-for-bit (the streaming weight
     /// upload's parity harness does exactly that against the f32-upload +
     /// device-cast path it replaced).
+    ///
+    /// Like every `download_*` reader, this fails once the copy completes if a
+    /// bounded device wait timed out ([`Self::take_device_wait_error`]).
     pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
         self.bind_thread()?;
         if tensor.dtype != DType::F16 {
@@ -6223,9 +7986,15 @@ impl Gpu {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 2) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
+    /// Synchronous device-to-host copy. Like every `download_*` reader, this
+    /// fails once the copy completes if a bounded device wait on this GPU
+    /// timed out ([`Self::take_device_wait_error`]). The copy follows the
+    /// step that produced `tensor`, so a stalled peer or rendezvous fails
+    /// the request here rather than handing back garbage.
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -6233,6 +8002,7 @@ impl Gpu {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
@@ -6245,7 +8015,8 @@ impl Gpu {
         // SAFETY: `out` holds exactly `numel` f32s; any byte pattern is a valid f32.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, numel * 4) };
-        self.hip.memcpy_dtoh(bytes, &tensor.buf)
+        self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()
     }
 
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
@@ -6259,6 +8030,7 @@ impl Gpu {
         let n = tensor.byte_size();
         let mut data = vec![0u8; n];
         self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
@@ -6356,6 +8128,13 @@ impl Gpu {
                     &format!("host-mapped tensor at 0x{key:x} has no registered host pointer"),
                 )
             })?;
+            // An S1-leased allocation: drop the registry's reference only. The last holder
+            // (a stream-held lease, else this release) runs the one hipHostFree.
+            if let Some(owner) = self.host_leases.release(key) {
+                debug_assert_eq!(owner.host_ptr() as usize, host_ptr);
+                drop(owner);
+                return Ok(());
+            }
             return self.hip.host_free(host_ptr as *mut std::ffi::c_void);
         }
         if self.vmm_arenas.contains_key(&key) {
@@ -6783,6 +8562,12 @@ impl Gpu {
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
+        // S1 arena (no-op without one): borrowed shadow views are dropped from the
+        // cache BEFORE their roots are quiesced and released, so the loop below only
+        // ever sees owning entries and `free_tensor` never gets a borrowed view.
+        if let Err(err) = self.clear_f16_shadow_arena() {
+            eprintln!("[rdna-compute] invalidate_weight_caches: {err}");
+        }
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
             let _ = self.free_tensor(t);
@@ -6933,9 +8718,10 @@ impl Gpu {
     /// fills every row owned by another rank from that owner's buffer.
     ///
     /// For slot `s` in `0..n_slots`, `e = slot_experts[s]` (i32, device memory);
-    /// when `e >= 0` and `owner = e % n_ranks != self_rank`, row `s`
+    /// when `0 <= e < n_experts` and `owner = e % n_ranks != self_rank`, row `s`
     /// (`n16` uint4 = `n16 * 16` bytes) is copied from `src[owner]` to `dst` at
-    /// the same row offset. Owned rows and negative-id slots are never written.
+    /// the same row offset. Owned rows and slots whose id is outside
+    /// `[0, n_experts)` (negative marker or corrupt id) are never written.
     /// Pure uint4 load/store, so the copy is bit-exact for every bit pattern.
     ///
     /// `src[r]` is rank `r`'s row-buffer base as a device address (valid on this
@@ -6945,20 +8731,29 @@ impl Gpu {
     pub fn ep_gather_rows_by_owner(
         &mut self,
         slot_experts: &GpuTensor,
-        src: [usize; 4],
+        src: [usize; 8],
         dst: usize,
         n_slots: usize,
         n_ranks: usize,
         self_rank: usize,
         n16: usize,
+        n_experts: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+        if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks {
             return Err(HipError::new(
                 0,
-                "ep_gather_rows_by_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+                "ep_gather_rows_by_owner: n_ranks must be 2..=8 and self_rank < n_ranks",
             ));
         }
+        if n_experts == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_experts must be non-zero",
+            ));
+        }
+        let mut experts_i32 = i32::try_from(n_experts)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n_experts exceeds i32"))?;
         if n_slots == 0 || n16 == 0 {
             return Err(HipError::new(
                 0,
@@ -6990,18 +8785,27 @@ impl Gpu {
         let s1 = src[1] as *mut c_void;
         let s2 = src[2] as *mut c_void;
         let s3 = src[3] as *mut c_void;
+        let s4 = src[4] as *mut c_void;
+        let s5 = src[5] as *mut c_void;
+        let s6 = src[6] as *mut c_void;
+        let s7 = src[7] as *mut c_void;
         let d = dst as *mut c_void;
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 15] = [
             &ids as *const _ as *mut c_void,
             &s0 as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &s3 as *const _ as *mut c_void,
+            &s4 as *const _ as *mut c_void,
+            &s5 as *const _ as *mut c_void,
+            &s6 as *const _ as *mut c_void,
+            &s7 as *const _ as *mut c_void,
             &d as *const _ as *mut c_void,
             &mut slots_i32 as *mut _ as *mut c_void,
             &mut ranks_i32 as *mut _ as *mut c_void,
             &mut self_i32 as *mut _ as *mut c_void,
             &mut n16_i32 as *mut _ as *mut c_void,
+            &mut experts_i32 as *mut _ as *mut c_void,
         ];
         let blob_builder = || {
             let mut blob = hip_bridge::KernargBlob::new();
@@ -7010,11 +8814,16 @@ impl Gpu {
             blob.push_ptr(s1);
             blob.push_ptr(s2);
             blob.push_ptr(s3);
+            blob.push_ptr(s4);
+            blob.push_ptr(s5);
+            blob.push_ptr(s6);
+            blob.push_ptr(s7);
             blob.push_ptr(d);
             blob.push_i32(slots_i32);
             blob.push_i32(ranks_i32);
             blob.push_i32(self_i32);
             blob.push_i32(n16_i32);
+            blob.push_i32(experts_i32);
             blob
         };
         let grid_x = (n16 as u32).div_ceil(256);
@@ -7040,7 +8849,7 @@ impl Gpu {
     pub fn ep_gather_rows_by_slot_owner(
         &mut self,
         slot_owner: &GpuTensor,
-        src: [usize; 4],
+        src: [usize; 8],
         dst: usize,
         n_slots: usize,
         n_ranks: usize,
@@ -7048,10 +8857,10 @@ impl Gpu {
         n16: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+        if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks {
             return Err(HipError::new(
                 0,
-                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=8 and self_rank < n_ranks",
             ));
         }
         if n_slots == 0 || n16 == 0 {
@@ -7085,13 +8894,21 @@ impl Gpu {
         let s1 = src[1] as *mut c_void;
         let s2 = src[2] as *mut c_void;
         let s3 = src[3] as *mut c_void;
+        let s4 = src[4] as *mut c_void;
+        let s5 = src[5] as *mut c_void;
+        let s6 = src[6] as *mut c_void;
+        let s7 = src[7] as *mut c_void;
         let d = dst as *mut c_void;
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 14] = [
             &owners as *const _ as *mut c_void,
             &s0 as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &s3 as *const _ as *mut c_void,
+            &s4 as *const _ as *mut c_void,
+            &s5 as *const _ as *mut c_void,
+            &s6 as *const _ as *mut c_void,
+            &s7 as *const _ as *mut c_void,
             &d as *const _ as *mut c_void,
             &mut slots_i32 as *mut _ as *mut c_void,
             &mut ranks_i32 as *mut _ as *mut c_void,
@@ -7105,6 +8922,10 @@ impl Gpu {
             blob.push_ptr(s1);
             blob.push_ptr(s2);
             blob.push_ptr(s3);
+            blob.push_ptr(s4);
+            blob.push_ptr(s5);
+            blob.push_ptr(s6);
+            blob.push_ptr(s7);
             blob.push_ptr(d);
             blob.push_i32(slots_i32);
             blob.push_i32(ranks_i32);
@@ -7611,11 +9432,25 @@ impl Gpu {
     }
 }
 
+/// Borrowed `arch` device ELF of an explicitly supplied code image
+/// (`#[cfg(lab)]`-only, neutral, no model/weight read). Wraps the existing
+/// `scratch::device_code_object` decoder so lab oracles can pin an explicit
+/// external `--reference-*-co` file by its ACTUAL raw device SHA instead of
+/// a module label, container proxy, or expected digest. Returns `None`
+/// exactly when the helper refuses (compressed/missing/ambiguous/malformed).
+#[cfg(feature = "lab")]
+pub fn lab_extract_device_bytes<'a>(image: &'a [u8], arch: &str) -> Option<&'a [u8]> {
+    crate::scratch::device_code_object(image, arch)
+}
+
 impl Drop for Gpu {
     /// Defensive: bind owning device before any future per-field `Drop`
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
+        // Before any bind/free: drop every registered module handle while the
+        // runtime and `self.modules` are still alive (no-op unless flagged).
+        crate::scratch::qsa_code_check_unregister_all(&self.modules);
         if std::thread::panicking()
             && self.vmm_allocation_count() == 0
             && self.host_mapped.is_empty()
@@ -7640,11 +9475,533 @@ impl Drop for Gpu {
                 }
             }
         }
+        if self.device_wait.is_some() {
+            // Queued bounded waits may still store into the error block.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize the device wait-error block during Gpu drop: {err}");
+            } else if let Some(mapping) = self.device_wait.take() {
+                if let Err(err) = mapping.free(&self.hip) {
+                    eprintln!("[rdna-compute] failed to release the device wait-error block during Gpu drop: {err}");
+                }
+            }
+        }
+        if self.router_fault.is_some() {
+            // Queued router producers may still store into the fault word.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize the router fault word during Gpu drop: {err}");
+            } else if let Some(mapping) = self.router_fault.take() {
+                if let Err(err) = mapping.free(&self.hip) {
+                    eprintln!("[rdna-compute] failed to release the router fault word during Gpu drop: {err}");
+                }
+            }
+        }
+        if self.f16_shadow_arena.is_active()
+            || self.f16_shadow_arena.live_roots() > 0
+            || self.f16_shadow_arena.quarantined_roots() > 0
+        {
+            // Borrowed shadow views first, then a quiesced release of the roots; a
+            // failed quiesce quarantines (leaks) them rather than freeing live memory.
+            if let Err(err) = self.clear_f16_shadow_arena() {
+                eprintln!(
+                    "[rdna-compute] failed to release the F16 shadow arena during Gpu drop: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// The direct HIP allocator used for exact-capacity roots: `hipMalloc` straight
+/// from the runtime (never the pool's possibly oversized reuse), owning
+/// `HipMalloc` buffers, quiesced with a whole-device synchronize.
+struct DirectHipRuntime<'a> {
+    hip: &'a HipRuntime,
+}
+
+impl crate::byte_arena::ExactRootDevice for DirectHipRuntime<'_> {
+    type Root = DeviceBuffer;
+    type Error = HipError;
+
+    fn alloc_exact(&mut self, bytes: usize) -> HipResult<DeviceBuffer> {
+        self.hip.malloc(bytes)
+    }
+
+    fn is_owning(root: &DeviceBuffer) -> bool {
+        root.is_hip_allocation()
+    }
+
+    fn capacity(root: &DeviceBuffer) -> usize {
+        root.size()
+    }
+
+    fn quiesce(&mut self) -> HipResult<()> {
+        self.hip.device_synchronize()
+    }
+
+    fn release(&mut self, root: DeviceBuffer) -> HipResult<()> {
+        self.hip.free(root)
+    }
+}
+
+/// Map an exact-allocation failure to a `HipError`, preserving the HIP code of a
+/// real allocator failure (out-of-memory stays out-of-memory).
+fn exact_alloc_hip_error(
+    context: &str,
+    err: crate::byte_arena::ExactAllocError<HipError>,
+) -> HipError {
+    match err {
+        crate::byte_arena::ExactAllocError::Alloc(hip) => hip,
+        other => HipError::new(0, &format!("{context}: {other}")),
+    }
+}
+
+/// The registry of host-mapped allocations whose physical ownership S1 shares with stream-held
+/// leases: `key` (the device alias of the owner tensor) -> the shared owner.  Generic over the
+/// owner so the lifecycle is tested on the CPU with a fake; `Gpu` uses
+/// `hip_bridge::HostAllocOwner`.  Empty on every non-S1 path (`HashMap::new` allocates
+/// nothing and a lookup in an empty map takes no lock).
+pub(crate) struct HostLeaseTable<O> {
+    map: HashMap<usize, std::sync::Arc<O>>,
+}
+
+impl<O> HostLeaseTable<O> {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// The shared owner of `key`: the existing one (no second adoption), else the result of
+    /// `adopt`, registered.  A failed adoption leaves the table unchanged.
+    pub(crate) fn lease_with(
+        &mut self,
+        key: usize,
+        adopt: impl FnOnce() -> HipResult<O>,
+    ) -> HipResult<std::sync::Arc<O>> {
+        if let Some(owner) = self.map.get(&key) {
+            return Ok(std::sync::Arc::clone(owner));
+        }
+        let owner = std::sync::Arc::new(adopt()?);
+        self.map.insert(key, std::sync::Arc::clone(&owner));
+        Ok(owner)
+    }
+
+    /// Drop the registry's record of `key` and return its reference, if the allocation was
+    /// ever leased.  `None` means NOT leased (or already released): the caller frees directly,
+    /// exactly as before S1.  The returned reference is dropped by the caller; the physical
+    /// free runs when the last holder (this one, or any stream-held lease) drops.
+    pub(crate) fn release(&mut self, key: usize) -> Option<std::sync::Arc<O>> {
+        if self.map.is_empty() {
+            return None;
+        }
+        self.map.remove(&key)
+    }
+}
+
+/// A stream-held share of one host-mapped allocation ([`Gpu::lease_host_owner`]): keeps the
+/// `hipHostMalloc` bytes alive until every clone drops, whatever happens to the `Gpu` or the
+/// tensor that owns the allocation.  Dropping the last holder frees it once.
+#[derive(Clone)]
+pub struct HostAllocLease {
+    owner: std::sync::Arc<hip_bridge::HostAllocOwner>,
+    device_alias: usize,
+}
+
+impl HostAllocLease {
+    /// Device alias of the owner tensor this lease was taken from (the kernels' pointer).
+    pub fn device_alias(&self) -> usize {
+        self.device_alias
+    }
+
+    /// The host pointer of the allocation.
+    pub fn host_ptr(&self) -> *mut std::ffi::c_void {
+        self.owner.host_ptr()
+    }
+
+    /// Holders of the physical allocation (leases plus, while recorded, the `Gpu` registry).
+    pub fn holders(&self) -> usize {
+        std::sync::Arc::strong_count(&self.owner)
+    }
+
+    /// The physical owner as a type-erased keepalive (a clone of the shared `Arc`, no
+    /// allocation): whoever holds it keeps the `hipHostMalloc` bytes alive, exactly like an
+    /// expert tier lease, and the last holder's drop frees them once.
+    pub fn keepalive(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self.owner.clone()
+    }
+}
+
+#[cfg(test)]
+mod slowlink_host_lease_tests {
+    use super::HostLeaseTable;
+    use std::sync::{Arc, Mutex};
+
+    static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// The fake owner: freed exactly when its last `Arc` drops.
+    struct FakeOwner(usize);
+
+    impl Drop for FakeOwner {
+        fn drop(&mut self) {
+            FREED.lock().unwrap_or_else(|e| e.into_inner()).push(self.0);
+        }
+    }
+
+    fn freed(key: usize) -> usize {
+        FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&k| k == key)
+            .count()
+    }
+
+    fn lease(t: &mut HostLeaseTable<FakeOwner>, key: usize) -> Arc<FakeOwner> {
+        t.lease_with(key, || Ok(FakeOwner(key))).unwrap()
+    }
+
+    #[test]
+    fn slowlink_host_lease_unleased_allocation_is_freed_directly() {
+        // No lease: `release` returns None, so free_tensor / Gpu drop run the unchanged
+        // immediate hipHostFree path; the table never grows.
+        let mut t: HostLeaseTable<FakeOwner> = HostLeaseTable::new();
+        assert!(t.release(0x2000).is_none());
+        assert_eq!(t.len(), 0);
+        let _held = lease(&mut t, 0x2001);
+        assert!(t.release(0x2000).is_none(), "another key is unaffected");
+    }
+
+    #[test]
+    fn slowlink_host_lease_outlives_free_tensor() {
+        let key = 0x3000;
+        let mut t = HostLeaseTable::new();
+        let stream_lease = lease(&mut t, key);
+        // free_tensor: the registry drops its reference; the lease keeps the bytes alive.
+        drop(t.release(key).expect("leased"));
+        assert_eq!(freed(key), 0, "no immediate free while a lease is held");
+        assert_eq!(t.len(), 0);
+        drop(stream_lease);
+        assert_eq!(freed(key), 1, "the last holder frees exactly once");
+    }
+
+    #[test]
+    fn slowlink_host_lease_outlives_gpu_drop() {
+        let (a, b) = (0x4000, 0x4010);
+        let mut t = HostLeaseTable::new();
+        let la = lease(&mut t, a);
+        let _lb_dropped = lease(&mut t, b);
+        drop(_lb_dropped);
+        // Gpu drop: release_registered_host_mapped drains every record without freeing.
+        for key in [a, b] {
+            drop(t.release(key));
+        }
+        drop(t);
+        assert_eq!(freed(a), 0, "a stream-held lease survives the Gpu");
+        assert_eq!(
+            freed(b),
+            1,
+            "an allocation nobody holds is freed by the drain itself"
+        );
+        drop(la);
+        assert_eq!(freed(a), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_quarantine_then_drain_frees_after_the_ring_drains() {
+        let key = 0x5000;
+        let mut t = HostLeaseTable::new();
+        // A quarantined ring page and a lease still held by an in-flight stream.
+        let quarantined = lease(&mut t, key);
+        let in_flight = lease(&mut t, key);
+        drop(t.release(key));
+        assert_eq!(freed(key), 0);
+        // The failed ring is quarantined: the owner (the source tensor) is released first.
+        drop(in_flight);
+        assert_eq!(freed(key), 0, "quarantine keeps the pinned source alive");
+        // `drain` syncs the streams, then releases the pages' leases.
+        drop(quarantined);
+        assert_eq!(freed(key), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_adopts_once_and_second_release_is_none() {
+        let key = 0x6000;
+        let mut t = HostLeaseTable::new();
+        let mut adoptions = 0;
+        let first = t
+            .lease_with(key, || {
+                adoptions += 1;
+                Ok(FakeOwner(key))
+            })
+            .unwrap();
+        let second = t
+            .lease_with(key, || {
+                adoptions += 1;
+                Ok(FakeOwner(key))
+            })
+            .unwrap();
+        assert_eq!(
+            adoptions, 1,
+            "a second lease clones the owner, never re-adopts"
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(t.release(key).is_some());
+        assert!(
+            t.release(key).is_none(),
+            "double release never frees or returns twice"
+        );
+        drop((first, second));
+        assert_eq!(freed(key), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_type_erased_keepalive_holds_the_owner_without_a_wrapper() {
+        // `HostAllocLease::keepalive` is `owner.clone()` coerced to `Arc<dyn Any + Send + Sync>`:
+        // the same physical Arc (no extra allocation, no second owner).
+        let key = 0x8000;
+        let mut t = HostLeaseTable::new();
+        let owner = lease(&mut t, key);
+        let keep: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
+        assert_eq!(
+            Arc::strong_count(&owner),
+            3,
+            "registry + owner + keepalive share one Arc"
+        );
+        drop(owner);
+        drop(t.release(key));
+        assert_eq!(
+            freed(key),
+            0,
+            "the erased keepalive alone keeps the bytes alive"
+        );
+        drop(keep);
+        assert_eq!(freed(key), 1, "the last holder frees exactly once");
+    }
+
+    #[test]
+    fn slowlink_host_lease_failed_adoption_leaves_the_table_unchanged() {
+        let key = 0x7000;
+        let mut t: HostLeaseTable<FakeOwner> = HostLeaseTable::new();
+        let err = t.lease_with(key, || Err(hip_bridge::HipError::new(1, "adopt")));
+        assert!(err.is_err());
+        assert_eq!(t.len(), 0);
+        assert!(t.release(key).is_none());
+        assert_eq!(freed(key), 0);
+    }
+}
+
+#[cfg(test)]
+mod lab_fn_carve_tests {
+    use super::{Gpu, LabFnOverflow, LabFnRecord};
+
+    fn record(symbol: &str) -> LabFnRecord {
+        LabFnRecord {
+            symbol: symbol.to_string(),
+            grid: [1, 2, 1],
+            block: [128, 1, 1],
+            width: 1280,
+            down: false,
+            grouped_rows: 16,
+            n_experts: 8,
+            total_slots: 80,
+            source_rows: 8,
+            module: "mod".to_string(),
+            container_sha256: "c".to_string(),
+            device_sha256: "d".to_string(),
+            host_mapped: false,
+            bf16_round_trip: true,
+            chunk_rows: 8,
+        }
+    }
+
+    #[test]
+    fn success_record_drains_with_full_geometry_and_provenance() {
+        let out = Gpu::lab_fn_split((vec![record("gate_up"), record("down")], 0))
+            .expect("success drains");
+        assert_eq!(out.1, LabFnOverflow(0));
+        assert_eq!(out.0.len(), 2);
+        assert_eq!(out.0[0].width, 1280);
+        assert_eq!(out.0[0].total_slots, 80);
+        assert_eq!(out.0[0].source_rows, 8);
+        assert_eq!(out.0[0].n_experts, 8);
+        assert_eq!(out.0[0].module, "mod");
+    }
+
+    #[test]
+    fn empty_window_is_omitted_absent_nonpass() {
+        assert!(Gpu::lab_fn_split((Vec::new(), 0)).is_none());
+    }
+
+    #[test]
+    fn overflow_marks_incomplete_and_keeps_collected_prefix() {
+        let (kept, overflow) =
+            Gpu::lab_fn_split((vec![record("gate_up")], 3)).expect("overflow drains");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(overflow, LabFnOverflow(3));
+        assert!(overflow.0 != 0);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_kernel_fault_counts_successes_then_fails_once_and_disarms() {
+        let fault = super::LabKernelFaultCountdown::default();
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(fault.disarm(), super::LabKernelFaultReceipt::default());
+        fault.arm(2).unwrap();
+        fault.before_launch().unwrap();
+        // A failed HIP submission does not call launched_successfully.
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert!(fault.before_launch().is_err());
+        // One-shot: repair launches cannot see a second failure.
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 2,
+                injected: true,
+            }
+        );
+        assert_eq!(fault.disarm(), super::LabKernelFaultReceipt::default());
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_kernel_fault_disarm_cancels_pending_failure() {
+        let fault = super::LabKernelFaultCountdown::default();
+        assert!(fault.arm(usize::MAX).is_err());
+        fault.arm(1).unwrap();
+        assert!(fault.arm(1).is_err());
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 1,
+                injected: false,
+            }
+        );
+        fault.before_launch().unwrap();
+        fault.arm(0).unwrap();
+        assert!(fault.before_launch().is_err());
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 0,
+                injected: true,
+            }
+        );
+    }
+
+    const QSA_MIB: usize = 1 << 20;
+
+    fn qsa_verdict(
+        bias: usize,
+        offset: usize,
+        len: usize,
+        limit: usize,
+    ) -> Result<usize, super::QsaExtentFailure> {
+        super::qsa_extent_verdict("test", super::qsa_required_end(bias, offset, len), limit)
+    }
+
+    #[test]
+    fn qsa_extent_in_bounds_and_exact_end_pass() {
+        assert_eq!(qsa_verdict(0, 0, 0, 0), Ok(0));
+        assert_eq!(qsa_verdict(0, 16, 48, 128), Ok(64));
+        assert_eq!(qsa_verdict(32, 16, 48, 96), Ok(96), "exact end is allowed");
+    }
+
+    #[test]
+    fn qsa_extent_one_over_fails_with_arena_limit_and_end() {
+        let failure = qsa_verdict(32, 16, 49, 96).unwrap_err();
+        assert_eq!(
+            failure,
+            super::QsaExtentFailure {
+                arena: "test",
+                limit_bytes: 96,
+                required_end: 97,
+                overflow: false
+            }
+        );
+    }
+
+    #[test]
+    fn qsa_extent_usize_overflow_is_rejected() {
+        assert_eq!(super::qsa_required_end(usize::MAX, 1, 0), None);
+        assert_eq!(super::qsa_required_end(0, usize::MAX, 1), None);
+        assert_eq!(
+            super::qsa_required_end(1, usize::MAX - 2, 1),
+            Some(usize::MAX)
+        );
+        // Even with an unbounded limit an overflowed end must not pass.
+        for (bias, offset, len) in [
+            (usize::MAX, 1, 0),
+            (0, usize::MAX, 1),
+            (usize::MAX / 2 + 1, usize::MAX / 2 + 1, 0),
+        ] {
+            let failure = qsa_verdict(bias, offset, len, usize::MAX).unwrap_err();
+            assert!(failure.overflow);
+            assert_eq!(failure.required_end, usize::MAX);
+            assert_eq!(failure.limit_bytes, usize::MAX);
+        }
+        // Unknown storage (required end `None`) fails closed.
+        assert!(
+            super::qsa_extent_verdict("unknown", None, 0)
+                .unwrap_err()
+                .overflow
+        );
+    }
+
+    #[test]
+    fn qsa_extent_limit_uses_mapped_prefix_not_logical_size() {
+        let base = 0x7000_0000_0000usize;
+        let reserved = 64 * QSA_MIB;
+        let mapped = 4 * QSA_MIB;
+        let owners = [(base, reserved, mapped), (0x1000, 0x1000, 0x800)];
+        // A view 1 MiB into the owner: bias 1 MiB, limit is the mapped prefix.
+        let (bias, limit) = super::qsa_extent_limit(base + QSA_MIB, owners, 32 * QSA_MIB);
+        assert_eq!((bias, limit), (QSA_MIB, mapped));
+        assert!(
+            limit < 32 * QSA_MIB,
+            "mapped prefix is smaller than the logical size"
+        );
+        // Logical size is within the view but past the mapped prefix: rejected.
+        let failure = qsa_verdict(bias, 0, 3 * QSA_MIB + 1, limit).unwrap_err();
+        assert_eq!(failure.limit_bytes, mapped);
+        assert_eq!(failure.required_end, QSA_MIB + 3 * QSA_MIB + 1);
+        assert_eq!(qsa_verdict(bias, 0, 3 * QSA_MIB, limit), Ok(mapped));
+        // Outside every owner (and at the reserved end): allocation size.
+        assert_eq!(
+            super::qsa_extent_limit(base + reserved, owners, 4096),
+            (0, 4096)
+        );
+        assert_eq!(super::qsa_extent_limit(0x2000, owners, 123), (0, 123));
+        assert_eq!(super::qsa_extent_limit(base, [], 77), (0, 77));
+    }
+
+    #[test]
+    fn qsa_extent_bf16_index_rows_at_dim128_2mib_boundary() {
+        let row_bytes = 128 * super::DType::BF16.size();
+        let limit = 2 * QSA_MIB;
+        assert_eq!(8192 * row_bytes, limit);
+        assert_eq!(qsa_verdict(0, 0, 8192 * row_bytes, limit), Ok(limit));
+        let failure = qsa_verdict(0, 0, 8193 * row_bytes, limit).unwrap_err();
+        assert_eq!(failure.limit_bytes, limit);
+        assert_eq!(failure.required_end, 8193 * row_bytes);
+        assert!(!failure.overflow);
+    }
+
     /// Pins the per-row geometry the per-arch copies used to hard-code.
     #[test]
     fn row_bytes_matches_the_producer_layouts() {
@@ -7657,6 +10014,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
         assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
+        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
+        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
@@ -7666,6 +10026,29 @@ mod tests {
         assert_eq!(DType::MFP3G32E8.row_bytes(256), Some(120));
         assert_eq!(DType::Q8_0.row_bytes(0), None);
         assert_eq!(DType::Raw.row_bytes(8), None);
+    }
+
+    /// qt=131..=134 are planar typed-qwen4-only formats: byte-level `size()`,
+    /// no per-row stride, and a name for generic consumers to refuse by.
+    #[test]
+    fn mq_i4_dtypes_are_planar_and_typed_only() {
+        for (dt, name) in [
+            (DType::MQ3I4G128R256, "MQ3I4G128R256"),
+            (DType::MQ3I4G128R128, "MQ3I4G128R128"),
+            (DType::MQ2I4G128R256, "MQ2I4G128R256"),
+            (DType::MQ2I4G128R128, "MQ2I4G128R128"),
+            (DType::E8PI4G128R256, "E8PI4G128R256"),
+            (DType::E8PI4G128R128, "E8PI4G128R128"),
+        ] {
+            assert_eq!(dt.size(), 1);
+            assert_eq!(dt.row_bytes(128), None);
+            assert_eq!(dt.row_bytes(640), None);
+            assert_eq!(dt.row_bytes(2560), None);
+            assert_eq!(dt.mq_i4_name(), Some(name));
+            assert!(dt.is_mq_i4());
+        }
+        assert!(!DType::MQ4G128V2.is_mq_i4());
+        assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
     }
 
     #[test]
@@ -7691,15 +10074,19 @@ mod tests {
     fn kernarg_cross_check_rejects_params_order_mismatch() {
         let mut m = 3i32;
         let mut k = 4i32;
-        let params: Vec<*mut c_void> =
-            vec![&mut k as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void];
+        let params: Vec<*mut c_void> = vec![
+            &mut k as *mut _ as *mut c_void,
+            &mut m as *mut _ as *mut c_void,
+        ];
         super::debug_assert_params_match(
             &params,
-            &[super::kernarg_value_bytes(&m), super::kernarg_value_bytes(&k)],
+            &[
+                super::kernarg_value_bytes(&m),
+                super::kernarg_value_bytes(&k),
+            ],
         );
     }
 
-    use std::ffi::c_void;
     use super::gen_fwht_signs;
     use super::DType;
     use super::Gpu;
@@ -7708,6 +10095,7 @@ mod tests {
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
+    use std::ffi::c_void;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -7898,23 +10286,11 @@ mod tests {
         );
     }
 
-    /// One device is shared by every GPU test in this module, and several assert on
-    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
-    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
-    /// allocating or freeing VRAM in that window breaks — observed as a failure on
-    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
-    /// change. Holding this lock for each GPU test's duration makes the suite
-    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
-    /// in one test must not fail the rest.
-    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Serialized GPU handle for a test. The guard must be *bound* for the test's
     /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
     /// dropping it immediately would release the lock.
     fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
-        let guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::gpu_test::lock();
         match super::Gpu::init() {
             Ok(gpu) => Some((gpu, guard)),
             Err(_) => None,
@@ -7959,6 +10335,62 @@ mod tests {
 
         gpu.free_tensor(t).ok();
         gpu.free_tensor(dev).ok();
+    }
+
+    /// A kernel launched past the replay recorder (a raw `hip.launch_kernel`)
+    /// inside an automatic capture window runs once but is missing from the
+    /// tape, so every replay would skip it. Prepare must refuse that tape
+    /// (sticky HIP fallback) and accept the same window without the stray
+    /// launch (HIPF-121: legacy MQ5G256 decoded garbage under Redline).
+    #[test]
+    fn retained_prepare_refuses_a_window_with_an_unrecorded_launch() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let a = gpu.upload_f32(&[1.0; 256], &[256]).expect("upload");
+        let b = gpu.zeros(&[256], super::DType::F32).expect("zeros");
+        for stray in [false, true] {
+            if !gpu.replay.configure_model_default(true) {
+                eprintln!("skip: an explicit replay backend disables the automatic lifecycle");
+                return;
+            }
+            gpu.replay.set_forward_eligible(true);
+            gpu.replay
+                .begin_auto_capture_if_armed()
+                .expect("begin capture");
+            assert!(gpu.replay.is_recording());
+            gpu.copy_f32_buffer(&b, &a, 256).expect("recorded copy");
+            gpu.copy_f32_buffer(&a, &b, 256).expect("recorded copy");
+            if stray {
+                let (dp, sp, n) = (b.buf.as_ptr(), a.buf.as_ptr(), 256i32);
+                let mut params: [*mut std::ffi::c_void; 3] = [
+                    &dp as *const _ as *mut _,
+                    &sp as *const _ as *mut _,
+                    &n as *const _ as *mut _,
+                ];
+                // SAFETY: the params match copy_f32_buffer(dst, src, n), loaded above.
+                unsafe {
+                    gpu.hip.launch_kernel(
+                        &gpu.functions["copy_f32_buffer"],
+                        [1, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        gpu.active_stream.as_ref(),
+                        &mut params,
+                    )
+                }
+                .expect("stray launch");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            gpu.replay.finish_capture().expect("finish capture");
+            let prepared = gpu.replay.prepare_pm4_prefix(gpu.device_id as usize, 2);
+            let refused = prepared
+                .as_ref()
+                .is_err_and(|reason| reason.contains("unrecorded launch"));
+            assert_eq!(refused, stray, "{prepared:?}");
+        }
+        gpu.replay.configure_model_default(false);
     }
 
     /// The row-chunked requant (and its reordered ranges) packs every row
@@ -8299,9 +10731,17 @@ mod tests {
         assert_eq!(alias(short, 3 * MIB), 3 * MIB);
         assert_eq!(alias(short, 3 * MIB - 1), 2 * MIB);
         assert_eq!(alias(std::iter::empty::<usize>(), MIB), 0);
-        assert_eq!(alias([0usize, 2 * MIB], 4 * MIB), 0, "zero-size granule ends the walk");
+        assert_eq!(
+            alias([0usize, 2 * MIB], 4 * MIB),
+            0,
+            "zero-size granule ends the walk"
+        );
         assert_eq!(alias([usize::MAX, 2], usize::MAX), usize::MAX);
-        assert_eq!(alias([usize::MAX, 2], usize::MAX - 1), 0, "overflowing sum ends the walk");
+        assert_eq!(
+            alias([usize::MAX, 2], usize::MAX - 1),
+            0,
+            "overflowing sum ends the walk"
+        );
     }
 
     /// FP8 rows are 516 B (512 payload + 4 scale), so a row straddles the 2 MiB
@@ -8320,12 +10760,18 @@ mod tests {
         let kv_alias = alias(granules, limit);
         assert_eq!(kv_alias, GRANULE);
         assert_eq!(valid - kv_alias, 388);
-        assert_eq!((valid - kv_alias) % ROW, ROW - (GRANULE - (GRANULE / ROW) * ROW));
+        assert_eq!(
+            (valid - kv_alias) % ROW,
+            ROW - (GRANULE - (GRANULE / ROW) * ROW)
+        );
         // Raw index with an in-place restored tail: writable_from four rows
         // short of valid falls inside granule 0, so nothing may alias.
         let writable_from = valid - 4 * ROW;
         assert!(writable_from < GRANULE);
-        assert_eq!(alias(granules, valid.min(writable_from).min(4 * GRANULE)), 0);
+        assert_eq!(
+            alias(granules, valid.min(writable_from).min(4 * GRANULE)),
+            0
+        );
         // granule_prefix_bytes caps the alias even when valid is larger.
         assert_eq!(alias(granules, valid.min(valid).min(GRANULE)), GRANULE);
         assert_eq!(alias(granules, 3 * GRANULE - 1), 2 * GRANULE);
@@ -8364,7 +10810,10 @@ mod tests {
             vmm_move(0x11_000, 0x91_000, 0x1000),
             vmm_move(0x20_000, 0xa0_000, 0x2000),
         ];
-        assert!(validate(&ok).is_ok(), "adjacent and disjoint ranges are fine");
+        assert!(
+            validate(&ok).is_ok(),
+            "adjacent and disjoint ranges are fine"
+        );
         assert!(validate(&[]).is_ok());
 
         let duplicate = [
@@ -8396,7 +10845,9 @@ mod tests {
             .contains("reserved_bytes is zero"));
         let mut bad_mapped = vmm_move(0x10_000, 0x90_000, 0x1000);
         bad_mapped.mapped_bytes = 0x1001;
-        assert!(validate(&[bad_mapped]).unwrap_err().contains("exceeds reserved"));
+        assert!(validate(&[bad_mapped])
+            .unwrap_err()
+            .contains("exceeds reserved"));
         assert!(validate(&[vmm_move(usize::MAX - 8, 0x90_000, 0x1000)])
             .unwrap_err()
             .contains("overflows"));
@@ -8408,9 +10859,7 @@ mod tests {
     #[ignore = "needs a HIP device with VMM granule support"]
     fn vmm_prefix_capture_fork_hw() {
         use hip_bridge::DeviceBuffer;
-        let _guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::gpu_test::lock();
         let mut gpu = Gpu::init().expect("vmm_prefix_capture_fork_hw requires a HIP device");
         hip_bridge::clear_vmm_faults();
         let access = [gpu.device_id];
@@ -8419,7 +10868,9 @@ mod tests {
         let granularity = gpu
             .vmm_recommended_granularity()
             .expect("VMM granularity query");
-        let granule = (2usize << 20).max(granularity).next_multiple_of(granularity);
+        let granule = (2usize << 20)
+            .max(granularity)
+            .next_multiple_of(granularity);
         let mut src = unsafe { gpu.alloc_vmm_tensor(&[4 * granule], DType::Raw, 0, &access) }
             .expect("alloc VMM source");
         let mapped = gpu
@@ -8461,7 +10912,11 @@ mod tests {
         let mut forks = gpu.fork_vmm_prefixes(&set, &access).expect("fork prefix");
         assert_eq!(forks.len(), 1);
         let fork = forks.pop().unwrap();
-        assert_ne!(fork.buf.as_ptr(), src.buf.as_ptr(), "fork must use a fresh VA");
+        assert_ne!(
+            fork.buf.as_ptr(),
+            src.buf.as_ptr(),
+            "fork must use a fresh VA"
+        );
         assert_ne!(gpu.vmm_owner_generation(&fork), Some(src_generation));
         let fork_mapped = gpu.vmm_mapped_bytes(&fork).expect("fork mapped");
         assert_eq!(fork_mapped, 3 * granule);
@@ -8469,8 +10924,16 @@ mod tests {
         let src_ids = gpu.vmm_physical_granules(&src).expect("source granules");
         let fork_ids = gpu.vmm_physical_granules(&fork).expect("fork granules");
         assert_eq!(fork_ids.len(), 3);
-        assert_eq!(fork_ids[..2], src_ids[..2], "aliased granules share physical ids");
-        assert_eq!(fork_ids[..2], aliased[..], "set reports the aliased granules");
+        assert_eq!(
+            fork_ids[..2],
+            src_ids[..2],
+            "aliased granules share physical ids"
+        );
+        assert_eq!(
+            fork_ids[..2],
+            aliased[..],
+            "set reports the aliased granules"
+        );
         assert_ne!(fork_ids[2], src_ids[2], "the frontier granule is private");
         let mv = gpu.vmm_resource_move(&src, &fork).expect("resource move");
         assert_eq!(mv.old_base, src.buf.as_ptr() as usize);
@@ -8484,7 +10947,11 @@ mod tests {
         gpu.hip
             .memcpy_dtoh(&mut fork_bytes, &view(&fork, fork_mapped))
             .expect("read fork");
-        assert_eq!(fork_bytes[..valid], pattern[..valid], "fork prefix != source");
+        assert_eq!(
+            fork_bytes[..valid],
+            pattern[..valid],
+            "fork prefix != source"
+        );
         assert!(
             fork_bytes[valid..].iter().all(|byte| *byte == 0),
             "fork bytes past valid must be zero"
@@ -8512,6 +10979,88 @@ mod tests {
         gpu.free_tensor(fork).expect("free fork");
         gpu.free_vmm_prefixes(set).expect("free prefix set");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    /// Nonzero, step-dependent byte pattern for the VMM growth tests.
+    fn vmm_grow_pattern(step: usize, index: usize) -> u8 {
+        ((index * 131 + step * 17 + 7) % 251) as u8 + 1
+    }
+
+    /// Several growth steps (whole-segment `grow_vmm_tensor` and granule
+    /// `grow_vmm_tensor_granules`) over one arena: every step maps exactly the
+    /// requested bytes, the fresh range reads zero after the owner's zeroing
+    /// memset (the `grow_context_arena` contract), and every earlier step's
+    /// bytes survive each later growth.
+    #[test]
+    fn vmm_grow_steps_preserve_prior_bytes_and_zero_fresh() {
+        use hip_bridge::DeviceBuffer;
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        for granules in [false, true] {
+            let Ok(granularity) = gpu.vmm_recommended_granularity() else {
+                eprintln!("skip: VMM unavailable");
+                return;
+            };
+            let unit = (2usize << 20).next_multiple_of(granularity);
+            let steps = [1usize, 2, 1, 3, 1, 2];
+            let total: usize = steps.iter().sum::<usize>() * unit;
+            let mut tensor = match unsafe { gpu.alloc_vmm_tensor(&[total], DType::Raw, 0, &access) }
+            {
+                Ok(tensor) => tensor,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+            let view = |t: &super::GpuTensor, bytes: usize| unsafe {
+                DeviceBuffer::from_raw(t.buf.as_ptr(), bytes)
+            };
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut mapped = 0usize;
+            for (step, units) in steps.iter().enumerate() {
+                let bytes = units * unit;
+                let grown = if granules {
+                    gpu.grow_vmm_tensor_granules(&mut tensor, bytes, &access)
+                } else {
+                    gpu.grow_vmm_tensor(&mut tensor, bytes, &access)
+                }
+                .expect("grow step");
+                assert_eq!(grown, mapped + bytes, "step {step} mapped bytes");
+                assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(grown));
+
+                // The grower's zeroing contract: memset exactly the fresh range.
+                let fresh = view(&tensor, grown).byte_view(mapped, bytes);
+                gpu.hip.memset(&fresh, 0, bytes).expect("zero fresh range");
+                let mut read = vec![0xA5u8; bytes];
+                gpu.hip.memcpy_dtoh(&mut read, &fresh).expect("read fresh");
+                assert!(
+                    read.iter().all(|b| *b == 0),
+                    "granules={granules} step {step}: fresh range is not zero"
+                );
+                let pattern: Vec<u8> = (0..bytes).map(|i| vmm_grow_pattern(step, i)).collect();
+                gpu.hip.memcpy_htod(&fresh, &pattern).expect("fill fresh");
+                ranges.push((mapped, bytes));
+                mapped = grown;
+
+                for (prior, &(offset, len)) in ranges.iter().enumerate() {
+                    let mut got = vec![0u8; len];
+                    gpu.hip
+                        .memcpy_dtoh(&mut got, &view(&tensor, mapped).byte_view(offset, len))
+                        .expect("read prior range");
+                    assert!(
+                        got.iter()
+                            .enumerate()
+                            .all(|(i, b)| *b == vmm_grow_pattern(prior, i)),
+                        "granules={granules}: step {prior} bytes changed by growth step {step}"
+                    );
+                }
+            }
+            gpu.free_tensor(tensor).expect("free tensor");
+        }
     }
 
     /// Alloc→init failure must return the owner to the pool. Baseline is taken
@@ -9005,10 +11554,16 @@ mod tests {
         let mib = 1usize << 20;
         assert_eq!(p, 64 * 1024);
         assert!(super::validate_weight_extents(p + g, 1, g).is_ok());
-        assert!(super::validate_weight_extents(p + g, g, g).is_ok(), "exact logical + pad");
+        assert!(
+            super::validate_weight_extents(p + g, g, g).is_ok(),
+            "exact logical + pad"
+        );
         assert!(super::validate_weight_extents(p + 2 * g, g + 1, g).is_ok());
         assert!(super::validate_weight_extents(64 * mib + p, 64 * mib, g).is_ok());
-        assert!(super::validate_weight_extents(2 * p + g, 1, g).is_ok(), "not exact ceil");
+        assert!(
+            super::validate_weight_extents(2 * p + g, 1, g).is_ok(),
+            "not exact ceil"
+        );
         assert!(super::validate_weight_extents(2 * mib, 1, 2 * mib).is_ok());
         assert!(super::validate_weight_extents(66 * mib, 64 * mib, 2 * mib).is_ok());
     }
@@ -9032,8 +11587,14 @@ mod tests {
         let mib = 1usize << 20;
         assert!(super::validate_weight_extents(p, 1, g).is_err());
         assert!(super::validate_weight_extents(p + g, g + 1, g).is_err());
-        assert!(super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(), "no tail");
-        assert!(super::validate_weight_extents(g, g + 1, g).is_err(), "logical beyond physical");
+        assert!(
+            super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(),
+            "no tail"
+        );
+        assert!(
+            super::validate_weight_extents(g, g + 1, g).is_err(),
+            "logical beyond physical"
+        );
         assert!(super::validate_weight_extents(64 * mib, 64 * mib, 2 * mib).is_err());
     }
 
@@ -9044,7 +11605,9 @@ mod tests {
         let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
         assert!(super::validate_weight_extents(p + g + 1, 1, g).is_err());
         assert!(super::validate_weight_extents(p + g - 1, 1, g).is_err());
-        assert!(super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err());
+        assert!(
+            super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -9068,7 +11631,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn s2_read(gpu: &super::Gpu, buf: &hip_bridge::DeviceBuffer, off: usize, len: usize) -> Vec<u8> {
+    fn s2_read(
+        gpu: &super::Gpu,
+        buf: &hip_bridge::DeviceBuffer,
+        off: usize,
+        len: usize,
+    ) -> Vec<u8> {
         let mut out = vec![0u8; len];
         gpu.hip
             .memcpy_dtoh_at(&mut out, buf, off)
@@ -9086,7 +11654,12 @@ mod tests {
             let n = chunk.min(logical - off);
             let got = s2_read(gpu, &owner.buf, off, n);
             if let Some(i) = (0..n).find(|&i| got[i] != pattern[off + i]) {
-                panic!("byte {} differs: got {} want {}", off + i, got[i], pattern[off + i]);
+                panic!(
+                    "byte {} differs: got {} want {}",
+                    off + i,
+                    got[i],
+                    pattern[off + i]
+                );
             }
             off += n;
         }
@@ -9094,7 +11667,12 @@ mod tests {
 
     /// Padding in `[logical, physical)` reads back zero.
     #[cfg(target_os = "linux")]
-    fn s2_check_tail_zero(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize, physical: usize) {
+    fn s2_check_tail_zero(
+        gpu: &super::Gpu,
+        owner: &super::GpuTensor,
+        logical: usize,
+        physical: usize,
+    ) {
         let tail = physical - logical;
         if tail == 0 {
             return;
@@ -9128,7 +11706,11 @@ mod tests {
     /// Freeing a borrowed view of a registered owner is refused and leaves the
     /// registration (and the orphan table) untouched.
     #[cfg(target_os = "linux")]
-    fn s2_assert_borrowed_free_rejected(gpu: &mut super::Gpu, owner: &super::GpuTensor, logical: usize) {
+    fn s2_assert_borrowed_free_rejected(
+        gpu: &mut super::Gpu,
+        owner: &super::GpuTensor,
+        logical: usize,
+    ) {
         let key = owner.buf.as_ptr() as usize;
         let before = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
         let view = || super::GpuTensor {
@@ -9137,7 +11719,9 @@ mod tests {
             shape: vec![logical],
             dtype: super::DType::Raw,
         };
-        let err = gpu.free_tensor(view()).expect_err("borrowed free must fail");
+        let err = gpu
+            .free_tensor(view())
+            .expect_err("borrowed free must fail");
         assert!(err.to_string().contains("borrowed VMM view"), "{err}");
         let err = gpu
             .release_tensor_immediate(view())
@@ -9174,10 +11758,14 @@ mod tests {
         let logical = (3usize << 20) + 12_345;
         let mut pattern = s2_pattern(logical);
         pattern.extend_from_slice(&[0xa5; 256]);
-        let mut src = gpu.upload_raw(&pattern, &[pattern.len()]).expect("upload small source");
+        let mut src = gpu
+            .upload_raw(&pattern, &[pattern.len()])
+            .expect("upload small source");
         let view = src.sub_offset(0, logical);
         assert!(view.buf.is_borrowed());
-        let exp = gpu.create_exportable_weight_copy(&view).expect("export bounded small source");
+        let exp = gpu
+            .create_exportable_weight_copy(&view)
+            .expect("export bounded small source");
         drop(view);
         assert_eq!(exp.logical_bytes, logical);
         assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
@@ -9188,7 +11776,8 @@ mod tests {
         s2_assert_owner(gpu, &exp.owner, logical);
         s2_check_pattern(gpu, &exp.owner, logical);
         s2_check_tail_zero(gpu, &exp.owner, logical, exp.physical_bytes);
-        gpu.release_weight_source_immediate(&mut src).expect("release small source");
+        gpu.release_weight_source_immediate(&mut src)
+            .expect("release small source");
         let super::ExportedWeightAllocation { owner, fd, .. } = exp;
         gpu.free_tensor(owner).expect("free small owner");
         drop(fd);
@@ -9255,9 +11844,7 @@ mod tests {
         use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::process::CommandExt;
 
-        let _guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::gpu_test::lock();
         let mut gpu = super::Gpu::init().expect("GPU initialization must succeed");
         assert_eq!(gpu.arch, "gfx1201", "test is gated to gfx1201");
         if std::env::var("WH_S2_IMPORT_FD").is_ok() {
@@ -9268,11 +11855,21 @@ mod tests {
         s2_small_nonaligned_case(&mut gpu);
 
         let logical = 64usize << 20;
-        let mut src = gpu.upload_raw(&s2_pattern(logical), &[logical]).expect("upload source");
-        let exp = gpu.create_exportable_weight_copy(&src).expect("create exportable copy");
+        let mut src = gpu
+            .upload_raw(&s2_pattern(logical), &[logical])
+            .expect("upload source");
+        let exp = gpu
+            .create_exportable_weight_copy(&src)
+            .expect("create exportable copy");
         assert_eq!(exp.logical_bytes, logical);
-        assert_eq!(exp.granularity, 4096, "weight arenas use the minimum granularity");
-        assert_eq!(exp.physical_bytes, logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert_eq!(
+            exp.granularity, 4096,
+            "weight arenas use the minimum granularity"
+        );
+        assert_eq!(
+            exp.physical_bytes,
+            logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES
+        );
         assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
         eprintln!(
             "S2_EXPORTER pid={} logical={} physical={} granularity={} vram_used={}",
@@ -9302,7 +11899,8 @@ mod tests {
 
         // Old hipMalloc owner is physically released, not parked.
         let before = s2_vram_used();
-        gpu.release_weight_source_immediate(&mut src).expect("release old owner");
+        gpu.release_weight_source_immediate(&mut src)
+            .expect("release old owner");
         assert!(src.buf.is_borrowed() && src.buf.size() == 0 && src.shape == vec![0]);
         gpu.release_weight_source_immediate(&mut src)
             .expect_err("emptied source is not a hipMalloc owner");
@@ -9323,7 +11921,10 @@ mod tests {
         let raw = exp.fd.as_raw_fd();
         // SAFETY: F_GETFD on an FD this process owns.
         let flags = unsafe { fcntl(raw, S2_F_GETFD) };
-        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exported FD must be CLOEXEC");
+        assert!(
+            flags >= 0 && flags & S2_FD_CLOEXEC != 0,
+            "exported FD must be CLOEXEC"
+        );
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
         cmd.args([
             "--exact",
@@ -9348,7 +11949,10 @@ mod tests {
         assert!(status.success(), "importer failed: {status:?}");
         // SAFETY: as above; the child's pre_exec cannot change the parent's descriptor flags.
         let flags = unsafe { fcntl(raw, S2_F_GETFD) };
-        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exporter FD lost CLOEXEC");
+        assert!(
+            flags >= 0 && flags & S2_FD_CLOEXEC != 0,
+            "exporter FD lost CLOEXEC"
+        );
 
         let super::ExportedWeightAllocation { owner, fd, .. } = exp;
         assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));

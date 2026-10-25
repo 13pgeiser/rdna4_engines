@@ -468,7 +468,10 @@ mod tests {
 
     #[test]
     fn zero_work_is_an_error_not_a_silent_single_lane() {
-        assert_eq!(resolve(&LaneWidth::Measured, "gfx1100", 0), Err(LaneError::NoWork));
+        assert_eq!(
+            resolve(&LaneWidth::Measured, "gfx1100", 0),
+            Err(LaneError::NoWork)
+        );
     }
 
     #[test]
@@ -573,7 +576,10 @@ mod tests {
 
     #[test]
     fn probe_plan_for_measured_uses_table() {
-        assert_eq!(probe_plan(&LaneWidth::Measured, "gfx1201", 512), Ok(vec![2]));
+        assert_eq!(
+            probe_plan(&LaneWidth::Measured, "gfx1201", 512),
+            Ok(vec![2])
+        );
         assert_eq!(
             probe_plan(&LaneWidth::Measured, "gfx942", 512),
             Ok(vec![CONSERVATIVE_LANES])

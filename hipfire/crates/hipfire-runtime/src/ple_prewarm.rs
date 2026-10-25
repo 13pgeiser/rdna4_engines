@@ -13,8 +13,9 @@
 //! [`PleRowsPrewarm`] reads `[data_offset, data_offset + min(budget, data_bytes))`
 //! in 8 MiB chunks with plain buffered `pread`s into one reused buffer (the data
 //! is discarded), and only while the row store is idle: before every chunk it
-//! waits on the row store's [`FetchActivity`] until no fetch is in flight and the
-//! last one finished [`FETCH_QUIET`] ago (the rule of the hot-row prewarm).  The
+//! waits on the row store's [`FetchActivity`] until no request is being served
+//! (no whole-request `ServingGuard` and no per-fetch guard held) and the last
+//! guard dropped [`FETCH_QUIET`] ago (the rule of the hot-row prewarm).  The
 //! budget can be set after spawn ([`PleRowsPrewarm::set_budget`]); the worker
 //! reads nothing before it.  Dropping the handle stops and joins the worker.
 //!
@@ -27,32 +28,47 @@
 //!                  complete() -> bool, failed() -> bool}
 //! ```
 //!
+//! Off Unix `spawn` returns `ErrorKind::Unsupported` without opening the file
+//! (the prewarm needs positional reads and `posix_fadvise`).
+//!
 //! Log lines (stderr, harness scripts key on the prefixes):
 //! `  qwen4 ple prewarm: complete, <MiB> MiB in <secs> s ...`,
 //! `  qwen4 ple prewarm: stopped, ...`, `  qwen4 ple prewarm: failed, ...`.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use crate::external_rows::{FetchActivity, FETCH_QUIET};
 
 /// Bytes per prewarm read.
+#[cfg(unix)]
 const PREWARM_CHUNK: usize = 8 << 20;
 /// `budget` before [`PleRowsPrewarm::set_budget`].
+#[cfg(unix)]
 const BUDGET_UNSET: u64 = u64::MAX;
+#[cfg(unix)]
 const TAG: &str = "  qwen4 ple prewarm:";
 
+#[cfg(unix)]
 fn mib(bytes: u64) -> u64 {
     bytes >> 20
 }
 
+// Off Unix no worker is ever spawned, so the struct is only read by the
+// platform-independent handle methods.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Shared {
     data_offset: u64,
     data_bytes: u64,
@@ -85,6 +101,7 @@ impl PleRowsPrewarm {
     }
 
     /// [`PleRowsPrewarm::spawn`] with an explicit quiet period (tests).
+    #[cfg(unix)]
     pub(crate) fn spawn_with_quiet(
         path: &Path,
         data_offset: u64,
@@ -117,6 +134,23 @@ impl PleRowsPrewarm {
             shared,
             worker: Some(worker),
         })
+    }
+
+    /// Unsupported off Unix: the prewarm needs positional reads and
+    /// `posix_fadvise`.  Fails before the file is touched and starts no worker.
+    #[cfg(not(unix))]
+    pub(crate) fn spawn_with_quiet(
+        _path: &Path,
+        _data_offset: u64,
+        _data_bytes: u64,
+        _activity: Arc<FetchActivity>,
+        _quiet: Duration,
+    ) -> io::Result<PleRowsPrewarm> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PLE sidecar page-cache prewarm is unsupported on Windows (it needs Unix \
+             positional reads and posix_fadvise); use a Unix host",
+        ))
     }
 
     /// Bytes of the data region to read (capped at its size; 0 = none).  The
@@ -158,6 +192,7 @@ impl Drop for PleRowsPrewarm {
     }
 }
 
+#[cfg(unix)]
 impl Shared {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
@@ -221,7 +256,7 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -307,6 +342,74 @@ mod tests {
         assert_eq!(prewarm.prewarmed_bytes(), 0);
         drop(guard);
         wait_until("second resume", || prewarm.complete());
+    }
+
+    /// A whole-request serving guard pauses the worker across the compute
+    /// gaps between that request's fetches (longer than `quiet`, where the
+    /// per-fetch guards alone would let it run); it resumes `quiet` after the
+    /// request ends and completes.
+    #[test]
+    fn pauses_across_a_whole_request_and_resumes_after_it() {
+        let (_dir, path) = data_file(OFFSET + DATA);
+        let activity = Arc::new(FetchActivity::new());
+        let serving = activity.serving();
+        let prewarm = spawn(&path, &activity);
+        prewarm.set_budget(DATA);
+        for _ in 0..3 {
+            // A fetch of the request, then a compute gap far over `quiet`.
+            drop(activity.busy());
+            std::thread::sleep(QUIET * 3);
+            assert_eq!(
+                prewarm.prewarmed_bytes(),
+                0,
+                "no progress while a request is being served"
+            );
+        }
+        assert!(!prewarm.complete());
+        let released = Instant::now();
+        drop(serving);
+        std::thread::sleep(QUIET / 3);
+        assert_eq!(prewarm.prewarmed_bytes(), 0, "quiet period not over yet");
+        wait_until("resume after the request", || prewarm.complete());
+        assert!(released.elapsed() >= QUIET);
+        assert_eq!(prewarm.prewarmed_bytes(), DATA);
+        assert!(!prewarm.failed());
+    }
+
+    /// A request that ends in an error or a cancellation releases its serving
+    /// guard on every path, so the paused worker resumes and completes.
+    #[test]
+    fn resumes_after_a_failed_or_canceled_request() {
+        let (_dir, path) = data_file(OFFSET + DATA);
+        for outcome in ["error", "panic"] {
+            let activity = Arc::new(FetchActivity::new());
+            let prewarm = spawn(&path, &activity);
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let request = {
+                let activity = activity.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    let _serving = activity.serving();
+                    let _fetch = activity.busy();
+                    held_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    if outcome == "panic" {
+                        panic!("request canceled mid-flight");
+                    }
+                    Err("request failed".to_string())
+                })
+            };
+            held_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            prewarm.set_budget(DATA);
+            std::thread::sleep(QUIET * 3);
+            assert_eq!(prewarm.prewarmed_bytes(), 0, "{outcome}: paused in flight");
+            finish_tx.send(()).unwrap();
+            let joined = request.join();
+            assert_eq!(joined.is_err(), outcome == "panic");
+            assert_eq!(activity.in_flight(), 0, "{outcome}: guards released");
+            wait_until("resume after the failed request", || prewarm.complete());
+            assert_eq!(prewarm.prewarmed_bytes(), DATA, "{outcome}");
+        }
     }
 
     /// Dropping the handle ends a worker that is paused or waiting for a budget.

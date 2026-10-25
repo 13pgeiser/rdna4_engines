@@ -16,8 +16,8 @@
 
 use hipfire_ds4_parent::inventory::{ParentInventory, ParentTensorClass};
 use hipfire_ds4_parent::manifest::{
-    sha256_file, CaptureBoundary, CaptureInfo, ModelInfo, ModelQuantInfo,
-    ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
+    sha256_file, CaptureBoundary, CaptureInfo, ModelInfo, ModelQuantInfo, ParentManifest,
+    ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
 use hipfire_ds4_parent::{Ds4ParentBackend, ParentQuantConfig};
 use hipfire_runtime::model_source::ModelSource;
@@ -77,10 +77,7 @@ fn run() -> Result<(), String> {
 
     // 2. Admit on a real gfx942 device.
     let mut gpu = Gpu::init().map_err(|e| format!("deepseek4 parent: Gpu::init failed: {e:?}"))?;
-    let gfx = gpu
-        .try_gfx942()
-        .map(|_| "gfx942")
-        .unwrap_or("not-gfx942");
+    let gfx = gpu.try_gfx942().map(|_| "gfx942").unwrap_or("not-gfx942");
     println!("gpu: {gfx}");
 
     let admit_t0 = Instant::now();
@@ -113,11 +110,7 @@ fn run() -> Result<(), String> {
     let class_stats = collect_class_stats(&source, &inv)?;
     print_class_stats(&class_stats, &inv);
 
-    let scale_pairings_main = inv
-        .entries
-        .iter()
-        .filter(|e| e.scale.is_some())
-        .count();
+    let scale_pairings_main = inv.entries.iter().filter(|e| e.scale.is_some()).count();
     // MTP quantized weights also had their scales claimed during build
     // (otherwise build would have refused). Count MTP weight names that
     // end in .weight among excluded_mtp.
@@ -150,10 +143,7 @@ fn run() -> Result<(), String> {
     println!(
         "engine: commit={} dirty={} rocm={}@{} arch={}",
         engine.commit,
-        engine
-            .dirty_diff_sha256
-            .as_deref()
-            .unwrap_or("clean"),
+        engine.dirty_diff_sha256.as_deref().unwrap_or("clean"),
         engine.rocm_path,
         engine.rocm_version,
         engine.gpu_arch
@@ -213,9 +203,8 @@ fn run() -> Result<(), String> {
         manifest.write_to(path)?;
         println!("wrote {}", path.display());
         // Echo a short preview so the log is self-contained.
-        let written = std::fs::read_to_string(path).map_err(|e| {
-            format!("deepseek4 parent: re-read manifest {}: {e}", path.display())
-        })?;
+        let written = std::fs::read_to_string(path)
+            .map_err(|e| format!("deepseek4 parent: re-read manifest {}: {e}", path.display()))?;
         println!("--- manifest.json begin ---");
         print!("{written}");
         if !written.ends_with('\n') {
@@ -228,18 +217,12 @@ fn run() -> Result<(), String> {
     println!("=== gate 1 summary ===");
     println!("admit:                 PASS");
     println!("assert_complete:       PASS ({EXPECTED_TENSORS})");
-    println!(
-        "inventory wall-clock:  {inv_secs:.3} s"
-    );
+    println!("inventory wall-clock:  {inv_secs:.3} s");
     println!(
         "VRAM main-tower proj:  {:.3} GiB / {CARD_VRAM_GIB:.0} GiB (headroom {:.3} GiB) — {}",
         vram.total_gib,
         vram.headroom_gib,
-        if vram.fits {
-            "FITS"
-        } else {
-            "DOES NOT FIT"
-        }
+        if vram.fits { "FITS" } else { "DOES NOT FIT" }
     );
     println!(
         "manifest.validate:     {}",
@@ -368,7 +351,9 @@ fn check_cfg_against_contract(cfg: &ParentQuantConfig) -> Result<(), String> {
             errs.join("; ")
         ));
     }
-    println!("config contract check: OK (43 layers, 3 hash, 256 experts, top-k 6, 46 compress_ratios)");
+    println!(
+        "config contract check: OK (43 layers, 3 hash, 256 experts, top-k 6, 46 compress_ratios)"
+    );
     Ok(())
 }
 
@@ -483,13 +468,7 @@ fn print_class_stats(stats: &ClassStats, inv: &ParentInventory) {
     println!();
     println!(
         "{:<12} {:>10} {:>14} {:>14} | {:>10} {:>14} {:>14}",
-        "class",
-        "main_n",
-        "main_w_bytes",
-        "main_s_bytes",
-        "mtp_n",
-        "mtp_w_bytes",
-        "mtp_s_bytes"
+        "class", "main_n", "main_w_bytes", "main_s_bytes", "mtp_n", "mtp_w_bytes", "mtp_s_bytes"
     );
     for i in 0..5 {
         let m = &stats.main[i];
@@ -593,9 +572,7 @@ fn print_vram(v: &VramProjection) {
         v.i64_bytes,
         v.i64_bytes as f64 / GIB
     );
-    println!(
-        "  ---------------------------------------------------------------"
-    );
+    println!("  ---------------------------------------------------------------");
     println!(
         "  TOTAL:                     {:>16} bytes  ({:>8.3} GiB)",
         v.total_bytes, v.total_gib
@@ -671,12 +648,8 @@ fn build_source_info(root: &Path, skip_shard_hashes: bool) -> Result<SourceInfo,
     let hash_t0 = Instant::now();
     let mut shards = Vec::with_capacity(shard_paths.len());
     for (i, p) in shard_paths.iter().enumerate() {
-        let meta = std::fs::metadata(p).map_err(|e| {
-            format!(
-                "deepseek4 parent: metadata {}: {e}",
-                p.display()
-            )
-        })?;
+        let meta = std::fs::metadata(p)
+            .map_err(|e| format!("deepseek4 parent: metadata {}: {e}", p.display()))?;
         let bytes = meta.len();
         let file = p
             .file_name()

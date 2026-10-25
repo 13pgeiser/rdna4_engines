@@ -61,6 +61,9 @@ fn main() {
         state_quant_override: None,
         cask: &cask,
         pp: 1,
+        pp_layer_counts: None,
+        admitted_mesh: None,
+        band_placement: None,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
         gemma4_drafter_path: None,
@@ -69,6 +72,7 @@ fn main() {
         mtp_path: None,
         vision_mode: "auto".to_string(),
         xdna: None,
+        batch_request: Default::default(),
     };
 
     let mut bundle = load_llama_bundle(src, &mut ctx).expect("load llama bundle");

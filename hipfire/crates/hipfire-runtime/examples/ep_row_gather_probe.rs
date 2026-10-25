@@ -46,6 +46,8 @@ use std::time::{Duration, Instant};
 type R<T> = Result<T, String>;
 
 const SLOTS: usize = 10;
+/// Expert-id bound of the modulo gather (the Flash-Next layer's expert count).
+const N_EXPERTS: usize = 512;
 const ROW_BYTES: usize = 10_240;
 const BUF_BYTES: usize = SLOTS * ROW_BYTES;
 const BYTES_ROUNDS: usize = 8;
@@ -176,7 +178,10 @@ impl Rig {
     fn new(n: usize, real_stream: bool, warm_bytes: usize) -> R<Self> {
         let mut gpus = Vec::with_capacity(n);
         for r in 0..n {
-            gpus.push(ctx(Gpu::init_with_device(r as i32), &format!("init rank {r}"))?);
+            gpus.push(ctx(
+                Gpu::init_with_device(r as i32),
+                &format!("init rank {r}"),
+            )?);
         }
         let mut bufs = Vec::with_capacity(n);
         let mut warm = Vec::new();
@@ -189,13 +194,22 @@ impl Rig {
             let zeros = vec![0u8; BUF_BYTES];
             let mut set = Vec::new();
             for i in 0..MAX_PROBE_BUFFERS {
-                set.push(ctx(gpu.upload_raw(&zeros, &[BUF_BYTES]), &format!("alloc buffer {i}"))?);
+                set.push(ctx(
+                    gpu.upload_raw(&zeros, &[BUF_BYTES]),
+                    &format!("alloc buffer {i}"),
+                )?);
             }
             bufs.push(set);
             if warm_bytes > 0 {
                 let z = vec![0u8; warm_bytes];
-                let a = ctx(gpu.upload_raw(&z, &[warm_bytes]), &format!("alloc warm src rank {r}"))?;
-                let b = ctx(gpu.upload_raw(&z, &[warm_bytes]), &format!("alloc warm dst rank {r}"))?;
+                let a = ctx(
+                    gpu.upload_raw(&z, &[warm_bytes]),
+                    &format!("alloc warm src rank {r}"),
+                )?;
+                let b = ctx(
+                    gpu.upload_raw(&z, &[warm_bytes]),
+                    &format!("alloc warm dst rank {r}"),
+                )?;
                 warm.push((a, b));
             }
         }
@@ -212,8 +226,14 @@ impl Rig {
         let g = &self.gpus[r];
         ctx(g.bind_thread(), "bind_thread")?;
         match g.active_stream.as_ref() {
-            Some(s) => ctx(g.hip.stream_synchronize(s), &format!("stream_synchronize rank {r}")),
-            None => ctx(g.hip.device_synchronize(), &format!("device_synchronize rank {r}")),
+            Some(s) => ctx(
+                g.hip.stream_synchronize(s),
+                &format!("stream_synchronize rank {r}"),
+            ),
+            None => ctx(
+                g.hip.device_synchronize(),
+                &format!("device_synchronize rank {r}"),
+            ),
         }
     }
 
@@ -223,7 +243,10 @@ impl Rig {
 
     fn ids_tensor(&mut self, rank: usize, experts: &[i32]) -> R<GpuTensor> {
         let bytes: Vec<u8> = experts.iter().flat_map(|e| e.to_le_bytes()).collect();
-        ctx(self.gpus[rank].upload_raw(&bytes, &[bytes.len()]), "upload slot_experts")
+        ctx(
+            self.gpus[rank].upload_raw(&bytes, &[bytes.len()]),
+            "upload slot_experts",
+        )
     }
 
     fn build_transport(&mut self, k: usize) -> R<std::sync::Arc<EpRowGather>> {
@@ -231,15 +254,22 @@ impl Rig {
             ranks: self.n,
             slots: SLOTS,
             row_bytes: ROW_BYTES,
-        }).device_waits(true);
+        })
+        .device_waits(true);
         for r in 0..self.n {
             let set: Vec<&GpuTensor> = self.bufs[r].iter().take(k).collect();
-            ctx(b.register(r, &mut self.gpus[r], &set), &format!("register rank {r}"))?;
+            ctx(
+                b.register(r, &mut self.gpus[r], &set),
+                &format!("register rank {r}"),
+            )?;
         }
         let t = ctx(b.build(), "build")?;
         // After every peer-read allocation (parity buffers + warm ring) exists.
         for r in 0..self.n {
-            ctx(t.enable_peers(r, &mut self.gpus[r]), &format!("enable_peers rank {r}"))?;
+            ctx(
+                t.enable_peers(r, &mut self.gpus[r]),
+                &format!("enable_peers rank {r}"),
+            )?;
         }
         Ok(t)
     }
@@ -247,7 +277,10 @@ impl Rig {
     fn release_transport(&mut self, t: &EpRowGather) -> R<()> {
         self.sync_all()?;
         for r in 0..self.n {
-            ctx(t.release(r, &mut self.gpus[r]), &format!("release rank {r}"))?;
+            ctx(
+                t.release(r, &mut self.gpus[r]),
+                &format!("release rank {r}"),
+            )?;
         }
         Ok(())
     }
@@ -264,7 +297,10 @@ impl Rig {
                 let d = (r + 1) % self.n;
                 let g = &self.gpus[d];
                 ctx(g.bind_thread(), "bind_thread")?;
-                let stream = g.active_stream.as_ref().ok_or("warm ring needs real streams")?;
+                let stream = g
+                    .active_stream
+                    .as_ref()
+                    .ok_or("warm ring needs real streams")?;
                 ctx(
                     g.hip.memcpy_peer_async(
                         &self.warm[d].1.buf,
@@ -311,9 +347,13 @@ enum Fault {
     None,
     /// Flip the sign bit of word 0 of the owner's row for `slot` after publish,
     /// before any gather reads it.
-    FlipOwnerSource { slot: usize },
+    FlipOwnerSource {
+        slot: usize,
+    },
     /// `rank` never gathers.
-    SkipGather { rank: usize },
+    SkipGather {
+        rank: usize,
+    },
 }
 
 struct CaseOut {
@@ -363,13 +403,20 @@ fn run_case(
         let mut snaps = Vec::new();
         for round in 0..rounds {
             let host = staging_bytes(r, round, experts, n);
-            staging.push(ctx(rig.gpus[r].upload_raw(&host, &[BUF_BYTES]), "upload staging")?);
+            staging.push(ctx(
+                rig.gpus[r].upload_raw(&host, &[BUF_BYTES]),
+                "upload staging",
+            )?);
             snaps.push(ctx(
                 rig.gpus[r].upload_raw(&vec![0xEEu8; BUF_BYTES], &[BUF_BYTES]),
                 "alloc snapshot",
             )?);
         }
-        data.push(RankData { staging, snaps, ids });
+        data.push(RankData {
+            staging,
+            snaps,
+            ids,
+        });
     }
     rig.sync_all()?;
     let transport = rig.build_transport(k)?;
@@ -381,11 +428,7 @@ fn run_case(
             .iter_mut()
             .zip(rig.bufs.iter())
             .zip(data.iter())
-            .map(|((gpu, bufs), d)| RankJob {
-                gpu,
-                bufs,
-                data: d,
-            })
+            .map(|((gpu, bufs), d)| RankJob { gpu, bufs, data: d })
             .collect();
         let results: Vec<R<()>> = std::thread::scope(|scope| {
             let handles: Vec<_> = jobs
@@ -399,9 +442,24 @@ fn run_case(
                         let body = (|| -> R<()> {
                             for round in 0..rounds {
                                 let parity = round % k;
-                                ctx(gpu.copy_f32_buffer(&bufs[parity], &d.staging[round], words), "producer")?;
-                                ctx(transport.exchange(gpu, rank, parity, EpSlotOwners::ExpertModulo(&d.ids), SLOTS), "exchange")?;
-                                ctx(gpu.copy_f32_buffer(&d.snaps[round], &bufs[parity], words), "snapshot")?;
+                                ctx(
+                                    gpu.copy_f32_buffer(&bufs[parity], &d.staging[round], words),
+                                    "producer",
+                                )?;
+                                ctx(
+                                    transport.exchange(
+                                        gpu,
+                                        rank,
+                                        parity,
+                                        EpSlotOwners::ExpertModulo(&d.ids, N_EXPERTS),
+                                        SLOTS,
+                                    ),
+                                    "exchange",
+                                )?;
+                                ctx(
+                                    gpu.copy_f32_buffer(&d.snaps[round], &bufs[parity], words),
+                                    "snapshot",
+                                )?;
                             }
                             Ok(())
                         })();
@@ -414,7 +472,10 @@ fn run_case(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err("rank thread panicked".to_string())))
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("rank thread panicked".to_string()))
+                })
                 .collect()
         });
         results.into_iter().collect()
@@ -424,7 +485,11 @@ fn run_case(
                 let parity = round % k;
                 for r in 0..n {
                     ctx(
-                        rig.gpus[r].copy_f32_buffer(&rig.bufs[r][parity], &data[r].staging[round], words),
+                        rig.gpus[r].copy_f32_buffer(
+                            &rig.bufs[r][parity],
+                            &data[r].staging[round],
+                            words,
+                        ),
                         "producer",
                     )?;
                 }
@@ -446,11 +511,24 @@ fn run_case(
                     if fault == (Fault::SkipGather { rank: r }) {
                         continue;
                     }
-                    ctx(transport.gather(&mut rig.gpus[r], r, parity, EpSlotOwners::ExpertModulo(&data[r].ids), SLOTS), "gather")?;
+                    ctx(
+                        transport.gather(
+                            &mut rig.gpus[r],
+                            r,
+                            parity,
+                            EpSlotOwners::ExpertModulo(&data[r].ids, N_EXPERTS),
+                            SLOTS,
+                        ),
+                        "gather",
+                    )?;
                 }
                 for r in 0..n {
                     ctx(
-                        rig.gpus[r].copy_f32_buffer(&data[r].snaps[round], &rig.bufs[r][parity], words),
+                        rig.gpus[r].copy_f32_buffer(
+                            &data[r].snaps[round],
+                            &rig.bufs[r][parity],
+                            words,
+                        ),
                         "snapshot",
                     )?;
                 }
@@ -471,7 +549,10 @@ fn run_case(
     };
     for r in 0..n {
         for round in 0..rounds {
-            let got = ctx(rig.gpus[r].download_raw_bytes(&data[r].snaps[round]), "download snapshot")?;
+            let got = ctx(
+                rig.gpus[r].download_raw_bytes(&data[r].snaps[round]),
+                "download snapshot",
+            )?;
             let want = expected_bytes(r, round, experts, n);
             out.compared_bytes += want.len();
             if got != want {
@@ -492,7 +573,12 @@ fn run_case(
     for (r, d) in data.into_iter().enumerate() {
         let g = &mut rig.gpus[r];
         ctx(g.bind_thread(), "bind_thread")?;
-        for t in d.staging.into_iter().chain(d.snaps).chain(std::iter::once(d.ids)) {
+        for t in d
+            .staging
+            .into_iter()
+            .chain(d.snaps)
+            .chain(std::iter::once(d.ids))
+        {
             ctx(g.hip.free(t.buf), "free case tensor")?;
         }
     }
@@ -510,7 +596,11 @@ fn bytes_mode(n: usize, real_stream: bool) -> R<bool> {
     for map in ["balanced", "skewed", "recorded", "negative"] {
         let experts = map_experts(map, n)?;
         for threaded in [false, true] {
-            let path = if threaded { "exchange-threads" } else { "publish-gather-1thread" };
+            let path = if threaded {
+                "exchange-threads"
+            } else {
+                "publish-gather-1thread"
+            };
             let o = run_case(&mut rig, &experts, threaded, Fault::None, BYTES_ROUNDS, 2)?;
             report(
                 o.mismatched_bufs == 0,
@@ -529,7 +619,11 @@ fn bytes_mode(n: usize, real_stream: bool) -> R<bool> {
     for map in ["balanced", "recorded"] {
         let experts = map_experts(map, n)?;
         for threaded in [false, true] {
-            let path = if threaded { "exchange-threads" } else { "publish-gather-1thread" };
+            let path = if threaded {
+                "exchange-threads"
+            } else {
+                "publish-gather-1thread"
+            };
             let o = run_case(&mut rig, &experts, threaded, Fault::None, 9, 3)?;
             report(
                 o.mismatched_bufs == 0,
@@ -546,7 +640,10 @@ fn bytes_mode(n: usize, real_stream: bool) -> R<bool> {
     // Negative controls: the comparison MUST report mismatches.
     let balanced = map_experts("balanced", n)?;
     let controls: [(&str, Fault); 2] = [
-        ("flip-owner-source-sign-bit", Fault::FlipOwnerSource { slot: 3 }),
+        (
+            "flip-owner-source-sign-bit",
+            Fault::FlipOwnerSource { slot: 3 },
+        ),
         ("rank-skips-gather", Fault::SkipGather { rank: n - 1 }),
     ];
     for (name, fault) in controls {
@@ -588,7 +685,15 @@ fn jstr(s: &str) -> String {
 fn timing_mode(cfg: &TimingCfg) -> R<()> {
     let n = cfg.n;
     let experts = map_experts(&cfg.map, n)?;
-    let mut rig = Rig::new(n, cfg.real_stream, if cfg.warm_secs > 0 { WARM_RING_BYTES } else { 0 })?;
+    let mut rig = Rig::new(
+        n,
+        cfg.real_stream,
+        if cfg.warm_secs > 0 {
+            WARM_RING_BYTES
+        } else {
+            0
+        },
+    )?;
     // Owned rows hold stable patterns in both parities; other rows poisoned.
     for r in 0..n {
         let host = {
@@ -599,10 +704,15 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
         };
         ctx(rig.gpus[r].bind_thread(), "bind_thread")?;
         for p in 0..2 {
-            ctx(rig.gpus[r].hip.memcpy_htod(&rig.bufs[r][p].buf, &host), "fill buffer")?;
+            ctx(
+                rig.gpus[r].hip.memcpy_htod(&rig.bufs[r][p].buf, &host),
+                "fill buffer",
+            )?;
         }
     }
-    let ids: Vec<GpuTensor> = (0..n).map(|r| rig.ids_tensor(r, &experts)).collect::<R<_>>()?;
+    let ids: Vec<GpuTensor> = (0..n)
+        .map(|r| rig.ids_tensor(r, &experts))
+        .collect::<R<_>>()?;
     rig.sync_all()?;
     let transport = rig.build_transport(2)?;
 
@@ -648,7 +758,16 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
             ctx(transport.publish(&mut rig.gpus[r], r, parity), "publish")?;
         }
         for r in 0..n {
-            ctx(transport.gather(&mut rig.gpus[r], r, parity, EpSlotOwners::ExpertModulo(&ids[r]), SLOTS), "gather")?;
+            ctx(
+                transport.gather(
+                    &mut rig.gpus[r],
+                    r,
+                    parity,
+                    EpSlotOwners::ExpertModulo(&ids[r], N_EXPERTS),
+                    SLOTS,
+                ),
+                "gather",
+            )?;
         }
         rig.sync_all()?;
         let dt = t.elapsed().as_secs_f64() * 1e6;
@@ -662,7 +781,10 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
     for r in 0..n {
         let want = expected_bytes(r, 0, &experts, n);
         for p in 0..2 {
-            let got = ctx(rig.gpus[r].download_raw_bytes(&rig.bufs[r][p]), "validate download")?;
+            let got = ctx(
+                rig.gpus[r].download_raw_bytes(&rig.bufs[r][p]),
+                "validate download",
+            )?;
             if got != want {
                 bad += 1;
                 eprintln!(
@@ -673,7 +795,9 @@ fn timing_mode(cfg: &TimingCfg) -> R<()> {
         }
     }
     if bad > 0 {
-        return Err(format!("post-timing validation failed on {bad} buffers; timings invalid"));
+        return Err(format!(
+            "post-timing validation failed on {bad} buffers; timings invalid"
+        ));
     }
 
     for (i, v) in us.iter().enumerate() {
@@ -734,7 +858,9 @@ fn run() -> R<bool> {
     };
     let mut i = 1;
     while i < args.len() {
-        let v = args.get(i + 1).ok_or_else(|| format!("{} needs a value\n{}", args[i], usage()))?;
+        let v = args
+            .get(i + 1)
+            .ok_or_else(|| format!("{} needs a value\n{}", args[i], usage()))?;
         let num = |v: &String| v.parse::<usize>().map_err(|e| format!("{}: {e}", args[i]));
         match args[i].as_str() {
             "--ranks" => cfg.n = num(v)?,

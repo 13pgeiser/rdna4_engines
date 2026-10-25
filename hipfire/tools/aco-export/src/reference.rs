@@ -16,14 +16,25 @@ use std::process::Command;
 const GUARD: u64 = 4096;
 
 fn verify_artifact_files(dir: &Path, art: &Value) -> Res<()> {
-    let files = jget(art, "files")?.as_object().ok_or("artifact.files must be an object")?;
+    let files = jget(art, "files")?
+        .as_object()
+        .ok_or("artifact.files must be an object")?;
     for (rel, v) in files {
         let got = sha256_file(&dir.join(rel))?;
         if Some(got.as_str()) != v["sha256"].as_str() {
-            return Err(format!("artifact file {rel} sha256 {got} != manifest {}", v["sha256"]));
+            return Err(format!(
+                "artifact file {rel} sha256 {got} != manifest {}",
+                v["sha256"]
+            ));
         }
     }
-    for must in ["shader.spv", "shader.bin", "shader.abi.json", "shader.rawspec.json", "shader.aco.dump"] {
+    for must in [
+        "shader.spv",
+        "shader.bin",
+        "shader.abi.json",
+        "shader.rawspec.json",
+        "shader.aco.dump",
+    ] {
         if !files.contains_key(must) {
             return Err(format!("artifact.files lacks {must}"));
         }
@@ -32,7 +43,9 @@ fn verify_artifact_files(dir: &Path, art: &Value) -> Res<()> {
 }
 
 fn le_u32(hex: &str, off: usize) -> Res<u32> {
-    let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(err)).collect::<Res<Vec<u8>>>()?;
+    let b: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(err))
+        .collect::<Res<Vec<u8>>>()?;
     if b.len() < off + 4 {
         return Err("kernarg blob too short".into());
     }
@@ -40,7 +53,10 @@ fn le_u32(hex: &str, off: usize) -> Res<u32> {
 }
 
 pub fn cmd_reference(a: &Args) -> Res<()> {
-    let spec_path = a.opt("spec").map(PathBuf::from).unwrap_or_else(default_spec);
+    let spec_path = a
+        .opt("spec")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_spec);
     let spec = read_json(&spec_path)?;
     let art_dir = a.path("artifact")?;
     let art = read_json(&art_dir.join("artifact.json"))?;
@@ -77,22 +93,36 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
     let meta_sha = sha256_file(&meta_path)?;
     let meta = read_json(&meta_path)?;
     if jstr(&meta, "symbol")? != jstr(&art, "symbol")? {
-        return Err(format!("capture symbol {} != artifact symbol {}", meta["symbol"], art["symbol"]));
+        return Err(format!(
+            "capture symbol {} != artifact symbol {}",
+            meta["symbol"], art["symbol"]
+        ));
     }
     let kernarg_hex = jstr(&meta, "kernarg_hex")?;
     let (cap_m, cap_k) = (le_u32(kernarg_hex, 24)?, le_u32(kernarg_hex, 28)?);
 
     let prep = read_json(&prep_dir.join("prepare.json"))?;
-    if jstr(&prep, "schema")? != "pm-aco-oracle-prepare-v1" || ju64(&prep, "guard_bytes")? != GUARD || jstr(&prep, "guard_byte")? != "a5" {
+    if jstr(&prep, "schema")? != "pm-aco-oracle-prepare-v1"
+        || ju64(&prep, "guard_bytes")? != GUARD
+        || jstr(&prep, "guard_byte")? != "a5"
+    {
         return Err("prepare.json schema/guard mismatch".into());
     }
     let refc = jget(k, "reference")?;
     let push_fields = jarr(k, "push.fields")?;
     let buf_for: std::collections::BTreeMap<String, String> = jarr(refc, "pointer_buffers")?
         .iter()
-        .map(|e| (e["push"].as_str().unwrap_or_default().to_owned(), e["buffer"].as_str().unwrap_or_default().to_owned()))
+        .map(|e| {
+            (
+                e["push"].as_str().unwrap_or_default().to_owned(),
+                e["buffer"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
         .collect();
-    let local: Vec<String> = jarr(k, "local_size")?.iter().map(|v| v.to_string()).collect();
+    let local: Vec<String> = jarr(k, "local_size")?
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
 
     let mut fixture_bucket: Option<Value> = None;
     let mut derived = Map::new();
@@ -108,12 +138,17 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
         }
         let m = ju64(shape, "M")?;
         let kk = ju64(shape, "K")?;
-        let wg: Vec<u64> = jarr(shape, "workgroups")?.iter().filter_map(Value::as_u64).collect();
+        let wg: Vec<u64> = jarr(shape, "workgroups")?
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect();
         if wg.len() != 3 {
             return Err("workgroups must have 3 entries".into());
         }
         if is_fixture && (m != cap_m as u64 || kk != cap_k as u64) {
-            return Err(format!("fixture shape M/K {m}/{kk} != capture kernarg {cap_m}/{cap_k}"));
+            return Err(format!(
+                "fixture shape M/K {m}/{kk} != capture kernarg {cap_m}/{cap_k}"
+            ));
         }
         let sdir = out.join(name);
         fs::create_dir_all(&sdir).map_err(err)?;
@@ -123,32 +158,51 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
         fs::create_dir_all(&capture_tmp).map_err(err)?;
 
         let mut argv: Vec<String> = vec![
-            "dispatch".into(), "--spv".into(), spv.display().to_string(),
-            "--push-size".into(), ju64(k, "push.size")?.to_string(), "--local".into(), local.join(","),
-            "--subgroup".into(), ju64(k, "subgroup.required")?.to_string(),
-            "--stats-out".into(), work.join("host-stats.txt").display().to_string(),
-            "--identity-out".into(), work.join("identity.json").display().to_string(),
-            "--pci-bdf".into(), bdf.clone(),
-            "--groups".into(), wg.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
-            "--out-dir".into(), sdir.display().to_string(),
+            "dispatch".into(),
+            "--spv".into(),
+            spv.display().to_string(),
+            "--push-size".into(),
+            ju64(k, "push.size")?.to_string(),
+            "--local".into(),
+            local.join(","),
+            "--subgroup".into(),
+            ju64(k, "subgroup.required")?.to_string(),
+            "--stats-out".into(),
+            work.join("host-stats.txt").display().to_string(),
+            "--identity-out".into(),
+            work.join("identity.json").display().to_string(),
+            "--pci-bdf".into(),
+            bdf.clone(),
+            "--groups".into(),
+            wg.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
+            "--out-dir".into(),
+            sdir.display().to_string(),
         ];
         let files = jget(shape, "files")?.as_object().ok_or("shape.files")?;
         let mut buffers = Map::new();
         for (bufname, push_name_unused) in buf_for.values().map(|b| (b.clone(), ())) {
             let _ = push_name_unused;
             let pre_name = format!("{bufname}.pre.framed.bin");
-            let finfo = files.get(&pre_name).ok_or_else(|| format!("prepare.json shape {name} lacks {pre_name}"))?;
+            let finfo = files
+                .get(&pre_name)
+                .ok_or_else(|| format!("prepare.json shape {name} lacks {pre_name}"))?;
             let pre_path = prep_dir.join(name).join(&pre_name);
             let pre_sha = sha256_file(&pre_path)?;
             if Some(pre_sha.as_str()) != finfo["sha256"].as_str() {
-                return Err(format!("{} sha256 differs from prepare.json", pre_path.display()));
+                return Err(format!(
+                    "{} sha256 differs from prepare.json",
+                    pre_path.display()
+                ));
             }
             if ju64(finfo, "payload_offset")? != GUARD {
                 return Err("payload_offset != guard".into());
             }
             argv.push("--buffer".into());
             argv.push(format!("{bufname}={}:{GUARD}", pre_path.display()));
-            buffers.insert(bufname.clone(), json!({"pre_framed_sha256": pre_sha, "bytes": finfo["bytes"]}));
+            buffers.insert(
+                bufname.clone(),
+                json!({"pre_framed_sha256": pre_sha, "bytes": finfo["bytes"]}),
+            );
         }
         // push block in field order
         let mut items: Vec<String> = Vec::new();
@@ -162,7 +216,12 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
             }
             let fname = jstr(f, "name")?;
             match jstr(f, "kind")? {
-                "u64_ptr" => items.push(format!("u64:buf:{}", buf_for.get(fname).ok_or_else(|| format!("no reference buffer for push field {fname}"))?)),
+                "u64_ptr" => items.push(format!(
+                    "u64:buf:{}",
+                    buf_for
+                        .get(fname)
+                        .ok_or_else(|| format!("no reference buffer for push field {fname}"))?
+                )),
                 "i32" => {
                     let v = match jstr(f, "reference_value")? {
                         "M" => m,
@@ -171,7 +230,11 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
                     };
                     items.push(format!("i32:{v}"));
                 }
-                other => return Err(format!("reference mode cannot synthesize push kind {other}")),
+                other => {
+                    return Err(format!(
+                        "reference mode cannot synthesize push kind {other}"
+                    ))
+                }
             }
             cursor += ju64(f, "size")?;
         }
@@ -188,19 +251,33 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
         write_file(&work.join("host.stderr.txt"), &o.stderr)?;
         write_file(&work.join("host.stdout.txt"), &o.stdout)?;
         if !o.status.success() || !String::from_utf8_lossy(&o.stdout).contains("dispatched") {
-            return Err(format!("vulkan dispatch of shape {name} failed ({}):\n{}", o.status, String::from_utf8_lossy(&o.stderr)));
+            return Err(format!(
+                "vulkan dispatch of shape {name} failed ({}):\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            ));
         }
         // the executed shader must be the exported binary
-        let dirs: Vec<PathBuf> = fs::read_dir(&capture_tmp).map_err(err)?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let dirs: Vec<PathBuf> = fs::read_dir(&capture_tmp)
+            .map_err(err)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
         if dirs.len() != 1 {
-            return Err(format!("shape {name}: expected exactly one compute capture, found {}", dirs.len()));
+            return Err(format!(
+                "shape {name}: expected exactly one compute capture, found {}",
+                dirs.len()
+            ));
         }
         let ran_sha = sha256_file(&dirs[0].join("shader.bin"))?;
         if ran_sha != bin_sha {
             return Err(format!("shape {name}: the Vulkan-executed ACO binary {ran_sha} != artifact shader.bin {bin_sha}; refusing a receipt"));
         }
         let ident = read_json(&work.join("identity.json"))?;
-        if jstr(&ident, "selection")? != "pci_bdf" || !jstr(&ident, "pci_bdf")?.eq_ignore_ascii_case(&bdf) {
+        if jstr(&ident, "selection")? != "pci_bdf"
+            || !jstr(&ident, "pci_bdf")?.eq_ignore_ascii_case(&bdf)
+        {
             return Err("identity.json does not carry the requested PCI BDF".into());
         }
         match &identity0 {
@@ -213,7 +290,12 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
             let post = sdir.join(format!("{bufname}.post.bin"));
             let bytes = fs::read(&post).map_err(|e| format!("{}: {e}", post.display()))?;
             if bytes.len() as u64 != b["bytes"].as_u64().unwrap_or(0) {
-                return Err(format!("{} length {} != framed pre length {}", post.display(), bytes.len(), b["bytes"]));
+                return Err(format!(
+                    "{} length {} != framed pre length {}",
+                    post.display(),
+                    bytes.len(),
+                    b["bytes"]
+                ));
             }
             b["post_framed_file"] = json!(format!("{name}/{bufname}.post.bin"));
             b["post_framed_sha256"] = json!(sha256_hex(&bytes));
@@ -231,8 +313,12 @@ pub fn cmd_reference(a: &Args) -> Res<()> {
     let ident = identity0.unwrap();
     let mesa_version = jstr(&ident, "driver_info")?.to_owned();
     let tag_version = jstr(&pin, "tag")?.trim_start_matches("mesa-").to_owned();
-    if !mesa_version.contains(&tag_version) && !jstr(&ident, "driver_name")?.to_lowercase().contains("radv") {
-        return Err(format!("driver identity `{mesa_version}` does not show the pinned Mesa {tag_version}"));
+    if !mesa_version.contains(&tag_version)
+        && !jstr(&ident, "driver_name")?.to_lowercase().contains("radv")
+    {
+        return Err(format!(
+            "driver identity `{mesa_version}` does not show the pinned Mesa {tag_version}"
+        ));
     }
 
     let receipt = json!({

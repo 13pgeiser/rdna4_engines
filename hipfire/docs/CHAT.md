@@ -40,11 +40,20 @@ text must begin with `/` is sent as `//text`, which transmits `/text`):
 | `/regen` (`/retry`) | Drop the last reply and regenerate from the last user turn. |
 | `/edit` | Pull the last user turn back into the input (dropping its reply) for editing and resending. |
 | `/copy` | Copy the last non-empty assistant reply to the clipboard (OSC 52 escape; replies over 100 KB are refused). |
-| `/help` | Show the command list in the status line. |
+| `/help` | Show the command and key list as a note in the transcript (never sent). |
 
-When the configured endpoint is offline, sending a message makes the TUI start
-`hipfire serve -d` and keeps your prompt; retry once the live serve status shows
-online. Config, registry, model lifecycle, and HTTP calls all use the shared
+The transcript follows new output while you are at the bottom: Up/Down and
+PgUp/PgDn scroll (also while a reply streams), Home jumps to the top and End
+resumes following. Typing keeps working during a reply; only Enter waits for it
+to finish, and Esc stops it (the reply is marked `[stopped]`). Reasoning text is
+shown dimmed under a `thinking` label. The token count under a reply is the
+serve's `usage.completion_tokens` when the serve reports it, otherwise the
+number of streamed chunks, labelled as chunks.
+
+The TUI checks the serve's `/health` every 2 s on every tab. When it is not
+online, Enter queues your prompt (Esc cancels it and puts the text back), starts
+`hipfire serve -d` only when the first check says the serve is down and no
+serve process exists, and sends the prompt by itself once the serve is online. Config, registry, model lifecycle, and HTTP calls all use the shared
 Rust crates; there is no separate script runtime.
 
 ## Lightweight chat command

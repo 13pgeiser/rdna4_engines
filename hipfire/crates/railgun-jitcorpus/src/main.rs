@@ -50,8 +50,14 @@ struct Args {
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
     let mut a = Args {
-        out: PathBuf::from("railgun-jit-corpus"), build_dir: None,
-        corpus: None, work: PathBuf::from("railgun-jit-corpus-work"), json: None, capture: None, archs: Vec::new(), jobs: 16,
+        out: PathBuf::from("railgun-jit-corpus"),
+        build_dir: None,
+        corpus: None,
+        work: PathBuf::from("railgun-jit-corpus-work"),
+        json: None,
+        capture: None,
+        archs: Vec::new(),
+        jobs: 16,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -72,11 +78,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
 
 fn run() -> Result<bool> {
     let mut argv = std::env::args().skip(1);
-    let command = argv.next().ok_or("usage: railgun-jit-corpus build|check|repro|verify-runtime-cache ...")?;
+    let command = argv
+        .next()
+        .ok_or("usage: railgun-jit-corpus build|check|repro|verify-runtime-cache ...")?;
     let mut args = parse(argv)?;
     corpus::install_product_defaults()?;
     std::fs::create_dir_all(&args.work).map_err(|e| format!("{}: {e}", args.work.display()))?;
-    args.work = std::fs::canonicalize(&args.work).map_err(|e| format!("{}: {e}", args.work.display()))?;
+    args.work =
+        std::fs::canonicalize(&args.work).map_err(|e| format!("{}: {e}", args.work.display()))?;
     // The runtime compiler seeds and writes a hot cache when constructed.
     std::env::set_var("HIPFIRE_KERNEL_CACHE", args.work.join("hot-cache"));
     let inventory = corpus::inventory()?;
@@ -86,27 +95,61 @@ fn run() -> Result<bool> {
     match command.as_str() {
         "build" => {
             let build_dir = args.build_dir.unwrap_or_else(|| args.out.join("build"));
-            let dir = corpus::build(&inventory, &corpus::BuildOptions { out: args.out, build_dir, archs: args.archs, jobs: args.jobs })?;
+            let dir = corpus::build(
+                &inventory,
+                &corpus::BuildOptions {
+                    out: args.out,
+                    build_dir,
+                    archs: args.archs,
+                    jobs: args.jobs,
+                },
+            )?;
             println!("{}", dir.display());
             Ok(true)
         }
         "check" => {
             let dir = args.corpus.ok_or("check needs --corpus")?;
-            let jit = JitCorpus::open(&dir).map_err(|e| format!("railgun JIT corpus rejected: {e}"))?;
+            let jit =
+                JitCorpus::open(&dir).map_err(|e| format!("railgun JIT corpus rejected: {e}"))?;
             let index = jit.index();
-            println!("corpus {} (build host {} {}, toolchain {} `{}`, source {})", dir.display(), index.build_host.hostname,
-                &index.build_host.key[..16], &index.toolchain.pin[..16], index.toolchain.id, index.source_commit);
-            let programs: Vec<_> = corpus::current_program_keys(&inventory)?.into_iter().filter(|p| args.archs.contains(&p.arch)).collect();
+            println!(
+                "corpus {} (build host {} {}, toolchain {} `{}`, source {})",
+                dir.display(),
+                index.build_host.hostname,
+                &index.build_host.key[..16],
+                &index.toolchain.pin[..16],
+                index.toolchain.id,
+                index.source_commit
+            );
+            let programs: Vec<_> = corpus::current_program_keys(&inventory)?
+                .into_iter()
+                .filter(|p| args.archs.contains(&p.arch))
+                .collect();
             let coverage = corpus::check(&jit, &programs);
-            println!("{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}", "program", "arch", "nodes", "covered", "proven", "unknown", "missing");
+            println!(
+                "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}",
+                "program", "arch", "nodes", "covered", "proven", "unknown", "missing"
+            );
             for c in &coverage {
-                println!("{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}", c.program, c.arch, c.nodes, c.covered, c.proven, c.unknown, c.missing.len());
+                println!(
+                    "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}",
+                    c.program,
+                    c.arch,
+                    c.nodes,
+                    c.covered,
+                    c.proven,
+                    c.unknown,
+                    c.missing.len()
+                );
             }
             let mut ok = true;
             for c in coverage.iter().filter(|c| !c.missing.is_empty()) {
                 ok = false;
                 for m in &c.missing {
-                    eprintln!("ERROR railgun JIT corpus: {} ({}) node {} has no fact record: {}", c.program, c.arch, m.symbol, m.reason);
+                    eprintln!(
+                        "ERROR railgun JIT corpus: {} ({}) node {} has no fact record: {}",
+                        c.program, c.arch, m.symbol, m.reason
+                    );
                 }
             }
             if !ok {
@@ -119,32 +162,73 @@ fn run() -> Result<bool> {
             let jit = JitCorpus::open(&dir).map_err(|e| e.to_string())?;
             let results = corpus::repro(&jit, &args.work.join("repro"), &args.archs, args.jobs)?;
             if let Some(path) = &args.json {
-                std::fs::write(path, serde_json::to_vec_pretty(&results).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&results).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
             }
-            let count = |f: &dyn Fn(&corpus::Repro) -> bool| results.iter().filter(|r| r.error.is_none() && f(r)).count();
+            let count = |f: &dyn Fn(&corpus::Repro) -> bool| {
+                results.iter().filter(|r| r.error.is_none() && f(r)).count()
+            };
             let errors: Vec<_> = results.iter().filter(|r| r.error.is_some()).collect();
             println!("modules {} (errors {})", results.len(), errors.len());
-            println!("rebuild at corpus build paths: raw-equal {}", count(&|r| r.rebuild_raw_equal));
-            println!("runtime-style unique temporaries x2: raw-equal {}, code-equal {}", count(&|r| r.jit_raw_equal), count(&|r| r.jit_code_equal));
-            println!("include order permuted: raw-equal {}, code-equal {}", count(&|r| r.include_order_raw_equal), count(&|r| r.include_order_code_equal));
-            println!("unique temporaries with -fuse-cuid=none: raw-equal {}", count(&|r| r.nocuid_raw_equal));
+            println!(
+                "rebuild at corpus build paths: raw-equal {}",
+                count(&|r| r.rebuild_raw_equal)
+            );
+            println!(
+                "runtime-style unique temporaries x2: raw-equal {}, code-equal {}",
+                count(&|r| r.jit_raw_equal),
+                count(&|r| r.jit_code_equal)
+            );
+            println!(
+                "include order permuted: raw-equal {}, code-equal {}",
+                count(&|r| r.include_order_raw_equal),
+                count(&|r| r.include_order_code_equal)
+            );
+            println!(
+                "unique temporaries with -fuse-cuid=none: raw-equal {}",
+                count(&|r| r.nocuid_raw_equal)
+            );
             for r in errors {
-                eprintln!("ERROR {} {}: {}", r.arch, r.module, r.error.as_deref().unwrap_or_default());
+                eprintln!(
+                    "ERROR {} {}: {}",
+                    r.arch,
+                    r.module,
+                    r.error.as_deref().unwrap_or_default()
+                );
             }
             Ok(true)
         }
         "verify-runtime-cache" => {
             let capture = args.capture.ok_or("verify-runtime-cache needs --capture")?;
-            let arch = args.archs.first().ok_or("verify-runtime-cache needs --arch")?.clone();
+            let arch = args
+                .archs
+                .first()
+                .ok_or("verify-runtime-cache needs --arch")?
+                .clone();
             let verdicts = corpus::verify_runtime_cache(&capture, &arch)?;
             let mut ok = true;
             for v in &verdicts {
                 ok &= v.source_equal && v.key_equal;
-                println!("{:<48} {:<44} {} source={} key={}", v.symbol, v.module, v.runtime_key,
-                    if v.source_equal { "equal" } else { "DIFFERS" }, if v.key_equal { "equal" } else { "DIFFERS" });
+                println!(
+                    "{:<48} {:<44} {} source={} key={}",
+                    v.symbol,
+                    v.module,
+                    v.runtime_key,
+                    if v.source_equal { "equal" } else { "DIFFERS" },
+                    if v.key_equal { "equal" } else { "DIFFERS" }
+                );
             }
-            println!("{} launches: {} with registry source and runtime cache key both equal",
-                verdicts.len(), verdicts.iter().filter(|v| v.source_equal && v.key_equal).count());
+            println!(
+                "{} launches: {} with registry source and runtime cache key both equal",
+                verdicts.len(),
+                verdicts
+                    .iter()
+                    .filter(|v| v.source_equal && v.key_equal)
+                    .count()
+            );
             Ok(ok)
         }
         other => Err(format!("unknown command {other}")),

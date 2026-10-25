@@ -799,7 +799,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1269,7 +1269,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hip-bridge"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-cohere2moe"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1304,11 +1304,12 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
 name = "hipfire-arch-diffusion"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "fancy-regex 0.14.0",
  "half",
@@ -1328,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -1340,8 +1341,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-embeddinggemma2"
+version = "0.4.3+patch.1"
+dependencies = [
+ "half",
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-runtime",
+ "image",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-gemma4"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1353,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm2-vl"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -1380,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1392,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-maple"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1405,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1419,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-muse-glimmer"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1431,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1444,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
@@ -1462,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-embed"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "half",
  "hip-bridge",
@@ -1475,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1489,12 +1503,13 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen4"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-loader",
  "hipfire-runtime",
  "memmap2",
  "peacemaker-npu",
@@ -1506,11 +1521,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "tracing",
 ]
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-runtime",
  "rdna-compute",
@@ -1518,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "regex",
  "serde",
@@ -1527,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cli"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1535,9 +1551,12 @@ dependencies = [
  "clap",
  "ctrlc",
  "flate2",
+ "getrandom 0.3.4",
  "hipfire-arch-qwen4",
  "hipfire-client",
  "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-loader",
  "hipfire-registry",
  "hipfire-runtime",
  "http-body-util",
@@ -1557,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-client"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "serde_json",
@@ -1567,26 +1586,29 @@ dependencies = [
 
 [[package]]
 name = "hipfire-config"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
+ "windows",
 ]
 
 [[package]]
 name = "hipfire-cpu"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "half",
+ "libc",
  "proptest",
  "rayon",
 ]
 
 [[package]]
 name = "hipfire-daemon"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "base64 0.22.1",
  "hip-bridge",
@@ -1609,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "md5 0.8.1",
  "regex",
@@ -1619,18 +1641,19 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-cpu",
+ "rayon",
  "rdna-compute",
  "smallvec",
 ]
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -1639,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-ds4-parent"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1653,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-engine"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1666,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-generate"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "base64 0.22.1",
  "hip-bridge",
@@ -1674,6 +1697,7 @@ dependencies = [
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2-vl",
  "hipfire-arch-lfm2moe",
@@ -1700,13 +1724,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-loader"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2-vl",
  "hipfire-arch-lfm2moe",
@@ -1730,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-pflash"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35",
@@ -1742,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "byteorder",
  "clap",
@@ -1769,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-reap"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "hipfire-runtime",
@@ -1779,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-registry"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "serde",
@@ -1791,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "byteorder",
  "half",
@@ -1807,6 +1832,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-qwen4",
  "hipfire-atlas",
  "hipfire-config",
  "hipfire-cpu",
@@ -1815,6 +1841,7 @@ dependencies = [
  "hipfire-engine",
  "hipfire-loader",
  "hipfire-pflash",
+ "hipfire-quantize",
  "hipfire-registry",
  "image",
  "libc",
@@ -1842,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-tui"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1858,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-xdna"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "libc",
  "parking_lot",
@@ -1866,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -2442,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "npu-tools"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "peacemaker-npu",
  "railgun",
@@ -2537,11 +2564,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
 dependencies = [
  "crc32fast",
- "flate2",
  "hashbrown 0.16.1",
  "indexmap",
  "memchr",
- "ruzstd",
 ]
 
 [[package]]
@@ -2626,14 +2651,18 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "peacemaker-author"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "trybuild",
 ]
 
 [[package]]
+name = "peacemaker-cdna"
+version = "0.4.3+patch.1"
+
+[[package]]
 name = "peacemaker-ir"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "insta",
  "petgraph",
@@ -2647,7 +2676,9 @@ dependencies = [
 name = "peacemaker-isa"
 version = "0.4.1"
 dependencies = [
+ "hip-bridge",
  "peacemaker-author",
+ "peacemaker-cdna",
  "peacemaker-ir",
  "peacemaker-lift",
  "radiowave",
@@ -2658,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "peacemaker-lift"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "insta",
  "object",
@@ -2673,14 +2704,17 @@ dependencies = [
 
 [[package]]
 name = "peacemaker-npu"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 
 [[package]]
 name = "peacemaker-rip"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
+ "hip-bridge",
  "peacemaker-author",
+ "peacemaker-ir",
  "peacemaker-isa",
+ "peacemaker-lift",
  "proc-macro2",
  "quote",
  "serde_json",
@@ -2943,7 +2977,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radiowave"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2953,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "railgun"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -2969,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-cert"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "peacemaker-ir",
  "peacemaker-lift",
@@ -2985,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-corpus"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2995,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "railgun-jitcorpus"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "railgun-cert",
@@ -3201,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "half",
  "hip-bridge",
@@ -3211,6 +3245,7 @@ dependencies = [
  "peacemaker-isa",
  "peacemaker-lift",
  "peacemaker-npu",
+ "peacemaker-rip",
  "radiowave",
  "railgun",
  "railgun-corpus",
@@ -3230,7 +3265,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redline"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "libc",
  "libloading",
@@ -3238,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "redline-dispatch"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -3250,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "redline-rocr"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -3346,7 +3381,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3391,15 +3426,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "ruzstd"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3407,7 +3433,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saddle-core"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
@@ -3416,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "saddle-lab"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -3438,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "saddle-quant"
-version = "0.4.2+patch.1"
+version = "0.4.3+patch.1"
 dependencies = [
  "clap",
  "memmap2",
@@ -3774,7 +3800,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3971,6 +3997,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
@@ -4155,12 +4182,6 @@ dependencies = [
  "termcolor",
  "toml 1.1.3+spec-1.1.0",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "typenum"
@@ -4485,7 +4506,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4495,16 +4516,102 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
+dependencies = [
+ "windows-implement",
+ "windows-interface",
+ "windows-link",
+ "windows-result",
+ "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
+]
+
+[[package]]
+name = "windows-implement"
+version = "0.60.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.59.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
+
+[[package]]
 name = "windows-result"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
 dependencies = [
  "windows-link",
 ]
@@ -4556,6 +4663,15 @@ dependencies = [
  "windows_x86_64_gnu 0.52.6",
  "windows_x86_64_gnullvm 0.52.6",
  "windows_x86_64_msvc 0.52.6",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

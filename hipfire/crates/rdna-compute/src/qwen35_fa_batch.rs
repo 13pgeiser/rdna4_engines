@@ -84,8 +84,21 @@ impl Gpu {
             ));
         }
         self.qwen35_fa_prep_batched_gfx11(
-            "qwen35_fa_prep_batched_gfx1100", FA_PREP_BATCHED_SRC, q_interleaved, q, gate, k, q_weight,
-            k_weight, positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size,
+            "qwen35_fa_prep_batched_gfx1100",
+            FA_PREP_BATCHED_SRC,
+            q_interleaved,
+            q,
+            gate,
+            k,
+            q_weight,
+            k_weight,
+            positions,
+            eps,
+            freq_base,
+            pos_offset,
+            n_q_heads,
+            n_kv_heads,
+            batch_size,
         )
     }
 
@@ -116,8 +129,21 @@ impl Gpu {
             ));
         }
         self.qwen35_fa_prep_batched_gfx11(
-            "qwen35_fa_prep_batched_gfx1151", FA_PREP_BATCHED_GFX1151_SRC, q_interleaved, q, gate, k, q_weight,
-            k_weight, positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size,
+            "qwen35_fa_prep_batched_gfx1151",
+            FA_PREP_BATCHED_GFX1151_SRC,
+            q_interleaved,
+            q,
+            gate,
+            k,
+            q_weight,
+            k_weight,
+            positions,
+            eps,
+            freq_base,
+            pos_offset,
+            n_q_heads,
+            n_kv_heads,
+            batch_size,
         )
     }
 
@@ -373,7 +399,10 @@ impl Gpu {
             }
         };
         if gate.is_some_and(|g| g.numel() < q_elems) {
-            return Err(hip_bridge::HipError::new(1, "fa prep: gate output too small"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "fa prep: gate output too small",
+            ));
         }
         self.ensure_kernel(symbol, FA_PREP_BATCHED_GFX1201_SRC, symbol)?;
 
@@ -414,8 +443,8 @@ impl Gpu {
         let rows = (n_q_heads + n_kv_heads) * batch_size;
         let q_bytes = if sp.is_some() { 256 + 4 } else { 256 * 4 };
         let gate_bytes = if gp.is_some() { 256 * 4 * 2 } else { 0 };
-        let bytes = batch_size
-            * (n_q_heads * (256 * 4 + gate_bytes + q_bytes) + n_kv_heads * 256 * 4 * 2);
+        let bytes =
+            batch_size * (n_q_heads * (256 * 4 + gate_bytes + q_bytes) + n_kv_heads * 256 * 4 * 2);
         let timer = crate::profile::begin_timer(&self.hip, "fused", symbol, bytes);
         let result = self.launch_maybe_blob(
             symbol,

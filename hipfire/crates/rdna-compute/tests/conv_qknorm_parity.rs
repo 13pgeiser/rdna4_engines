@@ -5,10 +5,10 @@
 //! gfx1201, gfx1100 and gfx1151: the decode-only fusion
 //! `conv1d_silu_split_qknorm` must produce the same bytes as the unfused pair
 //! it replaces (`conv1d_silu_split_f32` then `fused_qk_l2_norm_scale_f32`).
-//! The Qwen3.5 lowered decode uses the fusion and the hand decode
-//! (`HIPFIRE_FORWARD_LOWERED=0`, DFlash's per-token hidden-extracting
-//! forward) uses the pair, so any difference makes the two decode paths
-//! diverge. It did: the compiler contracted the conv tap sum and the first Q/K
+//! Qwen3.5 decode runs the fusion where its gate admits the shape and the pair
+//! where it does not (FP32/Q4 DeltaNet state, `HIPFIRE_CONV_QKNORM=0`), so any
+//! difference makes the same model's decode depend on that gate. It did: the
+//! compiler contracted the conv tap sum and the first Q/K
 //! square-sum add into FMAs in a different order in each kernel.
 //!
 //! Q, K, V and the conv state are compared bit for bit over four chained
@@ -96,12 +96,37 @@ fn launch_fused(gpu: &mut Gpu, f: &Fused) {
     let q_scale = 1.0 / (HEAD_DIM as f32).sqrt();
     match f.scalar_prep {
         None => gpu.conv1d_silu_split_qknorm(
-            f.q, f.k, f.v, f.input, f.weight, f.state, k_dim, v_dim, f.n_key_heads, HEAD_DIM,
-            q_scale, EPS,
+            f.q,
+            f.k,
+            f.v,
+            f.input,
+            f.weight,
+            f.state,
+            k_dim,
+            v_dim,
+            f.n_key_heads,
+            HEAD_DIM,
+            q_scale,
+            EPS,
         ),
         Some(p) => gpu.conv1d_silu_split_qknorm_scalar_prep_gfx1100(
-            f.q, f.k, f.v, f.input, f.weight, f.state, p.beta, p.alpha, p.dt_bias, p.a_log,
-            k_dim, v_dim, f.n_key_heads, HEAD_DIM, q_scale, EPS, f.n_value_heads,
+            f.q,
+            f.k,
+            f.v,
+            f.input,
+            f.weight,
+            f.state,
+            p.beta,
+            p.alpha,
+            p.dt_bias,
+            p.a_log,
+            k_dim,
+            v_dim,
+            f.n_key_heads,
+            HEAD_DIM,
+            q_scale,
+            EPS,
+            f.n_value_heads,
         ),
     }
     .expect("conv1d_silu_split_qknorm");
@@ -136,7 +161,12 @@ fn check_shape(
     write(gpu, &a_log, &fill(&mut seed, n_value_heads, 2.0));
     let (beta_ref, alpha_ref) = (alloc(gpu, n_value_heads), alloc(gpu, n_value_heads));
     let (beta_fused, alpha_fused) = (alloc(gpu, n_value_heads), alloc(gpu, n_value_heads));
-    let prep = ScalarPrep { beta: &beta_fused, alpha: &alpha_fused, dt_bias: &dt_bias, a_log: &a_log };
+    let prep = ScalarPrep {
+        beta: &beta_fused,
+        alpha: &alpha_fused,
+        dt_bias: &dt_bias,
+        a_log: &a_log,
+    };
     let fused = Fused {
         q: &q_fused,
         k: &k_fused,
@@ -153,11 +183,19 @@ fn check_shape(
         // JIT outside the capture on throwaway state, then record one launch.
         let scratch = alloc(gpu, channels * 3);
         let (scratch_beta, scratch_alpha) = (alloc(gpu, n_value_heads), alloc(gpu, n_value_heads));
-        let scratch_prep =
-            ScalarPrep { beta: &scratch_beta, alpha: &scratch_alpha, dt_bias: &dt_bias, a_log: &a_log };
+        let scratch_prep = ScalarPrep {
+            beta: &scratch_beta,
+            alpha: &scratch_alpha,
+            dt_bias: &dt_bias,
+            a_log: &a_log,
+        };
         launch_fused(
             gpu,
-            &Fused { state: &scratch, scalar_prep: scalar_prep.then_some(&scratch_prep), ..fused },
+            &Fused {
+                state: &scratch,
+                scalar_prep: scalar_prep.then_some(&scratch_prep),
+                ..fused
+            },
         );
         gpu.hip.device_synchronize().unwrap();
         for t in [scratch, scratch_beta, scratch_alpha] {
@@ -190,15 +228,22 @@ fn check_shape(
         write(gpu, &input, &fill(&mut seed, channels, 2.0));
         let beta_raw = fill(&mut seed, n_value_heads, 8.0);
         let alpha_raw = fill(&mut seed, n_value_heads, 30.0);
-        for (reference, fused, raw) in
-            [(&beta_ref, &beta_fused, &beta_raw), (&alpha_ref, &alpha_fused, &alpha_raw)]
-        {
+        for (reference, fused, raw) in [
+            (&beta_ref, &beta_fused, &beta_raw),
+            (&alpha_ref, &alpha_fused, &alpha_raw),
+        ] {
             write(gpu, reference, raw);
             write(gpu, fused, raw);
         }
         if scalar_prep {
-            gpu.fused_sigmoid_alpha_gate_f32(&beta_ref, &alpha_ref, &dt_bias, &a_log, n_value_heads)
-                .unwrap();
+            gpu.fused_sigmoid_alpha_gate_f32(
+                &beta_ref,
+                &alpha_ref,
+                &dt_bias,
+                &a_log,
+                n_value_heads,
+            )
+            .unwrap();
         }
         gpu.conv1d_silu_split_f32(
             &q_ref, &k_ref, &v_ref, &input, &weight, &state_ref, k_dim, v_dim,
@@ -229,7 +274,10 @@ fn check_shape(
             ("conv state", &state_ref, &state_fused),
         ];
         if scalar_prep {
-            tensors.extend([("beta", &beta_ref, &beta_fused), ("alpha", &alpha_ref, &alpha_fused)]);
+            tensors.extend([
+                ("beta", &beta_ref, &beta_fused),
+                ("alpha", &alpha_ref, &alpha_fused),
+            ]);
         }
         for (name, reference, got) in tensors {
             let (r, f) = (bits(gpu, reference), bits(gpu, got));
@@ -251,8 +299,22 @@ fn check_shape(
         }
     }
     for t in [
-        weight, state_ref, state_fused, input, q_ref, k_ref, v_ref, q_fused, k_fused, v_fused,
-        dt_bias, a_log, beta_ref, alpha_ref, beta_fused, alpha_fused,
+        weight,
+        state_ref,
+        state_fused,
+        input,
+        q_ref,
+        k_ref,
+        v_ref,
+        q_fused,
+        k_fused,
+        v_fused,
+        dt_bias,
+        a_log,
+        beta_ref,
+        alpha_ref,
+        beta_fused,
+        alpha_fused,
     ] {
         gpu.free_tensor(t).unwrap();
     }
@@ -267,7 +329,11 @@ fn conv_qknorm_fusion_matches_unfused_pair_bit_for_bit() {
         return;
     }
     // The scalar-prep variant is dispatched on gfx1100 only.
-    let scalar_prep_modes: &[bool] = if gpu.arch_caps.is_gfx1100() { &[false, true] } else { &[false] };
+    let scalar_prep_modes: &[bool] = if gpu.arch_caps.is_gfx1100() {
+        &[false, true]
+    } else {
+        &[false]
+    };
     for &scalar_prep in scalar_prep_modes {
         for (n_key_heads, n_value_heads) in SHAPES {
             check_shape(&mut gpu, n_key_heads, n_value_heads, false, scalar_prep);

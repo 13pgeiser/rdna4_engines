@@ -16,7 +16,8 @@ use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
-const MQ2L_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
+const MQ2L_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
 const MQ2GL_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256gl_moe_gate_up_indexed.hip");
 
 /// Textbook Lloyd–Max levels for a unit Gaussian, 2 bit. Measured on 28.3M real
@@ -24,7 +25,9 @@ const MQ2GL_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256gl_moe_ga
 const CB: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
 
 fn mix(x: u64) -> u64 {
-    let h = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let h = x
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd)) ^ (h >> 28)
 }
 
@@ -42,7 +45,8 @@ fn build_mq2l(m: usize, k: usize, seed: u64) -> Vec<u8> {
                 out[off + 2 * e + 1] = (h >> 8) as u8;
             }
             for b in 0..64 {
-                out[off + 8 + b] = (mix(seed ^ ((row as u64) << 32) ^ ((g as u64) << 8) ^ b as u64) & 0xff) as u8;
+                out[off + 8 + b] =
+                    (mix(seed ^ ((row as u64) << 32) ^ ((g as u64) << 8) ^ b as u64) & 0xff) as u8;
             }
         }
     }
@@ -58,7 +62,8 @@ fn build_mq2gl(m: usize, k: usize, seed: u64) -> Vec<u8> {
         for g in 0..gpr {
             let off = (row * gpr + g) * 64;
             for b in 0..64 {
-                out[off + b] = (mix(seed ^ ((row as u64) << 32) ^ ((g as u64) << 8) ^ b as u64) & 0xff) as u8;
+                out[off + b] =
+                    (mix(seed ^ ((row as u64) << 32) ^ ((g as u64) << 8) ^ b as u64) & 0xff) as u8;
             }
             let s = 0.004f32 + ((mix(seed ^ ((row as u64) << 20) ^ g as u64) % 4000) as f32) * 1e-6;
             let h = half_bits(s);
@@ -117,33 +122,67 @@ fn main() {
     let mut l_ts = Vec::new();
     let mut gl_ts = Vec::new();
     for e in 0..n_exp {
-        l_ts.push(gpu.upload_raw(&build_mq2l(m, k, 0x1000 + e as u64), &[mq2l_bytes]).unwrap());
-        gl_ts.push(gpu.upload_raw(&build_mq2gl(m, k, 0x1000 + e as u64), &[mq2gl_bytes]).unwrap());
+        l_ts.push(
+            gpu.upload_raw(&build_mq2l(m, k, 0x1000 + e as u64), &[mq2l_bytes])
+                .unwrap(),
+        );
+        gl_ts.push(
+            gpu.upload_raw(&build_mq2gl(m, k, 0x1000 + e as u64), &[mq2gl_bytes])
+                .unwrap(),
+        );
     }
     let l_ptrs: Vec<u64> = l_ts.iter().map(|t| t.buf.as_ptr() as u64).collect();
     let gl_ptrs: Vec<u64> = gl_ts.iter().map(|t| t.buf.as_ptr() as u64).collect();
     let l_ptr_t = gpu
-        .upload_raw(&l_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(), &[n_exp])
+        .upload_raw(
+            &l_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[n_exp],
+        )
         .unwrap();
     let gl_ptr_t = gpu
-        .upload_raw(&gl_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(), &[n_exp])
+        .upload_raw(
+            &gl_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[n_exp],
+        )
         .unwrap();
 
     let topk: Vec<i32> = (0..k_top as i32).map(|i| (i * 3) % n_exp as i32).collect();
     let topk_t = gpu
-        .upload_raw(&topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &[k_top])
+        .upload_raw(
+            &topk
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[k_top],
+        )
         .unwrap();
 
-    let x: Vec<f32> = (0..k).map(|i| ((i * 37 % 61) as f32 - 30.0) * 0.02).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i * 37 % 61) as f32 - 30.0) * 0.02)
+        .collect();
     let x_t = gpu.upload_f32(&x, &[k]).unwrap();
     let mi = m / 2;
     let y_g = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
     let y_u = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
 
-    gpu.ensure_kernel_public("gemv_mq2g256_lloyd_moe_gate_up_indexed", MQ2L_SRC,
-        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed").expect("JIT mq2l");
-    gpu.ensure_kernel_public("gemv_mq2g256gl_moe_gate_up_indexed", MQ2GL_SRC,
-        "gemv_mq2g256gl_moe_gate_up_k8_indexed").expect("JIT mq2gl");
+    gpu.ensure_kernel_public(
+        "gemv_mq2g256_lloyd_moe_gate_up_indexed",
+        MQ2L_SRC,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+    )
+    .expect("JIT mq2l");
+    gpu.ensure_kernel_public(
+        "gemv_mq2g256gl_moe_gate_up_indexed",
+        MQ2GL_SRC,
+        "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+    )
+    .expect("JIT mq2gl");
 
     let grid = [m as u32, k_top as u32, 1];
     let block = [32u32, 1, 1];
@@ -156,6 +195,7 @@ fn main() {
     blob_l.push_ptr(y_u.buf.as_ptr() as *const _);
     blob_l.push_i32(m as i32);
     blob_l.push_i32(k as i32);
+    blob_l.push_i32((l_ptr_t.buf.size() / 8) as i32);
     let mut bl = blob_l.into_vec();
 
     let mut blob_g = KernargBlob::new();
@@ -164,9 +204,12 @@ fn main() {
     blob_g.push_ptr(x_t.buf.as_ptr() as *const _);
     blob_g.push_ptr(y_g.buf.as_ptr() as *const _);
     blob_g.push_ptr(y_u.buf.as_ptr() as *const _);
-    for c in CB { blob_g.push_f32(c); }
+    for c in CB {
+        blob_g.push_f32(c);
+    }
     blob_g.push_i32(m as i32);
     blob_g.push_i32(k as i32);
+    blob_g.push_i32((gl_ptr_t.buf.size() / 8) as i32);
     let mut bg = blob_g.into_vec();
 
     // ---- correctness: each kernel vs its own CPU reference ----
@@ -202,31 +245,60 @@ fn main() {
             }
         }
         let rel = ((got[0] as f64 - want).abs()) / want.abs().max(1e-6);
-        eprintln!("  {:<8} row0 gpu={:>12.5}  cpu={:>12.5}  rel={:.2e}", if gl {"MQ2GL"} else {"MQ2L"}, got[0], want, rel);
+        eprintln!(
+            "  {:<8} row0 gpu={:>12.5}  cpu={:>12.5}  rel={:.2e}",
+            if gl { "MQ2GL" } else { "MQ2L" },
+            got[0],
+            want,
+            rel
+        );
         rel
     };
 
     eprintln!("\ncorrectness (kernel vs CPU reference on its own format):");
     let raw_l = build_mq2l(m, k, 0x1000 + topk[0] as u64);
     let raw_g = build_mq2gl(m, k, 0x1000 + topk[0] as u64);
-    let r1 = check(&mut gpu, "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed", &mut bl, false, &raw_l);
-    let r2 = check(&mut gpu, "gemv_mq2g256gl_moe_gate_up_k8_indexed", &mut bg, true, &raw_g);
+    let r1 = check(
+        &mut gpu,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+        &mut bl,
+        false,
+        &raw_l,
+    );
+    let r2 = check(
+        &mut gpu,
+        "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+        &mut bg,
+        true,
+        &raw_g,
+    );
 
     // ---- timing ----
     let bench = |gpu: &mut Gpu, name: &str, bytes: &mut [u8]| -> f64 {
-        for _ in 0..20 { gpu.launch_kernel_blob(name, grid, block, 0, bytes).unwrap(); }
+        for _ in 0..20 {
+            gpu.launch_kernel_blob(name, grid, block, 0, bytes).unwrap();
+        }
         gpu.hip.device_synchronize().unwrap();
         let runs = 500;
         let t0 = Instant::now();
-        for _ in 0..runs { gpu.launch_kernel_blob(name, grid, block, 0, bytes).unwrap(); }
+        for _ in 0..runs {
+            gpu.launch_kernel_blob(name, grid, block, 0, bytes).unwrap();
+        }
         gpu.hip.device_synchronize().unwrap();
         t0.elapsed().as_secs_f64() * 1e6 / runs as f64
     };
 
-    eprintln!("\n{:<10} {:>10} {:>12} {:>12}", "variant", "us/call", "wt GiB/s", "bytes/call");
+    eprintln!(
+        "\n{:<10} {:>10} {:>12} {:>12}",
+        "variant", "us/call", "wt GiB/s", "bytes/call"
+    );
     let mut res = Vec::new();
     for _pass in 0..3 {
-        let ul = bench(&mut gpu, "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed", &mut bl);
+        let ul = bench(
+            &mut gpu,
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+            &mut bl,
+        );
         let ug = bench(&mut gpu, "gemv_mq2g256gl_moe_gate_up_k8_indexed", &mut bg);
         res.push((ul, ug));
     }
@@ -234,9 +306,24 @@ fn main() {
     let (ul, ug) = res[res.len() / 2];
     let bl_bytes = (k_top * mq2l_bytes) as f64;
     let bg_bytes = (k_top * mq2gl_bytes) as f64;
-    eprintln!("{:<10} {:>10.2} {:>12.1} {:>12.0}", "MQ2L", ul, bl_bytes / (ul * 1e-6) / (1u64 << 30) as f64, bl_bytes);
-    eprintln!("{:<10} {:>10.2} {:>12.1} {:>12.0}", "MQ2GL", ug, bg_bytes / (ug * 1e-6) / (1u64 << 30) as f64, bg_bytes);
-    eprintln!("\nMQ2GL is {:+.2}% on time  ({:.1}% fewer weight bytes)",
-        100.0 * (ug / ul - 1.0), 100.0 * (1.0 - bg_bytes / bl_bytes));
+    eprintln!(
+        "{:<10} {:>10.2} {:>12.1} {:>12.0}",
+        "MQ2L",
+        ul,
+        bl_bytes / (ul * 1e-6) / (1u64 << 30) as f64,
+        bl_bytes
+    );
+    eprintln!(
+        "{:<10} {:>10.2} {:>12.1} {:>12.0}",
+        "MQ2GL",
+        ug,
+        bg_bytes / (ug * 1e-6) / (1u64 << 30) as f64,
+        bg_bytes
+    );
+    eprintln!(
+        "\nMQ2GL is {:+.2}% on time  ({:.1}% fewer weight bytes)",
+        100.0 * (ug / ul - 1.0),
+        100.0 * (1.0 - bg_bytes / bl_bytes)
+    );
     eprintln!("median of 3 passes; correctness rel err MQ2L={r1:.2e} MQ2GL={r2:.2e}");
 }

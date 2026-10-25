@@ -13,17 +13,22 @@
 pub mod cdo;
 pub mod dma;
 pub mod isa;
+pub mod kernels;
 pub mod pdi;
 pub mod regs;
 pub mod route;
-pub mod txn;
-pub mod kernels;
 pub mod sim;
+pub mod txn;
 
 /// Optional vendor core-ELF corpus (`AIE2P_VENDOR_CORPUS`, the `vendor-artifacts` directory of the NPU
 /// reference checkout; not in this repo). Tests that cross-check against it skip when it is unset or absent.
 #[cfg(test)]
 pub(crate) fn vendor_corpus() -> Option<std::path::PathBuf> {
     let root = std::path::PathBuf::from(std::env::var_os("AIE2P_VENDOR_CORPUS")?);
-    if root.exists() { Some(root) } else { eprintln!("SKIP: vendor corpus absent: {}", root.display()); None }
+    if root.exists() {
+        Some(root)
+    } else {
+        eprintln!("SKIP: vendor corpus absent: {}", root.display());
+        None
+    }
 }

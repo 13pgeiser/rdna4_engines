@@ -131,10 +131,7 @@ fn expected_shadow_bits(packed: &[u8], m: usize, k: usize) -> Vec<u16> {
     let mut out = vec![0u16; m * k];
     for row in 0..m {
         let row_off = row * row_bytes;
-        let row_scale = f16_bits_to_f32(u16::from_le_bytes([
-            packed[row_off],
-            packed[row_off + 1],
-        ]));
+        let row_scale = f16_bits_to_f32(u16::from_le_bytes([packed[row_off], packed[row_off + 1]]));
         for block in 0..blocks {
             let scale = row_scale * e4m3_scale(packed[row_off + 16 + block]) * 0.88;
             let cw_off = row_off + 16 + scale_padded + block * 16;
@@ -165,13 +162,7 @@ fn upload_weight(gpu: &Gpu, packed: &[u8], m: usize, k: usize) -> GpuTensor {
     weight
 }
 
-fn check_shadow(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    packed: &[u8],
-    m: usize,
-    k: usize,
-) -> GpuTensor {
+fn check_shadow(gpu: &mut Gpu, weight: &GpuTensor, packed: &[u8], m: usize, k: usize) -> GpuTensor {
     let expanded = gpu
         .alloc_tensor(&[m * k], DType::F16)
         .expect("allocate FP16 shadow oracle");
@@ -248,9 +239,13 @@ where
     for _ in 0..trials {
         let start = gpu.hip.event_create().expect("create start event");
         let stop = gpu.hip.event_create().expect("create stop event");
-        gpu.hip.event_record(&start, None).expect("record start event");
+        gpu.hip
+            .event_record(&start, None)
+            .expect("record start event");
         launch(gpu);
-        gpu.hip.event_record(&stop, None).expect("record stop event");
+        gpu.hip
+            .event_record(&stop, None)
+            .expect("record stop event");
         gpu.hip.event_synchronize(&stop).expect("wait stop event");
         values.push(
             gpu.hip
@@ -343,7 +338,10 @@ fn compare_outputs(candidate: &[f32], reference: &[f32], m: usize, batch: usize)
         "NUMERICS max_abs={max_abs:.6e} rms_ref={rms_ref:.6e} rel_l2={nrmse:.6e} cosine={cosine:.9} top1_diag={top1:.6} nonfinite={nonfinite} strict_local_diag_failures={tolerance_failures} first_local={first_tolerance_failure:?}"
     );
     assert_eq!(nonfinite, 0, "non-finite candidate/reference values");
-    assert!(max_abs <= 0.1, "max absolute error {max_abs:.6e} exceeds 0.1");
+    assert!(
+        max_abs <= 0.1,
+        "max absolute error {max_abs:.6e} exceeds 0.1"
+    );
     assert!(nrmse <= 1.0e-3, "relative L2 {nrmse:.6e} exceeds 1e-3");
     assert!(cosine >= 0.999999, "cosine {cosine:.9} below 0.999999");
 }
@@ -394,10 +392,9 @@ fn main() {
     gpu.hip
         .memcpy_htod(&x.buf, bytes_of_f32(&x2_host))
         .expect("overwrite x allocation");
-    assert!(
-        gpu.rocblas_gemm_mfp4e8_soa_prefill_auto(&weight, &x, &candidate, M, K, B)
-            .expect("second staged rocBLAS call")
-    );
+    assert!(gpu
+        .rocblas_gemm_mfp4e8_soa_prefill_auto(&weight, &x, &candidate, M, K, B)
+        .expect("second staged rocBLAS call"));
     direct_rocblas(&mut gpu, &shadow, &x, &x_f16, &direct_fp16, M, K, B);
     direct_batch(&mut gpu, &weight, &x, &reference, M, K, B);
     gpu.hip.device_synchronize().expect("correctness warm sync");
@@ -416,10 +413,9 @@ fn main() {
     );
 
     let candidate_times = time_gpu_ms(&mut gpu, TRIALS, |gpu| {
-        assert!(
-            gpu.rocblas_gemm_mfp4e8_soa_prefill_auto(&weight, &x, &candidate, M, K, B)
-                .expect("timed staged rocBLAS call")
-        );
+        assert!(gpu
+            .rocblas_gemm_mfp4e8_soa_prefill_auto(&weight, &x, &candidate, M, K, B)
+            .expect("timed staged rocBLAS call"));
     });
     let direct_fp16_times = time_gpu_ms(&mut gpu, TRIALS, |gpu| {
         direct_rocblas(gpu, &shadow, &x, &x_f16, &direct_fp16, M, K, B);
@@ -433,7 +429,11 @@ fn main() {
         .download_f32(&direct_fp16)
         .expect("download direct rocBLAS");
     let reference_host = gpu.download_f32(&reference).expect("download reference");
-    assert_bits_equal("auto vs assembled FP16 rocBLAS", &candidate_host, &direct_fp16_host);
+    assert_bits_equal(
+        "auto vs assembled FP16 rocBLAS",
+        &candidate_host,
+        &direct_fp16_host,
+    );
     compare_outputs(&candidate_host, &reference_host, M, B);
 
     let candidate_ms = median_ms(candidate_times.clone());
@@ -448,6 +448,9 @@ fn main() {
         (0.90..=1.10).contains(&assembly_ratio),
         "auto/assembled hot-time ratio {assembly_ratio:.3} outside 10%"
     );
-    assert!(speedup >= 2.0, "staged rocBLAS speedup {speedup:.3}x below 2x screen");
+    assert!(
+        speedup >= 2.0,
+        "staged rocBLAS speedup {speedup:.3}x below 2x screen"
+    );
     println!("PASS gfx942 qt35 staged-rocBLAS oracle");
 }

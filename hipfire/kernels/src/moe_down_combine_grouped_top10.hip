@@ -34,7 +34,8 @@ __device__ __forceinline__ void moe_down_combine_grouped(
     float* __restrict__ residual,             // [N * H], in-place +=
     int hidden,
     int grouped_rows,
-    int tokens
+    int tokens,
+    int n_experts
 ) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     const int token = blockIdx.y;
@@ -43,7 +44,13 @@ __device__ __forceinline__ void moe_down_combine_grouped(
     const size_t route_base = (size_t)token * 10;
     __hip_bfloat16 accumulated = moe_top10_bf16_round(
         residual[(size_t)token * hidden + column]);
+    // Ranks whose id is outside [0, n_experts) (the router's -1 marker) are
+    // unrouted: never selected, contributing neither weight nor a grouped row.
     int used_ranks = 0;
+    for (int rank = 0; rank < 10; ++rank) {
+        const int expert = topk_indices[route_base + rank];
+        if (expert < 0 || expert >= n_experts) used_ranks |= 1 << rank;
+    }
     for (int count = 0; count < 10; ++count) {
         int selected_rank = -1;
         int selected_expert = 0x7fffffff;
@@ -79,9 +86,9 @@ __launch_bounds__(256, 4)
 extern "C" __global__ void moe_down_combine_grouped_top10(
     const float* __restrict__ grouped_down, const int* __restrict__ inverse_perm,
     const int* __restrict__ topk_indices, const float* __restrict__ topk_weights,
-    float* __restrict__ residual, int hidden, int grouped_rows, int tokens) {
+    float* __restrict__ residual, int hidden, int grouped_rows, int tokens, int n_experts) {
     moe_down_combine_grouped(grouped_down, inverse_perm, topk_indices, topk_weights,
-                             residual, hidden, grouped_rows, tokens);
+                             residual, hidden, grouped_rows, tokens, n_experts);
 }
 
 // The BF16-input combine's rank order, once per token: the ten route ranks
@@ -90,14 +97,18 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
 extern "C" __global__ __launch_bounds__(64) void moe_combine_order_top10(
     const int* __restrict__ inverse_perm, const int* __restrict__ topk_indices,
     const float* __restrict__ topk_weights, int2* __restrict__ order, int grouped_rows,
-    int tokens) {
+    int tokens, int n_experts) {
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= tokens) return;
     const size_t route_base = (size_t)token * 10;
     int expert[10];
-#pragma unroll
-    for (int rank = 0; rank < 10; ++rank) expert[rank] = topk_indices[route_base + rank];
     int used_ranks = 0;
+#pragma unroll
+    for (int rank = 0; rank < 10; ++rank) {
+        expert[rank] = topk_indices[route_base + rank];
+        // Id outside [0, n_experts): unrouted, never selected (order slot stays (-1, 0)).
+        if (expert[rank] < 0 || expert[rank] >= n_experts) used_ranks |= 1 << rank;
+    }
 #pragma unroll
     for (int c = 0; c < 10; ++c) {
         int selected_rank = -1, selected_expert = 0x7fffffff;

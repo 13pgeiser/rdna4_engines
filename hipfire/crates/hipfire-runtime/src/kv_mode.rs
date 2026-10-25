@@ -25,9 +25,39 @@ pub struct KvModePolicy {
     pub default: KvMode,
 }
 
-/// Native Qwen35 cache eligibility, shared by auto selection and preflight.
-/// Explicit native presets still report a refusal when this is false.
-pub fn qwen35_native_eligible(
+/// Exact `(n_heads, n_kv_heads, head_dim)` shapes with a native-FP8 cache
+/// constructor on the single-GPU gfx1201 Qwen35 route. An authored
+/// `--kv-mode fp8` is admitted for exactly these.
+const QWEN35_NATIVE_FP8_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256), (16, 2, 256)];
+
+/// Exact shapes with a native-BF16 cache constructor (authored `bf16` only).
+const QWEN35_NATIVE_BF16_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256)];
+
+/// Subset of [`QWEN35_NATIVE_FP8_SHAPES`] qualified for implicit selection:
+/// unset / `auto` picks native FP8 only here and stays Q8 elsewhere.
+const QWEN35_AUTO_FP8_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256), (16, 2, 256)];
+
+/// Route-level conditions shared by every native Qwen35 cache: exact gfx1201,
+/// single GPU, no adaptive tiering, no CASK eviction.
+fn qwen35_native_route(arch: &str, pp: usize, adaptive: bool, cask: bool) -> bool {
+    arch == "gfx1201" && pp == 1 && !adaptive && !cask
+}
+
+fn qwen35_native_shapes(mode: KvMode) -> &'static [(usize, usize, usize)] {
+    match mode {
+        Fp8 => QWEN35_NATIVE_FP8_SHAPES,
+        Bf16 => QWEN35_NATIVE_BF16_SHAPES,
+        _ => &[],
+    }
+}
+
+/// Whether an AUTHORED native `mode` (`fp8` | `bf16`) has a constructor for
+/// this route and geometry. This is support, not qualification: it never
+/// decides what `auto` selects (see [`qwen35_native_auto_eligible`]). Every
+/// non-native mode reports `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_native_supported(
+    mode: KvMode,
     arch: &str,
     n_heads: usize,
     n_kv_heads: usize,
@@ -36,24 +66,67 @@ pub fn qwen35_native_eligible(
     adaptive: bool,
     cask: bool,
 ) -> bool {
-    arch == "gfx1201"
-        && n_heads == 24
-        && n_kv_heads == 4
-        && head_dim == 256
-        && pp == 1
-        && !adaptive
-        && !cask
+    qwen35_native_route(arch, pp, adaptive, cask)
+        && qwen35_native_shapes(mode).contains(&(n_heads, n_kv_heads, head_dim))
+}
+
+/// Whether unset / `auto` may select native FP8 for this route and geometry.
+/// Always a subset of [`qwen35_native_supported`] for [`Fp8`].
+pub fn qwen35_native_auto_eligible(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pp: usize,
+    adaptive: bool,
+    cask: bool,
+) -> bool {
+    qwen35_native_route(arch, pp, adaptive, cask)
+        && QWEN35_AUTO_FP8_SHAPES.contains(&(n_heads, n_kv_heads, head_dim))
+}
+
+/// Refusal text for an authored native `mode` the route cannot construct;
+/// `None` when [`qwen35_native_supported`]. The one diagnostic every
+/// preflight (loader admission, HFQ and safetensors carriers) reports.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_native_refusal(
+    mode: KvMode,
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pp: usize,
+    adaptive: bool,
+    cask: bool,
+) -> Option<String> {
+    if qwen35_native_supported(
+        mode, arch, n_heads, n_kv_heads, head_dim, pp, adaptive, cask,
+    ) {
+        return None;
+    }
+    let shapes = qwen35_native_shapes(mode)
+        .iter()
+        .map(|(h, kv, d)| format!("H{h}/Hkv{kv}/D{d}"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    Some(format!(
+        "native KV {} requires exact gfx1201 {shapes}, single GPU and no adaptive/CASK \
+         (got {arch}, H{n_heads}/Hkv{n_kv_heads}/D{head_dim}, pp={pp}, adaptive={adaptive}, cask={cask}); \
+         use --kv-mode q8",
+        qwen_k_display_name(mode),
+    ))
 }
 
 /// Retain explicit native-mode diagnostics, but don't choose native for an
-/// ineligible model's implicit auto preset. All names still use the one parser.
+/// implicit auto preset the model is not qualified for
+/// ([`qwen35_native_auto_eligible`]). All names still use the one parser.
 pub fn qwen35_policy_for_native(
     policy: &KvModePolicy,
     mode_raw: &str,
-    native_eligible: bool,
+    auto_native_eligible: bool,
 ) -> KvModePolicy {
     let mut selected = *policy;
-    if !native_eligible && matches!(mode_raw.trim(), "" | "auto") {
+    if !auto_native_eligible && matches!(mode_raw.trim(), "" | "auto") {
         selected.accepted = match policy.site {
             "qwen35-hfq" => &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
             "qwen35-paro" => &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4],
@@ -247,7 +320,7 @@ fn ensure_accepted(k: KvMode, policy: &KvModePolicy) -> Result<(), KvPairError> 
         Ok(())
     } else {
         Err(KvPairError::new(format!(
-            "K mode {k:?} is not supported at site '{}' (accepted: {:?})",
+            "K mode {k:?} is not supported for this model route '{}' (accepted: {:?}); choose one of those with --kv-mode (memory.kv_cache) or --kv-k",
             policy.site, policy.accepted
         )))
     }
@@ -539,22 +612,33 @@ pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
     default: Bf16,
 };
 
-/// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201
-/// and bf16 everywhere else; explicit `fp8` is refused off gfx1201 and
-/// explicit `q8` off gfx11/gfx12, and any other unsupported explicit mode
+/// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201,
+/// q8 on exact gfx1151 (Strix Halo) and exact gfx1100 (7900 XTX; the model's
+/// geometry is checked where the state is built, and an auto request the
+/// geometry cannot serve falls back to the F32 state there) and bf16
+/// everywhere else (gfx942 included: auto never selects fp8 there); an
+/// explicit `bf16` is the exact F32 state on every arch; explicit `fp8` is
+/// accepted on exact gfx1201 and exact gfx942 and refused elsewhere, explicit
+/// `q8` is refused off gfx11/gfx12, and any other unsupported explicit mode
 /// is refused before the generic [`resolve`] fallback can rewrite it. The
 /// model's head geometry is checked where the state is built
 /// (`hipfire_arch_qwen4::resolve_qsa_format`).
+/// Qwen4's `Bf16` mode denotes F32 state, not BF16 KV storage. On gfx942,
+/// unset/`auto`/`bf16` select that F32 state; only an explicit `fp8` selects
+/// the reduced FP8 K/V rows; `q8` is not supported there.
 pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
-    let fp8_arch = arch == "gfx1201";
+    let auto_fp8_arch = arch == "gfx1201";
+    let auto_q8_arch = matches!(arch, "gfx1151" | "gfx1100");
+    let explicit_fp8_arch = auto_fp8_arch || arch == "gfx942";
     let q8_arch = arch.starts_with("gfx11") || arch.starts_with("gfx12");
     let mode = match raw.trim() {
-        "" | "auto" if fp8_arch => Fp8,
+        "" | "auto" if auto_fp8_arch => Fp8,
+        "" | "auto" if auto_q8_arch => Q8,
         "" | "auto" | "bf16" => Bf16,
-        "fp8" if fp8_arch => Fp8,
+        "fp8" if explicit_fp8_arch => Fp8,
         "fp8" => {
             return Err(format!(
-                "qwen4 kv mode \"fp8\" needs gfx1201 (have {arch}); use bf16 or auto"
+                "qwen4 kv mode \"fp8\" needs gfx1201 or gfx942 (have {arch}); use bf16 or auto"
             ))
         }
         "q8" if q8_arch => Q8,
@@ -565,7 +649,7 @@ pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
         }
         other => {
             return Err(format!(
-                "unsupported qwen4 kv mode {other:?}; explicit mode must be one of: auto, bf16, fp8, q8"
+                "unsupported qwen4 kv mode {other:?}; --kv-mode (memory.kv_cache) must be one of: auto, bf16, fp8, q8"
             ))
         }
     };
@@ -594,7 +678,7 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
         Some(m @ (Fp8 | Bf16 | F16)) => (
             m,
             Some(
-                "explicit fp8/bf16/f16 KV requested but unsupported at this site; load will fail closed",
+                "explicit fp8/bf16/f16 KV requested but this model route does not support it; the load will be refused. Use --kv-mode q8 or auto",
             ),
         ),
         _ => {
@@ -605,8 +689,8 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
                 // satisfy the `&'static str` warning type.
                 let leaked: &'static str = Box::leak(
                     format!(
-                        "unrecognized or unsupported kv mode {raw:?} for site {}; \
-                         using site default {:?}",
+                        "unrecognized or unsupported --kv-mode {raw:?} for this model route '{}'; \
+                         using the route default {:?}",
                         policy.site, policy.default
                     )
                     .into_boxed_str(),
@@ -672,7 +756,9 @@ mod tests {
 
     #[test]
     fn deprecated_kv_names_warn_supported_names_do_not() {
-        for raw in ["", "auto", "q8", "fwht2", "fwht3", "fwht4", "fp8", "bf16", "f16", "lloyd3"] {
+        for raw in [
+            "", "auto", "q8", "fwht2", "fwht3", "fwht4", "fp8", "bf16", "f16", "lloyd3",
+        ] {
             assert!(deprecated_kv_name_warning(raw).is_none(), "{raw}");
         }
         for raw in DEPRECATED_KV_NAMES {
@@ -721,14 +807,69 @@ mod tests {
         }
     }
 
+    /// `hipfire_config::effective("memory.kv_cache")` is the Settings/CLI
+    /// prediction of the Qwen auto default; it must name the same mode the
+    /// loader resolves.
+    #[test]
+    fn effective_kv_cache_auto_matches_resolve_kv_pair() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::{resolve, ConfigValue};
+
+        let resolved = resolve([]).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030"] {
+            // An eligible-gfx1201 policy (accepted set contains Fp8).
+            let loaded =
+                resolve_kv_pair("auto", None, None, &QWEN35_HFQ_POLICY, arch, true).unwrap();
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: None,
+                registry_tag: Some("qwen3.8:27b".into()),
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("memory.kv_cache", &resolved, &ctx);
+            assert_eq!(
+                predicted.value,
+                ConfigValue::String(qwen_k_display_name(loaded.k()).into()),
+                "arch={arch}"
+            );
+        }
+    }
+
+    /// Native Qwen4 (`model_arch` 16) uses `resolve_qwen4`: fp8 on exact
+    /// gfx1201, bf16 elsewhere.
+    #[test]
+    fn effective_kv_cache_auto_matches_resolve_qwen4() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::{resolve, ConfigValue};
+
+        let resolved = resolve([]).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx942"] {
+            let loaded = resolve_qwen4("auto", arch).unwrap();
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: Some(16),
+                registry_tag: None,
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("memory.kv_cache", &resolved, &ctx);
+            assert_eq!(
+                predicted.value,
+                ConfigValue::String(qwen_k_display_name(loaded.mode).into()),
+                "arch={arch}"
+            );
+        }
+    }
+
     #[test]
     fn mismatched_qwen_geometry_auto_is_q8_but_explicit_native_is_preserved() {
         for base in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
-            let eligible = qwen35_native_eligible("gfx1201", 24, 4, 256, 1, false, false);
-            let small = qwen35_native_eligible("gfx1201", 8, 2, 256, 1, false, false);
+            let eligible = qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false, false);
+            let small = qwen35_native_auto_eligible("gfx1201", 8, 2, 256, 1, false, false);
             assert!(eligible);
             assert!(!small);
-            assert!(!qwen35_native_eligible(
+            assert!(!qwen35_native_auto_eligible(
                 "gfx1201", 24, 4, 256, 1, false, true
             ));
             let native = qwen35_policy_for_native(base, "auto", eligible);
@@ -759,6 +900,150 @@ mod tests {
                 Fp8
             );
         }
+    }
+
+    /// What every Qwen35 preflight does: auto qualification picks the policy,
+    /// the authored native mode then needs route + geometry support.
+    #[allow(clippy::too_many_arguments)]
+    fn native_preflight(
+        raw: &str,
+        arch: &str,
+        shape: (usize, usize, usize),
+        pp: usize,
+        adaptive: bool,
+        cask: bool,
+    ) -> Result<KvMode, String> {
+        let (h, kv, d) = shape;
+        let auto = qwen35_native_auto_eligible(arch, h, kv, d, pp, adaptive, cask);
+        let policy = qwen35_policy_for_native(&QWEN35_HFQ_POLICY, raw, auto);
+        let k = resolve_kv_pair(raw, None, None, &policy, arch, true)
+            .map_err(|e| e.to_string())?
+            .k();
+        if matches!(k, Fp8 | Bf16) {
+            if let Some(why) = qwen35_native_refusal(k, arch, h, kv, d, pp, adaptive, cask) {
+                return Err(why);
+            }
+        }
+        Ok(k)
+    }
+
+    #[test]
+    fn native_support_vs_auto_qualification_truth_table() {
+        const DENSE: (usize, usize, usize) = (24, 4, 256);
+        const A3B: (usize, usize, usize) = (16, 2, 256);
+        let ok = |raw, arch, shape, pp, ad, cask| native_preflight(raw, arch, shape, pp, ad, cask);
+
+        // Dense 27B: unchanged. auto/unset and explicit fp8/bf16 native; q8 override.
+        for raw in ["", "auto", "fp8"] {
+            assert_eq!(
+                ok(raw, "gfx1201", DENSE, 1, false, false),
+                Ok(Fp8),
+                "dense {raw}"
+            );
+        }
+        assert_eq!(ok("bf16", "gfx1201", DENSE, 1, false, false), Ok(Bf16));
+        assert_eq!(ok("q8", "gfx1201", DENSE, 1, false, false), Ok(Q8));
+
+        // Exact A3B H16/Hkv2/D256: auto/unset and explicit fp8 are qualified;
+        // q8 override honored, bf16 NOT widened.
+        for raw in ["", "auto", "fp8"] {
+            assert_eq!(
+                ok(raw, "gfx1201", A3B, 1, false, false),
+                Ok(Fp8),
+                "a3b {raw}"
+            );
+        }
+        assert_eq!(ok("q8", "gfx1201", A3B, 1, false, false), Ok(Q8));
+        assert!(ok("bf16", "gfx1201", A3B, 1, false, false).is_err());
+        assert!(ok("fp8", "gfx1201", (8, 2, 256), 1, false, false).is_err());
+
+        // Wrong shapes fail closed for explicit fp8/bf16; auto stays q8.
+        for shape in [
+            (8, 2, 256),
+            (16, 2, 128),
+            (24, 2, 256),
+            (16, 4, 256),
+            (24, 4, 128),
+            (48, 8, 128),
+            (16, 2, 512),
+        ] {
+            for raw in ["fp8", "bf16"] {
+                assert!(
+                    ok(raw, "gfx1201", shape, 1, false, false).is_err(),
+                    "{shape:?} {raw}"
+                );
+            }
+            for raw in ["", "auto"] {
+                assert_eq!(
+                    ok(raw, "gfx1201", shape, 1, false, false),
+                    Ok(Q8),
+                    "{shape:?} {raw}"
+                );
+            }
+        }
+
+        // pp>1, adaptive, CASK and non-gfx1201 refuse explicit native on both
+        // supported shapes; auto stays q8; q8 override stays valid.
+        for shape in [DENSE, A3B] {
+            for (arch, pp, ad, cask) in [
+                ("gfx1201", 2, false, false),
+                ("gfx1201", 1, true, false),
+                ("gfx1201", 1, false, true),
+                ("gfx1100", 1, false, false),
+                ("gfx1151", 1, false, false),
+                ("gfx1200", 1, false, false),
+                ("gfx942", 1, false, false),
+            ] {
+                for raw in ["fp8", "bf16"] {
+                    assert!(
+                        ok(raw, arch, shape, pp, ad, cask).is_err(),
+                        "{shape:?} {arch} pp{pp} ad{ad} cask{cask} {raw}"
+                    );
+                }
+                for raw in ["", "auto", "q8"] {
+                    assert_eq!(
+                        ok(raw, arch, shape, pp, ad, cask),
+                        Ok(Q8),
+                        "{shape:?} {arch} pp{pp} ad{ad} cask{cask} {raw}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_predicates_per_mode_and_auto_is_subset_of_fp8_support() {
+        let sup = |m, shape: (usize, usize, usize)| {
+            qwen35_native_supported(m, "gfx1201", shape.0, shape.1, shape.2, 1, false, false)
+        };
+        assert!(sup(Fp8, (24, 4, 256)) && sup(Fp8, (16, 2, 256)));
+        assert!(sup(Bf16, (24, 4, 256)) && !sup(Bf16, (16, 2, 256)));
+        for m in [Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, F16] {
+            assert!(!sup(m, (24, 4, 256)) && !sup(m, (16, 2, 256)), "{m:?}");
+        }
+        // Auto qualification includes both exact supported FP8 geometries.
+        assert!(qwen35_native_auto_eligible(
+            "gfx1201", 24, 4, 256, 1, false, false
+        ));
+        assert!(qwen35_native_auto_eligible(
+            "gfx1201", 16, 2, 256, 1, false, false
+        ));
+        for arch in ["gfx1201", "gfx1100"] {
+            for (h, kv, d) in [(24, 4, 256), (16, 2, 256), (8, 2, 256)] {
+                for (pp, ad, cask) in [
+                    (1, false, false),
+                    (2, false, false),
+                    (1, true, false),
+                    (1, false, true),
+                ] {
+                    if qwen35_native_auto_eligible(arch, h, kv, d, pp, ad, cask) {
+                        assert!(qwen35_native_supported(Fp8, arch, h, kv, d, pp, ad, cask));
+                    }
+                }
+            }
+        }
+        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 1, false, false).is_none());
+        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 2, false, false).is_some());
     }
 
     #[test]
@@ -1157,7 +1442,10 @@ mod tests {
         // become an auto selection.
         let r = resolve("fp8", p);
         assert_eq!(r.mode, KvMode::Fp8);
-        assert!(r.warning.is_none(), "fp8 must resolve cleanly on the slots site");
+        assert!(
+            r.warning.is_none(),
+            "fp8 must resolve cleanly on the slots site"
+        );
         // Arch-parameterized gate: explicit fp8 on gfx1201 is honored, and
         // every other arch hard-errors naming the arch and the fix.
         let ok = resolve_qwen35_slots("fp8", "gfx1201").unwrap();
@@ -1220,11 +1508,47 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_auto_fp8_on_gfx1201_bf16_elsewhere_and_rejects_before_fallback() {
+    fn qwen4_gfx942_auto_stays_f32_explicit_fp8_accepted_q8_refused() {
+        // Unset/auto/bf16 never select fp8 on gfx942: they resolve to F32 state.
+        for raw in ["", "auto", " auto ", "bf16"] {
+            let resolved = resolve_qwen4(raw, "gfx942").expect("gfx942 F32 state mode");
+            assert_eq!(resolved.mode, KvMode::Bf16, "{raw:?} on gfx942");
+            assert!(resolved.warning.is_none());
+        }
+        // Only an explicit fp8 selects reduced K/V on gfx942.
+        for raw in ["fp8", " fp8 "] {
+            let resolved = resolve_qwen4(raw, "gfx942").expect("explicit gfx942 fp8");
+            assert_eq!(resolved.mode, KvMode::Fp8, "{raw:?} on gfx942");
+            assert!(resolved.warning.is_none());
+        }
+        let Err(error) = resolve_qwen4("q8", "gfx942") else {
+            panic!("q8 reduced KV must be refused on gfx942");
+        };
+        assert!(
+            error.contains("q8") && error.contains("gfx942") && error.contains("use bf16 or auto"),
+            "{error}"
+        );
+        // Only exact gfx942 and gfx1201 accept explicit fp8; sibling CDNA
+        // arches and gfx1200 do not.
+        for arch in ["gfx940", "gfx941", "gfx90a", "gfx9420", "gfx1200"] {
+            let Err(error) = resolve_qwen4("fp8", arch) else {
+                panic!("fp8 must be refused on {arch}");
+            };
+            assert!(
+                error.contains("fp8") && error.contains(arch) && error.contains("gfx942"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_auto_fp8_gfx1201_q8_gfx1151_gfx1100_bf16_elsewhere_rejects_before_fallback() {
         let p = &QWEN4_POLICY;
-        // (raw, arch) -> mode. The Halo (gfx1151) and the XTX (gfx1100) keep
-        // bf16 under auto; only exact gfx1201 selects fp8 (not gfx1200).
-        // Explicit q8 is served on every gfx11/gfx12 arch and never by auto.
+        // (raw, arch) -> mode. Only exact gfx1201 selects fp8 (not gfx1200);
+        // only exact gfx1151 (the Halo) and exact gfx1100 (the XTX) select q8
+        // under auto; every other arch keeps bf16 (the F32 state). Explicit
+        // bf16 is the F32 state on every arch; explicit q8 is served on every
+        // gfx11/gfx12 arch.
         for (raw, arch, mode) in [
             ("", "gfx1201", KvMode::Fp8),
             ("auto", "gfx1201", KvMode::Fp8),
@@ -1232,13 +1556,22 @@ mod tests {
             ("bf16", "gfx1201", KvMode::Bf16),
             ("fp8", "gfx1201", KvMode::Fp8),
             ("q8", "gfx1201", KvMode::Q8),
-            ("", "gfx1151", KvMode::Bf16),
-            ("auto", "gfx1151", KvMode::Bf16),
+            ("", "gfx1151", KvMode::Q8),
+            ("auto", "gfx1151", KvMode::Q8),
+            (" auto ", "gfx1151", KvMode::Q8),
             ("bf16", "gfx1151", KvMode::Bf16),
+            (" bf16 ", "gfx1151", KvMode::Bf16),
             (" q8 ", "gfx1151", KvMode::Q8),
-            ("", "gfx1100", KvMode::Bf16),
-            ("auto", "gfx1100", KvMode::Bf16),
+            ("", "gfx1100", KvMode::Q8),
+            ("auto", "gfx1100", KvMode::Q8),
+            (" auto ", "gfx1100", KvMode::Q8),
+            ("bf16", "gfx1100", KvMode::Bf16),
             ("q8", "gfx1100", KvMode::Q8),
+            ("", "gfx1101", KvMode::Bf16),
+            ("auto", "gfx1101", KvMode::Bf16),
+            ("auto", "gfx1102", KvMode::Bf16),
+            ("auto", "gfx1150", KvMode::Bf16),
+            ("auto", "gfx1152", KvMode::Bf16),
             ("auto", "gfx1200", KvMode::Bf16),
             ("q8", "gfx1200", KvMode::Q8),
         ] {
@@ -1333,7 +1666,15 @@ mod tests {
         assert_eq!(legacy.mode, Asym3);
         assert!(legacy.warning.is_none());
         // Bare asymN/turboN/fwhtN are FWHT names; no hd512 FWHT tier → q8 + warn.
-        for raw in ["asym3", "turbo3", "turbo", "fwht3", "asym4", "legacy-asym4", "garbage"] {
+        for raw in [
+            "asym3",
+            "turbo3",
+            "turbo",
+            "fwht3",
+            "asym4",
+            "legacy-asym4",
+            "garbage",
+        ] {
             let r = resolve(raw, p);
             assert_eq!(r.mode, Q8, "{raw}");
             assert!(r.warning.is_some(), "{raw} must warn");

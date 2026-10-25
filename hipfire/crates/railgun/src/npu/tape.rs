@@ -213,7 +213,11 @@ impl ProgramSpec<'_> {
 
     /// Exact byte length of the canonical program layout.
     fn canonical_len(&self) -> usize {
-        let dynamic: usize = self.dynamic.iter().map(|&(_, kind)| 8 + kind.encode().1).sum();
+        let dynamic: usize = self
+            .dynamic
+            .iter()
+            .map(|&(_, kind)| 8 + kind.encode().1)
+            .sum();
         27 + self.pdi.len() + self.txn.len() + dynamic
     }
 
@@ -532,12 +536,24 @@ mod tests {
     #[test]
     fn moving_word_static_vs_dynamic_changes_program_key() {
         let txn = bytes(&[1, 2, 3]);
-        let stat = ProgramSpec { pdi: b"pdi", txn: &txn, dynamic: &[] };
+        let stat = ProgramSpec {
+            pdi: b"pdi",
+            txn: &txn,
+            dynamic: &[],
+        };
         let dyn1 = [(1usize, SEQ)];
-        let dynamic = ProgramSpec { pdi: b"pdi", txn: &txn, dynamic: &dyn1 };
+        let dynamic = ProgramSpec {
+            pdi: b"pdi",
+            txn: &txn,
+            dynamic: &dyn1,
+        };
         assert_ne!(stat.program_key(), dynamic.program_key());
         let dyn2 = [(2usize, SEQ)];
-        let moved = ProgramSpec { pdi: b"pdi", txn: &txn, dynamic: &dyn2 };
+        let moved = ProgramSpec {
+            pdi: b"pdi",
+            txn: &txn,
+            dynamic: &dyn2,
+        };
         assert_ne!(dynamic.program_key(), moved.program_key());
     }
 
@@ -546,22 +562,50 @@ mod tests {
         let dyn_ = [(0usize, SEQ), (2usize, BindingKind::Custom(9))];
         let a = bytes(&[1, 2, 3]);
         let b = bytes(&[0xdead_beef, 2, 0x1234_5678]);
-        let ka = ProgramSpec { pdi: b"p", txn: &a, dynamic: &dyn_ }.program_key();
-        let kb = ProgramSpec { pdi: b"p", txn: &b, dynamic: &dyn_ }.program_key();
+        let ka = ProgramSpec {
+            pdi: b"p",
+            txn: &a,
+            dynamic: &dyn_,
+        }
+        .program_key();
+        let kb = ProgramSpec {
+            pdi: b"p",
+            txn: &b,
+            dynamic: &dyn_,
+        }
+        .program_key();
         assert_eq!(ka, kb);
         // Static word change does change it.
         let c = bytes(&[1, 7, 3]);
-        let kc = ProgramSpec { pdi: b"p", txn: &c, dynamic: &dyn_ }.program_key();
+        let kc = ProgramSpec {
+            pdi: b"p",
+            txn: &c,
+            dynamic: &dyn_,
+        }
+        .program_key();
         assert_ne!(ka, kc);
     }
 
     #[test]
     fn cmd_bo_indices_do_not_mask_txn() {
-        let dyn_ = [(0usize, BindingKind::ArgAddress { arg: 1 }), (1, BindingKind::InstsAddress)];
+        let dyn_ = [
+            (0usize, BindingKind::ArgAddress { arg: 1 }),
+            (1, BindingKind::InstsAddress),
+        ];
         let a = bytes(&[1, 2]);
         let b = bytes(&[9, 2]);
-        let ka = ProgramSpec { pdi: b"p", txn: &a, dynamic: &dyn_ }.program_key();
-        let kb = ProgramSpec { pdi: b"p", txn: &b, dynamic: &dyn_ }.program_key();
+        let ka = ProgramSpec {
+            pdi: b"p",
+            txn: &a,
+            dynamic: &dyn_,
+        }
+        .program_key();
+        let kb = ProgramSpec {
+            pdi: b"p",
+            txn: &b,
+            dynamic: &dyn_,
+        }
+        .program_key();
         assert_ne!(ka, kb);
     }
 
@@ -579,7 +623,14 @@ mod tests {
         ];
         let mut base = bytes(&[10, 11, 12, 13, 14, 15]);
         base.extend_from_slice(&[0xaa, 0xbb]); // trailing partial word
-        let key = |txn: &[u8]| ProgramSpec { pdi: b"p", txn, dynamic: &dyn_ }.program_key();
+        let key = |txn: &[u8]| {
+            ProgramSpec {
+                pdi: b"p",
+                txn,
+                dynamic: &dyn_,
+            }
+            .program_key()
+        };
         let base_key = key(&base);
 
         for word in [1usize, 2, 4] {
@@ -604,8 +655,16 @@ mod tests {
         let mut cache: ProgramCache<u32> = ProgramCache::with_hasher(|_| ProgramKey(7));
         let t1 = bytes(&[1]);
         let t2 = bytes(&[2]);
-        let s1 = ProgramSpec { pdi: b"p", txn: &t1, dynamic: &[] };
-        let s2 = ProgramSpec { pdi: b"p", txn: &t2, dynamic: &[] };
+        let s1 = ProgramSpec {
+            pdi: b"p",
+            txn: &t1,
+            dynamic: &[],
+        };
+        let s2 = ProgramSpec {
+            pdi: b"p",
+            txn: &t2,
+            dynamic: &[],
+        };
         assert_eq!(cache.get_or_insert_with(s1, || Ok(11)).unwrap().1, Miss);
         let mut called = false;
         let err = cache
@@ -629,7 +688,14 @@ mod tests {
         let mut cache: ProgramCache<Vec<u32>> = ProgramCache::default();
         let t1 = bytes(&[1, 2, 3]);
         let (v, o) = cache
-            .get_or_insert_with(ProgramSpec { pdi: b"p", txn: &t1, dynamic: &dyn_ }, || Ok(vec![1]))
+            .get_or_insert_with(
+                ProgramSpec {
+                    pdi: b"p",
+                    txn: &t1,
+                    dynamic: &dyn_,
+                },
+                || Ok(vec![1]),
+            )
             .unwrap();
         assert_eq!(o, Miss);
         v.push(2);
@@ -637,10 +703,17 @@ mod tests {
         let t2 = bytes(&[1, 99, 3]); // only the dynamic word changed
         let mut built = false;
         let (v, o) = cache
-            .get_or_insert_with(ProgramSpec { pdi: b"p", txn: &t2, dynamic: &dyn_ }, || {
-                built = true;
-                Ok(vec![])
-            })
+            .get_or_insert_with(
+                ProgramSpec {
+                    pdi: b"p",
+                    txn: &t2,
+                    dynamic: &dyn_,
+                },
+                || {
+                    built = true;
+                    Ok(vec![])
+                },
+            )
             .unwrap();
         assert_eq!(o, Hit);
         assert!(!built);
@@ -648,7 +721,14 @@ mod tests {
 
         let t3 = bytes(&[5, 99, 3]); // static word changed
         let (v, o) = cache
-            .get_or_insert_with(ProgramSpec { pdi: b"p", txn: &t3, dynamic: &dyn_ }, || Ok(vec![7]))
+            .get_or_insert_with(
+                ProgramSpec {
+                    pdi: b"p",
+                    txn: &t3,
+                    dynamic: &dyn_,
+                },
+                || Ok(vec![7]),
+            )
             .unwrap();
         assert_eq!(o, Miss);
         assert_eq!(*v, vec![7]);
@@ -659,9 +739,16 @@ mod tests {
     fn builder_error_inserts_nothing() {
         let mut cache: ProgramCache<u8> = ProgramCache::new();
         let t = bytes(&[1]);
-        let spec = ProgramSpec { pdi: b"p", txn: &t, dynamic: &[] };
+        let spec = ProgramSpec {
+            pdi: b"p",
+            txn: &t,
+            dynamic: &[],
+        };
         assert_eq!(
-            cache.get_or_insert_with(spec, || Err("boom".into())).map(|_| ()).unwrap_err(),
+            cache
+                .get_or_insert_with(spec, || Err("boom".into()))
+                .map(|_| ())
+                .unwrap_err(),
             "boom"
         );
         assert!(cache.is_empty());
@@ -671,7 +758,11 @@ mod tests {
     fn inventory_out_of_range_is_explicit_error() {
         let t = bytes(&[1, 2]);
         let bad = [(2usize, SEQ)];
-        let spec = ProgramSpec { pdi: b"p", txn: &t, dynamic: &bad };
+        let spec = ProgramSpec {
+            pdi: b"p",
+            txn: &t,
+            dynamic: &bad,
+        };
         assert!(spec.validate().is_err());
         // Constructor does not panic and masks nothing.
         let _ = spec.program_key();
@@ -686,10 +777,22 @@ mod tests {
         // A partial trailing word is not a valid word either.
         let t5 = vec![0u8; 5];
         let d = [(1usize, BindingKind::Custom(1))];
-        assert!(ProgramSpec { pdi: b"", txn: &t5, dynamic: &d }.validate().is_err());
+        assert!(ProgramSpec {
+            pdi: b"",
+            txn: &t5,
+            dynamic: &d
+        }
+        .validate()
+        .is_err());
         // Cmd-BO indices are not range-checked against txn.
         let cmd = [(1000usize, BindingKind::InstsAddress)];
-        assert!(ProgramSpec { pdi: b"", txn: &t5, dynamic: &cmd }.validate().is_ok());
+        assert!(ProgramSpec {
+            pdi: b"",
+            txn: &t5,
+            dynamic: &cmd
+        }
+        .validate()
+        .is_ok());
     }
 
     fn entry(program: u64, config: u64, kinds: &[(BindingKind, u64)]) -> TapeEntry {
@@ -705,10 +808,25 @@ mod tests {
         let kinds = [(SEQ, 0u64)];
         let txn = bytes(&[1]);
         let changed_txn = bytes(&[2]);
-        let original = ProgramSpec { pdi: b"p", txn: &txn, dynamic: &[] };
-        let changed = ProgramSpec { txn: &changed_txn, ..original };
-        let good = Tape::record(vec![entry(original.program_key().0, original.config_key().0, &kinds)]);
-        let stale = Tape::record(vec![entry(changed.program_key().0, changed.config_key().0, &kinds)]);
+        let original = ProgramSpec {
+            pdi: b"p",
+            txn: &txn,
+            dynamic: &[],
+        };
+        let changed = ProgramSpec {
+            txn: &changed_txn,
+            ..original
+        };
+        let good = Tape::record(vec![entry(
+            original.program_key().0,
+            original.config_key().0,
+            &kinds,
+        )]);
+        let stale = Tape::record(vec![entry(
+            changed.program_key().0,
+            changed.config_key().0,
+            &kinds,
+        )]);
         assert_ne!(good.sequence_hash, stale.sequence_hash);
         assert!(good.check_replay(good.sequence_hash).is_ok());
         assert!(good.check_replay(stale.sequence_hash).is_err());
@@ -723,20 +841,34 @@ mod tests {
     #[test]
     fn binding_values_irrelevant_kind_and_order_matter() {
         let base = Tape::record(vec![entry(1, 1, &[(SEQ, 1), (BindingKind::Custom(3), 2)])]);
-        let values = Tape::record(vec![entry(1, 1, &[(SEQ, 99), (BindingKind::Custom(3), 77)])]);
+        let values = Tape::record(vec![entry(
+            1,
+            1,
+            &[(SEQ, 99), (BindingKind::Custom(3), 77)],
+        )]);
         assert_eq!(base.sequence_hash, values.sequence_hash);
         let kind = Tape::record(vec![entry(1, 1, &[(SEQ, 1), (BindingKind::Custom(4), 2)])]);
         assert_ne!(base.sequence_hash, kind.sequence_hash);
         let order = Tape::record(vec![entry(1, 1, &[(BindingKind::Custom(3), 2), (SEQ, 1)])]);
         assert_ne!(base.sequence_hash, order.sequence_hash);
-        let run = Tape::record(vec![entry(1, 1, &[(BindingKind::Seq { run: 1 }, 1), (BindingKind::Custom(3), 2)])]);
+        let run = Tape::record(vec![entry(
+            1,
+            1,
+            &[
+                (BindingKind::Seq { run: 1 }, 1),
+                (BindingKind::Custom(3), 2),
+            ],
+        )]);
         assert_ne!(base.sequence_hash, run.sequence_hash);
     }
 
     #[test]
     fn transitions_full_lean_by_previous_config() {
         let t = Tape::record(
-            [1u64, 1, 2, 2, 1].iter().map(|&c| entry(c, c, &[])).collect(),
+            [1u64, 1, 2, 2, 1]
+                .iter()
+                .map(|&c| entry(c, c, &[]))
+                .collect(),
         );
         let got: Vec<_> = t.transitions().collect();
         use Transition::{Full, Lean};
@@ -795,7 +927,12 @@ mod tests {
         raw.extend_from_slice(&[3, 5, 0, 0, 0]);
         let t = bytes(&[0xffff_ffff]);
         let d = [(0usize, BindingKind::Seq { run: 5 })];
-        let key = ProgramSpec { pdi: b"ab", txn: &t, dynamic: &d }.program_key();
+        let key = ProgramSpec {
+            pdi: b"ab",
+            txn: &t,
+            dynamic: &d,
+        }
+        .program_key();
         assert_eq!(key.0, fnv1a(FNV_OFFSET, &raw));
     }
 }

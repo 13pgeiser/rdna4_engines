@@ -1994,8 +1994,7 @@ impl Gpu {
             return Ok(());
         }
         let n_entries = entries.len() / 3;
-        if entries.len() % 3 != 0 || row_ends.last().map(|&end| end as usize) != Some(n_entries)
-        {
+        if entries.len() % 3 != 0 || row_ends.last().map(|&end| end as usize) != Some(n_entries) {
             return Err(HipError::new(
                 0,
                 &format!(
@@ -2005,7 +2004,9 @@ impl Gpu {
                 ),
             ));
         }
-        if logits.numel() < n_rows * vocab || vocab > i32::MAX as usize || n_rows > i32::MAX as usize
+        if logits.numel() < n_rows * vocab
+            || vocab > i32::MAX as usize
+            || n_rows > i32::MAX as usize
         {
             return Err(HipError::new(
                 0,
@@ -2043,12 +2044,20 @@ impl Gpu {
         // SAFETY: same allocation, `words * 4` bytes initialized just above.
         let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, words * 4) };
         match self.active_stream.as_ref() {
-            Some(stream) => self.hip.memcpy_htod_async(&stage.device.buf, bytes, stream)?,
-            None => self.hip.memcpy_htod_async_default(&stage.device.buf, bytes)?,
+            Some(stream) => self
+                .hip
+                .memcpy_htod_async(&stage.device.buf, bytes, stream)?,
+            None => self
+                .hip
+                .memcpy_htod_async_default(&stage.device.buf, bytes)?,
         }
         const FUNC: &str = "logit_penalty_table_rows";
         if !self.functions.contains_key(FUNC) {
-            self.ensure_kernel("logit_penalty_table", kernels::LOGIT_PENALTY_TABLE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "logit_penalty_table",
+                kernels::LOGIT_PENALTY_TABLE_SRC,
+                FUNC,
+            )?;
         }
         let func = &self.functions[FUNC];
         let mut lp = logits.buf.as_ptr();

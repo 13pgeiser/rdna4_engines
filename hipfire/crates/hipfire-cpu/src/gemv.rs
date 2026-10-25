@@ -28,7 +28,7 @@ use std::collections::hash_map::Entry;
 #[cfg(target_arch = "x86_64")]
 use std::collections::HashMap;
 
-use crate::quant::{decode_group_codes, CpuQuant};
+use crate::quant::{decode_group_codes, CpuQuant, PLANAR_GROUP};
 use crate::simd;
 
 /// Largest group size over [`CpuQuant`] (256 for every G256 format). The decode
@@ -37,15 +37,51 @@ const MAX_GROUP_ELEMS: usize = 256;
 
 /// Bytes per weight row: `row_header_bytes + (k / group_elems) * group_bytes`.
 ///
-/// G256 formats need `k % 256 == 0`, which every fixture shape satisfies and
-/// which [`gemv`]/[`gemm`] assert.
+/// G256 formats need `k % 256 == 0`, the 128-group formats `k % 128 == 0`
+/// ([`CpuQuant::k_multiple`]); [`gemv`]/[`gemm`] assert it.
+///
+/// **Planar formats** ([`CpuQuant::is_planar`]) return the stride of one row in
+/// the *codes plane* only (W3 `3k/8`, E8P `k/4`). That is NOT the tensor size
+/// divided by `m`: the f16 scales live in a separate plane after all `m` code
+/// rows. Whole-tensor sizes must use [`tensor_bytes`].
 pub fn row_bytes(q: CpuQuant, k: usize) -> usize {
     q.row_header_bytes() + (k / q.group_elems()) * q.group_bytes()
 }
 
+/// Bytes of a whole `[m, k]` weight tensor: `m * row_bytes(q, k)` for the row
+/// formats; for the planar formats the codes plane plus the scale plane,
+/// `m * (row_bytes(q, k) + 2 * (k / 128))`.
+pub fn tensor_bytes(q: CpuQuant, m: usize, k: usize) -> usize {
+    if q.is_planar() {
+        m * (row_bytes(q, k) + 2 * (k / PLANAR_GROUP))
+    } else {
+        m * row_bytes(q, k)
+    }
+}
+
+/// Row `r` of an `[m, k]` tensor as `(codes_row, scales_row)`.
+///
+/// Row formats: the row's bytes run to the end of `packed` (kernels may read
+/// the bytes right up to the next row, as before) and `scales_row` is empty.
+/// Planar formats: `codes_row` is exactly the row's `row_bytes(q, k)` codes and
+/// `scales_row` exactly its `2 * (k / 128)` scale bytes, so a kernel that stays
+/// inside the two slices never reads a neighbouring row or the other plane.
+/// `packed` must hold at least [`tensor_bytes`].
+#[inline]
+fn row_slices(q: CpuQuant, packed: &[u8], m: usize, k: usize, r: usize) -> (&[u8], &[u8]) {
+    let rb = row_bytes(q, k);
+    if q.is_planar() {
+        let spr = 2 * (k / PLANAR_GROUP);
+        let at = m * rb + r * spr;
+        (&packed[r * rb..(r + 1) * rb], &packed[at..at + spr])
+    } else {
+        (&packed[r * rb..], &[])
+    }
+}
+
 /// `y[0..m] = W[m,k] · x[0..k]`.
 ///
-/// `packed` is the whole weight tensor's bytes, `m * row_bytes(q, k)` of them.
+/// `packed` is the whole weight tensor's bytes, [`tensor_bytes`]`(q, m, k)` of them.
 /// `x` carries the format's rotation (see the module docs).
 pub fn gemv(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], y: &mut [f32]) {
     gemv_with_simd(q, packed, m, k, x, y, None)
@@ -68,9 +104,11 @@ pub fn gemv_with_simd(
         return;
     }
     let rb = row_bytes(q, k);
+    let tb = tensor_bytes(q, m, k);
     assert!(
-        k % 256 == 0,
-        "gemv({q:?}): k={k} is not a multiple of 256 (shape {m}x{k})"
+        k % q.k_multiple() == 0,
+        "gemv({q:?}): k={k} is not a multiple of {} (shape {m}x{k})",
+        q.k_multiple()
     );
     assert!(
         x.len() >= k,
@@ -83,8 +121,8 @@ pub fn gemv_with_simd(
         y.len()
     );
     assert!(
-        packed.len() >= m * rb,
-        "gemv({q:?}): packed has {} bytes, need m={m} rows of {rb}",
+        packed.len() >= tb,
+        "gemv({q:?}): packed has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
         packed.len()
     );
     let x = &x[..k];
@@ -93,7 +131,8 @@ pub fn gemv_with_simd(
     // shape).
     let use_simd = simd::row_dot_enabled(q, requested);
     y[..m].par_iter_mut().enumerate().for_each(|(row, out)| {
-        *out = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
+        let (codes, scales) = row_slices(q, packed, m, k, row);
+        *out = dot_row_simd(q, codes, scales, k, x, use_simd);
     });
 }
 
@@ -121,9 +160,11 @@ pub fn gemm_with_simd(
         return;
     }
     let rb = row_bytes(q, k);
+    let tb = tensor_bytes(q, m, k);
     assert!(
-        k % 256 == 0,
-        "gemm({q:?}): k={k} is not a multiple of 256 (shape {n}x{m}x{k})"
+        k % q.k_multiple() == 0,
+        "gemm({q:?}): k={k} is not a multiple of {} (shape {n}x{m}x{k})",
+        q.k_multiple()
     );
     assert!(
         x.len() >= n * k,
@@ -138,8 +179,8 @@ pub fn gemm_with_simd(
         n * m
     );
     assert!(
-        packed.len() >= m * rb,
-        "gemm({q:?}): packed has {} bytes, need m={m} rows of {rb}",
+        packed.len() >= tb,
+        "gemm({q:?}): packed has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
         packed.len()
     );
     let x = &x[..n * k];
@@ -149,7 +190,8 @@ pub fn gemm_with_simd(
         .enumerate()
         .for_each(|(flat, o)| {
             let (token, row) = (flat / m, flat % m);
-            *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
+            let (codes, scales) = row_slices(q, packed, m, k, row);
+            *o = dot_row_simd(q, codes, scales, k, &x[token * k..], use_simd);
         });
 }
 
@@ -257,20 +299,24 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
     if m == 0 || k == 0 || jobs == 0 {
         return SharedSourcedSplit::default();
     }
-    assert!(
-        k % 256 == 0,
-        "gemv_shared_sourced: k={k} is not a multiple of 256"
-    );
+    // `k` granularity is per format (a 128-group format such as qt 53 takes any
+    // multiple of 128), so it is asserted per job below.
     // Validate once per job, not per output element (the inner loop is m × n).
     let mut total = 0usize;
     for j in 0..jobs {
         let n = src.n(j);
         let q = src.quant(j);
         let rb = row_bytes(q, k);
+        let tb = tensor_bytes(q, m, k);
+        assert!(
+            k % q.k_multiple() == 0,
+            "gemv_shared_sourced({q:?}): k={k} is not a multiple of {}",
+            q.k_multiple()
+        );
         let packed = src.packed(j);
         assert!(
-            packed.len() >= m * rb,
-            "gemv_shared_sourced({q:?}): weight has {} bytes, need {m} rows of {rb}",
+            packed.len() >= tb,
+            "gemv_shared_sourced({q:?}): weight has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
             packed.len()
         );
         for t in 0..n {
@@ -316,13 +362,18 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
     // the `RefCell`/map itself). On other arches the batched path is unchanged.
     #[cfg(target_arch = "x86_64")]
     {
-        let split = ACTIVATION_SUMS.with(|cell| {
-            // Keep the borrow alive as an owned guard and reborrow it as a
-            // plain `&mut ActivationSumCache`: field-splitting (`lookup` vs
-            // `sums`) is then visible to the borrow checker, which a `RefMut`
-            // target hides behind `DerefMut`.
-            let mut cache_guard = cell.borrow_mut();
-            let cache = &mut *cache_guard;
+        let split = {
+            // Check the scratch out of the thread-local instead of holding a
+            // `RefCell` borrow across the rayon region: `run_shared_jobs` blocks
+            // this thread in a join, and rayon may steal another task onto it
+            // that is itself a sourced GEMV (nested/concurrent callers on one
+            // pool). That task finds an empty slot and prepares into its own
+            // scratch, so the borrow is only ever held for the swap. The guard
+            // returns the warm capacity on drop, including during unwind.
+            // `&mut guard.0` is a plain reborrow so field-splitting (`lookup`
+            // vs `sums`) stays visible to the borrow checker.
+            let mut guard = CheckedOutSums::take();
+            let cache = &mut guard.0;
             cache.reset();
             for j in 0..jobs {
                 let n = src.n(j);
@@ -361,7 +412,7 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                             match cache.lookup.entry(key) {
                                 Entry::Occupied(e) => *e.get(),
                                 Entry::Vacant(e) => {
-                                    let groups = k / 256;
+                                    let groups = kind.len(k);
                                     let start = cache.sums.len();
                                     cache.sums.resize(start + groups, 0.0);
                                     simd::prepare_activation_sums(
@@ -379,8 +430,9 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                     cache.offsets.push(off);
                 }
             }
-            // The outer TLS borrow is held for the whole region; the workers
-            // only ever see `&[…]` slices, so nothing shared-mutable is touched.
+            // No TLS borrow is held here (the scratch is checked out): a task
+            // stolen onto this thread may re-enter. The workers only ever see
+            // `&[…]` slices, so nothing shared-mutable is touched.
             // `prep` ends here: the `exec` span starts at the region boundary,
             // so the two are adjacent, not nested.
             let t_exec = std::time::Instant::now();
@@ -402,7 +454,7 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                 exec_ns,
                 total_ns,
             }
-        });
+        };
         split
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -425,8 +477,9 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
 #[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct ActivationSumCache {
-    /// `Σx` for every *unique* eligible activation row seen this call, `k / 256`
-    /// f32 each, concatenated in first-seen order.
+    /// `Σx` for every *unique* eligible activation row seen this call,
+    /// `kind.len(k)` f32 each (`k / 256` for the MQ kinds, `k / 128` for the MQ4
+    /// V2 kinds, `k / 8` word sums for E8P), concatenated in first-seen order.
     sums: Vec<f32>,
     /// Start index into `sums` per (job, token), flattened in job order;
     /// `usize::MAX` marks a token whose job is not prepared (scalar path or a
@@ -448,6 +501,36 @@ struct ActivationSumCache {
 thread_local! {
     static ACTIVATION_SUMS: RefCell<ActivationSumCache> =
         RefCell::new(ActivationSumCache::default());
+}
+
+/// Owns the thread's [`ActivationSumCache`] for the span of one sourced GEMV
+/// call. The thread-local slot is left holding an empty default (no heap
+/// allocation) so a reentrant call on the same thread never contends for it.
+#[cfg(target_arch = "x86_64")]
+struct CheckedOutSums(ActivationSumCache);
+
+#[cfg(target_arch = "x86_64")]
+impl CheckedOutSums {
+    fn take() -> Self {
+        Self(ACTIVATION_SUMS.with(|cell| std::mem::take(&mut *cell.borrow_mut())))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for CheckedOutSums {
+    fn drop(&mut self) {
+        let owned = std::mem::take(&mut self.0);
+        // `try_with`: the slot may already be destroyed at thread exit.
+        let _ = ACTIVATION_SUMS.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut() {
+                // A reentrant call may have parked its own scratch meanwhile;
+                // keep whichever holds more capacity so warm calls stay warm.
+                if owned.sums.capacity() >= slot.sums.capacity() {
+                    *slot = owned;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -515,68 +598,174 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
             shared_rows_per_block(m, n, workers_per_job)
         };
         let q = src.quant(j);
-        let rb = row_bytes(q, k);
         #[cfg(target_arch = "x86_64")]
         let use_simd = job_simd[j];
         #[cfg(not(target_arch = "x86_64"))]
         let use_simd = simd::row_dot_enabled(q, _requested);
         #[cfg(target_arch = "x86_64")]
-        let prepared = use_simd && simd::activation_sum_kind(q).is_some();
+        let prepared_kind = if use_simd {
+            simd::activation_sum_kind(q)
+        } else {
+            None
+        };
+        #[cfg(target_arch = "x86_64")]
+        let pair = prepared_kind.is_some() && simd::has_row_pair_kernel(q);
         o[..m * n]
             .par_chunks_mut(rows_per_block * n)
             .enumerate()
             .for_each(|(block, rows)| {
-                for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
-                    let r = block * rows_per_block + within_block;
-                    let row = &src.packed(j)[r * rb..];
-                    #[cfg(target_arch = "x86_64")]
-                    if prepared {
-                        let base = token_base[j];
-                        for (t, v) in chunk.iter_mut().enumerate() {
-                            let off = offsets[base + t];
-                            debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
-                            *v = simd::row_dot_with_activation_sums(
+                let first_row = block * rows_per_block;
+                #[cfg(target_arch = "x86_64")]
+                if let Some(kind) = prepared_kind {
+                    let base = token_base[j];
+                    let sum_len = kind.len(k);
+                    let sums_of = |t: usize| {
+                        let off = offsets[base + t];
+                        debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
+                        &sums[off..off + sum_len]
+                    };
+                    let mut r = first_row;
+                    let mut rest: &mut [f32] = rows;
+                    if pair {
+                        // Two rows at a time: each activation load is shared by
+                        // both rows' FMAs; every element is bit-identical to the
+                        // single-row kernel's.
+                        while rest.len() >= 2 * n {
+                            let (both, tail) = rest.split_at_mut(2 * n);
+                            let (out0, out1) = both.split_at_mut(n);
+                            let (row0, srow0) = row_slices(q, src.packed(j), m, k, r);
+                            let (row1, srow1) = row_slices(q, src.packed(j), m, k, r + 1);
+                            for t in 0..n {
+                                let [v0, v1] = simd::row_pair_dot_with_activation_sums(
+                                    q,
+                                    row0,
+                                    srow0,
+                                    row1,
+                                    srow1,
+                                    k,
+                                    &src.xs_row(j, t)[..k],
+                                    sums_of(t),
+                                );
+                                out0[t] = v0;
+                                out1[t] = v1;
+                            }
+                            rest = tail;
+                            r += 2;
+                        }
+                    }
+                    for chunk in rest.chunks_mut(n) {
+                        let (row, srow) = row_slices(q, src.packed(j), m, k, r);
+                        if n > 1 && simd::has_multi_token_kernel(q) {
+                            multi_token_row(
                                 q,
                                 row,
                                 k,
+                                (src, j),
+                                (sums, &offsets[base..base + n], sum_len),
+                                chunk,
+                            );
+                            r += 1;
+                            continue;
+                        }
+                        for (t, v) in chunk.iter_mut().enumerate() {
+                            *v = simd::row_dot_with_activation_sums(
+                                q,
+                                row,
+                                srow,
+                                k,
                                 &src.xs_row(j, t)[..k],
-                                &sums[off..off + k / 256],
+                                sums_of(t),
                             );
                         }
-                        continue;
+                        r += 1;
                     }
+                    return;
+                }
+                for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
+                    let r = first_row + within_block;
+                    let (row, srow) = row_slices(q, src.packed(j), m, k, r);
                     for (t, v) in chunk.iter_mut().enumerate() {
-                        *v = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                        *v = dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                     }
                 }
             });
     });
 }
 
+/// One weight row against all `chunk.len()` activation rows of job `j` on the
+/// prepared V2 path: each weight chunk is decoded once per group of up to
+/// [`simd::MULTI_TOKEN_MAX`] rows instead of once per row
+/// ([`simd::row_dot_multi_with_activation_sums`]). `out[t]` equals the
+/// single-token prepared row dot bit for bit. `sum_offsets[t]` locates token
+/// `t`'s prepared Σx in `sums`.
+#[cfg(target_arch = "x86_64")]
+fn multi_token_row<S: SharedJobSource>(
+    q: CpuQuant,
+    row: &[u8],
+    k: usize,
+    (src, j): (&S, usize),
+    (sums, sum_offsets, sum_len): (&[f32], &[usize], usize),
+    out: &mut [f32],
+) {
+    let mut t0 = 0;
+    while t0 < out.len() {
+        let g = (out.len() - t0).min(simd::MULTI_TOKEN_MAX);
+        let mut xs: [&[f32]; simd::MULTI_TOKEN_MAX] = [&[]; simd::MULTI_TOKEN_MAX];
+        let mut ss: [&[f32]; simd::MULTI_TOKEN_MAX] = [&[]; simd::MULTI_TOKEN_MAX];
+        for i in 0..g {
+            let off = sum_offsets[t0 + i];
+            debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
+            xs[i] = &src.xs_row(j, t0 + i)[..k];
+            ss[i] = &sums[off..off + sum_len];
+        }
+        simd::row_dot_multi_with_activation_sums(
+            q,
+            row,
+            k,
+            &xs[..g],
+            &ss[..g],
+            &mut out[t0..t0 + g],
+        );
+        t0 += g;
+    }
+}
+
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
+///
+/// `row` / `scales_row` are [`row_slices`]'s pair: for the planar formats the
+/// row's codes and its f16 scales, for the row formats the row's bytes and an
+/// empty slice.
 ///
 /// `use_simd` is resolved once per GEMV call by the caller
 /// ([`simd::row_dot_enabled`]); every format has a vector kernel, so when it is
 /// set the row is the kernel's and the scalar decode below is the ARM and
 /// non-AVX2 fallback (and the reference `simd::tests` compares against).
-fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
+fn dot_row_simd(
+    q: CpuQuant,
+    row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    x: &[f32],
+    use_simd: bool,
+) -> f32 {
     if use_simd {
-        return simd::row_dot_avx2(q, row, k, x);
+        return simd::row_dot_avx2(q, row, scales_row, k, x);
     }
-    dot_row_scalar(q, row, k, x)
+    dot_row_scalar(q, row, scales_row, k, x)
 }
 
 /// The `Mq4G256` row dot on the scalar path — the SIMD fallback and the
 /// reference `simd::tests` compares against.
 pub(crate) fn mq4g256_row_dot_scalar(row: &[u8], k: usize, x: &[f32]) -> f32 {
-    dot_row_scalar(CpuQuant::Mq4G256, row, k, x)
+    dot_row_scalar(CpuQuant::Mq4G256, row, &[], k, x)
 }
 
-fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
+fn dot_row_scalar(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize, x: &[f32]) -> f32 {
     let ge = q.group_elems();
     let gb = q.group_bytes();
     let mut scratch = [0.0f32; MAX_GROUP_ELEMS];
     let mut acc = 0.0f32;
+    let planar = q.is_planar();
     let e8 = q == CpuQuant::Mfp4G32E8;
     let row_scale = if e8 {
         crate::quant::half_f16_to_f32(u16::from_le_bytes([row[0], row[1]]))
@@ -585,7 +774,10 @@ fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
     };
     for g in 0..k / ge {
         let codes = &mut scratch[..ge];
-        if e8 {
+        if planar {
+            let d = u16::from_le_bytes([scales_row[2 * g], scales_row[2 * g + 1]]);
+            crate::quant::decode_planar_group(q, &row[g * gb..(g + 1) * gb], d, codes);
+        } else if e8 {
             crate::quant::decode_mfp4_e8_group(&row[16 + g * gb..], row_scale, codes);
         } else {
             decode_group_codes(q, &row[g * gb..], codes);
@@ -680,6 +872,7 @@ mod test {
             CpuQuant::Mq4G256,
             CpuQuant::Mq3G256Lloyd,
             CpuQuant::Mfp4G32E8,
+            CpuQuant::Mq4G128V2,
         ];
         let quants: Vec<_> = (0..jobs).map(|j| tiers[j % tiers.len()]).collect();
         // Mixed tiers and token counts, including empty jobs between active
@@ -735,7 +928,11 @@ mod test {
             off += n * m;
         }
         for (i, (got, want)) in out[..total].iter().zip(&reference).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "m={m} jobs={jobs} output {i}");
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "m={m} jobs={jobs} output {i}"
+            );
         }
         assert_eq!(&out[total..], &[-999.0; 3], "output tail overwritten");
     }
@@ -761,6 +958,84 @@ mod test {
                     check_shared_gemv(0, 4, requested);
                 }
             });
+        }
+    }
+
+    /// The splice runs on a pool whose worker count is a host/knob property, and
+    /// the same CPU row must produce identical bytes regardless of it: chunking
+    /// only partitions whole rows (`shared_rows_per_block`), and every output
+    /// element is one row dot accumulated in a fixed group order.
+    #[test]
+    fn gemv_shared_is_bitwise_identical_across_pool_sizes() {
+        struct Batch<'a> {
+            quants: &'a [CpuQuant],
+            packs: &'a [Vec<u8>],
+            xs: &'a [Vec<Vec<f32>>],
+        }
+        impl SharedJobSource for Batch<'_> {
+            fn jobs(&self) -> usize {
+                self.quants.len()
+            }
+            fn n(&self, j: usize) -> usize {
+                self.xs[j].len()
+            }
+            fn quant(&self, j: usize) -> CpuQuant {
+                self.quants[j]
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                &self.packs[j]
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                &self.xs[j][t]
+            }
+        }
+        let k = 512;
+        let tiers = [
+            CpuQuant::Mq6G256,
+            CpuQuant::Mq4G256,
+            CpuQuant::Mq4G128V2,
+            CpuQuant::Mq3G256Lloyd,
+        ];
+        for requested in [Some(false), None] {
+            for (m, jobs) in [(1usize, 1usize), (5, 10), (257, 10), (640, 3)] {
+                let quants: Vec<_> = (0..jobs).map(|j| tiers[j % tiers.len()]).collect();
+                let ns: Vec<usize> = (0..jobs).map(|j| [1usize, 3, 2][j % 3]).collect();
+                let packs: Vec<Vec<u8>> = quants.iter().map(|&q| weights(q, m, k)).collect();
+                let xs: Vec<Vec<Vec<f32>>> = ns
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &n)| {
+                        (0..n)
+                            .map(|t| x_of(k).iter().map(|v| v + (j * 7 + t) as f32).collect())
+                            .collect()
+                    })
+                    .collect();
+                let src = Batch {
+                    quants: &quants,
+                    packs: &packs,
+                    xs: &xs,
+                };
+                let total: usize = ns.iter().map(|n| n * m).sum();
+                let mut baseline: Option<Vec<u32>> = None;
+                for workers in [1usize, 3, 16] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap();
+                    let bits: Vec<u32> = pool.install(|| {
+                        let mut out = vec![0.0f32; total];
+                        gemv_shared_sourced(m, k, &mut out, &src, requested);
+                        out.iter().map(|v| v.to_bits()).collect()
+                    });
+                    match &baseline {
+                        None => baseline = Some(bits),
+                        Some(b) => assert_eq!(
+                            &bits, b,
+                            "m={m} jobs={jobs} requested={requested:?}: {workers} workers differ from 1"
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -896,6 +1171,143 @@ mod test {
             }
             assert_eq!(act.capacity(), cap, "pass {pass}: buffer reallocated");
             assert_eq!(act.as_ptr() as usize, ptr, "pass {pass}: buffer moved");
+        }
+    }
+
+    /// Serial, uncached single-row arithmetic of [`gemv_shared_sourced`]: every
+    /// `(job, weight row, token)` element is one [`dot_row_simd`] call — what
+    /// [`gemv`] computes for that activation row — in the batched row-major
+    /// layout (`out[r * n + t]`, jobs concatenated).
+    fn single_row_reference<S: SharedJobSource>(
+        m: usize,
+        k: usize,
+        out: &mut [f32],
+        src: &S,
+        requested: Option<bool>,
+    ) {
+        let mut base = 0usize;
+        for j in 0..src.jobs() {
+            let n = src.n(j);
+            let q = src.quant(j);
+            let use_simd = simd::row_dot_enabled(q, requested);
+            for r in 0..m {
+                let (row, srow) = row_slices(q, src.packed(j), m, k, r);
+                for t in 0..n {
+                    out[base + r * n + t] =
+                        dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
+                }
+            }
+            base += m * n;
+        }
+    }
+
+    /// D2 admits verify windows of 2..4 rows. A routed expert selected by `w`
+    /// window rows is ONE grouped job of `n = w` activation rows; each row's
+    /// bytes must equal a one-row (`n = 1`) job and independent `gemv` at every
+    /// token position, with the Σx cache seeing aliased pointers (identical
+    /// tokens sharing one buffer), distinct pointers with identical content, and
+    /// distinct content; and the grouped path must equal the serial uncached
+    /// reference.
+    #[test]
+    fn gemv_shared_window_rows_match_one_row_at_every_position() {
+        struct Window<'a> {
+            q: CpuQuant,
+            packed: &'a [u8],
+            rows: &'a [&'a [f32]],
+        }
+        impl SharedJobSource for Window<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, _: usize) -> usize {
+                self.rows.len()
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                self.q
+            }
+            fn packed(&self, _: usize) -> &[u8] {
+                self.packed
+            }
+            fn xs_row(&self, _: usize, t: usize) -> &[f32] {
+                self.rows[t]
+            }
+        }
+        let (m, k) = (37usize, 1024usize);
+        let base = x_of(k);
+        let copies: Vec<Vec<f32>> = (0..4).map(|_| base.clone()).collect();
+        let distinct: Vec<Vec<f32>> = (0..4)
+            .map(|t| {
+                base.iter()
+                    .map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32)
+                    .collect()
+            })
+            .collect();
+        for requested in [Some(false), None] {
+            for q in [
+                CpuQuant::Mq4G256,
+                CpuQuant::Mq6G256,
+                CpuQuant::Mq4G256V2,
+                CpuQuant::Mq4G128V2,
+                CpuQuant::Mq3G256Lloyd,
+                CpuQuant::Mfp4G32E8,
+                CpuQuant::E8pI4G128R256,
+                CpuQuant::E8pI4G128R128,
+                CpuQuant::Mq3I4G128R256,
+                CpuQuant::Mq3I4G128R128,
+            ] {
+                let packed = weights(q, m, k);
+                let one_row = |x: &[f32]| {
+                    let mut y = vec![0.0f32; m];
+                    let src = Window {
+                        q,
+                        packed: &packed,
+                        rows: &[x],
+                    };
+                    gemv_shared_sourced(m, k, &mut y, &src, requested);
+                    let mut g = vec![0.0f32; m];
+                    gemv_with_simd(q, &packed, m, k, x, &mut g, requested);
+                    assert_eq!(
+                        y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{q:?} requested={requested:?}: one-row shared job != gemv"
+                    );
+                    y
+                };
+                for width in 2..=4usize {
+                    // Rows alias one buffer / copy one token / differ.
+                    let aliased: Vec<&[f32]> = vec![&copies[0][..]; width];
+                    let copied: Vec<&[f32]> = copies[..width].iter().map(|v| &v[..]).collect();
+                    let varied: Vec<&[f32]> = distinct[..width].iter().map(|v| &v[..]).collect();
+                    for (name, rows) in
+                        [("aliased", aliased), ("copied", copied), ("varied", varied)]
+                    {
+                        let src = Window {
+                            q,
+                            packed: &packed,
+                            rows: &rows,
+                        };
+                        let mut out = vec![0.0f32; m * width];
+                        gemv_shared_sourced(m, k, &mut out, &src, requested);
+                        let mut reference = vec![0.0f32; m * width];
+                        single_row_reference(m, k, &mut reference, &src, requested);
+                        assert_eq!(
+                            out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "{q:?} {name} width={width} requested={requested:?}: grouped != serial uncached reference"
+                        );
+                        for t in 0..width {
+                            let y = one_row(rows[t]);
+                            for r in 0..m {
+                                assert_eq!(
+                                    out[r * width + t].to_bits(),
+                                    y[r].to_bits(),
+                                    "{q:?} {name} width={width} requested={requested:?}: row {r} token {t} != one-row"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1047,6 +1459,359 @@ mod test {
             &mut y,
         );
     }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of 256")]
+    fn g256_formats_still_reject_k_640() {
+        let mut y = [0.0f32; 1];
+        gemv(
+            CpuQuant::Mq4G256V2,
+            &[0u8; 640],
+            1,
+            640,
+            &[0.0f32; 640],
+            &mut y,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of 128")]
+    fn g128_formats_reject_k_not_a_multiple_of_128() {
+        let mut y = [0.0f32; 1];
+        gemv(
+            CpuQuant::Mq4G128V2,
+            &[0u8; 340],
+            1,
+            320,
+            &[0.0f32; 320],
+            &mut y,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of 256")]
+    fn shared_sourced_rejects_k_640_for_g256_jobs() {
+        let packed = vec![0u8; 640];
+        let xs = [0.0f32; 640];
+        struct One<'a>(&'a [u8], &'a [f32]);
+        impl SharedJobSource for One<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, _: usize) -> usize {
+                1
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                CpuQuant::Mq4G256V2
+            }
+            fn packed(&self, _: usize) -> &[u8] {
+                self.0
+            }
+            fn xs_row(&self, _: usize, _: usize) -> &[f32] {
+                self.1
+            }
+        }
+        let mut out = [0.0f32; 1];
+        gemv_shared_sourced(1, 640, &mut out, &One(&packed, &xs), None);
+    }
+
+    /// Flash-Next's down projection: qt 53, m = 2560 would be large, so a
+    /// narrower `m` with the real `k = 640` (5 groups, 340 B/row). `gemv`,
+    /// `gemm` and both shared-sourced entry points must accept it and agree
+    /// with an `f64` oracle over the crate's own decoder, scalar and SIMD.
+    #[test]
+    fn qt53_k640_gemv_gemm_and_shared_match_the_oracle() {
+        struct Job<'a> {
+            packed: &'a [u8],
+            xs: Vec<&'a [f32]>,
+        }
+        struct Src<'a>(Vec<Job<'a>>);
+        impl SharedJobSource for Src<'_> {
+            fn jobs(&self) -> usize {
+                self.0.len()
+            }
+            fn n(&self, j: usize) -> usize {
+                self.0[j].xs.len()
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                CpuQuant::Mq4G128V2
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                self.0[j].packed
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                self.0[j].xs[t]
+            }
+        }
+        let q = CpuQuant::Mq4G128V2;
+        let (m, k) = (37usize, 640usize);
+        assert_eq!(row_bytes(q, k), 340);
+        let w_a = crate::testfix::weight_bytes(q, m, k);
+        let w_b: Vec<u8> = w_a.iter().map(|b| b.rotate_left(3)).collect();
+        // The rotated fixture's headers are garbage; keep the finite fixture
+        // header of every group and only scramble the payload.
+        let mut w_b = w_b;
+        for (i, chunk) in w_b.chunks_mut(68).enumerate() {
+            chunk[..4].copy_from_slice(&w_a[i * 68..i * 68 + 4]);
+        }
+        let xs: Vec<Vec<f32>> = (0..3)
+            .map(|t| x_of(k).iter().map(|v| v + t as f32 * 0.37).collect())
+            .collect();
+        for requested in [Some(false), None] {
+            let tol = |got: f32, want: f64, what: &str| {
+                let rel = (got as f64 - want).abs() / want.abs().max(1e-3);
+                assert!(rel <= 1e-4, "{what}: {got} vs {want} (rel {rel:.2e})");
+            };
+            // gemv.
+            let mut y = vec![0.0f32; m];
+            gemv_with_simd(q, &w_a, m, k, &xs[0], &mut y, requested);
+            for (r, want) in oracle(q, &w_a, m, k, &xs[0]).iter().enumerate() {
+                tol(y[r], *want, &format!("gemv row {r}"));
+            }
+            // gemm over three activation rows.
+            let flat: Vec<f32> = xs.iter().flatten().copied().collect();
+            let mut out = vec![0.0f32; 3 * m];
+            gemm_with_simd(q, &w_a, m, k, &flat, 3, &mut out, requested);
+            for t in 0..3 {
+                for (r, want) in oracle(q, &w_a, m, k, &xs[t]).iter().enumerate() {
+                    tol(out[t * m + r], *want, &format!("gemm t{t} row {r}"));
+                }
+            }
+            // Shared-sourced: two distinct weights, 3 and 2 activation rows,
+            // row-major outputs, bit-identical to the per-token gemv.
+            let src = Src(vec![
+                Job {
+                    packed: &w_a,
+                    xs: xs.iter().map(|v| v.as_slice()).collect(),
+                },
+                Job {
+                    packed: &w_b,
+                    xs: xs[..2].iter().map(|v| v.as_slice()).collect(),
+                },
+            ]);
+            let mut shared = vec![0.0f32; m * 5];
+            let split = gemv_shared_sourced_traced(m, k, &mut shared, &src, requested);
+            assert_eq!(split.total_ns >= split.exec_ns, true);
+            let mut plain = vec![0.0f32; m * 5];
+            gemv_shared_sourced(m, k, &mut plain, &src, requested);
+            assert_eq!(shared, plain, "traced vs untraced");
+            let mut off = 0;
+            for (j, w) in [&w_a, &w_b].into_iter().enumerate() {
+                let n = src.0[j].xs.len();
+                for t in 0..n {
+                    let mut one = vec![0.0f32; m];
+                    gemv_with_simd(q, w, m, k, src.0[j].xs[t], &mut one, requested);
+                    for r in 0..m {
+                        assert_eq!(
+                            shared[off + r * n + t].to_bits(),
+                            one[r].to_bits(),
+                            "shared job {j} token {t} row {r}"
+                        );
+                        let want = oracle(q, w, m, k, src.0[j].xs[t])[r];
+                        tol(shared[off + r * n + t], want, "shared vs oracle");
+                    }
+                }
+                off += m * n;
+            }
+        }
+    }
+
+    /// The activation-sum scratch is checked out of the thread-local, not
+    /// borrowed across the rayon region. A source callback that re-enters
+    /// `gemv_shared_sourced` on the same thread (during Σ prep, and inside the
+    /// region, where a one-worker pool runs every task on the caller) and
+    /// concurrent callers on a small pool (a worker blocked in the region steals
+    /// another call onto itself) must neither panic with `RefCell already
+    /// borrowed` nor perturb the outer call's bits.
+    #[test]
+    fn shared_sourced_is_reentrant_from_source_callbacks_and_stolen_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Plain<'a> {
+            w: &'a [u8],
+            xs: &'a [Vec<f32>],
+        }
+        impl SharedJobSource for Plain<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, _: usize) -> usize {
+                self.xs.len()
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                CpuQuant::Mq4G256V2
+            }
+            fn packed(&self, _: usize) -> &[u8] {
+                self.w
+            }
+            fn xs_row(&self, _: usize, t: usize) -> &[f32] {
+                &self.xs[t]
+            }
+        }
+        /// Every activation read first runs a whole nested sourced GEMV over
+        /// different weights/activations and checks it against its reference.
+        struct Nesting<'a> {
+            outer: Plain<'a>,
+            inner: Plain<'a>,
+            inner_want: &'a [f32],
+            m: usize,
+            k: usize,
+            nested_calls: AtomicUsize,
+        }
+        impl SharedJobSource for Nesting<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, j: usize) -> usize {
+                self.outer.n(j)
+            }
+            fn quant(&self, j: usize) -> CpuQuant {
+                self.outer.quant(j)
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                self.outer.packed(j)
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                let mut got = vec![0.0f32; self.inner_want.len()];
+                gemv_shared_sourced(self.m, self.k, &mut got, &self.inner, None);
+                assert!(
+                    got.iter()
+                        .zip(self.inner_want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "nested call diverged"
+                );
+                self.nested_calls.fetch_add(1, Ordering::Relaxed);
+                self.outer.xs_row(j, t)
+            }
+        }
+
+        let q = CpuQuant::Mq4G256V2;
+        let (m, k) = (9usize, 256usize);
+        let w_outer = crate::testfix::weight_bytes(q, m, k);
+        // Different weights with valid headers: the same rows, reversed.
+        let w_inner: Vec<u8> = w_outer
+            .chunks(row_bytes(q, k))
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        let xs_outer: Vec<Vec<f32>> = (0..3)
+            .map(|t| x_of(k).iter().map(|v| v + t as f32 * 0.37).collect())
+            .collect();
+        let xs_inner: Vec<Vec<f32>> = (0..2)
+            .map(|t| x_of(k).iter().map(|v| v * 0.5 - t as f32 * 0.11).collect())
+            .collect();
+        let plain_outer = Plain {
+            w: &w_outer,
+            xs: &xs_outer,
+        };
+        let plain_inner = Plain {
+            w: &w_inner,
+            xs: &xs_inner,
+        };
+        let mut want_outer = vec![0.0f32; m * xs_outer.len()];
+        gemv_shared_sourced(m, k, &mut want_outer, &plain_outer, None);
+        let mut want_inner = vec![0.0f32; m * xs_inner.len()];
+        gemv_shared_sourced(m, k, &mut want_inner, &plain_inner, None);
+
+        let run_once = || {
+            let src = Nesting {
+                outer: Plain {
+                    w: &w_outer,
+                    xs: &xs_outer,
+                },
+                inner: Plain {
+                    w: &w_inner,
+                    xs: &xs_inner,
+                },
+                inner_want: &want_inner,
+                m,
+                k,
+                nested_calls: AtomicUsize::new(0),
+            };
+            let mut got = vec![0.0f32; want_outer.len()];
+            gemv_shared_sourced(m, k, &mut got, &src, None);
+            assert!(src.nested_calls.load(Ordering::Relaxed) > 0);
+            assert!(
+                got.iter()
+                    .zip(&want_outer)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "outer call perturbed by reentrancy"
+            );
+        };
+
+        for threads in [1usize, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            // Single call from a pool worker: nested calls land on the thread
+            // that owns the outer scratch.
+            pool.install(&run_once);
+            // Concurrent calls: a worker blocked in the region steals another
+            // whole call onto itself.
+            pool.install(|| {
+                (0..16usize).into_par_iter().for_each(|_| run_once());
+            });
+        }
+    }
+
+    /// End to end through the real format: encode weights, rotate the
+    /// activation with `rotate_x_128_v2`, dot the stored codes — the result is
+    /// the original-basis product `W·x` to 4-bit accuracy, and equals the dot
+    /// of the *unrotated* `x` with the inverse-rotated (`dequant_group`)
+    /// weights to f32 rounding. Using `x` = a weight row makes the product
+    /// large (`|w|²`), so a wrong rotation (product near 0) cannot hide in the
+    /// quantization tolerance.
+    #[test]
+    fn qt53_rotated_dot_equals_original_basis_product() {
+        use crate::quant::{dequant_group, rotate_x_128_v2};
+        let q = CpuQuant::Mq4G128V2;
+        let (m, k) = (4usize, 640usize);
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let v = (i as u64 * 2654435761 + 12345) % 2001;
+                (v as f32 - 1000.0) * 0.001 + ((i % 7) as f32 - 3.0) * 0.05
+            })
+            .collect();
+        let packed = crate::testfix::encode_mq4g128v2_ref(&w, m, k);
+        // Activation = weight row 0 plus a little structure.
+        let x: Vec<f32> = w[..k].to_vec();
+        let mut xr = x.clone();
+        rotate_x_128_v2(&mut xr);
+        for requested in [Some(false), None] {
+            let mut y = vec![0.0f32; m];
+            gemv_with_simd(q, &packed, m, k, &xr, &mut y, requested);
+            for row in 0..m {
+                // (a) dequantized original-basis weights · unrotated x.
+                let rb = row_bytes(q, k);
+                let mut deq = 0.0f64;
+                let mut norm = 0.0f64;
+                for g in 0..k / 128 {
+                    let mut orig = [0.0f32; 128];
+                    dequant_group(q, &packed[row * rb + g * 68..], &mut orig);
+                    for i in 0..128 {
+                        deq += orig[i] as f64 * x[g * 128 + i] as f64;
+                        norm += (orig[i] as f64).powi(2);
+                    }
+                }
+                let bound = 1e-4
+                    * (norm.sqrt() * (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()).sqrt());
+                assert!(
+                    (y[row] as f64 - deq).abs() <= bound,
+                    "row {row} simd={requested:?}: rotated-codes dot {} vs dequantized dot {deq}",
+                    y[row]
+                );
+            }
+            // (b) fidelity against the source weights for row 0: ~|w0|^2.
+            let self_dot: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum();
+            let rel = (y[0] as f64 - self_dot).abs() / self_dot;
+            assert!(
+                rel < 0.2,
+                "row 0 product {} vs |w0|^2 {self_dot} (rel {rel:.3})",
+                y[0]
+            );
+        }
+    }
 }
 
 /// Property tests: the batched / partitioned entry points are bit-identical to
@@ -1054,7 +1819,7 @@ mod test {
 /// `crate::testfix` (`pub(crate)`).
 ///
 /// Why exact equality is the right claim: every output element is produced by
-/// the same `dot_row_simd(q, row, k, x_token, use_simd)` call regardless of how
+/// the same `dot_row_simd(q, row, scales_row, k, x_token, use_simd)` call regardless of how
 /// the (token, row) pairs are batched or partitioned, so any difference is a
 /// stride/offset bug, never rounding.
 #[cfg(test)]
@@ -1064,7 +1829,7 @@ mod prop_tests {
 
     /// Every `CpuQuant` variant (all are valid for `gemm`: `k % 256 == 0`
     /// satisfies each format's group size).
-    const ALL: [CpuQuant; 29] = [
+    const ALL: [CpuQuant; 30] = [
         CpuQuant::Mq4G256,
         CpuQuant::Mq4G256V2,
         CpuQuant::Mq6G256,
@@ -1094,6 +1859,7 @@ mod prop_tests {
         CpuQuant::Bf16,
         CpuQuant::Q8F16,
         CpuQuant::Mfp4G32E8,
+        CpuQuant::Mq4G128V2,
     ];
 
     /// Compile-time-ish guard: adding a `CpuQuant` variant without extending
@@ -1129,7 +1895,16 @@ mod prop_tests {
             | CpuQuant::F32
             | CpuQuant::Bf16
             | CpuQuant::Q8F16
+            | CpuQuant::Mq4G128V2
             | CpuQuant::Mfp4G32E8 => {}
+            // Planar formats (qt 131/132/135/136): excluded from `ALL` because
+            // their rows are not byte-sliceable (the scale plane is separate, so
+            // `prop_output_row_split_invariant` does not apply); their
+            // gemv/gemm/shared-job bit-identity lives in `simd::tests`.
+            CpuQuant::Mq3I4G128R256
+            | CpuQuant::Mq3I4G128R128
+            | CpuQuant::E8pI4G128R256
+            | CpuQuant::E8pI4G128R128 => {}
         }
     }
 
@@ -1149,6 +1924,7 @@ mod prop_tests {
     /// decode): everything after it is free-form code payload.
     fn header_len(q: CpuQuant) -> usize {
         match q {
+            CpuQuant::Mq4G128V2 => 4,
             CpuQuant::Mq4G256Lloyd => 32,
             CpuQuant::Mq3G256Lloyd => 16,
             _ => 8,

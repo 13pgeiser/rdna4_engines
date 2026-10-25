@@ -142,10 +142,7 @@ impl Gate {
         println!("════════════════════════════════════════════════════════════");
         println!(" Gate 2 codec summary");
         println!("════════════════════════════════════════════════════════════");
-        println!(
-            "{:<6} {:<4} {:<48} {}",
-            "STATUS", "PART", "CHECK", "DETAIL"
-        );
+        println!("{:<6} {:<4} {:<48} {}", "STATUS", "PART", "CHECK", "DETAIL");
         println!("{}", "─".repeat(96));
         for c in &self.checks {
             let st = if c.ok { "PASS" } else { "FAIL" };
@@ -160,7 +157,11 @@ impl Gate {
                     d
                 }
             };
-            println!("{st:<6} {part:<4} {name:<48} {det}", part = c.part, name = c.name);
+            println!(
+                "{st:<6} {part:<4} {name:<48} {det}",
+                part = c.part,
+                name = c.name
+            );
         }
         let n_pass = self.checks.iter().filter(|c| c.ok).count();
         let n_fail = self.checks.len() - n_pass;
@@ -448,9 +449,8 @@ fn part_a_nan(gpu: &mut Gpu, gate: &mut Gate) -> Result<(), String> {
 
         let ok0 = cpu[0].is_nan() && gpu_out[0].is_nan();
         let ok1 = cpu[1].is_nan() && gpu_out[1].is_nan();
-        let ok2 = !cpu[2].is_nan()
-            && !gpu_out[2].is_nan()
-            && cpu[2].to_bits() == gpu_out[2].to_bits();
+        let ok2 =
+            !cpu[2].is_nan() && !gpu_out[2].is_nan() && cpu[2].to_bits() == gpu_out[2].to_bits();
         let ok = ok0 && ok1 && ok2;
         let detail = if ok {
             "0x7F→NaN, 0xFF→NaN, finite control matches".into()
@@ -632,11 +632,11 @@ fn build_fp8_act_cases(block: usize, n_rows: usize) -> Vec<f32> {
         // Place a few known midpoints + amax anchor.
         for i in 0..block {
             x[base + 5 * block + i] = match i % 8 {
-                0 => 300.0,          // amax anchor → s=1
-                1 => 1.0625,         // midpoint 1.0 ↔ 1.125
+                0 => 300.0,  // amax anchor → s=1
+                1 => 1.0625, // midpoint 1.0 ↔ 1.125
                 2 => -1.0625,
-                3 => 0.0009765625,   // midpoint 0 ↔ smallest subnormal
-                4 => 2.25,           // midpoint 2.0 ↔ 2.5?  E4M3 at exp for 2: codes
+                3 => 0.0009765625, // midpoint 0 ↔ smallest subnormal
+                4 => 2.25,         // midpoint 2.0 ↔ 2.5?  E4M3 at exp for 2: codes
                 5 => 3.0 + 0.0625, // near 3.0
                 6 => -0.5,
                 _ => 0.25,
@@ -689,7 +689,9 @@ fn build_fp4_act_cases(n_rows: usize) -> Vec<f32> {
         }
         // g5: E2M1 RNE midpoints at s=1 (amax in (3,6] → s=1)
         // midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-        let mids = [0.25f32, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.25, -0.75, -1.25, -2.5, -5.0];
+        let mids = [
+            0.25f32, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.25, -0.75, -1.25, -2.5, -5.0,
+        ];
         for i in 0..BLOCK {
             x[base + 5 * BLOCK + i] = if i == 0 {
                 5.5 // amax anchor → s=1
@@ -792,8 +794,8 @@ fn run_act_quant_fp8(
 fn build_fp8_post_rope_like_cases(n_rows: usize) -> Vec<f32> {
     const BLOCK: usize = 64;
     const LAST_DIM: usize = 448; // 7 groups × 64 — compressor non-RoPE slice
-    // Just-above boundaries of amax/448 at powers of two. BF16 rounds each
-    // back onto the boundary, flipping fast_round_scale by exactly one exp.
+                                 // Just-above boundaries of amax/448 at powers of two. BF16 rounds each
+                                 // back onto the boundary, flipping fast_round_scale by exactly one exp.
     let near = [
         224.4f32, // s_f32=1.0  vs s_bf16=0.5
         112.3,    // 0.5 vs 0.25
@@ -1033,8 +1035,8 @@ fn load_from_shard(
     if 8 + hdr_len > data.len() {
         return Err("header overruns file".into());
     }
-    let hdr: serde_json::Value = serde_json::from_slice(&data[8..8 + hdr_len])
-        .map_err(|e| format!("header json: {e}"))?;
+    let hdr: serde_json::Value =
+        serde_json::from_slice(&data[8..8 + hdr_len]).map_err(|e| format!("header json: {e}"))?;
     let meta = hdr
         .get(tensor_name)
         .ok_or_else(|| format!("tensor {tensor_name} not in {}", shard_path.display()))?;
@@ -1344,9 +1346,7 @@ fn parse_args() -> (PathBuf, Option<PathBuf>) {
                 }
             }
             "-h" | "--help" => {
-                eprintln!(
-                    "usage: ds4_parent_codec_gate [--ckpt-dir DIR] [--tensor-dir DIR]"
-                );
+                eprintln!("usage: ds4_parent_codec_gate [--ckpt-dir DIR] [--tensor-dir DIR]");
                 std::process::exit(0);
             }
             other => {
@@ -1386,10 +1386,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    println!(
-        "gpu arch:    {}  (gfx942 required)",
-        gpu.arch
-    );
+    println!("gpu arch:    {}  (gfx942 required)", gpu.arch);
     if !gpu.arch_caps.is_gfx942() {
         eprintln!(
             "FATAL: this binary must run on gfx942; got arch={}",
@@ -1437,12 +1434,7 @@ fn main() -> ExitCode {
     }
 
     // ── Part D ──
-    part_d_real(
-        &mut gpu,
-        &mut gate,
-        &ckpt_dir,
-        tensor_dir.as_deref(),
-    );
+    part_d_real(&mut gpu, &mut gate, &ckpt_dir, tensor_dir.as_deref());
 
     gate.print_table();
 

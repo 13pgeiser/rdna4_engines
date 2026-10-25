@@ -168,7 +168,10 @@ fn gdn_row(t: &LayerTape, st: &LayerState, sc: &Scratch, l: usize, ef_on: bool) 
 }
 
 fn scratch(gpu: &mut Gpu, layers: usize) -> Scratch {
-    let mut big = || gpu.alloc_tensor(&[layers * MAX_N * V_DIM], DType::F32).unwrap();
+    let mut big = || {
+        gpu.alloc_tensor(&[layers * MAX_N * V_DIM], DType::F32)
+            .unwrap()
+    };
     Scratch {
         q: big(),
         k: big(),
@@ -193,12 +196,20 @@ fn make_tape(gpu: &Gpu, t: &LayerTape, rng: &mut Lcg) {
     upload(
         gpu,
         &t.alpha,
-        &f32_bytes(&(0..MAX_N * N_V).map(|_| -rng.f(1.0).abs() * 2.0).collect::<Vec<_>>()),
+        &f32_bytes(
+            &(0..MAX_N * N_V)
+                .map(|_| -rng.f(1.0).abs() * 2.0)
+                .collect::<Vec<_>>(),
+        ),
     );
     upload(
         gpu,
         &t.beta,
-        &f32_bytes(&(0..MAX_N * N_V).map(|_| 0.5 + rng.f(0.98)).collect::<Vec<_>>()),
+        &f32_bytes(
+            &(0..MAX_N * N_V)
+                .map(|_| 0.5 + rng.f(0.98))
+                .collect::<Vec<_>>(),
+        ),
     );
 }
 
@@ -243,7 +254,9 @@ fn main() {
         let d8_snap: Vec<LayerState> = (0..LAYERS).map(|_| LayerState::alloc(&mut gpu)).collect();
         for l in 0..LAYERS {
             let conv0: Vec<f32> = (0..N_CH * 3).map(|_| rng.f(0.6)).collect();
-            let s0: Vec<u8> = (0..S_SIZE).map(|_| (rng.next() % 255) as u8 ^ 0x80).collect();
+            let s0: Vec<u8> = (0..S_SIZE)
+                .map(|_| (rng.next() % 255) as u8 ^ 0x80)
+                .collect();
             let sc0: Vec<f32> = (0..N_V * HD).map(|_| 0.004 + rng.f(0.006).abs()).collect();
             // Small f16 residuals: exponent 5..6, random sign/mantissa.
             let ef0: Vec<u8> = (0..S_SIZE)
@@ -287,13 +300,19 @@ fn main() {
                     base: gdn_row(&tapes[l], &d8_live[l], &sc_d8, l, ef_on),
                     s_q8_src: d8_snap[l].s.buf.as_ptr() as u64,
                     s_scales_src: d8_snap[l].scales.buf.as_ptr() as u64,
-                    ef_src: if ef_on { d8_snap[l].ef.buf.as_ptr() as u64 } else { 0 },
+                    ef_src: if ef_on {
+                        d8_snap[l].ef.buf.as_ptr() as u64
+                    } else {
+                        0
+                    },
                 })
                 .collect::<Vec<_>>(),
         );
 
         // Accept lengths 0..=15 plus the clamp-shaped short steps; n = accept + 1.
-        let steps = [1usize, 16, 2, 5, 16, 15, 3, 7, 16, 1, 12, 16, 16, 4, 9, 13, 1, 16];
+        let steps = [
+            1usize, 16, 2, 5, 16, 15, 3, 7, 16, 1, 12, 16, 16, 4, 9, 13, 1, 16,
+        ];
         for (cycle, &n) in steps.iter().enumerate() {
             for t in &tapes {
                 make_tape(&gpu, t, &mut rng);
@@ -318,7 +337,16 @@ fn main() {
                 e0_live[l].copy_from(&gpu, &e0_snap[l]);
             }
             gpu.dflash_gdn_replay_pre_ml(
-                e0_pre.as_ptr() as *const _, LAYERS, N_V, N_KEY, K_DIM, V_DIM, QKV_DIM, n, q_scale, EPS,
+                e0_pre.as_ptr() as *const _,
+                LAYERS,
+                N_V,
+                N_KEY,
+                K_DIM,
+                V_DIM,
+                QKV_DIM,
+                n,
+                q_scale,
+                EPS,
             )
             .unwrap();
             gpu.gated_delta_net_q8_fast_ml(e0_gdn.as_ptr() as *const _, LAYERS, n, N_V, HD)
@@ -327,12 +355,25 @@ fn main() {
             restore_gdn_requant_frame_checkpoint(frame0);
             // D8: replay from the snapshot, no restore.
             gpu.dflash_gdn_replay_pre_ml_from(
-                d8_pre.as_ptr() as *const _, LAYERS, N_V, N_KEY, K_DIM, V_DIM, QKV_DIM, n, q_scale, EPS,
+                d8_pre.as_ptr() as *const _,
+                LAYERS,
+                N_V,
+                N_KEY,
+                K_DIM,
+                V_DIM,
+                QKV_DIM,
+                n,
+                q_scale,
+                EPS,
             )
             .unwrap();
             gpu.gated_delta_net_q8_fast_ml_from(d8_gdn.as_ptr() as *const _, LAYERS, n, N_V, HD)
                 .unwrap();
-            assert_eq!(gdn_requant_frame_checkpoint(), frame_e0, "frame reservation differs");
+            assert_eq!(
+                gdn_requant_frame_checkpoint(),
+                frame_e0,
+                "frame reservation differs"
+            );
             gpu.hip.device_synchronize().unwrap();
 
             let names = ["conv_state", "s_q8", "s_scales", "ef"];
@@ -342,7 +383,11 @@ fn main() {
                     if i == 3 && !ef_on {
                         continue;
                     }
-                    check_eq(&format!("cycle{cycle} n={n} L{l} live {name}"), &a[i], &b[i]);
+                    check_eq(
+                        &format!("cycle{cycle} n={n} L{l} live {name}"),
+                        &a[i],
+                        &b[i],
+                    );
                 }
                 let after = d8_snap[l].bytes(&gpu);
                 for (i, name) in names.iter().enumerate() {
@@ -399,8 +444,18 @@ fn main() {
     make_tape(&gpu, &tapes[0], &mut rng);
     let sc = scratch(&mut gpu, TL);
     let t = &tapes[0];
-    let e0_pre = upload_table(&gpu, &(0..TL).map(|l| pre_row(t, &live[l], &sc, l)).collect::<Vec<_>>());
-    let e0_gdn = upload_table(&gpu, &(0..TL).map(|l| gdn_row(t, &live[l], &sc, l, true)).collect::<Vec<_>>());
+    let e0_pre = upload_table(
+        &gpu,
+        &(0..TL)
+            .map(|l| pre_row(t, &live[l], &sc, l))
+            .collect::<Vec<_>>(),
+    );
+    let e0_gdn = upload_table(
+        &gpu,
+        &(0..TL)
+            .map(|l| gdn_row(t, &live[l], &sc, l, true))
+            .collect::<Vec<_>>(),
+    );
     let d8_pre = upload_table(
         &gpu,
         &(0..TL)
@@ -428,7 +483,16 @@ fn main() {
                 live[l].copy_from(gpu, &snap[l]);
             }
             gpu.dflash_gdn_replay_pre_ml(
-                e0_pre.as_ptr() as *const _, TL, N_V, N_KEY, K_DIM, V_DIM, QKV_DIM, n, q_scale, EPS,
+                e0_pre.as_ptr() as *const _,
+                TL,
+                N_V,
+                N_KEY,
+                K_DIM,
+                V_DIM,
+                QKV_DIM,
+                n,
+                q_scale,
+                EPS,
             )
             .unwrap();
             gpu.gated_delta_net_q8_fast_ml(e0_gdn.as_ptr() as *const _, TL, n, N_V, HD)
@@ -436,7 +500,16 @@ fn main() {
         };
         let mut d8 = |gpu: &mut Gpu| {
             gpu.dflash_gdn_replay_pre_ml_from(
-                d8_pre.as_ptr() as *const _, TL, N_V, N_KEY, K_DIM, V_DIM, QKV_DIM, n, q_scale, EPS,
+                d8_pre.as_ptr() as *const _,
+                TL,
+                N_V,
+                N_KEY,
+                K_DIM,
+                V_DIM,
+                QKV_DIM,
+                n,
+                q_scale,
+                EPS,
             )
             .unwrap();
             gpu.gated_delta_net_q8_fast_ml_from(d8_gdn.as_ptr() as *const _, TL, n, N_V, HD)

@@ -118,6 +118,47 @@ impl ThinkBudget {
     pub fn closing(&mut self, tokens: usize) {
         self.closing = tokens;
     }
+
+    /// The most tokens the caller may commit next such that no
+    /// [`Self::observe`] call within the first `n - 1` of them returns
+    /// [`ThinkBudgetStep::ForceClose`] or [`ThinkBudgetStep::Exhausted`]: a
+    /// non-`Continue` step can only fall on the `n`-th (last) token, so a
+    /// speculative window of that size never needs repair after the fact.
+    /// `None` when no cap applies: the budget is disabled, or the stream is
+    /// outside a span with no close queued. `Some` is always `>= 1`.
+    ///
+    /// `in_think` is the stream state after the last observed token.
+    ///
+    /// - In a span (`in_think`, no queued close): `max - count` more tokens
+    ///   fit before the count reaches `max`, and the `max`-th lands on the last.
+    /// - Outside a span: uncapped. Nothing can trip until a committed token
+    ///   opens a span. Capping at `max` here would hold every answer window to
+    ///   `max` tokens for the rest of the turn, and thinking-off requests
+    ///   carry `max == 1`, so speculation would stop entirely. A span that
+    ///   opens and trips inside the same window is a strict-prefix window,
+    ///   which the decode loop repairs or realigns like any other.
+    /// - While close tokens are queued (`closing > 0`): `closing` plus the
+    ///   in-span cap. The queued tokens never count, but they never reset the
+    ///   count either: a stream still inside the span afterwards continues the
+    ///   count left at the `ForceClose` (`max`), so the first token after them
+    ///   may already trip. A span that leaves and re-opens resets the count and
+    ///   only trips later.
+    ///
+    /// A span that closes and re-opens inside the window resets the count, so
+    /// it only delays the trip and never moves it earlier.
+    pub fn window_cap(&self, in_think: bool) -> Option<usize> {
+        if self.max == 0 {
+            return None;
+        }
+        let cap = if self.closing > 0 {
+            self.closing + self.max.saturating_sub(self.count).max(1)
+        } else if in_think {
+            self.max.saturating_sub(self.count)
+        } else {
+            return None;
+        };
+        Some(cap.max(1))
+    }
 }
 
 const THINK_OPEN: &str = "<think>";
@@ -854,6 +895,353 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
     out
 }
 
+/// Extract LFM2.5 Pythonic tool calls. Liquid's format wraps a Python list
+/// literal of function calls inside dedicated special tokens (see
+/// [`LFM_TOOL_OPEN`] / [`LFM_TOOL_CLOSE`]). The daemon normally suppresses
+/// these markers at the token level before text reaches the stream, but this
+/// extractor scans decoded text so a caller with the full run recovers the
+/// calls byte-for-byte.
+///
+/// Mirrors vLLM's `pythonic` tool parser: the span body is one
+/// `[f(k=v, ...), g(...)]` list; each call maps to a [`ToolCall`] whose
+/// `arguments` is a JSON object built from the keyword arguments; positional
+/// arguments are parsed but dropped (vLLM `handle_single_tool` does the
+/// same); dotted function names (`a.b.c(...)`) are preserved; a body that
+/// fails to parse contributes no calls — the caller decides whether the raw
+/// text stays visible, matching vLLM's "treat as regular text" fallback.
+pub fn extract_lfm_tool_calls(s: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    let mut out: Vec<crate::prompt_frame::ToolCall> = Vec::new();
+    let mut search_pos = 0;
+    while let Some(open_rel) = s[search_pos..].find(LFM_TOOL_OPEN) {
+        let body_start = search_pos + open_rel + LFM_TOOL_OPEN.len();
+        let (body_end, advance) = match s[body_start..].find(LFM_TOOL_CLOSE) {
+            Some(i) => (body_start + i, body_start + i + LFM_TOOL_CLOSE.len()),
+            None => (s.len(), s.len()),
+        };
+        if let Some(calls) = parse_lfm_call_list(&s[body_start..body_end]) {
+            out.extend(calls);
+        }
+        search_pos = advance;
+        if advance == s.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// LFM2.5 tool-call span markers (literal text form of the special tokens,
+/// written as escapes so this file never carries the raw marker bytes).
+pub(crate) const LFM_TOOL_OPEN: &str = "\x3C\x7Ctool_call_start\x7C\x3E";
+pub(crate) const LFM_TOOL_CLOSE: &str = "\x3C\x7Ctool_call_end\x7C\x3E";
+
+/// Parse one LFM tool-call BODY — the bytes BETWEEN the markers — into calls.
+/// `[]` on malformed input (vLLM's treat-as-text fallback is the caller's
+/// choice). For text that still carries the markers use
+/// [`extract_lfm_tool_calls`].
+pub fn parse_lfm_tool_call_body(body: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    parse_lfm_call_list(body).unwrap_or_default()
+}
+
+/// Parse one LFM tool-call body: a Python list literal of `name(k=v, ...)`
+/// calls. All-or-nothing per span, like vLLM — `None` on any malformed input
+/// so the caller leaves the text alone.
+fn parse_lfm_call_list(body: &str) -> Option<Vec<crate::prompt_frame::ToolCall>> {
+    let mut p = LfmPyParser::new(body);
+    p.expect(b'[')?;
+    let mut calls = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.eat(b']') {
+            break;
+        }
+        calls.push(p.parse_call()?);
+        p.skip_ws();
+        if !p.eat(b',') {
+            p.expect(b']')?;
+            break;
+        }
+    }
+    p.skip_ws();
+    if !p.at_end() {
+        return None;
+    }
+    Some(calls)
+}
+
+struct LfmPyParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> LfmPyParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s: s.as_bytes(),
+            i: 0,
+        }
+    }
+    fn at_end(&self) -> bool {
+        self.i >= self.s.len()
+    }
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, c: u8) -> Option<()> {
+        self.eat(c).then_some(())
+    }
+    /// `ident` or dotted `a.b.c` — the call target, preserved verbatim.
+    fn parse_name(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.i;
+        if self.i < self.s.len() && (self.s[self.i].is_ascii_alphabetic() || self.s[self.i] == b'_')
+        {
+            self.i += 1;
+        } else {
+            return None;
+        }
+        loop {
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+            {
+                self.i += 1;
+            }
+            if self.i < self.s.len()
+                && self.s[self.i] == b'.'
+                && self
+                    .s
+                    .get(self.i + 1)
+                    .is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_')
+            {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        Some(std::str::from_utf8(&self.s[start..self.i]).ok()?.to_owned())
+    }
+    /// `name(k=v, pos, k2=v2)` → one [`ToolCall`]; positional args parsed,
+    /// dropped (vLLM convention).
+    fn parse_call(&mut self) -> Option<crate::prompt_frame::ToolCall> {
+        let name = self.parse_name()?;
+        self.expect(b'(')?;
+        let mut args = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            if self.eat(b')') {
+                break;
+            }
+            // Keyword arg iff `ident` directly followed by `=` (not `==`).
+            let save = self.i;
+            let is_kw = self.parse_name().is_some_and(|_| {
+                self.skip_ws();
+                self.s.get(self.i) == Some(&b'=') && self.s.get(self.i + 1) != Some(&b'=')
+            });
+            self.i = save;
+            if is_kw {
+                let key = self.parse_name()?;
+                self.expect(b'=')?;
+                let v = self.parse_value()?;
+                args.insert(key, v);
+            } else {
+                let _ = self.parse_value()?;
+            }
+            self.skip_ws();
+            if !self.eat(b',') {
+                self.expect(b')')?;
+                break;
+            }
+        }
+        Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments: serde_json::Value::Object(args),
+            rendered_body: None,
+        })
+    }
+    /// Python-literal value: string, number, bool/None, list, or dict.
+    fn parse_value(&mut self) -> Option<serde_json::Value> {
+        self.skip_ws();
+        let c = *self.s.get(self.i)?;
+        match c {
+            b'"' | b'\'' => self.parse_string(),
+            b'[' => {
+                self.i += 1;
+                let mut v = Vec::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b']') {
+                        break;
+                    }
+                    v.push(self.parse_value()?);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b']')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Array(v))
+            }
+            b'{' => {
+                self.i += 1;
+                let mut m = serde_json::Map::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b'}') {
+                        break;
+                    }
+                    let k = self.parse_value()?;
+                    let k = match k {
+                        serde_json::Value::String(s) => s,
+                        _ => return None,
+                    };
+                    self.expect(b':')?;
+                    let v = self.parse_value()?;
+                    m.insert(k, v);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b'}')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Object(m))
+            }
+            _ => self.parse_atom(),
+        }
+    }
+    /// Bareword / number: `True`, `False`, `None` (and JSON spellings), or a
+    /// numeric literal. Anything else (bare identifier, unary `+`, etc.)
+    /// rejects — a silently-accepted garbage arg is worse than no call.
+    fn parse_atom(&mut self) -> Option<serde_json::Value> {
+        let start = self.i;
+        while self.i < self.s.len()
+            && !matches!(self.s[self.i], b')' | b']' | b'}' | b',' | b':' | b'=')
+            && !self.s[self.i].is_ascii_whitespace()
+        {
+            self.i += 1;
+        }
+        let word = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+        match word {
+            "True" | "true" => Some(serde_json::Value::Bool(true)),
+            "False" | "false" => Some(serde_json::Value::Bool(false)),
+            "None" | "null" => Some(serde_json::Value::Null),
+            _ => {
+                if let Ok(i) = word.parse::<i64>() {
+                    Some(serde_json::Value::from(i))
+                } else if let Ok(f) = word.parse::<f64>() {
+                    if f.is_finite() {
+                        serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    /// Single- or double-quoted string with Python escape handling.
+    /// `\\n \\t \\r \\\\ \\' \\" \\0 \\xNN \\uXXXX \\UXXXXXXXX` all decode;
+    /// unknown escapes keep the backslash (Python's pass-through rule).
+    /// Triple-quoted strings supported.
+    fn parse_string(&mut self) -> Option<serde_json::Value> {
+        let quote = self.s[self.i];
+        self.i += 1;
+        let triple = self.s.get(self.i) == Some(&quote) && self.s.get(self.i + 1) == Some(&quote);
+        if triple {
+            self.i += 2;
+        }
+        let mut out = String::new();
+        loop {
+            let c = *self.s.get(self.i)?;
+            if c == quote {
+                if triple {
+                    if self.s.get(self.i + 1) == Some(&quote)
+                        && self.s.get(self.i + 2) == Some(&quote)
+                    {
+                        self.i += 3;
+                        break;
+                    }
+                    out.push(quote as char);
+                    self.i += 1;
+                    continue;
+                }
+                self.i += 1;
+                break;
+            }
+            if !triple && c == b'\n' {
+                return None; // unterminated single-line string
+            }
+            if c != b'\\' {
+                let width = utf8_len(c);
+                let end = self.i + width;
+                if end > self.s.len() {
+                    return None;
+                }
+                out.push_str(std::str::from_utf8(&self.s[self.i..end]).ok()?);
+                self.i = end;
+                continue;
+            }
+            self.i += 1;
+            let esc = *self.s.get(self.i)?;
+            self.i += 1;
+            match esc {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'0' => out.push('\0'),
+                b'\\' => out.push('\\'),
+                b'\'' => out.push('\''),
+                b'"' => out.push('"'),
+                b'a' => out.push('\u{07}'),
+                b'b' => out.push('\u{08}'),
+                b'f' => out.push('\u{0C}'),
+                b'v' => out.push('\u{0B}'),
+                b'x' => out.push(self.hex_char(2)?),
+                b'u' => out.push(self.hex_char(4)?),
+                b'U' => out.push(self.hex_char(8)?),
+                b'\n' => {} // line continuation
+                _ => {
+                    out.push('\\');
+                    out.push(esc as char);
+                }
+            }
+        }
+        Some(serde_json::Value::String(out))
+    }
+    fn hex_char(&mut self, n: usize) -> Option<char> {
+        if self.i + n > self.s.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&self.s[self.i..self.i + n]).ok()?;
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        self.i += n;
+        char::from_u32(v)
+    }
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
 /// Parse Qwen3.5/3.6's native tool-call body (legacy-tolerant):
 /// `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`.
 ///
@@ -1143,8 +1531,8 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter,
-        ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+        extract_lfm_tool_calls, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
+        ToolOutputRouter, ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
     };
     use crate::prompt_frame::ToolCall;
 
@@ -1989,5 +2377,312 @@ mod tests {
         assert!(matches!(err, ToolRouteError::MalformedToolProtocol { .. }));
         let err2 = r.push("more").expect_err("latched");
         assert_eq!(err2.detail(), err.detail());
+    }
+
+    // ── ThinkBudget::window_cap ──────────────────────────────────────────
+
+    use super::{ThinkBudget, ThinkBudgetStep};
+
+    const CLOSE_TOKENS: usize = 3;
+
+    /// Feed one committed token; mirror the decode loop by queueing the
+    /// close tokens after a ForceClose.
+    fn budget_step(b: &mut ThinkBudget, in_think: bool) -> ThinkBudgetStep {
+        let step = b.observe(in_think);
+        if step == ThinkBudgetStep::ForceClose {
+            b.closing(CLOSE_TOKENS);
+        }
+        step
+    }
+
+    /// Commit `cap` tokens following `pattern` bit by bit (bit i = stream
+    /// `in_think` after token i) and assert that only the last token may
+    /// intervene. Returns the last token's step.
+    fn commit_window(b: &ThinkBudget, cap: usize, pattern: u32, context: &str) -> ThinkBudgetStep {
+        let mut b = b.clone();
+        let mut last = ThinkBudgetStep::Continue;
+        for i in 0..cap {
+            let step = budget_step(&mut b, (pattern >> i) & 1 == 1);
+            if i + 1 < cap {
+                assert_eq!(
+                    step,
+                    ThinkBudgetStep::Continue,
+                    "{context}: intervention strictly inside the window (token {i} of {cap}, pattern {pattern:b})"
+                );
+            }
+            last = step;
+        }
+        last
+    }
+
+    /// Window length the uncapped (out-of-span) checks commit.
+    const UNCAPPED_LEN: usize = 7;
+
+    /// Commit `UNCAPPED_LEN` tokens following `pattern` from an uncapped
+    /// (out-of-span) state and assert that any intervention falls on a token
+    /// inside a span: one this window opened, since it started outside any.
+    /// The decode loop repairs such a strict-prefix window.
+    fn uncapped_window(b: &ThinkBudget, pattern: u32, context: &str) {
+        let mut b = b.clone();
+        for i in 0..UNCAPPED_LEN {
+            let in_think = (pattern >> i) & 1 == 1;
+            let step = budget_step(&mut b, in_think);
+            assert!(
+                step == ThinkBudgetStep::Continue || in_think,
+                "{context}: uncapped window intervened outside a span it opened (token {i}, pattern {pattern:b})"
+            );
+        }
+    }
+
+    #[test]
+    fn window_cap_disabled_is_none() {
+        let b = ThinkBudget::new(0);
+        assert_eq!(b.window_cap(false), None);
+        assert_eq!(b.window_cap(true), None);
+        assert_eq!(ThinkBudget::default().window_cap(true), None);
+    }
+
+    #[test]
+    fn window_cap_in_span_counts_zero_through_max() {
+        const MAX: usize = 6;
+        // Start inside a span (open-think prefix), then spend 0..MAX tokens.
+        for spent in 0..MAX {
+            let mut b = ThinkBudget::new(MAX);
+            for _ in 0..spent {
+                assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+            }
+            let cap = b.window_cap(true).expect("enabled");
+            assert_eq!(cap, MAX - spent, "spent={spent}");
+            assert!(cap >= 1);
+            // Staying in the span lands the force-close exactly on the last token.
+            let all_in = (1u32 << cap) - 1;
+            assert_eq!(
+                commit_window(&b, cap, all_in, "in span"),
+                ThinkBudgetStep::ForceClose,
+                "spent={spent}"
+            );
+            // Every other continuation never intervenes before the last token.
+            for pattern in 0..(1u32 << cap) {
+                commit_window(&b, cap, pattern, "in span");
+            }
+        }
+    }
+
+    #[test]
+    fn window_cap_out_of_span_is_uncapped() {
+        const MAX: usize = 5;
+        // Fresh budget, stream not in a span.
+        let b = ThinkBudget::new(MAX);
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "fresh out of span");
+        }
+        // After a span closed on its own (the count is stale and must not leak).
+        let mut b = ThinkBudget::new(MAX);
+        for _ in 0..(MAX - 1) {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "closed span");
+        }
+        // A re-opened span counts from 1: the in-span cap applies again and
+        // the force-close lands on its last token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
+        assert_eq!(
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "re-opened span"),
+            ThinkBudgetStep::ForceClose
+        );
+    }
+
+    /// Thinking off reaches the budget as `max_think_tokens == 1` behind a
+    /// closed-think prefix, so the answer streams outside any span: no MTP
+    /// window may be capped (a cap of 1 turns speculation off). The in-span
+    /// and close-token caps still engage if the answer opens a span.
+    #[test]
+    fn window_cap_thinking_off_never_caps_answer_windows() {
+        let mut b = ThinkBudget::new(1);
+        for _ in 0..256 {
+            assert_eq!(b.window_cap(false), None);
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(b.window_cap(false), None);
+        // An opened span trips on its opening token (count 1 == max) and the
+        // queued close tokens are capped.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+        assert_eq!(b.window_cap(true), Some(CLOSE_TOKENS + 1));
+        for left in (0..CLOSE_TOKENS).rev() {
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+            if left > 0 {
+                assert_eq!(b.window_cap(false), Some(left + 1));
+            }
+        }
+        // Back in the answer: uncapped again.
+        assert_eq!(b.window_cap(false), None);
+        // A second opened span ends the turn on its opening token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
+    }
+
+    #[test]
+    fn window_cap_after_force_close_covers_closing_then_reopened_span() {
+        const MAX: usize = 4;
+        let mut b = ThinkBudget::new(MAX);
+        for _ in 0..(MAX - 1) {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+
+        // Closing tokens are queued. The count stays at `max` through them,
+        // so a stream still in the span trips on the first token after them.
+        let cap = CLOSE_TOKENS + 1;
+        assert_eq!(b.window_cap(true), Some(cap));
+        assert_eq!(
+            commit_window(&b, cap, (1u32 << cap) - 1, "span never closed"),
+            ThinkBudgetStep::Exhausted
+        );
+        for pattern in 0..(1u32 << cap) {
+            commit_window(&b, cap, pattern, "after force close");
+        }
+
+        // Part-way through the close tokens the cap shrinks with `closing`.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(CLOSE_TOKENS - 1 + 1));
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), Some(CLOSE_TOKENS - 2 + 1));
+
+        // The close text ended the span: uncapped again. A re-opened span
+        // counts from 1 and its Exhausted lands exactly on the last token of
+        // the in-span cap.
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), None);
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
+        assert_eq!(
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "reopened span"),
+            ThinkBudgetStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn window_cap_holds_for_any_reachable_state() {
+        for max in 1..=3usize {
+            for start_in_think in [false, true] {
+                // Every prefix of up to 9 committed tokens reaches a state;
+                // skip prefixes whose turn already ended (Exhausted).
+                for len in 0..=9usize {
+                    for prefix in 0..(1u32 << len) {
+                        let mut b = ThinkBudget::new(max);
+                        let mut last_in_think = start_in_think;
+                        let mut ended = false;
+                        for i in 0..len {
+                            let in_think = (prefix >> i) & 1 == 1;
+                            if budget_step(&mut b, in_think) == ThinkBudgetStep::Exhausted {
+                                ended = true;
+                                break;
+                            }
+                            last_in_think = in_think;
+                        }
+                        if ended {
+                            continue;
+                        }
+                        let ctx = format!("max={max} prefix={prefix:b}/{len}");
+                        match b.window_cap(last_in_think) {
+                            Some(cap) => {
+                                assert!(cap >= 1, "{ctx}");
+                                assert!(cap <= CLOSE_TOKENS + max, "{ctx}");
+                                for pattern in 0..(1u32 << cap) {
+                                    commit_window(&b, cap, pattern, &ctx);
+                                }
+                            }
+                            None => {
+                                assert!(!last_in_think, "{ctx}: uncapped inside a span");
+                                for pattern in 0..(1u32 << UNCAPPED_LEN) {
+                                    uncapped_window(&b, pattern, &ctx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lfm_tool_call_span_parses_like_vllm_pythonic() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!("pre {open}[get_candidate_status(candidate_id=\"12345\")]{close}post");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_candidate_status");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"candidate_id": "12345"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_multiple_calls_and_value_types() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!(
+            "{open}[f(a=1, b=2.5, c=True, d=None, e=['x', 3]), ns.g(flag=false, l=[1,2], m={{'k': 'v'}})]{close}"
+        );
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"a":1,"b":2.5,"c":true,"d":null,"e":["x",3]})
+        );
+        assert_eq!(calls[1].name, "ns.g");
+        assert_eq!(
+            calls[1].arguments,
+            serde_json::json!({"flag":false,"l":[1,2],"m":{"k":"v"}})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_positional_dropped_and_escapes() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        // Positional args parse but are dropped (vLLM handle_single_tool).
+        let text =
+            format!("{open}[g('pos', s='line1\\nline2', q='it\\'s', x='\\x41\\u0042')]{close}");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"s":"line1\nline2","q":"it's","x":"AB"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_malformed_body_yields_no_calls() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        for bad in [
+            format!("{open}not a list{close}"),
+            format!("{open}[f(a=)]{close}"),
+            format!("{open}[f(a=1) trailing{close}"),
+            format!("{open}[f(a='unterminated)]{close}"),
+        ] {
+            assert!(
+                extract_lfm_tool_calls(&bad).is_empty(),
+                "should not fabricate calls from {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_tool_call_unclosed_span_still_extracted() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        // Whole-buffer tolerant path: unclosed span at end recovers the call.
+        let text = format!("{open}[f(a=1)]");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
     }
 }

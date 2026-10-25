@@ -15,6 +15,10 @@ use rdna_compute::{
     MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 
+/// Appended to every fixed-layout blob size refusal: the size only disagrees
+/// when the file is damaged or was written by an older quantizer.
+const BLOB_FIX: &str = "; the model file is corrupt or was written by an older quantizer — re-download it with `hipfire pull <model>` or re-quantize it";
+
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
 /// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
 fn widen_bf16(data: &[u8]) -> Vec<f32> {
@@ -108,10 +112,10 @@ pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "unsupported embedding quant_type {other}; \
-                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
-                 40 (TQ2G128→F32), 41 (BQ1G128→F32), 44/45/47-50 (MQ*G256V2→F32). \
-                 Add the format to embed_classify to support it."
+                "unsupported embedding quant_type {other}: this model's embedding table is stored in a \
+                 weight format hipfire cannot load. Supported embedding formats: 1 (F16), 2 (F32), 3 (Q8_0), \
+                 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16), 40 (TQ2G128), 41 (BQ1G128), 44/45/47-50 (MQ*G256V2). \
+                 Update hipfire, or re-quantize / re-download the model with a supported embedding format."
             ),
         )),
     }
@@ -697,6 +701,13 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 53,
         dtype: DType::MQ4G128V2,
     },
+    // FP8E4M3B128 (qt=55): OCP e4m3fn codes + 128x128 bf16 s_inv, expert-blocked
+    // (`rdna_compute::fp8_e4m3::b128_block_stride`). Verbatim storage; only the
+    // typed gfx942 Qwen4 FP8 route reads it, generic consumers reject it.
+    RawCodec {
+        quant_type: 55,
+        dtype: DType::FP8E4M3B128,
+    },
     // Neutral-size Magnum V2 family (qt47-50): same neutral header as qt44
     // (LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1, `[6..8)` fp16 z1,
     // `[8..B)` legacy payload). Half 0 covers q[0..128), half 1 q[128..256);
@@ -756,7 +767,7 @@ pub(crate) fn decode_raw_codec(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "{:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})",
+                "{:?} tensor {name} has K={k} columns, but this format needs K to be a multiple of 256; the model file does not match its declared format — re-quantize or re-download it",
                 codec.dtype
             ),
         ));
@@ -768,7 +779,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -797,7 +808,27 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::FP8E4M3B128 {
+        // Generic callers describe one 2-D `[m, k]` matrix, i.e. a single expert
+        // block (E=1). Expert-stacked `[E, R, K]` payloads are sized and
+        // validated by the typed Qwen4 loader via `b128_tensor_bytes(E, R, K)`.
+        let expected = rdna_compute::fp8_e4m3::b128_tensor_bytes(1, m, k).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("FP8E4M3B128 blob length overflow: M={m} K={k} (caller: {name})"),
+            )
+        })?;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "FP8E4M3B128 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -810,7 +841,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G256V2Lloyd blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}; stale +32B-prefix artifacts are rejected)",
+                    "MQ4G256V2Lloyd blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}; artifacts from the old +32B-prefix layout are rejected){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -825,7 +856,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -838,7 +869,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -851,7 +882,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -864,7 +895,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -877,7 +908,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -927,7 +958,7 @@ fn lowbit_expected_bytes(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "{:?} tensor [m={m}, k={k}] (caller: {name}) requires K%128==0: K={k} not divisible by 128",
+                "{:?} tensor {name} [m={m}, k={k}] has K={k} columns, but this format needs K to be a multiple of 128; the model file does not match its declared format — re-quantize or re-download it",
                 dtype
             ),
         ));
@@ -1067,7 +1098,7 @@ pub fn dequant_weight_raw(
             Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw", target),
             None => Err(hip_bridge::HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for dequant_weight_raw"),
+                &format!("unsupported quant_type {other} in dequant_weight_raw; this hipfire build cannot read that weight format — update hipfire or re-download the model in a supported format"),
             )),
         },
     }
@@ -1222,21 +1253,31 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             let mut out = Vec::with_capacity(n_groups * 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let h16 = |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
+                let h16 =
+                    |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
                 // qt45: [0..2) s, [2..4) z for BOTH halves. Others: per-half s/z.
                 let (s0, z0) = (h16(0), h16(2));
-                let (s1, z1) = if quant_type == 45 { (s0, z0) } else { (h16(4), h16(6)) };
+                let (s1, z1) = if quant_type == 45 {
+                    (s0, z0)
+                } else {
+                    (h16(4), h16(6))
+                };
                 let start = out.len();
                 for i in 0..256 {
                     let p = off + 8;
                     let code = match quant_type {
                         45 => {
                             let b = data[p + i / 2] as u32;
-                            if i % 2 == 0 { b & 0xF } else { b >> 4 }
+                            if i % 2 == 0 {
+                                b & 0xF
+                            } else {
+                                b >> 4
+                            }
                         }
                         47 => {
                             let bo = p + (i / 4) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 0x3F,
                                 ((b0 >> 6) | (b1 << 2)) & 0x3F,
@@ -1266,7 +1307,8 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
                         }
                         49 => {
                             let bo = p + (i / 8) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 7,
                                 (b0 >> 3) & 7,
@@ -1310,6 +1352,11 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             out
         }
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
+        55 => panic!("FP8E4M3B128 (qt=55) is typed-Qwen4-gfx942-only; generic dequant_f32 refuses it"),
+        56 => panic!("FP8E4M3PT (qt=56) is read by the Qwen4 PLE row store only; generic dequant_f32 refuses it"),
+        131..=134 => panic!(
+            "MQ-I4 (qt={quant_type}) is a typed-Qwen4 expert-slab format; generic dequant_f32 refuses it"
+        ),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     }
 }
@@ -1341,6 +1388,47 @@ pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f3
     dequantize_to_f32(quant_type, data, n)
 }
 
+/// Whether [`dequantize_to_f32`] implements this HFQ quant type.
+///
+/// Host-dequant loaders (embed encoders, draft/MTP heads, the host-offload
+/// path) should screen an artifact with this instead of discovering a gap as
+/// the decoder's `panic!` mid-load — that panic takes the daemon and any
+/// resident model down with it. Formats outside the dense HFQ set (Q4K qt=4 is
+/// GGUF/Maple-side, qt=53 is typed-Qwen4-only) are deliberately absent.
+///
+/// `dequant_f32_supported_matches_the_decoder` sweeps every `u8` and ties this
+/// set to the decoder's actual behaviour, so a new arm without a matching entry
+/// (or the reverse) fails the test rather than a user's load.
+pub fn dequant_f32_supported(quant_type: u8) -> bool {
+    matches!(
+        quant_type,
+        1 | 2
+            | 3
+            | 6
+            | 7
+            | 8
+            | 11
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 17
+            | 18
+            | 19
+            | 20
+            | 30
+            | 40
+            | 41
+            | 44
+            | 45
+            | 47
+            | 48
+            | 49
+            | 50
+    )
+}
+
 // ── WeightBackend trait ─────────────────────────────────────────────────────
 
 /// Where a weight's bytes physically land at load. One parameter, one upload
@@ -1368,9 +1456,9 @@ pub enum MemoryTarget {
 /// upload the widened bytes; no host-mapped upload exists, so silently placing
 /// them on the device would consume exactly the VRAM an offloaded layer frees.
 pub const HOST_DECODE_REFUSAL: &str =
-    "quantized weight falls back to the f32 dequant path, which has no \
-     host-localized upload; refusing to silently place it in device memory \
-     inside an offloaded layer";
+    "this quantized weight format has no host-memory (offload) upload path, and placing it \
+     in device memory would defeat the offload; use a model quantized in a supported format, \
+     or unset memory.gpu_layer_budget / memory.moe_expert_budget";
 
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use crate::model_source::ModelSource;
@@ -1868,6 +1956,8 @@ mod tests {
             // qt=53 is row-local MQ4G128V2 (68 B per ceil(K/128) group), admitted
             // only by typed Qwen4 sealed/dense consumers; generic paths refuse it.
             (53, DType::MQ4G128V2),
+            // qt=55 FP8E4M3B128: expert-blocked FP8 payload, typed gfx942 route only.
+            (55, DType::FP8E4M3B128),
             // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
             // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
             (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw
@@ -2007,7 +2097,7 @@ mod tests {
         for k in [1, 127, 129, 256 - 1, 255, 257, 1000] {
             let err = lowbit_expected_bytes(DType::TQ2G128, 1, k, "caller_ctx", 34).unwrap_err();
             assert!(
-                err.message.contains("K%128==0") || err.message.contains("requires K%128"),
+                err.message.contains("multiple of 128"),
                 "k={k}: expected K%128 error, got {}",
                 err.message
             );
@@ -2031,7 +2121,7 @@ mod tests {
         let err = lowbit_expected_bytes(DType::BQ1G128, 4, 200, "my_layer", 18).unwrap_err();
         assert!(err.message.contains("BQ1G128"));
         assert!(err.message.contains("my_layer"));
-        assert!(err.message.contains("K%128"));
+        assert!(err.message.contains("multiple of 128"));
     }
 
     #[test]
@@ -2202,5 +2292,27 @@ mod tests {
         assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
         assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
         assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
+    }
+
+    /// The supported-set predicate must equal what the decoder actually does.
+    ///
+    /// Probes every `u8`: a type the decoder handles (no panic on a small
+    /// buffer) must be `true`, and one it panics on must be `false`. This is
+    /// what keeps a new decoder arm from being invisible to the host-dequant
+    /// loaders that screen artifacts with the predicate — the failure mode
+    /// otherwise is a false refusal, or a panic mid-load.
+    #[test]
+    fn dequant_f32_supported_matches_the_decoder() {
+        let data = vec![0u8; 1024];
+        for qt in 0..=u8::MAX {
+            let handled = std::panic::catch_unwind(|| dequantize_to_f32(qt, &data, 32)).is_ok();
+            assert_eq!(
+                dequant_f32_supported(qt),
+                handled,
+                "qt={qt}: predicate says {}, decoder {}",
+                dequant_f32_supported(qt),
+                if handled { "handles it" } else { "panics" }
+            );
+        }
     }
 }

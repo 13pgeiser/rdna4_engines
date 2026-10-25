@@ -36,6 +36,9 @@ mod dev_tiny;
 #[cfg(feature = "qwen4-dev-profiles")]
 pub(crate) use dev_tiny::{run_dev_tiny_cli, Qwen4DevTinyEncoding};
 
+mod stock_fp8;
+pub(crate) use stock_fp8::run_stock_fp8_cli;
+
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
 /// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale
 /// block is why this cannot go through the uniform `(group, bytes)` model.
@@ -1196,17 +1199,8 @@ impl RemoteSource {
             .http_status_as_error(false)
             .build()
             .into();
-        let authorization = env::var_os("HF_TOKEN")
-            .and_then(|value| {
-                let value = value.to_string_lossy().into_owned();
-                (!value.is_empty()).then(|| format!("Bearer {value}"))
-            })
-            .or_else(|| {
-                env::var_os("HUGGING_FACE_HUB_TOKEN").and_then(|value| {
-                    let value = value.to_string_lossy().into_owned();
-                    (!value.is_empty()).then(|| format!("Bearer {value}"))
-                })
-            });
+        let authorization = hipfire_config::http_auth::hf_authorization()
+            .map_err(|error| Qwen4Error::Invalid(error.to_string()))?;
         Ok(Self {
             spec,
             base_url,
@@ -2114,6 +2108,8 @@ fn parse_safetensors_header_from_shard(
             "I64" => checked_product(&shape, name)?
                 .checked_mul(8)
                 .ok_or_else(|| Qwen4Error::Invalid(format!("{name} I64 length overflows")))?,
+            // One byte per element: stock FP8 checkpoints (`--recipe stock-fp8`).
+            "F8_E4M3" => checked_product(&shape, name)?,
             _ => relative_len,
         };
         if relative_len != expected_len {
@@ -3334,6 +3330,46 @@ fn build_metadata(
     ple: &PleMetadata,
     tokenizer: Option<&TokenizerMetadata>,
 ) -> Result<String, Qwen4Error> {
+    let recipe = json!({
+        "version": 2,
+        "stacked_experts": true,
+        "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
+        "matrix": plan_matrix_recipe(plan),
+        "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
+        "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
+        // The eight-bit classes: the token embedding and the language head,
+        // which every MoE recipe in this tree holds at Q8F16 rather than at
+        // a four-bit matrix tier.
+        "eight_bit": ["embed_tokens.weight", "lm_head.weight"],
+        // Parameters that keep source BF16 bytes; they are covered by
+        // neither format above.
+        "source_exact": [
+            "hyper_connection",
+            "mtp.fc_embedding.weight",
+            "mtp.fc_hidden.weight"
+        ],
+        "mtp_experts": "same_as_trunk"
+    });
+    let streaming = json!({
+        "version": 1,
+        "row_chunk": plan.row_chunk,
+        "resident_entries": plan.resident_entries,
+        "expert_entries": plan.expert_entries,
+        "external_ple_entries": plan.ple_shards,
+    });
+    build_metadata_document(config, recipe, streaming, ple, tokenizer)
+}
+
+/// Shared HFQM metadata envelope.  `recipe` becomes `qwen4_recipe` and
+/// `streaming` becomes `qwen4_streaming`; config, the PLE marker and the
+/// tokenizer are identical across recipes.
+fn build_metadata_document(
+    config: Option<&Value>,
+    recipe: Value,
+    streaming: Value,
+    ple: &PleMetadata,
+    tokenizer: Option<&TokenizerMetadata>,
+) -> Result<String, Qwen4Error> {
     let _valid_rows =
         validate_ple_metadata(&ple.multipliers, &ple.vocab_sizes, &ple.prefix_offsets)?;
     let physical_rows = (PLE_SHARD_COUNT as u64)
@@ -3354,29 +3390,7 @@ fn build_metadata(
             .cloned()
             .unwrap_or_else(|| json!({"model_type": "qwen4_exp"})),
     );
-    root.insert(
-        "qwen4_recipe".to_string(),
-        json!({
-            "version": 2,
-            "stacked_experts": true,
-            "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
-            "matrix": plan_matrix_recipe(plan),
-            "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
-            "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
-            // The eight-bit classes: the token embedding and the language head,
-            // which every MoE recipe in this tree holds at Q8F16 rather than at
-            // a four-bit matrix tier.
-            "eight_bit": ["embed_tokens.weight", "lm_head.weight"],
-            // Parameters that keep source BF16 bytes; they are covered by
-            // neither format above.
-            "source_exact": [
-                "hyper_connection",
-                "mtp.fc_embedding.weight",
-                "mtp.fc_hidden.weight"
-            ],
-            "mtp_experts": "same_as_trunk"
-        }),
-    );
+    root.insert("qwen4_recipe".to_string(), recipe);
     root.insert(
         "qwen4_ple".to_string(),
         json!({
@@ -3387,16 +3401,7 @@ fn build_metadata(
             "padded_rows": physical_rows,
         }),
     );
-    root.insert(
-        "qwen4_streaming".to_string(),
-        json!({
-            "version": 1,
-            "row_chunk": plan.row_chunk,
-            "resident_entries": plan.resident_entries,
-            "expert_entries": plan.expert_entries,
-            "external_ple_entries": plan.ple_shards,
-        }),
-    );
+    root.insert("qwen4_streaming".to_string(), streaming);
     if let Some(tokenizer) = tokenizer {
         root.insert(
             "tokenizer".to_string(),
@@ -4520,6 +4525,30 @@ mod tests {
         assert!(parse_remote_spec("weights/model.safetensors")
             .expect("local path is not remote")
             .is_none());
+    }
+
+    /// The only test that builds a `RemoteSource`, so it may own `HF_TOKEN`.
+    #[test]
+    fn remote_source_rejects_malformed_hf_token_naming_the_variable() {
+        let previous = env::var_os("HF_TOKEN");
+        env::set_var("HF_TOKEN", "hf_bad\ntoken");
+        let spec = parse_remote_spec("hf://owner/repo@0123456789abcdef0123456789abcdef01234567")
+            .expect("parse valid remote spec")
+            .expect("remote spec");
+        let result = RemoteSource::new(spec);
+        match previous {
+            Some(value) => env::set_var("HF_TOKEN", value),
+            None => env::remove_var("HF_TOKEN"),
+        }
+        let message = result
+            .expect_err("newline in token must be refused")
+            .to_string();
+        assert!(
+            message.contains("environment variable HF_TOKEN"),
+            "{message}"
+        );
+        assert!(message.contains("a newline at character 7"), "{message}");
+        assert!(!message.contains("bad"), "{message}");
     }
 
     #[test]

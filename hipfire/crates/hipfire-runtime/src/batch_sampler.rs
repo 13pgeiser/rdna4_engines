@@ -170,15 +170,17 @@ fn h2d_async(gpu: &Gpu, dst: &GpuTensor, src: &[u8]) -> HipResult<()> {
 
 /// D2H of `dst.len()` bytes from the start of `src`, ordered after every
 /// queued kernel (stream sync on the active stream, blocking copy on the
-/// legacy stream otherwise).
+/// legacy stream otherwise). Like `Gpu::download_*`, it then fails if a
+/// bounded device wait timed out during the step.
 fn d2h_sync(gpu: &Gpu, dst: &mut [u8], src: &GpuTensor) -> HipResult<()> {
     match gpu.active_stream.as_ref() {
         Some(stream) => {
             gpu.hip.memcpy_dtoh_async(dst, &src.buf, Some(stream))?;
-            gpu.hip.stream_synchronize(stream)
+            gpu.hip.stream_synchronize(stream)?;
         }
-        None => gpu.hip.memcpy_dtoh(dst, &src.buf),
+        None => gpu.hip.memcpy_dtoh(dst, &src.buf)?,
     }
+    gpu.take_device_wait_error()
 }
 
 /// Sample every job. Byte-identical (token, advanced RNG, post-sample logits
@@ -196,7 +198,10 @@ pub fn sample_batch<'a>(
     if n > arena.max_lanes {
         return Err(HipError::new(
             0,
-            &format!("sample_batch: {n} jobs exceed the arena's {} lanes", arena.max_lanes),
+            &format!(
+                "sample_batch: {n} jobs exceed the arena's {} lanes",
+                arena.max_lanes
+            ),
         ));
     }
     arena.picks.clear();
@@ -242,7 +247,13 @@ pub fn sample_batch<'a>(
         let vocab = job.logits.numel();
         for &tok in &job.cfg.blocked_tokens {
             if (tok as usize) < vocab {
-                gpu.memcpy_dtod_at_auto(&job.logits.buf, (tok as usize) * 4, &arena.neg_inf.buf, 0, 4)?;
+                gpu.memcpy_dtod_at_auto(
+                    &job.logits.buf,
+                    (tok as usize) * 4,
+                    &arena.neg_inf.buf,
+                    0,
+                    4,
+                )?;
             }
         }
         let (off, len, uploaded) = arena.scopes[i];

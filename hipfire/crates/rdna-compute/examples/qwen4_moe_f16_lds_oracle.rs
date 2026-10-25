@@ -75,8 +75,10 @@ const POISON: i32 = 0x5A;
 const GU_STRIDE: usize = GU_M * (HID / 256) * GU_GB;
 const DN_STRIDE: usize = DN_M * (MI / 128) * DN_GB;
 
-const GU_SRC: &str = include_str!("../../../kernels/src/qwen4_gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
-const DN_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_wmma.gfx1151.hip");
+const GU_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
+const DN_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_wmma.gfx1151.hip");
 const GU_WAVE: &str = "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out";
 const GU_X4: &str = "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4";
 const DN_MODULE: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151";
@@ -126,7 +128,11 @@ fn asym_header(r: &mut Rng) -> (u16, u16) {
 /// K % 128), independent headers, uniformly random nibble bytes.
 fn asym_weights(m: usize, k: usize, group_bytes: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed ^ 0x5eed_0000_0000_0001);
-    let (groups, hdrs) = if group_bytes == GU_GB { (k / 256, 2) } else { (k / 128, 1) };
+    let (groups, hdrs) = if group_bytes == GU_GB {
+        (k / 256, 2)
+    } else {
+        (k / 128, 1)
+    };
     let mut w = vec![0u8; m * groups * group_bytes];
     for g in w.chunks_exact_mut(group_bytes) {
         for h in 0..hdrs {
@@ -144,9 +150,9 @@ fn asym_weights(m: usize, k: usize, group_bytes: usize, seed: u64) -> Vec<u8> {
 
 fn md5_block(st: &mut [u32; 4], ch: &[u8], kk: &[u32; 64]) {
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
-        14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15,
-        21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     let mut m = [0u32; 16];
     for (d, w) in m.iter_mut().zip(ch.chunks_exact(4)) {
@@ -173,7 +179,8 @@ fn md5_block(st: &mut [u32; 4], ch: &[u8], kk: &[u32; 64]) {
 }
 
 fn md5_hex(b: &[u8]) -> String {
-    let kk: [u32; 64] = std::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32);
+    let kk: [u32; 64] =
+        std::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32);
     let mut st = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
     let mut chunks = b.chunks_exact(64);
     for ch in &mut chunks {
@@ -188,7 +195,10 @@ fn md5_hex(b: &[u8]) -> String {
     for ch in tail.chunks_exact(64) {
         md5_block(&mut st, ch, &kk);
     }
-    st.iter().flat_map(|v| v.to_le_bytes()).map(|x| format!("{x:02x}")).collect()
+    st.iter()
+        .flat_map(|v| v.to_le_bytes())
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 fn routing(kind: &str, t: usize, seed: u64) -> Res<Vec<i32>> {
@@ -265,7 +275,9 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 }
 
 fn to_i32(b: &[u8]) -> Vec<i32> {
-    b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 // ---------------------------------------------------------------- device
@@ -307,7 +319,7 @@ fn poke(gpu: &Gpu, t: &GpuTensor, off: usize, v: u8) -> Res<()> {
     Ok(())
 }
 
-/// The two GEMMs' kernarg ABI: 5 pointers, then M, K, x_row_div, m_total.
+/// The two GEMMs' kernarg ABI: 5 pointers, then M, K, x_row_div, m_total, n_experts (= E).
 fn blob(ptrs: [*const std::ffi::c_void; 5], ints: [usize; 4]) -> KernargBlob {
     let mut a = KernargBlob::new();
     for q in ptrs {
@@ -316,6 +328,7 @@ fn blob(ptrs: [*const std::ffi::c_void; 5], ints: [usize; 4]) -> KernargBlob {
     for v in ints {
         a.push_i32(v as i32);
     }
+    a.push_i32(E as i32);
     a
 }
 
@@ -382,7 +395,15 @@ struct Ops {
 
 impl Ops {
     fn free(self, gpu: &mut Gpu) -> Res<()> {
-        for t in [self.topk, self.x_in, self.counts, self.offsets, self.sorted, self.tiles, self.inverse] {
+        for t in [
+            self.topk,
+            self.x_in,
+            self.counts,
+            self.offsets,
+            self.sorted,
+            self.tiles,
+            self.inverse,
+        ] {
             gpu.free_tensor(t)?;
         }
         Ok(())
@@ -435,15 +456,41 @@ impl Ctx<'_> {
         match arm {
             Arm::GuWave | Arm::GuX4 => {
                 let x4 = arm == Arm::GuX4;
-                let mut a = blob([p(&w.gu_ptrs), p(&o.tiles), p(&o.sorted), p(x), p(y)], [GU_M, HID, TOPK, o.pmax]);
-                let (f, rows_per_block, block) = if x4 { (GU_X4, 64, 128) } else { (GU_WAVE, 16, 32) };
-                launch(gpu, f, [(GU_M / rows_per_block) as u32, tiles, 1], block, &mut a)
+                let mut a = blob(
+                    [p(&w.gu_ptrs), p(&o.tiles), p(&o.sorted), p(x), p(y)],
+                    [GU_M, HID, TOPK, o.pmax],
+                );
+                let (f, rows_per_block, block) = if x4 {
+                    (GU_X4, 64, 128)
+                } else {
+                    (GU_WAVE, 16, 32)
+                };
+                launch(
+                    gpu,
+                    f,
+                    [(GU_M / rows_per_block) as u32, tiles, 1],
+                    block,
+                    &mut a,
+                )
             }
             Arm::DnWave | Arm::DnX8 => {
                 let x8 = arm == Arm::DnX8;
-                let mut a = blob([p(&w.dn_ptrs), p(&o.tiles), p(&o.sorted), p(x), p(y)], [DN_M, MI, 1, o.pmax]);
-                let (f, rows_per_block, block) = if x8 { (DN_X8, 128, 256) } else { (DN_WAVE, 16, 32) };
-                launch(gpu, f, [(DN_M / rows_per_block) as u32, tiles, 1], block, &mut a)
+                let mut a = blob(
+                    [p(&w.dn_ptrs), p(&o.tiles), p(&o.sorted), p(x), p(y)],
+                    [DN_M, MI, 1, o.pmax],
+                );
+                let (f, rows_per_block, block) = if x8 {
+                    (DN_X8, 128, 256)
+                } else {
+                    (DN_WAVE, 16, 32)
+                };
+                launch(
+                    gpu,
+                    f,
+                    [(DN_M / rows_per_block) as u32, tiles, 1],
+                    block,
+                    &mut a,
+                )
             }
             Arm::GuLauncher => Ok(gpu.gemm_mq4g256v2_moe_grouped_top10_silu_bf16out(
                 &w.gu_ptrs, &o.tiles, &o.sorted, x, y, GU_M, HID, TOPK, o.pmax, o.t,
@@ -466,7 +513,15 @@ impl Ctx<'_> {
     /// Negative control: change one header byte (sc high byte of row 0,
     /// group 0, XOR 0x40) of the blob expert `e0` uses, rerun the LDS `arm`
     /// only, restore the byte; returns the byte mismatches vs `wave`.
-    fn negative(&self, gpu: &mut Gpu, arm: Arm, e0: usize, x: &GpuTensor, y: &GpuTensor, wave: &[u8]) -> Res<usize> {
+    fn negative(
+        &self,
+        gpu: &mut Gpu,
+        arm: Arm,
+        e0: usize,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        wave: &[u8],
+    ) -> Res<usize> {
         let w = self.w;
         let blob_idx = e0 % w.distinct;
         let (t, off, orig) = if arm == Arm::GuX4 {
@@ -499,7 +554,12 @@ struct CaseId {
 
 /// Routing, X and the production scatter of one case; fills the common
 /// report keys. Returns the operands and the host sorted/tiles tables.
-fn prepare(gpu: &mut Gpu, w: &Weights, id: &CaseId, mode: &str) -> Res<(Ops, Vec<i32>, Vec<i32>, Out)> {
+fn prepare(
+    gpu: &mut Gpu,
+    w: &Weights,
+    id: &CaseId,
+    mode: &str,
+) -> Res<(Ops, Vec<i32>, Vec<i32>, Out)> {
     let topk = routing(&id.kind, id.t, id.seed)?;
     let mut r = Rng(id.seed ^ 0x77);
     let x: Vec<f32> = (0..id.t * HID).map(|_| (r.unit() - 0.5) * 4.0).collect();
@@ -517,7 +577,9 @@ fn prepare(gpu: &mut Gpu, w: &Weights, id: &CaseId, mode: &str) -> Res<(Ops, Vec
         tiles: alloc(gpu, pmax / 16 * 4)?,
         inverse: alloc(gpu, l * 4)?,
     };
-    gpu.moe_scatter_fused_top10(&o.topk, &o.counts, &o.offsets, &o.sorted, &o.tiles, &o.inverse, l, E, pmax, 16)?;
+    gpu.moe_scatter_fused_top10(
+        &o.topk, &o.counts, &o.offsets, &o.sorted, &o.tiles, &o.inverse, l, E, pmax, 16,
+    )?;
     gpu.hip.device_synchronize()?;
     let sorted = to_i32(&download(gpu, &o.sorted, pmax * 4)?);
     let tiles = to_i32(&download(gpu, &o.tiles, pmax / 16 * 4)?);
@@ -532,9 +594,17 @@ fn prepare(gpu: &mut Gpu, w: &Weights, id: &CaseId, mode: &str) -> Res<(Ops, Vec
     out.insert("slots_L".into(), json!(l));
     out.insert("pmax".into(), json!(pmax));
     out.insert("live_tiles".into(), json!(live));
-    out.insert("run_len_tiles_hist".into(), json!({"1": hist[0], "2": hist[1], "3": hist[2], "4": hist[3], ">4": hist[4]}));
+    out.insert(
+        "run_len_tiles_hist".into(),
+        json!({"1": hist[0], "2": hist[1], "3": hist[2], "4": hist[3], ">4": hist[4]}),
+    );
     out.insert("md5_routing".into(), json!(md5_hex(&i32_bytes(&topk))));
-    out.insert("md5_x".into(), json!(md5_hex(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())));
+    out.insert(
+        "md5_x".into(),
+        json!(md5_hex(
+            &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        )),
+    );
     out.insert("md5_sorted".into(), json!(md5_hex(&i32_bytes(&sorted))));
     out.insert("md5_tiles".into(), json!(md5_hex(&i32_bytes(&tiles))));
     out.insert("md5_gu_w".into(), json!(w.md5_gu));
@@ -576,8 +646,14 @@ fn check_case(gpu: &mut Gpu, w: &Weights, id: &CaseId, first: bool) -> Res<(Out,
     out.insert("md5_gu_wave".into(), json!(md5_hex(&gu_wave)));
     out.insert("gu_buffer_bytes".into(), json!(gu_bytes));
     out.insert("gu_live_nonzero_bf16".into(), json!(gu_nonzero));
-    out.insert("gu_x4_vs_wave_mismatch".into(), json!(mismatch(&gu_x4, &gu_wave)));
-    out.insert("gu_launcher_vs_wave_mismatch".into(), json!(mismatch(&gu_launcher, &gu_wave)));
+    out.insert(
+        "gu_x4_vs_wave_mismatch".into(),
+        json!(mismatch(&gu_x4, &gu_wave)),
+    );
+    out.insert(
+        "gu_launcher_vs_wave_mismatch".into(),
+        json!(mismatch(&gu_launcher, &gu_wave)),
+    );
     bad("gu_x4_vs_wave", mismatch(&gu_x4, &gu_wave));
     bad("gu_launcher_vs_wave", mismatch(&gu_launcher, &gu_wave));
     if gu_nonzero == 0 {
@@ -606,8 +682,14 @@ fn check_case(gpu: &mut Gpu, w: &Weights, id: &CaseId, first: bool) -> Res<(Out,
     out.insert("md5_dn_wave".into(), json!(md5_hex(&dn_wave)));
     out.insert("dn_buffer_bytes".into(), json!(dn_bytes));
     out.insert("dn_live_nonzero_bf16".into(), json!(dn_nonzero));
-    out.insert("dn_x8_vs_wave_mismatch".into(), json!(mismatch(&dn_x8, &dn_wave)));
-    out.insert("dn_launcher_vs_wave_mismatch".into(), json!(mismatch(&dn_launcher, &dn_wave)));
+    out.insert(
+        "dn_x8_vs_wave_mismatch".into(),
+        json!(mismatch(&dn_x8, &dn_wave)),
+    );
+    out.insert(
+        "dn_launcher_vs_wave_mismatch".into(),
+        json!(mismatch(&dn_launcher, &dn_wave)),
+    );
     bad("dn_x8_vs_wave", mismatch(&dn_x8, &dn_wave));
     bad("dn_launcher_vs_wave", mismatch(&dn_launcher, &dn_wave));
     if dn_nonzero == 0 {
@@ -624,7 +706,10 @@ fn check_case(gpu: &mut Gpu, w: &Weights, id: &CaseId, first: bool) -> Res<(Out,
     }
 
     out.insert("fails".into(), json!(fails));
-    out.insert("result".into(), json!(if fails.is_empty() { "PASS" } else { "FAIL" }));
+    out.insert(
+        "result".into(),
+        json!(if fails.is_empty() { "PASS" } else { "FAIL" }),
+    );
     for t in [ygu_wave, ydn_wave, ytmp_gu, ytmp_dn] {
         gpu.free_tensor(t)?;
     }
@@ -652,7 +737,11 @@ fn time_arms(
     let (e0, e1) = (gpu.hip.event_create()?, gpu.hip.event_create()?);
     let mut ms = vec![Vec::with_capacity(iters); arms.len()];
     for i in 0..iters {
-        let order: Vec<usize> = if i % 2 == 0 { (0..arms.len()).collect() } else { (0..arms.len()).rev().collect() };
+        let order: Vec<usize> = if i % 2 == 0 {
+            (0..arms.len()).collect()
+        } else {
+            (0..arms.len()).rev().collect()
+        };
         for a in order {
             gpu.hip.event_record(&e0, None)?;
             ctx.run(gpu, arms[a], x, y)?;
@@ -664,7 +753,10 @@ fn time_arms(
     for (a, v) in arms.iter().zip(ms.iter_mut()) {
         v.sort_by(|x, y| x.total_cmp(y));
         let r = |x: f64| (x * 1e4).round() / 1e4;
-        out.insert(format!("{}_ms_min_med_max", a.name()), json!([r(v[0]), r(v[v.len() / 2]), r(v[v.len() - 1])]));
+        out.insert(
+            format!("{}_ms_min_med_max", a.name()),
+            json!([r(v[0]), r(v[v.len() / 2]), r(v[v.len() - 1])]),
+        );
     }
     Ok(())
 }
@@ -677,10 +769,26 @@ fn time_case(gpu: &mut Gpu, w: &Weights, id: &CaseId, iters: usize) -> Res<(Out,
     let ygu = alloc(gpu, Arm::GuWave.out_bytes(o.pmax))?;
     let ydn = alloc(gpu, Arm::DnWave.out_bytes(o.pmax))?;
     let xf16 = gpu.rotate_x_mq_batched_f16(&o.x_in, HID, o.t)?;
-    time_arms(gpu, &ctx, &[Arm::GuWave, Arm::GuX4, Arm::GuLauncher], &xf16, &ygu, iters, &mut out)?;
+    time_arms(
+        gpu,
+        &ctx,
+        &[Arm::GuWave, Arm::GuX4, Arm::GuLauncher],
+        &xf16,
+        &ygu,
+        iters,
+        &mut out,
+    )?;
     ctx.bytes(gpu, Arm::GuWave, &xf16, &ygu)?;
     let x16 = gpu.moe_unscatter_rotate128_f16(&ygu, &o.sorted, MI, o.pmax, o.l)?;
-    time_arms(gpu, &ctx, &[Arm::DnWave, Arm::DnX8, Arm::DnLauncher], &x16, &ydn, iters, &mut out)?;
+    time_arms(
+        gpu,
+        &ctx,
+        &[Arm::DnWave, Arm::DnX8, Arm::DnLauncher],
+        &x16,
+        &ydn,
+        iters,
+        &mut out,
+    )?;
     out.insert("iters".into(), json!(iters));
     out.insert("fails".into(), json!(Vec::<String>::new()));
     out.insert("result".into(), json!("PASS"));
@@ -694,7 +802,11 @@ fn time_case(gpu: &mut Gpu, w: &Weights, id: &CaseId, iters: usize) -> Res<(Out,
 // ---------------------------------------------------------------- main
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn list<T: std::str::FromStr>(args: &[String], k: &str, d: &str) -> Res<Vec<T>>
@@ -703,7 +815,11 @@ where
 {
     let v = arg(args, k, d)
         .split(',')
-        .map(|s| s.trim().parse::<T>().map_err(|e| format!("{k} item {s:?}: {e}")))
+        .map(|s| {
+            s.trim()
+                .parse::<T>()
+                .map_err(|e| format!("{k} item {s:?}: {e}"))
+        })
         .collect::<Result<Vec<T>, String>>()?;
     Ok(v)
 }
@@ -728,7 +844,11 @@ fn main() -> Res<()> {
 
     let mut gpu = Gpu::init()?;
     if gpu.arch != "gfx1151" {
-        return Err(format!("the F16 WMMA LDS-share entries are gfx1151-only, device is {}", gpu.arch).into());
+        return Err(format!(
+            "the F16 WMMA LDS-share entries are gfx1151-only, device is {}",
+            gpu.arch
+        )
+        .into());
     }
     load_kernels(&mut gpu)?;
 
@@ -738,7 +858,11 @@ fn main() -> Res<()> {
         let w = Weights::new(&mut gpu, seed, distinct)?;
         for kind in &kinds {
             for &t in &tokens {
-                let id = CaseId { kind: kind.clone(), t, seed };
+                let id = CaseId {
+                    kind: kind.clone(),
+                    t,
+                    seed,
+                };
                 let (out, fails) = if mode == "check" {
                     check_case(&mut gpu, &w, &id, cases == 0)?
                 } else {
@@ -752,7 +876,10 @@ fn main() -> Res<()> {
         w.free(&mut gpu)?;
     }
     let pass = all_fails.is_empty();
-    println!("{}", json!({"result": if pass { "PASS" } else { "FAIL" }, "cases": cases, "fails": all_fails}));
+    println!(
+        "{}",
+        json!({"result": if pass { "PASS" } else { "FAIL" }, "cases": cases, "fails": all_fails})
+    );
     if !pass {
         std::process::exit(1);
     }

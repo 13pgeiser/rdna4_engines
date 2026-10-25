@@ -6,14 +6,18 @@
 // - non-fill: the extra barrier `f284a3b8a` added (hip:613-620);
 // - fill: the retire rides the barrier that already precedes the first V
 //   store, so the safe body costs no extra barrier.
-use peacemaker_author::{join, ready, retire, trace::Trace, Backend, Gfx1100, LdsRegion, Published, Workgroup};
+use peacemaker_author::{
+    join, ready, retire, trace::Trace, Backend, Gfx1100, LdsRegion, Published, Workgroup,
+};
 
 enum KTile {}
 enum VBody {}
 enum Mailbox {}
 enum VPlane {}
 
-fn publish_mailbox<B: Backend<Insn = String>>(wg: &mut Workgroup<Gfx1100, B>) -> Result<LdsRegion<Mailbox, Published>, String> {
+fn publish_mailbox<B: Backend<Insn = String>>(
+    wg: &mut Workgroup<Gfx1100, B>,
+) -> Result<LdsRegion<Mailbox, Published>, String> {
     let mbox = wg.lds::<Mailbox>("mailbox", 32760, 8)?;
     let (mbox, st) = wg.ds_store(mbox, "ds_store_2addr_b32 v0, v1, v2 offset1:1".into())?;
     let drained = wg.wait(st)?;
@@ -52,5 +56,9 @@ fn main() {
     assert_eq!(b.count("s_barrier"), 2);
     let mut b = Trace::new("gfx1100");
     fill(&mut Workgroup::<Gfx1100, Trace>::new(&mut b).unwrap()).unwrap();
-    assert_eq!(b.count("s_barrier"), 2, "the mailbox retire rides the K-tile barrier");
+    assert_eq!(
+        b.count("s_barrier"),
+        2,
+        "the mailbox retire rides the K-tile barrier"
+    );
 }

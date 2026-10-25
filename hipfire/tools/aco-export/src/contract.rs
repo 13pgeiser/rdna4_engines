@@ -26,7 +26,9 @@ fn eval_extent(expr: &str, m: u64, k: u64) -> Res<u64> {
             let v: u128 = match tok.as_str() {
                 "M" => m as u128,
                 "K" => k as u128,
-                t => t.parse().map_err(|_| format!("bad extent token `{t}` in `{expr}`"))?,
+                t => t
+                    .parse()
+                    .map_err(|_| format!("bad extent token `{t}` in `{expr}`"))?,
             };
             if first {
                 acc = v;
@@ -35,7 +37,9 @@ fn eval_extent(expr: &str, m: u64, k: u64) -> Res<u64> {
                 acc *= v;
             } else {
                 if v == 0 || acc % v != 0 {
-                    return Err(format!("extent `{expr}` is not an exact integer division for M={m} K={k}"));
+                    return Err(format!(
+                        "extent `{expr}` is not an exact integer division for M={m} K={k}"
+                    ));
                 }
                 acc /= v;
             }
@@ -49,7 +53,9 @@ fn eval_extent(expr: &str, m: u64, k: u64) -> Res<u64> {
 }
 
 fn le_u32(hex: &str, off: usize) -> Res<u64> {
-    let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(err)).collect::<Res<Vec<u8>>>()?;
+    let b: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(err))
+        .collect::<Res<Vec<u8>>>()?;
     if b.len() < off + 4 {
         return Err("kernarg blob too short".into());
     }
@@ -57,7 +63,10 @@ fn le_u32(hex: &str, off: usize) -> Res<u64> {
 }
 
 pub fn cmd_contract(a: &Args) -> Res<()> {
-    let spec_path = a.opt("spec").map(PathBuf::from).unwrap_or_else(default_spec);
+    let spec_path = a
+        .opt("spec")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_spec);
     let spec = read_json(&spec_path)?;
     let dir = a.path("artifact")?;
     let art_path = dir.join("artifact.json");
@@ -81,17 +90,30 @@ pub fn cmd_contract(a: &Args) -> Res<()> {
     let kernarg_hex = jstr(&meta, "kernarg_hex")?;
     let mval = le_u32(kernarg_hex, 24)?;
     let kval = le_u32(kernarg_hex, 28)?;
-    let block: Vec<u64> = jarr(&meta, "block")?.iter().filter_map(Value::as_u64).collect();
-    let grid: Vec<u64> = jarr(&meta, "grid")?.iter().filter_map(Value::as_u64).collect();
-    let local: Vec<u64> = jarr(k, "local_size")?.iter().filter_map(Value::as_u64).collect();
+    let block: Vec<u64> = jarr(&meta, "block")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    let grid: Vec<u64> = jarr(&meta, "grid")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    let local: Vec<u64> = jarr(k, "local_size")?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
     if block != local {
-        return Err(format!("capture block {block:?} != compiled local_size {local:?}"));
+        return Err(format!(
+            "capture block {block:?} != compiled local_size {local:?}"
+        ));
     }
     if ju64(&meta, "dynamic_lds")? != 0 {
         return Err("capture used dynamic LDS; the compiled shader has none".into());
     }
     if grid != vec![mval, 1, 1] {
-        return Err(format!("capture grid {grid:?} is not the launcher rule (M,1,1) for M={mval}"));
+        return Err(format!(
+            "capture grid {grid:?} is not the launcher rule (M,1,1) for M={mval}"
+        ));
     }
 
     // HIP args (kernarg ABI of the incumbent)
@@ -105,7 +127,10 @@ pub fn cmd_contract(a: &Args) -> Res<()> {
             let extent = eval_extent(jstr(ha, "extent")?, mval, kval)?;
             if let Some(file) = meta["files"].get(format!("arg{}.pre.bin", ju64(ha, "offset")?)) {
                 if file["bytes"].as_u64() != Some(extent) {
-                    return Err(format!("arg {name}: extent {extent} != captured arg{}.pre.bin bytes {}", ha["offset"], file["bytes"]));
+                    return Err(format!(
+                        "arg {name}: extent {extent} != captured arg{}.pre.bin bytes {}",
+                        ha["offset"], file["bytes"]
+                    ));
                 }
             }
             args.push(json!({"name": name, "offset": ha["offset"], "size": ha["size"], "kind": kind, "access": access, "extent_bytes": extent}));
@@ -116,7 +141,12 @@ pub fn cmd_contract(a: &Args) -> Res<()> {
         }
         names.push(name);
     }
-    let arg_index = |n: &str| names.iter().position(|x| x == n).ok_or_else(|| format!("hip arg `{n}` not declared"));
+    let arg_index = |n: &str| {
+        names
+            .iter()
+            .position(|x| x == n)
+            .ok_or_else(|| format!("hip arg `{n}` not declared"))
+    };
 
     // Entry bindings from the sidecar
     let mut bindings = Vec::new();
@@ -125,7 +155,9 @@ pub fn cmd_contract(a: &Args) -> Res<()> {
         let base = ju64(e, "sgpr_index")?;
         let len = ju64(e, "dwords")?;
         let dst = json!({"kind": "sgpr", "base": base, "len": len});
-        let live = e["entry_live"].as_bool().ok_or("sidecar entry lacks entry_live (re-export with the typed-liveness exporter)")?;
+        let live = e["entry_live"]
+            .as_bool()
+            .ok_or("sidecar entry lacks entry_live (re-export with the typed-liveness exporter)")?;
         let source = match role {
             "bda_ptr" => {
                 if len != 2 {

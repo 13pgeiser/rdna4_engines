@@ -490,6 +490,7 @@ fn launch_gate_up_nolds(
     blob.push_ptr(y_up.buf.as_ptr());
     blob.push_i32(m as i32);
     blob.push_i32(k as i32);
+    blob.push_i32((expert_ptrs.buf.size() / 8) as i32);
     // Exact candidate grid: mi workgroups × 8 ranks (dead row >= mi removed).
     let grid = [(m as u32) >> 1, 8, 1];
     let block = [32u32, 1, 1];

@@ -6,29 +6,60 @@
 //! npu commit 8261881 (before the levers-joint lever 3 descriptor experiments) and pins every default selection, so
 //! opt-in variants cannot silently change the production bytes. Regenerate with `GOLDEN_PRINT=1` only for an
 //! intentional default change, and say so in the commit.
-use peacemaker_npu::kernels::{gemm_array, gemm_core::{self, Control, Epilogue, PairRole}};
+use peacemaker_npu::kernels::{
+    gemm_array,
+    gemm_core::{self, Control, Epilogue, PairRole},
+};
 
 /// FNV-1a 64 (stable across toolchains, unlike `DefaultHasher`).
 fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
-const SHAPES: [(usize, usize, usize); 10] = [(512, 512, 64), (512, 512, 128), (1536, 512, 64), (1024, 1024, 128), (1536, 512, 192),
-    (1024, 1536, 128), (1536, 1536, 64), (4096, 1280, 2560), (4096, 2560, 640), (2048, 2560, 640)];
+const SHAPES: [(usize, usize, usize); 10] = [
+    (512, 512, 64),
+    (512, 512, 128),
+    (1536, 512, 64),
+    (1024, 1024, 128),
+    (1536, 512, 192),
+    (1024, 1536, 128),
+    (1536, 1536, 64),
+    (4096, 1280, 2560),
+    (4096, 2560, 640),
+    (2048, 2560, 640),
+];
 const INT8: Epilogue = Epilogue::Int8 { shift: 12 };
 
 /// `variant m n k control pdi txn args lower upper` for every legal (variant, shape, control).
 fn rows() -> Vec<String> {
     let mut v = Vec::new();
-    for (name, legal) in [("V9", true), ("V10", false)] { for &(m, n, k) in &SHAPES {
-        let (kc, nw) = (k / 64, n.div_ceil(512));
-        if !legal && kc * (2 + nw) > 112 { continue; }
-        for ctl in [Control::Fast, Control::Slow] {
-            let d = if legal { gemm_array::design_v9(m, n, k, INT8, ctl) } else { gemm_array::design_v10(m, n, k, INT8, ctl) };
-            let prog = |role| fnv(&gemm_core::program_pair(kc, d.waves(), role, INT8, ctl).finish());
-            v.push(format!("{name} {m} {n} {k} {} {:016x} {:016x} {:016x} {:016x} {:016x}", if ctl.is_slow() { "Slow" } else { "Fast" },
-                fnv(&d.pdi), fnv(&d.insts), fnv(format!("{:?}", d.args).as_bytes()), prog(PairRole::Lower), prog(PairRole::Upper)));
+    for (name, legal) in [("V9", true), ("V10", false)] {
+        for &(m, n, k) in &SHAPES {
+            let (kc, nw) = (k / 64, n.div_ceil(512));
+            if !legal && kc * (2 + nw) > 112 {
+                continue;
+            }
+            for ctl in [Control::Fast, Control::Slow] {
+                let d = if legal {
+                    gemm_array::design_v9(m, n, k, INT8, ctl)
+                } else {
+                    gemm_array::design_v10(m, n, k, INT8, ctl)
+                };
+                let prog =
+                    |role| fnv(&gemm_core::program_pair(kc, d.waves(), role, INT8, ctl).finish());
+                v.push(format!(
+                    "{name} {m} {n} {k} {} {:016x} {:016x} {:016x} {:016x} {:016x}",
+                    if ctl.is_slow() { "Slow" } else { "Fast" },
+                    fnv(&d.pdi),
+                    fnv(&d.insts),
+                    fnv(format!("{:?}", d.args).as_bytes()),
+                    prog(PairRole::Lower),
+                    prog(PairRole::Upper)
+                ));
+            }
         }
-    } }
+    }
     v
 }
 
@@ -76,28 +107,50 @@ V10 2048 2560 640 Slow 33e7ce5283a03fe8 89c8a5dcab2378f7 5a270e8ee0665efe 31b50e
 #[test]
 fn default_v9_v10_bytes_match_golden() {
     let got = rows();
-    if std::env::var_os("GOLDEN_PRINT").is_some() { for r in &got { println!("{r}"); } }
-    let want: Vec<&str> = GOLDEN.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if std::env::var_os("GOLDEN_PRINT").is_some() {
+        for r in &got {
+            println!("{r}");
+        }
+    }
+    let want: Vec<&str> = GOLDEN
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     assert_eq!(got.len(), want.len(), "row count");
-    for (g, w) in got.iter().zip(&want) { assert_eq!(g, w, "default design bytes changed"); }
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(g, w, "default design bytes changed");
+    }
 }
 
 #[test]
 fn g80_legacy_bytes_match_golden() {
     // Captured before the BF16 changes from npu/trunk-pipeline's I32 cutover.
     let hashes = [
-        (0xe4085b5059424fc9, 0xae900bee5da82eeb), (0x2dd1f2492aa3df98, 0xae900bee5da82eeb),
-        (0x577123b1d2e5ae25, 0x7503151e9bf64fa1), (0x10e12b171628595e, 0x7503151e9bf64fa1),
-        (0x818eeafa6857be09, 0x87b27dc21c8a5786), (0xde100eb37076ca78, 0x87b27dc21c8a5786),
-        (0xd38932f7c0a8e865, 0xb7d9b0530c9ed98e), (0xebfea186a2ed6ade, 0xb7d9b0530c9ed98e),
+        (0xe4085b5059424fc9, 0xae900bee5da82eeb),
+        (0x2dd1f2492aa3df98, 0xae900bee5da82eeb),
+        (0x577123b1d2e5ae25, 0x7503151e9bf64fa1),
+        (0x10e12b171628595e, 0x7503151e9bf64fa1),
+        (0x818eeafa6857be09, 0x87b27dc21c8a5786),
+        (0xde100eb37076ca78, 0x87b27dc21c8a5786),
+        (0xd38932f7c0a8e865, 0xb7d9b0530c9ed98e),
+        (0xebfea186a2ed6ade, 0xb7d9b0530c9ed98e),
     ];
     let mut at = 0;
     for m in [256, 8192] {
         for epi in [Epilogue::Int8 { shift: 12 }, Epilogue::I32] {
             for ctl in [Control::Fast, Control::Slow] {
                 let d = peacemaker_npu::kernels::gemm_g80::design_g80(m, 1280, 2560, epi, ctl);
-                println!("G80 {m} {epi:?} {ctl:?} {:016x} {:016x}", fnv(&d.pdi), fnv(&d.insts));
-                assert_eq!((fnv(&d.pdi), fnv(&d.insts)), hashes[at], "G80 {m} {epi:?} {ctl:?} legacy bytes");
+                println!(
+                    "G80 {m} {epi:?} {ctl:?} {:016x} {:016x}",
+                    fnv(&d.pdi),
+                    fnv(&d.insts)
+                );
+                assert_eq!(
+                    (fnv(&d.pdi), fnv(&d.insts)),
+                    hashes[at],
+                    "G80 {m} {epi:?} {ctl:?} legacy bytes"
+                );
                 at += 1;
             }
         }
@@ -106,10 +159,22 @@ fn g80_legacy_bytes_match_golden() {
 
 #[test]
 fn g80_bf16_native_bytes_match_golden() {
-    for (m, hashes) in [(256, (0x0f0957038d4177ef, 0x2cc33282387023c1)),
-        (8192, (0x3140db0e2c87154f, 0x6dc4a91db3ec53db))] {
-        let d = peacemaker_npu::kernels::gemm_g80::design_g80(m, 1280, 2560, Epilogue::Bf16, Control::Fast);
-        assert_eq!((fnv(&d.pdi), fnv(&d.insts)), hashes, "G80 BF16 native {m} bytes changed");
+    for (m, hashes) in [
+        (256, (0x0f0957038d4177ef, 0x2cc33282387023c1)),
+        (8192, (0x3140db0e2c87154f, 0x6dc4a91db3ec53db)),
+    ] {
+        let d = peacemaker_npu::kernels::gemm_g80::design_g80(
+            m,
+            1280,
+            2560,
+            Epilogue::Bf16,
+            Control::Fast,
+        );
+        assert_eq!(
+            (fnv(&d.pdi), fnv(&d.insts)),
+            hashes,
+            "G80 BF16 native {m} bytes changed"
+        );
     }
 }
 
@@ -119,20 +184,80 @@ fn g80_bf16_native_bytes_match_golden() {
 #[test]
 fn g80_n512_out_bytes_match_golden() {
     use peacemaker_npu::kernels::gemm_g80::Bf16Layout;
-    let rowmajor = Bf16Layout::RowMajor { pitch_elems: 2560, col0_elems: 0 };
+    let rowmajor = Bf16Layout::RowMajor {
+        pitch_elems: 2560,
+        col0_elems: 0,
+    };
     let pins: [(usize, Bf16Layout, [u64; 4]); 4] = [
-        (512, Bf16Layout::NativeTiles, [0xc928b89c58012467, 0x4291c32493ddc1b0, 0x67f57222824ad41a, 0x1ce87df7f313cb6a]),
-        (8192, Bf16Layout::NativeTiles, [0x3135f27ae09c3207, 0xac5209c99a816729, 0xb1a9d43c99961334, 0x1910880189b8b7ec]),
-        (512, rowmajor, [0x5e6b30e57fdec1d7, 0x1fd333c421b95278, 0x67f57222824ad41a, 0x1ce87df7f313cb6a]),
-        (8192, rowmajor, [0x51878e7e9a89df77, 0x93952abc61528a3b, 0xb1a9d43c99961334, 0x1910880189b8b7ec]),
+        (
+            512,
+            Bf16Layout::NativeTiles,
+            [
+                0xc928b89c58012467,
+                0x4291c32493ddc1b0,
+                0x67f57222824ad41a,
+                0x1ce87df7f313cb6a,
+            ],
+        ),
+        (
+            8192,
+            Bf16Layout::NativeTiles,
+            [
+                0x3135f27ae09c3207,
+                0xac5209c99a816729,
+                0xb1a9d43c99961334,
+                0x1910880189b8b7ec,
+            ],
+        ),
+        (
+            512,
+            rowmajor,
+            [
+                0x5e6b30e57fdec1d7,
+                0x1fd333c421b95278,
+                0x67f57222824ad41a,
+                0x1ce87df7f313cb6a,
+            ],
+        ),
+        (
+            8192,
+            rowmajor,
+            [
+                0x51878e7e9a89df77,
+                0x93952abc61528a3b,
+                0xb1a9d43c99961334,
+                0x1910880189b8b7ec,
+            ],
+        ),
     ];
     let mut bad = Vec::new();
     for (m, layout, want) in pins {
-        let d = peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, 512, 6144, Epilogue::Bf16, Control::Fast, layout);
-        let got = [fnv(&d.pdi), fnv(&d.insts), fnv(d.core_program()), fnv(d.core_program_upper().unwrap())];
-        println!("N512 {m} {layout:?} {:016x} {:016x} {:016x} {:016x}", got[0], got[1], got[2], got[3]);
-        println!("N512 {m} sizes: pdi {} B, txn {} B, lean {} B, lower {} B, upper {} B", d.pdi.len(), d.insts.len(),
-            d.lean_insts().unwrap().len(), d.core_program().len(), d.core_program_upper().unwrap().len());
+        let d = peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512_layout(
+            m,
+            512,
+            6144,
+            Epilogue::Bf16,
+            Control::Fast,
+            layout,
+        );
+        let got = [
+            fnv(&d.pdi),
+            fnv(&d.insts),
+            fnv(d.core_program()),
+            fnv(d.core_program_upper().unwrap()),
+        ];
+        println!(
+            "N512 {m} {layout:?} {:016x} {:016x} {:016x} {:016x}",
+            got[0], got[1], got[2], got[3]
+        );
+        println!(
+            "N512 {m} sizes: pdi {} B, txn {} B, lean {} B, lower {} B, upper {} B",
+            d.pdi.len(),
+            d.insts.len(),
+            d.lean_insts().unwrap().len(),
+            d.core_program().len(),
+            d.core_program_upper().unwrap().len()
+        );
         bad.extend((got != want).then(|| format!("N512 out {m} {layout:?} bytes changed")));
     }
     assert!(bad.is_empty(), "{bad:?}");

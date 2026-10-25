@@ -52,19 +52,13 @@ impl PlogWriter {
             ));
         }
         if vocab > u32::MAX as usize {
-            return Err(format!(
-                "deepseek4 parent: plog vocab {vocab} exceeds u32"
-            ));
+            return Err(format!("deepseek4 parent: plog vocab {vocab} exceeds u32"));
         }
         if vocab == 0 {
             return Err("deepseek4 parent: plog vocab must be > 0".into());
         }
-        let file = File::create(path).map_err(|e| {
-            format!(
-                "deepseek4 parent: create plog {}: {e}",
-                path.display()
-            )
-        })?;
+        let file = File::create(path)
+            .map_err(|e| format!("deepseek4 parent: create plog {}: {e}", path.display()))?;
         let mut writer = BufWriter::new(file);
         writer
             .write_all(PLOG_MAGIC)
@@ -143,18 +137,10 @@ pub struct PlogReader {
 impl PlogReader {
     /// Open and validate a `.plog`. Rejects bad magic and size/header mismatch.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| {
-            format!(
-                "deepseek4 parent: open plog {}: {e}",
-                path.display()
-            )
-        })?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            format!(
-                "deepseek4 parent: mmap plog {}: {e}",
-                path.display()
-            )
-        })?;
+        let file = File::open(path)
+            .map_err(|e| format!("deepseek4 parent: open plog {}: {e}", path.display()))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("deepseek4 parent: mmap plog {}: {e}", path.display()))?;
         if mmap.len() < HEADER_BYTES {
             return Err(format!(
                 "deepseek4 parent: plog {} truncated header ({} bytes)",
@@ -196,7 +182,10 @@ impl PlogReader {
         }
         // Alignment: header is 24 bytes; body of f32 starts at offset 24.
         // memmap base is page-aligned; offset 24 is 8-byte aligned → ok for f32.
-        debug_assert_eq!((mmap.as_ptr() as usize + HEADER_BYTES) % std::mem::align_of::<f32>(), 0);
+        debug_assert_eq!(
+            (mmap.as_ptr() as usize + HEADER_BYTES) % std::mem::align_of::<f32>(),
+            0
+        );
         Ok(Self {
             _file: file,
             mmap,

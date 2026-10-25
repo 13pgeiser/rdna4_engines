@@ -116,7 +116,7 @@ fn normalize_hip_path(p: &Path) -> PathBuf {
 /// sometimes symlinks into `<root>/lib/llvm/bin`, so both layouts are
 /// recognized after canonicalization.
 fn root_from_tool_path(tool: &Path) -> Option<PathBuf> {
-    let resolved = std::fs::canonicalize(tool).unwrap_or_else(|_| tool.to_path_buf());
+    let resolved = canonicalize_plain(tool).unwrap_or_else(|_| tool.to_path_buf());
     let bin = resolved.parent()?;
     let parent = bin.parent()?;
     if parent.file_name().is_some_and(|name| name == "llvm")
@@ -131,6 +131,60 @@ fn root_from_tool_path(tool: &Path) -> Option<PathBuf> {
             .map(Path::to_path_buf);
     }
     Some(parent.to_path_buf())
+}
+
+/// `std::fs::canonicalize` for paths that are reported or exported (e.g. as
+/// `ROCM_PATH`). On Windows, canonicalize yields verbatim `\\?\C:\…` paths,
+/// which some tools (hipcc.bat, cmd) mishandle; those are rewritten to the
+/// plain `C:\…` form when that form names the same file. Elsewhere this is
+/// exactly `std::fs::canonicalize`.
+fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
+    let canon = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(plain) = canon.to_str().and_then(plain_drive_path) {
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(canon)
+}
+
+/// The plain `C:\…` form of a verbatim `\\?\C:\…` path, or `None` when the
+/// path is not a verbatim drive path or the plain form would be reinterpreted
+/// by Win32 path normalization (MAX_PATH overflow, `/` separators, reserved
+/// DOS device names, components with trailing dots/spaces). Pure string logic
+/// so the policy is unit-tested on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn plain_drive_path(verbatim: &str) -> Option<&str> {
+    const MAX_PATH: usize = 260;
+    let plain = verbatim.strip_prefix(r"\\?\")?;
+    let bytes = plain.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    if plain.len() >= MAX_PATH || plain.contains('/') {
+        return None;
+    }
+    let rest = &plain[3..];
+    if rest.is_empty() {
+        return Some(plain);
+    }
+    for component in rest.split('\\') {
+        if component.is_empty() || component.ends_with('.') || component.ends_with(' ') {
+            return None;
+        }
+        let stem = component.split('.').next().unwrap_or(component).trim_end();
+        let reserved = ["CON", "PRN", "AUX", "NUL"]
+            .iter()
+            .any(|r| stem.eq_ignore_ascii_case(r))
+            || (stem.len() == 4
+                && stem.get(..3).is_some_and(|p| {
+                    p.eq_ignore_ascii_case("COM") || p.eq_ignore_ascii_case("LPT")
+                })
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if reserved {
+            return None;
+        }
+    }
+    Some(plain)
 }
 
 /// Locate ROCm-specific tools on `PATH` and derive every distinct install root.
@@ -353,9 +407,7 @@ pub fn cross_root_warning_with_versions(
         .map(|v| format!(" (version {v})"))
         .unwrap_or_default();
     vec![
-        format!(
-            "WARNING: ROCm runtime and device compiler are from different installations."
-        ),
+        format!("WARNING: ROCm runtime and device compiler are from different installations."),
         format!(
             "  Selected ROCm root (runtime/headers): {}{sel_ver}",
             selected_root.display()
@@ -373,7 +425,11 @@ pub fn cross_root_warning_with_versions(
 
 /// Warning lines for a resolved toolchain, if it is cross-root.
 pub fn toolchain_warnings(toolchain: &ResolvedToolchain) -> Vec<String> {
-    match (&toolchain.compiler, &toolchain.compiler_root, &toolchain.compiler_source) {
+    match (
+        &toolchain.compiler,
+        &toolchain.compiler_root,
+        &toolchain.compiler_source,
+    ) {
         (Some(compiler), Some(compiler_root), Some(source))
             if matches!(source, CompilerSource::Path | CompilerSource::OtherRoot) =>
         {
@@ -491,10 +547,7 @@ pub fn resolve_toolchain_pure(
     other_root_compiler: Option<(PathBuf, PathBuf)>,
 ) -> Result<ResolvedToolchain, String> {
     let Some(root) = selected.map(|p| p.to_path_buf()) else {
-        return Err(resolution_failure(
-            "a complete ROCm installation",
-            &[],
-        ));
+        return Err(resolution_failure("a complete ROCm installation", &[]));
     };
     // Override takes absolute precedence; validate existence + executable.
     if let Some(ov) = override_compiler {
@@ -538,7 +591,12 @@ pub fn resolve_toolchain_pure(
         if let Some(pc) = path_compiler {
             let croot = root_from_tool_path(&pc)
                 .or_else(|| root_from_compiler(&pc))
-                .unwrap_or_else(|| pc.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone()));
+                .unwrap_or_else(|| {
+                    pc.parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| root.clone())
+                });
             return Ok(ResolvedToolchain {
                 root: root.clone(),
                 compiler: Some(pc),
@@ -598,13 +656,7 @@ pub fn resolve_toolchain() -> Result<ResolvedToolchain, String> {
     // a compiler was already found on PATH or under selected root). For
     // simplicity always compute here; the pure function decides.
     let other = selected.as_deref().and_then(find_compiler_in_other_roots);
-    resolve_toolchain_pure(
-        selected.as_deref(),
-        ov.as_deref(),
-        strict,
-        path_comp,
-        other,
-    )
+    resolve_toolchain_pure(selected.as_deref(), ov.as_deref(), strict, path_comp, other)
 }
 
 /// Pure helper for setup.rs and tests: resolve from caller-supplied explicit root.
@@ -631,7 +683,6 @@ pub fn resolve_toolchain_for_explicit(
         other,
     )
 }
-
 
 /// Expand a selected root into only that installation's compatible aliases.
 /// Split-tree packaging keeps the real SDK under `<root>/core[-VERSION]`.
@@ -938,7 +989,7 @@ fn path_tool(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         if let Some(found) = first_tool_in_dir(&dir, name, cfg!(windows)) {
-            return Some(std::fs::canonicalize(&found).unwrap_or(found));
+            return Some(canonicalize_plain(&found).unwrap_or(found));
         }
     }
     None
@@ -1294,7 +1345,10 @@ pub fn tool(name: &str) -> Option<PathBuf> {
         if let Some(tool) = tool_from_selected_root(&selected, name) {
             return Some(tool);
         }
-        if DEVICE_COMPILERS.contains(&name) && !is_strict_rocm() && is_headers_runtime_only_root(&selected) {
+        if DEVICE_COMPILERS.contains(&name)
+            && !is_strict_rocm()
+            && is_headers_runtime_only_root(&selected)
+        {
             if let Some(pc) = find_compiler_on_path() {
                 return Some(pc);
             }
@@ -1507,7 +1561,12 @@ mod tests {
             joined.contains("rocm.docs.amd.com"),
             "the docs link is the distro-independent answer: {lines:?}"
         );
-        for needle in ["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"] {
+        let needles: &[&str] = if cfg!(windows) {
+            &["amdhip64.dll", "hip_runtime.h", "hipcc.bat"]
+        } else {
+            &["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"]
+        };
+        for needle in needles {
             assert!(
                 joined.contains(needle),
                 "guidance must name required artifact {needle}: {lines:?}"
@@ -1518,6 +1577,34 @@ mod tests {
                 && !joined.contains("amdrocm-")
                 && !joined.contains("rocm-hip-"),
             "guidance must not guess drifting package names: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn verbatim_drive_paths_become_plain_only_when_equivalent() {
+        assert_eq!(
+            plain_drive_path(r"\\?\C:\Users\u\rocm"),
+            Some(r"C:\Users\u\rocm")
+        );
+        assert_eq!(plain_drive_path(r"\\?\d:\"), Some(r"d:\"));
+        // Not verbatim-drive forms: leave alone.
+        assert_eq!(plain_drive_path(r"C:\Users\u"), None);
+        assert_eq!(plain_drive_path(r"\\?\UNC\srv\share\x"), None);
+        assert_eq!(plain_drive_path(r"\\?\Volume{0}\x"), None);
+        assert_eq!(plain_drive_path("/opt/rocm"), None);
+        // Plain form would be reinterpreted by Win32 normalization.
+        assert_eq!(plain_drive_path(r"\\?\C:\x\con"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\Lpt3.txt"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\trailing."), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\trailing "), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x/y"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\\y"), None);
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(plain_drive_path(&long), None);
+        // Names merely containing a reserved word are fine.
+        assert_eq!(
+            plain_drive_path(r"\\?\C:\console\com10"),
+            Some(r"C:\console\com10")
         );
     }
 
@@ -2147,14 +2234,16 @@ mod tests {
     #[test]
     fn hipcc_override_invalid_is_not_silently_ignored() {
         // Create a libs-only root to act as selected runtime root.
-        let base = std::env::temp_dir().join(format!("hipfire-rocm-ov-invalid-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("hipfire-rocm-ov-invalid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("libs");
         std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
         std::fs::create_dir_all(root.join(HIP_RUNTIME_DIRS[0])).unwrap();
         std::fs::write(root.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         std::fs::write(
-            root.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            root.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
             b"",
         )
         .unwrap();
@@ -2173,7 +2262,10 @@ mod tests {
             Some(PathBuf::from("/usr/bin/hipcc")),
             None,
         );
-        assert!(result.is_err(), "invalid HIPFIRE_HIPCC must hard-fail: {result:?}");
+        assert!(
+            result.is_err(),
+            "invalid HIPFIRE_HIPCC must hard-fail: {result:?}"
+        );
         let msg = result.unwrap_err();
         assert!(msg.contains("HIPFIRE_HIPCC"), "{msg}");
         assert!(msg.contains(&bogus.display().to_string()), "{msg}");
@@ -2182,14 +2274,16 @@ mod tests {
 
     #[test]
     fn hipcc_override_valid_wins_over_path() {
-        let base = std::env::temp_dir().join(format!("hipfire-rocm-ov-valid-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("hipfire-rocm-ov-valid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("libs");
         std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
         std::fs::create_dir_all(root.join(HIP_RUNTIME_DIRS[0])).unwrap();
         std::fs::write(root.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         std::fs::write(
-            root.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            root.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
             b"",
         )
         .unwrap();
@@ -2212,7 +2306,9 @@ mod tests {
             std::fs::set_permissions(&ov, p).unwrap();
         }
         let other = PathBuf::from("/tmp/other/bin/hipcc");
-        let result = resolve_toolchain_pure(Some(&root), Some(&ov), false, Some(other.clone()), None).unwrap();
+        let result =
+            resolve_toolchain_pure(Some(&root), Some(&ov), false, Some(other.clone()), None)
+                .unwrap();
         assert_eq!(result.compiler, Some(ov.clone()));
         assert_eq!(result.compiler_source, Some(CompilerSource::Override));
         std::fs::remove_dir_all(&base).unwrap();
@@ -2227,7 +2323,8 @@ mod tests {
         std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
         std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         std::fs::write(
-            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            libs.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
             b"",
         )
         .unwrap();
@@ -2253,7 +2350,8 @@ mod tests {
             p.set_mode(0o755);
             std::fs::set_permissions(&comp, p).unwrap();
         }
-        let result = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
+        let result =
+            resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
         assert_eq!(result.root, libs);
         assert_eq!(result.compiler, Some(comp.clone()));
         assert_eq!(result.compiler_source, Some(CompilerSource::Path));
@@ -2264,7 +2362,10 @@ mod tests {
         let joined = warnings.join("\n");
         assert!(joined.contains(&libs.display().to_string()), "{joined}");
         assert!(joined.contains(&comp.display().to_string()), "{joined}");
-        assert!(joined.contains(&result.compiler_root.unwrap().display().to_string()), "{joined}");
+        assert!(
+            joined.contains(&result.compiler_root.unwrap().display().to_string()),
+            "{joined}"
+        );
         assert!(joined.contains("7.14.0"), "{joined}");
         assert!(joined.to_lowercase().contains("different"), "{joined}");
         std::fs::remove_dir_all(&base).unwrap();
@@ -2272,14 +2373,16 @@ mod tests {
 
     #[test]
     fn libs_only_root_with_strict_still_fails() {
-        let base = std::env::temp_dir().join(format!("hipfire-rocm-cross-strict-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("hipfire-rocm-cross-strict-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let libs = base.join("libs_only");
         std::fs::create_dir_all(libs.join("include").join("hip")).unwrap();
         std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
         std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         std::fs::write(
-            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            libs.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
             b"",
         )
         .unwrap();
@@ -2302,13 +2405,17 @@ mod tests {
         let result = resolve_toolchain_pure(Some(&libs), None, true, Some(comp), None);
         assert!(result.is_err(), "strict must hard-fail: {result:?}");
         let msg = result.unwrap_err();
-        assert!(msg.to_lowercase().contains("hipcc") || msg.contains("HIPFIRE_ROCM_STRICT"), "{msg}");
+        assert!(
+            msg.to_lowercase().contains("hipcc") || msg.contains("HIPFIRE_ROCM_STRICT"),
+            "{msg}"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn compiler_only_root_still_fails() {
-        let base = std::env::temp_dir().join(format!("hipfire-rocm-comp-only-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("hipfire-rocm-comp-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("comp_only");
         std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -2341,28 +2448,50 @@ mod tests {
     }
 
     #[test]
-    fn canonical_and_debian_multiarch_roots_still_resolve() {
+    fn canonical_root_still_resolves() {
         // Canonical layout uses HIP_RUNTIME_DIRS[0] directly.
-        let base = std::env::temp_dir().join(format!("hipfire-rocm-canonical-accept-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!(
+            "hipfire-rocm-canonical-accept-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&base);
         let canon = base.join("canonical");
         write_coherent_sdk(&canon);
         assert!(is_coherent_sdk_root(&canon));
         let result = resolve_toolchain_pure(Some(&canon), None, false, None, None).unwrap();
         assert_eq!(result.compiler_source, Some(CompilerSource::SelectedRoot));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
+    /// Debian multiarch is a Linux package layout (`lib/<triple>/libamdhip64.so`);
+    /// the Windows HIP SDK keeps the runtime in `bin/`.
+    #[test]
+    #[cfg(not(windows))]
+    fn debian_multiarch_root_still_resolves() {
+        let base =
+            std::env::temp_dir().join(format!("hipfire-rocm-debian-accept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
         // Debian multiarch: runtime under lib/x86_64-linux-gnu is discovered via
         // root_library_dirs one-level child scan — do not “fix” that.
         let debian = base.join("debian");
         std::fs::create_dir_all(debian.join("include").join("hip")).unwrap();
         std::fs::create_dir_all(debian.join("lib").join("x86_64-linux-gnu")).unwrap();
         std::fs::create_dir_all(debian.join("bin")).unwrap();
-        std::fs::write(debian.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
-        let runtime = debian.join("lib").join("x86_64-linux-gnu").join("libamdhip64.so");
-        std::fs::write(&runtime, b"").unwrap();
-        #[cfg(not(windows))]
         std::fs::write(
-            debian.join("lib").join("x86_64-linux-gnu").join("libhsa-runtime64.so.1"),
+            debian.join("include").join("hip").join("hip_runtime.h"),
+            b"",
+        )
+        .unwrap();
+        let runtime = debian
+            .join("lib")
+            .join("x86_64-linux-gnu")
+            .join("libamdhip64.so");
+        std::fs::write(&runtime, b"").unwrap();
+        std::fs::write(
+            debian
+                .join("lib")
+                .join("x86_64-linux-gnu")
+                .join("libhsa-runtime64.so.1"),
             b"",
         )
         .unwrap();
@@ -2383,7 +2512,8 @@ mod tests {
         std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
         std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         std::fs::write(
-            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            libs.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
             b"",
         )
         .unwrap();
@@ -2404,7 +2534,17 @@ mod tests {
             p.set_mode(0o755);
             std::fs::set_permissions(&comp, p).unwrap();
         }
-        let toolchain = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
+        // The returned root is canonical (temp dirs may sit behind symlinks or
+        // Windows 8.3 short names) and must be a plain path, never `\\?\C:\…`:
+        // it is exported as ROCM_PATH to hipcc.
+        let comp_root = canonicalize_plain(&comp_root).unwrap();
+        assert!(
+            !comp_root.to_string_lossy().starts_with(r"\\?\"),
+            "exported root must not be a verbatim path: {}",
+            comp_root.display()
+        );
+        let toolchain =
+            resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
         assert_eq!(toolchain.compiler_root, Some(comp_root.clone()));
         // compiler_env_root must return the compiler's own root, not the libs root.
         let env_root = compiler_env_root_from(&comp, None);
@@ -2456,5 +2596,4 @@ mod tests {
         let result = resolve_toolchain_pure(Some(bogus), None, false, None, None);
         assert!(result.is_err(), "nonexistent root must fail: {result:?}");
     }
-
 }

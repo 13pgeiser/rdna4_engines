@@ -67,7 +67,8 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o2_r8(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    int n_experts
 ) {
     const int row0 = blockIdx.x * 2;
     const int row1 = row0 + 1;
@@ -80,7 +81,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o2_r8(
     // Every pair of R8 subtiles therefore shares the same expert pointer.
     const int old_tile = subtile >> 1;
     const int expert_id = expert_tile_ids[old_tile];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 

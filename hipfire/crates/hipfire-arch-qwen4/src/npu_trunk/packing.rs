@@ -32,7 +32,8 @@ use peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512;
 use peacemaker_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
 
 use super::shapes::{
-    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
+    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS,
+    PANEL_COLS, TRUNK_K,
 };
 
 /// K covered by one MQ6G256V2 group.
@@ -105,7 +106,10 @@ const fn row_bytes(k: usize) -> usize {
 /// `w[k] = (q as f32) * f32(s_h) + f32(z_h)` for one row.
 fn decode_row(row: &[u8], out: &mut [f32]) {
     debug_assert_eq!(row.len() / GROUP_BYTES * GROUP_K, out.len());
-    for (group, dst) in row.chunks_exact(GROUP_BYTES).zip(out.chunks_exact_mut(GROUP_K)) {
+    for (group, dst) in row
+        .chunks_exact(GROUP_BYTES)
+        .zip(out.chunks_exact_mut(GROUP_K))
+    {
         let hdr = |i: usize| f16_to_f32(u16::from_le_bytes([group[2 * i], group[2 * i + 1]]));
         let halves = [(hdr(0), hdr(1)), (hdr(2), hdr(3))];
         for (t, b) in group[8..].chunks_exact(3).enumerate() {
@@ -131,12 +135,21 @@ fn quantize_row(row: &[u8], w: &mut [f32], out: &mut [i8]) -> f32 {
     quantize_scaled_row(row, w, out, false).0
 }
 
-fn quantize_scaled_row(row: &[u8], w: &mut [f32], out: &mut [i8], direct: bool) -> (f32, (u16, i16)) {
+fn quantize_scaled_row(
+    row: &[u8],
+    w: &mut [f32],
+    out: &mut [i8],
+    direct: bool,
+) -> (f32, (u16, i16)) {
     decode_row(row, w);
     let absmax = w.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
     let raw = ((absmax as f64) / 127.0) as f32;
     let grid = if direct { grid15_up(raw) } else { (0, 0) };
-    let ws = if direct { (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32 } else { raw };
+    let ws = if direct {
+        (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32
+    } else {
+        raw
+    };
     if ws == 0.0 {
         out.fill(0);
     } else {
@@ -154,7 +167,10 @@ fn quantize_scaled_row(row: &[u8], w: &mut [f32], out: &mut [i8], direct: bool) 
 /// If `k` is zero or not a multiple of 256, or `mq6.len() != m * k / 256 * 200`. `m == 0` is
 /// permitted (empty results). The shape and trunk packers validate before calling this.
 pub fn pack_matrix(mq6: &[u8], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(k > 0 && k % GROUP_K == 0, "k must be a positive multiple of {GROUP_K}, got {k}");
+    assert!(
+        k > 0 && k % GROUP_K == 0,
+        "k must be a positive multiple of {GROUP_K}, got {k}"
+    );
     let rb = row_bytes(k);
     assert_eq!(
         Some(mq6.len()),
@@ -176,9 +192,13 @@ pub(crate) fn pack_matrix_direct(mq6: &[u8], m: usize, k: usize, output: &mut [u
     assert_eq!(mq6.len(), m * row_bytes(k));
     assert_eq!(output.len(), m * k);
     // i8/u8 have identical size/alignment and every bit pattern is valid.
-    let codes = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<i8>(), output.len()) };
+    let codes =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<i8>(), output.len()) };
     let mut row = [0.0; TRUNK_K];
-    for (raw, dst) in mq6.chunks_exact(row_bytes(k)).zip(codes.chunks_exact_mut(k)) {
+    for (raw, dst) in mq6
+        .chunks_exact(row_bytes(k))
+        .zip(codes.chunks_exact_mut(k))
+    {
         quantize_scaled_row(raw, &mut row, dst, true);
     }
 }
@@ -201,7 +221,9 @@ fn select<'m, 'a>(
             return Err(format!("{} does not belong to shape {shape}", mat.family));
         };
         match prev {
-            Some(p) if p == pos => return Err(format!("duplicate {} in shape {shape}", mat.family)),
+            Some(p) if p == pos => {
+                return Err(format!("duplicate {} in shape {shape}", mat.family))
+            }
             Some(p) if p > pos => {
                 return Err(format!(
                     "{} is out of order in shape {shape} (expected fused order {})",
@@ -219,7 +241,11 @@ fn select<'m, 'a>(
             return Err(format!("missing selected {family} in shape {shape}"));
         };
         if mat.m != family.cols() {
-            return Err(format!("{family}: expected {} rows, got {}", family.cols(), mat.m));
+            return Err(format!(
+                "{family}: expected {} rows, got {}",
+                family.cols(),
+                mat.m
+            ));
         }
         if mat.k != TRUNK_K {
             return Err(format!("{family}: expected K {TRUNK_K}, got {}", mat.k));
@@ -241,7 +267,9 @@ fn select<'m, 'a>(
 /// The design whose `B` packer is the canonical one: one panel (`N = 1280`), `K = 2560`, one A row, direct BF16.
 fn packing_design_with_contract(contract: EpilogueContract) -> ArrayDesign {
     match contract {
-        EpilogueContract::Bf16Direct => design_g80(1, PANEL_COLS, TRUNK_K, Epilogue::Bf16, Control::Fast),
+        EpilogueContract::Bf16Direct => {
+            design_g80(1, PANEL_COLS, TRUNK_K, Epilogue::Bf16, Control::Fast)
+        }
     }
 }
 
@@ -262,7 +290,8 @@ fn pack_validated(design: &ArrayDesign, map: ColumnMap, selected: &[&MatrixRef<'
             let c0 = col0 as usize;
             for fused in c0.max(lo)..(c0 + cols as usize).min(hi) {
                 let (r, c) = (fused - c0, fused - lo);
-                let (scale, grid) = quantize_scaled_row(&mat.mq6[r * rb..(r + 1) * rb], &mut w, &mut codes, true);
+                let (scale, grid) =
+                    quantize_scaled_row(&mat.mq6[r * rb..(r + 1) * rb], &mut w, &mut codes, true);
                 ws[fused] = scale;
                 scales[fused] = grid;
                 for (k, &v) in codes.iter().enumerate() {
@@ -272,7 +301,12 @@ fn pack_validated(design: &ArrayDesign, map: ColumnMap, selected: &[&MatrixRef<'
         }
         out.push(pack_b_bf16(design, &b, &scales[lo..hi]));
     }
-    PackedB { panels: out, ws, scales, map }
+    PackedB {
+        panels: out,
+        ws,
+        scales,
+        map,
+    }
 }
 
 /// Pack one layer's fused `B` for the families of `families` that belong to `shape`
@@ -298,9 +332,18 @@ pub fn pack_shape_with_contract(
     let selected = select(shape, matrices, families)?;
     let map = shape.column_map(families);
     if map.panel_count() == 0 {
-        return Ok(PackedB { panels: Vec::new(), ws: Vec::new(), scales: Vec::new(), map });
+        return Ok(PackedB {
+            panels: Vec::new(),
+            ws: Vec::new(),
+            scales: Vec::new(),
+            map,
+        });
     }
-    Ok(pack_validated(&packing_design_with_contract(contract), map, &selected))
+    Ok(pack_validated(
+        &packing_design_with_contract(contract),
+        map,
+        &selected,
+    ))
 }
 
 /// Pack every layer (contract [`EpilogueContract::Bf16Direct`]).
@@ -338,7 +381,10 @@ pub fn pack_trunk_with_contract(
         let done: Vec<(usize, PackedB)> = jobs
             .par_iter()
             .map(|(i, shape, selected)| {
-                (*i, pack_validated(&design, maps[shape.index()].clone(), selected))
+                (
+                    *i,
+                    pack_validated(&design, maps[shape.index()].clone(), selected),
+                )
             })
             .collect();
         for (i, b) in done {
@@ -352,7 +398,11 @@ pub fn pack_trunk_with_contract(
         ws.push(b.as_ref().map(|b| b.ws.clone()).unwrap_or_default());
         per_layer.push(b.map(|b| (layer.shape, b)));
     }
-    Ok(PackedTrunk { per_layer, ws, map: maps })
+    Ok(PackedTrunk {
+        per_layer,
+        ws,
+        map: maps,
+    })
 }
 
 /// One out-projection matrix packed for the N512 K6144 program (`Shape::GdnOut` / `Shape::QsaO`): the five resident
@@ -381,7 +431,10 @@ fn validate_out(shape: Shape, mq6: &[u8], m: usize, k: usize) -> Result<(), Stri
     }
     let want = m * row_bytes(k);
     if mq6.len() != want {
-        return Err(format!("{shape}: expected {want} MQ6G256V2 bytes for {m}x{k}, got {}", mq6.len()));
+        return Err(format!(
+            "{shape}: expected {want} MQ6G256V2 bytes for {m}x{k}, got {}",
+            mq6.len()
+        ));
     }
     Ok(())
 }
@@ -402,7 +455,8 @@ fn pack_out_validated(design: &ArrayDesign, shape: Shape, mq6: &[u8]) -> PackedO
             let mut scales = Vec::with_capacity(OUT_PANEL_COLS);
             for c in 0..OUT_PANEL_COLS {
                 let row = p * OUT_PANEL_COLS + c;
-                let (scale, grid) = quantize_scaled_row(&mq6[row * rb..(row + 1) * rb], &mut w, &mut codes, true);
+                let (scale, grid) =
+                    quantize_scaled_row(&mq6[row * rb..(row + 1) * rb], &mut w, &mut codes, true);
                 ws.push(scale);
                 scales.push(grid);
                 for (k, &v) in codes.iter().enumerate() {
@@ -412,7 +466,12 @@ fn pack_out_validated(design: &ArrayDesign, shape: Shape, mq6: &[u8]) -> PackedO
             (pack_b_bf16(design, &b, &scales), ws, scales)
         })
         .collect();
-    let mut out = PackedOut { shape, panels: Vec::with_capacity(panels), ws: Vec::with_capacity(OUT_COLS), scales: Vec::with_capacity(OUT_COLS) };
+    let mut out = PackedOut {
+        shape,
+        panels: Vec::with_capacity(panels),
+        ws: Vec::with_capacity(OUT_COLS),
+        scales: Vec::with_capacity(OUT_COLS),
+    };
     for (panel, ws, scales) in done {
         out.panels.push(panel);
         out.ws.extend(ws);
@@ -437,7 +496,10 @@ pub fn pack_out_layers(layers: &[(Shape, &[u8])]) -> Result<Vec<PackedOut>, Stri
         return Ok(Vec::new());
     }
     let design = out_packing_design();
-    Ok(layers.par_iter().map(|&(shape, mq6)| pack_out_validated(&design, shape, mq6)).collect())
+    Ok(layers
+        .par_iter()
+        .map(|&(shape, mq6)| pack_out_validated(&design, shape, mq6))
+        .collect())
 }
 
 #[cfg(test)]
@@ -492,7 +554,9 @@ mod tests {
             g[2 * i..2 * i + 2].copy_from_slice(&h.to_le_bytes());
         }
         for t in 0..64 {
-            let v: u32 = (0..4).map(|c| (codes[4 * t + c] as u32 & 63) << (6 * c)).sum();
+            let v: u32 = (0..4)
+                .map(|c| (codes[4 * t + c] as u32 & 63) << (6 * c))
+                .sum();
             g[8 + 3 * t..11 + 3 * t].copy_from_slice(&v.to_le_bytes()[..3]);
         }
         g
@@ -505,9 +569,8 @@ mod tests {
             let hd = |i: usize| u16::from_le_bytes([g[2 * i], g[2 * i + 1]]);
             for j in 0..GROUP_K {
                 let (t, c, h) = (j / 4, j % 4, j / 128);
-                let v = g[8 + 3 * t] as u32
-                    | (g[9 + 3 * t] as u32) << 8
-                    | (g[10 + 3 * t] as u32) << 16;
+                let v =
+                    g[8 + 3 * t] as u32 | (g[9 + 3 * t] as u32) << 8 | (g[10 + 3 * t] as u32) << 16;
                 let q = ((v >> (6 * c)) & 63) as f32;
                 let prod = q * h2f(hd(2 * h));
                 w.push(prod + h2f(hd(2 * h + 1)));
@@ -540,7 +603,12 @@ mod tests {
     }
 
     fn mref(family: Family, mq6: &[u8]) -> MatrixRef<'_> {
-        MatrixRef { family, mq6, m: family.cols(), k: TRUNK_K }
+        MatrixRef {
+            family,
+            mq6,
+            m: family.cols(),
+            k: TRUNK_K,
+        }
     }
 
     // ---- scalar numerics ----------------------------------------------------------------
@@ -572,7 +640,11 @@ mod tests {
             let (codes, want_ws) =
                 ref_row(&mq6[n * row_bytes(TRUNK_K)..(n + 1) * row_bytes(TRUNK_K)]);
             assert_eq!(ws[n].to_bits(), want_ws.to_bits(), "ws row {n}");
-            assert_eq!(&w8[n * TRUNK_K..(n + 1) * TRUNK_K], &codes[..], "codes row {n}");
+            assert_eq!(
+                &w8[n * TRUNK_K..(n + 1) * TRUNK_K],
+                &codes[..],
+                "codes row {n}"
+            );
         }
     }
 
@@ -661,7 +733,8 @@ mod tests {
         let mut rows: Vec<(Vec<i8>, f32, (u16, i16))> = Vec::new();
         for &(f, mq6) in mats {
             for r in 0..f.cols() {
-                let (ws, grid) = quantize_scaled_row(&mq6[r * rb..(r + 1) * rb], &mut w, &mut codes, true);
+                let (ws, grid) =
+                    quantize_scaled_row(&mq6[r * rb..(r + 1) * rb], &mut w, &mut codes, true);
                 rows.push((codes.clone(), ws, grid));
             }
         }
@@ -695,7 +768,10 @@ mod tests {
         let packed = pack_shape(Shape::GdnIn, &mats, mask).unwrap();
         assert_eq!(packed.map, Shape::GdnIn.column_map(mask));
         assert_eq!(packed.panels.len(), 1);
-        assert_eq!(packed.panels[0].len(), packing_design_with_contract(EpilogueContract::Bf16Direct).args[1].bytes);
+        assert_eq!(
+            packed.panels[0].len(),
+            packing_design_with_contract(EpilogueContract::Bf16Direct).args[1].bytes
+        );
         assert_eq!(packed.ws.len(), PANEL_COLS);
         assert!(packed.ws[96..].iter().all(|&s| s == 0.0));
         assert!(packed.ws[..96].iter().any(|&s| s != 0.0));
@@ -712,7 +788,12 @@ mod tests {
         // k|v|idx = 512 + 512 + 640 = 1664 columns: panel 0 ends inside idx, panel 1 is
         // 384 live columns + zero padding. q is unselected and may be a placeholder.
         let (k, v, idx) = (synth(512, 3), synth(512, 4), synth(640, 5));
-        let placeholder = MatrixRef { family: Family::QsaQ, mq6: &[], m: 0, k: 0 };
+        let placeholder = MatrixRef {
+            family: Family::QsaQ,
+            mq6: &[],
+            m: 0,
+            k: 0,
+        };
         let mats = [
             placeholder,
             mref(Family::QsaK, &k),
@@ -772,7 +853,13 @@ mod tests {
         assert!(e.contains("rows"), "{e}");
         let e = err(&[MatrixRef { k: 2304, ..ok_a }, ok_b]);
         assert!(e.contains("K 2560"), "{e}");
-        let e = err(&[MatrixRef { mq6: &a[..a.len() - 1], ..ok_a }, ok_b]);
+        let e = err(&[
+            MatrixRef {
+                mq6: &a[..a.len() - 1],
+                ..ok_a
+            },
+            ok_b,
+        ]);
         assert!(e.contains("bytes"), "{e}");
         // Order is enforced even when the offender is unselected.
         let e = pack_shape(Shape::GdnIn, &[ok_b, ok_a], Family::GdnA.into()).unwrap_err();
@@ -782,12 +869,23 @@ mod tests {
     #[test]
     fn bf16_direct_validates_inputs_and_empty_masks() {
         let bad = [mref(Family::GdnB, &[])];
-        let err = pack_shape_with_contract(EpilogueContract::Bf16Direct, Shape::GdnIn, &bad, FamilyMask::ALL).unwrap_err();
+        let err = pack_shape_with_contract(
+            EpilogueContract::Bf16Direct,
+            Shape::GdnIn,
+            &bad,
+            FamilyMask::ALL,
+        )
+        .unwrap_err();
         assert!(err.contains("missing") || err.contains("expected"), "{err}");
-        let empty = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &[], FamilyMask::NONE).unwrap();
+        let empty =
+            pack_trunk_with_contract(EpilogueContract::Bf16Direct, &[], FamilyMask::NONE).unwrap();
         assert!(empty.per_layer.is_empty());
-        let layers = [LayerTrunkRefs { shape: Shape::GdnIn, matrices: bad.to_vec() }];
-        let err = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, FamilyMask::ALL).unwrap_err();
+        let layers = [LayerTrunkRefs {
+            shape: Shape::GdnIn,
+            matrices: bad.to_vec(),
+        }];
+        let err = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, FamilyMask::ALL)
+            .unwrap_err();
         assert!(err.starts_with("layer 0:"), "{err}");
     }
 
@@ -797,32 +895,50 @@ mod tests {
         let mut mq6 = synth(rows, 0x846271);
         mq6[..row_bytes(TRUNK_K)].fill(0);
         let mat = mref(Family::GdnA, &mq6);
-        let packed = pack_shape_with_contract(EpilogueContract::Bf16Direct, Shape::GdnIn, &[mat], Family::GdnA.into()).unwrap();
+        let packed = pack_shape_with_contract(
+            EpilogueContract::Bf16Direct,
+            Shape::GdnIn,
+            &[mat],
+            Family::GdnA.into(),
+        )
+        .unwrap();
         let mut expected_scales = vec![(0u16, 0i16); PANEL_COLS];
         let mut b = vec![0i8; TRUNK_K * PANEL_COLS];
         for row in 0..rows {
             let mut w = Vec::with_capacity(TRUNK_K);
-            for g in mq6[row * row_bytes(TRUNK_K)..(row + 1) * row_bytes(TRUNK_K)].chunks_exact(GROUP_BYTES) {
+            for g in mq6[row * row_bytes(TRUNK_K)..(row + 1) * row_bytes(TRUNK_K)]
+                .chunks_exact(GROUP_BYTES)
+            {
                 let hd = |i| h2f(u16::from_le_bytes([g[2 * i], g[2 * i + 1]]));
                 for j in 0..256 {
                     let bit = j * 6;
                     let mut q = 0u8;
-                    for k in 0..6 { q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k; }
+                    for k in 0..6 {
+                        q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k;
+                    }
                     let product = f32::from(q) * hd(2 * (j / 128));
                     w.push(product + hd(2 * (j / 128) + 1));
                 }
             }
             let absmax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
             let raw = (f64::from(absmax) / 127.0) as f32;
-            if raw == 0.0 { continue; }
+            if raw == 0.0 {
+                continue;
+            }
             let mut e = f64::from(raw).log2().floor() as i16 - 14;
             let mut sm = (f64::from(raw) * 2f64.powi(-i32::from(e))).ceil() as u16;
-            if sm == 32768 { sm = 16384; e += 1; }
+            if sm == 32768 {
+                sm = 16384;
+                e += 1;
+            }
             expected_scales[row] = (sm, e);
             let s = (f64::from(sm) * 2f64.powi(i32::from(e))) as f32;
             for (k, &value) in w.iter().enumerate() {
-                let v = value / s; let floor = v.floor(); let fraction = v - floor;
-                let rounded = floor + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
+                let v = value / s;
+                let floor = v.floor();
+                let fraction = v - floor;
+                let rounded = floor
+                    + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
                 b[k * PANEL_COLS + row] = rounded.clamp(-127.0, 127.0) as i8;
             }
         }
@@ -844,7 +960,10 @@ mod tests {
                 shape: Shape::GdnIn,
                 matrices: vec![mref(Family::GdnA, &data[0]), mref(Family::GdnB, &data[1])],
             },
-            LayerTrunkRefs { shape: Shape::QsaIn, matrices: vec![mref(Family::QsaK, &k)] },
+            LayerTrunkRefs {
+                shape: Shape::QsaIn,
+                matrices: vec![mref(Family::QsaK, &k)],
+            },
             LayerTrunkRefs {
                 shape: Shape::GdnIn,
                 matrices: vec![mref(Family::GdnA, &data[2]), mref(Family::GdnB, &data[3])],
@@ -876,7 +995,10 @@ mod tests {
                 shape: Shape::GdnIn,
                 matrices: vec![mref(Family::GdnA, &a), mref(Family::GdnB, &b)],
             },
-            LayerTrunkRefs { shape: Shape::QsaIn, matrices: vec![] },
+            LayerTrunkRefs {
+                shape: Shape::QsaIn,
+                matrices: vec![],
+            },
         ];
         let mask = Family::GdnA | Family::GdnB;
         let trunk = pack_trunk(&layers, mask).unwrap();
@@ -909,13 +1031,19 @@ mod tests {
             },
         ];
         let e = pack_trunk(&layers, Family::GdnA | Family::GdnB).unwrap_err();
-        assert!(e.starts_with("layer 1:") && e.contains("missing") && e.contains("gdn_b"), "{e}");
+        assert!(
+            e.starts_with("layer 1:") && e.contains("missing") && e.contains("gdn_b"),
+            "{e}"
+        );
         let swapped = [LayerTrunkRefs {
             shape: Shape::GdnIn,
             matrices: vec![mref(Family::GdnB, &b), mref(Family::GdnA, &a)],
         }];
         let e = pack_trunk(&swapped, Family::GdnA | Family::GdnB).unwrap_err();
-        assert!(e.starts_with("layer 0:") && e.contains("out of order"), "{e}");
+        assert!(
+            e.starts_with("layer 0:") && e.contains("out of order"),
+            "{e}"
+        );
     }
 
     // ---- out-projection (N512 K6144) packing ---------------------------------------------
@@ -951,22 +1079,35 @@ mod tests {
             for j in 0..256 {
                 let bit = j * 6;
                 let mut q = 0u8;
-                for k in 0..6 { q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k; }
+                for k in 0..6 {
+                    q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k;
+                }
                 w.push(f32::from(q) * hd(2 * (j / 128)) + hd(2 * (j / 128) + 1));
             }
         }
         let absmax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         let raw = (f64::from(absmax) / 127.0) as f32;
-        if raw == 0.0 { return (vec![0; w.len()], (0, 0)); }
+        if raw == 0.0 {
+            return (vec![0; w.len()], (0, 0));
+        }
         let mut e = f64::from(raw).log2().floor() as i16 - 14;
         let mut sm = (f64::from(raw) * 2f64.powi(-i32::from(e))).ceil() as u16;
-        if sm == 32768 { sm = 16384; e += 1; }
+        if sm == 32768 {
+            sm = 16384;
+            e += 1;
+        }
         let s = (f64::from(sm) * 2f64.powi(i32::from(e))) as f32;
-        let codes = w.iter().map(|&value| {
-            let v = value / s; let floor = v.floor(); let fraction = v - floor;
-            let rounded = floor + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
-            rounded.clamp(-127.0, 127.0) as i8
-        }).collect();
+        let codes = w
+            .iter()
+            .map(|&value| {
+                let v = value / s;
+                let floor = v.floor();
+                let fraction = v - floor;
+                let rounded = floor
+                    + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
+                rounded.clamp(-127.0, 127.0) as i8
+            })
+            .collect();
         (codes, (sm, e))
     }
 
@@ -980,7 +1121,10 @@ mod tests {
         }
         let packed = pack_out(Shape::GdnOut, &mq6, OUT_COLS, OUT_K).unwrap();
         assert_eq!(packed.shape, Shape::GdnOut);
-        assert_eq!((packed.panels.len(), packed.ws.len(), packed.scales.len()), (5, OUT_COLS, OUT_COLS));
+        assert_eq!(
+            (packed.panels.len(), packed.ws.len(), packed.scales.len()),
+            (5, OUT_COLS, OUT_COLS)
+        );
         let design = out_packing_design();
         assert_eq!(design.args[1].bytes, 8 * 96 * 4352);
         let mut scales = vec![(0u16, 0i16); OUT_COLS];
@@ -995,31 +1139,55 @@ mod tests {
                     b[k * OUT_PANEL_COLS + c] = v;
                 }
             }
-            panels.push(pack_b_bf16(&design, &b, &scales[p * OUT_PANEL_COLS..(p + 1) * OUT_PANEL_COLS]));
+            panels.push(pack_b_bf16(
+                &design,
+                &b,
+                &scales[p * OUT_PANEL_COLS..(p + 1) * OUT_PANEL_COLS],
+            ));
         }
         assert_eq!(packed.scales, scales);
         for (row, &(sm, se)) in scales.iter().enumerate() {
-            assert_eq!(packed.ws[row], (f64::from(sm) * 2f64.powi(i32::from(se))) as f32, "ws row {row}");
+            assert_eq!(
+                packed.ws[row],
+                (f64::from(sm) * 2f64.powi(i32::from(se))) as f32,
+                "ws row {row}"
+            );
         }
         for r in [3usize, 511, 512, OUT_COLS - 1] {
             assert_eq!((packed.scales[r], packed.ws[r]), ((0, 0), 0.0));
         }
-        assert!(packed.panels == panels, "pack_out panels != pack_b_bf16 of the independent W8 / grid scales");
+        assert!(
+            packed.panels == panels,
+            "pack_out panels != pack_b_bf16 of the independent W8 / grid scales"
+        );
         // Same bytes for the other out shape; deterministic.
         let again = pack_out(Shape::QsaO, &mq6, OUT_COLS, OUT_K).unwrap();
-        assert!(again.panels == packed.panels && again.ws == packed.ws && again.scales == packed.scales);
+        assert!(
+            again.panels == packed.panels && again.ws == packed.ws && again.scales == packed.scales
+        );
         let layers = pack_out_layers(&[(Shape::GdnOut, &mq6), (Shape::QsaO, &mq6)]).unwrap();
         assert_eq!(layers[0].panels, packed.panels);
-        assert_eq!((layers[1].shape, &layers[1].panels), (Shape::QsaO, &packed.panels));
+        assert_eq!(
+            (layers[1].shape, &layers[1].panels),
+            (Shape::QsaO, &packed.panels)
+        );
     }
 
     #[test]
     fn out_pack_validates_shape_dimensions_and_length() {
         let mq6 = synth_k(OUT_COLS, OUT_K, 7);
-        assert!(pack_out(Shape::GdnIn, &mq6, OUT_COLS, OUT_K).unwrap_err().contains("not an out-projection"));
-        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS - 1, OUT_K).unwrap_err().contains("2560x6144"));
-        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS, 2560).unwrap_err().contains("2560x6144"));
-        assert!(pack_out(Shape::QsaO, &mq6[1..], OUT_COLS, OUT_K).unwrap_err().contains("bytes"));
+        assert!(pack_out(Shape::GdnIn, &mq6, OUT_COLS, OUT_K)
+            .unwrap_err()
+            .contains("not an out-projection"));
+        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS - 1, OUT_K)
+            .unwrap_err()
+            .contains("2560x6144"));
+        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS, 2560)
+            .unwrap_err()
+            .contains("2560x6144"));
+        assert!(pack_out(Shape::QsaO, &mq6[1..], OUT_COLS, OUT_K)
+            .unwrap_err()
+            .contains("bytes"));
         let e = pack_out_layers(&[(Shape::GdnOut, &mq6), (Shape::QsaIn, &mq6)]).unwrap_err();
         assert!(e.starts_with("layer 1:"), "{e}");
         assert!(pack_out_layers(&[]).unwrap().is_empty());

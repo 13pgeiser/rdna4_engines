@@ -103,7 +103,7 @@ __device__ __forceinline__ void mq2_down_rowtile_body(
     const float* __restrict__ topk_weights,
     const float* __restrict__ rot_batch,
     float*       __restrict__ x_residual,
-    int M, int K,
+    int M, int K, int n_experts,
     float* cb_lds)   // R * 4 * 4 floats
 {
     const int row_base = blockIdx.x * R;
@@ -112,6 +112,7 @@ __device__ __forceinline__ void mq2_down_rowtile_body(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;
@@ -216,11 +217,11 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
     const float* __restrict__ topk_weights,
     const float* __restrict__ rot_batch,
     float*       __restrict__ x_residual,
-    int M, int K
+    int M, int K, int n_experts
 ) {
     __shared__ float cb_lds[2 * 4 * 4];
     mq2_down_rowtile_body<2>(expert_ptrs, topk_indices, topk_weights,
-                             rot_batch, x_residual, M, K, cb_lds);
+                             rot_batch, x_residual, M, K, n_experts, cb_lds);
 }
 
 __launch_bounds__(32, MQ2_DOWN_R4_WAVES_PER_EU)
@@ -230,9 +231,9 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
     const float* __restrict__ topk_weights,
     const float* __restrict__ rot_batch,
     float*       __restrict__ x_residual,
-    int M, int K
+    int M, int K, int n_experts
 ) {
     __shared__ float cb_lds[4 * 4 * 4];
     mq2_down_rowtile_body<4>(expert_ptrs, topk_indices, topk_weights,
-                             rot_batch, x_residual, M, K, cb_lds);
+                             rot_batch, x_residual, M, K, n_experts, cb_lds);
 }

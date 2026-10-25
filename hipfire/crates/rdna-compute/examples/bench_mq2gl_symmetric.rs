@@ -276,8 +276,10 @@ fn ref_mq2l_rows(blob: &[u8], m: usize, k: usize, x: &[f32]) -> Vec<f64> {
             let off = (row * gpr + g) * 72;
             let mut cb = [0.0f64; 4];
             for (e, c) in cb.iter_mut().enumerate() {
-                *c = f16_to_f32(u16::from_le_bytes([blob[off + 2 * e], blob[off + 2 * e + 1]]))
-                    as f64;
+                *c = f16_to_f32(u16::from_le_bytes([
+                    blob[off + 2 * e],
+                    blob[off + 2 * e + 1],
+                ])) as f64;
             }
             let ib = off + 8;
             for b in 0..64 {
@@ -431,13 +433,19 @@ fn main() {
     let gl_ptrs: Vec<u64> = gl_ts.iter().map(|t| t.buf.as_ptr() as u64).collect();
     let l_ptr_t = gpu
         .upload_raw(
-            &l_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+            &l_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_exp],
         )
         .unwrap();
     let gl_ptr_t = gpu
         .upload_raw(
-            &gl_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+            &gl_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_exp],
         )
         .unwrap();
@@ -446,13 +454,18 @@ fn main() {
     let topk: Vec<i32> = (0..k_top as i32).map(|i| (i * 3) % n_exp as i32).collect();
     let topk_t = gpu
         .upload_raw(
-            &topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &topk
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[k_top],
         )
         .unwrap();
 
     // x: arbitrary but deterministic; NOT FWHT-rotated (see header).
-    let x: Vec<f32> = (0..k).map(|i| gauss(0xbeef_0000 ^ i as u64) * 0.5).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| gauss(0xbeef_0000 ^ i as u64) * 0.5)
+        .collect();
     let x_t = gpu.upload_f32(&x, &[k]).unwrap();
 
     // NaN-prefilled outputs, one pair per kernel — an unwritten row fails loud.
@@ -496,6 +509,7 @@ fn main() {
     blob_l.push_ptr(y_l_u.buf.as_ptr() as *const _);
     blob_l.push_i32(m as i32);
     blob_l.push_i32(k as i32);
+    blob_l.push_i32((l_ptr_t.buf.size() / 8) as i32);
     let mut bl = blob_l.into_vec();
 
     let mut blob_g = KernargBlob::new();
@@ -509,6 +523,7 @@ fn main() {
     }
     blob_g.push_i32(m as i32);
     blob_g.push_i32(k as i32);
+    blob_g.push_i32((gl_ptr_t.buf.size() / 8) as i32);
     let mut bg = blob_g.into_vec();
 
     // sym: TWO scalars (cb_a, cb_b) in the same slot as the plain kernel's four.
@@ -522,6 +537,7 @@ fn main() {
     blob_s.push_f32(CB_B);
     blob_s.push_i32(m as i32);
     blob_s.push_i32(k as i32);
+    blob_s.push_i32((gl_ptr_t.buf.size() / 8) as i32);
     let mut bs = blob_s.into_vec();
 
     const NAME_L: &str = "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed";
@@ -529,11 +545,7 @@ fn main() {
     const NAME_S: &str = "gemv_mq2g256gl_moe_gate_up_sym_k8_indexed";
 
     // ---- one launch of each (this is the JIT-contaminated pass) ----
-    for (name, bytes) in [
-        (NAME_L, &mut bl),
-        (NAME_G, &mut bg),
-        (NAME_S, &mut bs),
-    ] {
+    for (name, bytes) in [(NAME_L, &mut bl), (NAME_G, &mut bg), (NAME_S, &mut bs)] {
         gpu.launch_kernel_blob(name, grid, block, 0, bytes).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
@@ -654,11 +666,7 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
         t0.elapsed().as_secs_f64() * 1e6 / n as f64
     };
-    for (name, bytes) in [
-        (NAME_L, &mut bl),
-        (NAME_G, &mut bg),
-        (NAME_S, &mut bs),
-    ] {
+    for (name, bytes) in [(NAME_L, &mut bl), (NAME_G, &mut bg), (NAME_S, &mut bs)] {
         let _ = bench(&mut gpu, name, bytes, warm);
     }
 

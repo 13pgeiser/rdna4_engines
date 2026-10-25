@@ -19,7 +19,7 @@ describes the math and wire contracts.
 | **HFQ** | none | INT asymmetric | G256 (G128 variants exist) | Dense Llama / Mistral / Gemma / plain Qwen |
 | **MQ (MagnumQuant)** | offline FWHT-256 | INT asymmetric (or Lloyd codebook) | G256 | Qwen 3.5+ hybrid path; FWHT baked into weights |
 | **HFP / MFP** | optional offline FWHT | OCP E2M1 FP4 | G32 rows | RDNA-oriented FP4; MFP = HFP + FWHT |
-| **PARO** | pairwise Givens | AWQ W4 | G128 | Imported ParoQuant/AWQ probe path |
+| **PARO** | pairwise Givens | AWQ W4 | G128 or G64 (`ParoQ4G128` / `ParoQ4G64`, from `group_size`) | Imported ParoQuant/AWQ probe path |
 | **Q8F16** | none | INT8 + f16 scale | G32 | Embeddings, routers, precision-sensitive 2D |
 
 Production defaults for day-to-day use:
@@ -176,7 +176,9 @@ lockstep (`crates/hipfire-runtime/src/llama.rs`,
 
 **Always batch-eligible (both owners):** `MQ4G256`, `HFQ4G256`, `MQ6G256`,
 `HFQ6G256`, `Q8_0`. (qwen35 also treats `ParoQ4G128` / `F32` as always-ok for
-the PARO probe path.)
+the PARO probe path; llama admits `ParoQ4G64`, whose prefill rotates each
+projection's rows and runs `gemm_hfq4g64`, while llama `ParoQ4G128` stays
+per-token.)
 
 | DType | `llama::is_batchable_la` | `qwen35::is_batchable_la` |
 |---|---|---|
@@ -261,7 +263,7 @@ already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
 | Mode | K | V | Notes |
 |---|---|---|---|
 | `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
-| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 (H24/Hkv4/D256, single GPU, no adaptive/CASK) |
+| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B, D256, no adaptive/CASK/slots/TP/PP split). Native `bf16` stays H24 dense-only |
 | `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts |
 | `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Deprecated spellings** (since 0.4.0, removal in 0.5.0; spell `fwhtN` or `q8`) | Q8_0 | On Qwen they are aliases that resolve to the supported FWHT K path: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the legacy Givens constructors (deprecated route, removal in 0.5.0) |
 | `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Deprecated since 0.4.0, removal in 0.5.0** (fwht3 supersedes Givens asym KV); Qwen `--kv-k` only |
@@ -274,9 +276,10 @@ then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
 3. Registry `default_kv_mode` when no user layer sets `kv_cache` and the
    card's value is not `q8` (a `q8` card value is left to `auto`)
 4. Else `auto`, resolved by the architecture: Qwen native **fp8** on
-   native-eligible exact gfx1201, **q8** on every other Qwen load
-   (gfx1100, gfx1151, …); other families keep their own default (Maple
-   bf16, DeepSeek V4 f32, others q8)
+   native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or
+   H16/Hkv2/D256 A3B; no adaptive/CASK/slots/TP/PP split), **q8** on
+   every other Qwen load (gfx1100, gfx1151, …); other families keep
+   their own default (Maple bf16, DeepSeek V4 f32, others q8)
 
 There is **no** live per-arch `archDefaults` table (removed). Compressed modes
 are opt-in via registry cards or explicit config — not guessed from GPU VRAM.
@@ -368,6 +371,12 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 | 53 | MQ4G128V2 | Row-local MQ4 V2, per-128 groups of 68 B (4.25 bpw) — passthrough; Qwen4 routed-expert `down_proj` |
 | 54 | QwenI64 | **Reserved in the register; not a quantized weight and no `QuantType` variant.** Raw signed-I64 metadata record (the three PLE hash arrays: multipliers, vocab sizes, prefix offsets) written by the Qwen4 producer |
+| 131 | MQ3I4G128R256 | MQ3-I4 gate/up — planar `[M·K·3/8 B codes][M·K/128 f16 scales]`, R256 FWHT (seeds 42/1042); **typed-qwen4 expert-slab only, gfx1151/gfx1201** |
+| 132 | MQ3I4G128R128 | MQ3-I4 down — same planar W3 layout, R128 FWHT (seeds 43/1043); **typed-qwen4 expert-slab only, gfx1151/gfx1201** |
+| 133 | MQ2I4G128R256 | MQ2-I4 gate/up — planar `[M·K/4 B codes][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
+| 134 | MQ2I4G128R128 | MQ2-I4 down — same planar W2 layout, R128 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
+| 135 | E8PI4G128R256 | E8P-I4 gate/up — `[M·K/8 LE u16 words][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1151/gfx1201** |
+| 136 | E8PI4G128R128 | E8P-I4 down — same planar E8P layout, R128 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1151/gfx1201** |
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
@@ -376,6 +385,134 @@ were reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt 42 and 53 are now live
 rows (above); qt **43 and 46** have no register row (43 is burned by the retired
 SEL codebook, 46 is the design-only hierarchical `mq4_k`). Do not invent slots —
 edit `qt-register.txt` to claim a number.
+
+IDs **131–134** (MQ3-I4 / MQ2-I4) are fresh allocations above qt130 (compact
+Hessian records, not a `QuantType`). They are planar (codes plane, then f16
+scale plane; codec in `crates/hipfire-runtime/src/mq_i4.rs`), valid only as
+per-expert entries of a Qwen4 artifact declaring `qwen4.expert_slabs` v1
+(`crates/hipfire-arch-qwen4/src/expert_slabs.rs`).
+The CPU byte/arithmetic oracles in `hipfire_runtime::mq_i4_reference` define
+signed A4 unpacking, ascending-K128 fused IU4 folds, the frozen wave32 F4
+decode tree and original-slot scatter. Their module documentation is the
+rounding/order contract for the corresponding PeaceMaker kernels.
+
+**Producing the artifact.** `qwen4_i4_slabs` (`crates/hipfire-quantize/src/bin/qwen4_i4_slabs.rs`, writer
+`hipfire_quantize::i4_slabs::write_i4_expert_slabs`) packs the pinned MQ4-XTS Flash-Next HFQ plus R1
+per-expert NPZ records (`L{L}/E{e}.npz`: `gds/gc/dds/dc/sd/bits/grid/scale_rule`) into the slab container:
+trunk expert entries first (layer, expert, gate_up then down; qt 131/132, 133/134 or the unchanged 44/53
+slices of the published aggregates, chosen per expert by an allocation point or `--uniform w3|w2|mq4`), then
+every other source tensor byte-identically (legacy MTP aggregate experts included), plus the
+`qwen4.expert_slabs` and `qwen4.expert_slabs_provenance` metadata keys. Import accepts only `grid=uniform`,
+`sd` exactly 1.0 and the scale rules `mqi4-canonical-v1-rne-tree128`, `mqi4-recover-s1-v1`,
+`mqi4-recover-s2-v1`; scales must be exact f16 values. Verification cannot be disabled: every expert is
+decoded back to its codes and scale bits, the output is reopened and every payload plus the whole file is
+re-hashed, and `--cross-check-packs-w3/-w2` additionally compares each slab byte-for-byte with the Python R1
+pack. `--receipt` writes the JSON receipt. An existing `--out` is never overwritten.
+
+**Pruned coder split bases.** `--expert-keep keep.json` accepts
+`hipfire.coder.keep.v1` through `ExpertKeep::from_coder_keep_file`. Expert ids
+remain in the original 512-id space; sorted, ragged layer lists are allowed
+(at least top-10 per layer). Absent experts have no index entries or payload.
+The loader synthesizes their zero-byte slab slots. Allocation rows may remain
+dense (absent entries are ignored) or contain only kept experts in keep-list
+order. Optional `tiers` is null or an object keyed by original layer and expert
+ids, e.g. `{"0":{"3":"w3","17":"mq4"}}`. A tier for an absent expert is refused,
+as are missing records for selected W3/W2 experts. Receipt tier counts cover
+kept experts only.
+Optional `mtp` selects compact MTP aggregate rows; absent/null preserves MTP.
+`qwen4.expert_keep` records membership and its canonical SHA-256.
+
+Use the shipped `hipfire ple split` path on the MQ4 source first (or reuse an
+already verified MQ4 split base). Packing that base preserves its
+`hipfire_ple_rows` marker unchanged and never adds PLE rows. This binds the
+pruned base to the same shared `.ple-q4`/`.ple-q8` row identity, independent of
+its new base size/index hash. The split command verifies the Q8 source rows;
+do not copy a marker from an unrelated model.
+
+```sh
+hipfire ple split "$SOURCE_MQ4" --out "$SOURCE_BASE_MQ4" --keep-original
+qwen4_i4_slabs --source "$SOURCE_BASE_MQ4" \
+  --alloc "$ALLOC" --point "$POINT" --records-w3 "$W3_RECORDS" \
+  --expert-keep "$KEEP_JSON" --out "$CODER_BASE" \
+  --receipt "$RECEIPT" --threads 8
+qwen4_slab_admit_check "$CODER_BASE"
+```
+
+Install the verified shared row files under the runtime aliases
+`$CODER_BASE.ple-q4` / `$CODER_BASE.ple-q8` (links to the shared files, not copies).
+They must have the same Q8 source-row digest and geometry as the split marker.
+Add `--size-only` to the pack command to print exact container bytes and
+kept-only routed/non-expert payload totals without writing output or receipt;
+use identical source, records paths, allocation, and keep file for packing.
+The checker verifies membership SHA, table counts, exclusion of absent expert
+tensors, all W3/W2 payloads, and the production CPU admission refusal.
+
+The CPU loader builds an O(index entries) `expert_slab_table::ExpertSlabTable`
+from the actual spans: 48 × 512 gate/up-down pairs first, canonical names and
+order, frozen shapes/qtype pairs/group sizes/byte sizes, contiguous aligned
+slabs, no trunk aggregates or stray I4 entries. The sealed slab route admits
+MQ4 (codec 0) with E8P (codec 3) on exact gfx1100, MQ4 with W3 (codec 1) or E8P
+on exact gfx1151 (E8P through the `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`
+admission switch, `true`; its earlier Halo byte-oracle receipts are pre-rc5 history and do
+not by themselves qualify the current bounded images), and MQ4 with W3 or E8P on exact gfx1201. Each
+layer has at most
+one cold codec; W3 and E8P cannot share its cold bucket. W2 is refused
+everywhere, as are W3 on gfx1100 and all other slab
+architectures. Missing or malformed v1 metadata fails closed.
+`validate_expert_slab_scales` separately checks W3/W2 payloads through the shared
+codec, including finite non-negative f16 scales, rejection of -0, and canonical
+midpoint codes for zero-scale groups; it is not run on the default load path.
+Legacy aggregate artifacts retain their existing admission checks and ordering.
+
+The two execution buckets remain cold codec then MQ4. The planner's u8
+table is a cold-membership flag (W3/E8P = 1, MQ4 = 0), not a codec ID;
+the real codec IDs remain available for the prefill tile masks. Kernel
+entries are selected by architecture and the layer's cold codec. gfx1100
+uses its own K1/K2/K3 objects and tile-mask image, with AR only (MTP off).
+Existing gfx1201 W3/MQ4 kernel bytes, the gfx1201-only EP long-prefill staging
+default, and VMM/MTP refusals are unchanged. gfx1151 (Strix Halo) keeps its
+beta MQ4/W3 route (W3 K2 NT4 launcher, hipcc tile mask) and serves E8P layers
+with its own PeaceMaker E8P K1/K2 images (`e8p_i4_moe_gemv_pm_gfx1151`,
+`qwen4_moe_iu4_sym_e8p_pm_gfx1151`), admitted by the single
+`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` constant
+(`rdna-compute/src/slab_admission.rs`); that is an admission statement, not a GPU
+qualification claim for the rc5 bounded images (fresh Halo gates are separate). Its slab
+kernel preload is unconditional (planner, mask and all four K1 handles, even
+for an MQ4-only layer), the one exception to the no-cold-kernel-preload rule
+that gfx1100 and gfx1201 keep; it is not a W3 bucket launch.
+
+The gfx1100 E8P K2 wiring is CPU-prepared; promotion remains gated on its
+XTX K2 G1. This admission description is not a GPU qualification claim.
+
+The rc5 bounded E8P ABI is shared by gfx1100 and gfx1151: K1 uses a
+96-byte kernarg segment (`n_experts: u32` at byte 88, reserved zero at
+byte 92; 17 kernel parameters), and K2 uses a 64-byte segment
+(`n_experts: u32` at byte 60). Both kernels reject expert IDs with an
+unsigned, uniform bounds check before any expert pointer read, prefetch,
+or barrier. Invalid IDs perform no dereference or output store; the
+gfx1151 port preserves rc5's E8P NaN containment.
+
+#### Expert capability table
+
+One table, `rdna_compute::expert_capabilities`, answers "does this arch run this expert codec on
+this route" for every gate (slab K1/K2 selection, arena and tier-plan `check_executable`,
+artifact load, dispatch pair/bucket selection, expert stage defaults). The key is the exact
+on-disk quant-tag pair read from the tensor table (`ExpertQt`: MQ4 `(44,53)`, W3 `(131,132)`,
+W2 `(133,134)`, E8P `(135,136)`), never a model or XTS label. `generation_label` (v1 qt 13,
+v2 candidates qt 45/52, v3 qt 44/53 and the planar I4 tags) is display-only and never read by
+admission; the "V2" in `MQ4G256V2`/`MQ4G128V2` names a codec-layout revision, not the MQ
+generation. The qt 44/53 kernels need the symmetric grid, which the tag cannot show; the
+existing header check (`routed_headers_symmetric`, `qwen4_moe_sym_check`) stays the prerequisite.
+
+Routes: `PrefillK2`, `DecodeGemv`, `Stage` (slab-arena staging, needs K1 and K2), `TierStage`
+(`ExpertTierPlan`; MQ4 is arch-neutral), `D2CpuSplit` (CPU decoder inventory supplied by
+dispatch). A cell is admitted only when its raw kernel inventory (read from the real K1/K2
+tables, never from admission) is present and no named hold refuses it. Beta holds, all in
+`HOLD_CELLS`: tier plans refuse E8P on gfx1100/gfx1151/gfx1201 and W3 on gfx1151; the gfx1151
+E8P cells (K2, K1, stage) hold only while `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is false. The
+per-arch artifact receipts flags gate the load only. W2 and gfx1100 W3 have no kernel. Stage
+defaults (gfx1201 always on and 2048 rows; narrow-link policy elsewhere; the gfx1100 8192-row
+narrow-link chunk) are `stage_policy` metadata read together with the measured link predicate.
 
 ### PARO4G128 probe payload
 

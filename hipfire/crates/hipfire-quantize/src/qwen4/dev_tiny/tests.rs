@@ -84,11 +84,9 @@ fn specs(config: &Value) -> Vec<Spec> {
 }
 
 fn bf16_bytes(name: &str, elements: usize) -> Vec<u8> {
-    let mut state = name
-        .bytes()
-        .fold(0x9E37_79B9_7F4A_7C15u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
-        });
+    let mut state = name.bytes().fold(0x9E37_79B9_7F4A_7C15u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    });
     let mut out = Vec::with_capacity(elements * 2);
     for _ in 0..elements {
         state ^= state << 13;
@@ -205,7 +203,10 @@ fn assert_nothing_published(out: &TempDir) {
         .expect("read output dir")
         .map(|entry| entry.expect("entry").path())
         .collect();
-    assert!(leftovers.is_empty(), "a refused transaction left {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "a refused transaction left {leftovers:?}"
+    );
 }
 
 fn layer(role: &str) -> String {
@@ -240,7 +241,12 @@ fn source_exact_tiny_profiles_are_complete_bit_exact_and_admitted() {
                 .unwrap_or_else(|| panic!("artifact carries {}", spec.name));
             let expected_tag = if spec.dtype == "I64" { 54 } else { 16 };
             assert_eq!(info.quant_type, expected_tag, "{}", spec.name);
-            assert_eq!(data, bytes_for(spec, &config).as_slice(), "{} payload", spec.name);
+            assert_eq!(
+                data,
+                bytes_for(spec, &config).as_slice(),
+                "{} payload",
+                spec.name
+            );
         }
         assert!(
             hfq.tensor_data(VISION_NAME).is_none(),
@@ -262,7 +268,10 @@ fn packed_moe_uses_each_roles_flash_next_format_and_stays_admitted() {
     assert!(produced.receipt.packed_entries > 0);
     let hfq = HfqFile::open(&produced.output).expect("reopen");
     assert_eq!(qt(&hfq, "lm_head.weight"), (47, 256));
-    assert_eq!(qt(&hfq, "model.language_model.embed_tokens.weight"), (3, 32));
+    assert_eq!(
+        qt(&hfq, "model.language_model.embed_tokens.weight"),
+        (3, 32)
+    );
     assert_eq!(qt(&hfq, &layer("mlp.experts.gate_up_proj")), (44, 256));
     assert_eq!(qt(&hfq, &layer("mlp.experts.down_proj")), (53, 128));
     assert_eq!(qt(&hfq, "mtp.layers.0.mlp.experts.gate_up_proj"), (44, 256));
@@ -297,7 +306,10 @@ fn packed_moe_uses_each_roles_flash_next_format_and_stays_admitted() {
         for lane in 0..32 {
             let got = scale * f32::from(chunk[2 + lane] as i8);
             let index = block * 32 + lane;
-            let want = bf16_to_f32(u16::from_le_bytes([source[2 * index], source[2 * index + 1]]));
+            let want = bf16_to_f32(u16::from_le_bytes([
+                source[2 * index],
+                source[2 * index + 1],
+            ]));
             assert!(
                 (got - want).abs() <= scale.abs() * 0.6 + 1e-6,
                 "block {block} lane {lane}: {got} vs {want}"
@@ -391,7 +403,11 @@ fn header_only_sources(config: &Value) -> (TempDir, Vec<SourceTensor>) {
             SourceTensor {
                 name: spec.name.clone(),
                 dtype: spec.dtype.to_string(),
-                shape: spec.shape.iter().map(|&dimension| dimension as u64).collect(),
+                shape: spec
+                    .shape
+                    .iter()
+                    .map(|&dimension| dimension as u64)
+                    .collect(),
                 data_start: start,
                 data_end: start + len,
                 shard: Arc::clone(&shard),
@@ -405,7 +421,10 @@ fn header_only_sources(config: &Value) -> (TempDir, Vec<SourceTensor>) {
 fn width_5120_profiles_plan_exact_extents_and_admit_header_only() {
     for base in [TINY_MOE, TINY_DENSE] {
         let config = config_for(base, 5120, None);
-        for encoding in [Qwen4DevTinyEncoding::SourceExact, Qwen4DevTinyEncoding::Packed] {
+        for encoding in [
+            Qwen4DevTinyEncoding::SourceExact,
+            Qwen4DevTinyEncoding::Packed,
+        ] {
             let (_keep, tensors) = header_only_sources(&config);
             let prepared = prepare_dev_artifact(
                 &config,
@@ -449,14 +468,24 @@ fn width_5120_profiles_plan_exact_extents_and_admit_header_only() {
             match encoding {
                 Qwen4DevTinyEncoding::SourceExact => assert_eq!(packed, 0),
                 Qwen4DevTinyEncoding::Packed => {
-                    assert!(packed > 0, "{} packed nothing at width 5120", prepared.manifest.identity.profile_id);
-                    assert!(matches!(entry("lm_head.weight").kind, EntryKind::Quant(DType::MQ6G256V2)));
+                    assert!(
+                        packed > 0,
+                        "{} packed nothing at width 5120",
+                        prepared.manifest.identity.profile_id
+                    );
+                    assert!(matches!(
+                        entry("lm_head.weight").kind,
+                        EntryKind::Quant(DType::MQ6G256V2)
+                    ));
                     if base == TINY_DENSE {
                         assert!(matches!(
                             entry(".mlp.gate_proj.weight").kind,
                             EntryKind::Quant(DType::Q8_0)
                         ));
-                        assert!(matches!(entry(".mlp.down_proj.weight").kind, EntryKind::Bf16));
+                        assert!(matches!(
+                            entry(".mlp.down_proj.weight").kind,
+                            EntryKind::Bf16
+                        ));
                     }
                     // The recipe id is the artifact's identity: the same packed
                     // inventory is refused under the source-exact id.
@@ -574,7 +603,10 @@ fn identity_and_destination_refusals() {
     let error = write_dev_tiny_artifact(input.path(), &existing, exact)
         .expect_err("replacement refused")
         .to_string();
-    assert!(error.contains("refusing to replace existing Qwen4 artifact"), "{error}");
+    assert!(
+        error.contains("refusing to replace existing Qwen4 artifact"),
+        "{error}"
+    );
     assert_eq!(fs::read(&existing).expect("existing"), b"keep me");
 
     // Only a local safetensors directory is accepted.
@@ -612,5 +644,9 @@ fn identity_and_destination_refusals() {
         .expect("read output dir")
         .map(|entry| entry.expect("entry").file_name())
         .collect();
-    assert_eq!(leftovers.len(), 1, "only the pre-existing file remains: {leftovers:?}");
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "only the pre-existing file remains: {leftovers:?}"
+    );
 }

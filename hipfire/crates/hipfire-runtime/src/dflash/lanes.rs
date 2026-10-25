@@ -6,8 +6,9 @@
 //! store's DFlash lanes). See [`draft_forward_lanes`].
 
 use super::{
-    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ordered_draft, ring_segments, upload_slice_i32, DflashConfig,
-    DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode, DRAFT_LANE_WS_ROWS,
+    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ordered_draft, ring_segments, upload_slice_i32,
+    DflashConfig, DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode,
+    DRAFT_LANE_WS_ROWS,
 };
 use crate::llama::{rotate_x_mq_batched_for, WeightTensor};
 use hip_bridge::HipResult;
@@ -138,9 +139,25 @@ fn lane_ctx_fill(
             shared.mq_x_rot.as_ref(),
             shared.mq_x_rot_f16.as_ref(),
         )?;
-        gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, step * cfg.n_kv_heads, hd, eps)?;
+        gpu.rmsnorm_batched(
+            &k_slot,
+            &layer.k_norm,
+            &k_slot,
+            step * cfg.n_kv_heads,
+            hd,
+            eps,
+        )?;
         let fill_positions = ls.positions_k.sub_offset(row - g.pos_base, step);
-        gpu.rope_batched_f32(q_dummy, &k_slot, &fill_positions, 0, cfg.n_kv_heads, hd, theta, step)?;
+        gpu.rope_batched_f32(
+            q_dummy,
+            &k_slot,
+            &fill_positions,
+            0,
+            cfg.n_kv_heads,
+            hd,
+            theta,
+            step,
+        )?;
         row += step;
     }
     Ok(())
@@ -157,7 +174,12 @@ struct CtxLayout<'a> {
     fill_start: usize,
 }
 
-fn ctx_layout<'a>(cfg: &DflashConfig, ls: &'a DflashScratch, g: &LaneGeo, li: usize) -> CtxLayout<'a> {
+fn ctx_layout<'a>(
+    cfg: &DflashConfig,
+    ls: &'a DflashScratch,
+    g: &LaneGeo,
+    li: usize,
+) -> CtxLayout<'a> {
     let l = g.l;
     let (swa_w, full_w) = (g.swa_w, g.full_w);
     let is_last_layer = li + 1 == cfg.n_layers;
@@ -196,8 +218,16 @@ fn ctx_step(row: usize, l: usize, swa_w: usize, layer_w: usize) -> (usize, usize
             row % layer_w
         }))
         .min(l - row);
-    let p_slot = if swa_w == usize::MAX { row } else { row % swa_w };
-    let c_slot = if layer_w == usize::MAX { row } else { row % layer_w };
+    let p_slot = if swa_w == usize::MAX {
+        row
+    } else {
+        row % swa_w
+    };
+    let c_slot = if layer_w == usize::MAX {
+        row
+    } else {
+        row % layer_w
+    };
     (step, p_slot, c_slot)
 }
 
@@ -335,7 +365,11 @@ impl RowPlan {
     /// Classify (by ORIGINAL segment length) and assign packed rows. `false`
     /// when the packed rows exceed `max_rows` (the workspace capacity).
     fn finish(&mut self, max_rows: usize) -> bool {
-        self.n_w = self.segs[..self.ns].iter().filter(|s| s.n >= 2).map(|s| s.n).sum();
+        self.n_w = self.segs[..self.ns]
+            .iter()
+            .filter(|s| s.n >= 2)
+            .map(|s| s.n)
+            .sum();
         self.n_s = self.segs[..self.ns].iter().filter(|s| s.n == 1).count();
         if self.n_w + self.n_s > max_rows {
             return false;
@@ -467,7 +501,10 @@ fn pool_gemm(
     y: &GpuTensor,
     plan: &RowPlan,
 ) -> HipResult<()> {
-    let rot_scratch = shared.mq_x_rot.as_ref().expect("lane ctx admitted without mq_x_rot");
+    let rot_scratch = shared
+        .mq_x_rot
+        .as_ref()
+        .expect("lane ctx admitted without mq_x_rot");
     let (k, m) = (w.k, w.m);
     let mut r0 = 0usize;
     while r0 < plan.n_w {
@@ -569,7 +606,14 @@ fn fc_batched(
     let gather = gather_spans(plan);
     gpu.draft_rows_gather_f32(&ws.input, None, &gather[..plan.ns], k)?;
     pool_gemm(gpu, shared, &weights.fc, &ws.input, &ws.fc_out, plan)?;
-    gpu.rmsnorm_batched(&ws.fc_out, &weights.hidden_norm, &ws.fc_out, plan.total(), h, cfg.norm_eps)?;
+    gpu.rmsnorm_batched(
+        &ws.fc_out,
+        &weights.hidden_norm,
+        &ws.fc_out,
+        plan.total(),
+        h,
+        cfg.norm_eps,
+    )?;
     let scatter = scatter_spans(plan);
     gpu.draft_rows_scatter_f32(&ws.fc_out, None, &scatter[..plan.ns], h)
 }
@@ -587,7 +631,12 @@ fn plan_ctx(
 ) -> Option<RowPlan> {
     let ws = shared.lane_ws.as_ref()?;
     let (h, kvd) = (cfg.hidden, cfg.kv_dim());
-    if layer.wk.k != h || layer.wk.m != kvd || layer.wv.k != h || layer.wv.m != kvd || h > ws.input_width {
+    if layer.wk.k != h
+        || layer.wk.m != kvd
+        || layer.wv.k != h
+        || layer.wv.m != kvd
+        || h > ws.input_width
+    {
         return None;
     }
     let mut plan = RowPlan::new();
@@ -648,7 +697,14 @@ fn ctx_fill_batched(
     gpu.draft_rows_gather_f32(&ws.input, Some(&ws.positions), &gather[..plan.ns], h)?;
     pool_gemm(gpu, shared, &layer.wk, &ws.input, &ws.k_out, plan)?;
     pool_gemm(gpu, shared, &layer.wv, &ws.input, &ws.v_out, plan)?;
-    gpu.rmsnorm_batched(&ws.k_out, &layer.k_norm, &ws.k_out, total * cfg.n_kv_heads, hd, cfg.norm_eps)?;
+    gpu.rmsnorm_batched(
+        &ws.k_out,
+        &layer.k_norm,
+        &ws.k_out,
+        total * cfg.n_kv_heads,
+        hd,
+        cfg.norm_eps,
+    )?;
     gpu.rope_batched_f32(
         &shared.q,
         &ws.k_out,
@@ -707,12 +763,44 @@ fn lane_attention(
     let mut cat_off = 0usize;
     for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
         let seg_bytes = len * kvd * 4;
-        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
-        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &k_cat_l.buf,
+            cat_off,
+            &k_cache_layer.buf,
+            slot0 * kvd * 4,
+            seg_bytes,
+        )?;
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &v_cat_l.buf,
+            cat_off,
+            &v_cache_layer.buf,
+            slot0 * kvd * 4,
+            seg_bytes,
+        )?;
         cat_off += seg_bytes;
     }
-    draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &shared.k_noise.buf, g.off * kvd * 4, noise_bytes)?;
-    draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &shared.v_noise.buf, g.off * kvd * 4, noise_bytes)?;
+    draft_dtod_at(
+        gpu,
+        ordered,
+        &k_cat_l.buf,
+        cat_off,
+        &shared.k_noise.buf,
+        g.off * kvd * 4,
+        noise_bytes,
+    )?;
+    draft_dtod_at(
+        gpu,
+        ordered,
+        &v_cat_l.buf,
+        cat_off,
+        &shared.v_noise.buf,
+        g.off * kvd * 4,
+        noise_bytes,
+    )?;
     let q_view = shared.q.sub_offset(g.off * qd, b * qd);
     let out_view = shared.attn_out.sub_offset(g.off * qd, b * qd);
     let is_swa_layer = g.windowed && (g.all_sliding_windowed || !is_full_layer);
@@ -813,10 +901,12 @@ pub fn draft_forward_lanes(
         ));
     }
     if let Some(sh) = shared.mq_x_rot.as_ref() {
-        if lanes
-            .iter()
-            .any(|ln| ln.scratch.mq_x_rot.as_ref().is_some_and(|t| t.shape != sh.shape))
-        {
+        if lanes.iter().any(|ln| {
+            ln.scratch
+                .mq_x_rot
+                .as_ref()
+                .is_some_and(|t| t.shape != sh.shape)
+        }) {
             return Err(hip_bridge::HipError::new(
                 0,
                 "draft_forward_lanes: a lane's own FWHT rotation scratch differs in size from the shared one",
@@ -835,7 +925,10 @@ pub fn draft_forward_lanes(
     let theta = cfg.rope_theta;
     let inter = cfg.intermediate;
     let total: usize = lanes.iter().map(|ln| ln.b).sum();
-    assert!(total <= shared.max_block_size, "lane rows > shared scratch max");
+    assert!(
+        total <= shared.max_block_size,
+        "lane rows > shared scratch max"
+    );
 
     // ── Per-lane geometry, key positions, context projection ─────────────
     let ordered = ordered_draft();
@@ -850,9 +943,17 @@ pub fn draft_forward_lanes(
         // GEMMs and hidden norms read no positions; every position reader
         // (context RoPE, query/noise RoPE) still runs after its upload.
         for lane in lanes.iter() {
-            assert_eq!(lane.positions_k.len(), lane.ctx_len + lane.b, "positions_k size");
+            assert_eq!(
+                lane.positions_k.len(),
+                lane.ctx_len + lane.b,
+                "positions_k size"
+            );
             let ls = &*lane.scratch;
-            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, lane.ctx_len))?;
+            upload_slice_i32(
+                gpu,
+                &ls.positions_k,
+                lane_key_positions(ls, lane.positions_k, lane.ctx_len),
+            )?;
         }
         upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
     }
@@ -879,9 +980,18 @@ pub fn draft_forward_lanes(
             DraftCtxMode::Windowed { w, w_full } => (w, w_full),
         };
         let windowed = !matches!(ls.ctx_mode, DraftCtxMode::Legacy);
-        let pos_base = if windowed { l.saturating_sub(full_w) } else { 0 };
-        if windowed && full_w != swa_w && l > swa_w && ls.thlog.full_cached_rows() < l.saturating_sub(swa_w) {
-            static BACKFILL_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let pos_base = if windowed {
+            l.saturating_sub(full_w)
+        } else {
+            0
+        };
+        if windowed
+            && full_w != swa_w
+            && l > swa_w
+            && ls.thlog.full_cached_rows() < l.saturating_sub(swa_w)
+        {
+            static BACKFILL_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !BACKFILL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[dflash] windowed: last-layer backfill watermark {} < l−W {} — stale \
@@ -893,7 +1003,11 @@ pub fn draft_forward_lanes(
             }
         }
         if !ordered {
-            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, l))?;
+            upload_slice_i32(
+                gpu,
+                &ls.positions_k,
+                lane_key_positions(ls, lane.positions_k, l),
+            )?;
         }
         let cached_rows = ls.thlog.proj_cached_rows();
         if fc_plan.is_none() {
@@ -937,7 +1051,14 @@ pub fn draft_forward_lanes(
         && geos.len() <= DRAFT_CONV_LANES_MAX
         && geos.iter().all(|g_| g_.b > 0)
         && gpu.draft_lane_conv_admitted())
-    .then(|| geos.iter().map(|g_| DraftConvLane { row0: g_.off, rows: g_.b }).collect());
+    .then(|| {
+        geos.iter()
+            .map(|g_| DraftConvLane {
+                row0: g_.off,
+                rows: g_.b,
+            })
+            .collect()
+    });
     let conv_kgs = || {
         let k = cfg.conv_kernel_size.unwrap_or(2);
         let g = cfg.conv_group_size.unwrap_or(16);
@@ -945,7 +1066,15 @@ pub fn draft_forward_lanes(
     };
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
-        draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &shared.residual.buf,
+            0,
+            &shared.x.buf,
+            0,
+            (rows * h) * 4,
+        )?;
         gpu.rmsnorm_batched(&shared.x, &layer.attn_norm, &shared.x_norm, rows, h, eps)?;
 
         // DFlash2 prepare convolution (causal across the rows of ONE block ⇒
@@ -970,7 +1099,18 @@ pub fn draft_forward_lanes(
                 shared.mq_x_rot_f16.as_ref(),
             )?;
             if let Some(cl) = &conv_lanes {
-                gpu.dynamic_causal_conv_f32_lanes(&shared.x_norm, base, dyn_buf, tmp, cl, h, k, g, stride, 0)?;
+                gpu.dynamic_causal_conv_f32_lanes(
+                    &shared.x_norm,
+                    base,
+                    dyn_buf,
+                    tmp,
+                    cl,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    0,
+                )?;
             } else {
                 for g_ in &geos {
                     let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
@@ -1036,8 +1176,22 @@ pub fn draft_forward_lanes(
         gpu.draft_rows64_exit(scoped);
         filled?;
 
-        gpu.rmsnorm_batched(&shared.q, &layer.q_norm, &shared.q, rows * cfg.n_heads, hd, eps)?;
-        gpu.rmsnorm_batched(&shared.k_noise, &layer.k_norm, &shared.k_noise, rows * cfg.n_kv_heads, hd, eps)?;
+        gpu.rmsnorm_batched(
+            &shared.q,
+            &layer.q_norm,
+            &shared.q,
+            rows * cfg.n_heads,
+            hd,
+            eps,
+        )?;
+        gpu.rmsnorm_batched(
+            &shared.k_noise,
+            &layer.k_norm,
+            &shared.k_noise,
+            rows * cfg.n_kv_heads,
+            hd,
+            eps,
+        )?;
         gpu.rope_batched_f32(
             &shared.q,
             &shared.k_noise,
@@ -1070,13 +1224,35 @@ pub fn draft_forward_lanes(
             let (k, g, groups, stride) = conv_kgs();
             let base_phase1 = base.sub_offset(k * h, k * h);
             if let Some(cl) = &conv_lanes {
-                gpu.dynamic_causal_conv_f32_lanes(&shared.x, &base_phase1, dyn_buf, tmp, cl, h, k, g, stride, k * groups)?;
+                gpu.dynamic_causal_conv_f32_lanes(
+                    &shared.x,
+                    &base_phase1,
+                    dyn_buf,
+                    tmp,
+                    cl,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
             } else {
                 for g_ in &geos {
                     let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
                     let out = tmp.sub_offset(g_.off * h, g_.b * h);
                     let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                    gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+                    gpu.dynamic_causal_conv_f32(
+                        &inp,
+                        &base_phase1,
+                        &dy,
+                        &out,
+                        g_.b,
+                        h,
+                        k,
+                        g,
+                        stride,
+                        k * groups,
+                    )?;
                 }
             }
             let tmp_v = tmp.sub_offset(0, rows * h);
@@ -1092,7 +1268,15 @@ pub fn draft_forward_lanes(
             &shared.conv_dynamic,
             &shared.conv_temp,
         ) {
-            draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
+            draft_dtod_at(
+                gpu,
+                ordered,
+                &shared.residual.buf,
+                0,
+                &shared.x.buf,
+                0,
+                (rows * h) * 4,
+            )?;
             gpu.rmsnorm_batched(&shared.x, &layer.ffn_norm, &shared.x_norm, rows, h, eps)?;
             let (k, g, groups, stride) = conv_kgs();
             let dyn_all = dyn_buf.sub_offset(0, rows * stride);
@@ -1106,7 +1290,18 @@ pub fn draft_forward_lanes(
                 shared.mq_x_rot_f16.as_ref(),
             )?;
             if let Some(cl) = &conv_lanes {
-                gpu.dynamic_causal_conv_f32_lanes(&shared.x_norm, base, dyn_buf, tmp, cl, h, k, g, stride, 0)?;
+                gpu.dynamic_causal_conv_f32_lanes(
+                    &shared.x_norm,
+                    base,
+                    dyn_buf,
+                    tmp,
+                    cl,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    0,
+                )?;
             } else {
                 for g_ in &geos {
                     let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
@@ -1148,13 +1343,35 @@ pub fn draft_forward_lanes(
             )?;
             let base_phase1 = base.sub_offset(k * h, k * h);
             if let Some(cl) = &conv_lanes {
-                gpu.dynamic_causal_conv_f32_lanes(&shared.x, &base_phase1, dyn_buf, tmp, cl, h, k, g, stride, k * groups)?;
+                gpu.dynamic_causal_conv_f32_lanes(
+                    &shared.x,
+                    &base_phase1,
+                    dyn_buf,
+                    tmp,
+                    cl,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
             } else {
                 for g_ in &geos {
                     let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
                     let out = tmp.sub_offset(g_.off * h, g_.b * h);
                     let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                    gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+                    gpu.dynamic_causal_conv_f32(
+                        &inp,
+                        &base_phase1,
+                        &dy,
+                        &out,
+                        g_.b,
+                        h,
+                        k,
+                        g,
+                        stride,
+                        k * groups,
+                    )?;
                 }
             }
             let tmp_v = tmp.sub_offset(0, rows * h);

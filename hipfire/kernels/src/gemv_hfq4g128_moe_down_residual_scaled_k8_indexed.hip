@@ -23,7 +23,7 @@ extern "C" __global__ void gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
     const float* __restrict__ per_expert_scale,
     const float* __restrict__ hidden_batch,
     float* __restrict__ x_residual,
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -40,6 +40,7 @@ extern "C" __global__ void gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
 #pragma unroll
         for (int krank = 0; krank < 8; ++krank) {
             const int expert_id = topk_indices[krank];
+            if ((unsigned)expert_id >= (unsigned)n_experts) continue;
             const char* gptr = reinterpret_cast<const char*>(expert_ptrs[expert_id])
                 + ((long long)row * groups_per_row + g) * 72;
             const float scale = __builtin_bit_cast(float, *(const unsigned int*)gptr);

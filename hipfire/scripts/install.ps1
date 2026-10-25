@@ -590,6 +590,49 @@ if ($NoPath) {
     Write-Host "hipfire already in PATH ✓" -ForegroundColor Green
 }
 
+# ─── Calibration offer ───────────────────────────────────
+# Offer `hipfire calibrate` only on an interactive console and only when no fresh record covers
+# this host (`calibrate --check` fails). Never fatal: a calibrate failure is a warning.
+$HipfireExe = "$BinDir\hipfire.exe"
+if (Test-Path $HipfireExe) {
+    $CalibrateFresh = $false
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $HipfireExe calibrate --check *> $null
+        $CalibrateFresh = ($LASTEXITCODE -eq 0)
+    } catch {
+        $CalibrateFresh = $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if (-not $CalibrateFresh) {
+        $AssumeYes = ($args -contains "--yes") -or ($args -contains "-y")
+        $CanPrompt = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not $AssumeYes
+        Write-Host ""
+        if ($CanPrompt) {
+            $reply = Read-Host "Calibrate hipfire for this host now? Measures link, CPU and GPU rates; takes up to 60 s. [Y/n]"
+            if ($reply -notmatch "^[Nn]") {
+                $ErrorActionPreference = "Continue"
+                try {
+                    & $HipfireExe calibrate
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "WARNING: hipfire calibrate failed (exit $LASTEXITCODE); the install is unaffected. Re-run 'hipfire calibrate' later." -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-Host "WARNING: hipfire calibrate failed: $_; the install is unaffected. Re-run 'hipfire calibrate' later." -ForegroundColor Yellow
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+            } else {
+                Write-Host "Skipped. Run 'hipfire calibrate' to tune hipfire to this host."
+            }
+        } else {
+            Write-Host "Run 'hipfire calibrate' to tune hipfire to this host."
+        }
+    }
+}
+
 # ─── Quick start ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== hipfire installed ===" -ForegroundColor Cyan

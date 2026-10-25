@@ -11,18 +11,18 @@
 // other 255 wait.  Here one wave32 owns one token (8 tokens per workgroup,
 // no workgroup barriers) and keeps the 512 logits in 16 registers per lane.
 //
-// Exactness:
+// Exactness (finite rows):
 //  * Selection.  For finite logits the incumbent's two-stage (per-wave top ten,
 //    then merge) selection is the global stable top ten in (value desc, index
 //    asc) order, which ten rounds of "wave max, lowest index holding it,
 //    remove" over all 512 entries produce directly.
-//  * Non-finite logits (NaN, +/-inf; checked after the optional BF16 round
-//    trip) make that equivalence fail (removed entries re-tie with real -inf
-//    entries, NaN never equals the max), so such a token runs the incumbent's
-//    two-stage selection verbatim, one virtual wave at a time.
 //  * The softmax denominator is the same left-to-right float32 sum over
 //    expert index 0..511 (one lane, LDS-staged), the same expf calls, the same
-//    selected-probability renormalization and early-return rules.
+//    selected-probability renormalization.
+//
+// Non-finite logits (NaN, +/-inf; checked after the optional BF16 round trip)
+// fail the whole row closed exactly as the incumbent does: ids -1, weights 0 and
+// a (layer, row) record in the device fault word.
 
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -36,6 +36,33 @@ __device__ __forceinline__ float router_bf16_rt(float v) {
     if (!isfinite(v)) return v;
     const unsigned int u = __float_as_uint(v);
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+// Router fault word (host-mapped, written with plain system-scope stores like the
+// bounded-wait block, so PCIe atomics are not required). 0 = clear; otherwise
+// ((row + 1) << 24) | (layer + 1) with the global row. The smaller code (earliest
+// row, then earliest layer) is kept; with simultaneous writers the last store wins.
+__device__ __forceinline__ void router_record_fault(
+    unsigned long long* fault, int layer, int row) {
+    if (fault == nullptr) return;
+    const unsigned long long code =
+        ((unsigned long long)(unsigned int)(row + 1) << 24) | (unsigned long long)(unsigned int)(layer + 1);
+    const unsigned long long current =
+        __hip_atomic_load(fault, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (current == 0ull || code < current)
+        __hip_atomic_store(fault, code, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Invalid-row result: expert marker -1 and weight 0 for all ten slots of local
+// row `token`, plus the fault record for global row `row`.
+__device__ __forceinline__ void router_fail_row(
+    int* topk_idx, float* topk_w, int token, unsigned long long* fault, int layer, int row) {
+    const size_t output_base = (size_t)token * 10;
+    for (int rank = 0; rank < 10; ++rank) {
+        topk_idx[output_base + rank] = -1;
+        topk_w[output_base + rank] = 0.0f;
+    }
+    router_record_fault(fault, layer, row);
 }
 
 __device__ __forceinline__ float router_wave_max(float v) {
@@ -73,11 +100,12 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
     int top_k,
     int normalize_topk_prob,
     int round_logits,
-    int tokens
+    int tokens,
+    unsigned long long* __restrict__ fault, // host-mapped router fault word, or null
+    int layer,                              // sealed call layer index
+    int row_base                            // global row of this launch's row 0
 ) {
     __shared__ float s_exps[ROUTER_TOKENS_PER_BLOCK][512];
-    __shared__ float s_cv[ROUTER_TOKENS_PER_BLOCK][80];
-    __shared__ int s_ci[ROUTER_TOKENS_PER_BLOCK][80];
 
     // Uniform across the workgroup; no workgroup barrier is used below.
     if (n_exp != 512 || top_k != 10) return;
@@ -95,14 +123,21 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
         for (int j = 0; j < 16; ++j) x[j] = router_bf16_rt(x[j]);
     }
 
+    // Any NaN/Inf logit (after the optional BF16 round trip) fails the whole row
+    // closed: expert marker -1, weight 0 for every slot, and the (row, layer)
+    // recorded in the device fault word. The vote is wave-uniform (one wave owns
+    // the token) and no later barrier exists, so the wave returns together.
     int nonfinite = 0;
 #pragma unroll
     for (int j = 0; j < 16; ++j) nonfinite |= !isfinite(x[j]);
-    const bool any_nonfinite = __any(nonfinite);
+    if (__any(nonfinite)) {
+        if (lane == 0) router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+        return;
+    }
 
     float bv[10];
     int bi[10];
-    if (!any_nonfinite) {
+    {
         float v[16];
 #pragma unroll
         for (int j = 0; j < 16; ++j) v[j] = x[j];
@@ -120,53 +155,6 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
             bi[rank] = best_index;
 #pragma unroll
             for (int j = 0; j < 16; ++j) v[j] = (lane + 32 * j) == best_index ? -INFINITY : v[j];
-        }
-    } else {
-        // Incumbent selection verbatim: eight virtual waves of 64 entries each
-        // pick a local top ten, then a 32-lane merge of the 80 candidates.
-#pragma unroll 1
-        for (int vw = 0; vw < 8; ++vw) {
-            float first_value = row[vw * 32 + lane];
-            float second_value = row[256 + vw * 32 + lane];
-            if (round_logits != 0) {
-                first_value = router_bf16_rt(first_value);
-                second_value = router_bf16_rt(second_value);
-            }
-            const int first_index = vw * 32 + lane;
-            const int second_index = 256 + vw * 32 + lane;
-            for (int rank = 0; rank < 10; ++rank) {
-                const float best_value = router_wave_max(fmaxf(first_value, second_value));
-                const int candidate = first_value == best_value ? first_index
-                    : second_value == best_value ? second_index : 0x7fffffff;
-                const int best_index = router_wave_min(candidate);
-                if (lane == 0) {
-                    s_cv[wave][vw * 10 + rank] = best_value;
-                    s_ci[wave][vw * 10 + rank] = best_index;
-                }
-                if (first_index == best_index) first_value = -INFINITY;
-                if (second_index == best_index) second_value = -INFINITY;
-            }
-        }
-        router_wave_sync();
-        float value0 = s_cv[wave][lane];
-        float value1 = s_cv[wave][lane + 32];
-        float value2 = lane + 64 < 80 ? s_cv[wave][lane + 64] : -INFINITY;
-        const int index0 = s_ci[wave][lane];
-        const int index1 = s_ci[wave][lane + 32];
-        const int index2 = lane + 64 < 80 ? s_ci[wave][lane + 64] : 0x7fffffff;
-#pragma unroll
-        for (int rank = 0; rank < 10; ++rank) {
-            const float best_value = router_wave_max(fmaxf(fmaxf(value0, value1), value2));
-            int candidate = 0x7fffffff;
-            if (value0 == best_value) candidate = min(candidate, index0);
-            if (value1 == best_value) candidate = min(candidate, index1);
-            if (value2 == best_value) candidate = min(candidate, index2);
-            const int best_index = router_wave_min(candidate);
-            bv[rank] = best_value;
-            bi[rank] = best_index;
-            if (index0 == best_index) value0 = -INFINITY;
-            if (index1 == best_index) value1 = -INFINITY;
-            if (index2 == best_index) value2 = -INFINITY;
         }
     }
 
@@ -192,7 +180,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
             denom += e.z;
             denom += e.w;
         }
-        if (!(denom > 0.0f) || !isfinite(denom)) return;
+        if (!(denom > 0.0f) || !isfinite(denom)) {
+            router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+            return;
+        }
 
         float probabilities[10];
         const float inv_denom = 1.0f / denom;
@@ -204,7 +195,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32_fast(
             float selected_sum = 0.0f;
 #pragma unroll
             for (int rank = 0; rank < 10; ++rank) selected_sum += probabilities[rank];
-            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) return;
+            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) {
+                router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+                return;
+            }
             const float inv_selected = 1.0f / selected_sum;
 #pragma unroll
             for (int rank = 0; rank < 10; ++rank) probabilities[rank] *= inv_selected;

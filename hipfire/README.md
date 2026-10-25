@@ -11,15 +11,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.2" src="https://img.shields.io/badge/release-v0.4.2-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.2-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="90 curated registry entries" src="https://img.shields.io/badge/registry-90%20curated%20entries-ff8a1f?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.3" src="https://img.shields.io/badge/release-v0.4.3-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.3-f04b24?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="94 curated registry entries" src="https://img.shields.io/badge/registry-94%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#whats-new-in-042">What's new</a> ·
+  <a href="#whats-new-in-043">What's new</a> ·
   <a href="#models">Models</a> ·
   <a href="#gpu-support">GPU support</a> ·
   <a href="#peacemaker">PeaceMaker</a> ·
@@ -59,10 +59,12 @@ For one-shot inference:
 hipfire run qwen3.8:27b-mq4-xts "What is the capital of France?"
 ```
 
-Qwen3.8-Flash (`qwen3.8:flash-next`) is a MoE model with about 125 GB
-(116.7 GiB) of base weights plus sidecars. Its pinned artifact is
-`qwen3.8-flash-next.mq4-xts` (formerly `qwen3.8-flash-next-gptq3.mq4`, same
-bytes):
+Qwen3.8-Flash (`qwen3.8:flash-next`) is a MoE model. The tag resolves to the
+split base `qwen3.8-flash-next-base.mq4-xts` (about 70.9 GB), plus a shared
+per-token-embedding (PLE) sidecar (29.1 GB for q4 rows, 54.4 GB for q8 rows)
+and, on gfx1201, a 213 KB expert hot-set file. The old 125 GB monolith
+(`qwen3.8-flash-next.mq4-xts`, formerly `qwen3.8-flash-next-gptq3.mq4`) stays
+published for existing clients:
 
 ```bash
 hipfire pull qwen3.8:flash-next
@@ -98,6 +100,115 @@ back empty with `finish_reason: "length"`. Turn thinking off as shown above,
 or raise `max_tokens`. Qwen3.8 and Ornith 1.5 default to `medium` reasoning
 effort. See [docs/SERVE.md](docs/SERVE.md).
 
+## What's new in 0.4.3
+
+Every figure in this section comes from the v0.4.3 release notes. Each is a
+measurement on one named fixture and card, not a general throughput claim.
+The [CHANGELOG](CHANGELOG.md) 0.4.3 entry has the fixtures, methods and kill
+switches.
+
+### A3B prefill on the R9700: 0.4.2 (mq4r) vs 0.4.3 (mq4rs)
+
+Qwen3.6-35B-A3B prefill on a Radeon AI PRO R9700 (gfx1201):
+
+|Prefill tok/s|0.4.2 (mq4r)|0.4.3 (mq4r)|0.4.3 (mq4rs)|Speedup|
+|---|---:|---:|---:|---:|
+|pp512|3,292|3,332|11,589|3.5x|
+|pp1024|3,248|3,607|15,718|4.8x|
+|pp4096|2,886|3,737|19,828|6.9x|
+|pp8192|2,488|3,615|20,035|8.1x|
+|pp16384|1,957|3,561|18,545|9.5x|
+
+The speedup column is 0.4.3 mq4rs over 0.4.2 mq4r. Most of the gain comes from
+the new `qwen3.6:35b-a3b-mq4rs` quant (18.7 GB): 3.5x to 5.5x faster than the
+same 0.4.3 engine on the old mq4r file. The 0.4.3 engine alone is 1.0x to 1.8x
+faster on mq4r, and it removes 0.4.2's long-context falloff (0.4.2 loses 41%
+from pp512 to pp16384; 0.4.3 on mq4r does not fall off).
+
+**Fast mq4rs prefill is gfx1201 only.** On other GPUs the mq4rs file needs
+`HIPFIRE_MOE_SYM_IU4=0`, which makes prefill about 5x slower.
+
+**If you run the old mq4r, pull the new file:**
+
+```bash
+hipfire pull qwen3.6:35b-a3b-mq4rs
+```
+
+Caveats:
+
+- The measurement used one R9700, `hipfire bench --matrix --pp 512,1024,4096,8192,16384 --tg 1 --ctx 1 --runs 3 --warmups 1 --spec off`.
+  Each cell is the median of 9 samples from 3 fresh processes, with the arms
+  interleaved in one timing hold.
+- "0.4.2" means v0.4.2.1. Each version ran its default config, and the
+  defaults differ: 0.4.2.1 uses KV q8 and a 512-row prefill chunk, 0.4.3 uses
+  fp8 KV and an 8192-row chunk, and the symmetric IU4 MoE prefill route is only
+  admitted on the mq4rs file. The mq4r columns show what you get from upgrading
+  without changing the model file, not a single-variable engine A/B.
+- mq4rs WikiText-2 KLD is 0.129, against 0.206 for `qwen3.6:35b-a3b-mq4r`
+  (same harness). There is no MTP sidecar for mq4rs yet, and its router and
+  lm_head are 4-bit.
+- On the old mq4r file, 0.4.3 prefill numerics change slightly (WikiText-2
+  prefill KLD 0.2082 to 0.2115, inside the quality bar), and greedy output can
+  differ from 0.4.2 at near-ties.
+
+### Flash-Next on gfx1201 (R9700)
+
+- **Larger prefill chunk by default: faster prefill, slower decode.** The
+  default prefill chunk for Flash-Next is now 16,384 rows on gfx1201, together
+  with the compact forward scratch (below). Against the same build at a
+  4096-row chunk (one R9700, `gptq3` monolith, 3 fresh processes per arm),
+  pp16384 goes from 5,405 to 6,431 tok/s (+19.0%). Decode pays for it: AR
+  tg128 goes from 34.88 to 33.11 (−5.1%; synthetic tg128 uses random token
+  ids and understates real-text decode), `--spec auto` prose from 49.1 to 44.3
+  (−9.8%) and code from 73.7 to 66.1 (−10.3%), and resident experts drop from
+  8,234 to 6,578. **For short prompts with long generations, set
+  `HIPFIRE_PREFILL_CHUNK_ROWS=4096`.** Output is byte-identical.
+- **Compact forward scratch by default** for symmetric packed Flash-Next (the
+  split base and the `gptq3` monolith). Measured at the 4096-row chunk on the
+  split base: forward scratch 4,388 to 1,270 MiB (about 4.3 to 1.2 GiB), 8,234
+  experts resident instead of 6,948, pp16384 5,024 to 5,405 tok/s (+7.6%), tg128
+  33.56 to 34.84 (+3.8%). `HIPFIRE_QWEN4_COMPACT_SCRATCH=0` restores the full
+  scratch, and with it the 4096-row default chunk.
+- **Expert hot set by default.** `hipfire pull qwen3.8:flash-next` fetches the
+  213 KB `.expert-hotset` sidecar and the load applies it on gfx1201 only.
+  Hot experts stay resident in VRAM instead of whole layers. On real text it
+  measured +14% to +26% MTP decode (fiction prose +14.4%, coding prompt
+  +26.3%) and +7% to +40% plain AR, with no prefill loss (pp16384 +0.5%) and
+  byte-identical output. The copy-heavy code edit under MTP is the exception
+  (−3.1%). An earlier single-R9700 measurement, taken before the 16,384-row
+  default and not re-measured since, found the hot set costs about 9.5% of
+  short-context decode and 6% of pp512 against hot set off.
+  `HIPFIRE_QWEN4_EXPERT_HOTSET=0` restores whole-layer placement. Dense models
+  and Strix Halo are not affected.
+- **Exact prefill kernels on by default on gfx1201:** MQ6 INT8 GEMM (+3.8% at
+  pp16384 on one R9700), plus four byte-identical prefill waves (W1–W4) whose
+  gains are measured at the 16,384-row chunk. Kill switches are in the
+  [CHANGELOG](CHANGELOG.md).
+
+### Models, containers and tools
+
+- **LFM2.5 support.** Decode runs as typed dispatch steps for LFM2.5 dense and
+  MoE models, with correct think-channel and tool-call shapes, real stop
+  tokens, and a fix for the MoE down kernel that made LFM2.5-8B-A1B emit
+  degenerate text. LFM2.5-24B-A2B comes up with partial-GPU offload but has no
+  registry tag in this release. The `lfm2.5:` tags are unchanged.
+- **Smaller Flash-Next tiers**, `qwen3.8:flash-next-mq3-xts` and
+  `-mq2-xts`; see [the tier table](#qwen-38-flash-next-split-ple-tiers-043).
+- **Container image.** `compose.yml` runs a ROCm 10.1 `full` image (default)
+  or a slim `runtime` image with baked gfx1100, gfx1151 and gfx1201 kernel
+  packs. The image is published as `ghcr.io/warpfront/hipfire:0.4.3.1` (and
+  `:latest`).
+- **Strix Halo repetitive-prompt NaN fix**, with no prefill cost. A long
+  prompt with many repeated tokens could turn Flash-Next/Qwen GDN prefill NaN
+  on Strix Halo and the 7900 XTX.
+- **New commands:** `hipfire fit`, `hipfire doctor`, `hipfire calibrate`,
+  `hipfire doctor --npu` and `hipfire config tuning` presets.
+- **Retired tags:** `qwen3.8:flash-next-rtn-asym` and
+  `qwen3.8:flash-next-mq6q8-pleq8` are retired from new pulls; use
+  `qwen3.8:flash-next`. Already-installed verified files keep running.
+
+Upgrade notes and known issues are in the [CHANGELOG](CHANGELOG.md).
+
 ## What's new in 0.4.2
 
 The chart compares the 0.4.1 Strix Halo release-matrix cells published on
@@ -119,10 +230,11 @@ gives different token streams across fresh processes on three of the eight
 prompts (a known issue in the wall-time route chooser). Greedy AR and greedy
 MTP are bit-identical across processes.
 
-- **Qwen3.8-Flash EP2.** Owner-routed prefill and long-prefill expert staging
-  are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
-  expert ownership and native MTP also run under EP. EP4 owner-routed
-  prefill is still refused at admission.
+- **Qwen3.8-Flash expert parallelism (EP2 through EP8).** Owner-routed prefill
+  is on by default when `topology.ep` ranks of one exact arch, gfx1201 or
+  gfx1100, admit it; long-prefill expert staging and balanced per-call expert
+  ownership are gfx1201-only. Native MTP also runs under EP. EP is opt-in and
+  experimental.
   *Measured on 2x R9700 (gfx1201), pinned Qwen3.8-Flash XTS, committed prompts,
   2026-10-13: prefill went from 3,033 to 3,943 tok/s at 8K (1.30x) and from
   3,754 to 4,308 tok/s at 16K (1.15x), one card vs EP2.* See
@@ -156,10 +268,12 @@ MTP are bit-identical across processes.
   committed 8.2K-token prompt, 2026-10-12: prompt throughput went from
   3,809 to 4,921 tok/s (+29%).* See the
   [paired DFlash default](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
-- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolves to 4 for
-  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else.
+- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolved to 4 for
+  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else in 0.4.2.
   *Measured on gfx1151, pinned Qwen3.8-Flash XTS, code prompts (Rust/Go/Java),
-  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).*
+  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).* Since
+  0.4.3 `auto` drafts up to 7 on gfx1151 and the adaptive depth chooser picks
+  each window's depth; see the [CHANGELOG](CHANGELOG.md).
 - **Also in 0.4.2:**
   - a faster Qwen35 MTP prompt fill
   - gfx1201 batched MTP fill for Qwen3.8-Flash
@@ -178,15 +292,15 @@ not current product baselines.
 
 ## Models
 
-The bundled registry (`registry/v1.json`) contains 90 curated entries
-(models, quant variants and draft sidecars) and 82 aliases. Run
+The bundled registry (`registry/v1.json`) contains 94 curated entries
+(models, quant variants and draft sidecars) and 85 aliases. Run
 `hipfire list -r` for the live list.
 
 | Family | Pull tags |
 |---|---|
 | Qwen 3.8 dense | `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-xts` (flagship), `-mq4-xt`, `-mq4-pro`; MQ3, MQ5 and MQ6 `-xt` / base / `-pro` tiers; drafts `qwen3.8:27b-draft-mq3` … `-mq6` |
-| Qwen 3.8 Flash | `qwen3.8:flash-next` (alias `qwen3.8:flash`; MQ4 XTS) |
-| Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq5`, `-mq6` |
+| Qwen 3.8 Flash | `qwen3.8:flash-next` (alias `qwen3.8:flash`; MQ4 XTS split base), `-mq3-xts`, `-mq2-xts`, `-mq2-xts-4500` |
+| Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq4rs` (symmetric experts, gfx1201 fast prefill), `-mq5`, `-mq6` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, drafts `qwen3.6:27b-draft`, `-draft-mq3` |
 | Qwen 3.5 dense | `qwen3.5:0.8b`, `2b`, `4b`, `9b`, `27b`, with `-mq3` / `-mq6` variants and `9b` / `27b` drafts |
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
@@ -208,6 +322,60 @@ Curated weights are published under
 [docs/MODELS.md](docs/MODELS.md) covers sizes, minimum VRAM, sampling
 defaults, sidecars and provenance. To bring your own model, use
 `hipfire quantize`.
+
+### Qwen 3.8 Flash Next split-PLE tiers (0.4.3)
+
+The `hipfire-models/qwen3.8-flash-next` repository publishes three plain
+split-PLE trunk files at its root, next to the shared PLE sidecar. The sizes
+below are **file sizes in bytes, not VRAM or peak-memory requirements**.
+Publishing a file is not a claim that every GPU route or speed has been
+measured on it.
+The [published model card](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/fc845731a50018daf1eb43ad2619ca2cdd75c0ee/README.md#measurement-boundary-for-the-new-hashes)
+records the receipt-backed measurements and their acceptance scope.
+
+| Tier | File (HF link) | Bytes | SHA-256 |
+|---|---|---:|---|
+| MQ3 | [`qwen3.8-flash-next-base.mq3-xts`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq3-xts) | 59109362200 | `d35896ca69b87d3e93176847a036db3e2cb1554931f130a842b13718b486238b` |
+| MQ2 (6,306 hot) | [`qwen3.8-flash-next-base.mq2-xts`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq2-xts) | 46895167000 | `e2ba747485190da92cd7a36d3f56809e6db31a3ec328f5ab23e000275d798e57` |
+| MQ2 (4,500 hot) | [`qwen3.8-flash-next-base.mq2-xts-4500`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq2-xts-4500) | 44537253400 | `9087d7d8f67629a3256c26bfeb705e7ed22dd1622bb91e074035543d6caea5c2` |
+| Shared PLE sidecar (Q4) | [`qwen3.8-flash-next.ple-q4`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next.ple-q4) | 29120146432 | `fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e` |
+
+Trunk plus the Q4 sidecar totals 88,229,508,632 (MQ3), 76,015,313,432 (MQ2
+6,306) and 73,657,399,832 (MQ2 4,500) bytes on disk. The MQ2 tiers need
+hipfire at or after `ea2abd111f06339e9f25ac86715b7d210d0c5ae8`; the MQ3 tier
+needs `ca0aee9c925b4180651b194b440bcda80f656ac5`.
+
+**MQ2 KLD on an RX 7900 XTX (gfx1100), post-land.** Mean KLD against the FP8
+reference, hipfire `ea2abd111f06339e9f25ac86715b7d210d0c5ae8`, with the
+shipping MQ2 hashes above. WikiText-2 (`wt2`): 32 chunks, 8160 scored rows;
+`code24`: 24 chunks, 6120 scored rows. Pre-land references describe earlier
+d2 predecessor bytes, not fresh measurements of the published roots; decode
+rows are paired against the weight-only reference and prefill rows against
+the prefill reference. The pre-land
+decode references (MQ2 6,306: 0.1851 wt2 / 0.1981 code24; MQ2 4,500: 0.2078 /
+0.2077) are weight-only model KLD, not GPU route measurements; the XTX
+columns are GPU route measurements.
+
+| Tier | Corpus | Route | Pre-land reference | XTX post-land | Paired Δ (95% CI) | Relative Δ | Status |
+|---|---|---|---:|---:|---|---:|---|
+| MQ2 6,306 | wt2 | decode | 0.1851 | 0.1966 | +0.0115 (+0.0075, +0.0155) | +6.23% | accepted by Kaden exact-row exception |
+| MQ2 6,306 | code24 | decode | 0.1981 | 0.2083 | +0.0103 (+0.0018, +0.0160) | +5.18% | accepted, relative budget |
+| MQ2 6,306 | wt2 | prefill | 0.2095 | 0.2106 | +0.0011 (−0.0058, +0.0080) | +0.55% | accepted, not significant |
+| MQ2 6,306 | code24 | prefill | 0.2111 | 0.2112 | +0.0001 (−0.0059, +0.0068) | +0.05% | accepted, not significant |
+| MQ2 4,500 | wt2 | decode | 0.2078 | not re-measured (identity + G2 pass) | — | — | not re-measured (identity + G2 pass) |
+| MQ2 4,500 | code24 | decode | 0.2077 | 0.2192 | +0.0116 (+0.0053, +0.0179) | +5.56% | accepted, relative budget |
+| MQ2 4,500 | wt2 | prefill | 0.2274 | 0.2291 | +0.0017 (−0.0055, +0.0091) | +0.76% | accepted, not significant |
+| MQ2 4,500 | code24 | prefill | 0.2237 | not re-measured (identity + G2 pass) | — | — | not re-measured (identity + G2 pass) |
+
+Six of the eight cells were measured on the XTX. The MQ2 6,306 wt2 decode row
+(0.1966, +6.23%) exceeds the 6% relative budget and is accepted only as an
+explicit exact-row exception by Kaden; it is not a budget pass. The two
+remaining MQ2 4,500 cells were not re-measured. Product identity compared
+the builds on earlier d2 bytes (32 identical greedy token ids); G2 AR-lane
+parity passed on the published root hashes. Neither is a KLD measurement.
+This is not an
+all-eight-measured result. MQ3 XTX evidence is refusal-only; no XTX KLD or
+speed measurement is claimed.
 
 ## GPU support
 
@@ -300,10 +468,10 @@ notice (see `scripts/mirror_split.py`).
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.3/scripts/install.sh | bash
 
 # Or install the integration branch for testing:
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.3/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -313,13 +481,17 @@ detected arch when one is available. Otherwise they build kernels locally
 with hipcc. See
 [Prebuilt kernel packs](docs/GETTING_STARTED.md#prebuilt-kernel-packs).
 
+Before the first pull, `hipfire doctor` checks the driver and ROCm install, and
+`hipfire fit <model> --ctx N` says whether that model loads at that context on
+this machine, what the load would choose, and what to change if it does not.
+
 `hipfire version` compares the installed binary, the managed source checkout
 and the daemon. To switch revisions, use `hipfire update @beta`,
 `hipfire update --tag <tag>` or `hipfire update --commit <sha>`. To
 uninstall while keeping models and settings:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.3/scripts/uninstall.sh | bash
 ```
 
 `--dry-run` previews the uninstall. `--purge` also deletes `~/.hipfire` and
@@ -337,13 +509,13 @@ nix build github:warpfront/hipfire    # build package
 Containers ([docs/CONTAINER.md](docs/CONTAINER.md)):
 
 ```bash
-podman build -f Containerfile --target runtime -t hipfire .
-podman run --rm -it --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
-  -v hipfire-models:/root/.hipfire/models \
-  -v hipfire-kcache:/var/cache/hipfire \
-  hipfire run qwen3.5:4b "2+2="
+docker compose up -d      # or: podman compose up -d
+curl http://127.0.0.1:11435/v1/models
 ```
+
+The image is `ghcr.io/warpfront/hipfire:latest` (`docker pull
+ghcr.io/warpfront/hipfire:0.4.3.1`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.3.1`
+pins compose to a release.
 
 ## Deprecated features
 

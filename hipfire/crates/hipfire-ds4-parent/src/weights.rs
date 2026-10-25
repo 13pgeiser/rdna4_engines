@@ -141,9 +141,9 @@ pub struct ParentLayerWeights {
 
     // Router. `gate_bias` only on score-routed layers; `tid2eid` only on
     // hash-routed layers (`layer_idx < num_hash_layers`).
-    pub gate_weight: GpuTensor,           // BF16
-    pub gate_bias: Option<GpuTensor>,     // F32
-    pub tid2eid: Option<GpuTensor>,       // I64 / Raw
+    pub gate_weight: GpuTensor,       // BF16
+    pub gate_bias: Option<GpuTensor>, // F32
+    pub tid2eid: Option<GpuTensor>,   // I64 / Raw
 
     // Shared experts (dense FP8 → resident BF16).
     pub shared_w1: ParentDenseWeight,
@@ -204,11 +204,8 @@ impl ParentWeights {
 
         // Index inventory entries by name for O(1) lookup. MTP is already
         // excluded from `inv.entries`.
-        let by_name: HashMap<&str, &ParentTensorEntry> = inv
-            .entries
-            .iter()
-            .map(|e| (e.name.as_str(), e))
-            .collect();
+        let by_name: HashMap<&str, &ParentTensorEntry> =
+            inv.entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
         let t0 = Instant::now();
         let mut running = ParentResidency::default();
@@ -336,11 +333,46 @@ fn load_layer(
     let attn_sink = upload_f32(source, gpu, by_name, &p("attn.attn_sink"), running)?;
 
     // Dense attention projections.
-    let wq_a = decode_dense(source, gpu, backend, by_name, &p("attn.wq_a.weight"), running)?;
-    let wq_b = decode_dense(source, gpu, backend, by_name, &p("attn.wq_b.weight"), running)?;
-    let wkv = decode_dense(source, gpu, backend, by_name, &p("attn.wkv.weight"), running)?;
-    let wo_a = decode_dense(source, gpu, backend, by_name, &p("attn.wo_a.weight"), running)?;
-    let wo_b = decode_dense(source, gpu, backend, by_name, &p("attn.wo_b.weight"), running)?;
+    let wq_a = decode_dense(
+        source,
+        gpu,
+        backend,
+        by_name,
+        &p("attn.wq_a.weight"),
+        running,
+    )?;
+    let wq_b = decode_dense(
+        source,
+        gpu,
+        backend,
+        by_name,
+        &p("attn.wq_b.weight"),
+        running,
+    )?;
+    let wkv = decode_dense(
+        source,
+        gpu,
+        backend,
+        by_name,
+        &p("attn.wkv.weight"),
+        running,
+    )?;
+    let wo_a = decode_dense(
+        source,
+        gpu,
+        backend,
+        by_name,
+        &p("attn.wo_a.weight"),
+        running,
+    )?;
+    let wo_b = decode_dense(
+        source,
+        gpu,
+        backend,
+        by_name,
+        &p("attn.wo_b.weight"),
+        running,
+    )?;
 
     // Compressor (ratio > 0).
     let compressor = if compress_ratio > 0 {
@@ -592,9 +624,7 @@ fn layer_residency(layer: &ParentLayerWeights) -> ParentResidency {
         &layer.shared_w2,
         &layer.shared_w3,
     ] {
-        r.dense_bf16_bytes = r
-            .dense_bf16_bytes
-            .saturating_add(d.resident_bytes() as u64);
+        r.dense_bf16_bytes = r.dense_bf16_bytes.saturating_add(d.resident_bytes() as u64);
     }
 
     if let Some(c) = layer.compressor.as_ref() {
@@ -691,9 +721,7 @@ fn shape_nbytes(shape: &[usize], elem: usize) -> Result<usize, String> {
     shape
         .iter()
         .try_fold(elem, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| {
-            format!("deepseek4 parent: shape {shape:?} × elem_size {elem} overflowed")
-        })
+        .ok_or_else(|| format!("deepseek4 parent: shape {shape:?} × elem_size {elem} overflowed"))
 }
 
 fn decode_dense(
@@ -729,12 +757,13 @@ fn decode_dense(
         )
     })?;
 
-    let w = ParentDenseWeight::decode_resident(gpu, backend, codes, scales, n, k).map_err(|err| {
-        format!(
-            "deepseek4 parent: dense decode failed for {name:?} \
+    let w =
+        ParentDenseWeight::decode_resident(gpu, backend, codes, scales, n, k).map_err(|err| {
+            format!(
+                "deepseek4 parent: dense decode failed for {name:?} \
              ([{n},{k}] codes={codes_nbytes} B scales={scales_nbytes} B): {err}"
-        )
-    })?;
+            )
+        })?;
     running.dense_bf16_bytes = running
         .dense_bf16_bytes
         .saturating_add(w.resident_bytes() as u64);
@@ -1001,7 +1030,11 @@ mod tests {
         for layer in 0..3 {
             let ratio = cfg.compress_ratio(layer);
             let is_hash = layer < cfg.num_hash_layers;
-            s.push(&format!("layers.{layer}.attn_norm.weight"), "BF16", vec![16]);
+            s.push(
+                &format!("layers.{layer}.attn_norm.weight"),
+                "BF16",
+                vec![16],
+            );
             s.push(&format!("layers.{layer}.ffn_norm.weight"), "BF16", vec![16]);
             s.push(
                 &format!("layers.{layer}.attn.q_norm.weight"),
@@ -1041,24 +1074,14 @@ mod tests {
             );
 
             for e in 0..cfg.n_routed_experts {
-                push_expert(
-                    &mut s,
-                    &format!("layers.{layer}.ffn.experts.{e}.w1"),
-                    8,
-                    32,
-                );
+                push_expert(&mut s, &format!("layers.{layer}.ffn.experts.{e}.w1"), 8, 32);
                 push_expert(
                     &mut s,
                     &format!("layers.{layer}.ffn.experts.{e}.w2"),
                     16,
                     32,
                 );
-                push_expert(
-                    &mut s,
-                    &format!("layers.{layer}.ffn.experts.{e}.w3"),
-                    8,
-                    32,
-                );
+                push_expert(&mut s, &format!("layers.{layer}.ffn.experts.{e}.w3"), 8, 32);
             }
 
             s.push(
@@ -1111,12 +1134,7 @@ mod tests {
                 );
             }
             if ratio == 4 {
-                push_dense(
-                    &mut s,
-                    &format!("layers.{layer}.attn.indexer.wq_b"),
-                    8,
-                    8,
-                );
+                push_dense(&mut s, &format!("layers.{layer}.attn.indexer.wq_b"), 8, 8);
                 s.push(
                     &format!("layers.{layer}.attn.indexer.weights_proj.weight"),
                     "BF16",
@@ -1163,16 +1181,8 @@ mod tests {
 
     fn push_expert(s: &mut ByteSource, stem: &str, n: usize, k_logical: usize) {
         assert!(k_logical % 32 == 0);
-        s.push(
-            &format!("{stem}.weight"),
-            "I8",
-            vec![n, k_logical / 2],
-        );
-        s.push(
-            &format!("{stem}.scale"),
-            "F8_E8M0",
-            vec![n, k_logical / 32],
-        );
+        s.push(&format!("{stem}.weight"), "I8", vec![n, k_logical / 2]);
+        s.push(&format!("{stem}.scale"), "F8_E8M0", vec![n, k_logical / 32]);
     }
 
     #[test]
@@ -1238,10 +1248,7 @@ mod tests {
         for layer in 0..3 {
             for e in 0..cfg.n_routed_experts {
                 let n = format!("layers.{layer}.ffn.experts.{e}.w1.weight");
-                assert!(
-                    inv.entries.iter().any(|ent| ent.name == n),
-                    "missing {n}"
-                );
+                assert!(inv.entries.iter().any(|ent| ent.name == n), "missing {n}");
             }
         }
     }
@@ -1269,9 +1276,12 @@ mod tests {
         let inv = ParentInventory::build(&src, &cfg).unwrap();
         let by_name: HashMap<&str, &ParentTensorEntry> =
             inv.entries.iter().map(|e| (e.name.as_str(), e)).collect();
-        let err =
-            require_entry(&by_name, "layers.0.attn.does_not_exist.weight", ParentTensorClass::Bf16)
-                .expect_err("missing");
+        let err = require_entry(
+            &by_name,
+            "layers.0.attn.does_not_exist.weight",
+            ParentTensorClass::Bf16,
+        )
+        .expect_err("missing");
         assert!(
             err.contains("missing from inventory") && err.starts_with("deepseek4 parent:"),
             "{err}"
@@ -1284,9 +1294,16 @@ mod tests {
         let inv = ParentInventory::build(&src, &cfg).unwrap();
         let by_name: HashMap<&str, &ParentTensorEntry> =
             inv.entries.iter().map(|e| (e.name.as_str(), e)).collect();
-        let err = require_entry(&by_name, "mtp.0.attn.wq_a.weight", ParentTensorClass::DenseFp8)
-            .expect_err("mtp");
-        assert!(err.contains("missing from inventory") || err.contains("MTP"), "{err}");
+        let err = require_entry(
+            &by_name,
+            "mtp.0.attn.wq_a.weight",
+            ParentTensorClass::DenseFp8,
+        )
+        .expect_err("mtp");
+        assert!(
+            err.contains("missing from inventory") || err.contains("MTP"),
+            "{err}"
+        );
     }
 
     #[test]

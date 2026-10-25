@@ -13,6 +13,9 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     p.s::<8>("scalars", 0, Live::Whole)?;
     let mut b = Builder::new(kspec, p);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    // registers initialized so the fixture is definedness-clean (R0604)
+    op(wg.isa(), "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    sop(wg.isa(), "s_mov_b32 s4, 0", &[4], &[])?;
     let tile = wg.lds::<Tile>("tile", 0, 16)?;
     let st = wg.begin_write(tile);
     wg.loop_carried(".Lloop", st, |wg, st| {

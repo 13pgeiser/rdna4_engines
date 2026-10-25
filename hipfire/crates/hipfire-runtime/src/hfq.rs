@@ -9,12 +9,13 @@ use crate::llama::{
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, SourceError,
-    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
-    SourceReader, SourceReaderImpl,
+    capture_file_identity, read_file_exact_at, read_file_nowait_at, verify_path_identity,
+    ModelSource, SourceError, SourceFileIdentity, SourceFormat, SourceIdentity,
+    SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl,
 };
-use crate::ple_sidecar::PleRowsFile;
 use crate::offload::LayerResidency;
+use crate::ple_hot_store::NowaitRead;
+use crate::ple_sidecar::PleRowsFile;
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, upload_decoded_bytes, HfqBackend, MemoryTarget, WeightBackend,
@@ -91,7 +92,7 @@ pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io:
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{}: unsupported HFQ format version {}",
+                "{}: unsupported HFQ format version {}; this model file was written by a newer hipfire. Update hipfire (`hipfire update`) or re-download a compatible build of the model",
                 path.display(),
                 raw_version & !HFQ_METADATA_OVERLAY_FLAG
             ),
@@ -244,6 +245,57 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
+
+/// One positioned read (`pread` on unix, `seek_read` on Windows) that does not
+/// need the file's mmap. Neither call is guaranteed to fill the buffer.
+#[cfg(any(unix, windows))]
+fn file_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+}
+
+/// Fill `buf` from `read_at(chunk, absolute_offset)`, looping over short
+/// reads and retrying `Interrupted`. Returns the bytes filled and the error
+/// that stopped the loop, if any. `total < buf.len()` with no error means EOF:
+/// the file is shorter than the index claims, so the caller must refuse rather
+/// than serve the untouched (zero-initialized) tail as tensor data.
+///
+/// Platform-neutral so the offset/short-read/EOF logic is unit-tested on every
+/// target; [`file_read_at`] supplies the OS call.
+#[cfg(any(unix, windows, test))]
+fn read_positional_exact(
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    offset: u64,
+    buf: &mut [u8],
+) -> (usize, Option<std::io::Error>) {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let Some(absolute) = offset.checked_add(total as u64) else {
+            return (
+                total,
+                Some(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read offset overflows u64",
+                )),
+            );
+        };
+        match read_at(&mut buf[total..], absolute) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return (total, Some(e)),
+        }
+    }
+    (total, None)
+}
 
 /// The only tensor a head overlay may carry.
 const HEAD_TENSOR_NAME: &str = "lm_head.weight";
@@ -489,7 +541,11 @@ pub struct HfqSourceIdentity {
 /// those sealed files.
 struct HfqRangeReader {
     identity: Arc<SourceIdentity>,
-    file: File,
+    /// The container's own open file, shared by every range of it: one
+    /// descriptor per HFQ file however many ranges are live (a Flash-Next EP
+    /// rank keeps ~130 ranges for its lifetime; a descriptor each ran a
+    /// many-rank load into `RLIMIT_NOFILE`). Reads are positional.
+    file: Arc<File>,
     file_identity: SourceFileIdentity,
     /// The file's `evict_page_cache` policy when the range was taken: the
     /// weight upload's bytes are dropped from the page cache after upload.
@@ -509,6 +565,13 @@ impl SourceReaderImpl for HfqRangeReader {
             verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+
+    fn read_nowait_at(&self, offset: u64, dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+        for expected in &self.identity.files {
+            verify_path_identity(expected)?;
+        }
+        read_file_nowait_at(&self.file, &self.file_identity, offset, dst)
     }
 
     fn release_uploaded(&self, offset: u64, len: u64) {
@@ -534,7 +597,9 @@ pub struct RecommendedSampling {
 }
 
 pub struct HfqFile {
-    _file: File,
+    /// Open container file, shared with every range reader handed out by
+    /// [`Self::tensor_range`] / [`Self::span_range`].
+    _file: Arc<File>,
     /// Path used to open the file. Exposed via [`Self::path`] so the
     /// weight pager can open its own file handle for paged reads without
     /// going through this struct (cleanly separates HfqFile's mmap-based
@@ -605,33 +670,15 @@ impl HfqFile {
         self.mq4v2_symmetric
     }
 
-    /// Header-only sibling of [`Self::open`]: read the 32-byte container
-    /// header and return its `arch_id` — no mmap, no metadata JSON parse, no
-    /// tensor index.
+    /// Header-only sibling of [`Self::open`]: the container's `arch_id` from
+    /// its 32-byte header, no mmap, no metadata parse, no tensor index.
     ///
-    /// [`Self::open`] is the load path: it walks the metadata and
-    /// materialises every tensor entry, which is far too much work for a
-    /// discovery scan. Serve's `/v1/models` uses this to classify an on-disk
-    /// file the registry does not vouch for — a trunk versus a sidecar
-    /// artifact (the DFlash drafts and friends carry arch ids 20/21/22/23;
-    /// see `docs/architecture-ids.md` § Sidecar / reserved ids). `Err` for
-    /// anything that is not a container, or is shorter than one, so a caller
-    /// can read "cannot tell" as "not a trunk".
-    ///
-    /// The layout is the one [`Self::open_at_offset`] parses: `HFQM` magic,
-    /// `u32` version, `u32` arch id, `u32` tensor count, then the metadata and
-    /// data offsets — little-endian, relative to the container start.
+    /// Delegates to [`hipfire_registry::probe_hfq_arch_id`], which
+    /// owns the header layout (the one [`Self::open_at_offset`] parses) so the
+    /// registry's local-file classification and the loader cannot drift. `Err`
+    /// for anything that is not a container, or is shorter than one.
     pub fn probe_arch_id(path: &Path) -> std::io::Result<u32> {
-        let mut file = File::open(path)?;
-        let mut header = [0u8; 32];
-        file.read_exact(&mut header)?;
-        if &header[..4] != b"HFQM" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("HfqFile: not an HFQ container: {}", path.display()),
-            ));
-        }
-        Ok(u32::from_le_bytes(header[8..12].try_into().unwrap()))
+        hipfire_registry::probe_hfq_arch_id(path)
     }
 
     /// `open` with the REAP plan injected instead of taken from process config.
@@ -819,14 +866,17 @@ impl HfqFile {
             .cloned()
     }
 
-    /// Bind a PLE row sidecar to this base. The sidecar must have been built
-    /// for exactly this file: same length and same sha256 over
-    /// `[0, data_offset)`. A split base (marker, no shard tensors) must also
-    /// agree on the rows' source digest (`q8_rows_sha256 ==
-    /// source_rows_sha256`) and geometry; a monolithic base's embedded shard
-    /// tensors must match the sidecar's geometry (Q8_0 `[rows_per_shard,
-    /// row_width]`). One attach only. The sidecar takes no part in the
-    /// effective source identity, overlays or [`Self::tensor_range`].
+    /// Bind a PLE row sidecar to this base. A monolithic base (embedded shard
+    /// tensors, no marker) is bound to exactly one file: the sidecar must
+    /// carry this file's length and sha256 over `[0, data_offset)`, and the
+    /// embedded shards must match the sidecar's geometry (Q8_0
+    /// `[rows_per_shard, row_width]`). A split base (marker, no shard
+    /// tensors) is bound by row identity instead: the marker's geometry and
+    /// `q8_rows_sha256` must equal the sidecar's geometry and
+    /// `source_rows_sha256`; its own file length and index hash are free, so
+    /// one sidecar serves every split base marked for the same rows. One
+    /// attach only. The sidecar takes no part in the effective source
+    /// identity, overlays or [`Self::tensor_range`].
     pub fn attach_ple_rows(&mut self, rows: PleRowsFile) -> Result<(), String> {
         use crate::ple_sidecar::{
             embedded_shard_count, ple_shard_name, short_hex, PLE_BASE_MARKER_KEY, Q8_QUANT_TYPE,
@@ -840,7 +890,7 @@ impl HfqFile {
             crate::external_rows::RowEncoding::Q4Lm => {
                 "delete it and run `hipfire ple derive --format q4 <model>` to rebuild it for this base, or re-pull the matching files with `hipfire pull <model tag> --ple q4`"
             }
-            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar is bound to exactly one base file)",
+            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar must match its base: the same file for a monolithic base, the same source rows for a split base)",
         };
         if let Some(existing) = &self.ple_rows {
             return Err(format!(
@@ -848,16 +898,16 @@ impl HfqFile {
                 existing.path().display()
             ));
         }
-        if self.file_len() != table.base_file_bytes {
-            return Err(format!(
-                "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
-                table.base_file_bytes,
-                self.file_len()
-            ));
-        }
         let embedded = embedded_shard_count(&self.tensors).map_err(|e| format!("{base}: {e}"))?;
         let marker = self.ple_rows_marker();
         if embedded > 0 {
+            if self.file_len() != table.base_file_bytes {
+                return Err(format!(
+                    "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
+                    table.base_file_bytes,
+                    self.file_len()
+                ));
+            }
             if marker.is_some() {
                 return Err(format!(
                     "{base} carries `{PLE_BASE_MARKER_KEY}` (rows in a sidecar) but its index also holds {embedded} embedded PLE shard tensors; PLE sidecar {sidecar} cannot bind to it"
@@ -881,6 +931,18 @@ impl HfqFile {
                         rows_per_shard, row_width, info.quant_type, info.shape
                     ));
                 }
+            }
+            let actual = crate::ple_sidecar::hex_lower(
+                &self
+                    .index_sha256()
+                    .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
+            );
+            if actual != table.base_index_sha256 {
+                return Err(format!(
+                    "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
+                    short_hex(&table.base_index_sha256),
+                    short_hex(&actual)
+                ));
             }
         } else {
             let marker = marker.ok_or_else(|| {
@@ -908,18 +970,6 @@ impl HfqFile {
                     short_hex(&table.source_rows_sha256)
                 ));
             }
-        }
-        let actual = crate::ple_sidecar::hex_lower(
-            &self
-                .index_sha256()
-                .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
-        );
-        if actual != table.base_index_sha256 {
-            return Err(format!(
-                "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
-                short_hex(&table.base_index_sha256),
-                short_hex(&actual)
-            ));
         }
         self.ple_rows = Some(rows);
         Ok(())
@@ -985,7 +1035,7 @@ impl HfqFile {
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "HfqFile: truncated or corrupt HFQ container: reading {what} \
-                         needs {end} bytes but the file is only {file_len}"
+                         needs {end} bytes but the file is only {file_len}. The download may be incomplete; re-download the model with `hipfire pull <model>`"
                     ),
                 ))
             } else {
@@ -1018,7 +1068,7 @@ impl HfqFile {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "HfqFile: unsupported HFQ format version {format_version} \
-                     (raw header word {raw_format_version})"
+                     (raw header word {raw_format_version}); this model file was written by a newer hipfire. Update hipfire (`hipfire update`) or re-download a compatible build of the model"
                 ),
             ));
         }
@@ -1225,7 +1275,7 @@ impl HfqFile {
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "HfqFile: tensor '{name}' payload [{cumulative_offset}, {end}) \
-                         extends past the {file_len}-byte file (truncated container)"
+                         extends past the {file_len}-byte file (truncated container); the download may be incomplete, so re-download the model with `hipfire pull <model>`"
                     ),
                 ));
             }
@@ -1287,7 +1337,7 @@ impl HfqFile {
             }
         }
         let me = Self {
-            _file: file,
+            _file: Arc::new(file),
             path: path.to_path_buf(),
             source_file_identity,
             mmap: Some(mmap),
@@ -1323,7 +1373,7 @@ impl HfqFile {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "qwen3* model ({prov}) stamped arch_id={}; cannot guarantee froggeric pillar — re-quantize with correct arch_id (5=dense, 6=MoE)",
+                        "qwen3* model ({prov}) is stamped arch_id={}, which is wrong for a Qwen3 model; re-quantize it with the correct arch_id (5 = dense, 6 = MoE) or download a corrected build",
                         me.arch_id
                     ),
                 ));
@@ -1334,7 +1384,8 @@ impl HfqFile {
     }
 
     /// Drop the mmap to free the virtual address mapping. After this call,
-    /// `tensor_data()` returns `None` and all reads go through `tensor_data_pread()`.
+    /// `tensor_data()` returns `None` and all reads go through `tensor_data_pread()`
+    /// (`pread` on unix, `seek_read` on Windows) or `tensor_data_vec()`.
     ///
     /// On unified-memory APUs (Strix Halo, Steam Deck, etc.), GPU and CPU
     /// share physical RAM. Keeping the mmap alive while hipMalloc copies
@@ -1602,7 +1653,7 @@ impl HfqFile {
         if end > mmap.len() {
             eprintln!(
                 "HfqFile: tensor {name:?} data region [{}, {}) overruns the \
-                 {}-byte file — truncated or corrupt HFQ container",
+                 {}-byte file — truncated or corrupt HFQ container; re-download the model with `hipfire pull <model>`",
                 info.data_offset,
                 info.data_offset + info.data_size,
                 mmap.len()
@@ -1612,19 +1663,21 @@ impl HfqFile {
         Some((info, &mmap[info.data_offset..end]))
     }
 
-    /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
-    /// the file range. On unified-memory APUs (Strix Halo etc.), mmap pages
-    /// can't be evicted while the mapping exists, so pread + fadvise is the
-    /// only way to prevent page cache from starving hipMalloc.
+    /// Read tensor data via a positioned read (`pread` on unix, `seek_read`
+    /// on Windows) into a reusable buffer, then FADV_DONTNEED the file range
+    /// (unix only). On unified-memory APUs (Strix Halo etc.), mmap pages
+    /// can't be evicted while the mapping exists, so a positioned read after
+    /// [`Self::drop_mmap`] is the only way to prevent page cache from starving
+    /// hipMalloc. This path never touches the mmap, so it keeps working after
+    /// `drop_mmap()`.
     ///
     /// Returns (info, guard) where guard derefs to `&[u8]`. The buffer is
     /// reused across calls — the previous data is overwritten.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn tensor_data_pread(
         &self,
         name: &str,
     ) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
-        use std::os::unix::io::AsRawFd;
         // Overlay-first resolution (SP3): the overlay reads from its own fd /
         // pread_buf, so the returned guard borrows the overlay, not the base.
         if self.overlay.is_some() {
@@ -1636,43 +1689,23 @@ impl HfqFile {
         }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
-        let fd = self._file.as_raw_fd();
         {
             let mut buf = self.pread_buf.borrow_mut();
             buf.resize(info.data_size, 0);
-            let mut total_read = 0usize;
-            let mut read_err: Option<std::io::Error> = None;
-            while total_read < info.data_size {
-                let n = unsafe {
-                    libc::pread(
-                        fd,
-                        buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
-                    )
-                };
-                if n == 0 {
-                    // EOF: the file is shorter than the index claims. Without
-                    // this check the tail of the zero-initialized buffer would
-                    // be served as tensor data — silent weight corruption for
-                    // a truncated copy. Drop the partial buffer and report
-                    // the tensor as missing.
-                    break;
-                }
-                if n < 0 {
-                    read_err = Some(std::io::Error::last_os_error());
-                    break;
-                }
-                total_read += n as usize;
-            }
+            let (total_read, read_err) = read_positional_exact(
+                |chunk, at| file_read_at(&self._file, chunk, at),
+                info.data_offset as u64,
+                &mut buf,
+            );
             // A short read means the file shrank after a successful open
             // (open validates every indexed range up front). Return None so
             // the caller refuses — never hand back a zero-filled tail as if
-            // it were weights.
+            // it were weights. EOF (`read_err == None`) and I/O errors both
+            // land here.
             if total_read < info.data_size {
                 eprintln!(
                     "HfqFile: tensor {name:?} short read ({total_read} of {} \
-                     bytes at offset {}) — truncated or corrupt HFQ container{}",
+                     bytes at offset {}) — truncated or corrupt HFQ container; the file may have been cut short on disk, so re-download the model with `hipfire pull <model>`{}",
                     info.data_size,
                     info.data_offset,
                     read_err
@@ -1683,22 +1716,22 @@ impl HfqFile {
                 buf.clear();
                 return None;
             }
-            // Evict these pages from cache — works because pread doesn't hold a
-            // mapping. Skipped when the loader disabled eviction (discrete-GPU
-            // loads want the page cache warm for repeat loads).
-            if self.evict_page_cache {
-                fadvise_dontneed(fd, info.data_offset, info.data_size);
-            }
+            // Evict these pages from cache — works because a positioned read
+            // doesn't hold a mapping. Skipped when the loader disabled
+            // eviction (discrete-GPU loads want the page cache warm for
+            // repeat loads); a no-op on non-unix.
+            self.drop_pages_range(info.data_offset, info.data_size);
         }
         Some((info, self.pread_buf.borrow()))
     }
 
-    /// Non-unix fallback: just delegates to mmap-based tensor_data.
-    #[cfg(not(unix))]
+    /// Fallback for targets with neither `pread` nor `seek_read`: delegates to
+    /// the mmap-based `tensor_data`, so it returns `None` after `drop_mmap()`.
+    #[cfg(not(any(unix, windows)))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         // Overlay-first resolution (SP3). `tensor_data` already consults the
         // overlay, so delegating preserves it; the explicit guard keeps this
-        // symmetric with the unix path.
+        // symmetric with the unix/windows path.
         if self.overlay.is_some() {
             if let Some(ov) = &self.overlay {
                 if ov.find_tensor_info(name).is_some() {
@@ -1710,8 +1743,9 @@ impl HfqFile {
     }
 
     /// Read tensor data using the best available path:
-    /// - Unix with pread support: pread + fadvise_dontneed (avoids page cache buildup)
-    /// - Fallback: mmap slice (returns None if mmap was dropped)
+    /// - Unix / Windows: positioned read (`pread` / `seek_read`), independent
+    ///   of the mmap, so it works after `drop_mmap()`; unix also fadvise_dontneeds
+    /// - Other targets: mmap slice (returns None if mmap was dropped)
     ///
     /// Returns owned Vec<u8> to avoid lifetime issues with the pread RefCell.
     pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
@@ -1727,26 +1761,14 @@ impl HfqFile {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = self._file.as_raw_fd();
             let mut buf = vec![0u8; info.data_size];
-            let mut total_read = 0usize;
-            while total_read < info.data_size {
-                let n = unsafe {
-                    libc::pread(
-                        fd,
-                        buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
-                    )
-                };
-                if n <= 0 {
-                    break;
-                }
-                total_read += n as usize;
-            }
+            let (total_read, _) = read_positional_exact(
+                |chunk, at| file_read_at(&self._file, chunk, at),
+                info.data_offset as u64,
+                &mut buf,
+            );
             // A short read means the file shrank after a successful open
             // (open validates every indexed range up front). Return None so
             // the caller refuses — never hand back a zero-filled tail as if
@@ -1754,13 +1776,11 @@ impl HfqFile {
             if total_read < info.data_size {
                 return None;
             }
-            if self.evict_page_cache {
-                fadvise_dontneed(fd, info.data_offset, info.data_size);
-            }
+            self.drop_pages_range(info.data_offset, info.data_size);
             return Some((info, buf));
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let mmap = self.mmap.as_ref()?;
             Some((
@@ -2011,10 +2031,7 @@ impl HfqFile {
                 reason: format!("HFQ source file index {file_index} is not sealed"),
             })?
             .clone();
-        let file = target._file.try_clone().map_err(|source| SourceError::Io {
-            offset: info.data_offset as u64,
-            source,
-        })?;
+        let file = Arc::clone(&target._file);
         let reader = SourceReader::from_inner(HfqRangeReader {
             identity: source_identity.clone(),
             file,
@@ -2030,6 +2047,48 @@ impl HfqFile {
             reader,
         )
         .map(Some)
+    }
+
+    /// A checked positional descriptor over an arbitrary byte span of the
+    /// BASE container (not an index entry). Used for derived views such as a
+    /// layer's contiguous expert slab arena.
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        let source_identity = self.effective_source_identity()?;
+        let file_identity = source_identity
+            .files
+            .first()
+            .ok_or_else(|| SourceError::MissingEffectiveSeal {
+                reason: "HFQ source file index 0 is not sealed".to_string(),
+            })?
+            .clone();
+        let file = Arc::clone(&self._file);
+        let reader = SourceReader::from_inner(HfqRangeReader {
+            identity: source_identity.clone(),
+            file,
+            file_identity,
+            evict_after_upload: self.evict_page_cache,
+        });
+        SourceRangeDescriptor::from_parts(
+            source_identity,
+            offset as u64,
+            len as u64,
+            dtype.to_string(),
+            logical_shape,
+            reader,
+        )
+    }
+
+    /// The mapped bytes of `[offset, offset + len)`; `None` when the mapping
+    /// was dropped or the span overruns the file.
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        mmap.get(offset..offset.checked_add(len)?)
     }
 
     /// Full tensor index of this HFQ file, in on-disk order.
@@ -2161,6 +2220,12 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         52 => "MQ4G256V2L",
         53 => "MQ4G128V2",
         54 => "I64",
+        55 => "FP8E4M3B128",
+        56 => "FP8E4M3PT",
+        131 => "MQ3I4G128R256",
+        132 => "MQ3I4G128R128",
+        133 => "MQ2I4G128R256",
+        134 => "MQ2I4G128R128",
         _ => "?",
     }
 }
@@ -2171,6 +2236,7 @@ pub struct HfqModelSource {
     hfq: HfqFile,
     infos: Vec<crate::model_source::TensorInfo>,
     index: std::collections::HashMap<String, usize>,
+    prefer_ranges: bool,
 }
 
 impl HfqModelSource {
@@ -2196,7 +2262,16 @@ impl HfqModelSource {
                 }
             })
             .collect();
-        Self { hfq, infos, index }
+        Self {
+            hfq,
+            infos,
+            index,
+            prefer_ranges: false,
+        }
+    }
+    /// Prefer checked file ranges without discarding the discrete-GPU mmap.
+    pub fn set_prefer_ranges(&mut self, enabled: bool) {
+        self.prefer_ranges = enabled;
     }
     pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
         self.hfq.source_identity()
@@ -2204,6 +2279,22 @@ impl HfqModelSource {
 
     pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
         self.hfq.tensor_range(name)
+    }
+
+    /// See [`HfqFile::span_range`].
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        self.hfq.span_range(offset, len, dtype, logical_shape)
+    }
+
+    /// See [`HfqFile::span_bytes`].
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        self.hfq.span_bytes(offset, len)
     }
 }
 
@@ -2231,6 +2322,19 @@ impl crate::model_source::ModelSource for HfqModelSource {
     }
     fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
         HfqModelSource::tensor_range(self, name)
+    }
+
+    fn tensor_payload<'a>(
+        &'a self,
+        name: &str,
+    ) -> Result<Option<crate::model_source::SourcePayload<'a>>, SourceError> {
+        use crate::model_source::SourcePayload;
+        if !self.prefer_ranges {
+            if let Some((info, bytes)) = self.tensor_data(name) {
+                return Ok(Some(SourcePayload::Borrowed { info, bytes }));
+            }
+        }
+        Ok(self.tensor_range(name)?.map(SourcePayload::Range))
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -2535,13 +2639,13 @@ pub(crate) fn load_weight_tensor(
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
-            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+            None => Err(HipError::new(0, "weight format qt=52 has no decoder in this hipfire build; update hipfire or re-download a build of the model in a supported format")),
         },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
+                &format!("weight {st_name} uses quant_type {other}, which this hipfire build cannot load; update hipfire or re-download a build of the model in a supported format"),
             )),
         },
     }?;
@@ -2620,13 +2724,13 @@ pub fn load_weight_tensor_pread(
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
-            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+            None => Err(HipError::new(0, "weight format qt=52 has no decoder in this hipfire build; update hipfire or re-download a build of the model in a supported format")),
         },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
+                &format!("weight {st_name} uses quant_type {other}, which this hipfire build cannot load; update hipfire or re-download a build of the model in a supported format"),
             )),
         },
     }?;
@@ -2777,17 +2881,11 @@ pub fn validate_llama_hfq_admission(hfq: &HfqFile) -> HipResult<()> {
             0,
             &format!(
                 "refusing to load Qwen2 HFQ through the LLaMA family path: \
-                 tensor `model.layers.0.self_attn.q_proj.bias` is present, \
-                 which means this is a Qwen2 (attention_bias=true) model. \
-                 The LLaMA loader drops Q/K/V proj bias and would produce \
-                 wrong outputs. \
-                 Current HFQ arch_id = {}. Re-quantise with \
-                 `hipfire-quantize --arch-id 7 ...` so the daemon \
-                 dispatches arch_id=7 to hipfire-arch-qwen2 (once that \
-                 crate is wired in), or — for inspection only — load \
-                 directly via `cargo run --example inspect_hfq -p \
-                 hipfire-arch-qwen2 -- <path>`. \
-                 See docs/plans/dots-ocr-devlog.md §7.",
+                 this file is a Qwen2 model (tensor \
+                 `model.layers.0.self_attn.q_proj.bias` is present, so it has attention \
+                 biases) but it is labelled arch_id = {} (LLaMA). The LLaMA loader drops \
+                 the Q/K/V biases and would produce wrong output. Re-quantize the model \
+                 with `hipfire-quantize --arch-id 7 ...` so it loads as a Qwen2 model.",
                 hfq.arch_id
             ),
         ));
@@ -3685,6 +3783,33 @@ mod compact_qwen4_ple_tests {
     use super::*;
     use crate::model_source::{ModelSource, SourceError, SourceFormat, SourcePayload};
 
+    #[test]
+    fn direct_source_range_preference_retains_mmap_and_old_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range-preference.hfq");
+        write_compact_qwen4_ple_hfq(&path).unwrap();
+        let mut source = HfqModelSource::from_hfq(HfqFile::open(&path).unwrap());
+        let name = COMPACT_PLE_NAMES[0];
+        assert!(matches!(
+            source.tensor_payload(name).unwrap(),
+            Some(SourcePayload::Borrowed { .. })
+        ));
+        let expected = source.tensor_data(name).unwrap().1.to_vec();
+        source.set_prefer_ranges(true);
+        let Some(SourcePayload::Range(range)) = source.tensor_payload(name).unwrap() else {
+            panic!("direct source must prefer checked ranges");
+        };
+        let mut actual = vec![0; expected.len()];
+        range.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(source.tensor_data(name).unwrap().1, expected);
+        source.set_prefer_ranges(false);
+        assert!(matches!(
+            source.tensor_payload(name).unwrap(),
+            Some(SourcePayload::Borrowed { .. })
+        ));
+    }
+
     fn range(hfq: &HfqFile, name: &str) -> SourceRangeDescriptor {
         let source: &dyn ModelSource = hfq;
         match source
@@ -4157,6 +4282,46 @@ mod range_upload_release_tests {
             assert_eq!(bytes, data);
         }
     }
+
+    /// Every range of one container reads through the container's own
+    /// descriptor: holding many ranges (as an EP rank does for its lifetime)
+    /// opens no further descriptors on the file, and the ranges stay readable
+    /// after the container is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ranges_share_the_container_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![32, 64],
+            group_size: 0,
+            data: data.clone(),
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let target = std::fs::canonicalize(&path).unwrap();
+        let open_on_path = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|link| *link == target)
+                .count()
+        };
+        let hfq = HfqFile::open(&path).unwrap();
+        let base = open_on_path();
+        let mut ranges = Vec::new();
+        for _ in 0..256 {
+            ranges.push(hfq.tensor_range("w").unwrap().unwrap());
+            ranges.push(hfq.span_range(0, 64, "u8", vec![64]).unwrap());
+        }
+        assert_eq!(open_on_path(), base);
+        drop(hfq);
+        let mut bytes = vec![0u8; data.len()];
+        ranges[0].read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data);
+    }
 }
 #[cfg(test)]
 mod metadata_overlay_tests {
@@ -4604,6 +4769,179 @@ mod overlay_tests {
 }
 
 #[cfg(test)]
+mod positional_read_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// A `read_at` over an in-memory file that serves at most `max_chunk`
+    /// bytes per call and records every `(offset, requested_len)`.
+    fn memory_reader<'a>(
+        data: &'a [u8],
+        max_chunk: usize,
+        calls: &'a mut Vec<(u64, usize)>,
+    ) -> impl FnMut(&mut [u8], u64) -> std::io::Result<usize> + 'a {
+        move |buf, at| {
+            calls.push((at, buf.len()));
+            let at = at as usize;
+            if at >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(max_chunk).min(data.len() - at);
+            buf[..n].copy_from_slice(&data[at..at + n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn loops_over_short_reads_at_advancing_offsets() {
+        let data: Vec<u8> = (0u8..64).collect();
+        let mut calls = Vec::new();
+        let mut out = [0u8; 10];
+        let (n, err) = read_positional_exact(memory_reader(&data, 3, &mut calls), 20, &mut out);
+        assert!(err.is_none());
+        assert_eq!(n, 10);
+        assert_eq!(&out[..], &data[20..30]);
+        assert_eq!(calls, vec![(20, 10), (23, 7), (26, 4), (29, 1)]);
+    }
+
+    #[test]
+    fn eof_reports_short_total_without_error_and_keeps_tail_untouched() {
+        let data = [9u8; 12];
+        let mut calls = Vec::new();
+        let mut out = [0xEEu8; 16];
+        let (n, err) = read_positional_exact(memory_reader(&data, 5, &mut calls), 4, &mut out);
+        assert!(err.is_none(), "EOF is a short total, not an error");
+        assert_eq!(n, 8);
+        assert_eq!(&out[..8], &[9u8; 8]);
+        assert_eq!(
+            &out[8..],
+            &[0xEEu8; 8],
+            "bytes past EOF must not be written"
+        );
+    }
+
+    #[test]
+    fn retries_interrupted_and_returns_other_errors_with_partial_count() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let mut step = 0;
+        let mut out = [0u8; 6];
+        let (n, err) = read_positional_exact(
+            |buf: &mut [u8], at: u64| {
+                step += 1;
+                match step {
+                    1 => Err(Error::from(ErrorKind::Interrupted)),
+                    2 => {
+                        buf[..2].copy_from_slice(&data[at as usize..at as usize + 2]);
+                        Ok(2)
+                    }
+                    3 => Err(Error::from(ErrorKind::Interrupted)),
+                    4 => Err(Error::new(ErrorKind::PermissionDenied, "denied")),
+                    _ => unreachable!("loop must stop at the first non-interrupt error"),
+                }
+            },
+            0,
+            &mut out,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(
+            err.expect("error surfaced").kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn offset_overflow_is_an_error_not_a_wrap() {
+        let mut out = [0u8; 4];
+        let (n, err) = read_positional_exact(
+            |buf: &mut [u8], _at: u64| Ok(buf.len().min(2)),
+            u64::MAX - 1,
+            &mut out,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(err.expect("overflow error").kind(), ErrorKind::InvalidInput);
+    }
+
+    /// The Windows `seek_read` / unix `pread` OS call: positioned, so reads at
+    /// two offsets in either order are correct whatever the file cursor is.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_read_at_is_positioned() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 8];
+        let mut got = 0;
+        while got < 8 {
+            got += file_read_at(&file, &mut b[got..], 200 + got as u64).unwrap();
+        }
+        got = 0;
+        while got < 8 {
+            got += file_read_at(&file, &mut a[got..], 10 + got as u64).unwrap();
+        }
+        assert_eq!(&b[..], &bytes[200..208]);
+        assert_eq!(&a[..], &bytes[10..18]);
+        let mut past = [0u8; 4];
+        assert_eq!(
+            file_read_at(&file, &mut past, 256).unwrap(),
+            0,
+            "EOF reads 0"
+        );
+    }
+
+    /// Regression for #869: UMA loads `drop_mmap()` and then read every tensor
+    /// through `tensor_data_pread`. The Windows build delegated to the mmap
+    /// accessor and so reported every tensor missing ("tensor 'embed.weight'
+    /// missing in HFQ"). Runs on unix and Windows (positioned read on both).
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn pread_and_vec_serve_tensors_after_mmap_is_dropped() {
+        use super::hfq_test_fixture::write_min_hfq;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uma.hfq");
+        let first: Vec<u8> = (0u8..32).collect();
+        let second: Vec<u8> = (100u8..148).collect();
+        write_min_hfq(
+            &path,
+            15,
+            &[
+                ("embed.weight", 13, &[2, 4], &first),
+                ("norm.weight", 13, &[3, 4], &second),
+            ],
+        );
+        let mut f = HfqFile::open(&path).unwrap();
+        assert!(
+            f.tensor_data("embed.weight").is_some(),
+            "mmap serves before the drop"
+        );
+        f.drop_mmap();
+        assert!(
+            f.tensor_data("embed.weight").is_none(),
+            "precondition: mmap dropped"
+        );
+        {
+            let (info, data) = f
+                .tensor_data_pread("embed.weight")
+                .expect("pread after drop");
+            assert_eq!(info.data_size, first.len());
+            assert_eq!(&data[..], &first[..]);
+        }
+        {
+            let (_, data) = f.tensor_data_pread("norm.weight").expect("second tensor");
+            assert_eq!(&data[..], &second[..], "offset of the second tensor");
+        }
+        let (_, v) = f
+            .tensor_data_vec("norm.weight")
+            .expect("vec after drop_mmap");
+        assert_eq!(v, second);
+        assert!(f.tensor_data_pread("absent.weight").is_none());
+    }
+}
+
+#[cfg(test)]
 mod ple_rows_binding_tests {
     use super::hfq_test_fixture::write_min_hfq;
     use super::*;
@@ -4685,5 +5023,78 @@ mod ple_rows_binding_tests {
         .unwrap();
         let marker = HfqFile::open(&marked).unwrap().ple_rows_marker().unwrap();
         assert_eq!(marker["location"], "sidecar");
+    }
+}
+
+#[cfg(test)]
+mod mq_i4_header_tests {
+    use super::*;
+    use crate::mq_i4::{decode_tensor, encode_tensor, tensor_bytes, MqI4Profile, GROUP};
+
+    /// Tiny legal shape per profile: R256 profiles `[2,256]`, R128 `[2,128]`.
+    fn shape_for(profile: MqI4Profile) -> (usize, usize) {
+        (2, profile.rotation.width())
+    }
+
+    fn fixture(profile: MqI4Profile) -> (Vec<u8>, Vec<u16>, Vec<u8>) {
+        let (m, k) = shape_for(profile);
+        let levels = usize::from(profile.codec.levels()) + 1;
+        let codes: Vec<u8> = (0..m * k).map(|i| ((i * 5 + 1) % levels) as u8).collect();
+        let scales: Vec<u16> = (0..m * (k / GROUP)).map(|g| 0x3C00 + g as u16).collect();
+        let bytes = encode_tensor(profile, m, k, &codes, &scales).unwrap();
+        (codes, scales, bytes)
+    }
+
+    #[test]
+    fn qt131_to_134_round_trip_through_hfqm_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqi4.hfq");
+
+        let mut tensors = Vec::new();
+        let mut expected = Vec::new();
+        for profile in MqI4Profile::ALL {
+            let (codes, scales, bytes) = fixture(profile);
+            let (m, k) = shape_for(profile);
+            assert_eq!(bytes.len(), tensor_bytes(profile, m, k).unwrap());
+            let name = format!("model.layers.0.mlp.experts.0.{}", profile.name());
+            tensors.push(HfqMemTensor {
+                name: name.clone(),
+                quant_type: profile.quant_type(),
+                shape: vec![m as u32, k as u32],
+                group_size: GROUP as u32,
+                data: bytes,
+            });
+            expected.push((name, profile, m, k, codes, scales));
+        }
+        write_hfqm_package_mem(&path, 16, r#"{"x":1}"#, &tensors).unwrap();
+
+        let f = HfqFile::open(&path).unwrap();
+        assert_eq!(f.tensors().len(), 4);
+        for (i, (name, profile, m, k, codes, scales)) in expected.iter().enumerate() {
+            let info = &f.tensors()[i];
+            assert_eq!(&info.name, name);
+            assert_eq!(info.quant_type, profile.quant_type());
+            assert_eq!(info.shape, vec![*m as u32, *k as u32]);
+            assert_eq!(info.group_size, 128);
+            assert_eq!(info.data_size, tensor_bytes(*profile, *m, *k).unwrap());
+            assert_eq!(quant_type_to_dtype(info.quant_type), profile.name());
+
+            let (_, payload) = f.tensor_data(name).expect("tensor payload");
+            assert_eq!(payload, &tensors[i].data[..]);
+            let decoded = decode_tensor(*profile, *m, *k, payload).unwrap();
+            assert_eq!(&decoded.codes, codes);
+            assert_eq!(&decoded.scale_bits, scales);
+        }
+    }
+
+    #[test]
+    fn quant_type_to_dtype_names_131_to_134() {
+        assert_eq!(quant_type_to_dtype(131), "MQ3I4G128R256");
+        assert_eq!(quant_type_to_dtype(132), "MQ3I4G128R128");
+        assert_eq!(quant_type_to_dtype(133), "MQ2I4G128R256");
+        assert_eq!(quant_type_to_dtype(134), "MQ2I4G128R128");
+        // Neighbours stay unknown (130 is the compact-Hessian record id).
+        assert_eq!(quant_type_to_dtype(130), "?");
+        assert_eq!(quant_type_to_dtype(135), "?");
     }
 }

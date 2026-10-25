@@ -145,15 +145,21 @@
 //! G80 core's issue cycles, not any TN64 constant. For `Epilogue::I32` it adds the serial single-slot stripe hand-off chain
 //! (six 5120-cycle stripe phases exposed per wave before the core regains `C_EMPTY`, no overlap credit) against the int8
 //! `2560`-cycle `Cout` drain plus `663`-cycle epilogue.
-use super::gemm_array::{self as array, ArrayDesign, CycleEstimate, Geometry, Kind, Topo, Variant, MAX_WAVES};
+use super::gemm_array::{
+    self as array, ArrayDesign, CycleEstimate, Geometry, Kind, Topo, Variant, MAX_WAVES,
+};
 use super::gemm_core::{self, Control, CoreVariant, Epilogue, PairRole};
 use super::gemm_core_g80 as g80_core;
 use super::gemm_i8::{peak_ops_per_second, ArgKind, ArgSpec};
+use super::iu4_ief15_core::g80_bf16 as bf16;
 use crate::{
-    dma::{Bd, BdLocks, Direction::{Mm2s, S2mm}, Iteration, Location, Task},
+    dma::{
+        Bd, BdLocks,
+        Direction::{Mm2s, S2mm},
+        Iteration, Location, Task,
+    },
     route::{Circuit, Port, ShimDma},
 };
-use super::iu4_ief15_core::g80_bf16 as bf16;
 
 const TM: usize = g80_core::TM;
 const TN: usize = g80_core::TN;
@@ -171,8 +177,11 @@ const A_COLS: usize = array::G80_A_COLS;
 /// Rows / columns of one wave: two 128-row M tiles x sixteen 80-column N tiles.
 pub const WAVE_M: usize = array::G80_WAVE_M;
 pub const WAVE_N: usize = array::G80_WAVE_N;
-const _: () = assert!(WAVE_M == 256 && WAVE_N == 1280 && A_COLS == 4 && A_HALF_BYTES == 4096 && B_BYTES == 5120);
-const _: () = assert!(COUT_BYTES == 10240 && MB == 16 && NB == 10 && KB == 8 && ROWS == 4 && COLS == 8);
+const _: () = assert!(
+    WAVE_M == 256 && WAVE_N == 1280 && A_COLS == 4 && A_HALF_BYTES == 4096 && B_BYTES == 5120
+);
+const _: () =
+    assert!(COUT_BYTES == 10240 && MB == 16 && NB == 10 && KB == 8 && ROWS == 4 && COLS == 8);
 
 /// Host BF16 destination. Strides and starting columns must be even because
 /// AIE2P DMA addresses pairs of BF16 elements as 32-bit words.
@@ -180,18 +189,33 @@ const _: () = assert!(COUT_BYTES == 10240 && MB == 16 && NB == 10 && KB == 8 && 
 pub enum Bf16Layout {
     #[default]
     NativeTiles,
-    RowMajor { pitch_elems: usize, col0_elems: usize },
+    RowMajor {
+        pitch_elems: usize,
+        col0_elems: usize,
+    },
 }
 
 impl Bf16Layout {
-    fn validate(self, padded_rows: usize) -> Result<(), String> { self.validate_for(padded_rows, WAVE_N) }
+    fn validate(self, padded_rows: usize) -> Result<(), String> {
+        self.validate_for(padded_rows, WAVE_N)
+    }
 
     /// `validate` for a wave `wave_n` columns wide (1280 for G80, 512 for the N512 design).
     pub(crate) fn validate_for(self, padded_rows: usize, wave_n: usize) -> Result<(), String> {
-        if let Self::RowMajor { pitch_elems: pitch, col0_elems: col0 } = self {
-            if pitch % 2 != 0 || col0 % 2 != 0 || pitch / 2 > 1 << 20 ||
-                col0.checked_add(wave_n).is_none_or(|end| end > pitch) ||
-                padded_rows.checked_mul(pitch).and_then(|n| n.checked_mul(2)).is_none() {
+        if let Self::RowMajor {
+            pitch_elems: pitch,
+            col0_elems: col0,
+        } = self
+        {
+            if pitch % 2 != 0
+                || col0 % 2 != 0
+                || pitch / 2 > 1 << 20
+                || col0.checked_add(wave_n).is_none_or(|end| end > pitch)
+                || padded_rows
+                    .checked_mul(pitch)
+                    .and_then(|n| n.checked_mul(2))
+                    .is_none()
+            {
                 return Err(format!("BF16 row-major needs even pitch/col0, col0+{wave_n} <= pitch <= {}, and a representable arena", 2 << 20));
             }
         }
@@ -207,7 +231,11 @@ const A_OFF: [u32; 2] = [0x18000, 0x1a000];
 const B_OFF: u32 = 0x1c000;
 const MEM_END: u32 = 0x80000;
 const _: () = assert!(C_ROW_STRIDE as usize == COUT_BYTES && C_SLOT_STRIDE == 4 * C_ROW_STRIDE);
-const _: () = assert!(C_OFF + 2 * C_SLOT_STRIDE == A_OFF[0] && A_OFF[0] + 0x2000 == A_OFF[1] && A_OFF[1] + 0x2000 == B_OFF);
+const _: () = assert!(
+    C_OFF + 2 * C_SLOT_STRIDE == A_OFF[0]
+        && A_OFF[0] + 0x2000 == A_OFF[1]
+        && A_OFF[1] + 0x2000 == B_OFF
+);
 const _: () = assert!(B_OFF as usize + 2 * g80_core::MAX_KC * B_BYTES == MEM_END as usize);
 const _: () = assert!(A_HALF_BYTES <= 0x2000);
 
@@ -234,14 +262,24 @@ pub(crate) const A_MM2S_BD: [u32; 2] = [14, 15];
 pub(crate) const C_LOCK0: u32 = 8;
 const _: () = assert!(B_READY[0] == 4 && B_READY[1] == 6 && g80_core::MAX_KC < 63);
 
-pub(crate) fn c_lock(slot: usize, row: usize) -> u32 { C_LOCK0 + (slot * 8 + row * 2) as u32 }
-fn c_off(slot: usize, row: usize) -> u32 { C_OFF + slot as u32 * C_SLOT_STRIDE + row as u32 * C_ROW_STRIDE }
+pub(crate) fn c_lock(slot: usize, row: usize) -> u32 {
+    C_LOCK0 + (slot * 8 + row * 2) as u32
+}
+fn c_off(slot: usize, row: usize) -> u32 {
+    C_OFF + slot as u32 * C_SLOT_STRIDE + row as u32 * C_ROW_STRIDE
+}
 /// `Epilogue::I32` stage of row `r`: one 20480 B slot (`g80_core::C_STRIPE_BYTES`), rows contiguous from `0x4000`, ending `0x18000`.
-fn c_i32_off(row: usize) -> u32 { C_OFF + row as u32 * g80_core::C_STRIPE_BYTES as u32 }
+fn c_i32_off(row: usize) -> u32 {
+    C_OFF + row as u32 * g80_core::C_STRIPE_BYTES as u32
+}
 /// Serial single-slot stripe phases between `C_FULL` and the `C_EMPTY` return of the last row of a pair (see [`estimate`]).
 const I32_HANDOFF_PHASES: u64 = 6;
-fn b_off(kc: usize, parity: usize) -> u32 { B_OFF + (parity * kc * B_BYTES) as u32 }
-fn a_locks() -> ([u32; 2], [u32; 2]) { (gemm_core::A_EMPTY, gemm_core::A_FULL) }
+fn b_off(kc: usize, parity: usize) -> u32 {
+    B_OFF + (parity * kc * B_BYTES) as u32
+}
+fn a_locks() -> ([u32; 2], [u32; 2]) {
+    (gemm_core::A_EMPTY, gemm_core::A_FULL)
+}
 
 /// `(kc, mw)` of a G80 topology; panics for any other kind.
 fn shape(topo: Topo) -> (usize, usize) {
@@ -252,109 +290,291 @@ fn shape(topo: Topo) -> (usize, usize) {
 }
 
 /// `Epilogue::I32` topology (raw 40,960 B tiles, one 20,480 B memtile stage per row, finite C tasks).
-fn is_i32(topo: Topo) -> bool { matches!(topo.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
+fn is_i32(topo: Topo) -> bool {
+    matches!(
+        topo.kind,
+        Kind::G80 {
+            epi: Epilogue::I32,
+            ..
+        }
+    )
+}
 
 pub(crate) fn a_chunk_bytes(topo: Topo) -> usize {
-    if topo.is_g80_bf16() { bf16::A_BYTES } else { A_HALF_BYTES }
+    if topo.is_g80_bf16() {
+        bf16::A_BYTES
+    } else {
+        A_HALF_BYTES
+    }
 }
 pub(crate) fn b_chunk_bytes(topo: Topo) -> usize {
-    if topo.is_g80_n512() { return bf16::NARROW.b_bytes(); }
-    if topo.is_g80_bf16() { bf16::B_BYTES } else { B_BYTES }
+    if topo.is_g80_n512() {
+        return bf16::NARROW.b_bytes();
+    }
+    if topo.is_g80_bf16() {
+        bf16::B_BYTES
+    } else {
+        B_BYTES
+    }
 }
 fn a_offsets(topo: Topo) -> [u32; 2] {
-    if topo.is_g80_bf16() { [0xe000, 0x10000] } else { A_OFF }
+    if topo.is_g80_bf16() {
+        [0xe000, 0x10000]
+    } else {
+        A_OFF
+    }
 }
 fn b_offset(topo: Topo, kc: usize, parity: usize) -> u32 {
-    if topo.is_g80_bf16() { 0x12000 + (parity * kc * bf16::B_BYTES) as u32 } else { b_off(kc, parity) }
+    if topo.is_g80_bf16() {
+        0x12000 + (parity * kc * bf16::B_BYTES) as u32
+    } else {
+        b_off(kc, parity)
+    }
 }
 
 fn check_geometry(geo: &Geometry) -> (usize, usize) {
     let (kc, mw) = shape(geo.topo);
-    assert!(geo.kc == kc && geo.mw == mw && geo.nw == 1 && geo.waves == mw && geo.n == WAVE_N && geo.k == kc * CHUNK_K,
-        "inconsistent G80 geometry {geo:?}");
+    assert!(
+        geo.kc == kc
+            && geo.mw == mw
+            && geo.nw == 1
+            && geo.waves == mw
+            && geo.n == WAVE_N
+            && geo.k == kc * CHUNK_K,
+        "inconsistent G80 geometry {geo:?}"
+    );
     (kc, mw)
 }
 
 /// One memtile BD in a cyclic chain: `idx` of `len`, ids from `first`, acquiring `acq` (-1) and releasing `rel` (+1).
-fn chain_bd(first: u32, idx: usize, len: usize, addr: u32, words: u32, acq: u32, rel: u32) -> (u32, Bd) {
+fn chain_bd(
+    first: u32,
+    idx: usize,
+    len: usize,
+    addr: u32,
+    words: u32,
+    acq: u32,
+    rel: u32,
+) -> (u32, Bd) {
     let mut bd = Bd::new((array::MEM_BASE + addr) as u64, words);
-    bd.locks = BdLocks { acq: Some((array::MEM_LOCK + acq, -1)), rel: Some((array::MEM_LOCK + rel, 1)) };
+    bd.locks = BdLocks {
+        acq: Some((array::MEM_LOCK + acq, -1)),
+        rel: Some((array::MEM_LOCK + rel, 1)),
+    };
     bd.next = Some(first + ((idx + 1) % len) as u32);
     (first + idx as u32, bd)
 }
 
 /// Static stream-switch circuits of one column (see the module header, "Switch circuits").
 pub(crate) fn column_circuits(topo: Topo, col: u32) -> Vec<Circuit> {
-    if topo.is_g80_n512() { return super::gemm_g80_n512::column_circuits(topo, col); }
+    if topo.is_g80_n512() {
+        return super::gemm_g80_n512::column_circuits(topo, col);
+    }
     shape(topo);
     let has_a = topo.has_a(col);
     let mut v = Vec::new();
     let (shim, mem) = (array::shim_loc(col), array::mem_loc(col));
-    let sh = |direction, channel| ShimDma { tile: shim, direction, channel };
-    v.push(Circuit { tile: shim, slave: sh(Mm2s, 0).port(), master: Port::North(0) });
-    v.push(Circuit { tile: shim, slave: Port::North(0), master: sh(S2mm, 0).port() });
-    v.push(Circuit { tile: shim, slave: Port::North(1), master: sh(S2mm, 1).port() });
-    v.push(Circuit { tile: mem, slave: Port::South(0), master: Port::Dma(B_FILL_CH as u8) });
-    v.push(Circuit { tile: mem, slave: Port::Dma(B_READ_CH[0] as u8), master: Port::North(4) });
-    v.push(Circuit { tile: mem, slave: Port::Dma(B_READ_CH[1] as u8), master: Port::North(3) });
-    v.push(Circuit { tile: mem, slave: Port::Dma(C_DRAIN_CH[0] as u8), master: Port::South(0) });
-    v.push(Circuit { tile: mem, slave: Port::Dma(C_DRAIN_CH[1] as u8), master: Port::South(1) });
-    for r in 0..ROWS as u8 { v.push(Circuit { tile: mem, slave: Port::North(r), master: Port::Dma(r) }); }
+    let sh = |direction, channel| ShimDma {
+        tile: shim,
+        direction,
+        channel,
+    };
+    v.push(Circuit {
+        tile: shim,
+        slave: sh(Mm2s, 0).port(),
+        master: Port::North(0),
+    });
+    v.push(Circuit {
+        tile: shim,
+        slave: Port::North(0),
+        master: sh(S2mm, 0).port(),
+    });
+    v.push(Circuit {
+        tile: shim,
+        slave: Port::North(1),
+        master: sh(S2mm, 1).port(),
+    });
+    v.push(Circuit {
+        tile: mem,
+        slave: Port::South(0),
+        master: Port::Dma(B_FILL_CH as u8),
+    });
+    v.push(Circuit {
+        tile: mem,
+        slave: Port::Dma(B_READ_CH[0] as u8),
+        master: Port::North(4),
+    });
+    v.push(Circuit {
+        tile: mem,
+        slave: Port::Dma(B_READ_CH[1] as u8),
+        master: Port::North(3),
+    });
+    v.push(Circuit {
+        tile: mem,
+        slave: Port::Dma(C_DRAIN_CH[0] as u8),
+        master: Port::South(0),
+    });
+    v.push(Circuit {
+        tile: mem,
+        slave: Port::Dma(C_DRAIN_CH[1] as u8),
+        master: Port::South(1),
+    });
+    for r in 0..ROWS as u8 {
+        v.push(Circuit {
+            tile: mem,
+            slave: Port::North(r),
+            master: Port::Dma(r),
+        });
+    }
     if has_a {
-        v.push(Circuit { tile: shim, slave: sh(Mm2s, 1).port(), master: Port::North(1) });
-        v.push(Circuit { tile: mem, slave: Port::South(1), master: Port::Dma(A_S2MM_CH as u8) });
-        v.push(Circuit { tile: mem, slave: Port::Dma(A_MM2S_CH as u8), master: Port::North(5) });
+        v.push(Circuit {
+            tile: shim,
+            slave: sh(Mm2s, 1).port(),
+            master: Port::North(1),
+        });
+        v.push(Circuit {
+            tile: mem,
+            slave: Port::South(1),
+            master: Port::Dma(A_S2MM_CH as u8),
+        });
+        v.push(Circuit {
+            tile: mem,
+            slave: Port::Dma(A_MM2S_CH as u8),
+            master: Port::North(5),
+        });
     }
     let c = col as usize;
     for r in 0..ROWS {
         let tile = array::core_loc(col, r);
         // C down: own tile, then the rows above forward on their own lanes.
-        v.push(Circuit { tile, slave: Port::Dma(0), master: Port::South(r as u8) });
-        for s in r + 1..ROWS { v.push(Circuit { tile, slave: Port::North(s as u8), master: Port::South(s as u8) }); }
+        v.push(Circuit {
+            tile,
+            slave: Port::Dma(0),
+            master: Port::South(r as u8),
+        });
+        for s in r + 1..ROWS {
+            v.push(Circuit {
+                tile,
+                slave: Port::North(s as u8),
+                master: Port::South(s as u8),
+            });
+        }
         // B: parity 0 on lane 4 (rows 0, 2), parity 1 on lane 3 (rows 1, 3); lanes are passed up through the rows between.
-        if r % 2 == 0 { v.push(Circuit { tile, slave: Port::South(4), master: Port::Dma(1) }); }
-        if r < 2 { v.push(Circuit { tile, slave: Port::South(4), master: Port::North(4) }); }
-        if r % 2 == 1 { v.push(Circuit { tile, slave: Port::South(3), master: Port::Dma(1) }); }
-        if r < 3 { v.push(Circuit { tile, slave: Port::South(3), master: Port::North(3) }); }
+        if r % 2 == 0 {
+            v.push(Circuit {
+                tile,
+                slave: Port::South(4),
+                master: Port::Dma(1),
+            });
+        }
+        if r < 2 {
+            v.push(Circuit {
+                tile,
+                slave: Port::South(4),
+                master: Port::North(4),
+            });
+        }
+        if r % 2 == 1 {
+            v.push(Circuit {
+                tile,
+                slave: Port::South(3),
+                master: Port::Dma(1),
+            });
+        }
+        if r < 3 {
+            v.push(Circuit {
+                tile,
+                slave: Port::South(3),
+                master: Port::North(3),
+            });
+        }
         // A of row r is injected by column r and broadcast along the row on horizontal lane 0.
         let slave = match c.cmp(&r) {
             std::cmp::Ordering::Equal => Port::South(5),
             std::cmp::Ordering::Less => Port::East(0),
             std::cmp::Ordering::Greater => Port::West(0),
         };
-        v.push(Circuit { tile, slave, master: Port::Dma(0) });
-        if c > 0 && c <= r { v.push(Circuit { tile, slave, master: Port::West(0) }); }
-        if c < COLS - 1 && c >= r { v.push(Circuit { tile, slave, master: Port::East(0) }); }
-        if c < A_COLS && r < c { v.push(Circuit { tile, slave: Port::South(5), master: Port::North(5) }); }
+        v.push(Circuit {
+            tile,
+            slave,
+            master: Port::Dma(0),
+        });
+        if c > 0 && c <= r {
+            v.push(Circuit {
+                tile,
+                slave,
+                master: Port::West(0),
+            });
+        }
+        if c < COLS - 1 && c >= r {
+            v.push(Circuit {
+                tile,
+                slave,
+                master: Port::East(0),
+            });
+        }
+        if c < A_COLS && r < c {
+            v.push(Circuit {
+                tile,
+                slave: Port::South(5),
+                master: Port::North(5),
+            });
+        }
     }
     v
 }
 
 /// All memtile BDs of a column `(id, bd)`: B fill / guarded / whole readers, C rings and drains, A rings (columns 0..3).
 pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
-    if topo.is_g80_n512() { return super::gemm_g80_n512::memtile_descriptors(topo, col); }
+    if topo.is_g80_n512() {
+        return super::gemm_g80_n512::memtile_descriptors(topo, col);
+    }
     let (kc, _) = shape(topo);
     let mut v = Vec::new();
     let chunk_words = (b_chunk_bytes(topo) / 4) as u32;
-    let iteration = Iteration { step: chunk_words, wrap: kc as u32, current: 0 };
+    let iteration = Iteration {
+        step: chunk_words,
+        wrap: kc as u32,
+        current: 0,
+    };
     for p in 0..2 {
         let addr = (array::MEM_BASE + b_offset(topo, kc, p)) as u64;
         let mut fill = Bd::new(addr, chunk_words);
         fill.iteration = iteration;
-        fill.locks = BdLocks { acq: None, rel: Some((array::MEM_LOCK + B_READY[p], 1)) };
+        fill.locks = BdLocks {
+            acq: None,
+            rel: Some((array::MEM_LOCK + B_READY[p], 1)),
+        };
         fill.next = (p == 0).then_some(B_FILL_BD[1]);
         v.push((B_FILL_BD[p], fill));
         let mut guard = Bd::new(addr, chunk_words);
         guard.iteration = iteration;
-        guard.locks = BdLocks { acq: Some((array::MEM_LOCK + B_READY[p], -1)), rel: None };
+        guard.locks = BdLocks {
+            acq: Some((array::MEM_LOCK + B_READY[p], -1)),
+            rel: None,
+        };
         v.push((B_GUARD_BD[p], guard));
         v.push((B_WHOLE_BD[p], Bd::new(addr, kc as u32 * chunk_words)));
     }
     if topo.has_a(col) {
         let (empty, full) = a_locks();
         let words = (a_chunk_bytes(topo) / 4) as u32;
-        v.extend(array::ring(A_S2MM_BD, a_offsets(topo), words, empty, full, true));
-        v.extend(array::ring(A_MM2S_BD, a_offsets(topo), words, empty, full, false));
+        v.extend(array::ring(
+            A_S2MM_BD,
+            a_offsets(topo),
+            words,
+            empty,
+            full,
+            true,
+        ));
+        v.extend(array::ring(
+            A_MM2S_BD,
+            a_offsets(topo),
+            words,
+            empty,
+            full,
+            false,
+        ));
     }
     if topo.is_g80_bf16() {
         // A drain hands the shared whole-tile stage to its pair's other row.
@@ -396,63 +616,114 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
         let stripe_words = (g80_core::C_STRIPE_BYTES / 4) as u32;
         let stripe = |addr: u32, acq: u32, rel: u32, next: Option<u32>| {
             let mut bd = Bd::new((array::MEM_BASE + addr) as u64, stripe_words);
-            bd.locks = BdLocks { acq: Some((array::MEM_LOCK + acq, -1)), rel: Some((array::MEM_LOCK + rel, 1)) };
+            bd.locks = BdLocks {
+                acq: Some((array::MEM_LOCK + acq, -1)),
+                rel: Some((array::MEM_LOCK + rel, 1)),
+            };
             bd.next = next;
             bd
         };
         for r in 0..ROWS {
             let (empty, full) = (c_lock(0, r), c_lock(0, r) + 1);
             for s in 0..2 {
-                v.push((C_S2MM_BD[r][s], stripe(c_i32_off(r), empty, full, (s == 0).then_some(C_S2MM_BD[r][1]))));
+                v.push((
+                    C_S2MM_BD[r][s],
+                    stripe(
+                        c_i32_off(r),
+                        empty,
+                        full,
+                        (s == 0).then_some(C_S2MM_BD[r][1]),
+                    ),
+                ));
             }
         }
-        for g in 0..2 { for idx in 0..4usize {
-            let row = 2 * g + idx / 2;
-            let (empty, full) = (c_lock(0, row), c_lock(0, row) + 1);
-            let id = C_DRAIN_BD0[g] + idx as u32;
-            v.push((id, stripe(c_i32_off(row), full, empty, (idx < 3).then_some(id + 1))));
-        } }
+        for g in 0..2 {
+            for idx in 0..4usize {
+                let row = 2 * g + idx / 2;
+                let (empty, full) = (c_lock(0, row), c_lock(0, row) + 1);
+                let id = C_DRAIN_BD0[g] + idx as u32;
+                v.push((
+                    id,
+                    stripe(c_i32_off(row), full, empty, (idx < 3).then_some(id + 1)),
+                ));
+            }
+        }
         return v;
     }
     let words = (COUT_BYTES / 4) as u32;
     for r in 0..ROWS {
         let empty = [c_lock(0, r), c_lock(1, r)];
-        v.extend(array::ring(C_S2MM_BD[r], [c_off(0, r), c_off(1, r)], words, empty, [empty[0] + 1, empty[1] + 1], true));
+        v.extend(array::ring(
+            C_S2MM_BD[r],
+            [c_off(0, r), c_off(1, r)],
+            words,
+            empty,
+            [empty[0] + 1, empty[1] + 1],
+            true,
+        ));
     }
     for g in 0..2 {
-        for slot in 0..2 { for rr in 0..2 {
-            let row = 2 * g + rr;
-            let lock = c_lock(slot, row);
-            v.push(chain_bd(C_DRAIN_BD0[g], slot * 2 + rr, 4, c_off(slot, row), words, lock + 1, lock));
-        } }
+        for slot in 0..2 {
+            for rr in 0..2 {
+                let row = 2 * g + rr;
+                let lock = c_lock(slot, row);
+                v.push(chain_bd(
+                    C_DRAIN_BD0[g],
+                    slot * 2 + rr,
+                    4,
+                    c_off(slot, row),
+                    words,
+                    lock + 1,
+                    lock,
+                ));
+            }
+        }
     }
     v
 }
 
 /// Initial memtile lock values: `*_EMPTY` 1, `*_FULL` 0, B ready 0.
 pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
-    if topo.is_g80_n512() { return super::gemm_g80_n512::memtile_locks(topo, col); }
+    if topo.is_g80_n512() {
+        return super::gemm_g80_n512::memtile_locks(topo, col);
+    }
     shape(topo);
     let mut v = vec![(B_READY[0], 0), (B_READY[1], 0)];
     if topo.has_a(col) {
         let (empty, full) = a_locks();
-        for i in 0..2 { v.extend([(empty[i], 1), (full[i], 0)]); }
+        for i in 0..2 {
+            v.extend([(empty[i], 1), (full[i], 0)]);
+        }
     }
     // I32 has one stage per row (locks 8 + 2r empty, 9 + 2r full); int8 two slots (8 + 8s + 2r).
-    let c_slots = if is_i32(topo) || topo.is_g80_bf16() { 1 } else { 2 };
-    for slot in 0..c_slots { for r in 0..ROWS {
-        let empty = u32::from(!topo.is_g80_bf16() || r % 2 == 0);
-        v.extend([(c_lock(slot, r), empty), (c_lock(slot, r) + 1, 0)]);
-    } }
+    let c_slots = if is_i32(topo) || topo.is_g80_bf16() {
+        1
+    } else {
+        2
+    };
+    for slot in 0..c_slots {
+        for r in 0..ROWS {
+            let empty = u32::from(!topo.is_g80_bf16() || r % 2 == 0);
+            v.extend([(c_lock(slot, r), empty), (c_lock(slot, r) + 1, 0)]);
+        }
+    }
     v
 }
 
 /// Core ring tasks plus the memtile tasks of a column (the shim tasks depend on the arguments). Finite B tasks come in queue
 /// order: per reader channel the guarded task, then the whole-stream task (omitted for `mw = 1`).
 pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
-    if topo.is_g80_n512() { return super::gemm_g80_n512::ring_tasks(topo, col); }
+    if topo.is_g80_n512() {
+        return super::gemm_g80_n512::ring_tasks(topo, col);
+    }
     let (kc, mw) = shape(topo);
-    let rep = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
+    let rep = |direction, channel, bd, repeat| Task {
+        direction,
+        channel,
+        bd,
+        repeat,
+        issue_token: false,
+    };
     let task = |direction, channel, bd| rep(direction, channel, bd, 1);
     let mut v = Vec::new();
     for r in 0..ROWS {
@@ -464,24 +735,46 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
     let mem = array::mem_loc(col);
     for r in 0..ROWS {
         // I32: finite two-stripe chain, one pass per wave.
-        v.push((mem, if is_i32(topo) || topo.is_g80_bf16() { rep(S2mm, r as u32, C_S2MM_BD[r][0], mw as u32) } else { task(S2mm, r as u32, C_S2MM_BD[r][0]) }));
+        v.push((
+            mem,
+            if is_i32(topo) || topo.is_g80_bf16() {
+                rep(S2mm, r as u32, C_S2MM_BD[r][0], mw as u32)
+            } else {
+                task(S2mm, r as u32, C_S2MM_BD[r][0])
+            },
+        ));
     }
     v.push((mem, rep(S2mm, B_FILL_CH, B_FILL_BD[0], kc as u32)));
-    if topo.has_a(col) { v.push((mem, task(S2mm, A_S2MM_CH, A_S2MM_BD[0]))); }
+    if topo.has_a(col) {
+        v.push((mem, task(S2mm, A_S2MM_CH, A_S2MM_BD[0])));
+    }
     for g in 0..2 {
-        v.push((mem, if is_i32(topo) || topo.is_g80_bf16() { rep(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g], mw as u32) } else { task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g]) }));
+        v.push((
+            mem,
+            if is_i32(topo) || topo.is_g80_bf16() {
+                rep(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g], mw as u32)
+            } else {
+                task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g])
+            },
+        ));
     }
     for p in 0..2 {
         v.push((mem, rep(Mm2s, B_READ_CH[p], B_GUARD_BD[p], kc as u32)));
-        if mw > 1 { v.push((mem, rep(Mm2s, B_READ_CH[p], B_WHOLE_BD[p], (mw - 1) as u32))); }
+        if mw > 1 {
+            v.push((mem, rep(Mm2s, B_READ_CH[p], B_WHOLE_BD[p], (mw - 1) as u32)));
+        }
     }
-    if topo.has_a(col) { v.push((mem, task(Mm2s, A_MM2S_CH, A_MM2S_BD[0]))); }
+    if topo.has_a(col) {
+        v.push((mem, task(Mm2s, A_MM2S_CH, A_MM2S_BD[0])));
+    }
     v
 }
 
 /// A argument: 4 injecting-column segments, `(wave, chunk, E/O half 4 KiB)`.
 pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
-    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_a(geo, a); }
+    if geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::pack_a(geo, a);
+    }
     let (kc, _) = check_geometry(geo);
     assert_eq!(a.len(), geo.m * geo.k, "A must be m*k");
     let chunk = a_chunk_bytes(geo.topo);
@@ -490,35 +783,57 @@ pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
     assert_eq!(out.len(), geo.a_bytes(), "A stream size");
     for c in 0..A_COLS {
         let (q, h) = (c / 2, c % 2);
-        for w in 0..geo.waves { for ch in 0..kc {
-            let at = c * segment + (w * kc + ch) * chunk;
-            geo.pack_a_half_chunk(a, w * WAVE_M + q * TM, h, ch, &mut out[at..at + A_HALF_BYTES]);
-        } }
+        for w in 0..geo.waves {
+            for ch in 0..kc {
+                let at = c * segment + (w * kc + ch) * chunk;
+                geo.pack_a_half_chunk(
+                    a,
+                    w * WAVE_M + q * TM,
+                    h,
+                    ch,
+                    &mut out[at..at + A_HALF_BYTES],
+                );
+            }
+        }
     }
     out
 }
 
 /// B argument: 8 column segments, chunk-major `[even N tile, odd N tile]`, each tile `(kb 0..8, nb 0..10)` 8x8 blocks.
 pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
-    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_b(geo, b); }
+    if geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::pack_b(geo, b);
+    }
     let (kc, _) = check_geometry(geo);
     assert_eq!(b.len(), geo.k * geo.n, "B must be k*n");
     let chunk = b_chunk_bytes(geo.topo);
     let mut out = vec![0u8; COLS * kc * 2 * chunk];
     assert_eq!(out.len(), geo.b_bytes(), "B stream size");
-    for col in 0..COLS { for ch in 0..kc { for par in 0..2 {
-        let n0 = (2 * col + par) * TN;
-        let base = (col * kc + ch) * 2 * chunk + par * chunk;
-        for kb in 0..KB { for nb in 0..NB { for kk in 0..8 {
-            let c0 = n0 + nb * 8;
-            if c0 >= geo.n { continue; }
-            let width = (geo.n - c0).min(8);
-            let row = ch * CHUNK_K + kb * 8 + kk;
-            let dst = base + (kb * NB + nb) * 64 + kk * 8;
-            let s = row * geo.n + c0;
-            for (x, y) in out[dst..dst + width].iter_mut().zip(&b[s..s + width]) { *x = *y as u8; }
-        } } }
-    } } }
+    for col in 0..COLS {
+        for ch in 0..kc {
+            for par in 0..2 {
+                let n0 = (2 * col + par) * TN;
+                let base = (col * kc + ch) * 2 * chunk + par * chunk;
+                for kb in 0..KB {
+                    for nb in 0..NB {
+                        for kk in 0..8 {
+                            let c0 = n0 + nb * 8;
+                            if c0 >= geo.n {
+                                continue;
+                            }
+                            let width = (geo.n - c0).min(8);
+                            let row = ch * CHUNK_K + kb * 8 + kk;
+                            let dst = base + (kb * NB + nb) * 64 + kk * 8;
+                            let s = row * geo.n + c0;
+                            for (x, y) in out[dst..dst + width].iter_mut().zip(&b[s..s + width]) {
+                                *x = *y as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -526,48 +841,76 @@ pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
 /// 40960 B (stripe 0 = `mb 0..8`, stripe 1 = `mb 8..16`, contiguous) of little-endian i32 8x8 blocks in `(mb 0..16, nb 0..10)`
 /// order.
 pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
-    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::unpack_c(geo, output); }
+    if geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::unpack_c(geo, output);
+    }
     check_geometry(geo);
     assert_eq!(output.len(), geo.c_bytes(), "C stream size");
     let i32_tiles = is_i32(geo.topo);
     if let Some((pitch, col0)) = geo.topo.bf16_rowmajor() {
-        return (0..geo.m).flat_map(|row| (0..geo.n).map(move |col| {
-            let off = 2 * (row * pitch + col0 + col);
-            i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
-        })).collect();
+        return (0..geo.m)
+            .flat_map(|row| {
+                (0..geo.n).map(move |col| {
+                    let off = 2 * (row * pitch + col0 + col);
+                    i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
+                })
+            })
+            .collect();
     }
     let mut c = vec![0i32; geo.m * geo.n];
-    for col in 0..COLS { for w in 0..geo.waves { for rho in 0..ROWS {
-        let m0 = w * WAVE_M + (rho / 2) * TM;
-        let n0 = (2 * col + rho % 2) * TN;
-        let base = geo.pair_c_offset(col, w, rho);
-        if m0 >= geo.m || n0 >= geo.n { continue; }
-        for mb in 0..MB { for nb in 0..NB { for i in 0..8 {
-            let row = m0 + mb * 8 + i;
-            if row >= geo.m { break; }
-            for j in 0..8 {
-                let cc = n0 + nb * 8 + j;
-                if cc >= geo.n { break; }
-                let at = (mb * NB + nb) * 64 + i * 8 + j;
-                c[row * geo.n + cc] = if i32_tiles {
-                    let off = base + at * 4;
-                    i32::from_le_bytes(output[off..off + 4].try_into().unwrap())
-                } else if geo.topo.is_g80_bf16() {
-                    let off = base + at * 2;
-                    i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
-                } else { output[base + at] as i8 as i32 };
+    for col in 0..COLS {
+        for w in 0..geo.waves {
+            for rho in 0..ROWS {
+                let m0 = w * WAVE_M + (rho / 2) * TM;
+                let n0 = (2 * col + rho % 2) * TN;
+                let base = geo.pair_c_offset(col, w, rho);
+                if m0 >= geo.m || n0 >= geo.n {
+                    continue;
+                }
+                for mb in 0..MB {
+                    for nb in 0..NB {
+                        for i in 0..8 {
+                            let row = m0 + mb * 8 + i;
+                            if row >= geo.m {
+                                break;
+                            }
+                            for j in 0..8 {
+                                let cc = n0 + nb * 8 + j;
+                                if cc >= geo.n {
+                                    break;
+                                }
+                                let at = (mb * NB + nb) * 64 + i * 8 + j;
+                                c[row * geo.n + cc] = if i32_tiles {
+                                    let off = base + at * 4;
+                                    i32::from_le_bytes(output[off..off + 4].try_into().unwrap())
+                                } else if geo.topo.is_g80_bf16() {
+                                    let off = base + at * 2;
+                                    i32::from(u16::from_le_bytes(
+                                        output[off..off + 2].try_into().unwrap(),
+                                    ))
+                                } else {
+                                    output[base + at] as i8 as i32
+                                };
+                            }
+                        }
+                    }
+                }
             }
-        } } }
-    } } }
+        }
+    }
     c
 }
 
 /// Issue-cycle growth of a K64 chunk against the 128x64 pair core: `1280 - 1024` VMACs per chunk (the wavefront is
 /// `1315` against `1059` bundles), control unchanged (`docs/g80-feasibility.md` Gate 5c: later chunk ping / pong 1387 / 1379).
-const CHUNK_GROWTH: u64 = (TM * TN * CHUNK_K / 512 - gemm_core::TM * gemm_core::TN * gemm_core::CHUNK_K / 512) as u64;
+const CHUNK_GROWTH: u64 =
+    (TM * TN * CHUNK_K / 512 - gemm_core::TM * gemm_core::TN * gemm_core::CHUNK_K / 512) as u64;
 /// Issue cycles of the G80 reverse int8 epilogue `[Fast, Slow]`: 663 emitted for `Fast` (Gate 5c); `Slow` adds the baseline's
 /// `550 - 530` serial-control delta ([INFERENCE]: not separately executed).
-const EPILOGUE_CYCLES: [u64; 2] = [663, 663 + gemm_core::PAIR_EPILOGUE_CYCLES[1] - gemm_core::PAIR_EPILOGUE_CYCLES[0]];
+const EPILOGUE_CYCLES: [u64; 2] = [
+    663,
+    663 + gemm_core::PAIR_EPILOGUE_CYCLES[1] - gemm_core::PAIR_EPILOGUE_CYCLES[0],
+];
 /// One full wavefront of the compute region, the cost of each extra `Probe::repeat` pass.
 const WAVEFRONT_BUNDLES: u64 = (32 * 5 * 8 + 35) as u64;
 
@@ -595,7 +938,9 @@ const WAVEFRONT_BUNDLES: u64 = (32 * 5 * 8 + 35) as u64;
 /// `output_dma_cycles` reports the per-wave epilogue plus exposed `Cout` drain cycles summed over the waves (I32: the
 /// six-phase `C_EMPTY` stall per wave plus one final drain phase).
 pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEstimate {
-    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::estimate(geo, ctl, clock_hz); }
+    if geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::estimate(geo, ctl, clock_hz);
+    }
     assert!(clock_hz > 0);
     let (kc, _) = check_geometry(geo);
     let (kc, waves) = (kc as u64, geo.waves as u64);
@@ -603,8 +948,11 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
     let slow = usize::from(probe.serial);
     let input_chunk = (b_chunk_bytes(geo.topo) / 4) as u64;
     let chunk = |cycles: u64| {
-        if probe.no_compute { input_chunk } else {
-            (cycles + CHUNK_GROWTH + (u64::from(probe.repeat.max(1)) - 1) * WAVEFRONT_BUNDLES).max(input_chunk)
+        if probe.no_compute {
+            input_chunk
+        } else {
+            (cycles + CHUNK_GROWTH + (u64::from(probe.repeat.max(1)) - 1) * WAVEFRONT_BUNDLES)
+                .max(input_chunk)
         }
     };
     let [ping, pong] = gemm_core::PAIR_CHUNK_CYCLES[slow].map(chunk);
@@ -613,21 +961,36 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
         let stripe = (g80_core::C_STRIPE_BYTES / 4) as u64;
         let wave_core = compute + I32_HANDOFF_PHASES * stripe;
         let shim_c = 4 * stripe;
-        (input_chunk + (waves - 1) * wave_core.max(shim_c) + compute + (I32_HANDOFF_PHASES + 1) * stripe,
-            (I32_HANDOFF_PHASES * waves + 1) * stripe)
+        (
+            input_chunk
+                + (waves - 1) * wave_core.max(shim_c)
+                + compute
+                + (I32_HANDOFF_PHASES + 1) * stripe,
+            (I32_HANDOFF_PHASES * waves + 1) * stripe,
+        )
     } else if geo.topo.is_g80_bf16() {
         let phase = (bf16::OUT_BYTES / 4) as u64;
         let epilogue = bf16::wave_issue_cycles();
         // Shared pair stage: row0 write/drain, row1 write before its core can
         // reuse C. Row1's final drain is exposed once at the submit tail.
         let wave_core = compute + epilogue + 3 * phase;
-        (input_chunk + waves * wave_core + phase, waves * (epilogue + 3 * phase) + phase)
+        (
+            input_chunk + waves * wave_core + phase,
+            waves * (epilogue + 3 * phase) + phase,
+        )
     } else {
-        let epilogue = if probe.no_compute { 0 } else { EPILOGUE_CYCLES[slow] };
+        let epilogue = if probe.no_compute {
+            0
+        } else {
+            EPILOGUE_CYCLES[slow]
+        };
         let cout_drain = (COUT_BYTES / 4) as u64;
         let shim_c = (2 * COUT_BYTES / 4) as u64;
         let wave_core = compute + epilogue + cout_drain;
-        (input_chunk + (waves - 1) * wave_core.max(shim_c) + wave_core + shim_c, (epilogue + cout_drain) * waves)
+        (
+            input_chunk + (waves - 1) * wave_core.max(shim_c) + wave_core + shim_c,
+            (epilogue + cout_drain) * waves,
+        )
     };
     let estimated_seconds = estimated_cycles as f64 / clock_hz as f64;
     let useful_ops = 2.0 * geo.m as f64 * geo.n as f64 * geo.k as f64;
@@ -650,37 +1013,83 @@ pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> 
 }
 
 /// G80 builder with an explicit BF16 destination; other epilogues require native tiles.
-pub fn design_g80_bf16_layout(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control, layout: Bf16Layout) -> ArrayDesign {
-    assert!(epi == Epilogue::Bf16 || layout == Bf16Layout::NativeTiles, "row-major is BF16-only");
-    if let Epilogue::Int8 { shift } = epi { assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31"); }
-    assert_eq!(ctl.probe().layout, 0, "G80 has one fixed data-memory map; Probe::layout={} is not defined", ctl.probe().layout);
+pub fn design_g80_bf16_layout(
+    m: usize,
+    n: usize,
+    k: usize,
+    epi: Epilogue,
+    ctl: Control,
+    layout: Bf16Layout,
+) -> ArrayDesign {
+    assert!(
+        epi == Epilogue::Bf16 || layout == Bf16Layout::NativeTiles,
+        "row-major is BF16-only"
+    );
+    if let Epilogue::Int8 { shift } = epi {
+        assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31");
+    }
+    assert_eq!(
+        ctl.probe().layout,
+        0,
+        "G80 has one fixed data-memory map; Probe::layout={} is not defined",
+        ctl.probe().layout
+    );
     assert!(m > 0, "G80 needs M >= 1");
     assert_eq!(n, WAVE_N, "G80 needs N = {WAVE_N} exactly, got {n}");
-    assert!(k % CHUNK_K == 0 && (CHUNK_K..=g80_core::MAX_KC * CHUNK_K).contains(&k),
-        "G80 K must be a multiple of {CHUNK_K} in {CHUNK_K}..={}, got {k}", g80_core::MAX_KC * CHUNK_K);
+    assert!(
+        k % CHUNK_K == 0 && (CHUNK_K..=g80_core::MAX_KC * CHUNK_K).contains(&k),
+        "G80 K must be a multiple of {CHUNK_K} in {CHUNK_K}..={}, got {k}",
+        g80_core::MAX_KC * CHUNK_K
+    );
     let waves = m.div_ceil(WAVE_M);
-    assert!(waves <= MAX_WAVES, "G80 M={m} needs {waves} waves, exceeding {MAX_WAVES}");
-    layout.validate(waves * WAVE_M).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        waves <= MAX_WAVES,
+        "G80 M={m} needs {waves} waves, exceeding {MAX_WAVES}"
+    );
+    layout
+        .validate(waves * WAVE_M)
+        .unwrap_or_else(|e| panic!("{e}"));
     let mut geo = Geometry::g80(m, n, k, epi, ctl);
-    if let Kind::G80 { bf16_layout, .. } = &mut geo.topo.kind { *bf16_layout = layout; }
+    if let Kind::G80 { bf16_layout, .. } = &mut geo.topo.kind {
+        *bf16_layout = layout;
+    }
     let topo = geo.topo;
     let program = |role| g80_core::program_pair(geo.kc, geo.waves, role, epi, ctl).finish();
     let (lower, upper) = (program(PairRole::Lower), program(PairRole::Upper));
-    for p in [&lower, &upper] { assert!(p.len() <= 16 * 1024, "G80 core program {} B exceeds 16 KiB", p.len()); }
+    for p in [&lower, &upper] {
+        assert!(
+            p.len() <= 16 * 1024,
+            "G80 core program {} B exceeds 16 KiB",
+            p.len()
+        );
+    }
     let insts = array::build_txn_dynamic(&geo, false);
     ArrayDesign {
         pdi: crate::pdi::build(&array::build_cdo(topo, [&lower, &upper], false).to_words()),
         insts: insts.to_bytes(),
         args: vec![
-            ArgSpec { bytes: geo.a_bytes(), kind: ArgKind::In },
-            ArgSpec { bytes: geo.b_bytes(), kind: ArgKind::In },
-            ArgSpec { bytes: geo.c_bytes(), kind: ArgKind::Out },
+            ArgSpec {
+                bytes: geo.a_bytes(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: geo.b_bytes(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: geo.c_bytes(),
+                kind: ArgKind::Out,
+            },
         ],
         geo,
         variant: Variant::G80,
         program: lower,
         upper_program: upper,
-        core: if ctl.is_slow() { CoreVariant::FastSlowCtl } else { CoreVariant::Fast },
+        core: if ctl.is_slow() {
+            CoreVariant::FastSlowCtl
+        } else {
+            CoreVariant::Fast
+        },
         v8: Some((epi, ctl)),
         shim_axi: crate::dma::ShimAxi::default(),
     }
@@ -690,23 +1099,49 @@ pub fn design_g80_bf16_layout(m: usize, n: usize, k: usize, epi: Epilogue, ctl: 
 /// complete M256 wave; no Qwen-specific shape or device ownership lives here.
 pub fn build_panel_program(rows_max: usize, epilogue: Epilogue) -> Result<ArrayDesign, String> {
     if !(1..=256 * WAVE_M).contains(&rows_max) {
-        return Err(format!("G80 rows_max {rows_max} outside 1..={}", 256 * WAVE_M));
+        return Err(format!(
+            "G80 rows_max {rows_max} outside 1..={}",
+            256 * WAVE_M
+        ));
     }
-    Ok(design_g80(rows_max.div_ceil(WAVE_M) * WAVE_M, WAVE_N, 2560, epilogue, Control::Fast))
+    Ok(design_g80(
+        rows_max.div_ceil(WAVE_M) * WAVE_M,
+        WAVE_N,
+        2560,
+        epilogue,
+        Control::Fast,
+    ))
 }
 
 /// K2560 BF16 panel into a fused row-major arena (M padded to 256).
 /// Build once with col0=0 and advance arg2's base by `panel_col0 * 2`
 /// through `append_run_body` / `append_lean_run_body` for every panel.
 /// The caller must retain the full arena allocation behind that offset.
-pub fn build_panel_program_rowmajor(rows_max: usize, pitch: usize, col0: usize) -> Result<ArrayDesign, String> {
+pub fn build_panel_program_rowmajor(
+    rows_max: usize,
+    pitch: usize,
+    col0: usize,
+) -> Result<ArrayDesign, String> {
     if !(1..=256 * WAVE_M).contains(&rows_max) {
-        return Err(format!("G80 rows_max {rows_max} outside 1..={}", 256 * WAVE_M));
+        return Err(format!(
+            "G80 rows_max {rows_max} outside 1..={}",
+            256 * WAVE_M
+        ));
     }
     let rows = rows_max.div_ceil(WAVE_M) * WAVE_M;
-    let layout = Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 };
+    let layout = Bf16Layout::RowMajor {
+        pitch_elems: pitch,
+        col0_elems: col0,
+    };
     layout.validate(rows)?;
-    Ok(design_g80_bf16_layout(rows, WAVE_N, 2560, Epilogue::Bf16, Control::Fast, layout))
+    Ok(design_g80_bf16_layout(
+        rows,
+        WAVE_N,
+        2560,
+        Epilogue::Bf16,
+        Control::Fast,
+        layout,
+    ))
 }
 
 /// BF16 activation stream. Each K64 E/O half has 4096 code bytes followed
@@ -714,41 +1149,59 @@ pub fn build_panel_program_rowmajor(rows_max: usize, pitch: usize, col0: usize) 
 /// Padding tokens have zero scales. Scale metadata is deliberately repeated per
 /// chunk to reuse the existing ping/pong descriptors and locks.
 pub fn pack_a_bf16(design: &ArrayDesign, a: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
-    if design.geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_a_bf16(design, a, scales); }
+    if design.geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::pack_a_bf16(design, a, scales);
+    }
     let geo = &design.geo;
-    assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
+    assert!(
+        geo.topo.is_g80_bf16(),
+        "BF16 sidecars require a BF16 G80 design"
+    );
     assert_eq!(scales.len(), geo.m);
     let mut out = pack_a(geo, a);
     let segment = geo.a_segment_bytes();
-    for col in 0..A_COLS { for wave in 0..geo.waves { for ch in 0..geo.kc {
-        let base = col * segment + (wave * geo.kc + ch) * bf16::A_BYTES + A_HALF_BYTES;
-        let row0 = wave * WAVE_M + (col / 2) * TM;
-        for t in 0..TM {
-            let (m, e) = scales.get(row0 + t).copied().unwrap_or((0, 0));
-            out[base + 2 * t..base + 2 * t + 2].copy_from_slice(&m.to_le_bytes());
-            out[base + 256 + 2 * t..base + 258 + 2 * t].copy_from_slice(&e.to_le_bytes());
+    for col in 0..A_COLS {
+        for wave in 0..geo.waves {
+            for ch in 0..geo.kc {
+                let base = col * segment + (wave * geo.kc + ch) * bf16::A_BYTES + A_HALF_BYTES;
+                let row0 = wave * WAVE_M + (col / 2) * TM;
+                for t in 0..TM {
+                    let (m, e) = scales.get(row0 + t).copied().unwrap_or((0, 0));
+                    out[base + 2 * t..base + 2 * t + 2].copy_from_slice(&m.to_le_bytes());
+                    out[base + 256 + 2 * t..base + 258 + 2 * t].copy_from_slice(&e.to_le_bytes());
+                }
+            }
         }
-    } } }
+    }
     out
 }
 
 /// BF16 resident B panel: each 5120-byte K64 N80 tile is followed by Sm[96]
 /// u16 and Se[96] i16 (80 live +16 zero padding for aligned vector loads).
 pub fn pack_b_bf16(design: &ArrayDesign, b: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
-    if design.geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_b_bf16(design, b, scales); }
+    if design.geo.topo.is_g80_n512() {
+        return super::gemm_g80_n512::pack_b_bf16(design, b, scales);
+    }
     let geo = &design.geo;
-    assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
+    assert!(
+        geo.topo.is_g80_bf16(),
+        "BF16 sidecars require a BF16 G80 design"
+    );
     assert_eq!(scales.len(), geo.n);
     let mut out = pack_b(geo, b);
-    for col in 0..COLS { for ch in 0..geo.kc { for parity in 0..2 {
-        let base = ((col * geo.kc + ch) * 2 + parity) * bf16::B_BYTES + B_BYTES;
-        let n0 = (2 * col + parity) * TN;
-        for n in 0..TN {
-            let (m, e) = scales[n0 + n];
-            out[base + 2 * n..base + 2 * n + 2].copy_from_slice(&m.to_le_bytes());
-            out[base + 192 + 2 * n..base + 194 + 2 * n].copy_from_slice(&e.to_le_bytes());
+    for col in 0..COLS {
+        for ch in 0..geo.kc {
+            for parity in 0..2 {
+                let base = ((col * geo.kc + ch) * 2 + parity) * bf16::B_BYTES + B_BYTES;
+                let n0 = (2 * col + parity) * TN;
+                for n in 0..TN {
+                    let (m, e) = scales[n0 + n];
+                    out[base + 2 * n..base + 2 * n + 2].copy_from_slice(&m.to_le_bytes());
+                    out[base + 192 + 2 * n..base + 194 + 2 * n].copy_from_slice(&e.to_le_bytes());
+                }
+            }
         }
-    } } }
+    }
     out
 }
 
@@ -760,8 +1213,8 @@ pub fn bf16_output_offset(padded_rows: usize, row: usize, col: usize) -> usize {
     let waves = padded_rows / WAVE_M;
     let tile = col / TN;
     let rho = 2 * ((row % WAVE_M) / TM) + tile % 2;
-    let base = ((tile / 2) * waves * ROWS + (rho / 2) * waves * 2
-        + (row / WAVE_M) * 2 + rho % 2) * bf16::OUT_BYTES;
+    let base = ((tile / 2) * waves * ROWS + (rho / 2) * waves * 2 + (row / WAVE_M) * 2 + rho % 2)
+        * bf16::OUT_BYTES;
     let (r, c) = (row % TM, col % TN);
     base + 2 * ((r / 8 * NB + c / 8) * 64 + (r % 8) * 8 + c % 8)
 }

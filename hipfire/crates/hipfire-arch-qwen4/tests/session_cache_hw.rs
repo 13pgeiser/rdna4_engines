@@ -21,10 +21,49 @@
 //! logits and 16 greedy ids; the MTP leg repeats the chain and branch on the
 //! native MTP route (target plus draft head and its policy) and compares the
 //! seed token.
+//!
+//! `retired_turn_commits_live_on_flash_next` (`--features lab` only) checks
+//! that a native MTP turn the AR floor retired still ends with its head at
+//! the target and commits live for the conversation's next turn.
+//!
+//! `terminal_stop_inside_window_repairs_live_on_flash_next` (`--features lab`
+//! only) checks that a terminal stop inside a committed MTP window restores
+//! the retained pre-window state, replays only the consumed prefix and
+//! commits live.
+//!
+//! Each test loads Flash-Next (tens of GiB of pinned host memory), so run them
+//! one per process thread and only inside a fabric hold that declares that
+//! memory and holds the Flash-Next host lock, e.g. on an R9700:
+//!
+//! ```text
+//! fabric-run.sh --class correct --card B --mem-gb 30 --hostmem-gb 50 --hostmem-lock \
+//!   --max-secs 3600 -- session_cache_hw --ignored --test-threads=1 --exact <test>
+//! ```
+//!
+//! (Halo: `--card halo --mem-gb 120 --hostmem-lock`.) [`load`] refuses to run
+//! outside such a hold, naming the processes that hold the host lock, and
+//! without `--test-threads=1`.
+//!
+//! # GDN state mode
+//!
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=q8|fp32` picks the GDN recurrent-state format
+//! the loaded bundle runs under (unset = `q8`, the historical fixture; `q8_ef`
+//! is reserved and refuses with "not available in this build" until Track B
+//! lands; anything else is refused). [`load`] passes it as `state_request` to
+//! `resolve_state_format` and fails unless the resolved `GdnStateFormat` is the
+//! requested one; the product's `HIPFIRE_STATE_QUANT` is never read. After the
+//! load, every GDN layer's recurrent tensor must have that format's dtype and
+//! `GdnStateFormat::state_bytes`, and the bundle's session-cache scope must
+//! carry the resolved state format and not the other format's (so Q8 and F32
+//! snapshots never alias a domain); `load` prints the request, resolved
+//! format, per-layer recurrent bytes and scope as its evidence line. Every
+//! state digest also checks that its recurrent parts are those tensors, so the
+//! compared bytes are the resolved format's. Example (inside a hold):
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=fp32 HIPFIRE_SESSION_CACHE_MODEL=$M <test-bin> --ignored --test-threads=1 --exact restored_prefill_matches_cold_on_flash_next`.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
-use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend, Qwen4StateFormat};
+use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -37,6 +76,9 @@ use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+#[path = "common/hw_identity.rs"]
+mod hw_identity;
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
 const MAX_SEQ: usize = 32768;
@@ -54,6 +96,73 @@ fn prompt(seed: u64, len: usize) -> Vec<u32> {
         .collect()
 }
 
+/// The loaded bundle's GDN recurrent state is the format the test mode
+/// requested: every layer's recurrent tensor has that format's dtype and
+/// `GdnStateFormat::state_bytes`, and the session-cache scope names the
+/// resolved state format (so it differs from the other format's scope).
+/// Prints the evidence line.
+fn assert_resolved_gdn_state(bundle: &Qwen4Bundle, request: &str, state_format: Qwen4StateFormat) {
+    let config = &bundle.config;
+    let want = state_format.gdn.state_bytes(
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+    );
+    assert!(!bundle.state.gdn.is_empty(), "no GDN layers loaded");
+    for (layer, state) in bundle.state.gdn.iter().enumerate() {
+        assert_eq!(
+            state.recurrent.dtype,
+            state_format.gdn.dtype(),
+            "GDN layer {layer} recurrent dtype"
+        );
+        assert_eq!(
+            state.recurrent.byte_size(),
+            want,
+            "GDN layer {layer} recurrent bytes"
+        );
+        let residual = state_format.gdn.residual_bytes(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        );
+        match (&state.ef_residual, state_format.gdn.has_residual()) {
+            (None, false) => {}
+            (Some(ef), true) => {
+                assert_eq!(ef.dtype, DType::F16, "GDN layer {layer} residual dtype");
+                assert_eq!(ef.byte_size(), residual, "GDN layer {layer} residual bytes");
+            }
+            (have, want) => panic!(
+                "GDN layer {layer}: residual present={} but format {:?} wants {want}",
+                have.is_some(),
+                state_format.gdn
+            ),
+        }
+    }
+    let scope = SessionState::snapshot_scope(bundle, SessionRoute::Ar).expect("session scope");
+    let other = Qwen4StateFormat {
+        gdn: match state_format.gdn {
+            GdnStateFormat::F32 => GdnStateFormat::Q8,
+            GdnStateFormat::Q8 => GdnStateFormat::F32,
+            GdnStateFormat::Q8Ef => GdnStateFormat::Q8,
+        },
+        ..state_format
+    };
+    assert!(
+        scope.contains(&format!("{state_format:?}")),
+        "session scope {scope:?} does not carry the resolved state format {state_format:?}"
+    );
+    assert!(
+        !scope.contains(&format!("{other:?}")),
+        "session scope {scope:?} carries the other GDN format {other:?}"
+    );
+    println!(
+        "{} state_quant={request} gdn_format={} gdn_layers={} recurrent_bytes_per_layer={want} scope={scope}",
+        hw_identity::GDN_TEST_STATE_QUANT_ENV,
+        state_format.gdn.name(),
+        bundle.state.gdn.len()
+    );
+}
+
 /// SHA-256 of every part of the live state at `position` on `route`: the
 /// metadata, each fixed part, then the valid rows of each row stream.
 fn state_digests(
@@ -62,8 +171,24 @@ fn state_digests(
     route: SessionRoute,
     position: usize,
 ) -> Vec<[u8; 32]> {
+    let recurrent_bytes: Vec<usize> = bundle
+        .state
+        .gdn
+        .iter()
+        .map(|layer| layer.recurrent.byte_size())
+        .collect();
     let SnapshotParts { meta, layout } =
         SessionState::snapshot_parts(bundle, route, position).expect("state parts");
+    // Fixed parts are `[recurrent, conv]` per GDN layer first: the digested
+    // recurrent bytes are exactly the resolved format's state.
+    for (layer, bytes) in recurrent_bytes.iter().enumerate() {
+        assert_eq!(
+            layout.fixed[2 * layer].bytes,
+            *bytes,
+            "snapshot part {} is not GDN layer {layer}'s recurrent state",
+            2 * layer
+        );
+    }
     gpu.hip.device_synchronize().expect("sync");
     let mut digests = vec![Sha256::digest(&meta).into()];
     let ranges = layout
@@ -145,6 +270,7 @@ fn run_mtp(
             reused > 0,
             &|| false,
         )
+        .and_then(|outcome| outcome.into_first_token())
         .expect("MTP prefill");
     let digests = state_digests(bundle, gpu, SessionRoute::Mtp, tokens.len());
     bundle.session_commit();
@@ -168,6 +294,195 @@ fn assert_four_deltas(route: &str, stored: u64, one: u64) {
     );
 }
 
+/// The Flash-Next host lock fabric takes with `--hostmem-lock` (shared for
+/// correct, exclusive for timing holds).
+const HOSTMEM_LOCK: &str = "hostmem-flashnext.lock";
+
+/// `/proc/<pid>/stat` fields after the command: 1 = ppid, 19 = starttime.
+fn proc_stat(pid: u32, index: usize) -> Option<u64> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.get(raw.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(index)?
+        .parse()
+        .ok()
+}
+
+/// Granted flocks on files named [`HOSTMEM_LOCK`] that `pids` hold, read from
+/// `/proc/locks` through each process's open files: `(pid, mode)`.
+fn hostmem_lock_holders(pids: impl Iterator<Item = u32>) -> Vec<(u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+    let mut held = Vec::new();
+    for pid in pids {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if target.file_name().and_then(|n| n.to_str()) != Some(HOSTMEM_LOCK) {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&target) else {
+                continue;
+            };
+            let inode = format!(":{}", meta.ino());
+            for line in locks.lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() >= 6
+                    && !f.contains(&"->")
+                    && f[1] == "FLOCK"
+                    && f[4] == pid.to_string()
+                    && f[5].ends_with(&inode)
+                    && !held.iter().any(|(p, _): &(u32, String)| *p == pid)
+                {
+                    held.push((pid, f[3].to_string()));
+                }
+            }
+        }
+    }
+    held
+}
+
+/// Why a Flash-Next load must not run here, or `None` inside its own hold:
+/// the harness runs one test at a time (two loads in one process exhaust
+/// host memory), `chain` (this process, then its ancestors) contains the live
+/// fabric wrapper `FABRIC_JOB` names (`pid:starttime:cards`), and a process
+/// on the chain up to that wrapper holds [`HOSTMEM_LOCK`].
+fn hold_refusal(
+    threads_one: bool,
+    marker: &str,
+    chain: &[u32],
+    start_of: impl Fn(u32) -> Option<u64>,
+    holds_lock: impl Fn(&[u32]) -> bool,
+) -> Option<String> {
+    if !threads_one {
+        return Some("each test loads Flash-Next: run with --test-threads=1".into());
+    }
+    let mut parts = marker.splitn(3, ':');
+    let wrapper = parts.next().and_then(|p| p.parse::<u32>().ok());
+    let start = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let Some((wrapper, start)) = wrapper.zip(start) else {
+        return Some("no fabric hold (FABRIC_JOB unset)".into());
+    };
+    let Some(depth) = chain.iter().position(|&pid| pid == wrapper) else {
+        return Some(format!(
+            "fabric wrapper {wrapper} is not an ancestor of this process"
+        ));
+    };
+    if start_of(wrapper) != Some(start) {
+        return Some(format!(
+            "fabric wrapper {wrapper} is gone (stale FABRIC_JOB)"
+        ));
+    }
+    if !holds_lock(&chain[..=depth]) {
+        return Some(format!(
+            "fabric job {marker} does not hold {HOSTMEM_LOCK} (no --hostmem-lock)"
+        ));
+    }
+    None
+}
+
+/// Panic before a Flash-Next load outside its own fabric hold
+/// ([`hold_refusal`]), naming the processes that hold the host lock.
+fn require_fabric_hold() {
+    let args: Vec<String> = std::env::args().collect();
+    let threads_one = std::env::var("RUST_TEST_THREADS").is_ok_and(|v| v == "1")
+        || args.iter().any(|a| a == "--test-threads=1")
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--test-threads" && w[1] == "1");
+    let mut chain = vec![std::process::id()];
+    while let Some(ppid) = proc_stat(*chain.last().unwrap(), 1).filter(|&p| p > 1) {
+        chain.push(ppid as u32);
+    }
+    let marker = std::env::var("FABRIC_JOB").unwrap_or_default();
+    let refusal = hold_refusal(
+        threads_one,
+        &marker,
+        &chain,
+        |pid| proc_stat(pid, 19),
+        |pids| !hostmem_lock_holders(pids.iter().copied()).is_empty(),
+    );
+    if let Some(why) = refusal {
+        let all = std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok());
+        panic!(
+            "refusing to load Flash-Next: {why}. {HOSTMEM_LOCK} holders (pid, mode): {:?}. Run \
+             inside `fabric-run.sh ... --hostmem-gb <true peak> --hostmem-lock -- session_cache_hw \
+             --ignored --test-threads=1 ...` (see the module docs)",
+            hostmem_lock_holders(all)
+        );
+    }
+}
+
+#[test]
+fn fabric_hold_guard_refuses_loads_outside_a_hold() {
+    let chain = [30, 20, 10];
+    let start = |pid| (pid == 20).then_some(77);
+    let refusal = |threads, marker: &str, holds: bool| {
+        hold_refusal(threads, marker, &chain, start, |pids: &[u32]| {
+            holds && pids.contains(&20)
+        })
+    };
+    assert!(refusal(false, "20:77:B", true)
+        .unwrap()
+        .contains("--test-threads=1"));
+    assert!(refusal(true, "", true)
+        .unwrap()
+        .contains("FABRIC_JOB unset"));
+    assert!(refusal(true, "40:77:B", true)
+        .unwrap()
+        .contains("not an ancestor"));
+    assert!(refusal(true, "20:78:B", true).unwrap().contains("stale"));
+    assert!(refusal(true, "20:77:B", false)
+        .unwrap()
+        .contains("--hostmem-lock"));
+    assert_eq!(refusal(true, "20:77:B", true), None);
+}
+
+/// The holder scan finds a real shared flock on a file named like the host
+/// lock, held by a child `flock(1)` process, and nothing for this process.
+#[test]
+fn hostmem_lock_holders_reads_proc_locks() {
+    let dir = std::env::temp_dir().join(format!("session-cache-hw-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = dir.join(HOSTMEM_LOCK);
+    std::fs::write(&lock, b"").unwrap();
+    // `flock` holds the lock while its `cat` child waits on our stdin pipe,
+    // which closing below ends.
+    let Ok(mut child) = std::process::Command::new("flock")
+        .arg("-s")
+        .arg(&lock)
+        .arg("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        eprintln!("skip: flock(1) unavailable");
+        return;
+    };
+    let pid = child.id();
+    let mut held = Vec::new();
+    for _ in 0..100 {
+        held = hostmem_lock_holders(std::iter::once(pid));
+        if !held.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(hostmem_lock_holders(std::iter::once(std::process::id())).is_empty());
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(held, vec![(pid, "READ".to_string())]);
+}
+
 /// A loaded Flash-Next bundle with the session cache attached.
 struct Loaded {
     bundle: Qwen4Bundle,
@@ -184,6 +499,7 @@ struct Loaded {
 /// whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the `<|im_end|>` token is
 /// still the caller's `set_turn_end_token`).
 fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
+    require_fabric_hold();
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
@@ -222,9 +538,8 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         },
     )
     .expect("weights");
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
+    let (state_request, state_format) = hw_identity::resolve_gdn_test_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        "",
         &gpu,
         &receipt.config,
     )
@@ -247,6 +562,7 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     bundle
         .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .expect("forward");
+    assert_resolved_gdn_state(&bundle, state_request, state_format);
     let cache = SessionCache::new(domain, budget);
     bundle.attach_session_cache(match disk {
         Some(dir) => cache.with_disk(dir, 1 << 40),
@@ -383,6 +699,115 @@ fn resident_restore_matches_cold_on_flash_next() {
     let (digests, seed) = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, reused);
     assert_same_state("MTP resident", &cold.0, &digests);
     assert_eq!(seed, cold.1, "MTP resident seed");
+
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// Lever 1: the tail snapshot. A cold prompt A ends with a user message, its
+/// final `<|im_end|>` and an assistant header; with the turn end token set
+/// (message-end snapshots off) its cold prefill also splits and snapshots at
+/// the index BEFORE that final `<|im_end|>`, at least the test's 256-row minimum gap
+/// past the previous chunk boundary. Prompt B extends A's last user message
+/// (A up to that index, 200 new content tokens, then A's template suffix from
+/// the `<|im_end|>` on, so B's last `<|im_end|>` is at `tail + 200`) and must
+/// plan exactly A's index. B's own tail split is skipped: 200 rows past the
+/// restored tail is under that 256-row gap (and a turn restored from a tail
+/// never splits again). The tail schedule is
+/// session-exact, not cold-exact, so the restored B is compared with a cold B
+/// split manually at the same index (chunk boundary, then the index, then the
+/// rest as a live continuation), never with the unsplit cold schedule. A
+/// restore after the tail adds nothing to the pool. Runs with the tail
+/// snapshot on (`HIPFIRE_QWEN4_TAIL_SNAPSHOT` unset) and the thresholds
+/// lowered to a 256-row gap and no minimum prompt (`set_tail_snapshot_limits`).
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        tokenizer,
+        vocab,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    let im_end = tokenizer
+        .special_token_id("<|im_end|>")
+        .expect("tokenizer has <|im_end|>");
+    bundle.set_turn_end_token(Some(im_end));
+    // The production thresholds (1024-row gap, 16384-token prompt) would skip
+    // a split this short; keep the test prompts small.
+    bundle.set_tail_snapshot_limits(256, 0);
+    assert!(
+        !bundle.turn_snapshots_active(),
+        "message-end snapshots must stay off: only the tail splits"
+    );
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    assert!(chunk >= 1024, "test needs B to end before the second chunk");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+
+    // The tail index sits 300 rows past the chunk boundary (test minimum
+    // gap 256) and A ends in the same chunk. Neither prompt has an earlier
+    // `<|im_end|>`.
+    let tail = chunk + 300;
+    let mut a = prompt(0xa7, tail);
+    a.push(im_end);
+    a.extend(prompt(0xa8, 40));
+    assert_eq!(a.iter().rposition(|&t| t == im_end), Some(tail));
+    assert_eq!(a.iter().filter(|&&t| t == im_end).count(), 1);
+    // B continues A's last user message with new content and keeps A's
+    // template suffix, so its last `<|im_end|>` is 200 rows past the tail; it
+    // stays below the second chunk boundary.
+    let mut b = a[..tail].to_vec();
+    b.extend(prompt(0xb7, 200));
+    b.extend_from_slice(&a[tail..]);
+    assert_eq!(b.iter().rposition(|&t| t == im_end), Some(tail + 200));
+    assert_eq!(b.iter().filter(|&&t| t == im_end).count(), 1);
+    assert!(b.len() < 2 * chunk);
+    // The gap from the restored tail (200) is under the test minimum
+    // (256): B's own tail split is skipped, so B has no boundary after the
+    // restore.
+    assert_eq!(
+        SessionState::lineage_boundary(&bundle, &b, tail, b.len()),
+        None
+    );
+
+    assert_eq!(bundle.session_plan(&a, SessionRoute::Ar), 0);
+    run(&mut bundle, &mut gpu, &logits, &a, 0);
+    let stored = stored_bytes(&bundle);
+    assert!(stored > 0, "cold A published no snapshot");
+
+    // B plans exactly A's tail index, past A's chunk snapshot.
+    let reused = bundle.session_plan(&b, SessionRoute::Ar);
+    assert_eq!(reused, tail, "plan must offer A's tail snapshot");
+    let warm = run(&mut bundle, &mut gpu, &logits, &b, reused);
+    assert_eq!(
+        stored_bytes(&bundle),
+        stored,
+        "a restore after the tail must not publish to the pool"
+    );
+
+    // Cold B split manually at A's tail index: the cold prefix up to it, kept
+    // live, then the rest continuing in place (no capture, no tail).
+    bundle
+        .prefill_final(&mut gpu, &b[..tail], 0, &logits)
+        .expect("split prefix prefill");
+    bundle.session_commit_live(&b[..tail]);
+    assert_eq!(
+        bundle.session_plan(&b, SessionRoute::Ar),
+        tail,
+        "the split reference continues the live prefix"
+    );
+    let cold = run(&mut bundle, &mut gpu, &logits, &b, tail);
+    println!(
+        "AR tail split-cold ids {:?}\nAR tail warm ids {:?}",
+        cold.2, warm.2
+    );
+    assert_same_state("AR tail", &cold.0, &warm.0);
+    assert!(
+        warm.1 == cold.1,
+        "tail-restored final logits differ from the same-split cold prefill"
+    );
+    assert_eq!(warm.2, cold.2, "AR tail ids");
 
     gpu.free_tensor(logits).expect("free logits");
     bundle.free_gpu(&mut gpu).expect("free bundle");
@@ -554,6 +979,462 @@ fn message_end_snapshots_restore_on_flash_next() {
     );
     assert_eq!(warm.2, cold.2, "AR message-end ids");
 
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// A native MTP turn the AR floor retired still commits live. Retired AR
+/// windows (`lab_ar_window(.., false)`, the floor's head-free route) advance
+/// the target alone and owe their head rows; the terminal flush of the
+/// pending token (`mtp_forced_advance`) appends them teacher-forced first, so
+/// head and target end together, `session_commit_live` keeps the state and
+/// the conversation's next turn prefills only its suffix in place. Before
+/// the fix the flush advanced the target alone and the head stayed behind,
+/// so the commit dropped the live state and the next turn restored a chunk
+/// snapshot instead. One owed row takes the per-row Append, more take the
+/// batched decode fill (where it runs). The caught-up state (target and
+/// head) must equal the same tokens teacher-forced with the head synced
+/// throughout, and both must continue the next turn to the same seed.
+///
+/// Built only with `--features lab` (`lab_ar_window`):
+/// `cargo test -p hipfire-arch-qwen4 --release --features lab --test
+/// session_cache_hw -- --ignored retired_turn_commits_live_on_flash_next`.
+#[cfg(feature = "lab")]
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL; build with --features lab"]
+fn retired_turn_commits_live_on_flash_next() {
+    use hipfire_runtime::spec::SpecRequestConfig;
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let never = || false;
+    let a = prompt(0x7e7, 1500);
+    let mut mismatches = Vec::new();
+    for owed in [1usize, 2, 37] {
+        // The retired turn: cold prefill, `owed` head-free AR windows, then
+        // the terminal flush of the pending token.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        let seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("MTP prefill");
+        let mut emitted = vec![seed];
+        for i in 0..owed {
+            let window = drafter
+                .lab_ar_window(&mut gpu, &mut bundle, a.len() + i, emitted[i], false)
+                .expect("retired AR window");
+            emitted.extend(window.committed);
+            assert_eq!(
+                SessionState::live_position(&bundle, SessionRoute::Mtp),
+                None,
+                "owed {owed}: the head lags while it owes rows"
+            );
+        }
+        assert_eq!(
+            emitted.len(),
+            owed + 1,
+            "owed {owed}: one token per AR window"
+        );
+        let flushed = MtpDrafter::mtp_forced_advance(
+            &mut drafter,
+            &mut gpu,
+            &mut bundle,
+            &emitted[owed..],
+            a.len() + owed,
+            &never,
+        )
+        .expect("terminal flush");
+        assert!(
+            flushed,
+            "owed {owed}: the drafter advances the retired flush itself"
+        );
+        let consumed: Vec<u32> = a.iter().chain(&emitted).copied().collect();
+        assert_eq!(
+            SessionState::live_position(&bundle, SessionRoute::Mtp),
+            Some(consumed.len()),
+            "owed {owed}: head and target end at the consumed history"
+        );
+        let retired = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, consumed.len());
+        let next: Vec<u32> = consumed.iter().copied().chain(prompt(0x2e7, 64)).collect();
+        bundle.session_commit_live(&consumed);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            consumed.len(),
+            "owed {owed}: the next turn continues live"
+        );
+        let live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[consumed.len()..],
+                consumed.len(),
+                true,
+                &never,
+            )
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("live prefill after the retired turn");
+        bundle.session_commit();
+
+        // Reference: the same tokens teacher-forced with the head synced.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        let reference_seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("reference MTP prefill");
+        assert_eq!(reference_seed, seed, "owed {owed}: cold seed");
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &emitted,
+                a.len(),
+                &never
+            )
+            .expect("teacher-forced reference"),
+            "owed {owed}: the reference advance runs on the drafter"
+        );
+        let reference = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, consumed.len());
+        bundle.session_commit_live(&consumed);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            consumed.len(),
+            "owed {owed}: the reference continues live"
+        );
+        let reference_live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[consumed.len()..],
+                consumed.len(),
+                true,
+                &never,
+            )
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("live prefill after the reference turn");
+        bundle.session_commit();
+
+        let parts: Vec<usize> = (0..reference.len().max(retired.len()))
+            .filter(|&i| reference.get(i) != retired.get(i))
+            .collect();
+        println!(
+            "owed {owed}: consumed {} live seeds retired {live_seed} reference {reference_live_seed}; \
+             state parts differing from the reference: {parts:?} of {}",
+            consumed.len(),
+            reference.len()
+        );
+        if !parts.is_empty() || live_seed != reference_live_seed {
+            mismatches.push((owed, parts, live_seed, reference_live_seed));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "caught-up retired turns differ from the teacher-forced reference \
+         (owed, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
+    );
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// A terminal stop inside a committed window (a stop sequence the emitter
+/// observes after the window committed more rows than it consumed) is
+/// repaired in place and commits live. The window is an n-gram takeover over
+/// the target's own greedy continuation, so it accepts every candidate and
+/// commits four tokens; the emitter consumes only the first `n` of them.
+/// `Speculator::repair_terminal_prefix` restores the pre-window target and head
+/// tickets the window retained and replays the seed plus the first `n - 1`
+/// consumed tokens; the pending token is then flushed as the caller does. The
+/// conversation must continue live (no re-prefill), and its next turn must
+/// seed exactly as the same tokens teacher-forced do.
+///
+/// `stop_sequences` is set, so `HIPFIRE_MTP_INCREMENTAL=1` runs the same test
+/// on the interleaved takeover route (which snapshots only then); the default
+/// runs the batched takeover. Built only with `--features lab`
+/// (`lab_ar_window` gives the greedy stream):
+/// `cargo test -p hipfire-arch-qwen4 --release --features lab --test
+/// session_cache_hw -- --ignored terminal_stop_inside_window_repairs_live_on_flash_next`.
+#[cfg(feature = "lab")]
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL; build with --features lab"]
+fn terminal_stop_inside_window_repairs_live_on_flash_next() {
+    use hipfire_runtime::spec::SpecRequestConfig;
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let never = || false;
+    let cfg = SpecRequestConfig {
+        stop_sequences: true,
+        ..SpecRequestConfig::default()
+    };
+    let a = prompt(0x7e7, 1500);
+
+    // The target's greedy continuation: the seed and four more tokens, from
+    // head-free AR windows.
+    MtpDrafter::configure_request(&mut drafter, cfg);
+    let seed = drafter
+        .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+        .and_then(|outcome| outcome.into_first_token())
+        .expect("MTP prefill");
+    let mut stream = vec![seed];
+    for i in 0..4 {
+        let window = drafter
+            .lab_ar_window(&mut gpu, &mut bundle, a.len() + i, stream[i], false)
+            .expect("AR window");
+        stream.extend(window.committed);
+    }
+    assert_eq!(stream.len(), 5);
+
+    let mut mismatches = Vec::new();
+    for n in 1..=3usize {
+        MtpDrafter::configure_request(&mut drafter, cfg);
+        let cold_seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("MTP prefill");
+        assert_eq!(cold_seed, seed, "n {n}: cold seed");
+        let window = drafter
+            .mtp_takeover_step(
+                &mut gpu,
+                &mut bundle,
+                a.len(),
+                seed,
+                &[seed],
+                &stream[1..4],
+                u32::MAX,
+            )
+            .expect("takeover window");
+        assert_eq!(
+            window.committed,
+            stream[1..5].to_vec(),
+            "n {n}: the window accepts the whole greedy continuation"
+        );
+        let consumed = &window.committed[..n];
+        let repaired = MtpDrafter::mtp_repair_terminal_prefix(
+            &mut drafter,
+            &mut gpu,
+            &mut bundle,
+            a.len(),
+            seed,
+            consumed,
+        )
+        .expect("terminal repair");
+        assert!(repaired, "n {n}: the retained window repairs the stop");
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &consumed[n - 1..],
+                a.len() + n,
+                &never
+            )
+            .expect("terminal flush"),
+            "n {n}: the drafter advances the flush itself"
+        );
+        let history: Vec<u32> = a.iter().chain(&[seed]).chain(consumed).copied().collect();
+        assert_eq!(
+            SessionState::live_position(&bundle, SessionRoute::Mtp),
+            Some(history.len()),
+            "n {n}: head and target end at the consumed history"
+        );
+        let repaired_state = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, history.len());
+        let next: Vec<u32> = history.iter().copied().chain(prompt(0x2e7, 64)).collect();
+        bundle.session_commit_live(&history);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            history.len(),
+            "n {n}: the next turn continues live"
+        );
+        let live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[history.len()..],
+                history.len(),
+                true,
+                &never,
+            )
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("live prefill after the repaired turn");
+        bundle.session_commit();
+
+        // Reference: the same history teacher-forced.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .expect("reference MTP prefill");
+        let forced: Vec<u32> = std::iter::once(seed)
+            .chain(consumed.iter().copied())
+            .collect();
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &forced,
+                a.len(),
+                &never
+            )
+            .expect("teacher-forced reference"),
+            "n {n}: the reference advance runs on the drafter"
+        );
+        let reference = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, history.len());
+        bundle.session_commit_live(&history);
+        let reference_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[history.len()..],
+                history.len(),
+                true,
+                &never,
+            )
+            .and_then(|outcome| outcome.into_first_token())
+            .expect("live prefill after the reference turn");
+        bundle.session_commit();
+
+        let parts: Vec<usize> = (0..reference.len().max(repaired_state.len()))
+            .filter(|&i| reference.get(i) != repaired_state.get(i))
+            .collect();
+        println!(
+            "n {n}: history {} live seeds repaired {live_seed} reference {reference_seed}; \
+             state parts differing from the teacher-forced reference: {parts:?} of {}",
+            history.len(),
+            reference.len()
+        );
+        if live_seed != reference_seed {
+            mismatches.push((n, parts, live_seed, reference_seed));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "a repaired terminal differs from the teacher-forced reference \
+         (n, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
+    );
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+#[cfg(feature = "reference-parity")]
+#[path = "common/slowlink_receipt.rs"]
+mod slowlink_receipt;
+
+/// S1 slow-link layer-major prefill: the session-cache chain and branch of
+/// `restored_prefill_matches_cold_on_flash_next`, with the loader's
+/// admission-first placement (the S1 profile's joint placement: the largest
+/// resident layer count that actually fits, ten preferred but never a floor,
+/// the rest host-mapped) and the route forced through the
+/// production switch
+/// (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`). Every cold and restored prefill must
+/// carry a valid S1 route receipt (a call of at most one tile may be an
+/// explicit named bypass), A is restored through its three-link chain and B
+/// through the shared root (a divergent continuation), and each restored
+/// state, final logits and greedy ids must equal the same-route cold prefill
+/// byte for byte. Needs `--features reference-parity`.
+#[cfg(feature = "reference-parity")]
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host, HIPFIRE_SESSION_CACHE_MODEL and --features reference-parity"]
+fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
+    use hipfire_arch_qwen4::state_parity::{slowlink_load_bundle, SlowlinkLoaded};
+    use slowlink_receipt::{
+        admission_actual, admission_witness, admission_witness_problems, validate,
+        validate_forced_short, Expect, Limits, MAX_TILE_ROWS,
+    };
+
+    require_fabric_hold();
+    match std::env::var("HIPFIRE_QWEN4_SLOWLINK_PREFILL") {
+        Ok(v) => assert_eq!(v, "1", "the layer-major restore test forces the route on"),
+        Err(_) => std::env::set_var("HIPFIRE_QWEN4_SLOWLINK_PREFILL", "1"),
+    }
+    let model = std::env::var_os(MODEL_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
+    let mut gpu = Gpu::init().expect("GPU");
+    let SlowlinkLoaded {
+        mut bundle,
+        vocab,
+        resident_layers,
+        num_layers,
+        placement,
+        slowlink_profile,
+        ..
+    } = slowlink_load_bundle(
+        &mut gpu,
+        &model,
+        MAX_SEQ,
+        Some(u64::MAX >> 1),
+        hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose::Product,
+    )
+    .expect("slowlink load");
+    assert!(
+        slowlink_profile,
+        "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
+    );
+    // No resident floor: the actual count must be a maximal-fits proof
+    // (selected fits, one more does not, a host layer remains).
+    {
+        let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
+        let witness = admission_witness(profile);
+        let bad = admission_witness_problems(
+            Some(&witness),
+            &admission_actual(Some(profile), resident_layers, num_layers),
+        );
+        assert!(
+            bad.is_empty(),
+            "the admission is not a maximal-fits proof: {bad:?}\nwitness: {witness}"
+        );
+    }
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let mut b = a[..chunk].to_vec();
+    b.extend(prompt(0xb, chunk + 200));
+    println!("S1 layer-major restore: chunk={chunk} resident layers={resident_layers} placement={placement}");
+
+    let check_route = |bundle: &Qwen4Bundle, rows: usize, what: &str| {
+        let receipt = bundle.slowlink_receipt();
+        let limits = Limits::default();
+        let problems = if rows as u64 > MAX_TILE_ROWS {
+            validate(receipt.as_ref(), Expect::LayerMajor, &limits)
+        } else {
+            validate_forced_short(receipt.as_ref(), &limits)
+        };
+        assert!(
+            problems.is_empty(),
+            "{what}: route receipt problems {problems:?}\n{receipt:?}"
+        );
+    };
+
+    let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
+    check_route(&bundle, a.len(), "cold A");
+    let cold_b = run(&mut bundle, &mut gpu, &logits, &b, 0);
+    check_route(&bundle, b.len(), "cold B");
+    for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
+        let reused = bundle.session_plan(tokens, SessionRoute::Ar);
+        assert_eq!(
+            reused,
+            links * chunk,
+            "plan must offer {name}'s {links}-chunk snapshot"
+        );
+        let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
+        check_route(&bundle, tokens.len() - reused, &format!("restored {name}"));
+        assert_same_state(&format!("S1 AR {name}"), &cold.0, &digests);
+        assert!(
+            warm_logits == cold.1,
+            "S1 AR {name}: restored final logits differ from cold"
+        );
+        assert_eq!(warm_ids, cold.2, "S1 AR {name}");
+    }
     gpu.free_tensor(logits).expect("free logits");
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }

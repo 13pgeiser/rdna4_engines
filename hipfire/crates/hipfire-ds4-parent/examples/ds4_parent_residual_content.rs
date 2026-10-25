@@ -27,8 +27,8 @@ use hipfire_ds4_parent::attention::{
     PARENT_DIM, PARENT_HEAD_DIM, PARENT_N_KV_HEADS, PARENT_SWA_WINDOW,
 };
 use hipfire_ds4_parent::forward::{
-    parent_layer_forward, parent_layer_forward_traced, ParentForwardScratch,
-    ParentLayerTrace, PARENT_HC_DIM, PARENT_HC_MULT,
+    parent_layer_forward, parent_layer_forward_traced, ParentForwardScratch, ParentLayerTrace,
+    PARENT_HC_DIM, PARENT_HC_MULT,
 };
 use hipfire_ds4_parent::head::parent_embed;
 use hipfire_ds4_parent::inventory::ParentInventory;
@@ -75,12 +75,7 @@ fn run() -> Result<(), String> {
     }
     let token_ids = &token_ids[..n];
 
-    let positions: Vec<usize> = args
-        .positions
-        .iter()
-        .copied()
-        .filter(|&p| p < n)
-        .collect();
+    let positions: Vec<usize> = args.positions.iter().copied().filter(|&p| p < n).collect();
     if positions.is_empty() {
         return Err("no positions in range".into());
     }
@@ -159,13 +154,7 @@ fn run() -> Result<(), String> {
 
     if want.contains(&-1) {
         let host = download_f32(&gpu, &hc_a, n * PARENT_HC_DIM)?;
-        let path = dump_layer_positions(
-            &args.out_dir,
-            "layer_-1_embed",
-            &host,
-            n,
-            &positions,
-        )?;
+        let path = dump_layer_positions(&args.out_dir, "layer_-1_embed", &host, n, &positions)?;
         let g = l2_all(&host);
         println!("  dumped embed -> {} global_L2={g:.6}", path.display());
         dumped.push(format!(
@@ -337,7 +326,11 @@ fn dump_stage(
     }
     let path = out_dir.join(format!("L{layer}_{name}.f32"));
     write_f32_le(&path, &out)?;
-    println!("  stage dump {} elems={} row_dim={row_dim}", path.display(), out.len());
+    println!(
+        "  stage dump {} elems={} row_dim={row_dim}",
+        path.display(),
+        out.len()
+    );
     Ok(())
 }
 
@@ -418,8 +411,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut host = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("dtoh: {e:?}"))?;
@@ -499,7 +491,10 @@ fn parse_args() -> Result<Args, String> {
                 stage_layers = s
                     .split(',')
                     .filter(|x| !x.is_empty())
-                    .map(|x| x.parse::<usize>().map_err(|e| format!("stage layer {x}: {e}")))
+                    .map(|x| {
+                        x.parse::<usize>()
+                            .map_err(|e| format!("stage layer {x}: {e}"))
+                    })
                     .collect::<Result<_, _>>()?;
             }
             "--help" | "-h" => {

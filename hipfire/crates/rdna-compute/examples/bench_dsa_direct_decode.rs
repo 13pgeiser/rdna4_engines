@@ -125,9 +125,7 @@ fn run_shape(gpu: &mut Gpu, heads: usize, seed: &mut u32) {
 
     // Deterministic permutation of 0..511; all indices are valid and exactly
     // one of the 513 compressed rows is excluded, as in the near-cap route.
-    let indices: Vec<i32> = (0..TOPK)
-        .map(|i| ((i * 313 + 97) % TOPK) as i32)
-        .collect();
+    let indices: Vec<i32> = (0..TOPK).map(|i| ((i * 313 + 97) % TOPK) as i32).collect();
     let valid = [SWA as i32];
     let active = [TOPK as i32];
     let n_compressed = [N_COMPRESSED as i32];
@@ -135,9 +133,7 @@ fn run_shape(gpu: &mut Gpu, heads: usize, seed: &mut u32) {
     let d_q = gpu.upload_f32(&q, &[heads * D]).expect("q");
     let d_swa_k = gpu.upload_f32(&swa_k, &[D * SWA]).expect("swa k");
     let d_swa_v = gpu.upload_f32(&swa_v, &[D * SWA]).expect("swa v");
-    let d_kv = gpu
-        .upload_f32(&kv, &[N_COMPRESSED * D])
-        .expect("main kv");
+    let d_kv = gpu.upload_f32(&kv, &[N_COMPRESSED * D]).expect("main kv");
     let d_indices = upload_i32(gpu, &indices);
     let d_sink = gpu.upload_f32(&sink, &[heads]).expect("sink");
     let d_valid = upload_i32(gpu, &valid);
@@ -246,8 +242,8 @@ fn run_shape(gpu: &mut Gpu, heads: usize, seed: &mut u32) {
     }
     gpu.hip.event_record(&e1, None).expect("record");
     gpu.hip.event_synchronize(&e1).expect("sync");
-    let gathered_us = gpu.hip.event_elapsed_ms(&e0, &e1).expect("elapsed") as f64 * 1_000.0
-        / ITERS as f64;
+    let gathered_us =
+        gpu.hip.event_elapsed_ms(&e0, &e1).expect("elapsed") as f64 * 1_000.0 / ITERS as f64;
 
     let e2 = gpu.hip.event_create().expect("event");
     let e3 = gpu.hip.event_create().expect("event");
@@ -269,8 +265,8 @@ fn run_shape(gpu: &mut Gpu, heads: usize, seed: &mut u32) {
     }
     gpu.hip.event_record(&e3, None).expect("record");
     gpu.hip.event_synchronize(&e3).expect("sync");
-    let direct_us = gpu.hip.event_elapsed_ms(&e2, &e3).expect("elapsed") as f64 * 1_000.0
-        / ITERS as f64;
+    let direct_us =
+        gpu.hip.event_elapsed_ms(&e2, &e3).expect("elapsed") as f64 * 1_000.0 / ITERS as f64;
 
     eprintln!(
         "H={heads}: gather+attention={gathered_us:.3} us direct={direct_us:.3} us speedup={:.4}x saved={:.3} us raw_mismatches={mismatches}/{} max_abs={max_abs:.9e}",

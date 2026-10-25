@@ -58,7 +58,10 @@ impl MemClass {
     }
 
     pub fn writes(self) -> bool {
-        matches!(self, Self::VmemStore | Self::Atomic | Self::AtomicCommutative)
+        matches!(
+            self,
+            Self::VmemStore | Self::Atomic | Self::AtomicCommutative
+        )
     }
 }
 
@@ -90,7 +93,10 @@ impl ReadCache {
 pub enum ArgRole {
     /// A1: a resolved access base. `classes` is empty when the kernel never
     /// dereferences it.
-    Pointer { classes: Vec<MemClass>, read_cache: ReadCache },
+    Pointer {
+        classes: Vec<MemClass>,
+        read_cache: ReadCache,
+    },
     /// A4: loaded, never an access base.
     Integer,
     NotLoaded,
@@ -182,7 +188,8 @@ impl KernelFacts {
         let status = match record.status.as_str() {
             "proven" => FactStatus::Proven,
             "unknown" => {
-                let mut rules: Vec<String> = record.unresolved.iter().map(|u| u.rule.clone()).collect();
+                let mut rules: Vec<String> =
+                    record.unresolved.iter().map(|u| u.rule.clone()).collect();
                 rules.sort();
                 rules.dedup();
                 FactStatus::Unknown(rules)
@@ -193,35 +200,66 @@ impl KernelFacts {
         let mut hidden = Vec::new();
         for arg in &record.args {
             if let Some(kind) = HiddenKind::parse(&arg.value_kind) {
-                hidden.push(HiddenArg { offset: arg.offset, size: arg.size, kind, value_kind: arg.value_kind.clone(), loaded: arg.loaded });
+                hidden.push(HiddenArg {
+                    offset: arg.offset,
+                    size: arg.size,
+                    kind,
+                    value_kind: arg.value_kind.clone(),
+                    loaded: arg.loaded,
+                });
                 continue;
             }
             let role = match arg.role.as_str() {
                 "pointer" => {
-                    let classes = arg.classes.iter().map(|c| MemClass::parse(c)).collect::<Result<Vec<_>, _>>()?;
-                    ArgRole::Pointer { classes, read_cache: ReadCache::parse(&arg.read_cache)? }
+                    let classes = arg
+                        .classes
+                        .iter()
+                        .map(|c| MemClass::parse(c))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ArgRole::Pointer {
+                        classes,
+                        read_cache: ReadCache::parse(&arg.read_cache)?,
+                    }
                 }
                 "integer" => ArgRole::Integer,
                 "not_loaded" => ArgRole::NotLoaded,
-                other => return Err(format!("{} +{}: unknown A4 role {other:?}", record.symbol, arg.offset)),
+                other => {
+                    return Err(format!(
+                        "{} +{}: unknown A4 role {other:?}",
+                        record.symbol, arg.offset
+                    ))
+                }
             };
-            args.push(ArgFact { offset: arg.offset, size: arg.size, role });
+            args.push(ArgFact {
+                offset: arg.offset,
+                size: arg.size,
+                role,
+            });
         }
         args.sort_by_key(|a| a.offset);
         hidden.sort_by_key(|a| a.offset);
         let explicit_bytes = args.last().map_or(0, |a| a.offset + a.size);
         for pair in args.windows(2) {
             if pair[0].offset + pair[0].size > pair[1].offset {
-                return Err(format!("{}: arguments +{} and +{} overlap", record.symbol, pair[0].offset, pair[1].offset));
+                return Err(format!(
+                    "{}: arguments +{} and +{} overlap",
+                    record.symbol, pair[0].offset, pair[1].offset
+                ));
             }
         }
         for h in &hidden {
             if h.offset < explicit_bytes || h.offset + h.size > record.kernarg_size {
-                return Err(format!("{}: hidden {} at +{} lies outside the hidden block", record.symbol, h.value_kind, h.offset));
+                return Err(format!(
+                    "{}: hidden {} at +{} lies outside the hidden block",
+                    record.symbol, h.value_kind, h.offset
+                ));
             }
         }
         if explicit_bytes > record.kernarg_size {
-            return Err(format!("{}: explicit arguments end past the {}-byte segment", record.symbol, record.kernarg_size));
+            return Err(format!(
+                "{}: explicit arguments end past the {}-byte segment",
+                record.symbol, record.kernarg_size
+            ));
         }
         Ok(Self {
             status,
@@ -238,7 +276,10 @@ impl KernelFacts {
     /// Offsets of the A1 pointer arguments: the ones a recorder must bind to
     /// live allocations.
     pub fn pointer_offsets(&self) -> impl Iterator<Item = u32> + '_ {
-        self.args.iter().filter(|a| matches!(a.role, ArgRole::Pointer { .. })).map(|a| a.offset)
+        self.args
+            .iter()
+            .filter(|a| matches!(a.role, ArgRole::Pointer { .. }))
+            .map(|a| a.offset)
     }
 }
 
@@ -265,18 +306,32 @@ pub struct NodeFacts {
 
 impl NodeFacts {
     /// The facts for `symbol` from a verified corpus hit.
-    pub fn from_hit(record: &CorpusRecord, receipt: &Receipt, symbol: &str) -> Result<Self, String> {
+    pub fn from_hit(
+        record: &CorpusRecord,
+        receipt: &Receipt,
+        symbol: &str,
+    ) -> Result<Self, String> {
         let kernel = receipt
             .railgun
             .kernels
             .iter()
             .find(|k| k.symbol == symbol)
-            .ok_or_else(|| format!("receipt {} has no railgun record for {symbol}", receipt.object_sha256))?;
+            .ok_or_else(|| {
+                format!(
+                    "receipt {} has no railgun record for {symbol}",
+                    receipt.object_sha256
+                )
+            })?;
         let identity = receipt
             .kernels
             .iter()
             .find(|k| k.symbol == symbol)
-            .ok_or_else(|| format!("receipt {} has no identity for {symbol}", receipt.object_sha256))?;
+            .ok_or_else(|| {
+                format!(
+                    "receipt {} has no identity for {symbol}",
+                    receipt.object_sha256
+                )
+            })?;
         Ok(Self {
             kref: KernelRef {
                 module: record.module.clone(),
@@ -335,7 +390,10 @@ pub struct LaunchRecord {
 pub enum Arg {
     Const(Vec<u8>),
     /// `base(resource) + interior`, re-encoded from the binding.
-    Resource { resource: ResourceId, interior: u64 },
+    Resource {
+        resource: ResourceId,
+        interior: u64,
+    },
     Word(WordId),
 }
 
@@ -368,9 +426,13 @@ impl RegionEffect {
 pub enum Lowering {
     Pm4,
     /// Certified but not PM4-admissible (e.g. a non-commutative atomic).
-    Graph { reason: String },
+    Graph {
+        reason: String,
+    },
     /// No usable facts: a full barrier on both sides (§1.4 rule 4).
-    HipDirect { reason: String },
+    HipDirect {
+        reason: String,
+    },
 }
 
 impl Lowering {
@@ -452,17 +514,30 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         }
         let explicit = f.explicit_bytes as usize;
         if launch.kernarg.len() < explicit {
-            refusals.push(format!("recorded kernarg is {} bytes, the object's explicit segment {explicit}", launch.kernarg.len()));
+            refusals.push(format!(
+                "recorded kernarg is {} bytes, the object's explicit segment {explicit}",
+                launch.kernarg.len()
+            ));
             nodes.push(uncertified_node(launch, refusals.join("; ")));
             continue;
         }
         if launch.kernarg[explicit..].iter().any(|b| *b != 0) {
-            refusals.push(format!("recorded kernarg carries nonzero bytes past the {explicit}-byte explicit segment"));
+            refusals.push(format!(
+                "recorded kernarg carries nonzero bytes past the {explicit}-byte explicit segment"
+            ));
         }
-        for h in f.hidden.iter().filter(|h| h.loaded && h.kind == HiddenKind::Other) {
-            refusals.push(format!("loads hidden {} which railgun does not supply", h.value_kind));
+        for h in f
+            .hidden
+            .iter()
+            .filter(|h| h.loaded && h.kind == HiddenKind::Other)
+        {
+            refusals.push(format!(
+                "loads hidden {} which railgun does not supply",
+                h.value_kind
+            ));
         }
-        let declared: BTreeMap<u32, WordRole> = launch.declared.iter().map(|w| (w.offset, w.role)).collect();
+        let declared: BTreeMap<u32, WordRole> =
+            launch.declared.iter().map(|w| (w.offset, w.role)).collect();
         let mut used_words = 0usize;
         let mut args = Vec::with_capacity(f.args.len() * 2);
         let mut effects = Vec::new();
@@ -471,7 +546,10 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         for arg in &f.args {
             let (start, end) = (arg.offset as usize, (arg.offset + arg.size) as usize);
             if start > cursor {
-                args.push((cursor as u32, Arg::Const(launch.kernarg[cursor..start].to_vec())));
+                args.push((
+                    cursor as u32,
+                    Arg::Const(launch.kernarg[cursor..start].to_vec()),
+                ));
             }
             let bytes = &launch.kernarg[start..end];
             cursor = end;
@@ -480,9 +558,17 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 if arg.role == ArgRole::Integer && arg.size == 4 {
                     let authored = u32::from_le_bytes(bytes.try_into().expect("4-byte argument"));
                     args.push((arg.offset, Arg::Word(WordId(words.len() as u32))));
-                    words.push(ProgramWord { node: index, offset: arg.offset, role: *role, authored });
+                    words.push(ProgramWord {
+                        node: index,
+                        offset: arg.offset,
+                        role: *role,
+                        authored,
+                    });
                 } else {
-                    refusals.push(format!("declared word at +{} is not a loaded 4-byte integer argument (A4)", arg.offset));
+                    refusals.push(format!(
+                        "declared word at +{} is not a loaded 4-byte integer argument (A4)",
+                        arg.offset
+                    ));
                     args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 }
                 continue;
@@ -492,7 +578,10 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 continue;
             };
             if arg.size != 8 {
-                refusals.push(format!("pointer argument +{} is {} bytes", arg.offset, arg.size));
+                refusals.push(format!(
+                    "pointer argument +{} is {} bytes",
+                    arg.offset, arg.size
+                ));
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             }
@@ -502,45 +591,84 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             }
-            let allocation = launch.allocations.iter().find(|(offset, _)| *offset == arg.offset).map(|(_, a)| a);
+            let allocation = launch
+                .allocations
+                .iter()
+                .find(|(offset, _)| *offset == arg.offset)
+                .map(|(_, a)| a);
             let binding = match allocation {
-                Some(Ok(binding)) if value >= binding.base && value - binding.base < binding.bytes.max(1) => *binding,
+                Some(Ok(binding))
+                    if value >= binding.base && value - binding.base < binding.bytes.max(1) =>
+                {
+                    *binding
+                }
                 Some(Ok(binding)) => {
-                    refusals.push(format!("pointer +{} = {value:#x} lies outside its reported allocation {:#x}+{}", arg.offset, binding.base, binding.bytes));
+                    refusals.push(format!(
+                        "pointer +{} = {value:#x} lies outside its reported allocation {:#x}+{}",
+                        arg.offset, binding.base, binding.bytes
+                    ));
                     args.push((arg.offset, Arg::Const(bytes.to_vec())));
                     continue;
                 }
                 Some(Err(reason)) => {
-                    refusals.push(format!("pointer +{} = {value:#x} has no live allocation: {reason}", arg.offset));
+                    refusals.push(format!(
+                        "pointer +{} = {value:#x} has no live allocation: {reason}",
+                        arg.offset
+                    ));
                     args.push((arg.offset, Arg::Const(bytes.to_vec())));
                     continue;
                 }
                 None => {
-                    refusals.push(format!("pointer +{} = {value:#x} was not probed", arg.offset));
+                    refusals.push(format!(
+                        "pointer +{} = {value:#x} was not probed",
+                        arg.offset
+                    ));
                     args.push((arg.offset, Arg::Const(bytes.to_vec())));
                     continue;
                 }
             };
-            let resource = *by_allocation.entry((binding.base, binding.bytes)).or_insert_with(|| {
-                resources.push(binding);
-                ResourceId(resources.len() as u32 - 1)
-            });
-            args.push((arg.offset, Arg::Resource { resource, interior: value - binding.base }));
+            let resource = *by_allocation
+                .entry((binding.base, binding.bytes))
+                .or_insert_with(|| {
+                    resources.push(binding);
+                    ResourceId(resources.len() as u32 - 1)
+                });
+            args.push((
+                arg.offset,
+                Arg::Resource {
+                    resource,
+                    interior: value - binding.base,
+                },
+            ));
             if !classes.is_empty() {
                 non_commutative_atomic |= classes.contains(&MemClass::Atomic);
-                effects.push(RegionEffect { arg_offset: arg.offset, resource, classes: classes.clone() });
+                effects.push(RegionEffect {
+                    arg_offset: arg.offset,
+                    resource,
+                    classes: classes.clone(),
+                });
             }
         }
         if cursor < explicit {
-            args.push((cursor as u32, Arg::Const(launch.kernarg[cursor..explicit].to_vec())));
+            args.push((
+                cursor as u32,
+                Arg::Const(launch.kernarg[cursor..explicit].to_vec()),
+            ));
         }
         if used_words != declared.len() {
-            refusals.push(format!("{} declared word(s) name no argument of the object", declared.len() - used_words));
+            refusals.push(format!(
+                "{} declared word(s) name no argument of the object",
+                declared.len() - used_words
+            ));
         }
         let lowering = if !refusals.is_empty() {
-            Lowering::HipDirect { reason: refusals.join("; ") }
+            Lowering::HipDirect {
+                reason: refusals.join("; "),
+            }
         } else if non_commutative_atomic {
-            Lowering::Graph { reason: "atomic without a commutativity certificate".to_owned() }
+            Lowering::Graph {
+                reason: "atomic without a commutativity certificate".to_owned(),
+            }
         } else {
             Lowering::Pm4
         };
@@ -559,7 +687,12 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             lowering,
         });
     }
-    KernelProgram { arch: arch.to_owned(), resources, words, nodes }
+    KernelProgram {
+        arch: arch.to_owned(),
+        resources,
+        words,
+        nodes,
+    }
 }
 
 fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
@@ -584,9 +717,20 @@ impl KernelProgram {
     /// (`loader_bytes`, which must equal the certified segment): explicit
     /// arguments re-encoded from the program (resources from their bindings,
     /// words from `words`), then the declared hidden arguments.
-    pub fn kernarg_image(&self, node: usize, loader_bytes: usize, words: &[u32]) -> Result<Vec<u8>, String> {
-        let n = self.nodes.get(node).ok_or_else(|| format!("no node {node}"))?;
-        let segment = n.segment_bytes.ok_or_else(|| format!("{}: no certified kernarg segment", n.symbol))? as usize;
+    pub fn kernarg_image(
+        &self,
+        node: usize,
+        loader_bytes: usize,
+        words: &[u32],
+    ) -> Result<Vec<u8>, String> {
+        let n = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| format!("no node {node}"))?;
+        let segment = n
+            .segment_bytes
+            .ok_or_else(|| format!("{}: no certified kernarg segment", n.symbol))?
+            as usize;
         if loader_bytes != segment {
             return Err(format!("{}: the loaded object's kernarg segment is {loader_bytes} B, the certified one {segment} B", n.symbol));
         }
@@ -596,12 +740,20 @@ impl KernelProgram {
             match arg {
                 Arg::Const(bytes) => image[at..at + bytes.len()].copy_from_slice(bytes),
                 Arg::Resource { resource, interior } => {
-                    let binding = self.resources.get(resource.0 as usize).ok_or_else(|| format!("unknown resource {}", resource.0))?;
-                    let address = binding.base.checked_add(*interior).ok_or_else(|| "pointer overflows".to_owned())?;
+                    let binding = self
+                        .resources
+                        .get(resource.0 as usize)
+                        .ok_or_else(|| format!("unknown resource {}", resource.0))?;
+                    let address = binding
+                        .base
+                        .checked_add(*interior)
+                        .ok_or_else(|| "pointer overflows".to_owned())?;
                     image[at..at + 8].copy_from_slice(&address.to_le_bytes());
                 }
                 Arg::Word(id) => {
-                    let value = words.get(id.0 as usize).ok_or_else(|| format!("no value for word {}", id.0))?;
+                    let value = words
+                        .get(id.0 as usize)
+                        .ok_or_else(|| format!("no value for word {}", id.0))?;
                     image[at..at + 4].copy_from_slice(&value.to_le_bytes());
                 }
             }
@@ -624,7 +776,10 @@ impl KernelProgram {
             };
             let size = h.size as usize;
             if size > 8 || (size < 8 && value >> (8 * size) != 0) {
-                return Err(format!("{}: {} = {value} does not fit {size} bytes", n.symbol, h.value_kind));
+                return Err(format!(
+                    "{}: {} = {value} does not fit {size} bytes",
+                    n.symbol, h.value_kind
+                ));
             }
             let at = h.offset as usize;
             image[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
@@ -669,15 +824,32 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn ptr(offset: u32, classes: &[MemClass]) -> ArgFact {
-        ArgFact { offset, size: 8, role: ArgRole::Pointer { classes: classes.to_vec(), read_cache: ReadCache::VmemOnly } }
+        ArgFact {
+            offset,
+            size: 8,
+            role: ArgRole::Pointer {
+                classes: classes.to_vec(),
+                read_cache: ReadCache::VmemOnly,
+            },
+        }
     }
 
-    pub(crate) fn launch(pointers: &[(u32, u64)], explicit: u32, args: Vec<ArgFact>) -> LaunchRecord {
+    pub(crate) fn launch(
+        pointers: &[(u32, u64)],
+        explicit: u32,
+        args: Vec<ArgFact>,
+    ) -> LaunchRecord {
         let mut kernarg = vec![0u8; explicit.next_multiple_of(16) as usize];
         let mut allocations = Vec::new();
         for &(offset, value) in pointers {
             kernarg[offset as usize..offset as usize + 8].copy_from_slice(&value.to_le_bytes());
-            allocations.push((offset, Ok(Binding { base: value & !0xfff, bytes: 0x10000 })));
+            allocations.push((
+                offset,
+                Ok(Binding {
+                    base: value & !0xfff,
+                    bytes: 0x10000,
+                }),
+            ));
         }
         LaunchRecord {
             symbol: "k".into(),
@@ -693,21 +865,40 @@ pub(crate) mod tests {
 
     #[test]
     fn declared_word_must_be_a_loaded_integer_and_image_reencodes_it() {
-        let args = vec![ptr(0, &[MemClass::VmemLoad]), ArgFact { offset: 8, size: 4, role: ArgRole::Integer }];
+        let args = vec![
+            ptr(0, &[MemClass::VmemLoad]),
+            ArgFact {
+                offset: 8,
+                size: 4,
+                role: ArgRole::Integer,
+            },
+        ];
         let mut good = launch(&[(0, 0x7000_0100)], 12, args.clone());
         good.kernarg[8..12].copy_from_slice(&41u32.to_le_bytes());
-        good.declared = vec![DeclaredWord { offset: 8, role: WordRole::GdnFrame { frames: 1 } }];
+        good.declared = vec![DeclaredWord {
+            offset: 8,
+            role: WordRole::GdnFrame { frames: 1 },
+        }];
         let program = author("gfx1201", &[good.clone()]);
         assert_eq!(program.nodes[0].lowering, Lowering::Pm4);
         assert_eq!(program.words[0].authored, 41);
         let image = program.kernarg_image(0, 12, &[99]).unwrap();
         assert_eq!(&image[0..8], &0x7000_0100u64.to_le_bytes());
-        assert_eq!(&image[8..12], &99u32.to_le_bytes(), "the word is patched, not the recorded constant");
+        assert_eq!(
+            &image[8..12],
+            &99u32.to_le_bytes(),
+            "the word is patched, not the recorded constant"
+        );
 
         let mut bad = good;
-        bad.declared = vec![DeclaredWord { offset: 0, role: WordRole::GdnFrame { frames: 1 } }];
+        bad.declared = vec![DeclaredWord {
+            offset: 0,
+            role: WordRole::GdnFrame { frames: 1 },
+        }];
         let program = author("gfx1201", &[bad]);
-        assert!(matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("A4")));
+        assert!(
+            matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("A4"))
+        );
     }
 
     #[test]
@@ -722,13 +913,28 @@ pub(crate) mod tests {
         let mut unprobed = launch(&[(0, 0x7000_0000)], 8, args);
         unprobed.allocations.clear();
         let program = author("gfx1201", &[missing, unknown, unprobed]);
-        for (node, needle) in program.nodes.iter().zip(["receipt_missing", "A1 Unknown", "not probed"]) {
-            assert!(matches!(&node.lowering, Lowering::HipDirect { reason } if reason.contains(needle)), "{:?}", node.lowering);
+        for (node, needle) in
+            program
+                .nodes
+                .iter()
+                .zip(["receipt_missing", "A1 Unknown", "not probed"])
+        {
+            assert!(
+                matches!(&node.lowering, Lowering::HipDirect { reason } if reason.contains(needle)),
+                "{:?}",
+                node.lowering
+            );
         }
     }
 
     fn hidden(offset: u32, size: u32, value_kind: &str, loaded: bool) -> HiddenArg {
-        HiddenArg { offset, size, kind: HiddenKind::parse(value_kind).unwrap(), value_kind: value_kind.into(), loaded }
+        HiddenArg {
+            offset,
+            size,
+            kind: HiddenKind::parse(value_kind).unwrap(),
+            value_kind: value_kind.into(),
+            loaded,
+        }
     }
 
     #[test]
@@ -753,14 +959,28 @@ pub(crate) mod tests {
         assert_eq!(&image[8..16], &[3, 0, 0, 0, 5, 0, 0, 0]);
         assert_eq!(&image[20..22], &[0, 1]);
         assert_eq!(&image[72..74], &[2, 0]);
-        assert_eq!(u32::from_le_bytes(image[128..132].try_into().unwrap()), 1024);
+        assert_eq!(
+            u32::from_le_bytes(image[128..132].try_into().unwrap()),
+            1024
+        );
         // One nonzero byte each: the pointer, both block counts, the group size, the dims, the LDS size.
-        assert_eq!(image.iter().filter(|b| **b != 0).count(), 6, "nothing undeclared is written");
-        assert!(program.kernarg_image(0, 272, &[]).is_err(), "a loaded object with another segment size is refused");
+        assert_eq!(
+            image.iter().filter(|b| **b != 0).count(),
+            6,
+            "nothing undeclared is written"
+        );
+        assert!(
+            program.kernarg_image(0, 272, &[]).is_err(),
+            "a loaded object with another segment size is refused"
+        );
 
-        f.facts.hidden.push(hidden(200, 8, "hidden_queue_ptr", true));
+        f.facts
+            .hidden
+            .push(hidden(200, 8, "hidden_queue_ptr", true));
         l.facts = Ok(Arc::new(f));
         let program = author("gfx1201", &[l]);
-        assert!(matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("hidden_queue_ptr")));
+        assert!(
+            matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("hidden_queue_ptr"))
+        );
     }
 }

@@ -190,7 +190,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "4206f421af1a8bd2b331bb77952516e0689179d046896b9e381b7afe3b2b1ad9",
+      "sha256": "bbb1a93064b553995df25fa6b844d9d68f72973d29d4ea3bb0747bc4388905e3",
       "symbols": [
         "gated_delta_chunk_gate_wmma"
       ],
@@ -287,7 +287,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "98d58c8aaf5ce7efbc7fac58eedd80427a95187f59ceda9c580f7d7619110a52",
+      "sha256": "2f4fff61535fae7babee6f9cfa6b5d4cdfe5563b520eea4850c60af2725501c0",
       "symbols": [
         "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
       ],
@@ -331,7 +331,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "61f00e9594d7eb98b78b6d1f9a6f2b5e396e5ff1df356e13c72a395836d62240",
+      "sha256": "f82dccca09b94abe72efbfe6c4b15213be67d53f501fdd4ada28c1b4a0d71add",
       "symbols": [
         "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
       ],
@@ -601,7 +601,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "2326440b1210f8f069ab34c0246f8bf7af30969b44eb0f3c563660039fe93bdb",
+      "sha256": "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
       "symbols": [
         "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"
       ],
@@ -643,7 +643,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+      "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
       "symbols": [
         "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
         "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -944,7 +944,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+      "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
       "symbols": [
         "moe_combine_order_top10",
         "moe_down_combine_grouped_top10_bf16in"
@@ -999,7 +999,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+      "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
       "symbols": [
         "moe_down_combine_top10_batched"
       ],
@@ -1096,7 +1096,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+      "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
       "symbols": [
         "moe_router_softmax_top10_f32"
       ],
@@ -1657,7 +1657,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b",
+      "sha256": "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25",
       "symbols": [
         "gemv_bf16_xf32_bf16_scaled_add",
         "gemv_bf16_xf32_k4",
@@ -1953,7 +1953,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
+      "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -2247,12 +2247,7 @@
         "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/tensor_ops/rep-1/kernel.hsaco",
         "sha256": "c21c1cc18b25dbb77653a66a0e765b92bd1afee101937d484ae66fbb2312edfc"
       },
-      "registry_missing_symbols": [
-        "indexed_attention_attention_q8_batched",
-        "indexed_attention_attention_q8_batched_hg4",
-        "indexed_attention_cache_append_q8_batched",
-        "indexed_attention_decode_prologue_q8"
-      ]
+      "registry_missing_symbols": []
     }
   ],
   "alternate_arms": [

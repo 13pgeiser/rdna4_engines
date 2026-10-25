@@ -122,7 +122,10 @@ fn main() {
         // QSCALE: shrink Q to tame score magnitudes (IID synthetic Q at
         // full scale makes winner-take-all scores where any rounding flips
         // rows; real activations are softer).
-        let qscale: f32 = std::env::var("ORA_QSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let qscale: f32 = std::env::var("ORA_QSCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
         // Q: ~(u-0.5)*8*qscale, deterministic.
         let qn = batch * NH * HD;
         let mut q = vec![0f32; qn];
@@ -145,8 +148,10 @@ fn main() {
         let d_q = gpu.upload_f32(&q, &[batch, NH, HD]).unwrap();
         let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
         let d_out = gpu.zeros(&[batch * NH * HD], DType::F32).unwrap();
-        gpu.attention_q8_0_fa2_gqa_gfx1201(&d_q, &d_k, &d_v, &d_out, &d_pos, NH, NKV, HD, ctx, batch)
-            .unwrap_or_else(|e| panic!("fa2 launch shape {si}: {e:?}"));
+        gpu.attention_q8_0_fa2_gqa_gfx1201(
+            &d_q, &d_k, &d_v, &d_out, &d_pos, NH, NKV, HD, ctx, batch,
+        )
+        .unwrap_or_else(|e| panic!("fa2 launch shape {si}: {e:?}"));
         let o: Vec<f32> = gpu.download_f32(&d_out).unwrap();
         assert_eq!(o.len(), qn);
         // gate on host in f64, write gated f32.
@@ -159,9 +164,8 @@ fn main() {
             cksum = cksum.wrapping_add(gated[idx].to_bits() as u64);
         }
         let path = format!("{outdir}/shape{si}_b{batch}_c{ctx}.f32");
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(gated.as_ptr() as *const u8, qn * 4)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(gated.as_ptr() as *const u8, qn * 4) };
         std::fs::write(&path, bytes).unwrap();
         eprintln!("shape{si} batch={batch} ctx={ctx} wrote {path} cksum={cksum:016x}");
     }

@@ -143,7 +143,9 @@ fn main() {
         let ww = gpu
             .upload_raw(&build_hfq4g256(wm, wk, 0x5C), &[wm, wk])
             .expect("warm w");
-        let wxv: Vec<f32> = (0..wb * wk).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+        let wxv: Vec<f32> = (0..wb * wk)
+            .map(|i| ((i % 61) as f32 - 30.0) * 0.01)
+            .collect();
         let wx = gpu.upload_f32(&wxv, &[wb, wk]).expect("warm x");
         let wy = gpu.alloc_tensor(&[wb, wm], DType::F32).expect("warm y");
         let t = Instant::now();
@@ -172,9 +174,7 @@ fn main() {
     // duplicate allocations by uploading once and reusing across B.
     let gate_w_raw = build_hfq4g256(ffn, dim, 0xB1);
     let up_w_raw = build_hfq4g256(ffn, dim, 0xB2);
-    let gate_w = gpu
-        .upload_raw(&gate_w_raw, &[ffn, dim])
-        .expect("gate w");
+    let gate_w = gpu.upload_raw(&gate_w_raw, &[ffn, dim]).expect("gate w");
     let up_w = gpu.upload_raw(&up_w_raw, &[ffn, dim]).expect("up w");
     // Drop host copies after upload (keep device only) to avoid resident duplicate.
     drop(gate_w_raw);
@@ -187,21 +187,22 @@ fn main() {
         let x_dim_f32: Vec<f32> = (0..b * dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
             .collect();
-        let x_dim = gpu
-            .upload_f32(&x_dim_f32, &[b, dim])
-            .expect("x dim");
+        let x_dim = gpu.upload_f32(&x_dim_f32, &[b, dim]).expect("x dim");
 
         // Fused gate+up: one call producing both outputs from shared x.
         // Compare each output against its separate batched_lmhead baseline.
         {
             let yg = gpu.alloc_tensor(&[b, ffn], DType::F32).expect("yg");
             let yu = gpu.alloc_tensor(&[b, ffn], DType::F32).expect("yu");
-            let y_gate_base = gpu.alloc_tensor(&[b, ffn], DType::F32).expect("y gate base");
+            let y_gate_base = gpu
+                .alloc_tensor(&[b, ffn], DType::F32)
+                .expect("y gate base");
             let y_up_base = gpu.alloc_tensor(&[b, ffn], DType::F32).expect("y up base");
 
             // Warmup fused (2 iters)
             for _ in 0..2 {
-                let _ = gpu.gemm_gate_up_hfq4g256(&gate_w, &up_w, &x_dim, &yg, &yu, ffn, ffn, dim, b);
+                let _ =
+                    gpu.gemm_gate_up_hfq4g256(&gate_w, &up_w, &x_dim, &yg, &yu, ffn, ffn, dim, b);
             }
             let _ = gpu.hip.device_synchronize();
 
@@ -217,13 +218,15 @@ fn main() {
                 reps.push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
             }
             let ms_fused = median_ms(reps.clone());
-            let tflops_fused =
-                2.0 * (ffn as f64 + ffn as f64) * (dim as f64) * (b as f64) / (ms_fused / 1000.0) / 1e12;
+            let tflops_fused = 2.0 * (ffn as f64 + ffn as f64) * (dim as f64) * (b as f64)
+                / (ms_fused / 1000.0)
+                / 1e12;
 
             // Baseline: two separate batched_lmhead calls (production path) for reference.
             // Time them together as the cost Glimmer pays today (gate then up).
             for _ in 0..2 {
-                let _ = gpu.gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_gate_base, ffn, dim, b);
+                let _ =
+                    gpu.gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_gate_base, ffn, dim, b);
                 let _ = gpu.gemm_hfq4g256_batched_lmhead(&up_w, &x_dim, &y_up_base, ffn, dim, b);
             }
             let _ = gpu.hip.device_synchronize();
@@ -240,16 +243,20 @@ fn main() {
                 base_reps.push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
             }
             let ms_base = median_ms(base_reps);
-            let tflops_base =
-                2.0 * (ffn as f64 + ffn as f64) * (dim as f64) * (b as f64) / (ms_base / 1000.0) / 1e12;
+            let tflops_base = 2.0 * (ffn as f64 + ffn as f64) * (dim as f64) * (b as f64)
+                / (ms_base / 1000.0)
+                / 1e12;
 
             // Correctness: fused outputs vs separate baseline outputs.
-            let _ = gpu.gemm_gate_up_hfq4g256(&gate_w, &up_w, &x_dim, &yg, &yu, ffn, ffn, dim, b)
+            let _ = gpu
+                .gemm_gate_up_hfq4g256(&gate_w, &up_w, &x_dim, &yg, &yu, ffn, ffn, dim, b)
                 .expect("fused for dl");
             let _ = gpu.hip.device_synchronize();
-            let _ = gpu.gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_gate_base, ffn, dim, b)
+            let _ = gpu
+                .gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_gate_base, ffn, dim, b)
                 .expect("gate base dl");
-            let _ = gpu.gemm_hfq4g256_batched_lmhead(&up_w, &x_dim, &y_up_base, ffn, dim, b)
+            let _ = gpu
+                .gemm_hfq4g256_batched_lmhead(&up_w, &x_dim, &y_up_base, ffn, dim, b)
                 .expect("up base dl");
             let _ = gpu.hip.device_synchronize();
             let fused_g = gpu.download_f32(&yg).expect("dl fused g");
@@ -354,7 +361,8 @@ fn main() {
 
                 // Correctness: baseline vs residual (both should be bit-identical; residual
                 // needs zeroed Y, batched zeros internally). Report bitdiff etc.
-                let _ = gpu.gemm_hfq4g256_batched_lmhead(w_ref, x, &y_base, *m, *k, b)
+                let _ = gpu
+                    .gemm_hfq4g256_batched_lmhead(w_ref, x, &y_base, *m, *k, b)
                     .expect("base for dl");
                 let _ = gpu.hip.memset(&y_resid.buf, 0, b * *m * 4);
                 gpu.gemm_hfq4g256_residual(w_ref, x, &y_resid, *m, *k, b)
@@ -405,7 +413,8 @@ fn main() {
                         let muse_host = gpu.download_f32(&y_muse).expect("dl muse");
                         // baseline already downloaded as base_host above, but re-download
                         // after ensuring y_base still holds baseline result.
-                        let (bdiff_m, maxabs_m, maxrel_m) = correctness_stats(&base_host, &muse_host);
+                        let (bdiff_m, maxabs_m, maxrel_m) =
+                            correctness_stats(&base_host, &muse_host);
                         // Timed muse
                         let mut muse_reps: Vec<f64> = Vec::new();
                         for _ in 0..3 {
@@ -506,7 +515,8 @@ fn main() {
                 let tflops_resid =
                     2.0 * (*m as f64) * (*k as f64) * (b as f64) / (ms_resid / 1000.0) / 1e12;
 
-                let _ = gpu.gemm_hfq4g256_batched_lmhead(&w, &xk, &y_base, *m, *k, b)
+                let _ = gpu
+                    .gemm_hfq4g256_batched_lmhead(&w, &xk, &y_base, *m, *k, b)
                     .expect("base dl");
                 let _ = gpu.hip.memset(&y_resid.buf, 0, b * *m * 4);
                 gpu.gemm_hfq4g256_residual(&w, &xk, &y_resid, *m, *k, b)
@@ -542,7 +552,8 @@ fn main() {
                     let _ = gpu.hip.device_synchronize();
                     if used {
                         let muse_host = gpu.download_f32(&y_muse).expect("dl muse");
-                        let (bdiff_m, maxabs_m, maxrel_m) = correctness_stats(&base_host, &muse_host);
+                        let (bdiff_m, maxabs_m, maxrel_m) =
+                            correctness_stats(&base_host, &muse_host);
                         let mut muse_reps: Vec<f64> = Vec::new();
                         for _ in 0..3 {
                             let t0 = Instant::now();
@@ -677,19 +688,16 @@ fn main() {
 
             // Fresh production baseline. batched_lmhead zeros Y internally.
             for _ in 0..2 {
-                let _ = gpu.gemm_hfq4g256_batched_lmhead(
-                    &gate_w, &x_dim, &y_base, m_gate, k_gate, b,
-                );
+                let _ =
+                    gpu.gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_base, m_gate, k_gate, b);
             }
             let _ = gpu.hip.device_synchronize();
             let mut base_reps: Vec<f64> = Vec::new();
             for _ in 0..3 {
                 let t0 = Instant::now();
                 for _ in 0..iters {
-                    gpu.gemm_hfq4g256_batched_lmhead(
-                        &gate_w, &x_dim, &y_base, m_gate, k_gate, b,
-                    )
-                    .expect("gate g11 base");
+                    gpu.gemm_hfq4g256_batched_lmhead(&gate_w, &x_dim, &y_base, m_gate, k_gate, b)
+                        .expect("gate g11 base");
                 }
                 let _ = gpu.hip.device_synchronize();
                 base_reps.push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
@@ -765,16 +773,7 @@ fn main() {
                 let klabel = format!("muse_g11_bt{}", bt);
                 println!(
                     "{:<12} {:>4} {:<14} {:>9.3} {:>9.2} {:>9} {:>9.2e} {:>9.2e} {:>+8.1}%  bt={}",
-                    "gate_proj",
-                    b,
-                    klabel,
-                    ms_cand,
-                    tflops_cand,
-                    bdiff,
-                    maxabs,
-                    maxrel,
-                    vs,
-                    bt
+                    "gate_proj", b, klabel, ms_cand, tflops_cand, bdiff, maxabs, maxrel, vs, bt
                 );
             }
 
@@ -834,16 +833,7 @@ fn main() {
                 let klabel = format!("muse_g11_cb{}", bt);
                 println!(
                     "{:<12} {:>4} {:<14} {:>9.3} {:>9.2} {:>9} {:>9.2e} {:>9.2e} {:>+8.1}%  bt={}",
-                    "gate_proj",
-                    b,
-                    klabel,
-                    ms_cand,
-                    tflops_cand,
-                    bdiff,
-                    maxabs,
-                    maxrel,
-                    vs,
-                    bt
+                    "gate_proj", b, klabel, ms_cand, tflops_cand, bdiff, maxabs, maxrel, vs, bt
                 );
             }
             // Multiwave gate sweep: groups multiple identical BT4 row waves into
@@ -1211,10 +1201,7 @@ fn main() {
             // Additionally one fresh up_w correctness probe per symbol prints an
             // indented up bitdiff line; timing stays on gate. Never called outside
             // the is_gfx1100 block above.
-            for (packed, klabel) in [
-                (false, "rm2_pipe_scalar"),
-                (true, "rm2_pipe_pk2"),
-            ] {
+            for (packed, klabel) in [(false, "rm2_pipe_scalar"), (true, "rm2_pipe_pk2")] {
                 let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
                 let used = gpu
                     .gemm_hfq4g256_residual_muse_gfx1100_rm2_pipe(
@@ -1315,7 +1302,9 @@ fn main() {
     println!("\nAttribution summary:");
     println!("  gate/up/down (ffn 19968) dominate 82.4% of layer FLOPs — they explain the gap.");
     println!("  o_proj (6656x4096) is next; attention q/k/v/gate are 17.6% combined.");
-    println!("  candidate oracle: batched (production overwrite) vs residual+zero must be bitdiff=0");
+    println!(
+        "  candidate oracle: batched (production overwrite) vs residual+zero must be bitdiff=0"
+    );
     println!("  fused gate+up must be bitdiff=0 per output vs 2x batched; muse_bt12 must be bitdiff=0 vs batched");
     println!("  on gfx1100/gfx1151 muse rows report arch_skip and do not call the gfx12 kernel");
     println!("  on gfx1100 only: gate_proj muse_g11_bt{{4,6,8,12,16}}, muse_g11_cb{{4,6,12}}, muse_g11_mw{{2,4,8}}, muse_g11_lds, muse_g11_rm{{2,3,4,6}}x{{6,4,3,2}}, muse_g11_rm{{2,4}}x{{6,3}}_hb, muse_g11_rm{{1,2}}x{{12,6}}_pk, rm2_pipe_scalar/pk2 (B192) rows vs g11_batched (zeroed); skipped if Ok(false); pipe also prints indented up bitdiff");

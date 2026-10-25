@@ -51,10 +51,10 @@ use std::time::{Duration, Instant};
 use hip_bridge::{DeviceBuffer, HipRuntime};
 use redline_rocr::packet::PacketImage;
 use redline_rocr::{
-    CompletionSignal, Executable, Gfx10Pm4CommandBuffer, GpuDevice, GpuSelector, KernargBuffer, KernargPool, Kernel,
-    LaunchGeometry, QueueSet, Runtime, load_symbols,
+    load_symbols, CompletionSignal, Executable, Gfx10Pm4CommandBuffer, GpuDevice, GpuSelector,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, QueueSet, Runtime,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 type R<T> = Result<T, String>;
@@ -136,7 +136,10 @@ impl Rung {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Work {
     /// `bb_empty` over `wgs` workgroups of `lanes` lanes.
-    Empty { wgs: u32, lanes: u32 },
+    Empty {
+        wgs: u32,
+        lanes: u32,
+    },
     Rmsnorm,
 }
 
@@ -149,9 +152,16 @@ impl Work {
         if s == "rmsnorm" {
             return Ok(Self::Rmsnorm);
         }
-        let shape = s.strip_prefix("empty:").ok_or_else(|| format!("unknown work {s}"))?;
-        let (w, l) = shape.split_once('x').ok_or_else(|| format!("bad shape {shape}"))?;
-        Ok(Self::Empty { wgs: w.parse().map_err(err)?, lanes: l.parse().map_err(err)? })
+        let shape = s
+            .strip_prefix("empty:")
+            .ok_or_else(|| format!("unknown work {s}"))?;
+        let (w, l) = shape
+            .split_once('x')
+            .ok_or_else(|| format!("bad shape {shape}"))?;
+        Ok(Self::Empty {
+            wgs: w.parse().map_err(err)?,
+            lanes: l.parse().map_err(err)?,
+        })
     }
 
     fn name(self) -> String {
@@ -235,7 +245,10 @@ fn parse_args() -> R<Args> {
             i += 1;
             continue;
         }
-        let v = argv.get(i + 1).cloned().ok_or_else(|| format!("{k} needs a value"))?;
+        let v = argv
+            .get(i + 1)
+            .cloned()
+            .ok_or_else(|| format!("{k} needs a value"))?;
         match k {
             "--arch" => a.arch = v,
             "--bus" => a.bus = v,
@@ -266,7 +279,10 @@ fn parse_args() -> R<Args> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// KFD topology `unique_id` of the node at `bus`, as `GPU-%016x`.
@@ -279,14 +295,18 @@ fn kfd_uuid(bus: &str) -> R<Option<String>> {
     let f = u32::from_str_radix(parts[2], 16).map_err(err)?;
     let location = (b << 8) | (d << 3) | f;
     for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes").map_err(err)? {
-        let props = std::fs::read_to_string(entry.map_err(err)?.path().join("properties")).unwrap_or_default();
+        let props = std::fs::read_to_string(entry.map_err(err)?.path().join("properties"))
+            .unwrap_or_default();
         let field = |k: &str| {
             props
                 .lines()
                 .find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))
         };
-        if field("location_id ") == Some(location as u64) && field("domain ") == Some(domain as u64) {
-            return Ok(field("unique_id ").filter(|u| *u != 0).map(|u| format!("GPU-{u:016x}")));
+        if field("location_id ") == Some(location as u64) && field("domain ") == Some(domain as u64)
+        {
+            return Ok(field("unique_id ")
+                .filter(|u| *u != 0)
+                .map(|u| format!("GPU-{u:016x}")));
         }
     }
     Ok(None)
@@ -330,7 +350,9 @@ fn hip_setup(args: &Args) -> R<(Hip, Value)> {
     let hip = HipRuntime::load().map_err(err)?;
     let count = hip.device_count().map_err(err)?;
     if count != 1 {
-        return Err(format!("expected exactly one visible HIP device, found {count}"));
+        return Err(format!(
+            "expected exactly one visible HIP device, found {count}"
+        ));
     }
     hip.set_device(0).map_err(err)?;
     let arch = hip.get_arch(0).map_err(err)?;
@@ -343,7 +365,10 @@ fn hip_setup(args: &Args) -> R<(Hip, Value)> {
         ));
     }
     let bytes = RMS_N * 4;
-    let x = [hip.malloc(bytes).map_err(err)?, hip.malloc(bytes).map_err(err)?];
+    let x = [
+        hip.malloc(bytes).map_err(err)?,
+        hip.malloc(bytes).map_err(err)?,
+    ];
     let weight = hip.malloc(bytes).map_err(err)?;
     // Deterministic input; weights within 1e-3 of 1 so the 1000-step chain
     // keeps changing without under/overflow.
@@ -354,24 +379,42 @@ fn hip_setup(args: &Args) -> R<(Hip, Value)> {
         rng ^= rng << 17;
         (rng >> 11) as f64 / (1u64 << 53) as f64
     };
-    let x0: Vec<u8> = (0..RMS_N).flat_map(|_| ((next() * 2.0 - 1.0) as f32).to_le_bytes()).collect();
-    let w: Vec<u8> = (0..RMS_N).flat_map(|_| ((1.0 + (next() * 2.0 - 1.0) * 1e-3) as f32).to_le_bytes()).collect();
+    let x0: Vec<u8> = (0..RMS_N)
+        .flat_map(|_| ((next() * 2.0 - 1.0) as f32).to_le_bytes())
+        .collect();
+    let w: Vec<u8> = (0..RMS_N)
+        .flat_map(|_| ((1.0 + (next() * 2.0 - 1.0) * 1e-3) as f32).to_le_bytes())
+        .collect();
     hip.memcpy_htod(&weight, &w).map_err(err)?;
     let identity = json!({"hip_arch": arch, "hip_bus": bus, "hip_uuid": uuid});
-    Ok((Hip { hip, x, weight, x0_host: x0 }, identity))
+    Ok((
+        Hip {
+            hip,
+            x,
+            weight,
+            x0_host: x0,
+        },
+        identity,
+    ))
 }
 
 impl Hip {
     fn reset_input(&self) -> R<()> {
-        self.hip.memcpy_htod(&self.x[0], &self.x0_host).map_err(err)?;
-        self.hip.memcpy_htod(&self.x[1], &vec![0u8; RMS_N * 4]).map_err(err)?;
+        self.hip
+            .memcpy_htod(&self.x[0], &self.x0_host)
+            .map_err(err)?;
+        self.hip
+            .memcpy_htod(&self.x[1], &vec![0u8; RMS_N * 4])
+            .map_err(err)?;
         self.hip.device_synchronize().map_err(err)
     }
 
     fn result_hash(&self, n: usize) -> R<String> {
         self.hip.device_synchronize().map_err(err)?;
         let mut out = vec![0u8; RMS_N * 4];
-        self.hip.memcpy_dtoh(&mut out, &self.x[n % 2]).map_err(err)?;
+        self.hip
+            .memcpy_dtoh(&mut out, &self.x[n % 2])
+            .map_err(err)?;
         Ok(sha256_hex(&out)[..16].to_owned())
     }
 
@@ -405,9 +448,14 @@ fn run_hip(args: &Args, hip: &Hip) -> R<Value> {
                 Work::Empty { wgs, lanes } => {
                     h.launch_kernel(&func, [wgs, 1, 1], [lanes, 1, 1], 0, Some(&stream), &mut [])
                 }
-                Work::Rmsnorm => {
-                    h.launch_kernel_blob(&func, [1, 1, 1], [RMS_BLOCK, 1, 1], RMS_LDS, Some(&stream), &mut blobs[i])
-                }
+                Work::Rmsnorm => h.launch_kernel_blob(
+                    &func,
+                    [1, 1, 1],
+                    [RMS_BLOCK, 1, 1],
+                    RMS_LDS,
+                    Some(&stream),
+                    &mut blobs[i],
+                ),
             }
         }
         .map_err(err)
@@ -452,7 +500,8 @@ fn run_hip(args: &Args, hip: &Hip) -> R<Value> {
         h.event_record(&e1, Some(&stream)).map_err(err)?;
         h.event_synchronize(&e1).map_err(err)?;
         s.wall_us.push(t.elapsed().as_secs_f64() * 1e6);
-        s.gpu_us.push(h.event_elapsed_ms(&e0, &e1).map_err(err)? as f64 * 1e3);
+        s.gpu_us
+            .push(h.event_elapsed_ms(&e0, &e1).map_err(err)? as f64 * 1e3);
     }
     Ok(json!({
         "timer": "hipEventElapsedTime around one launch of the N-kernel sequence",
@@ -512,7 +561,10 @@ impl Pm4 {
         let runtime = Runtime::initialize(load_symbols().map_err(err)?).map_err(err)?;
         let devices = runtime.gpu_devices().map_err(err)?;
         if devices.len() != 1 {
-            return Err(format!("expected exactly one visible ROCr GPU, found {}", devices.len()));
+            return Err(format!(
+                "expected exactly one visible ROCr GPU, found {}",
+                devices.len()
+            ));
         }
         let device: GpuDevice = runtime.select_gpu(GpuSelector::Ordinal(0)).map_err(err)?;
         let name = device.name().to_owned();
@@ -527,7 +579,8 @@ impl Pm4 {
         let cus = device.compute_unit_count().map_err(err)?;
         let load = |path: &PathBuf, symbol: &str| -> R<(Executable, Kernel)> {
             let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let exe = Executable::load(&device, Arc::from(bytes.into_boxed_slice())).map_err(err)?;
+            let exe =
+                Executable::load(&device, Arc::from(bytes.into_boxed_slice())).map_err(err)?;
             let k = exe.kernel(&format!("{symbol}.kd")).map_err(err)?;
             Ok((exe, k))
         };
@@ -535,11 +588,18 @@ impl Pm4 {
         let (e1, rmsnorm) = load(&args.rmsnorm_co, "rmsnorm_f32")?;
         let rms_ka = rmsnorm.metadata().kernarg_segment_size as usize;
         if rms_ka != RMS_EXPLICIT + 256 {
-            return Err(format!("rmsnorm_f32 kernarg segment {rms_ka} != {}", RMS_EXPLICIT + 256));
+            return Err(format!(
+                "rmsnorm_f32 kernarg segment {rms_ka} != {}",
+                RMS_EXPLICIT + 256
+            ));
         }
         let host_pool = KernargPool::discover(&device).map_err(err)?;
-        let timestamps = host_pool.allocate_fine_grained_bytes(64, 256).map_err(err)?;
-        let fence = host_pool.allocate_fine_grained_bytes(64, 256).map_err(err)?;
+        let timestamps = host_pool
+            .allocate_fine_grained_bytes(64, 256)
+            .map_err(err)?;
+        let fence = host_pool
+            .allocate_fine_grained_bytes(64, 256)
+            .map_err(err)?;
         let completion = CompletionSignal::new(&device).map_err(err)?;
         let queue_size = *device.queue_size_range().start();
         let queues = QueueSet::create(&device, 1, queue_size).map_err(err)?;
@@ -551,7 +611,17 @@ impl Pm4 {
             "rmsnorm_kernarg_segment": rms_ka,
         });
         Ok((
-            Self { queues, completion, host_pool, empty, rmsnorm, timestamps, fence, freq_hz, _exes: vec![e0, e1] },
+            Self {
+                queues,
+                completion,
+                host_pool,
+                empty,
+                rmsnorm,
+                timestamps,
+                fence,
+                freq_hz,
+                _exes: vec![e0, e1],
+            },
             identity,
         ))
     }
@@ -564,7 +634,10 @@ impl Pm4 {
         };
         let seg = (kernel.metadata().kernarg_segment_size as usize).max(64);
         let stride = seg.div_ceil(64) * 64;
-        let mut kernargs = self.host_pool.allocate_fine_grained_bytes(n * stride, 256).map_err(err)?;
+        let mut kernargs = self
+            .host_pool
+            .allocate_fine_grained_bytes(n * stride, 256)
+            .map_err(err)?;
         let base = kernargs.address() as usize;
         {
             let bytes = kernargs.as_mut_bytes();
@@ -581,11 +654,21 @@ impl Pm4 {
             }
         }
         let (geometry, lds) = match work {
-            Work::Empty { wgs, lanes } => (LaunchGeometry::new([wgs * lanes, 1, 1], [lanes as u16, 1, 1]), 0),
-            Work::Rmsnorm => (LaunchGeometry::new([RMS_BLOCK, 1, 1], [RMS_BLOCK as u16, 1, 1]), RMS_LDS),
+            Work::Empty { wgs, lanes } => (
+                LaunchGeometry::new([wgs * lanes, 1, 1], [lanes as u16, 1, 1]),
+                0,
+            ),
+            Work::Rmsnorm => (
+                LaunchGeometry::new([RMS_BLOCK, 1, 1], [RMS_BLOCK as u16, 1, 1]),
+                RMS_LDS,
+            ),
         };
         let geometry = geometry.map_err(err)?;
-        let mut c = if args.legacy_regs { Gfx10Pm4CommandBuffer::new() } else { Gfx10Pm4CommandBuffer::new_stateful() };
+        let mut c = if args.legacy_regs {
+            Gfx10Pm4CommandBuffer::new()
+        } else {
+            Gfx10Pm4CommandBuffer::new_stateful()
+        };
         let fence = self.fence.address() as u64;
         let mut epoch = 0u32;
         if rung == Rung::ReleaseWait {
@@ -617,7 +700,8 @@ impl Pm4 {
                     }
                 }
             }
-            c.dispatch(kernel, geometry, lds, (base + i * stride) as *mut c_void).map_err(err)?;
+            c.dispatch(kernel, geometry, lds, (base + i * stride) as *mut c_void)
+                .map_err(err)?;
         }
         // Redline's trailing release.
         c.wait_compute_idle();
@@ -631,9 +715,17 @@ impl Pm4 {
             .map(|((op, dw), count)| (format!("op{op:#04x}x{dw}"), json!(count)))
             .collect();
         let bytes = timed.as_bytes();
-        let mut buffer = self.host_pool.allocate_executable_bytes(bytes.len()).map_err(err)?;
+        let mut buffer = self
+            .host_pool
+            .allocate_executable_bytes(bytes.len())
+            .map_err(err)?;
         buffer.as_mut_bytes().copy_from_slice(&bytes);
-        Ok(Ib { buffer, dwords: timed.len_dwords(), _kernargs: kernargs, census: Value::Object(census) })
+        Ok(Ib {
+            buffer,
+            dwords: timed.len_dwords(),
+            _kernargs: kernargs,
+            census: Value::Object(census),
+        })
     }
 
     /// Submit one IB and wait. Returns (GPU µs between the IB's first and
@@ -644,11 +736,15 @@ impl Pm4 {
             t[..16].fill(0);
         }
         self.completion.reset();
-        let packet = PacketImage::pm4_indirect_buffer(ib.buffer.address(), ib.dwords, self.completion.raw()).map_err(err)?;
+        let packet =
+            PacketImage::pm4_indirect_buffer(ib.buffer.address(), ib.dwords, self.completion.raw())
+                .map_err(err)?;
         self.queues.prepare_batches(&[vec![packet]]).map_err(err)?;
         let t = Instant::now();
         self.queues.ring_prepared().map_err(err)?;
-        self.queues.wait_signal(&self.completion, Duration::from_secs(30)).map_err(err)?;
+        self.queues
+            .wait_signal(&self.completion, Duration::from_secs(30))
+            .map_err(err)?;
         let wall = t.elapsed().as_secs_f64() * 1e6;
         let (start, end) = {
             let b = self.timestamps.as_mut_bytes();
@@ -741,12 +837,18 @@ fn run() -> R<()> {
         Arm::HipGraph | Arm::HipStream => run_hip(&args, &hip)?,
         Arm::Pm4(rung) => {
             let (mut pm4, id) = Pm4::setup(&args)?;
-            identity.as_object_mut().unwrap().extend(id.as_object().unwrap().clone());
+            identity
+                .as_object_mut()
+                .unwrap()
+                .extend(id.as_object().unwrap().clone());
             run_pm4(&args, &hip, &mut pm4, rung)?
         }
         Arm::Soak => {
             let (mut pm4, id) = Pm4::setup(&args)?;
-            identity.as_object_mut().unwrap().extend(id.as_object().unwrap().clone());
+            identity
+                .as_object_mut()
+                .unwrap()
+                .extend(id.as_object().unwrap().clone());
             run_soak(&args, &hip, &mut pm4)?
         }
     };
@@ -761,7 +863,11 @@ fn run() -> R<()> {
     });
     let path = args.out.join(format!("{}.json", args.label));
     std::fs::write(&path, serde_json::to_vec_pretty(&doc).map_err(err)?).map_err(err)?;
-    let med = |k: &str| doc["result"][k]["median_us_per_kernel"].as_f64().unwrap_or(f64::NAN);
+    let med = |k: &str| {
+        doc["result"][k]["median_us_per_kernel"]
+            .as_f64()
+            .unwrap_or(f64::NAN)
+    };
     eprintln!(
         "[bb] {} {} n={} gpu={:.4} wall={:.4} us/kernel parity={} -> {}",
         args.arm.name(),

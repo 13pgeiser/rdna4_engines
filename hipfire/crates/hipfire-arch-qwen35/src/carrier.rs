@@ -294,16 +294,28 @@ struct PlacementCapacity {
     inputs: offload::CapacityInputs,
 }
 
+/// Whether the placement reserves device room for the MTP head: exactly when
+/// the load will attach it, i.e. the producer-capability gate admits the typed
+/// mode (`on`; `auto` only with a declared measured AR floor, which this
+/// producer lacks). Mirrors the sequential loader's head gate so a reservation
+/// is never charged for a head that does not load.
+pub(crate) fn mtp_head_reserved(spec_mtp: Option<bool>) -> bool {
+    hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(spec_mtp),
+        crate::MTP_MEASURED_AR_FLOOR,
+    )
+}
+
 fn placement_capacity_inputs(
     hfq: &HfqFile,
     config: &Qwen35Config,
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<PlacementCapacity, String> {
+    // Capped sizing query (UMA-safe clamp, then the HIPFIRE_EMU cap).
     let free_vram = ctx
         .gpu
-        .hip
-        .get_vram_info()
+        .device_mem_info()
         .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
         .0 as u64;
     let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);
@@ -311,11 +323,10 @@ fn placement_capacity_inputs(
         crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
             .ok_or("Qwen KV stride overflow")?;
     let kv = offload::kv_reserve(stride as u64, rows).ok_or("Qwen KV reservation overflow")?;
-    // A MoE model has no prefill-scratch sizing model
-    // (`dense_prefill_allocation_bytes` deliberately returns `None` for
-    // `num_experts != 0`), which is why the VMM path refuses MoE models outright.
-    // Reserve 0 and say so: the placement is then bounded by the KV reservation
-    // alone, and the shortfall is visible rather than hidden.
+    // `None` only on sizing overflow (MoE is charged through
+    // `PrefillBatchScratch::projected_allocation_bytes`). Reserve 0 and say so:
+    // the placement is then bounded by the KV reservation alone, and the
+    // shortfall is visible rather than hidden.
     let pbs_reservation =
         crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
     let pbs = pbs_reservation.unwrap_or(0) as u64;
@@ -323,19 +334,23 @@ fn placement_capacity_inputs(
     // the DFlash draft are both device-resident and are *not* part of the
     // trunk spill, so they must be reserved out of the capacity the placement
     // spends — otherwise `auto` would over-place the trunk and the head's own
-    // load would OOM after the weights landed.
+    // load would OOM after the weights landed. The MTP head is reserved only
+    // when the load will actually attach it (`mtp_head_reserved`): under
+    // `auto` this producer declares no measured AR floor, so no head loads
+    // and nothing is reserved.
     let mtp_head: Option<MtpHeadLocation>;
     let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
-    if ctx.spec.mtp != Some(false) {
+    if mtp_head_reserved(ctx.spec.mtp) {
         mtp_head = match ctx.mtp_path.clone() {
             // An explicit CLI path is always a standalone sidecar file.
             Some(path) => Some(MtpHeadLocation::Sidecar(path)),
             None => resolve_mtp_head_file(hfq.path()),
         };
     } else {
-        // Speculation explicitly off: the MTP head will not load. A DFlash
-        // draft is still charged when named — the slots route runs its
-        // DFlash2 chain independently of the MTP kill switch.
+        // MTP not admitted (explicit off, or `auto` without a measured AR
+        // floor): the head will not load. A DFlash draft is still charged when
+        // named — the slots route runs its DFlash2 chain independently of the
+        // MTP gate.
         mtp_head = None;
     }
     // (DSpark is a DeepSeek4 module and never attaches here.)
@@ -351,7 +366,10 @@ fn placement_capacity_inputs(
         draft_bytes: draft_reservation,
         slack: 128u64 << 20,
     };
-    Ok(PlacementCapacity { layer_bytes, inputs })
+    Ok(PlacementCapacity {
+        layer_bytes,
+        inputs,
+    })
 }
 
 /// Defensive arm for a configured spill on an unspillable path. Admission
@@ -444,6 +462,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         return Err("qwen35: directory source unsupported".into());
     };
 
+    let config_placement_started = std::time::Instant::now();
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
@@ -455,13 +474,22 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let dn_quant = parse_state_quant(ctx.state_quant_override)?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
+    rdna_compute::load_phases::add(
+        "qwen35_config_placement",
+        rdna_compute::load_phases::ns_since(config_placement_started),
+        0,
+    );
 
     // ── Weights (first GPU ownership): private upload, or import from the
     //    weight host when HIPFIRE_WEIGHT_HOST=1. No private-load fallback
     //    once opted in. ─────────────────────────────────────────────────
     let weights_started = std::time::Instant::now();
     let socket = weight_host_socket()?;
-    let route = if socket.is_some() { "import" } else { "private" };
+    let route = if socket.is_some() {
+        "import"
+    } else {
+        "private"
+    };
     let (weights, mut weight_lease) = match socket {
         None => (
             <Qwen35 as Architecture>::load_weights_with_placement(
@@ -483,10 +511,13 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.device_mem_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
-            let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
-                &config, &ctx.gpu.arch,
-            ).ok_or("Qwen minimum PBS sizing overflow")?;
+            let (free, _) = ctx
+                .gpu
+                .device_mem_info()
+                .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let minimum =
+                crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
+                    .ok_or("Qwen minimum PBS sizing overflow")?;
             let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
                 &config,
                 plan.pair,
@@ -570,6 +601,14 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     eprintln!(
         "QWEN35_LOAD_PHASES route={route} weights_ms={weights_ms:.3} kv_ms={kv_ms:.3} dn_ms={dn_ms:.3} scratch_ms={scratch_ms:.3}"
     );
+    for (name, ms) in [
+        ("qwen35_weights", weights_ms),
+        ("qwen35_kv", kv_ms),
+        ("qwen35_deltanet", dn_ms),
+        ("qwen35_scratch", scratch_ms),
+    ] {
+        rdna_compute::load_phases::add(name, (ms * 1e6) as u64, 0);
+    }
 
     Ok(Qwen35Bundle {
         config,
@@ -622,7 +661,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|s| s.to_string())
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
-    let native_eligible = kv_mode::qwen35_native_eligible(
+    let auto_native = kv_mode::qwen35_native_auto_eligible(
         ctx.gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -632,7 +671,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         ctx.cask.sidecar.is_some(),
     );
     let policy =
-        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, auto_native);
 
     let pair = kv_mode::resolve_kv_pair(
         &mode_raw,
@@ -773,10 +812,12 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     }
 }
 
-/// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen dense route.
-/// Explicit native presets require exact gfx1201 H24/Hkv4/D256, single GPU,
-/// non-adaptive, no CASK eviction, and neutral V. Implicit auto instead selects
-/// Q8 when the same geometry/policy is ineligible.
+/// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen route. Authored
+/// native presets need `kv_mode::qwen35_native_supported` (exact gfx1201,
+/// single GPU, non-adaptive, no CASK eviction, and a mode-specific exact
+/// geometry: fp8 H24/Hkv4/D256 or H16/Hkv2/D256, bf16 H24/Hkv4/D256) plus
+/// neutral V. Implicit auto is gated separately by
+/// `kv_mode::qwen35_native_auto_eligible` and instead selects Q8.
 pub fn validate_native_kv_admission(
     mode: hipfire_runtime::kv_mode::KvMode,
     config: &Qwen35Config,
@@ -788,7 +829,8 @@ pub fn validate_native_kv_admission(
     if !matches!(mode, KvMode::Fp8 | KvMode::Bf16) {
         return Ok(());
     }
-    if !kv_mode::qwen35_native_eligible(
+    if let Some(why) = kv_mode::qwen35_native_refusal(
+        mode,
         ctx.gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -797,10 +839,7 @@ pub fn validate_native_kv_admission(
         adaptive,
         ctx.cask.sidecar.is_some(),
     ) {
-        return Err(format!(
-            "kv_mode {mode:?} requires exact gfx1201 H24/Hkv4/D256, single GPU, no adaptive/CASK (got {}, H{}/Hkv{}/D{}); use --kv-mode q8",
-            ctx.gpu.arch, config.n_heads, config.n_kv_heads, config.head_dim
-        ));
+        return Err(why);
     }
     if authored_v {
         return Err(format!(
@@ -1087,7 +1126,9 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         }
         (Some(lease), Err(e)) => {
             drop(lease);
-            Err(format!("{e}; weight-host lease closed without release (teardown not proven clean)"))
+            Err(format!(
+                "{e}; weight-host lease closed without release (teardown not proven clean)"
+            ))
         }
     }
 }
@@ -1119,7 +1160,9 @@ impl SharedWeightLease {
         {
             let mut inner = self.inner;
             inner.close_allocation_fds();
-            inner.release().map_err(|e| format!("weight-host release: {e}"))
+            inner
+                .release()
+                .map_err(|e| format!("weight-host release: {e}"))
         }
         #[cfg(not(target_os = "linux"))]
         match self._never {}
@@ -1193,15 +1236,28 @@ fn refuse_outside_weight_host_envelope(ctx: &LoadCtx) -> Result<(), String> {
 pub fn weight_host_card_identity(
     gpu: &rdna_compute::Gpu,
 ) -> Result<hipfire_runtime::weight_host::CardIdentity, String> {
-    let uuid = gpu.hip.device_uuid(gpu.device_id).map_err(|e| format!("card UUID: {e}"))?;
-    let pci_bus_id = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| format!("card PCI bus ID: {e}"))?;
-    Ok(hipfire_runtime::weight_host::CardIdentity { uuid, pci_bus_id, device_arch: gpu.arch.clone() })
+    let uuid = gpu
+        .hip
+        .device_uuid(gpu.device_id)
+        .map_err(|e| format!("card UUID: {e}"))?;
+    let pci_bus_id = gpu
+        .hip
+        .device_pci_bus_id(gpu.device_id)
+        .map_err(|e| format!("card PCI bus ID: {e}"))?;
+    Ok(hipfire_runtime::weight_host::CardIdentity {
+        uuid,
+        pci_bus_id,
+        device_arch: gpu.arch.clone(),
+    })
 }
 
 /// Source certificate the host publishes beside its socket (same private
 /// directory): `<socket>.source-cert`.
 pub fn weight_host_source_certificate_path(socket: &std::path::Path) -> std::path::PathBuf {
-    let mut name = socket.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = socket
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".source-cert");
     socket.with_file_name(name)
 }
@@ -1217,10 +1273,13 @@ mod loader_abi_generated {
 #[cfg(target_os = "linux")]
 pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
     use hipfire_runtime::weight_host::{FieldValue, LoaderAbi, Sha256Digest};
-    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1")
-        .with("representation_tag", FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG));
+    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1").with(
+        "representation_tag",
+        FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG),
+    );
     for (name, digest) in loader_abi_generated::LOADER_ABI_COMPONENTS {
-        abi.components.insert((*name).to_owned(), Sha256Digest(*digest));
+        abi.components
+            .insert((*name).to_owned(), Sha256Digest(*digest));
     }
     abi
 }
@@ -1230,13 +1289,16 @@ pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
 pub fn weight_host_source_sha256(
     cert: &hipfire_runtime::weight_host::SourceCertificate,
 ) -> Result<hipfire_runtime::weight_host::Sha256Digest, String> {
-    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()]).map_err(|e| e.to_string())
+    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()])
+        .map_err(|e| e.to_string())
 }
 
 /// Diagnostics-only provenance: never compared or hashed.
 #[cfg(target_os = "linux")]
 pub fn weight_host_provenance(role: &str) -> hipfire_runtime::weight_host::BuildProvenance {
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     hipfire_runtime::weight_host::BuildProvenance {
         label: format!("{role} {exe} pid {}", std::process::id()),
         ..Default::default()
@@ -1253,16 +1315,25 @@ fn import_from_weight_host(
     use hipfire_runtime::weight_host as wh;
     refuse_outside_weight_host_envelope(ctx)?;
     let connect_started = std::time::Instant::now();
-    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION")
-        .map_err(|_| "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)".to_string())?;
+    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION").map_err(|_| {
+        "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)"
+            .to_string()
+    })?;
     let card = weight_host_card_identity(ctx.gpu)?;
     let cert_path = weight_host_source_certificate_path(socket);
     // Identity check only (fstat), no content scan: the host hashed once.
-    let (_source, cert) = wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
-        .map_err(|e| format!("weight host source certificate {}: {e}", cert_path.display()))?;
+    let (_source, cert) =
+        wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
+            .map_err(|e| {
+                format!(
+                    "weight host source certificate {}: {e}",
+                    cert_path.display()
+                )
+            })?;
     let source_sha256 = weight_host_source_sha256(&cert)?;
     crate::shared_weights::apply_source_dispatch_flags(ctx.gpu, hfq);
-    let recipe = crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
+    let recipe =
+        crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
     let hello = wh::HostHello {
         card,
         source_sha256,
@@ -1270,7 +1341,10 @@ fn import_from_weight_host(
         recipe,
         admission_token,
         provenance: weight_host_provenance("tenant"),
-        options: wh::ConnectOptions { handshake_timeout: std::time::Duration::from_secs(30), expected_host_pid: None },
+        options: wh::ConnectOptions {
+            handshake_timeout: std::time::Duration::from_secs(30),
+            expected_host_pid: None,
+        },
     };
     let mut lease = wh::WeightHostClient::connect(socket, hello)
         .map_err(|e| format!("weight host {}: {e}", socket.display()))?;
@@ -1283,7 +1357,10 @@ fn import_from_weight_host(
     let imported_bytes = crate::shared_weights::dense_imported_physical_bytes(lease.manifest());
     if let Err(e) = lease.ack_import(imported_bytes) {
         weights.free_gpu(ctx.gpu);
-        return Err(append_cleanup_context(format!("weight host import ack: {e}"), note_vmm_after_free(ctx.gpu)));
+        return Err(append_cleanup_context(
+            format!("weight host import ack: {e}"),
+            note_vmm_after_free(ctx.gpu),
+        ));
     }
     let import_map_ms = import_started.elapsed().as_secs_f64() * 1e3;
     eprintln!(
@@ -1617,7 +1694,8 @@ mod tests {
     /// file + file/8 + 512 MiB, and MTP + DFlash charge independently and add.
     #[test]
     fn draft_reserve_charges_mtp_and_dflash() {
-        let dir = std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let write_sized = |name: &str, len: u64| {
@@ -1642,7 +1720,9 @@ mod tests {
             expect.saturating_mul(2)
         );
         // A bundled head charges only its appended section, never the trunk.
-        let bundled = MtpHeadLocation::Bundled { section_bytes: file_len };
+        let bundled = MtpHeadLocation::Bundled {
+            section_bytes: file_len,
+        };
         assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect);
         assert_eq!(
             draft_device_reserve_bytes(Some(&bundled), Some(&dflash)),
@@ -1652,6 +1732,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The placement reserves the MTP head only where the load attaches it:
+    /// qwen35 declares no measured AR floor, so `auto` reserves nothing, an
+    /// explicit `on` reserves, `off` never. A DFlash draft is charged
+    /// independently of this verdict (`draft_device_reserve_bytes`).
+    #[test]
+    fn placement_reserves_the_mtp_head_only_when_the_load_attaches_it() {
+        assert!(!crate::MTP_MEASURED_AR_FLOOR);
+        assert!(
+            !mtp_head_reserved(None),
+            "auto without a floor: no head, no reservation"
+        );
+        assert!(
+            mtp_head_reserved(Some(true)),
+            "explicit on reserves the head"
+        );
+        assert!(!mtp_head_reserved(Some(false)), "off never reserves");
+    }
+
     /// The MTP head probe both resolvers share: the stem sidecar spelling
     /// resolves, the last-extension spelling shadows it, and a bundled
     /// trailer resolves to the appended section size (its MTP container is
@@ -1659,7 +1757,8 @@ mod tests {
     /// `resolve_mtp_head_file`).
     #[test]
     fn mtp_head_probe_prefers_sidecar_spelling_then_bundle() {
-        let dir = std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let trunk = dir.join("model.mq4v2.hfq");

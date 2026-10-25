@@ -40,7 +40,9 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
+/// The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) on exact gfx1201 is
+/// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
+/// ids identical to the HIP route. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// spill on either tier — an explicit layer or routed-expert count, or
 /// explicit `auto`) gets no retained default: its
@@ -75,6 +77,19 @@ pub fn retained_redline_default(
         && pp == 1
         && tp == 1
         && !has_drafter
+    {
+        return true;
+    }
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension; 0.5.0 selects by HFQ metadata (symmetric IU4 headers verified at load) (no runtime warning: only way to reach the route today)
+    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+        && model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+        && std::path::Path::new(model_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4rs"))
     {
         return true;
     }
@@ -156,7 +171,8 @@ pub struct RuntimeConfig {
     pub mtp_mode: String,
     /// Explicit numeric `HIPFIRE_MTP_K` / `speculation.mtp_k`. `None` = unset
     /// or `auto`: the consumer applies its default (`hipfire_config::
-    /// mtp_k_default_for_arch` for native Qwen4 MTP, else `MTP_K_DEFAULT`).
+    /// mtp_k_default` over the GPU's row-exact verify rows for native Qwen4
+    /// MTP, else `MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
     /// `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR`: YaRN RoPE factor
     /// override applied by [`crate::rope::rope_scaling`]. `None` = the
@@ -233,9 +249,13 @@ impl RuntimeConfig {
             ngram_window: value("HIPFIRE_NGRAM_WINDOW")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            // `auto` is not an explicit arm here (the daemon-direct fallback);
+            // on/1/true is, via the shared strict tri-state parser.
             ngram_draft: matches!(
-                value("HIPFIRE_NGRAM_DRAFT").as_deref(),
-                Some("1") | Some("on")
+                value("HIPFIRE_NGRAM_DRAFT")
+                    .as_deref()
+                    .map(hipfire_config::parse_tri_state_alias),
+                Some(Ok(Some(true)))
             ),
             ngram_k: value("HIPFIRE_NGRAM_DRAFT_K")
                 .and_then(|v| v.parse().ok())
@@ -303,8 +323,12 @@ mod tests {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
         assert!(redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, 1, false));
         for ep in [2, 4] {
-            assert!(!redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, ep, false));
-            assert!(!redline_with_ep("gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen4", fn_xts, 1, 1, ep, false
+            ));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false
+            ));
             assert!(!redline_with_ep(
                 "gfx1201",
                 "qwen4",
@@ -456,6 +480,82 @@ mod tests {
             "/models/qwen3.6-35b-a3b.mq4r",
             1,
             2,
+        ));
+    }
+
+    #[test]
+    fn a3b_mq4rs_takes_retained_redline_on_gfx1201_only() {
+        let f = "/models/qwen3.6-35b-a3b-d53.mq4rs";
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            false
+        ));
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            "/models/A3B.MQ4RS",
+            1,
+            1,
+            false
+        ));
+        // drafter (MTP-loaded), other arches, multi-GPU, other families, other extensions
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            true
+        ));
+        for arch in ["gfx1200", "gfx1100", "gfx1151", "gfx942"] {
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                1,
+                1,
+                false
+            ));
+        }
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            2,
+            1,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            2,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3", f, 1, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            "/models/a3b.mq4",
+            1,
+            1,
+            false
+        ));
+        assert!(!redline_with_ep(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            2,
+            false
         ));
     }
 
@@ -624,14 +724,24 @@ mod tests {
     #[test]
     fn qwen4_redline_default_requires_gfx1201_single_gpu_without_mtp() {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
-        assert!(retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, false
+        ));
         // The native MTP head is a drafter: an MTP load keeps its spec path.
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, true));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 2, false));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, true
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 2, false
+        ));
         // A plain `.mq4` Flash-Next stays on HIP off gfx1201.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
-            assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen4", fn_xts, 1, 1, false
+            ));
         }
     }
 
@@ -648,7 +758,11 @@ mod tests {
             OffloadBudget::Auto,
             OffloadBudget::Layers(4),
         ] {
-            assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+            assert!(!cpu_offload_configured_from(
+                OffloadExec::Pcie,
+                budget,
+                budget
+            ));
         }
         // CPU with both tiers unset is not configured on any model.
         assert!(!cpu_offload_configured_from(
@@ -673,7 +787,11 @@ mod tests {
         ] {
             assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
             // `passback` runs the CPU arm of a spilled step, so it counts too.
-            assert!(cpu_offload_configured_from(OffloadExec::Passback, layer, expert));
+            assert!(cpu_offload_configured_from(
+                OffloadExec::Passback,
+                layer,
+                expert
+            ));
         }
     }
 }

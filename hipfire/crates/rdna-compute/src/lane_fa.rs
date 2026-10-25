@@ -137,7 +137,9 @@ fn check_native_kv_capacity(
     if have < need {
         return Err(HipError::new(
             0,
-            &format!("{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"),
+            &format!(
+                "{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"
+            ),
         ));
     }
     Ok(())
@@ -194,7 +196,9 @@ impl Gpu {
             && n_kv_heads > 0
             && n_heads == 6 * n_kv_heads
             && (1..=LANE_FA_MAX).contains(&lane_rows.len())
-            && lane_rows.iter().all(|&r| (1..=LANE_FA_MAX_ROWS).contains(&r))
+            && lane_rows
+                .iter()
+                .all(|&r| (1..=LANE_FA_MAX_ROWS).contains(&r))
     }
 
     /// Per-lane `(partials base in f32 elements, max_tiles)`; errors when
@@ -209,7 +213,10 @@ impl Gpu {
         if partials.numel() < need {
             return Err(HipError::new(
                 0,
-                &format!("{what}: partials hold {} floats, lane layout needs {need}", partials.numel()),
+                &format!(
+                    "{what}: partials hold {} floats, lane layout needs {need}",
+                    partials.numel()
+                ),
             ));
         }
         let mut base = 0usize;
@@ -321,10 +328,25 @@ impl Gpu {
                     "attention_verify_gqa_fp8_lanes: lane rows / context outside the VerifyAttn route",
                 ));
             }
-            check_native_kv_capacity(l.k_cache, l.physical_cap, row, "attention_verify_gqa_fp8_lanes")?;
-            check_native_kv_capacity(l.v_cache, l.physical_cap, row, "attention_verify_gqa_fp8_lanes")?;
+            check_native_kv_capacity(
+                l.k_cache,
+                l.physical_cap,
+                row,
+                "attention_verify_gqa_fp8_lanes",
+            )?;
+            check_native_kv_capacity(
+                l.v_cache,
+                l.physical_cap,
+                row,
+                "attention_verify_gqa_fp8_lanes",
+            )?;
         }
-        let layout = Self::lane_fa_partials_layout(n_heads, &shape, partials, "attention_verify_gqa_fp8_lanes")?;
+        let layout = Self::lane_fa_partials_layout(
+            n_heads,
+            &shape,
+            partials,
+            "attention_verify_gqa_fp8_lanes",
+        )?;
         self.ensure_kernel(
             ATTENTION_VERIFY_LANES_MODULE,
             ATTENTION_VERIFY_LANES_SRC,
@@ -381,7 +403,11 @@ impl Gpu {
                         b.push_u64(*v);
                     }
                 }
-                for arr in [&blob_args.n_rows, &blob_args.max_tiles, &blob_args.batch_offset] {
+                for arr in [
+                    &blob_args.n_rows,
+                    &blob_args.max_tiles,
+                    &blob_args.batch_offset,
+                ] {
                     for v in arr {
                         b.push_i32(*v);
                     }
@@ -409,7 +435,12 @@ impl Gpu {
         );
         self.bind_thread()?;
         let shape: Vec<(usize, usize)> = lanes.iter().map(|l| (l.rows, l.max_ctx_len)).collect();
-        let layout = Self::lane_fa_partials_layout(n_heads, &shape, partials, "attention_verify_reduce_lanes")?;
+        let layout = Self::lane_fa_partials_layout(
+            n_heads,
+            &shape,
+            partials,
+            "attention_verify_reduce_lanes",
+        )?;
         self.ensure_kernel(
             ATTENTION_VERIFY_LANES_MODULE,
             ATTENTION_VERIFY_LANES_SRC,
@@ -453,7 +484,11 @@ impl Gpu {
                         b.push_u64(*v);
                     }
                 }
-                for arr in [&blob_args.n_rows, &blob_args.max_tiles, &blob_args.batch_offset] {
+                for arr in [
+                    &blob_args.n_rows,
+                    &blob_args.max_tiles,
+                    &blob_args.batch_offset,
+                ] {
                     for v in arr {
                         b.push_i32(*v);
                     }

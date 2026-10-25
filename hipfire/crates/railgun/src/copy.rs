@@ -72,7 +72,14 @@ pub struct CopyEntry {
 
 impl CopyEntry {
     pub fn encode(&self, out: &mut Vec<u8>) {
-        for word in [self.src_slot, self.src_offset, self.dst_slot, self.dst_offset, self.bytes, 0] {
+        for word in [
+            self.src_slot,
+            self.src_offset,
+            self.dst_slot,
+            self.dst_offset,
+            self.bytes,
+            0,
+        ] {
             out.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -100,7 +107,12 @@ pub fn copy_launch(src: u64, dst: u64, bytes: u32) -> Launch {
     kernarg.extend_from_slice(&dst.to_le_bytes());
     kernarg.extend_from_slice(&bytes.to_le_bytes());
     kernarg.resize(24, 0);
-    Launch { symbol: COPY_SYMBOL, grid: [grid_x(u64::from(bytes)), 1, 1], block: [BLOCK, 1, 1], kernarg }
+    Launch {
+        symbol: COPY_SYMBOL,
+        grid: [grid_x(u64::from(bytes)), 1, 1],
+        block: [BLOCK, 1, 1],
+        kernarg,
+    }
 }
 
 /// `railgun_copy_batch` over the first `n ≥ 1` entries of the table at
@@ -108,7 +120,12 @@ pub fn copy_launch(src: u64, dst: u64, bytes: u32) -> Launch {
 /// to `src[k]` and destination slot `k` to `dst[k]`. Unused slots are null,
 /// so an entry naming one faults instead of reaching another allocation.
 pub fn batch_launch(table: u64, n: u32, src: &[u64], dst: &[u64], max_bytes: u64) -> Launch {
-    assert!(src.len() <= SRC_SLOTS && dst.len() <= DST_SLOTS, "{} source / {} destination slots", src.len(), dst.len());
+    assert!(
+        src.len() <= SRC_SLOTS && dst.len() <= DST_SLOTS,
+        "{} source / {} destination slots",
+        src.len(),
+        dst.len()
+    );
     let mut kernarg = Vec::with_capacity(BATCH_KERNARG_BYTES);
     kernarg.extend_from_slice(&table.to_le_bytes());
     kernarg.extend_from_slice(&n.to_le_bytes());
@@ -118,7 +135,12 @@ pub fn batch_launch(table: u64, n: u32, src: &[u64], dst: &[u64], max_bytes: u64
             kernarg.extend_from_slice(&bases.get(k).copied().unwrap_or(0).to_le_bytes());
         }
     }
-    Launch { symbol: BATCH_SYMBOL, grid: [grid_x(max_bytes), n, 1], block: [BLOCK, 1, 1], kernarg }
+    Launch {
+        symbol: BATCH_SYMBOL,
+        grid: [grid_x(max_bytes), n, 1],
+        block: [BLOCK, 1, 1],
+        kernarg,
+    }
 }
 
 #[cfg(test)]

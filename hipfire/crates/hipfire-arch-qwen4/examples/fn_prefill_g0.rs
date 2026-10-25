@@ -55,8 +55,14 @@
 //! compared run is identical and every control is detected (bench exits 0
 //! unless an error occurs). Nothing is written outside OUT_DIR; the reference
 //! state files under `OUT_DIR/ref` are removed unless `--keep-raw`.
+//!
+//! Model load follows `qwen4_kld`: admission on the GPU architecture
+//! (`admit_hfqm_artifact_on`), slab layer arenas served by
+//! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
+//! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
+//! rest host-mapped and borrowed from the resident source bytes.
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::gpu_forward_lanes::{
     LaneStagePolicy, StageName, StageShare, WaveHead, WaveLane,
@@ -64,7 +70,7 @@ use hipfire_arch_qwen4::gpu_forward_lanes::{
 use hipfire_arch_qwen4::state::Qwen4State;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::prefill_invariant::{
@@ -112,15 +118,23 @@ struct Args {
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
     s.split(',')
         .filter(|v| !v.trim().is_empty())
-        .map(|v| v.trim().parse::<usize>().map_err(|x| format!("bad {what} '{v}': {x}")))
+        .map(|v| {
+            v.trim()
+                .parse::<usize>()
+                .map_err(|x| format!("bad {what} '{v}': {x}"))
+        })
         .collect()
 }
 
 fn parse_words(s: &str) -> Vec<String> {
-    s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect()
+    s.split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
-const USAGE: &str = "usage: fn_prefill_g0 MODEL.mq4 TEXT.txt OUT_DIR --mode concat|chunk|singleton|bench \
+const USAGE: &str =
+    "usage: fn_prefill_g0 MODEL.mq4 TEXT.txt OUT_DIR --mode concat|chunk|singleton|bench \
     [--mix 232,366,...] [--depths 0,4096,...] [--orders given,reverse,rotate] \
     [--chunkings 1+231,100+132,1+*,...] [--policy shared|production|per-lane|<spec>] \
     [--stage-g0] [--controls] [--all-logits] [--reps N] [--max-seq N] [--keep-raw]";
@@ -148,7 +162,9 @@ fn parse_args() -> R<Args> {
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
         *i += 1;
-        raw.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))
+        raw.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))
     };
     while i < raw.len() {
         match raw[i].as_str() {
@@ -176,7 +192,9 @@ fn parse_args() -> R<Args> {
     a.text = pos[1].clone().into();
     a.out = pos[2].clone().into();
     if !matches!(a.mode.as_str(), "concat" | "chunk" | "singleton" | "bench") {
-        return Err(format!("--mode must be concat|chunk|singleton|bench\n{USAGE}"));
+        return Err(format!(
+            "--mode must be concat|chunk|singleton|bench\n{USAGE}"
+        ));
     }
     if a.mix.is_empty() || a.mix.contains(&0) {
         return Err("--mix must be non-empty and positive".into());
@@ -250,13 +268,21 @@ impl Diff {
         self.items += 1;
         self.bytes += reference.len() as u64;
         if reference.len() != got.len() {
-            self.note(format!("{label}: length ref {} got {}", reference.len(), got.len()));
+            self.note(format!(
+                "{label}: length ref {} got {}",
+                reference.len(),
+                got.len()
+            ));
             return;
         }
         if reference == got {
             return;
         }
-        let i = reference.iter().zip(got).position(|(a, b)| a != b).unwrap_or(0);
+        let i = reference
+            .iter()
+            .zip(got)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
         let n = reference.iter().zip(got).filter(|(a, b)| a != b).count();
         self.diff_bytes += n as u64;
         let mut msg = format!(
@@ -287,7 +313,9 @@ impl Diff {
 
     /// The first failing item's label (text before the first `": "`).
     fn first_item(&self) -> Option<String> {
-        self.first.as_ref().map(|m| m.split(": ").next().unwrap_or(m).to_string())
+        self.first
+            .as_ref()
+            .map(|m| m.split(": ").next().unwrap_or(m).to_string())
     }
 }
 
@@ -298,7 +326,10 @@ fn read_prefix(gpu: &Gpu, t: &GpuTensor, bytes: usize) -> R<Vec<u8>> {
         return Ok(Vec::new());
     }
     if bytes > t.buf.size() {
-        return Err(format!("read of {bytes} bytes exceeds the {}-byte device buffer", t.buf.size()));
+        return Err(format!(
+            "read of {bytes} bytes exceeds the {}-byte device buffer",
+            t.buf.size()
+        ));
     }
     let mut out = vec![0u8; bytes];
     gpu.hip.memcpy_dtoh(&mut out, &t.buf).map_err(e)?;
@@ -312,7 +343,9 @@ fn read_rows(gpu: &Gpu, t: &GpuTensor, rows: usize, capacity: usize) -> R<Vec<u8
     }
     let total = t.byte_size();
     if total % capacity != 0 {
-        return Err(format!("arena of {total} bytes does not hold {capacity} equal rows"));
+        return Err(format!(
+            "arena of {total} bytes does not hold {capacity} equal rows"
+        ));
     }
     read_prefix(gpu, t, rows.min(capacity) * (total / capacity))
 }
@@ -341,12 +374,24 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
     let mut items = Vec::new();
     let mut push = |name: String, bytes: Vec<u8>| items.push(Item { name, bytes });
     for (i, g) in st.gdn.iter().enumerate() {
-        push(format!("gdn_recurrent[{i}]"), read_prefix(gpu, &g.recurrent, g.recurrent.byte_size())?);
-        push(format!("gdn_conv[{i}]"), read_prefix(gpu, &g.conv, g.conv.byte_size())?);
+        push(
+            format!("gdn_recurrent[{i}]"),
+            read_prefix(gpu, &g.recurrent, g.recurrent.byte_size())?,
+        );
+        push(
+            format!("gdn_conv[{i}]"),
+            read_prefix(gpu, &g.conv, g.conv.byte_size())?,
+        );
     }
     for (i, q) in st.qsa.iter().enumerate() {
-        push(format!("qsa_full_keys[{i}]"), read_rows(gpu, &q.full_keys, q.full_len, q.full_capacity)?);
-        push(format!("qsa_full_values[{i}]"), read_rows(gpu, &q.full_values, q.full_len, q.full_capacity)?);
+        push(
+            format!("qsa_full_keys[{i}]"),
+            read_rows(gpu, &q.full_keys, q.full_len, q.full_capacity)?,
+        );
+        push(
+            format!("qsa_full_values[{i}]"),
+            read_rows(gpu, &q.full_values, q.full_len, q.full_capacity)?,
+        );
         push(
             format!("qsa_raw_index_keys[{i}]"),
             read_rows(gpu, &q.raw_index_keys, q.raw_len, q.raw_capacity)?,
@@ -365,18 +410,39 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
         );
         push(
             format!("qsa_selected_indices[{i}]"),
-            read_prefix(gpu, &q.selected_indices, (q.selected_len * 4).min(q.selected_indices.byte_size()))?,
+            read_prefix(
+                gpu,
+                &q.selected_indices,
+                (q.selected_len * 4).min(q.selected_indices.byte_size()),
+            )?,
         );
         push(
             format!("qsa_marks[{i}]"),
-            le_u64s(&[q.full_len, q.raw_len, q.pooled_len, q.partial_len, q.selected_len, q.position]),
+            le_u64s(&[
+                q.full_len,
+                q.raw_len,
+                q.pooled_len,
+                q.partial_len,
+                q.selected_len,
+                q.position,
+            ]),
         );
     }
     // The PLE conv state exists only on profiles that declare PLE.
     if let Some(ple_conv) = &st.ple_conv {
-        push("ple_conv".into(), read_prefix(gpu, ple_conv, ple_conv.byte_size())?);
+        push(
+            "ple_conv".into(),
+            read_prefix(gpu, ple_conv, ple_conv.byte_size())?,
+        );
     }
-    push("hyper_feedback".into(), read_prefix(gpu, &st.hyper_feedback, st.hyper_feedback.byte_size())?);
+    let hyper_feedback = st
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
+    push(
+        "hyper_feedback".into(),
+        read_prefix(gpu, hyper_feedback, hyper_feedback.byte_size())?,
+    );
     let prev = st.ple_history.previous();
     let mut hist = Vec::with_capacity(12);
     for v in [prev[0], prev[1], st.ple_history.eos_token_id()] {
@@ -411,19 +477,30 @@ fn write_ckpt(dir: &Path, items: &[Item]) -> R<RefCkpt> {
         .iter()
         .map(|(n, o, l)| json!({"name": n, "offset": o, "len": l}))
         .collect();
-    fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&idx).map_err(e)?).map_err(e)?;
+    fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&idx).map_err(e)?,
+    )
+    .map_err(e)?;
     Ok(RefCkpt { path, index })
 }
 
 fn compare_ckpt(diff: &mut Diff, ctx: &str, reference: &RefCkpt, got: &[Item]) -> R<()> {
     let mut f = File::open(&reference.path).map_err(e)?;
     if reference.index.len() != got.len() {
-        diff.note(format!("{ctx}: state item count ref {} got {}", reference.index.len(), got.len()));
+        diff.note(format!(
+            "{ctx}: state item count ref {} got {}",
+            reference.index.len(),
+            got.len()
+        ));
     }
     for (idx, (name, offset, len)) in reference.index.iter().enumerate() {
         let Some(g) = got.get(idx) else { break };
         if &g.name != name {
-            diff.note(format!("{ctx}: state item {idx} is '{}' but the reference has '{name}'", g.name));
+            diff.note(format!(
+                "{ctx}: state item {idx} is '{}' but the reference has '{name}'",
+                g.name
+            ));
             continue;
         }
         let mut buf = vec![0u8; *len as usize];
@@ -462,7 +539,11 @@ fn compare_one(ctx: &str, rf: &RefReq, out: &LaneOut, items: &[Item]) -> R<Diff>
 fn compare_top1(d: &mut Diff, ctx: &str, reference: &[i32], got: &[i32]) {
     if reference.len() != got.len() {
         d.items += 1;
-        d.note(format!("{ctx} top1: length ref {} got {}", reference.len(), got.len()));
+        d.note(format!(
+            "{ctx} top1: length ref {} got {}",
+            reference.len(),
+            got.len()
+        ));
         return;
     }
     for (j, (a, b)) in reference.iter().zip(got).enumerate() {
@@ -481,21 +562,62 @@ struct World {
 fn load(path: &Path, max_seq: usize) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
-    let receipt = admit_hfqm_artifact(&hfq).map_err(e)?;
     let mut gpu = Gpu::init().map_err(e)?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(e)?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
     let mesh = DeviceMesh::single().map_err(e)?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+    // and host-maps the rest (a slab artifact larger than one card).
+    let weights = {
+        let mut weights = receipt.manifest.weights.clone();
+        match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+            None => {}
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                if gpu.is_uma() {
+                    return Err("host-mapped experts are only for discrete GPUs".into());
+                }
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
+                eprintln!(
+                    "fn_prefill_g0: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                );
+            }
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                return Err("fn_prefill_g0 takes a fixed expert layer count, not auto".into());
+            }
+        }
+        weights
+    };
     let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
+        &weights,
         &mesh,
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // The store rejects a host-mapped entry as a range: borrow it
+            // from the resident source bytes, as the product loader does.
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             source
                 .tensor_range(&entry.name)
                 .map_err(|x| x.to_string())?
@@ -525,14 +647,20 @@ fn load(path: &Path, max_seq: usize) -> R<(HfqModelSource, World, Tokenizer)> {
     )
     .map_err(e)?;
     bundle
-        .attach_forward(&mut gpu, max_seq, hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full)
+        .attach_forward(
+            &mut gpu,
+            max_seq,
+            hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full,
+        )
         .map_err(e)?;
     Ok((source, World { gpu, bundle, vocab }, tokenizer))
 }
 
 /// Request prompt: TEXT tokens from offset `i * 997`, wrapping.
 fn prompt_for(tokens: &[u32], i: usize, ctx: usize) -> Vec<u32> {
-    (0..ctx).map(|j| tokens[(i * 997 + j) % tokens.len()]).collect()
+    (0..ctx)
+        .map(|j| tokens[(i * 997 + j) % tokens.len()])
+        .collect()
 }
 
 struct Req {
@@ -623,7 +751,10 @@ impl Rig {
             return Err("wave lane without rows".into());
         }
         if total > self.tile {
-            return Err(format!("wave of {total} rows exceeds the {}-row tile", self.tile));
+            return Err(format!(
+                "wave of {total} rows exceeds the {}-row tile",
+                self.tile
+            ));
         }
         let Rig { w, pool, sc, .. } = self;
         let mut slots: Vec<Option<&mut Qwen4State>> = pool.iter_mut().map(Some).collect();
@@ -633,10 +764,18 @@ impl Rig {
                 .get_mut(s.state)
                 .and_then(|x| x.take())
                 .ok_or_else(|| format!("wave state {} missing or used twice", s.state))?;
-            lanes.push(WaveLane { state: st, tokens: s.tokens });
+            lanes.push(WaveLane {
+                state: st,
+                tokens: s.tokens,
+            });
         }
         let (head, logits) = if all {
-            (WaveHead::All, sc.all.as_ref().ok_or("--all-logits buffer is not allocated")?)
+            (
+                WaveHead::All,
+                sc.all
+                    .as_ref()
+                    .ok_or("--all-logits buffer is not allocated")?,
+            )
         } else {
             (WaveHead::Final, &sc.final_logits)
         };
@@ -656,11 +795,29 @@ impl Rig {
         let mut row = 0usize;
         for (k, s) in specs.iter().enumerate() {
             if all {
-                let t = self.sc.all.as_ref().ok_or("--all-logits buffer is not allocated")?;
-                outs.push(read_rows_out(&self.w.gpu, t, &self.sc.top1, vocab, row, s.tokens.len())?);
+                let t = self
+                    .sc
+                    .all
+                    .as_ref()
+                    .ok_or("--all-logits buffer is not allocated")?;
+                outs.push(read_rows_out(
+                    &self.w.gpu,
+                    t,
+                    &self.sc.top1,
+                    vocab,
+                    row,
+                    s.tokens.len(),
+                )?);
                 row += s.tokens.len();
             } else {
-                outs.push(read_rows_out(&self.w.gpu, &self.sc.final_logits, &self.sc.top1, vocab, k, 1)?);
+                outs.push(read_rows_out(
+                    &self.w.gpu,
+                    &self.sc.final_logits,
+                    &self.sc.top1,
+                    vocab,
+                    k,
+                    1,
+                )?);
             }
         }
         Ok(outs)
@@ -674,7 +831,14 @@ impl Rig {
         let policy = self.prefix_policy;
         let tile = self.tile;
         for t in prefix.chunks(tile) {
-            self.wave(&[LaneSpec { state: idx, tokens: t }], false, &policy)?;
+            self.wave(
+                &[LaneSpec {
+                    state: idx,
+                    tokens: t,
+                }],
+                false,
+                &policy,
+            )?;
         }
         Ok(())
     }
@@ -694,14 +858,21 @@ impl Rig {
         let final_row = sc.final_logits.sub_offset(0, w.vocab);
         w.bundle.reset(&mut w.gpu).map_err(e)?;
         for t in req.prefix.chunks(*tile) {
-            w.bundle.forward_chunk_final(&mut w.gpu, t, &final_row, None).map_err(e)?;
+            w.bundle
+                .forward_chunk_final(&mut w.gpu, t, &final_row, None)
+                .map_err(e)?;
         }
         w.gpu.hip.device_synchronize().map_err(e)?;
         let t0 = Instant::now();
         if all {
-            let buf = sc.all.as_ref().ok_or("--all-logits buffer is not allocated")?;
+            let buf = sc
+                .all
+                .as_ref()
+                .ok_or("--all-logits buffer is not allocated")?;
             let rows = buf.sub_offset(0, req.suffix.len() * w.vocab);
-            w.bundle.forward_chunk(&mut w.gpu, &req.suffix, &rows, Some(&sc.top1)).map_err(e)?;
+            w.bundle
+                .forward_chunk(&mut w.gpu, &req.suffix, &rows, Some(&sc.top1))
+                .map_err(e)?;
         } else {
             w.bundle
                 .forward_chunk_final(&mut w.gpu, &req.suffix, &final_row, Some(&sc.top1))
@@ -710,7 +881,10 @@ impl Rig {
         w.gpu.hip.device_synchronize().map_err(e)?;
         let secs = t0.elapsed().as_secs_f64();
         let out = if all {
-            let buf = sc.all.as_ref().ok_or("--all-logits buffer is not allocated")?;
+            let buf = sc
+                .all
+                .as_ref()
+                .ok_or("--all-logits buffer is not allocated")?;
             read_rows_out(&w.gpu, buf, &sc.top1, w.vocab, 0, req.suffix.len())?
         } else {
             read_rows_out(&w.gpu, &sc.final_logits, &sc.top1, w.vocab, 0, 1)?
@@ -762,15 +936,23 @@ impl RefCache {
         let key = format!("{}|all={all}", policy.describe());
         if !self.sets.contains_key(&key) {
             let n = self.sets.len();
-            let mut set = RefSet { reqs: Vec::with_capacity(reqs.len()) };
+            let mut set = RefSet {
+                reqs: Vec::with_capacity(reqs.len()),
+            };
             let t = Instant::now();
             for r in reqs {
                 rig.prep(0, &r.prefix)?;
-                let specs = [LaneSpec { state: 0, tokens: &r.suffix }];
+                let specs = [LaneSpec {
+                    state: 0,
+                    tokens: &r.suffix,
+                }];
                 rig.wave(&specs, all, policy)?;
                 let out = rig.outputs(&specs, all)?.remove(0);
                 let items = rig.capture_state(0)?;
-                let dir = self.dir.join(format!("set{n}")).join(format!("req{}", r.idx));
+                let dir = self
+                    .dir
+                    .join(format!("set{n}"))
+                    .join(format!("req{}", r.idx));
                 let ckpt = write_ckpt(&dir, &items)?;
                 if self.keep_raw {
                     fs::write(dir.join("logits.bin"), &out.logits).map_err(e)?;
@@ -829,7 +1011,9 @@ fn diffs_first(diffs: &[(usize, Diff)]) -> Option<String> {
 }
 
 fn diffs_first_item(diffs: &[(usize, Diff)]) -> Option<String> {
-    diffs.iter().find_map(|(r, d)| d.first_item().map(|m| format!("req{r} {m}")))
+    diffs
+        .iter()
+        .find_map(|(r, d)| d.first_item().map(|m| format!("req{r} {m}")))
 }
 
 struct RunOut {
@@ -886,12 +1070,17 @@ impl Ctx {
         meta["label"] = json!(name);
         match res {
             Ok(None) => {
-                self.log.say(format!("SKIP control {name}: not applicable to this mix/depths"));
+                self.log.say(format!(
+                    "SKIP control {name}: not applicable to this mix/depths"
+                ));
                 meta["verdict"] = json!("SKIP");
             }
             Ok(Some(out)) => {
                 let detected = !diffs_pass(&out.diffs);
-                let mut line = format!("{} control {name}", if detected { "DETECTED" } else { "UNDETECTED" });
+                let mut line = format!(
+                    "{} control {name}",
+                    if detected { "DETECTED" } else { "UNDETECTED" }
+                );
                 if let Some(first) = diffs_first(&out.diffs) {
                     line += &format!(": {first}");
                 }
@@ -1028,10 +1217,15 @@ fn run_concat(
     let total: usize = reqs.iter().map(|r| r.suffix.len()).sum();
     let slack = if args.controls { 1 } else { 0 };
     if total + slack > rig.tile {
-        return Err(format!("concat wave of {total} rows exceeds the {}-row tile", rig.tile));
+        return Err(format!(
+            "concat wave of {total} rows exceeds the {}-row tile",
+            rig.tile
+        ));
     }
     if args.all_logits && total > ALL_LOGITS_MAX_ROWS {
-        return Err(format!("--all-logits needs a total of <= {ALL_LOGITS_MAX_ROWS} rows (have {total})"));
+        return Err(format!(
+            "--all-logits needs a total of <= {ALL_LOGITS_MAX_ROWS} rows (have {total})"
+        ));
     }
     let policy = parse_policy(&args.policy)?;
     let meta0 = mix_depths_meta(args, reqs);
@@ -1066,7 +1260,10 @@ fn run_concat(
         let mut variants: Vec<(String, LaneStagePolicy)> = vec![("all-per-lane".into(), per_lane)];
         for s in StageName::ALL {
             if !s.stateful() {
-                variants.push((s.key().to_string(), per_lane.with(s, StageShare::OnceAllRows)?));
+                variants.push((
+                    s.key().to_string(),
+                    per_lane.with(s, StageShare::OnceAllRows)?,
+                ));
             }
         }
         variants.push(("all-shared".into(), all_shared()?));
@@ -1076,7 +1273,10 @@ fn run_concat(
             let mut stage_first: Option<String> = None;
             for order_kind in &args.orders {
                 let order = lane_order(order_kind, k);
-                let label = format!("stage={name} order={order_kind} policy=[{}]", pol.describe());
+                let label = format!(
+                    "stage={name} order={order_kind} policy=[{}]",
+                    pol.describe()
+                );
                 let mut meta = meta0.clone();
                 meta["stage"] = json!(name);
                 meta["order"] = json!(order_kind);
@@ -1104,7 +1304,8 @@ fn run_concat(
                 },
             ));
         }
-        ctx.log.say("stage-g0 verdicts (reference: all-per-lane one-lane waves):".into());
+        ctx.log
+            .say("stage-g0 verdicts (reference: all-per-lane one-lane waves):".into());
         for (name, verdict) in &table {
             ctx.log.say(format!("  {name:<14} {verdict}"));
         }
@@ -1114,14 +1315,22 @@ fn run_concat(
             "table": table.iter().map(|(n, v)| json!({"stage": n, "verdict": v})).collect::<Vec<_>>(),
         }));
         if table.first().is_some_and(|(_, v)| v != "identical") {
-            ctx.log.say("stage-g0: BASELINE all-per-lane differs, which must not happen by construction".into());
+            ctx.log.say(
+                "stage-g0: BASELINE all-per-lane differs, which must not happen by construction"
+                    .into(),
+            );
             ctx.all_pass = false;
         }
     }
 
     if args.controls {
         let order = lane_order("given", k);
-        for control in [Control::SwapTokens, Control::SwapStates, Control::DupToken, Control::ShiftOne] {
+        for control in [
+            Control::SwapTokens,
+            Control::SwapStates,
+            Control::DupToken,
+            Control::ShiftOne,
+        ] {
             let mut meta = meta0.clone();
             meta["policy"] = json!(policy.describe());
             meta["order"] = json!("given");
@@ -1149,7 +1358,9 @@ fn parse_chunking(spec: &str) -> R<(Vec<usize>, bool)> {
             }
             star = true;
         } else {
-            let n: usize = it.parse().map_err(|x| format!("chunking '{spec}': bad part '{it}': {x}"))?;
+            let n: usize = it
+                .parse()
+                .map_err(|x| format!("chunking '{spec}': bad part '{it}': {x}"))?;
             if n == 0 {
                 return Err(format!("chunking '{spec}': parts must be >= 1"));
             }
@@ -1194,7 +1405,10 @@ fn split_single(
     let mut off = 0usize;
     let mut last: Option<LaneOut> = None;
     for (j, &p) in parts.iter().enumerate() {
-        let specs = [LaneSpec { state: 0, tokens: &req.suffix[off..off + p] }];
+        let specs = [LaneSpec {
+            state: 0,
+            tokens: &req.suffix[off..off + p],
+        }];
         secs += rig.wave(&specs, all, policy)?;
         let out = rig.outputs(&specs, all)?.remove(0);
         if all {
@@ -1239,7 +1453,11 @@ fn split_packed(
     for &r in &active {
         rig.prep(r, &reqs[r].prefix)?;
     }
-    let max_parts = active.iter().map(|&r| parts[r].as_ref().unwrap().len()).max().unwrap_or(0);
+    let max_parts = active
+        .iter()
+        .map(|&r| parts[r].as_ref().unwrap().len())
+        .max()
+        .unwrap_or(0);
     let mut offs = vec![0usize; reqs.len()];
     let mut finals: Vec<Option<LaneOut>> = (0..reqs.len()).map(|_| None).collect();
     let (mut secs, mut rows) = (0.0, 0usize);
@@ -1250,23 +1468,37 @@ fn split_packed(
             .collect();
         let specs: Vec<LaneSpec<'_>> = lanes
             .iter()
-            .map(|&(r, p)| LaneSpec { state: r, tokens: &reqs[r].suffix[offs[r]..offs[r] + p] })
+            .map(|&(r, p)| LaneSpec {
+                state: r,
+                tokens: &reqs[r].suffix[offs[r]..offs[r] + p],
+            })
             .collect();
         secs += rig.wave(&specs, false, policy)?;
         rows += lanes.iter().map(|&(_, p)| p).sum::<usize>();
         let mut outs = rig.outputs(&specs, false)?;
         for (lane, &(r, p)) in lanes.iter().enumerate() {
             if j + 1 == parts[r].as_ref().unwrap().len() {
-                finals[r] = Some(std::mem::replace(&mut outs[lane], LaneOut { logits: Vec::new(), top1: Vec::new() }));
+                finals[r] = Some(std::mem::replace(
+                    &mut outs[lane],
+                    LaneOut {
+                        logits: Vec::new(),
+                        top1: Vec::new(),
+                    },
+                ));
             }
             offs[r] += p;
         }
     }
     let mut diffs = Vec::new();
     for &r in &active {
-        let out = finals[r].take().ok_or_else(|| format!("req{r} produced no final row"))?;
+        let out = finals[r]
+            .take()
+            .ok_or_else(|| format!("req{r} produced no final row"))?;
         let items = rig.capture_state(r)?;
-        diffs.push((r, compare_one(&format!("req{r}"), &refs.reqs[r], &out, &items)?));
+        diffs.push((
+            r,
+            compare_one(&format!("req{r}"), &refs.reqs[r], &out, &items)?,
+        ));
     }
     Ok(RunOut { diffs, secs, rows })
 }
@@ -1322,7 +1554,11 @@ fn run_chunk(
                 let res = (|| -> R<RunOut> {
                     let refs = cache.get(rig, reqs, &policy, all, &mut ctx.log)?;
                     let (d, secs) = split_single(rig, req, &p, &policy, &refs.reqs[r], all)?;
-                    Ok(RunOut { diffs: vec![(r, d)], secs, rows: req.suffix.len() })
+                    Ok(RunOut {
+                        diffs: vec![(r, d)],
+                        secs,
+                        rows: req.suffix.len(),
+                    })
                 })();
                 ctx.record("chunk", &label, meta, res);
             }
@@ -1347,12 +1583,7 @@ fn run_chunk(
 
 // ── singleton ────────────────────────────────────────────────────────
 
-fn run_singleton(
-    args: &Args,
-    ctx: &mut Ctx,
-    rig: &mut Rig,
-    reqs: &[Req],
-) -> R<()> {
+fn run_singleton(args: &Args, ctx: &mut Ctx, rig: &mut Rig, reqs: &[Req]) -> R<()> {
     let policy = parse_policy(&args.policy)?;
     let meta0 = mix_depths_meta(args, reqs);
     for all in [false, true] {
@@ -1394,12 +1625,19 @@ fn run_singleton(
                 let rf = RefReq { out: ref_out, ckpt };
                 // Candidate: the same request as a one-lane wave.
                 rig.prep(0, &req.prefix)?;
-                let specs = [LaneSpec { state: 0, tokens: &req.suffix }];
+                let specs = [LaneSpec {
+                    state: 0,
+                    tokens: &req.suffix,
+                }];
                 let secs = rig.wave(&specs, all, &policy)?;
                 let out = rig.outputs(&specs, all)?.remove(0);
                 let items = rig.capture_state(0)?;
                 let d = compare_one(&format!("req{}", req.idx), &rf, &out, &items)?;
-                Ok(RunOut { diffs: vec![(req.idx, d)], secs, rows: req.suffix.len() })
+                Ok(RunOut {
+                    diffs: vec![(req.idx, d)],
+                    secs,
+                    rows: req.suffix.len(),
+                })
             })();
             ctx.record("singleton", &label, meta, res);
         }
@@ -1431,7 +1669,10 @@ fn run_bench(args: &Args, ctx: &mut Ctx, rig: &mut Rig, reqs: &[Req]) -> R<()> {
     let k = reqs.len();
     let total: usize = reqs.iter().map(|r| r.suffix.len()).sum();
     if total > rig.tile {
-        return Err(format!("bench concat wave of {total} rows exceeds the {}-row tile", rig.tile));
+        return Err(format!(
+            "bench concat wave of {total} rows exceeds the {}-row tile",
+            rig.tile
+        ));
     }
     rig.ensure_pool(k)?;
     let (mut concat, mut one_lane, mut singleton) = (Vec::new(), Vec::new(), Vec::new());
@@ -1441,7 +1682,10 @@ fn run_bench(args: &Args, ctx: &mut Ctx, rig: &mut Rig, reqs: &[Req]) -> R<()> {
             rig.prep(r, &reqs[r].prefix)?;
         }
         let specs: Vec<LaneSpec<'_>> = (0..k)
-            .map(|r| LaneSpec { state: r, tokens: &reqs[r].suffix })
+            .map(|r| LaneSpec {
+                state: r,
+                tokens: &reqs[r].suffix,
+            })
             .collect();
         let a = rig.wave(&specs, false, &policy)?;
         // Sum of one-lane waves: fresh prefixes again.
@@ -1450,7 +1694,14 @@ fn run_bench(args: &Args, ctx: &mut Ctx, rig: &mut Rig, reqs: &[Req]) -> R<()> {
         }
         let mut b = 0.0;
         for r in 0..k {
-            b += rig.wave(&[LaneSpec { state: r, tokens: &reqs[r].suffix }], false, &policy)?;
+            b += rig.wave(
+                &[LaneSpec {
+                    state: r,
+                    tokens: &reqs[r].suffix,
+                }],
+                false,
+                &policy,
+            )?;
         }
         // Sum of product singleton suffix calls (prefix outside the timing).
         let mut c = 0.0;
@@ -1531,17 +1782,26 @@ fn real_main() -> R<bool> {
         .unwrap();
     let max_seq = args.max_seq.unwrap_or((longest + 64).div_ceil(1024) * 1024);
     if longest + 2 > max_seq {
-        return Err(format!("--max-seq {max_seq} cannot hold depth + rows = {longest}"));
+        return Err(format!(
+            "--max-seq {max_seq} cannot hold depth + rows = {longest}"
+        ));
     }
 
-    let mut ctx = Ctx { log: Log::default(), runs: Vec::new(), all_pass: true };
+    let mut ctx = Ctx {
+        log: Log::default(),
+        runs: Vec::new(),
+        all_pass: true,
+    };
     let file_size = fs::metadata(&args.model).map_err(e)?.len();
     let (_source, w, tokenizer) = load(&args.model, max_seq)?;
     let arch = w.gpu.arch.to_string();
     let invariant_env = prefill_pm_invariant_enabled();
     let invariant_effective = invariant_env && arch == "gfx1151";
     ctx.log.say(format!("gpu arch: {arch}"));
-    ctx.log.say(format!("model: {} ({file_size} bytes)", args.model.display()));
+    ctx.log.say(format!(
+        "model: {} ({file_size} bytes)",
+        args.model.display()
+    ));
     ctx.log.say(format!(
         "env: HIPFIRE_PREFILL_PM_INVARIANT={} (effective={invariant_effective}) HIPFIRE_QWEN4_GDN_PREFILL={}",
         invariant_env,
@@ -1585,10 +1845,16 @@ fn real_main() -> R<bool> {
         ));
     }
     let mut w = w;
-    let final_logits = w.gpu.zeros(&[reqs.len().max(1) * vocab], DType::F32).map_err(e)?;
+    let final_logits = w
+        .gpu
+        .zeros(&[reqs.len().max(1) * vocab], DType::F32)
+        .map_err(e)?;
     let top1 = w
         .gpu
-        .zeros(&[reqs.len().max(all_rows).max(1) * std::mem::size_of::<i32>()], DType::Raw)
+        .zeros(
+            &[reqs.len().max(all_rows).max(1) * std::mem::size_of::<i32>()],
+            DType::Raw,
+        )
         .map_err(e)?;
     let all = if all_rows > 0 {
         Some(w.gpu.zeros(&[all_rows * vocab], DType::F32).map_err(e)?)
@@ -1599,11 +1865,19 @@ fn real_main() -> R<bool> {
     let mut rig = Rig {
         w,
         pool: Vec::new(),
-        sc: Scratch { final_logits, top1, all },
+        sc: Scratch {
+            final_logits,
+            top1,
+            all,
+        },
         tile,
         prefix_policy: LaneStagePolicy::all_per_lane(),
     };
-    let mut cache = RefCache { dir: args.out.join("ref"), keep_raw: args.keep_raw, sets: HashMap::new() };
+    let mut cache = RefCache {
+        dir: args.out.join("ref"),
+        keep_raw: args.keep_raw,
+        sets: HashMap::new(),
+    };
 
     let started = Instant::now();
     let result = match args.mode.as_str() {
@@ -1659,7 +1933,11 @@ fn real_main() -> R<bool> {
         "runs": ctx.runs,
         "log": ctx.log.lines,
     });
-    fs::write(args.out.join("summary.json"), serde_json::to_vec_pretty(&summary).map_err(e)?).map_err(e)?;
+    fs::write(
+        args.out.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).map_err(e)?,
+    )
+    .map_err(e)?;
     if !args.keep_raw {
         let _ = fs::remove_dir_all(args.out.join("ref"));
     }

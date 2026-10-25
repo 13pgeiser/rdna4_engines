@@ -5,7 +5,15 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Routed-expert `down_proj` codec override (`--moe-expert-down`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum MoeExpertDown {
+    /// Symmetric MQ4G128V2 (qt53): row-local per-128 groups, 68 B each.
+    #[value(name = "mq4g128v2-symmetric")]
+    Mq4g128v2Symmetric,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +54,16 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "MODE", default_value = "production",
           value_parser = ["production", "compact-fixture"])]
     pub qwen4_component_mode: String,
+    /// Select a dedicated recipe converter.  `stock-fp8` converts the stock
+    /// Qwen3.8-Flash-Next FP8 checkpoint (a directory holding `fp8.sha256`)
+    /// into an FP8-passthrough Qwen4 artifact plus `<output>.receipt.json`;
+    /// it selects its own route, so `--qwen4-flash-next` is not given.
+    /// `--qwen4-component-mode compact-fixture` is the only other flag read;
+    /// legacy recipe flags, `--format` and the other routes are refused.
+    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8"],
+          conflicts_with_all = ["qwen4_flash_next", "flux_pipe", "mq4v2_final_codes",
+                                "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay"])]
+    pub recipe: Option<String>,
     /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
     /// tiny local Qwen4 checkpoint from a local safetensors directory whose
     /// config.json carries a `hipfire_profile` developer marker.
@@ -55,7 +73,7 @@ pub(crate) struct QuantizeArgs {
     /// Exclusive with `--qwen4-flash-next` and `--qwen4-component-mode`.
     #[cfg(feature = "qwen4-dev-profiles")]
     #[arg(long, value_name = "ENCODING",
-          conflicts_with_all = ["qwen4_flash_next", "qwen4_component_mode", "flux_pipe"],
+          conflicts_with_all = ["qwen4_flash_next", "qwen4_component_mode", "flux_pipe", "recipe"],
           value_parser = ["source-exact", "packed"])]
     pub qwen4_dev_tiny: Option<String>,
 
@@ -237,6 +255,15 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq2v2_symmetric: bool,
 
+    /// Routed-expert down_proj codec override. `mq4g128v2-symmetric` encodes
+    /// every routed-expert down_proj (stacked `experts.down_proj` slices and
+    /// un-stacked `mlp.experts.N.down_proj`) as symmetric MQ4G128V2 (qt53,
+    /// 68 B per 128 weights) while gate_up and everything else keep the
+    /// recipe's codec. Requires uniform symmetric MQ4: `--format mq4
+    /// --uniform --mq4v2-symmetric`.
+    #[arg(long, value_enum, value_name = "VALUE")]
+    pub moe_expert_down: Option<MoeExpertDown>,
+
     /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
     /// codes. PATH is one frozen-record `.safetensors` file or a directory of
     /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors
@@ -340,6 +367,8 @@ pub(crate) enum Route {
     Flux,
     /// `--qwen4-flash-next` streaming artifact.
     Qwen4,
+    /// `--recipe stock-fp8` stock FP8 passthrough converter.
+    Qwen4StockFp8,
     /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
     #[cfg(feature = "qwen4-dev-profiles")]
     Qwen4DevTiny,
@@ -358,21 +387,64 @@ pub(crate) enum Route {
 use Route::*;
 
 #[cfg(not(feature = "qwen4-dev-profiles"))]
-const EVERY: &[Route] = &[Flux, Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+const EVERY: &[Route] = &[
+    Flux,
+    Qwen4,
+    Qwen4StockFp8,
+    FinalCodes,
+    EarlySpecial,
+    Gguf,
+    ReapOverlay,
+    Main,
+];
 #[cfg(feature = "qwen4-dev-profiles")]
-const EVERY: &[Route] = &[Flux, Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+const EVERY: &[Route] = &[
+    Flux,
+    Qwen4,
+    Qwen4StockFp8,
+    Qwen4DevTiny,
+    FinalCodes,
+    EarlySpecial,
+    Gguf,
+    ReapOverlay,
+    Main,
+];
 
 /// Clap argument id → the routes that read it. Every argument of
 /// [`QuantizeArgs`] must appear (enforced by a test).
 pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     #[cfg(not(feature = "qwen4-dev-profiles"))]
-    ("input", &[Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    (
+        "input",
+        &[
+            Qwen4,
+            Qwen4StockFp8,
+            FinalCodes,
+            EarlySpecial,
+            Gguf,
+            ReapOverlay,
+            Main,
+        ],
+    ),
     #[cfg(feature = "qwen4-dev-profiles")]
-    ("input", &[Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    (
+        "input",
+        &[
+            Qwen4,
+            Qwen4StockFp8,
+            Qwen4DevTiny,
+            FinalCodes,
+            EarlySpecial,
+            Gguf,
+            ReapOverlay,
+            Main,
+        ],
+    ),
     ("output", EVERY),
     ("threads", EVERY),
     ("qwen4_flash_next", &[Qwen4]),
-    ("qwen4_component_mode", &[Qwen4]),
+    ("qwen4_component_mode", &[Qwen4, Qwen4StockFp8]),
+    ("recipe", &[Qwen4StockFp8]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
     ("format", &[EarlySpecial, Gguf, Main]),
@@ -409,6 +481,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("awq_a4_source_sha", &[Main]),
     ("mq3v2_symmetric", &[Main]),
     ("mq2v2_symmetric", &[Main]),
+    ("moe_expert_down", &[Main]),
     ("mq4v2_final_codes", &[FinalCodes]),
     ("mq3v2_final_codes", &[FinalCodes]),
     ("mq2v2_final_codes", &[FinalCodes]),
@@ -430,6 +503,7 @@ fn route_label(route: Route) -> &'static str {
     match route {
         Flux => "--flux-pipe",
         Qwen4 => "--qwen4-flash-next",
+        Qwen4StockFp8 => "--recipe stock-fp8",
         #[cfg(feature = "qwen4-dev-profiles")]
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
@@ -483,7 +557,9 @@ mod route_tests {
         }
         for (id, _) in FLAG_ROUTES {
             assert!(
-                QuantizeArgs::command().get_arguments().any(|a| a.get_id() == *id),
+                QuantizeArgs::command()
+                    .get_arguments()
+                    .any(|a| a.get_id() == *id),
                 "FLAG_ROUTES names unknown argument {id}"
             );
         }
@@ -492,18 +568,211 @@ mod route_tests {
     #[test]
     fn each_route_rejects_a_flag_it_never_reads() {
         let cases: &[(Route, &[&str], &str)] = &[
-            (Flux, &["--flux-pipe", "p", "--output", "o", "--format", "mq4"], "--format"),
-            (Qwen4, &["--qwen4-flash-next", "--input", "i", "--output", "o", "--tier", "xt"], "--tier"),
-            (FinalCodes, &["--mq4v2-final-codes", "r", "--input", "i", "--output", "o", "--awq"], "--awq"),
-            (EarlySpecial, &["--format", "maple", "--input", "i", "--output", "o", "--mq4v2-symmetric"], "--mq4v2-symmetric"),
-            (Gguf, &["--input", "m.gguf", "--output", "o", "--imatrix", "x"], "--imatrix"),
-            (ReapOverlay, &["--reap-overlay", "p", "--input", "i", "--output", "o", "--format", "mq4"], "--format"),
-            (Main, &["--input", "i", "--output", "o", "--head-only"], "--head-only"),
+            (
+                Flux,
+                &["--flux-pipe", "p", "--output", "o", "--format", "mq4"],
+                "--format",
+            ),
+            (
+                Qwen4,
+                &[
+                    "--qwen4-flash-next",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    "--tier",
+                    "xt",
+                ],
+                "--tier",
+            ),
+            (
+                FinalCodes,
+                &[
+                    "--mq4v2-final-codes",
+                    "r",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    "--awq",
+                ],
+                "--awq",
+            ),
+            (
+                EarlySpecial,
+                &[
+                    "--format",
+                    "maple",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    "--mq4v2-symmetric",
+                ],
+                "--mq4v2-symmetric",
+            ),
+            (
+                Gguf,
+                &["--input", "m.gguf", "--output", "o", "--imatrix", "x"],
+                "--imatrix",
+            ),
+            (
+                ReapOverlay,
+                &[
+                    "--reap-overlay",
+                    "p",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    "--format",
+                    "mq4",
+                ],
+                "--format",
+            ),
+            (
+                Main,
+                &["--input", "i", "--output", "o", "--head-only"],
+                "--head-only",
+            ),
         ];
         for (route, argv, flag) in cases {
             let err = reject_unreachable(&matches(argv), *route).unwrap_err();
-            assert!(err.starts_with(&format!("{flag} has no effect")), "{route:?}: {err}");
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{route:?}: {err}"
+            );
         }
+    }
+
+    #[test]
+    fn moe_expert_down_parses_only_its_value_and_is_main_only() {
+        let parse = |value: &str| {
+            QuantizeArgs::command().try_get_matches_from([
+                "hipfire-quantize",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--moe-expert-down",
+                value,
+            ])
+        };
+        let parsed = parse("mq4g128v2-symmetric").unwrap();
+        assert_eq!(
+            parsed.get_one::<MoeExpertDown>("moe_expert_down"),
+            Some(&MoeExpertDown::Mq4g128v2Symmetric)
+        );
+        for bad in [
+            "mq4g128v2",
+            "mq4g128v2-asymmetric",
+            "mq4v2-symmetric",
+            "",
+            "MQ4G128V2-SYMMETRIC",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must not parse");
+        }
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from([
+                "hipfire-quantize",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--moe-expert-down"
+            ])
+            .is_err());
+        let argv = [
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--moe-expert-down",
+            "mq4g128v2-symmetric",
+        ];
+        reject_unreachable(&matches(&argv), Main).unwrap();
+        // Flux reads `--flux-pipe` instead of `--input` (and refuses `--input`
+        // first), so give each route its own minimal source argument.
+        for route in EVERY.iter().copied().filter(|route| *route != Main) {
+            let source: &[&str] = if route == Flux {
+                &["--flux-pipe", "p"]
+            } else {
+                &["--input", "i"]
+            };
+            let mut probe = source.to_vec();
+            probe.extend(["--output", "o", "--moe-expert-down", "mq4g128v2-symmetric"]);
+            let err = reject_unreachable(&matches(&probe), route).unwrap_err();
+            assert!(
+                err.starts_with("--moe-expert-down has no effect"),
+                "{route:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_fp8_recipe_selects_its_route_and_refuses_what_it_never_reads() {
+        let base = ["--recipe", "stock-fp8", "--input", "i", "--output", "o"];
+        reject_unreachable(&matches(&base), Qwen4StockFp8).unwrap();
+        let mut fixture = base.to_vec();
+        fixture.extend(["--qwen4-component-mode", "compact-fixture"]);
+        reject_unreachable(&matches(&fixture), Qwen4StockFp8).unwrap();
+        for (flag, value) in [
+            ("--format", Some("mq4")),
+            ("--imatrix", Some("x")),
+            ("--awq-alpha", Some("0.5")),
+            ("--tier", Some("xt")),
+            ("--hessian-dir", Some("d")),
+            ("--awq", None),
+            ("--mq4v2-symmetric", None),
+        ] {
+            let mut argv = base.to_vec();
+            argv.push(flag);
+            argv.extend(value);
+            let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
+        }
+        // No other route reads --recipe.
+        for route in [Qwen4, Main, Gguf, EarlySpecial] {
+            let err = reject_unreachable(&matches(&base), route).unwrap_err();
+            assert!(
+                err.starts_with("--recipe has no effect"),
+                "{route:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_fp8_recipe_is_exclusive_with_other_routes() {
+        for extra in [
+            &["--qwen4-flash-next"][..],
+            &["--flux-pipe", "p"][..],
+            &["--reap-overlay", "p"][..],
+            &["--mq4v2-final-codes", "r"][..],
+        ] {
+            let mut argv = vec!["--recipe", "stock-fp8", "--input", "i", "--output", "o"];
+            argv.extend_from_slice(extra);
+            assert!(
+                QuantizeArgs::command()
+                    .try_get_matches_from(std::iter::once("hipfire-quantize").chain(argv))
+                    .is_err(),
+                "{extra:?}"
+            );
+        }
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from([
+                "hipfire-quantize",
+                "--recipe",
+                "other",
+                "--input",
+                "i",
+                "--output",
+                "o"
+            ])
+            .is_err());
     }
 
     #[test]
@@ -511,7 +780,17 @@ mod route_tests {
         // `--format` has a default and `--kmap-mode` too: unset ⇒ not rejected.
         reject_unreachable(&matches(&["--flux-pipe", "p", "--output", "o"]), Flux).unwrap();
         reject_unreachable(
-            &matches(&["--input", "i", "--output", "o", "--format", "mq4", "--awq", "--imatrix", "x"]),
+            &matches(&[
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--format",
+                "mq4",
+                "--awq",
+                "--imatrix",
+                "x",
+            ]),
             Main,
         )
         .unwrap();
@@ -520,21 +799,51 @@ mod route_tests {
     #[test]
     fn qwen4_refuses_legacy_recipe_flags_it_never_reads() {
         for (flag, value) in [("--imatrix", "x"), ("--awq-alpha", "0.5")] {
-            let argv = ["--qwen4-flash-next", "--input", "i", "--output", "o", flag, value];
+            let argv = [
+                "--qwen4-flash-next",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                flag,
+                value,
+            ];
             let err = reject_unreachable(&matches(&argv), Qwen4).unwrap_err();
-            assert!(err.starts_with(&format!("{flag} has no effect")), "{flag}: {err}");
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
         }
         for flag in ["--mq4v2-symmetric", "--awq", "--hessian-dir"] {
             let argv: &[&str] = if flag == "--hessian-dir" {
-                &["--qwen4-flash-next", "--input", "i", "--output", "o", flag, "d"]
+                &[
+                    "--qwen4-flash-next",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    flag,
+                    "d",
+                ]
             } else {
                 &["--qwen4-flash-next", "--input", "i", "--output", "o", flag]
             };
             let err = reject_unreachable(&matches(argv), Qwen4).unwrap_err();
-            assert!(err.starts_with(&format!("{flag} has no effect")), "{flag}: {err}");
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
         }
         reject_unreachable(
-            &matches(&["--qwen4-flash-next", "--input", "i", "--output", "o", "--qwen4-component-mode", "compact-fixture"]),
+            &matches(&[
+                "--qwen4-flash-next",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--qwen4-component-mode",
+                "compact-fixture",
+            ]),
             Qwen4,
         )
         .unwrap();
@@ -544,21 +853,53 @@ mod route_tests {
     #[test]
     fn qwen4_dev_tiny_reads_only_its_encoding() {
         for encoding in ["source-exact", "packed"] {
-            let argv = ["--qwen4-dev-tiny", encoding, "--input", "i", "--output", "o"];
+            let argv = [
+                "--qwen4-dev-tiny",
+                encoding,
+                "--input",
+                "i",
+                "--output",
+                "o",
+            ];
             reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap();
-            let argv = ["--qwen4-dev-tiny", encoding, "--input", "i", "--output", "o", "--imatrix", "x"];
+            let argv = [
+                "--qwen4-dev-tiny",
+                encoding,
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--imatrix",
+                "x",
+            ];
             let err = reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap_err();
             assert!(err.starts_with("--imatrix has no effect"), "{err}");
         }
         // FN-only and recipe controls never ride along with the developer route.
-        let argv = ["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o", "--tier", "xt"];
+        let argv = [
+            "--qwen4-dev-tiny",
+            "packed",
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--tier",
+            "xt",
+        ];
         let err = reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap_err();
         assert!(err.starts_with("--tier has no effect"), "{err}");
         // The encoding is meaningless for the FN route.
         let argv = ["--qwen4-flash-next", "--input", "i", "--output", "o"];
         reject_unreachable(&matches(&argv), Qwen4).unwrap();
         let err = reject_unreachable(
-            &matches(&["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o"]),
+            &matches(&[
+                "--qwen4-dev-tiny",
+                "packed",
+                "--input",
+                "i",
+                "--output",
+                "o",
+            ]),
             Qwen4,
         )
         .unwrap_err();
@@ -572,7 +913,14 @@ mod route_tests {
             &["--qwen4-flash-next"][..],
             &["--qwen4-component-mode", "compact-fixture"][..],
         ] {
-            let mut argv = vec!["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o"];
+            let mut argv = vec![
+                "--qwen4-dev-tiny",
+                "packed",
+                "--input",
+                "i",
+                "--output",
+                "o",
+            ];
             argv.extend_from_slice(extra);
             assert!(
                 QuantizeArgs::command()

@@ -27,10 +27,12 @@ fn prng_f32(i: usize, salt: u32) -> f32 {
 }
 
 fn cache_dir(arch: &str) -> PathBuf {
-    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".hipfire_kernels")
-    });
+    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+            PathBuf::from(home).join(".hipfire_kernels")
+        });
     root.join(arch)
 }
 
@@ -73,10 +75,13 @@ fn main() {
 
     // gate_set N=512, same numbers as the oracle TIME row.
     let (m, k, n) = (gate_m, gate_k, 512usize);
-    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0x71E0).mul_add(1.0, 0.0)).collect();
+    let x: Vec<f32> = (0..n * k)
+        .map(|i| prng_f32(i, 0x71E0).mul_add(1.0, 0.0))
+        .collect();
     let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
-    let xq_ptr =
-        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
+    let xq_ptr = gpu
+        .ensure_int4_mmq_x(&d_x, n, k)
+        .expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
     let d_a = gpu.upload_raw(&gate, &[gate.len()]).expect("upload A");
     let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
     let y0 = vec![0.0f32; n * m];

@@ -28,18 +28,33 @@
 // `qwen35_fa_prep_fp8q_nogate_batched_gfx1201` leaves unconsumed, instead of
 // a compact `[N x K]` gate copy: the same f32 values, so identical bytes.
 //
-// Bit-exactness: the FWHT body is a verbatim copy of `mq_rotate_x` /
-// `rotate_x_mq_awq` (same grid, same multiply order, same butterfly, same
-// scale). The sidecar reuses `emit_iu4_sidecar_from_producer8` from the
-// shared recipe (prepended by the host JIT with
-// `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE=1`, same as the C2 producers):
-// f32 store→load is lossless, so the registers hold exactly what the
-// standalone quantizer would reload, the lane remap delivers the same
-// `xv[4]` per lane, and the shared `quantize_block_i4_128_wave` (amax →
-// 8-candidate strict-`<` MSE → rintf/clamp → exact int sum) yields
-// identical Xq bytes. Lane ownership matches because both this kernel and
-// the C2 producers hold 8 consecutive values per lane
+// Bit-exactness of the f32 path: the FWHT body is a verbatim copy of
+// `mq_rotate_x` / `rotate_x_mq_awq` (same grid, same multiply order, same
+// butterfly, same scale), and f32 store→load is lossless, so the registers
+// hold exactly what the standalone quantizer would reload. Lane ownership
+// matches the C2 producers because both hold 8 consecutive values per lane
 // (`d0 = tid * 8`, `base = group * 256 + d0`).
+//
+// The sidecar goes through `emit_iu4_sidecar_from_producer8` from the shared
+// recipe (prepended by the host JIT with
+// `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE=1`). Its Xq bytes depend on the
+// candidate policy: the compiled emit (legacy; `cand_mode` 0) uses the build's
+// `IU4_A4_CANDIDATES` (gfx12 C2 {5,7}), so it matches the C2 producers but is
+// NOT in general byte-identical to the standalone quantizer. Only the
+// `cand_mode == 8` exact path (`emit_iu4_sidecar_from_producer8<true>`: the
+// same lane remap, then `quantize_block_i4_128_wave<false>`, the 8-candidate
+// strict-`<` MSE → rintf/clamp → exact int sum) matches the standalone
+// quantizer's bytes.
+//
+// -DHIPFIRE_ROTATE_F16_OUT=1 (plain rotate only) adds an `x_f16` output: the
+// RNE F16 cast of the raw, UNROTATED input row (the bytes `convert_f32_to_f16`
+// leaves for the BF16 router / shared-expert F16 WMMA GEMMs), stored from the
+// registers the lane already loaded. One launch then emits both the F16 X and
+// the IU4 sidecar of a row read once (`mq_rotate_x_i4_f16out`).
+#if defined(HIPFIRE_ROTATE_F16_OUT) && \
+    (defined(HIPFIRE_ROTATE_AWQ) || defined(HIPFIRE_ROTATE_SIGMOID_GATE))
+#error "HIPFIRE_ROTATE_F16_OUT is the plain-rotate twin only"
+#endif
 
 #ifdef HIPFIRE_ROTATE_KERNEL
 /* caller (host JIT concat) already named the symbol */
@@ -59,11 +74,17 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     const float* __restrict__ awq_scale,   // [K], FP32
 #endif
     float* __restrict__ x_out,             // nullable when emit_f32=false
+#ifdef HIPFIRE_ROTATE_F16_OUT
+    _Float16* __restrict__ x_f16,          // [N, K] F16 = (_Float16) of the UNROTATED x_in
+#endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
     int K,
     int N
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    , int cand_mode                        // 0: compiled emit (legacy); 8: exact reference8
+#endif
 ) {
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
@@ -97,6 +118,17 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     float x5 = x_in_b[base + 5];
     float x6 = x_in_b[base + 6];
     float x7 = x_in_b[base + 7];
+#ifdef HIPFIRE_ROTATE_F16_OUT
+    // `convert_f32_to_f16` of the raw (unrotated) row, from the registers this lane
+    // already holds: one 16-byte store per lane, no extra DRAM read. The cast is
+    // the same RNE `(_Float16)` the standalone conversion applies per element.
+    {
+        typedef _Float16 hipfire_h8 __attribute__((ext_vector_type(8)));
+        hipfire_h8 h = {(_Float16)x0, (_Float16)x1, (_Float16)x2, (_Float16)x3,
+                        (_Float16)x4, (_Float16)x5, (_Float16)x6, (_Float16)x7};
+        *reinterpret_cast<hipfire_h8*>(x_f16 + batch_off + base) = h;
+    }
+#endif
 #ifdef HIPFIRE_ROTATE_SIGMOID_GATE
     // Exact `sigmoid_mul_f32` expression and operation order. The old global
     // store/reload is lossless for f32, so these registers are identical.
@@ -195,6 +227,21 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
         x_out_b[base + 7] = f7;
     }
 
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    // -DHIPFIRE_IU4_RUNTIME_CAND=1 (only the two gfx12 `mq_rotate_x_i4_gfx12`
+    // / `rotate_x_mq_awq_i4_gfx12` host concats) appends a trailing
+    // `int cand_mode` kernel argument (wave-uniform). 8 selects the
+    // standalone-quantizer reference through the shared
+    // `emit_iu4_sidecar_from_producer8<true>` (same f0..f7 remap, then
+    // `quantize_block_i4_128_wave<false>`); any other value runs the compiled
+    // emit below, unchanged. The FWHT/f32 body above is identical in both modes.
+    if (cand_mode == 8) {
+        emit_iu4_sidecar_from_producer8<true>(
+            f0, f1, f2, f3, f4, f5, f6, f7,
+            x_i4, group, batch, N, tid);
+        return;
+    }
+#endif
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.
     // token = batch; N is the batch extent for the [K/128, N] layout.

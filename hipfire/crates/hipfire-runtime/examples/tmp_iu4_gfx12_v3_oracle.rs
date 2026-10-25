@@ -60,7 +60,11 @@ struct Geometry {
     lds: u32,
 }
 
-const K1_GEOMETRY: Geometry = Geometry { rows: 128, block: 256, lds: 20480 };
+const K1_GEOMETRY: Geometry = Geometry {
+    rows: 128,
+    block: 256,
+    lds: 20480,
+};
 
 /// Candidate kernel set: either JIT `_v3` (default) or a path-loaded module.
 struct Candidate {
@@ -81,7 +85,10 @@ impl Candidate {
 }
 
 fn rand(i: usize, salt: u32) -> f32 {
-    let mut x = (i as u32).wrapping_mul(0x9e3779b1).wrapping_add(salt).wrapping_mul(0x85ebca6b);
+    let mut x = (i as u32)
+        .wrapping_mul(0x9e3779b1)
+        .wrapping_add(salt)
+        .wrapping_mul(0x85ebca6b);
     x ^= x >> 16;
     x = x.wrapping_mul(0xc2b2ae35);
     x ^= x >> 16;
@@ -94,13 +101,21 @@ fn weight(hfq: &HfqFile, layer: usize, suffixes: &[&str]) -> Matrix {
     let mut k = 0;
     for suffix in suffixes {
         let name = format!("{MODEL_PREFIX}{layer}.{suffix}.weight");
-        let (info, data) = hfq.tensor_data_vec(&name).unwrap_or_else(|| panic!("missing {name}"));
+        let (info, data) = hfq
+            .tensor_data_vec(&name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(info.quant_type, 44, "{name}: not qt44");
         assert_eq!(info.shape.len(), 2);
         let (rows, cols) = (info.shape[0] as usize, info.shape[1] as usize);
         assert_eq!(cols % 256, 0);
-        assert_eq!(data.len(), rows * (cols / 256) * 136, "{name}: weight layout");
-        if m != 0 { assert_eq!(k, cols, "{name}: incompatible K"); }
+        assert_eq!(
+            data.len(),
+            rows * (cols / 256) * 136,
+            "{name}: weight layout"
+        );
+        if m != 0 {
+            assert_eq!(k, cols, "{name}: incompatible K");
+        }
         m += rows;
         k = cols;
         bytes.extend_from_slice(&data);
@@ -145,7 +160,11 @@ fn launch(
     }
     let mut blob = b.into_vec();
     let rows = if u.is_some() { 2 * m } else { m };
-    let grid = [rows.div_ceil(geometry.rows) as u32, n.div_ceil(128) as u32, 1];
+    let grid = [
+        rows.div_ceil(geometry.rows) as u32,
+        n.div_ceil(128) as u32,
+        1,
+    ];
     let block = [geometry.block, 1, 1];
     let shared = geometry.lds;
     match func {
@@ -200,7 +219,9 @@ fn check(
         .collect();
     let d_x = gpu.upload_f32(&x, &[n, *k]).expect("upload X");
     let xq = gpu.ensure_int4_mmq_x(&d_x, n, *k).expect("quantize X") as *const c_void;
-    let d_a = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload weights");
+    let d_a = gpu
+        .upload_raw(bytes, &[bytes.len()])
+        .expect("upload weights");
     let d_u = u.map(|(_, _, b)| gpu.upload_raw(b, &[b.len()]).expect("upload up"));
     let ap = d_a.buf.as_ptr() as *const c_void;
     let up = d_u.as_ref().map(|t| t.buf.as_ptr() as *const c_void);
@@ -221,9 +242,48 @@ fn check(
     let cname = cand_symbol(fused, add, &cand.suffix);
     let cfunc = cand.func(&cname);
     let reference_symbol = cand_symbol(fused, add, "_v3");
-    launch(gpu, None, &reference_symbol, ap, up, xq, rp, *m, *k, n, add, K1_GEOMETRY);
-    launch(gpu, cfunc, &cname, ap, up, xq, np, *m, *k, n, add, cand.geometry);
-    launch(gpu, cfunc, &cname, ap, up, xq, pp, *m, *k, n, add, cand.geometry);
+    launch(
+        gpu,
+        None,
+        &reference_symbol,
+        ap,
+        up,
+        xq,
+        rp,
+        *m,
+        *k,
+        n,
+        add,
+        K1_GEOMETRY,
+    );
+    launch(
+        gpu,
+        cfunc,
+        &cname,
+        ap,
+        up,
+        xq,
+        np,
+        *m,
+        *k,
+        n,
+        add,
+        cand.geometry,
+    );
+    launch(
+        gpu,
+        cfunc,
+        &cname,
+        ap,
+        up,
+        xq,
+        pp,
+        *m,
+        *k,
+        n,
+        add,
+        cand.geometry,
+    );
     gpu.hip.device_synchronize().expect("sync G1");
     let reference = gpu.download_f32(&yref).expect("download K1");
     let candidate = gpu.download_f32(&ynew).expect("download builder");
@@ -270,7 +330,11 @@ fn timed(
     let d_u = u.map(|(_, _, b)| gpu.upload_raw(b, &[b.len()]).expect("upload U"));
     let ap = d_a.buf.as_ptr() as *const c_void;
     let up = d_u.as_ref().map(|t| t.buf.as_ptr() as *const c_void);
-    let y0 = if add { vec![0.11f32; n * m] } else { vec![0.0f32; n * m] };
+    let y0 = if add {
+        vec![0.11f32; n * m]
+    } else {
+        vec![0.0f32; n * m]
+    };
     let y = gpu.upload_f32(&y0, &[n, *m]).expect("upload Y");
     let yp = y.buf.as_ptr() as *const c_void;
     let fused = u.is_some();
@@ -287,7 +351,10 @@ fn timed(
     }
     gpu.hip.device_synchronize().expect("warmup sync");
     let arm = if candidate { cand.arm.as_str() } else { "k1" };
-    let csv = format!("{OUT}/{label}-{n}-{}-{arm}-{repetition}-telemetry.csv", cand.suffix);
+    let csv = format!(
+        "{OUT}/{label}-{n}-{}-{arm}-{repetition}-telemetry.csv",
+        cand.suffix
+    );
     let mut child = Command::new("python3")
         .args(["-u", "-c", TELEMETRY, &csv])
         .stdout(Stdio::piped())
@@ -368,16 +435,31 @@ fn load_candidate(gpu: &mut Gpu) -> Candidate {
 
     let rows = std::env::var("HIPFIRE_ISA_TILE_ROWS")
         .ok()
-        .map(|value| value.parse::<usize>().expect("HIPFIRE_ISA_TILE_ROWS integer"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("HIPFIRE_ISA_TILE_ROWS integer")
+        })
         .unwrap_or(if suffix.ends_with("t256") { 256 } else { 128 });
     let geometry = match rows {
         128 => K1_GEOMETRY,
-        256 => Geometry { rows: 256, block: 512, lds: 30720 },
+        256 => Geometry {
+            rows: 256,
+            block: 512,
+            lds: 30720,
+        },
         _ => panic!("HIPFIRE_ISA_TILE_ROWS must be 128 or 256"),
     };
-    eprintln!("CANDIDATE GEOMETRY rows={} block={} lds={}", geometry.rows, geometry.block, geometry.lds);
+    eprintln!(
+        "CANDIDATE GEOMETRY rows={} block={} lds={}",
+        geometry.rows, geometry.block, geometry.lds
+    );
     for fused in [false, true] {
-        for add in if fused { &[false][..] } else { &[false, true][..] } {
+        for add in if fused {
+            &[false][..]
+        } else {
+            &[false, true][..]
+        } {
             let sym = cand_symbol(fused, *add, "_v3");
             gpu.ensure_kernel_public(V3, V3_SRC, &sym)
                 .unwrap_or_else(|e| panic!("compile {sym}: {e}"));
@@ -389,12 +471,8 @@ fn load_candidate(gpu: &mut Gpu) -> Candidate {
         let path_str = path
             .to_str()
             .unwrap_or_else(|| panic!("HIPFIRE_ISA_MODULE path is not UTF-8: {}", path.display()));
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "HIPFIRE_ISA_MODULE read {}: {e}",
-                path.display()
-            )
-        });
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("HIPFIRE_ISA_MODULE read {}: {e}", path.display()));
         let digest = Sha256::digest(&bytes);
         let arm = format!("isa-{digest:x}");
         eprintln!(
@@ -487,8 +565,12 @@ fn main() {
                     .occupancy_max_active_blocks(f, cand.geometry.block, cand.geometry.lds as usize)
                     .expect("occupancy cand")
             } else {
-                gpu.occupancy_max_active_blocks(&cname, [cand.geometry.block, 1, 1], cand.geometry.lds)
-                    .expect("occupancy cand")
+                gpu.occupancy_max_active_blocks(
+                    &cname,
+                    [cand.geometry.block, 1, 1],
+                    cand.geometry.lds,
+                )
+                .expect("occupancy cand")
             };
             eprintln!("OCC {cname} active_blocks_per_CU={blocks}");
         }
@@ -513,7 +595,13 @@ fn main() {
                 let k1 = (a.0 + a2.0) / 2.0;
                 let builder = (b.0 + b2.0) / 2.0;
                 let gain = (builder / k1 - 1.0) * 100.0;
-                let threshold = if n == 512 { -3.0 } else if label == "set" { 3.0 } else { 4.0 };
+                let threshold = if n == 512 {
+                    -3.0
+                } else if label == "set" {
+                    3.0
+                } else {
+                    4.0
+                };
                 eprintln!(
                     "G2_COMPARE {label} N={n} K1_TOPS={k1:.3} builder_TOPS={builder:.3} gain_pct={gain:.2} K1_sclk_mhz={:.1} builder_sclk_mhz={:.1} K1_watts={:.1} builder_watts={:.1} threshold_pct={threshold:.1} {}",
                     (a.1 + a2.1) / 2.0, (b.1 + b2.1) / 2.0,

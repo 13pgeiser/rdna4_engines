@@ -19,11 +19,14 @@
 #![allow(clippy::all)]
 
 use hipfire_engine::terminal::*;
-use hipfire_generate::ar::{emit_active_route_done_value, emit_generation_start, GenerationRoute, GenerationRouteScope};
+use hipfire_generate::ar::{
+    emit_active_route_done_value, emit_generation_start, GenerationRoute, GenerationRouteScope,
+};
 use hipfire_generate::common::{
     arm_generation_fault_after_first_decode, arm_generation_fault_after_prefill,
-    emit_fail_closed_error, emit_spec_cancel_after_rollback, take_generation_fault_after_first_decode,
-    take_generation_fault_after_prefill, RollbackEpilogue,
+    emit_fail_closed_error, emit_spec_cancel_after_rollback,
+    take_generation_fault_after_first_decode, take_generation_fault_after_prefill,
+    RollbackEpilogue,
 };
 static TERMINAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -93,7 +96,11 @@ fn lfm_success_envelope_sequence_byte_stable() {
         );
     }
     let events = parse_lines(&output);
-    assert_eq!(events.len(), 3, "success emits exactly 3 envelopes: {events:?}");
+    assert_eq!(
+        events.len(),
+        3,
+        "success emits exactly 3 envelopes: {events:?}"
+    );
     assert_eq!(events[0]["type"], "gen_start");
     assert_eq!(events[0]["id"], id);
     assert_eq!(events[0]["attempt_id"], 901);
@@ -124,11 +131,25 @@ fn dense_fail_closed_error_attested_is_single_terminal() {
     {
         let _route = GenerationRouteScope::enter(GenerationRoute::LfmAr, id);
         emit_generation_start(GenerationRoute::LfmAr, &mut output, id, false);
-        let ep = RollbackEpilogue { rolled_back: true, context: None };
-        emit_fail_closed_error(&mut output, Some(id), "lfm2moe decode failed: test", "internal", false, &ep);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error(
+            &mut output,
+            Some(id),
+            "lfm2moe decode failed: test",
+            "internal",
+            false,
+            &ep,
+        );
     }
     let events = parse_lines(&output);
-    assert_eq!(events.len(), 2, "gen_start + one error, no done: {events:?}");
+    assert_eq!(
+        events.len(),
+        2,
+        "gen_start + one error, no done: {events:?}"
+    );
     assert_eq!(events[1]["type"], "error");
     assert_eq!(events[1]["id"], id);
     assert_eq!(events[1]["class"], "internal");
@@ -158,10 +179,21 @@ fn dense_fail_closed_error_unattested_is_visible_single_terminal() {
             rolled_back: false,
             context: Some("device_synchronize failed: test-reset".to_string()),
         };
-        emit_fail_closed_error(&mut output, Some(id), "minimax decode failed: test", "internal", false, &ep);
+        emit_fail_closed_error(
+            &mut output,
+            Some(id),
+            "minimax decode failed: test",
+            "internal",
+            false,
+            &ep,
+        );
     }
     let events = parse_lines(&output);
-    assert_eq!(events.len(), 2, "gen_start + one error, no done: {events:?}");
+    assert_eq!(
+        events.len(),
+        2,
+        "gen_start + one error, no done: {events:?}"
+    );
     assert_eq!(events[1]["type"], "error");
     assert_eq!(events[1]["rolled_back"], false);
     let message = events[1]["message"].as_str().expect("error message");
@@ -186,11 +218,17 @@ fn spec_cancel_attested_keeps_aborted_done_pair() {
     {
         let _route = GenerationRouteScope::enter(GenerationRoute::LfmAr, id);
         emit_generation_start(GenerationRoute::LfmAr, &mut output, id, false);
-        let ep = RollbackEpilogue { rolled_back: true, context: None };
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
         emit_spec_cancel_after_rollback(&mut output, id, 3, &ep);
     }
     let events = parse_lines(&output);
-    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap_or("?")).collect();
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("?"))
+        .collect();
     assert_eq!(
         types,
         vec!["gen_start", "aborted", "done"],
@@ -221,7 +259,11 @@ fn spec_cancel_unattested_is_single_error_no_done() {
         emit_spec_cancel_after_rollback(&mut output, id, 3, &ep);
     }
     let events = parse_lines(&output);
-    assert_eq!(events.len(), 2, "gen_start + one error, never done: {events:?}");
+    assert_eq!(
+        events.len(),
+        2,
+        "gen_start + one error, never done: {events:?}"
+    );
     assert_eq!(events[1]["type"], "error");
     assert_eq!(events[1]["rolled_back"], false);
     assert!(
@@ -291,7 +333,11 @@ fn llama_success_envelope_sequence_byte_stable() {
         );
     }
     let events = parse_lines(&output);
-    assert_eq!(events.len(), 3, "success emits exactly 3 envelopes: {events:?}");
+    assert_eq!(
+        events.len(),
+        3,
+        "success emits exactly 3 envelopes: {events:?}"
+    );
     assert_eq!(events[0]["type"], "gen_start");
     assert_eq!(events[0]["id"], id);
     assert_eq!(events[0]["attempt_id"], 911);

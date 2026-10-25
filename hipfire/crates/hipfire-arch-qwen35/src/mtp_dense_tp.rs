@@ -734,7 +734,8 @@ pub fn prefill_trunk_and_mtp_cache_dense_tp(
                 dev.hip
                     .memcpy_dtod_at(&prompt_hidden.buf, 0, &state.prev_hidden.buf, 0, dim_bytes)
             } else {
-                dev.hip.memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])
+                dev.hip
+                    .memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])
             };
             row0.map_err(|e| format!("dense TP MTP partner row: {e}"))?;
         }

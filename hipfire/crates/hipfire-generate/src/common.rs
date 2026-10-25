@@ -251,6 +251,11 @@ pub fn production_fail_closed_rollback(
     slot: Option<&mut dyn SpecTarget>,
     spec: Option<&mut dyn Speculator>,
 ) -> RollbackEpilogue {
+    if slot.is_none() && spec.is_none() {
+        if let Some(epilogue) = qwen4_pp_rollback(m) {
+            return epilogue;
+        }
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
@@ -297,6 +302,114 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+fn qwen4_pp_owns_reset(pp: usize, active_qwen4_mesh: bool) -> bool {
+    pp > 1 && active_qwen4_mesh
+}
+
+/// Only the admitted Qwen4 native drafter may participate in a mesh reset.
+/// A speculator's display name is not an ownership proof.
+fn qwen4_pp_reset_drafter(
+    drafter: Option<&mut dyn Any>,
+) -> Result<&mut hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter, String> {
+    drafter
+        .and_then(|drafter| drafter.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+        .ok_or_else(|| {
+            "qwen4 topology.pp reset found a speculator other than native Qwen4 MTP".into()
+        })
+}
+
+fn qwen4_pp_reset_owners(
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    spec: Option<&mut dyn Speculator>,
+    has_checkpoints: bool,
+) -> Result<(), String> {
+    if has_checkpoints {
+        return Err("qwen4 topology.pp reset found checkpoint state excluded by admission".into());
+    }
+    // Resolve the drafter before any GPU operation; foreign speculative state
+    // cannot be reset through the output owner's native-MTP entry.
+    let drafter = match spec {
+        Some(spec) => Some(qwen4_pp_reset_drafter(spec.drafter_any_mut())?),
+        None => None,
+    };
+    bundle.pp_reset(gpus).map_err(|error| error.to_string())?;
+    if let Some(drafter) = drafter {
+        drafter.pp_mtp_reset(gpus, bundle)?;
+    }
+    Ok(())
+}
+
+/// Live-slot PP rollback: target and native drafter use the same admitted
+/// hardware owner, never the daemon's otherwise unused control handle.
+pub fn production_fail_closed_rollback_live_pp(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> RollbackEpilogue {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    asst_turn_cache.clear();
+    let result = match slot
+        .as_any_mut()
+        .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    {
+        Some(bundle) if bundle.pp_mesh_active() => qwen4_pp_reset_owners(
+            bundle,
+            gpus,
+            Some(spec),
+            !prefill_checkpoints.is_empty() || !dflash_checkpoints.is_empty(),
+        ),
+        _ => Err("qwen4 topology.pp reset is missing its admitted target bundle".into()),
+    };
+    RollbackEpilogue {
+        rolled_back: result.is_ok(),
+        context: result.err(),
+    }
+}
+
+/// Qwen4's band adapter resets every model GPU through the `LoadedModel`
+/// hardware owner. Its all-band reset is already drained; neither a daemon
+/// root reset nor the legacy Qwen3.5 DN reset applies to that route.
+fn qwen4_pp_rollback(m: &mut LoadedModel) -> Option<RollbackEpilogue> {
+    if !qwen4_pp_owns_reset(
+        m.pp,
+        m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active()),
+    ) {
+        return None;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    m.asst_turn_cache.clear();
+    let has_checkpoints = !m.prefill_checkpoints.is_empty() || !m.dflash_checkpoints.is_empty();
+    let result = match (
+        m.state.as_deref_mut().and_then(|state| {
+            (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }),
+        m.pp_gpus.as_mut(),
+    ) {
+        (Some(bundle), Some(gpus)) => qwen4_pp_reset_owners(
+            bundle,
+            gpus,
+            m.speculator
+                .as_mut()
+                .map(|spec| &mut **spec as &mut dyn Speculator),
+            has_checkpoints,
+        ),
+        _ => Err("qwen4 topology.pp reset is missing its admitted Gpus owner".into()),
+    };
+    let context = result.err();
+    Some(RollbackEpilogue {
+        rolled_back: context.is_none(),
+        context,
+    })
+}
+
 /// Pipeline-parallel production fail-closed rollback (G4.7).
 ///
 /// Extends [`production_fail_closed_rollback`] — host cursors, asst-turn
@@ -320,6 +433,9 @@ pub fn production_pp_fail_closed_rollback(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> RollbackEpilogue {
+    if let Some(epilogue) = qwen4_pp_rollback(m) {
+        return epilogue;
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     let single = fail_closed_reset_target_and_spec(m, gpu, None, None);
@@ -383,6 +499,9 @@ pub fn reset_mesh_request_state(
     m: &mut LoadedModel,
     gpu: Option<&mut rdna_compute::Gpu>,
 ) -> RollbackEpilogue {
+    if let Some(epilogue) = qwen4_pp_rollback(m) {
+        return epilogue;
+    }
     if m.pp > 1 {
         return match gpu {
             Some(gpu) => production_pp_fail_closed_rollback(m, gpu),
@@ -800,7 +919,12 @@ impl Drop for FitMaxTokensGuard {
 /// prefix, trailer) minus [`FIT_MAX_TOKENS_MARGIN`]. With no room left the
 /// value is returned unchanged so the prompt itself is refused.
 pub fn fit_max_tokens(max_tokens: usize, used: usize, cap: usize) -> usize {
-    fit_max_tokens_if(FIT_MAX_TOKENS.with(std::cell::Cell::get), max_tokens, used, cap)
+    fit_max_tokens_if(
+        FIT_MAX_TOKENS.with(std::cell::Cell::get),
+        max_tokens,
+        used,
+        cap,
+    )
 }
 
 /// [`fit_max_tokens`] with the fit decision passed explicitly, for paths that
@@ -1537,6 +1661,9 @@ pub struct SpecEmitRequest {
     /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
     /// wrapper builds/caches the Arc so this struct carries no `LoadedModel` ref.
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    /// `Some(k)`: each emitted token event carries `logprob` and `k`
+    /// `top_logprobs` from the row `Speculator::token_logits` kept for it.
+    pub logprobs_top_k: Option<usize>,
 }
 
 /// Summary returned by `generate_spec` to its arch wrapper, which writes the
@@ -1547,6 +1674,11 @@ pub struct SpecRun {
     pub generated: usize,
     pub spec_cycles: usize,
     pub spec_accepted: usize,
+    /// Context position where the spec-retire policy switched this request to
+    /// AR (`hipfire_runtime::spec_retire`); `None` while it speculated throughout.
+    pub spec_retired_at: Option<usize>,
+    /// Tokens decoded as plain AR after retirement (not counted in `spec_cycles`).
+    pub ar_steps: usize,
     /// Full committed stream (from the emitter) for the wrapper's cache store.
     /// Empty for emitters that don't track it. Deepseek4 and qwen35 both expose
     /// streamed tokens for asst-turn cache replay on safe terminals.
@@ -2017,6 +2149,25 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen4_pp_reset_dispatch_accepts_only_the_native_drafter_type() {
+        use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
+        let mut native = Qwen4MtpDrafter::new(3, 128, None);
+        assert!(super::qwen4_pp_reset_drafter(Some(&mut native)).is_ok());
+        let mut foreign = String::from("mtp");
+        assert!(super::qwen4_pp_reset_drafter(Some(&mut foreign)).is_err());
+        assert!(super::qwen4_pp_reset_drafter(None).is_err());
+    }
+
+    #[test]
+    fn qwen4_pp_reset_dispatch_excludes_legacy_and_single() {
+        assert!(super::qwen4_pp_owns_reset(2, true));
+        assert!(super::qwen4_pp_owns_reset(8, true));
+        assert!(!super::qwen4_pp_owns_reset(1, true));
+        assert!(!super::qwen4_pp_owns_reset(2, false));
+        assert!(!super::qwen4_pp_owns_reset(1, false));
+    }
+
     use super::{
         fit_max_tokens, latch_request_think_cap, spec_ctx_request_fits, FitMaxTokensGuard,
         FIT_MAX_TOKENS_MARGIN,

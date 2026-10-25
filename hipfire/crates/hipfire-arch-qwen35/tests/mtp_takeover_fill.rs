@@ -218,21 +218,37 @@ impl HeadRows {
 fn argmax(v: &[f32]) -> u32 {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv {
+                (i, x)
+            } else {
+                (bi, bv)
+            }
+        })
         .0 as u32
 }
 
-fn prefill(gpu: &mut Gpu, slot: &mut ModelSlot, head: &mtp_head::Qwen35MtpHead, state: &mut MtpSpecState, prompt: &[u32]) -> u32 {
+fn prefill(
+    gpu: &mut Gpu,
+    slot: &mut ModelSlot,
+    head: &mtp_head::Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt: &[u32],
+) -> u32 {
     slot.reset_recurrent(gpu).expect("reset trunk");
     state.reset(gpu).expect("reset head");
-    prefill_trunk_and_mtp_cache(gpu, slot, head, state, prompt, 0, MtpPromptRoute::ArRoute).expect("prefill");
+    prefill_trunk_and_mtp_cache(gpu, slot, head, state, prompt, 0, MtpPromptRoute::ArRoute)
+        .expect("prefill");
     argmax(&gpu.download_f32(&slot.scratch.logits).expect("logits"))
 }
 
 #[test]
 #[ignore = "requires real HIP GPU + HIPFIRE_MTP_BYTE_IDENTITY_MODEL (qwen3.5/3.8 trunk) + MTP sidecar"]
 fn takeover_fills_head_kv_like_one_token_decode() {
-    let Some(model) = std::env::var("HIPFIRE_MTP_BYTE_IDENTITY_MODEL").ok().map(PathBuf::from) else {
+    let Some(model) = std::env::var("HIPFIRE_MTP_BYTE_IDENTITY_MODEL")
+        .ok()
+        .map(PathBuf::from)
+    else {
         eprintln!("skipping: HIPFIRE_MTP_BYTE_IDENTITY_MODEL not set");
         return;
     };
@@ -294,14 +310,22 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             &slot.weights,
         )
         .expect("decode head row");
-        let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, pos, seed, eos, 0)
-            .expect("k=0 window");
+        let r = spec_step_mtp_compressed_serial_with_k(
+            &mut gpu, &mut slot, &head, &mut state, pos, seed, eos, 0,
+        )
+        .expect("k=0 window");
         assert_eq!(r.advance, 1);
-        assert_ne!(r.committed[0], eos, "reference continuation hit EOS; use a longer prompt");
+        assert_ne!(
+            r.committed[0], eos,
+            "reference continuation hit EOS; use a longer prompt"
+        );
         toks.push(r.committed[0]);
     }
     let reference = HeadRows::read(&gpu, &state, n, REF_STEPS);
-    eprintln!("[fill] reference continuation: {:?}", tokenizer.decode(&toks));
+    eprintln!(
+        "[fill] reference continuation: {:?}",
+        tokenizer.decode(&toks)
+    );
 
     // ── Takeover arm ─────────────────────────────────────────────────────
     let seed = prefill(&mut gpu, &mut slot, &head, &mut state, &prompt);
@@ -312,7 +336,11 @@ fn takeover_fills_head_kv_like_one_token_decode() {
     // (label, candidates relative to the window seed index, expected accept)
     let mut idx = 0usize; // index into `toks` of the current seed
     let mut filled = 0usize;
-    let windows: [(&str, usize, bool); 3] = [("partial", 20, true), ("full", 30, false), ("zero", 0, true)];
+    let windows: [(&str, usize, bool); 3] = [
+        ("partial", 20, true),
+        ("full", 30, false),
+        ("zero", 0, true),
+    ];
     for (label, accept, append_wrong) in windows {
         let pos = n + idx;
         let mut cands: Vec<u32> = toks[idx + 1..=idx + accept].to_vec();
@@ -329,8 +357,15 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             r.accept_count,
             r.advance
         );
-        assert_eq!(r.accept_count, accept, "{label}: takeover must accept the reference prefix");
-        assert_eq!(&r.committed[..], &toks[idx + 1..=idx + r.advance], "{label}: committed tokens");
+        assert_eq!(
+            r.accept_count, accept,
+            "{label}: takeover must accept the reference prefix"
+        );
+        assert_eq!(
+            &r.committed[..],
+            &toks[idx + 1..=idx + r.advance],
+            "{label}: committed tokens"
+        );
         let adv = r.advance;
 
         // 4. Nothing past the kept rows was written by this window.
@@ -338,17 +373,30 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             let after = HeadRows::read(&gpu, &state, pos + adv, cands.len() + 1 - adv);
             let before_rows = cands.len() + 1 - adv;
             for j in 0..before_rows {
-                assert_eq!(after.row(j), untouched.row(adv + j), "{label}: rejected row {j} written");
+                assert_eq!(
+                    after.row(j),
+                    untouched.row(adv + j),
+                    "{label}: rejected row {j} written"
+                );
             }
         }
 
         // 2. Pairing: staged hidden row i is what decode pairs with token i.
-        let staged = gpu.download_f32(&state.takeover_fill_hidden).expect("staged");
-        let verify = gpu.download_f32(&state.verify_hidden).expect("verify hidden");
+        let staged = gpu
+            .download_f32(&state.takeover_fill_hidden)
+            .expect("staged");
+        let verify = gpu
+            .download_f32(&state.verify_hidden)
+            .expect("verify hidden");
         for i in 0..adv {
             let row = &staged[i * dim..(i + 1) * dim];
             if i > 0 {
-                assert_eq!(row, &verify[(i - 1) * dim..i * dim], "{label}: fill row {i} != verify row {}", i - 1);
+                assert_eq!(
+                    row,
+                    &verify[(i - 1) * dim..i * dim],
+                    "{label}: fill row {i} != verify row {}",
+                    i - 1
+                );
             }
             let hidden_rel = rel_l2(row, &ref_hidden[idx + i]);
             let shifted_rel = if idx + i + 1 < ref_hidden.len() {
@@ -359,7 +407,10 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             if i < 3 || i + 1 == adv {
                 eprintln!("[fill] {label} row {i}: hidden rel-L2 vs decode h_(p-1)={hidden_rel:.3e}  vs h_p={shifted_rel:.3e}");
             }
-            assert!(hidden_rel < 0.05, "{label} row {i}: hidden is not decode's h_(p-1) (rel {hidden_rel})");
+            assert!(
+                hidden_rel < 0.05,
+                "{label} row {i}: hidden is not decode's h_(p-1) (rel {hidden_rel})"
+            );
         }
 
         // 1. Head route: recompute each row with the decode-route forward.
@@ -387,7 +438,8 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             if filled_rows.row(i) == decode_route.row(i) {
                 route_identical += 1;
             }
-            max_route_rel = max_route_rel.max(rel_l2(&filled_rows.row_f32(i), &decode_route.row_f32(i)));
+            max_route_rel =
+                max_route_rel.max(rel_l2(&filled_rows.row_f32(i), &decode_route.row_f32(i)));
         }
         eprintln!(
             "[fill] {label}: head route byte-identical rows {route_identical}/{adv}, max rel-L2 {max_route_rel:.3e}"
@@ -405,8 +457,14 @@ fn takeover_fills_head_kv_like_one_token_decode() {
             }
         }
         eprintln!("[fill] {label}: rows vs one-token decode max rel-L2 {max_e2e:.3e}; nearest off-by-one row {min_offby1:.3e}");
-        assert_eq!(route_identical, adv, "{label}: batched head route is not byte-identical to decode route ({max_route_rel})");
-        assert!(max_e2e < 0.1 * min_offby1, "{label}: filled rows not decode-paired ({max_e2e} vs off-by-one {min_offby1})");
+        assert_eq!(
+            route_identical, adv,
+            "{label}: batched head route is not byte-identical to decode route ({max_route_rel})"
+        );
+        assert!(
+            max_e2e < 0.1 * min_offby1,
+            "{label}: filled rows not decode-paired ({max_e2e} vs off-by-one {min_offby1})"
+        );
 
         idx += adv;
         filled += adv;
@@ -415,14 +473,23 @@ fn takeover_fills_head_kv_like_one_token_decode() {
 
     // Native MTP drafts again after the takeovers.
     let pos = n + idx;
-    let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, pos, toks[idx], eos, MAX_N)
-        .expect("native window after takeovers");
+    let r = spec_step_mtp_compressed_serial_with_k(
+        &mut gpu, &mut slot, &head, &mut state, pos, toks[idx], eos, MAX_N,
+    )
+    .expect("native window after takeovers");
     eprintln!(
         "[fill] native window after takeovers: drafts={} accept={} committed={:?}",
         r.drafts_generated, r.accept_count, r.committed
     );
-    assert_eq!(r.drafts_generated, MAX_N, "native MTP must draft after a takeover");
-    assert_eq!(r.committed[0], toks[idx + 1], "greedy output diverged after takeovers");
+    assert_eq!(
+        r.drafts_generated, MAX_N,
+        "native MTP must draft after a takeover"
+    );
+    assert_eq!(
+        r.committed[0],
+        toks[idx + 1],
+        "greedy output diverged after takeovers"
+    );
 
     state.free_gpu(&mut gpu);
     head.free_gpu(&mut gpu);
@@ -503,8 +570,16 @@ fn fill_ms(
     tokens: &[u32],
     start_pos: usize,
 ) -> f64 {
-    let t = prefill_trunk_and_mtp_cache(gpu, slot, head, state, tokens, start_pos, MtpPromptRoute::ArRoute)
-        .expect("prefill_trunk_and_mtp_cache");
+    let t = prefill_trunk_and_mtp_cache(
+        gpu,
+        slot,
+        head,
+        state,
+        tokens,
+        start_pos,
+        MtpPromptRoute::ArRoute,
+    )
+    .expect("prefill_trunk_and_mtp_cache");
     t.mtp_prompt_fill_secs * 1e3
 }
 
@@ -532,7 +607,9 @@ fn state_record(
     );
     // Oracle observation boundary (not production timing): wait for every
     // queued fill/copy before reading cache, prev_hidden and logits.
-    gpu.hip.device_synchronize().expect("device_synchronize before state read");
+    gpu.hip
+        .device_synchronize()
+        .expect("device_synchronize before state read");
     let rows = HeadRows::read(gpu, state, start, end - start);
     let blocks = |bytes: &[u8]| -> Vec<String> {
         bytes
@@ -568,13 +645,21 @@ fn state_record(
 fn reset_proof(gpu: &mut Gpu, state: &mut MtpSpecState) -> serde_json::Value {
     const POISON: u8 = 0xA5;
     let layers = state.mtp_kv.inner.k_gpu.len();
-    assert_eq!(layers, state.mtp_kv.inner.v_gpu.len(), "K/V layer count mismatch");
+    assert_eq!(
+        layers,
+        state.mtp_kv.inner.v_gpu.len(),
+        "K/V layer count mismatch"
+    );
     // Logical span: exactly what `KvCache` reset zeros (`numel() * 4`). The
     // device allocation may be larger (pool over-allocation / padding) and
     // that tail is intentionally neither poisoned, read nor hashed.
     let span = |t: &GpuTensor| -> usize {
         let n = t.numel() * 4;
-        assert!(n <= t.buf.size(), "logical span {n} exceeds allocation {}", t.buf.size());
+        assert!(
+            n <= t.buf.size(),
+            "logical span {n} exceeds allocation {}",
+            t.buf.size()
+        );
         n
     };
     let read_all = |gpu: &Gpu, bufs: &[GpuTensor]| -> Vec<u8> {
@@ -584,11 +669,24 @@ fn reset_proof(gpu: &mut Gpu, state: &mut MtpSpecState) -> serde_json::Value {
         }
         all
     };
-    for t in state.mtp_kv.inner.k_gpu.iter().chain(state.mtp_kv.inner.v_gpu.iter()) {
-        gpu.hip.memcpy_htod(&t.buf, &vec![POISON; span(t)]).expect("poison head kv");
+    for t in state
+        .mtp_kv
+        .inner
+        .k_gpu
+        .iter()
+        .chain(state.mtp_kv.inner.v_gpu.iter())
+    {
+        gpu.hip
+            .memcpy_htod(&t.buf, &vec![POISON; span(t)])
+            .expect("poison head kv");
     }
-    gpu.hip.device_synchronize().expect("device_synchronize after poison");
-    let (pk, pv) = (read_all(gpu, &state.mtp_kv.inner.k_gpu), read_all(gpu, &state.mtp_kv.inner.v_gpu));
+    gpu.hip
+        .device_synchronize()
+        .expect("device_synchronize after poison");
+    let (pk, pv) = (
+        read_all(gpu, &state.mtp_kv.inner.k_gpu),
+        read_all(gpu, &state.mtp_kv.inner.v_gpu),
+    );
     assert!(
         !pk.is_empty() && pk.iter().chain(pv.iter()).all(|&b| b == POISON),
         "poison did not land in the whole head KV; the reset proof would be vacuous"
@@ -597,8 +695,13 @@ fn reset_proof(gpu: &mut Gpu, state: &mut MtpSpecState) -> serde_json::Value {
     state.reset(gpu).expect("reset head");
     // The fast reset is stream-async; observe only after every queued memset
     // completed, so a stream-vs-DTOH ordering gap cannot read pre-reset bytes.
-    gpu.hip.device_synchronize().expect("device_synchronize after reset");
-    let (k, v) = (read_all(gpu, &state.mtp_kv.inner.k_gpu), read_all(gpu, &state.mtp_kv.inner.v_gpu));
+    gpu.hip
+        .device_synchronize()
+        .expect("device_synchronize after reset");
+    let (k, v) = (
+        read_all(gpu, &state.mtp_kv.inner.k_gpu),
+        read_all(gpu, &state.mtp_kv.inner.v_gpu),
+    );
     let nonzero_k = k.iter().position(|&b| b != 0);
     let nonzero_v = v.iter().position(|&b| b != 0);
     assert!(
@@ -607,7 +710,11 @@ fn reset_proof(gpu: &mut Gpu, state: &mut MtpSpecState) -> serde_json::Value {
         k.len(),
         v.len()
     );
-    eprintln!("[oracle] reset proof: {} K + {} V bytes poisoned then zeroed", k.len(), v.len());
+    eprintln!(
+        "[oracle] reset proof: {} K + {} V bytes poisoned then zeroed",
+        k.len(),
+        v.len()
+    );
     serde_json::json!({
         "layers": layers,
         "k_bytes": k.len(),
@@ -676,22 +783,36 @@ fn device_witness(gpu: &Gpu) -> serde_json::Value {
     let root = DeviceRoot::system();
     let source = root.identity_source();
     let count = gpu.hip.device_count().expect("hip device_count");
-    assert_eq!(count, 1, "oracle expects exactly one HIP-visible device, saw {count}");
+    assert_eq!(
+        count, 1,
+        "oracle expects exactly one HIP-visible device, saw {count}"
+    );
     let observed: Vec<ObservedDevice> = (0..count)
         .map(|id| ObservedDevice {
             logical: id as usize,
             arch: gpu.hip.get_arch(id).expect("hip get_arch"),
-            pci_bus_id: gpu.hip.device_pci_bus_id(id).expect("hip device_pci_bus_id"),
-            uuid: (source == IdentitySource::Hip).then(|| gpu.hip.device_uuid(id).expect("hip device_uuid")),
+            pci_bus_id: gpu
+                .hip
+                .device_pci_bus_id(id)
+                .expect("hip device_pci_bus_id"),
+            uuid: (source == IdentitySource::Hip)
+                .then(|| gpu.hip.device_uuid(id).expect("hip device_uuid")),
         })
         .collect();
     let seen = &observed[0];
     let (device, verified) = if let Some(active) = devices::active_devices() {
-        active.verify_visible(&observed).unwrap_or_else(|e| panic!("[devices] verification failed: {e}"));
+        active
+            .verify_visible(&observed)
+            .unwrap_or_else(|e| panic!("[devices] verification failed: {e}"));
         let device = active.devices[0].clone();
         eprintln!(
             "[devices] verified logical {}: HIP {} {} = index {} {} rocr={}",
-            seen.logical, seen.arch, seen.pci_bus_id, device.index, device.lock_identity(), device.rocr_selector()
+            seen.logical,
+            seen.arch,
+            seen.pci_bus_id,
+            device.index,
+            device.lock_identity(),
+            device.rocr_selector()
         );
         (device, true)
     } else {
@@ -708,7 +829,11 @@ fn device_witness(gpu: &Gpu) -> serde_json::Value {
         };
         eprintln!(
             "[devices] logical {}: HIP {} {} = index {} {}{note}",
-            seen.logical, seen.arch, seen.pci_bus_id, device.index, device.lock_identity()
+            seen.logical,
+            seen.arch,
+            seen.pci_bus_id,
+            device.index,
+            device.lock_identity()
         );
         (device, false)
     };
@@ -748,11 +873,23 @@ fn generation_record(
 ) -> serde_json::Value {
     spec.configure_request(req);
     let first = match prefix {
-        None => ready(spec.prefill(gpu, slot, prompt, prompt, 0, false, None, &|| false).expect("prefill")),
+        None => ready(
+            spec.prefill(gpu, slot, prompt, prompt, 0, false, None, &|| false)
+                .expect("prefill"),
+        ),
         Some(p) => {
             ready(
-                spec.prefill(gpu, slot, &prompt[..p], &prompt[..p], 0, false, None, &|| false)
-                    .expect("prefix prefill"),
+                spec.prefill(
+                    gpu,
+                    slot,
+                    &prompt[..p],
+                    &prompt[..p],
+                    0,
+                    false,
+                    None,
+                    &|| false,
+                )
+                .expect("prefix prefill"),
             );
             ready(
                 spec.prefill(gpu, slot, prompt, &prompt[p..], p, true, None, &|| false)
@@ -766,10 +903,18 @@ fn generation_record(
     while generated.len() < GEN_TOKENS {
         let remaining = GEN_TOKENS - generated.len();
         let step = spec
-            .step(gpu, slot, position, seed, &generated, None, req.temp, remaining)
+            .step(
+                gpu, slot, position, seed, &generated, None, req.temp, remaining,
+            )
             .expect("spec step");
-        assert!(!step.emit.is_empty(), "{case}/{mode}: empty step at {position}");
-        assert!(step.emit.len() <= remaining, "{case}/{mode}: step overshoots max_emit");
+        assert!(
+            !step.emit.is_empty(),
+            "{case}/{mode}: empty step at {position}"
+        );
+        assert!(
+            step.emit.len() <= remaining,
+            "{case}/{mode}: step overshoots max_emit"
+        );
         steps += 1;
         proposed += step.proposed;
         accepted += step.accepted;
@@ -827,7 +972,8 @@ fn mtp_fill_oracle_arm() {
         return;
     };
     let out_path = PathBuf::from(
-        std::env::var(OUT_ENV).unwrap_or_else(|_| panic!("{OUT_ENV} must name the artifact JSON to write")),
+        std::env::var(OUT_ENV)
+            .unwrap_or_else(|_| panic!("{OUT_ENV} must name the artifact JSON to write")),
     );
     let head_path = std::env::var(HEAD_ENV)
         .map(PathBuf::from)
@@ -840,11 +986,17 @@ fn mtp_fill_oracle_arm() {
     cfg.max_seq = ORACLE_CTX;
     let mut slot = ModelSlot::load(&mut gpu, &model, "mtp-fill-oracle", cfg).expect("load trunk");
     let head = mtp_head::load_mtp_head(&head_path, &mut gpu, ORACLE_CTX).expect("load head");
-    assert_eq!(head.config.vocab_size, slot.config.vocab_size, "trunk/head vocab mismatch");
+    assert_eq!(
+        head.config.vocab_size, slot.config.vocab_size,
+        "trunk/head vocab mismatch"
+    );
     let tokenizer = slot.load_tokenizer().expect("tokenizer");
     let real_eos = slot.config.eos_token;
     let tokens = fixture(&tokenizer, slot.config.vocab_size, real_eos);
-    eprintln!("[oracle] arm {FILL_ENV}={fill_env} gpu={} ctx={ORACLE_CTX}", gpu.arch);
+    eprintln!(
+        "[oracle] arm {FILL_ENV}={fill_env} gpu={} ctx={ORACLE_CTX}",
+        gpu.arch
+    );
 
     // ── State oracle (fill digests), head borrowed ───────────────────────
     let (state, reset) = state_phase(&mut gpu, &mut slot, &head, &tokens);
@@ -861,21 +1013,47 @@ fn mtp_fill_oracle_arm() {
         rng_seed: SAMPLED_SEED,
         ..SpecRequestConfig::default()
     };
-    assert!(spec.supports_temp_verify(), "speculator must advertise sampled verification");
+    assert!(
+        spec.supports_temp_verify(),
+        "speculator must advertise sampled verification"
+    );
     let chat = chat_prompt(&tokenizer);
     let mut generation = Vec::new();
     for (mode, req) in [("greedy", greedy), ("sampled", sampled)] {
-        generation.push(generation_record(&mut gpu, &mut slot, spec.as_mut(), "chat", mode, req, &chat, None));
+        generation.push(generation_record(
+            &mut gpu,
+            &mut slot,
+            spec.as_mut(),
+            "chat",
+            mode,
+            req,
+            &chat,
+            None,
+        ));
         for len in COLD_LENS {
             let case = format!("cold-{len}");
             generation.push(generation_record(
-                &mut gpu, &mut slot, spec.as_mut(), &case, mode, req, &tokens[..len], None,
+                &mut gpu,
+                &mut slot,
+                spec.as_mut(),
+                &case,
+                mode,
+                req,
+                &tokens[..len],
+                None,
             ));
         }
         for (p, len) in SUFFIX_CASES {
             let case = format!("suffix-{p}-{len}");
             generation.push(generation_record(
-                &mut gpu, &mut slot, spec.as_mut(), &case, mode, req, &tokens[..len], Some(p),
+                &mut gpu,
+                &mut slot,
+                spec.as_mut(),
+                &case,
+                mode,
+                req,
+                &tokens[..len],
+                Some(p),
             ));
         }
     }
@@ -895,7 +1073,11 @@ fn mtp_fill_oracle_arm() {
         "state": state,
         "generation": generation,
     });
-    std::fs::write(&out_path, serde_json::to_vec_pretty(&artifact).expect("serialize")).expect("write artifact");
+    std::fs::write(
+        &out_path,
+        serde_json::to_vec_pretty(&artifact).expect("serialize"),
+    )
+    .expect("write artifact");
     eprintln!("[oracle] wrote {}", out_path.display());
 
     gpu.invalidate_weight_caches();
@@ -917,28 +1099,51 @@ fn short(v: &serde_json::Value) -> String {
 
 /// First index where two token arrays differ, with a window of context.
 fn token_diff_context(a: &serde_json::Value, b: &serde_json::Value) -> String {
-    let (a, b) = (a.as_array().cloned().unwrap_or_default(), b.as_array().cloned().unwrap_or_default());
+    let (a, b) = (
+        a.as_array().cloned().unwrap_or_default(),
+        b.as_array().cloned().unwrap_or_default(),
+    );
     match (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
         None => "no token difference".into(),
         Some(i) => {
             let lo = i.saturating_sub(4);
             let win = |v: &Vec<serde_json::Value>| {
-                v[lo.min(v.len())..(i + 5).min(v.len())].iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+                v[lo.min(v.len())..(i + 5).min(v.len())]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
-            format!("first token diff at index {i}: a[{lo}..]=[{}] b[{lo}..]=[{}]", win(&a), win(&b))
+            format!(
+                "first token diff at index {i}: a[{lo}..]=[{}] b[{lo}..]=[{}]",
+                win(&a),
+                win(&b)
+            )
         }
     }
 }
 
 /// First differing digest block (rows `start + i * BLOCK_ROWS ..`).
-fn block_diff_context(a: &serde_json::Value, b: &serde_json::Value, key: &str, start: u64) -> String {
-    let (ab, bb) = (a[key].as_array().cloned().unwrap_or_default(), b[key].as_array().cloned().unwrap_or_default());
+fn block_diff_context(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    key: &str,
+    start: u64,
+) -> String {
+    let (ab, bb) = (
+        a[key].as_array().cloned().unwrap_or_default(),
+        b[key].as_array().cloned().unwrap_or_default(),
+    );
     match (0..ab.len().max(bb.len())).find(|&i| ab.get(i) != bb.get(i)) {
         None => format!("{key}: no block difference"),
         Some(i) => {
             let first = start + (i * BLOCK_ROWS) as u64;
-            format!("{key}: first differing block {i} = rows {first}..{} (a={} b={})", first + BLOCK_ROWS as u64,
-                ab.get(i).map(short).unwrap_or_default(), bb.get(i).map(short).unwrap_or_default())
+            format!(
+                "{key}: first differing block {i} = rows {first}..{} (a={} b={})",
+                first + BLOCK_ROWS as u64,
+                ab.get(i).map(short).unwrap_or_default(),
+                bb.get(i).map(short).unwrap_or_default()
+            )
         }
     }
 }
@@ -969,19 +1174,43 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
     if pm_diff && (a["fill_fast_env"] != "1" || b["fill_fast_env"] != "1") {
         failures.push("PM GEMM oracle requires fast fill enabled in both arms".into());
     }
-    println!("MTP_FILL_PM_GEMM a={} b={}", a["fill_pm_gemm"], b["fill_pm_gemm"]);
+    println!(
+        "MTP_FILL_PM_GEMM a={} b={}",
+        a["fill_pm_gemm"], b["fill_pm_gemm"]
+    );
     let (da, db) = (&a["device"], &b["device"]);
     {
-        const DEVICE_FIELDS: [&str; 9] =
-            ["logical", "arch", "pci_bus_id", "uuid", "index", "lock_identity", "rocr", "identity_source", "verified"];
-        let bad: Vec<&str> = DEVICE_FIELDS.iter().copied().filter(|f| da[*f] != db[*f] || da[*f].is_null() && *f != "uuid").collect();
+        const DEVICE_FIELDS: [&str; 9] = [
+            "logical",
+            "arch",
+            "pci_bus_id",
+            "uuid",
+            "index",
+            "lock_identity",
+            "rocr",
+            "identity_source",
+            "verified",
+        ];
+        let bad: Vec<&str> = DEVICE_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| da[*f] != db[*f] || da[*f].is_null() && *f != "uuid")
+            .collect();
         println!(
             "MTP_FILL_DEVICE identical={} count_a={} count_b={} arch={} pci={} index={} lock_identity={} rocr={} uuid={} verified={} source={}",
             bad.is_empty(), da["count"], db["count"], da["arch"], da["pci_bus_id"], da["index"],
             da["lock_identity"], da["rocr"], da["uuid"], da["verified"], da["identity_source"],
         );
-        if !bad.is_empty() || da["count"] != 1 || db["count"] != 1 || da["verified"] != true || db["verified"] != true {
-            let mut ctx = format!("device witness: differing/missing {bad:?}, count a={} b={}, verified a={} b={}", da["count"], db["count"], da["verified"], db["verified"]);
+        if !bad.is_empty()
+            || da["count"] != 1
+            || db["count"] != 1
+            || da["verified"] != true
+            || db["verified"] != true
+        {
+            let mut ctx = format!(
+                "device witness: differing/missing {bad:?}, count a={} b={}, verified a={} b={}",
+                da["count"], db["count"], da["verified"], db["verified"]
+            );
             for f in &bad {
                 ctx += &format!("\n    {f}: a={} b={}", da[*f], db[*f]);
             }
@@ -989,11 +1218,22 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
         }
     }
 
-
     let (ra, rb) = (&a["reset"], &b["reset"]);
     {
-        const RESET_FIELDS: [&str; 7] = ["layers", "k_bytes", "v_bytes", "poison_sha", "k_sha", "v_sha", "all_zero"];
-        let bad: Vec<&str> = RESET_FIELDS.iter().copied().filter(|f| ra[*f] != rb[*f] || ra[*f].is_null()).collect();
+        const RESET_FIELDS: [&str; 7] = [
+            "layers",
+            "k_bytes",
+            "v_bytes",
+            "poison_sha",
+            "k_sha",
+            "v_sha",
+            "all_zero",
+        ];
+        let bad: Vec<&str> = RESET_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| ra[*f] != rb[*f] || ra[*f].is_null())
+            .collect();
         let zero = ra["all_zero"] == true && rb["all_zero"] == true;
         println!(
             "MTP_FILL_ROW kind=reset case=head-kv-reset stage=poison-then-reset rows=0..{} identical={} all_zero_a={} all_zero_b={} k_bytes={} v_bytes={} poison_a={} poison_b={} k_a={} k_b={} v_a={} v_b={}",
@@ -1002,7 +1242,10 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
             short(&ra["k_sha"]), short(&rb["k_sha"]), short(&ra["v_sha"]), short(&rb["v_sha"]),
         );
         if !bad.is_empty() || !zero {
-            let mut ctx = format!("head KV reset: differing/missing {bad:?}, all_zero a={} b={}", ra["all_zero"], rb["all_zero"]);
+            let mut ctx = format!(
+                "head KV reset: differing/missing {bad:?}, all_zero a={} b={}",
+                ra["all_zero"], rb["all_zero"]
+            );
             for f in &bad {
                 ctx += &format!("\n    {f}: a={} b={}", ra[*f], rb[*f]);
             }
@@ -1010,7 +1253,10 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
         }
     }
 
-    let (sa, sb) = (a["state"].as_array().cloned().unwrap_or_default(), b["state"].as_array().cloned().unwrap_or_default());
+    let (sa, sb) = (
+        a["state"].as_array().cloned().unwrap_or_default(),
+        b["state"].as_array().cloned().unwrap_or_default(),
+    );
     if sa.len() != sb.len() || sa.len() != EXPECTED_STATE_RECORDS {
         failures.push(format!(
             "state record counts: a={} b={}, expected {EXPECTED_STATE_RECORDS} (missing or extra cases)",
@@ -1018,9 +1264,21 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
             sb.len()
         ));
     }
-    const STATE_FIELDS: [&str; 8] = ["start", "end", "k_sha", "v_sha", "prev_sha", "logits_sha", "argmax", "prev_hidden_pos"];
+    const STATE_FIELDS: [&str; 8] = [
+        "start",
+        "end",
+        "k_sha",
+        "v_sha",
+        "prev_sha",
+        "logits_sha",
+        "argmax",
+        "prev_hidden_pos",
+    ];
     for (ra, rb) in sa.iter().zip(&sb) {
-        let (case, stage) = (ra["case"].as_str().unwrap_or("?"), ra["stage"].as_str().unwrap_or("?"));
+        let (case, stage) = (
+            ra["case"].as_str().unwrap_or("?"),
+            ra["stage"].as_str().unwrap_or("?"),
+        );
         let mut bad: Vec<&str> = Vec::new();
         if ra["case"] != rb["case"] || ra["stage"] != rb["stage"] {
             bad.push("case/stage");
@@ -1040,7 +1298,10 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
         );
         if !bad.is_empty() {
             let start = ra["start"].as_u64().unwrap_or(0);
-            let mut ctx = format!("state {case}/{stage} rows {}..{}: differing {bad:?}", ra["start"], ra["end"]);
+            let mut ctx = format!(
+                "state {case}/{stage} rows {}..{}: differing {bad:?}",
+                ra["start"], ra["end"]
+            );
             for f in &bad {
                 ctx += &format!("\n    {f}: a={} b={}", ra[*f], rb[*f]);
             }
@@ -1054,7 +1315,10 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
         }
     }
 
-    let (ga, gb) = (a["generation"].as_array().cloned().unwrap_or_default(), b["generation"].as_array().cloned().unwrap_or_default());
+    let (ga, gb) = (
+        a["generation"].as_array().cloned().unwrap_or_default(),
+        b["generation"].as_array().cloned().unwrap_or_default(),
+    );
     if ga.len() != gb.len() || ga.len() != EXPECTED_GEN_RECORDS {
         failures.push(format!(
             "generation record counts: a={} b={}, expected {EXPECTED_GEN_RECORDS} (missing or extra cases)",
@@ -1062,10 +1326,27 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
             gb.len()
         ));
     }
-    const GEN_FIELDS: [&str; 9] = ["case", "mode", "prompt_len", "prefill_start", "tokens", "generated", "steps", "proposed", "accepted"];
+    const GEN_FIELDS: [&str; 9] = [
+        "case",
+        "mode",
+        "prompt_len",
+        "prefill_start",
+        "tokens",
+        "generated",
+        "steps",
+        "proposed",
+        "accepted",
+    ];
     for (ra, rb) in ga.iter().zip(&gb) {
-        let (case, mode) = (ra["case"].as_str().unwrap_or("?"), ra["mode"].as_str().unwrap_or("?"));
-        let mut bad: Vec<&str> = GEN_FIELDS.iter().copied().filter(|f| ra[*f] != rb[*f]).collect();
+        let (case, mode) = (
+            ra["case"].as_str().unwrap_or("?"),
+            ra["mode"].as_str().unwrap_or("?"),
+        );
+        let mut bad: Vec<&str> = GEN_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| ra[*f] != rb[*f])
+            .collect();
         if ra["windows"] != rb["windows"] {
             bad.push("windows");
         }
@@ -1088,12 +1369,16 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
         }
     }
     let identical = failures.is_empty();
-    println!("MTP_FILL_VERDICT identical={identical} failures={}", failures.len());
+    println!(
+        "MTP_FILL_VERDICT identical={identical} failures={}",
+        failures.len()
+    );
     failures
 }
 
 fn read_artifact(env: &str) -> serde_json::Value {
-    let path = std::env::var(env).unwrap_or_else(|_| panic!("{env} must name an arm artifact JSON"));
+    let path =
+        std::env::var(env).unwrap_or_else(|_| panic!("{env} must name an arm artifact JSON"));
     serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}")))
         .unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
@@ -1104,7 +1389,11 @@ fn read_artifact(env: &str) -> serde_json::Value {
 fn mtp_fill_oracle_compare() {
     let (a, b) = (read_artifact(ARM_A_ENV), read_artifact(ARM_B_ENV));
     let failures = compare_artifacts(&a, &b);
-    assert!(failures.is_empty(), "fill fast/off oracle mismatches:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "fill fast/off oracle mismatches:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// One-command oracle: re-executes this test binary twice, each a fresh
@@ -1120,7 +1409,9 @@ fn mtp_fill_oracle_spawn() {
     }
     let dir = std::env::var_os(DIR_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("mtp_fill_oracle_{}", std::process::id())));
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("mtp_fill_oracle_{}", std::process::id()))
+        });
     std::fs::create_dir_all(&dir).expect("create oracle dir");
     let exe = std::env::current_exe().expect("test binary path");
     let mut artifacts = Vec::new();
@@ -1128,19 +1419,46 @@ fn mtp_fill_oracle_spawn() {
         let out = dir.join(format!("{label}.json"));
         let _ = std::fs::remove_file(&out);
         let output = std::process::Command::new(&exe)
-            .args(["--exact", ARM_TEST, "--ignored", "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                ARM_TEST,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env(FILL_ENV, value)
             .env(OUT_ENV, &out)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap_or_else(|e| panic!("spawn {label} arm: {e}"));
-        std::fs::write(dir.join(format!("{label}.stdout.log")), &output.stdout).expect("write stdout log");
-        std::fs::write(dir.join(format!("{label}.stderr.log")), &output.stderr).expect("write stderr log");
-        assert!(output.status.success(), "{label} arm failed ({}); logs in {}", output.status, dir.display());
-        assert!(out.exists(), "{label} arm wrote no artifact (is {MODEL_ENV} visible to the child?); logs in {}", dir.display());
-        artifacts.push(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&out).expect("read artifact")).expect("parse artifact"));
+        std::fs::write(dir.join(format!("{label}.stdout.log")), &output.stdout)
+            .expect("write stdout log");
+        std::fs::write(dir.join(format!("{label}.stderr.log")), &output.stderr)
+            .expect("write stderr log");
+        assert!(
+            output.status.success(),
+            "{label} arm failed ({}); logs in {}",
+            output.status,
+            dir.display()
+        );
+        assert!(
+            out.exists(),
+            "{label} arm wrote no artifact (is {MODEL_ENV} visible to the child?); logs in {}",
+            dir.display()
+        );
+        artifacts.push(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(&out).expect("read artifact"),
+            )
+            .expect("parse artifact"),
+        );
     }
     eprintln!("[oracle] artifacts in {}", dir.display());
     let failures = compare_artifacts(&artifacts[0], &artifacts[1]);
-    assert!(failures.is_empty(), "fill fast/off oracle mismatches (artifacts in {}):\n{}", dir.display(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "fill fast/off oracle mismatches (artifacts in {}):\n{}",
+        dir.display(),
+        failures.join("\n")
+    );
 }

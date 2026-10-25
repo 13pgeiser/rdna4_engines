@@ -20,7 +20,9 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--arch" => arch = args.next(),
             "--out-dir" => out = args.next().map(PathBuf::from),
-            "--extra-flags" => extra_flags = Some(args.next().ok_or("missing --extra-flags value")?),
+            "--extra-flags" => {
+                extra_flags = Some(args.next().ok_or("missing --extra-flags value")?)
+            }
             "--help" | "-h" => {
                 println!("Usage: hipfire-kernel-registry --arch <gfx> --out-dir <dir> [--extra-flags <flags>]");
                 return Ok(());
@@ -32,14 +34,15 @@ fn run() -> Result<(), String> {
     let out = out.ok_or("missing --out-dir")?;
     // Match Gpu::init's per-arch derived compiler flags, not only the raw
     // HIPFIRE_HIPCC_EXTRA_FLAGS override.
-    let extra_flags = extra_flags.unwrap_or_else(|| {
-        rdna_compute::FeatureFlags::from_active_config(&arch).hipcc_extra_flags
-    });
+    let extra_flags = extra_flags
+        .unwrap_or_else(|| rdna_compute::FeatureFlags::from_active_config(&arch).hipcc_extra_flags);
     let mut lines = String::new();
     let mut entries = kernel_registry::entries(&arch, &extra_flags)
         .map_err(|e| format!("unsupported registry architecture: {e:?}"))?;
     fs::create_dir_all(&out).map_err(|e| format!("creating {}: {e}", out.display()))?;
-    let out = out.canonicalize().map_err(|e| format!("resolving {}: {e}", out.display()))?;
+    let out = out
+        .canonicalize()
+        .map_err(|e| format!("resolving {}: {e}", out.display()))?;
     entries.sort_by_key(|entry| entry.module);
     fs::write(out.join("extra-flags.txt"), &extra_flags)
         .map_err(|e| format!("writing extra-flags.txt: {e}"))?;

@@ -177,7 +177,11 @@ fn build_gl(m: usize, k: usize, seed: u64) -> Vec<u8> {
             for b in 0..64 {
                 out[off + b] = idx_byte(seed, row, g, b);
             }
-            put_half(&mut out, idx_bytes + (row * gpr + g) * 2, blk_scale(seed, row, g));
+            put_half(
+                &mut out,
+                idx_bytes + (row * gpr + g) * 2,
+                blk_scale(seed, row, g),
+            );
         }
     }
     out
@@ -289,7 +293,9 @@ fn build_case(gpu: &mut Gpu, m: usize, k: usize, k_top: usize, n_exp: usize, sb:
         .collect();
 
     // Nonzero pre-seed — a store-instead-of-atomicAdd bug shows.
-    let seed: Vec<f32> = (0..m).map(|row| ((row % 17) as f32 - 8.0) * 0.005).collect();
+    let seed: Vec<f32> = (0..m)
+        .map(|row| ((row % 17) as f32 - 8.0) * 0.005)
+        .collect();
 
     // Upload every expert of both formats.
     let mut gl_t = Vec::with_capacity(n_exp);
@@ -328,6 +334,7 @@ fn build_case(gpu: &mut Gpu, m: usize, k: usize, k_top: usize, n_exp: usize, sb:
     }
     b_gl.push_i32(m as i32);
     b_gl.push_i32(k as i32);
+    b_gl.push_i32((gl_ptr_t.buf.size() / 8) as i32);
 
     let mut b_l = KernargBlob::new();
     b_l.push_ptr(l_ptr_t.buf.as_ptr() as *const _);
@@ -337,8 +344,12 @@ fn build_case(gpu: &mut Gpu, m: usize, k: usize, k_top: usize, n_exp: usize, sb:
     b_l.push_ptr(resid.buf.as_ptr() as *const _);
     b_l.push_i32(m as i32);
     b_l.push_i32(k as i32);
+    b_l.push_i32((l_ptr_t.buf.size() / 8) as i32);
 
-    let raw_gl = topk.iter().map(|&e| build_gl(m, k, sb + e as u64)).collect();
+    let raw_gl = topk
+        .iter()
+        .map(|&e| build_gl(m, k, sb + e as u64))
+        .collect();
     let raw_l = topk.iter().map(|&e| build_l(m, k, sb + e as u64)).collect();
 
     let mut keep = Vec::new();
@@ -382,7 +393,13 @@ impl Case {
     ///
     /// Returns (expected output, Σ|term| per row) — the latter is the
     /// conditioning of the f32 sum the GPU performs, used to normalize error.
-    fn reference(&self, gl: bool, ranks: usize, seeded: bool, repeats: f64) -> (Vec<f64>, Vec<f64>) {
+    fn reference(
+        &self,
+        gl: bool,
+        ranks: usize,
+        seeded: bool,
+        repeats: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
         let mut out = vec![0.0f64; self.m];
         if seeded {
             for (o, s) in out.iter_mut().zip(&self.seed) {
@@ -467,7 +484,9 @@ fn report(label: &str, s: &Stats, got: &[f32], want: &[f64]) -> bool {
     );
     eprintln!(
         "  {:<34} worst row: gpu={:+.8e}  cpu={:+.8e}   [{}]",
-        "", got[s.rel_idx], want[s.rel_idx],
+        "",
+        got[s.rel_idx],
+        want[s.rel_idx],
         if ok { "PASS" } else { "FAIL" }
     );
     ok
@@ -484,7 +503,11 @@ fn write_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) {
 fn run(gpu: &mut Gpu, func: &str, c: &Case, gl: bool, ranks: usize, n: usize) -> Vec<f32> {
     let grid = [c.m as u32, ranks as u32, 1];
     let block = [32u32, 1, 1];
-    let mut blob = if gl { c.blob_gl.clone() } else { c.blob_l.clone() };
+    let mut blob = if gl {
+        c.blob_gl.clone()
+    } else {
+        c.blob_l.clone()
+    };
     for _ in 0..n {
         gpu.launch_kernel_blob(func, grid, block, 0, &mut blob)
             .expect("launch");
@@ -504,8 +527,10 @@ fn main() {
          Final acceptance = golden bundle (registry/redline-golden-v1.json), HIP + PM4 arms.\n"
     );
 
-    gpu.ensure_kernel_public(GL_MOD, GL_SRC, GL_FN).expect("JIT mq2gl down");
-    gpu.ensure_kernel_public(L_MOD, L_SRC, L_FN).expect("JIT mq2l down");
+    gpu.ensure_kernel_public(GL_MOD, GL_SRC, GL_FN)
+        .expect("JIT mq2gl down");
+    gpu.ensure_kernel_public(L_MOD, L_SRC, L_FN)
+        .expect("JIT mq2l down");
 
     // ── a3b routed-expert DOWN shape: M = hidden = 2048, K = moe_inter = 512 ──
     let (m, k, k_top, n_exp) = (2048usize, 512usize, 8usize, 256usize);
@@ -518,7 +543,9 @@ fn main() {
         c.gpr,
         c.n_exp,
         c.topk,
-        c.tw.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>(),
+        c.tw.iter()
+            .map(|v| (v * 1e4).round() / 1e4)
+            .collect::<Vec<_>>(),
         c.gpr
     );
 
@@ -568,7 +595,10 @@ fn main() {
 
     // ── 3. double launch: out = seed + 2Δ (accumulate, not overwrite) ──
     eprintln!("\n[3] double launch on one seeded residual (out = seed + 2Δ):");
-    for (gl, fname, tag) in [(true, GL_FN, "MQ2GL down ×2"), (false, L_FN, "MQ2L  down ×2")] {
+    for (gl, fname, tag) in [
+        (true, GL_FN, "MQ2GL down ×2"),
+        (false, L_FN, "MQ2L  down ×2"),
+    ] {
         write_f32(&gpu, &c.resid, &c.seed);
         let got = run(&mut gpu, fname, &c, gl, k_top, 2);
         let (want, absum) = c.reference(gl, k_top, true, 2.0);
@@ -610,7 +640,10 @@ fn main() {
             eprintln!(
                 "  {tag} K={ks:<5} gpr={:<2} quads={quads} tail={tail}  max|abs|={:.3e} \
                  max rel={:.3e} @row {:<4} {}",
-                cs.gpr, s.max_abs, s.max_rel, s.rel_idx,
+                cs.gpr,
+                s.max_abs,
+                s.max_rel,
+                s.rel_idx,
                 if ok { "PASS" } else { "FAIL" }
             );
         }

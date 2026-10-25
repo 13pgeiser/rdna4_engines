@@ -45,8 +45,7 @@ fn main() {
                 i += 2;
             }
             "--prompt-file" => {
-                prompt = std::fs::read_to_string(&argv[i + 1])
-                    .expect("--prompt-file: read");
+                prompt = std::fs::read_to_string(&argv[i + 1]).expect("--prompt-file: read");
                 i += 2;
             }
             // Bypass the tokenizer: feed comma-separated input token ids (e.g.

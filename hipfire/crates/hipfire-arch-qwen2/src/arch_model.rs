@@ -35,7 +35,11 @@ impl ArchModel for Qwen2Bundle {
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
-        let Qwen2Bundle { config: _, weights, state } = *self;
+        let Qwen2Bundle {
+            config: _,
+            weights,
+            state,
+        } = *self;
         // Mirror unload_model ModelState::Qwen2 arm:
         //   b.state.free_gpu(gpu);
         //   b.weights.free_gpu(gpu);

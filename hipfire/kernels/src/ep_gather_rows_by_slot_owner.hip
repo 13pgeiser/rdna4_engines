@@ -15,20 +15,31 @@
 // `self_rank`, and slots with a negative owner, are never written.
 //
 // grid  = (ceil(n16 / blockDim.x), n_slots), block = (256, 1, 1)
-// src0..src3: row-buffer base of rank 0..3 (unused entries may be null)
+// src0..src7: row-buffer base of rank 0..7 (entries >= n_ranks may be null)
 // dst:        this rank's row-buffer base
 
 extern "C" __global__ void ep_gather_rows_by_slot_owner(
     const int *__restrict__ slot_owner, const uint4 *src0, const uint4 *src1,
-    const uint4 *src2, const uint4 *src3, uint4 *dst, int n_slots, int n_ranks,
+    const uint4 *src2, const uint4 *src3, const uint4 *src4, const uint4 *src5,
+    const uint4 *src6, const uint4 *src7, uint4 *dst, int n_slots, int n_ranks,
     int self_rank, int n16) {
     const int slot = (int)blockIdx.y;
     if (slot >= n_slots)
         return;
     const int owner = slot_owner[slot];
-    if (owner < 0 || owner >= n_ranks || owner == self_rank)
+    if (owner < 0 || owner >= n_ranks || owner >= 8 || owner == self_rank)
         return;
-    const uint4 *src = owner == 0 ? src0 : (owner == 1 ? src1 : (owner == 2 ? src2 : src3));
+    const uint4 *src;
+    switch (owner) {
+    case 0: src = src0; break;
+    case 1: src = src1; break;
+    case 2: src = src2; break;
+    case 3: src = src3; break;
+    case 4: src = src4; break;
+    case 5: src = src5; break;
+    case 6: src = src6; break;
+    default: src = src7; break;
+    }
     const size_t row = (size_t)slot * (size_t)n16;
     const size_t stride = (size_t)gridDim.x * (size_t)blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < (size_t)n16; i += stride)

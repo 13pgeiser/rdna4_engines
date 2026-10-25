@@ -38,12 +38,18 @@
 //! PC-relative bodies, dynamic LDS, wave64, FP/mode state the gfx12 descriptor cannot
 //! express, and 32-bit or otherwise truncated pointer apertures. There is no whole-kernel
 //! register allocation, no descriptor truncation, no MODE reset to builder defaults.
-use crate::aco_cert::{certify_program, CertError, CertificationReport, IdentityDomain, LaunchContract, StaticCertificate};
+use crate::aco_cert::{
+    certify_program, CertError, CertificationReport, IdentityDomain, LaunchContract,
+    StaticCertificate,
+};
 use crate::native::{self, EncodedKernel};
 use crate::plan::Access;
 use peacemaker_ir::cfg::BlockId;
 use peacemaker_ir::codec::gfx12;
-use peacemaker_ir::inst::{Abi, Arch as IrArch, Axis, EntryCell, EntryValue, FpState, Frontend, KernelOrigin, RawResources, Setting, SymbolId, Target, Wave};
+use peacemaker_ir::inst::{
+    Abi, Arch as IrArch, Axis, EntryCell, EntryValue, FpState, Frontend, KernelOrigin,
+    RawResources, Setting, SymbolId, Target, Wave,
+};
 use peacemaker_ir::passes::liveness::{LivePoint, Liveness, Loc};
 use peacemaker_ir::passes::resources::summarize;
 use peacemaker_ir::reg::{Kind, RegRef};
@@ -55,7 +61,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Adapter identity recorded in the emission proof and the candidate manifest.
-pub const ADAPTER_VERSION: &str = concat!("peacemaker-isa ", env!("CARGO_PKG_VERSION"), " aco-hsa adapter v1");
+pub const ADAPTER_VERSION: &str = concat!(
+    "peacemaker-isa ",
+    env!("CARGO_PKG_VERSION"),
+    " aco-hsa adapter v1"
+);
 /// Schema of [`AcoHipContract::from_json`].
 pub const CONTRACT_SCHEMA: &str = "pm-aco-hip-contract-v1";
 /// Schema of [`AcoHsaEmission::candidate_manifest`].
@@ -134,7 +144,10 @@ pub enum Aperture {
 pub enum HipArgKind {
     /// An 8-byte global pointer. `extent_bytes` is the byte extent the fixed shape domain
     /// accesses through it (the oracle's guard bound).
-    GlobalPointer { access: Option<Access>, extent_bytes: u64 },
+    GlobalPointer {
+        access: Option<Access>,
+        extent_bytes: u64,
+    },
     /// A by-value scalar of the arg's `size`.
     ByValue,
 }
@@ -219,81 +232,174 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(2 * bytes.len());
-    for b in bytes { write!(s, "{b:02x}").expect("String write"); }
+    for b in bytes {
+        write!(s, "{b:02x}").expect("String write");
+    }
     s
 }
 
 fn ident_ok(s: &str) -> bool {
-    !s.is_empty() && !s.starts_with(|c: char| c.is_ascii_digit()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Canonical, length-prefixed serialisation hashed into the contract identity.
 #[derive(Default)]
 struct Canon(Vec<u8>);
 impl Canon {
-    fn u(&mut self, v: u64) { self.0.extend(v.to_le_bytes()) }
-    fn s(&mut self, s: &str) { self.u(s.len() as u64); self.0.extend(s.as_bytes()) }
-    fn b(&mut self, b: &[u8]) { self.u(b.len() as u64); self.0.extend(b) }
+    fn u(&mut self, v: u64) {
+        self.0.extend(v.to_le_bytes())
+    }
+    fn s(&mut self, s: &str) {
+        self.u(s.len() as u64);
+        self.0.extend(s.as_bytes())
+    }
+    fn b(&mut self, b: &[u8]) {
+        self.u(b.len() as u64);
+        self.0.extend(b)
+    }
 }
 
 impl AcoHipContract {
     /// Self-consistency of the contract alone (no raw program involved).
     pub fn validate(&self) -> Result<(), AcoError> {
         let bad = |m: String| Err(AcoError::Contract(m));
-        if !ident_ok(&self.hip_symbol) { return bad(format!("hip symbol {:?} is not a plain identifier", self.hip_symbol)) }
-        if self.raw_symbol.0.is_empty() { return bad("empty raw symbol".into()) }
-        if self.kernarg_size == 0 || self.kernarg_size > 4096 { return bad(format!("kernarg size {} is outside 1..=4096", self.kernarg_size)) }
+        if !ident_ok(&self.hip_symbol) {
+            return bad(format!(
+                "hip symbol {:?} is not a plain identifier",
+                self.hip_symbol
+            ));
+        }
+        if self.raw_symbol.0.is_empty() {
+            return bad("empty raw symbol".into());
+        }
+        if self.kernarg_size == 0 || self.kernarg_size > 4096 {
+            return bad(format!(
+                "kernarg size {} is outside 1..=4096",
+                self.kernarg_size
+            ));
+        }
         let mut spans: Vec<(u32, u32, &str)> = Vec::new();
         for arg in &self.args {
-            if !ident_ok(&arg.name) { return bad(format!("arg name {:?} is not a plain identifier", arg.name)) }
-            if !matches!(arg.size, 1 | 2 | 4 | 8) { return bad(format!("arg {} has size {}", arg.name, arg.size)) }
-            if arg.offset % arg.size != 0 { return bad(format!("arg {} offset {} is not aligned to its size {}", arg.name, arg.offset, arg.size)) }
-            let end = arg.offset.checked_add(arg.size).ok_or_else(|| AcoError::Contract(format!("arg {} overflows", arg.name)))?;
-            if end > self.kernarg_size { return bad(format!("arg {} ends at {end}, past kernarg size {}", arg.name, self.kernarg_size)) }
-            if let HipArgKind::GlobalPointer { .. } = arg.kind {
-                if arg.size != 8 { return bad(format!("pointer arg {} is {} bytes: pointers are carried as full 64 bits", arg.name, arg.size)) }
+            if !ident_ok(&arg.name) {
+                return bad(format!("arg name {:?} is not a plain identifier", arg.name));
             }
-            if let Some((_, _, other)) = spans.iter().find(|(o, e, _)| arg.offset < *e && *o < end) {
+            if !matches!(arg.size, 1 | 2 | 4 | 8) {
+                return bad(format!("arg {} has size {}", arg.name, arg.size));
+            }
+            if arg.offset % arg.size != 0 {
+                return bad(format!(
+                    "arg {} offset {} is not aligned to its size {}",
+                    arg.name, arg.offset, arg.size
+                ));
+            }
+            let end = arg
+                .offset
+                .checked_add(arg.size)
+                .ok_or_else(|| AcoError::Contract(format!("arg {} overflows", arg.name)))?;
+            if end > self.kernarg_size {
+                return bad(format!(
+                    "arg {} ends at {end}, past kernarg size {}",
+                    arg.name, self.kernarg_size
+                ));
+            }
+            if let HipArgKind::GlobalPointer { .. } = arg.kind {
+                if arg.size != 8 {
+                    return bad(format!(
+                        "pointer arg {} is {} bytes: pointers are carried as full 64 bits",
+                        arg.name, arg.size
+                    ));
+                }
+            }
+            if let Some((_, _, other)) = spans.iter().find(|(o, e, _)| arg.offset < *e && *o < end)
+            {
                 return bad(format!("arg {} overlaps arg {other}", arg.name));
             }
             spans.push((arg.offset, end, arg.name.as_str()));
         }
         for dims in [self.shape.block, self.shape.grid] {
-            if dims.contains(&0) { return bad(format!("empty launch dimension {dims:?}")) }
+            if dims.contains(&0) {
+                return bad(format!("empty launch dimension {dims:?}"));
+            }
         }
         let threads: u64 = self.shape.block.iter().map(|&d| u64::from(d)).product();
-        if threads > 1024 { return bad(format!("block {:?} has {threads} work-items", self.shape.block)) }
+        if threads > 1024 {
+            return bad(format!(
+                "block {:?} has {threads} work-items",
+                self.shape.block
+            ));
+        }
         for (arg, value) in &self.shape.scalars {
-            let a = self.args.get(*arg).ok_or_else(|| AcoError::Contract(format!("shape scalar names missing arg {arg}")))?;
-            if a.kind != HipArgKind::ByValue { return bad(format!("shape scalar names pointer arg {}", a.name)) }
-            if a.size < 8 && value >> (8 * a.size) != 0 { return bad(format!("shape scalar {} = {value} exceeds its {} bytes", a.name, a.size)) }
+            let a = self.args.get(*arg).ok_or_else(|| {
+                AcoError::Contract(format!("shape scalar names missing arg {arg}"))
+            })?;
+            if a.kind != HipArgKind::ByValue {
+                return bad(format!("shape scalar names pointer arg {}", a.name));
+            }
+            if a.size < 8 && value >> (8 * a.size) != 0 {
+                return bad(format!(
+                    "shape scalar {} = {value} exceeds its {} bytes",
+                    a.name, a.size
+                ));
+            }
         }
         for (i, a) in self.args.iter().enumerate() {
-            if a.kind == HipArgKind::ByValue && self.shape.scalars.iter().filter(|(x, _)| *x == i).count() != 1 {
-                return bad(format!("by-value arg {} needs exactly one fixed shape value", a.name));
+            if a.kind == HipArgKind::ByValue
+                && self.shape.scalars.iter().filter(|(x, _)| *x == i).count() != 1
+            {
+                return bad(format!(
+                    "by-value arg {} needs exactly one fixed shape value",
+                    a.name
+                ));
             }
         }
         let mut used: BTreeSet<u16> = BTreeSet::new();
         for b in &self.bindings {
             b.dst.validate().map_err(AcoError::Contract)?;
-            if b.dst.kind != Kind::S { return bad(format!("binding destination {} is not an SGPR run", b.dst)) }
+            if b.dst.kind != Kind::S {
+                return bad(format!("binding destination {} is not an SGPR run", b.dst));
+            }
             let want = match b.source {
                 BindingSource::KernargPointer { arg } => {
-                    let a = self.args.get(arg).ok_or_else(|| AcoError::Contract(format!("binding names missing arg {arg}")))?;
-                    if !matches!(a.kind, HipArgKind::GlobalPointer { .. }) { return bad(format!("pointer binding names by-value arg {}", a.name)) }
-                    if b.dst.base % 2 != 0 { return bad(format!("pointer {} needs an even SGPR pair, got {}", a.name, b.dst)) }
+                    let a = self.args.get(arg).ok_or_else(|| {
+                        AcoError::Contract(format!("binding names missing arg {arg}"))
+                    })?;
+                    if !matches!(a.kind, HipArgKind::GlobalPointer { .. }) {
+                        return bad(format!("pointer binding names by-value arg {}", a.name));
+                    }
+                    if b.dst.base % 2 != 0 {
+                        return bad(format!(
+                            "pointer {} needs an even SGPR pair, got {}",
+                            a.name, b.dst
+                        ));
+                    }
                     2
                 }
                 BindingSource::KernargScalar { arg } => {
-                    let a = self.args.get(arg).ok_or_else(|| AcoError::Contract(format!("binding names missing arg {arg}")))?;
-                    if a.kind != HipArgKind::ByValue || !matches!(a.size, 4 | 8) { return bad(format!("scalar binding of arg {} (must be a 4 or 8 byte by-value arg)", a.name)) }
+                    let a = self.args.get(arg).ok_or_else(|| {
+                        AcoError::Contract(format!("binding names missing arg {arg}"))
+                    })?;
+                    if a.kind != HipArgKind::ByValue || !matches!(a.size, 4 | 8) {
+                        return bad(format!(
+                            "scalar binding of arg {} (must be a 4 or 8 byte by-value arg)",
+                            a.name
+                        ));
+                    }
                     (a.size / 4) as u8
                 }
                 BindingSource::WorkgroupId(_) | BindingSource::Constant(_) => 1,
             };
-            if b.dst.len != want { return bad(format!("binding {:?} needs {want} dword(s), destination {} has {}", b.source, b.dst, b.dst.len)) }
+            if b.dst.len != want {
+                return bad(format!(
+                    "binding {:?} needs {want} dword(s), destination {} has {}",
+                    b.source, b.dst, b.dst.len
+                ));
+            }
             for n in b.dst.base..b.dst.base + u16::from(b.dst.len) {
-                if !used.insert(n) { return bad(format!("two bindings write s{n}")) }
+                if !used.insert(n) {
+                    return bad(format!("two bindings write s{n}"));
+                }
             }
         }
         Ok(())
@@ -309,21 +415,41 @@ impl AcoHipContract {
         c.s(&format!("{:?}", self.wave));
         c.u(self.args.len() as u64);
         for a in &self.args {
-            c.s(&a.name); c.u(u64::from(a.offset)); c.u(u64::from(a.size));
+            c.s(&a.name);
+            c.u(u64::from(a.offset));
+            c.u(u64::from(a.size));
             match &a.kind {
-                HipArgKind::GlobalPointer { access, extent_bytes } => { c.s("ptr"); c.s(access.map_or("none", Access::name)); c.u(*extent_bytes) }
+                HipArgKind::GlobalPointer {
+                    access,
+                    extent_bytes,
+                } => {
+                    c.s("ptr");
+                    c.s(access.map_or("none", Access::name));
+                    c.u(*extent_bytes)
+                }
                 HipArgKind::ByValue => c.s("value"),
             }
         }
         c.u(u64::from(self.kernarg_size));
         c.u(self.bindings.len() as u64);
-        for b in &self.bindings { c.s(&format!("{:?}", b)) }
+        for b in &self.bindings {
+            c.s(&format!("{:?}", b))
+        }
         c.s(&format!("{:?}", self.fp));
         c.s(&format!("{:?}", self.resources));
         c.u(u64::from(self.dynamic_lds_max));
         c.s(&format!("{:?}", self.shape));
         c.s(&format!("{:?}", self.aperture));
-        for h in [&self.artifact_sha256, &self.rawspec_sha256, &self.spirv_sha256, &self.raw_binary_sha256, &self.raw_exec_sha256, &self.sidecar_sha256] { c.b(h) }
+        for h in [
+            &self.artifact_sha256,
+            &self.rawspec_sha256,
+            &self.spirv_sha256,
+            &self.raw_binary_sha256,
+            &self.raw_exec_sha256,
+            &self.sidecar_sha256,
+        ] {
+            c.b(h)
+        }
         sha256(&c.0)
     }
 
@@ -342,79 +468,240 @@ impl AcoHipContract {
 
     /// Parse a `pm-aco-hip-contract-v1` document. All keys are required; unknown keys reject.
     pub fn from_json(text: &str) -> Result<Self, AcoError> {
-        let doc: Value = serde_json::from_str(text).map_err(|e| AcoError::Contract(format!("contract JSON: {e}")))?;
-        let m = object(&doc, "contract", &["schema", "target", "raw_symbol", "hip_symbol", "wave", "kernarg_size", "args", "bindings", "fp",
-            "resources", "dynamic_lds_max", "shape", "aperture", "artifact_sha256", "rawspec_sha256", "spirv_sha256", "raw_binary_sha256", "raw_exec_sha256", "sidecar_sha256"])?;
-        if str_of(m, "schema")? != CONTRACT_SCHEMA { return Err(AcoError::Contract(format!("schema is not {CONTRACT_SCHEMA}"))) }
-        let t = object(&m["target"], "target", &["arch", "xnack", "sramecc", "abi_version"])?;
+        let doc: Value = serde_json::from_str(text)
+            .map_err(|e| AcoError::Contract(format!("contract JSON: {e}")))?;
+        let m = object(
+            &doc,
+            "contract",
+            &[
+                "schema",
+                "target",
+                "raw_symbol",
+                "hip_symbol",
+                "wave",
+                "kernarg_size",
+                "args",
+                "bindings",
+                "fp",
+                "resources",
+                "dynamic_lds_max",
+                "shape",
+                "aperture",
+                "artifact_sha256",
+                "rawspec_sha256",
+                "spirv_sha256",
+                "raw_binary_sha256",
+                "raw_exec_sha256",
+                "sidecar_sha256",
+            ],
+        )?;
+        if str_of(m, "schema")? != CONTRACT_SCHEMA {
+            return Err(AcoError::Contract(format!(
+                "schema is not {CONTRACT_SCHEMA}"
+            )));
+        }
+        let t = object(
+            &m["target"],
+            "target",
+            &["arch", "xnack", "sramecc", "abi_version"],
+        )?;
         let setting = |k: &str| -> Result<Setting, AcoError> {
-            Ok(match str_of(t, k)? { "any" => Setting::Any, "on" => Setting::On, "off" => Setting::Off, o => return Err(AcoError::Contract(format!("target.{k} {o:?}"))) })
+            Ok(match str_of(t, k)? {
+                "any" => Setting::Any,
+                "on" => Setting::On,
+                "off" => Setting::Off,
+                o => return Err(AcoError::Contract(format!("target.{k} {o:?}"))),
+            })
         };
         let arch = match str_of(t, "arch")? {
-            "gfx1100" => IrArch::Gfx1100, "gfx1151" => IrArch::Gfx1151, "gfx1201" => IrArch::Gfx1201,
+            "gfx1100" => IrArch::Gfx1100,
+            "gfx1151" => IrArch::Gfx1151,
+            "gfx1201" => IrArch::Gfx1201,
             o => return Err(AcoError::Contract(format!("target.arch {o:?}"))),
         };
-        let target = Target { arch, xnack: setting("xnack")?, sramecc: setting("sramecc")?, abi_version: u8::try_from(uint(t, "abi_version")?).map_err(|_| AcoError::Contract("target.abi_version".into()))? };
-        let wave = match uint(m, "wave")? { 32 => Wave::Wave32, 64 => Wave::Wave64, o => return Err(AcoError::Contract(format!("wave {o}"))) };
+        let target = Target {
+            arch,
+            xnack: setting("xnack")?,
+            sramecc: setting("sramecc")?,
+            abi_version: u8::try_from(uint(t, "abi_version")?)
+                .map_err(|_| AcoError::Contract("target.abi_version".into()))?,
+        };
+        let wave = match uint(m, "wave")? {
+            32 => Wave::Wave32,
+            64 => Wave::Wave64,
+            o => return Err(AcoError::Contract(format!("wave {o}"))),
+        };
         let mut args = Vec::new();
         for (i, a) in array(m, "args")?.iter().enumerate() {
-            let am = object(a, &format!("args[{i}]"), &["name", "offset", "size", "kind", "access", "extent_bytes"])?;
+            let am = object(
+                a,
+                &format!("args[{i}]"),
+                &["name", "offset", "size", "kind", "access", "extent_bytes"],
+            )?;
             let kind = match str_of(am, "kind")? {
                 "global_pointer" => {
                     let access = match &am["access"] {
                         Value::Null => None,
-                        Value::String(s) => Some(match s.as_str() { "read_only" => Access::ReadOnly, "write_only" => Access::WriteOnly, "read_write" => Access::ReadWrite, o => return Err(AcoError::Contract(format!("args[{i}].access {o:?}"))) }),
-                        _ => return Err(AcoError::Contract(format!("args[{i}].access must be a string or null"))),
+                        Value::String(s) => Some(match s.as_str() {
+                            "read_only" => Access::ReadOnly,
+                            "write_only" => Access::WriteOnly,
+                            "read_write" => Access::ReadWrite,
+                            o => return Err(AcoError::Contract(format!("args[{i}].access {o:?}"))),
+                        }),
+                        _ => {
+                            return Err(AcoError::Contract(format!(
+                                "args[{i}].access must be a string or null"
+                            )))
+                        }
                     };
-                    HipArgKind::GlobalPointer { access, extent_bytes: uint(am, "extent_bytes")? }
+                    HipArgKind::GlobalPointer {
+                        access,
+                        extent_bytes: uint(am, "extent_bytes")?,
+                    }
                 }
                 "by_value" => {
-                    if !am["access"].is_null() || !am["extent_bytes"].is_null() { return Err(AcoError::Contract(format!("args[{i}]: by_value takes null access and extent_bytes"))) }
+                    if !am["access"].is_null() || !am["extent_bytes"].is_null() {
+                        return Err(AcoError::Contract(format!(
+                            "args[{i}]: by_value takes null access and extent_bytes"
+                        )));
+                    }
                     HipArgKind::ByValue
                 }
                 o => return Err(AcoError::Contract(format!("args[{i}].kind {o:?}"))),
             };
-            args.push(HipArg { name: str_of(am, "name")?.to_owned(), offset: u32_of(am, "offset")?, size: u32_of(am, "size")?, kind });
+            args.push(HipArg {
+                name: str_of(am, "name")?.to_owned(),
+                offset: u32_of(am, "offset")?,
+                size: u32_of(am, "size")?,
+                kind,
+            });
         }
         let mut bindings = Vec::new();
         for (i, b) in array(m, "bindings")?.iter().enumerate() {
             let bm = object(b, &format!("bindings[{i}]"), &["dst", "source"])?;
             let d = object(&bm["dst"], "binding dst", &["kind", "base", "len"])?;
-            if str_of(d, "kind")? != "sgpr" { return Err(AcoError::Contract(format!("bindings[{i}].dst.kind must be sgpr"))) }
-            let dst = RegRef { kind: Kind::S, base: u16::try_from(uint(d, "base")?).map_err(|_| AcoError::Contract("dst.base".into()))?, len: u8::try_from(uint(d, "len")?).map_err(|_| AcoError::Contract("dst.len".into()))? };
-            let sm = bm["source"].as_object().ok_or_else(|| AcoError::Contract(format!("bindings[{i}].source must be an object")))?;
+            if str_of(d, "kind")? != "sgpr" {
+                return Err(AcoError::Contract(format!(
+                    "bindings[{i}].dst.kind must be sgpr"
+                )));
+            }
+            let dst = RegRef {
+                kind: Kind::S,
+                base: u16::try_from(uint(d, "base")?)
+                    .map_err(|_| AcoError::Contract("dst.base".into()))?,
+                len: u8::try_from(uint(d, "len")?)
+                    .map_err(|_| AcoError::Contract("dst.len".into()))?,
+            };
+            let sm = bm["source"].as_object().ok_or_else(|| {
+                AcoError::Contract(format!("bindings[{i}].source must be an object"))
+            })?;
             let source = match str_of(sm, "kind")? {
-                "kernarg_pointer" => { only(sm, &["kind", "arg"])?; BindingSource::KernargPointer { arg: uint(sm, "arg")? as usize } }
-                "kernarg_scalar" => { only(sm, &["kind", "arg"])?; BindingSource::KernargScalar { arg: uint(sm, "arg")? as usize } }
-                "workgroup_id" => { only(sm, &["kind", "axis"])?; BindingSource::WorkgroupId(axis_of(str_of(sm, "axis")?)?) }
-                "constant" => { only(sm, &["kind", "value"])?; BindingSource::Constant(u32::try_from(uint(sm, "value")?).map_err(|_| AcoError::Contract("constant exceeds a dword".into()))?) }
-                o => return Err(AcoError::Contract(format!("bindings[{i}].source.kind {o:?}"))),
+                "kernarg_pointer" => {
+                    only(sm, &["kind", "arg"])?;
+                    BindingSource::KernargPointer {
+                        arg: uint(sm, "arg")? as usize,
+                    }
+                }
+                "kernarg_scalar" => {
+                    only(sm, &["kind", "arg"])?;
+                    BindingSource::KernargScalar {
+                        arg: uint(sm, "arg")? as usize,
+                    }
+                }
+                "workgroup_id" => {
+                    only(sm, &["kind", "axis"])?;
+                    BindingSource::WorkgroupId(axis_of(str_of(sm, "axis")?)?)
+                }
+                "constant" => {
+                    only(sm, &["kind", "value"])?;
+                    BindingSource::Constant(
+                        u32::try_from(uint(sm, "value")?)
+                            .map_err(|_| AcoError::Contract("constant exceeds a dword".into()))?,
+                    )
+                }
+                o => {
+                    return Err(AcoError::Contract(format!(
+                        "bindings[{i}].source.kind {o:?}"
+                    )))
+                }
             };
             bindings.push(EntryBinding { dst, source });
         }
-        let f = object(&m["fp"], "fp", &["round32", "round16_64", "denorm32", "denorm16_64", "dx10_clamp", "ieee_mode", "fp16_overflow", "wgp_mode", "mem_ordered", "forward_progress", "wg_round_robin", "exceptions"])?;
+        let f = object(
+            &m["fp"],
+            "fp",
+            &[
+                "round32",
+                "round16_64",
+                "denorm32",
+                "denorm16_64",
+                "dx10_clamp",
+                "ieee_mode",
+                "fp16_overflow",
+                "wgp_mode",
+                "mem_ordered",
+                "forward_progress",
+                "wg_round_robin",
+                "exceptions",
+            ],
+        )?;
         let fp = FpState {
-            round32: u8_of(f, "round32")?, round16_64: u8_of(f, "round16_64")?, denorm32: u8_of(f, "denorm32")?, denorm16_64: u8_of(f, "denorm16_64")?,
-            dx10_clamp: bool_of(f, "dx10_clamp")?, ieee_mode: bool_of(f, "ieee_mode")?, fp16_overflow: bool_of(f, "fp16_overflow")?,
-            wgp_mode: bool_of(f, "wgp_mode")?, mem_ordered: bool_of(f, "mem_ordered")?, forward_progress: bool_of(f, "forward_progress")?,
+            round32: u8_of(f, "round32")?,
+            round16_64: u8_of(f, "round16_64")?,
+            denorm32: u8_of(f, "denorm32")?,
+            denorm16_64: u8_of(f, "denorm16_64")?,
+            dx10_clamp: bool_of(f, "dx10_clamp")?,
+            ieee_mode: bool_of(f, "ieee_mode")?,
+            fp16_overflow: bool_of(f, "fp16_overflow")?,
+            wgp_mode: bool_of(f, "wgp_mode")?,
+            mem_ordered: bool_of(f, "mem_ordered")?,
+            forward_progress: bool_of(f, "forward_progress")?,
             wg_round_robin: bool_of(f, "wg_round_robin")?,
-            exceptions: u16::try_from(uint(f, "exceptions")?).map_err(|_| AcoError::Contract("fp.exceptions".into()))?,
+            exceptions: u16::try_from(uint(f, "exceptions")?)
+                .map_err(|_| AcoError::Contract("fp.exceptions".into()))?,
         };
-        let r = object(&m["resources"], "resources", &["lds_bytes", "scratch_bytes_per_lane", "vgprs_actual", "vgprs_allocated", "sgprs_actual", "sgprs_allocated"])?;
+        let r = object(
+            &m["resources"],
+            "resources",
+            &[
+                "lds_bytes",
+                "scratch_bytes_per_lane",
+                "vgprs_actual",
+                "vgprs_allocated",
+                "sgprs_actual",
+                "sgprs_allocated",
+            ],
+        )?;
         let resources = RawResources {
-            lds_bytes: u32_of(r, "lds_bytes")?, scratch_bytes_per_lane: u32_of(r, "scratch_bytes_per_lane")?,
-            vgprs_actual: u16::try_from(uint(r, "vgprs_actual")?).map_err(|_| AcoError::Contract("vgprs_actual".into()))?,
-            vgprs_allocated: u16::try_from(uint(r, "vgprs_allocated")?).map_err(|_| AcoError::Contract("vgprs_allocated".into()))?,
-            sgprs_actual: u16::try_from(uint(r, "sgprs_actual")?).map_err(|_| AcoError::Contract("sgprs_actual".into()))?,
-            sgprs_allocated: u16::try_from(uint(r, "sgprs_allocated")?).map_err(|_| AcoError::Contract("sgprs_allocated".into()))?,
+            lds_bytes: u32_of(r, "lds_bytes")?,
+            scratch_bytes_per_lane: u32_of(r, "scratch_bytes_per_lane")?,
+            vgprs_actual: u16::try_from(uint(r, "vgprs_actual")?)
+                .map_err(|_| AcoError::Contract("vgprs_actual".into()))?,
+            vgprs_allocated: u16::try_from(uint(r, "vgprs_allocated")?)
+                .map_err(|_| AcoError::Contract("vgprs_allocated".into()))?,
+            sgprs_actual: u16::try_from(uint(r, "sgprs_actual")?)
+                .map_err(|_| AcoError::Contract("sgprs_actual".into()))?,
+            sgprs_allocated: u16::try_from(uint(r, "sgprs_allocated")?)
+                .map_err(|_| AcoError::Contract("sgprs_allocated".into()))?,
         };
-        let s = object(&m["shape"], "shape", &["block", "grid", "scalars", "odd_tail_evidence_sha256"])?;
+        let s = object(
+            &m["shape"],
+            "shape",
+            &["block", "grid", "scalars", "odd_tail_evidence_sha256"],
+        )?;
         let dims = |k: &str| -> Result<[u32; 3], AcoError> {
             let a = array(s, k)?;
-            if a.len() != 3 { return Err(AcoError::Contract(format!("shape.{k} needs three dimensions"))) }
+            if a.len() != 3 {
+                return Err(AcoError::Contract(format!(
+                    "shape.{k} needs three dimensions"
+                )));
+            }
             let mut out = [0u32; 3];
             for (o, v) in out.iter_mut().zip(a) {
-                *o = v.as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(|| AcoError::Contract(format!("shape.{k} entry is not a u32")))?;
+                *o = v
+                    .as_u64()
+                    .and_then(|x| u32::try_from(x).ok())
+                    .ok_or_else(|| AcoError::Contract(format!("shape.{k} entry is not a u32")))?;
             }
             Ok(out)
         };
@@ -426,36 +713,76 @@ impl AcoHipContract {
         let aperture = match &m["aperture"] {
             Value::String(a) if a == "global64" => Aperture::Global64,
             Value::String(a) if a == "flat_scratch" => Aperture::FlatScratch,
-            Value::Object(o) if o.len() == 2 && o.get("kind").and_then(Value::as_str) == Some("pointer32") =>
-                Aperture::Pointer32 { high_dword: o.get("high_dword").and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok()).ok_or_else(|| AcoError::Contract("aperture.high_dword".into()))? },
+            Value::Object(o)
+                if o.len() == 2 && o.get("kind").and_then(Value::as_str) == Some("pointer32") =>
+            {
+                Aperture::Pointer32 {
+                    high_dword: o
+                        .get("high_dword")
+                        .and_then(Value::as_u64)
+                        .and_then(|x| u32::try_from(x).ok())
+                        .ok_or_else(|| AcoError::Contract("aperture.high_dword".into()))?,
+                }
+            }
             o => return Err(AcoError::Contract(format!("aperture {o}"))),
         };
         Ok(Self {
-            target, raw_symbol: SymbolId(str_of(m, "raw_symbol")?.to_owned()), hip_symbol: str_of(m, "hip_symbol")?.to_owned(), wave, args,
-            kernarg_size: u32_of(m, "kernarg_size")?, bindings, fp, resources,
-            dynamic_lds_max: u32_of(m, "dynamic_lds_max")?, shape: ShapeDomain { block: dims("block")?, grid: dims("grid")?, scalars, odd_tail_evidence_sha256: match &s["odd_tail_evidence_sha256"] { Value::Null => None, _ => Some(hash_of(s, "odd_tail_evidence_sha256")?) } }, aperture,
-            artifact_sha256: hash_of(m, "artifact_sha256")?, rawspec_sha256: hash_of(m, "rawspec_sha256")?, spirv_sha256: hash_of(m, "spirv_sha256")?,
-            raw_binary_sha256: hash_of(m, "raw_binary_sha256")?, raw_exec_sha256: hash_of(m, "raw_exec_sha256")?, sidecar_sha256: hash_of(m, "sidecar_sha256")?,
+            target,
+            raw_symbol: SymbolId(str_of(m, "raw_symbol")?.to_owned()),
+            hip_symbol: str_of(m, "hip_symbol")?.to_owned(),
+            wave,
+            args,
+            kernarg_size: u32_of(m, "kernarg_size")?,
+            bindings,
+            fp,
+            resources,
+            dynamic_lds_max: u32_of(m, "dynamic_lds_max")?,
+            shape: ShapeDomain {
+                block: dims("block")?,
+                grid: dims("grid")?,
+                scalars,
+                odd_tail_evidence_sha256: match &s["odd_tail_evidence_sha256"] {
+                    Value::Null => None,
+                    _ => Some(hash_of(s, "odd_tail_evidence_sha256")?),
+                },
+            },
+            aperture,
+            artifact_sha256: hash_of(m, "artifact_sha256")?,
+            rawspec_sha256: hash_of(m, "rawspec_sha256")?,
+            spirv_sha256: hash_of(m, "spirv_sha256")?,
+            raw_binary_sha256: hash_of(m, "raw_binary_sha256")?,
+            raw_exec_sha256: hash_of(m, "raw_exec_sha256")?,
+            sidecar_sha256: hash_of(m, "sidecar_sha256")?,
         })
     }
 }
 
 fn object<'a>(v: &'a Value, what: &str, keys: &[&str]) -> Result<&'a Map<String, Value>, AcoError> {
-    let m = v.as_object().ok_or_else(|| AcoError::Contract(format!("{what} must be an object")))?;
+    let m = v
+        .as_object()
+        .ok_or_else(|| AcoError::Contract(format!("{what} must be an object")))?;
     only(m, keys).map_err(|e| AcoError::Contract(format!("{what}: {e}")))?;
     Ok(m)
 }
 /// Exactly `keys`, no more, no fewer.
 fn only(m: &Map<String, Value>, keys: &[&str]) -> Result<(), AcoError> {
-    if let Some(k) = m.keys().find(|k| !keys.contains(&k.as_str())) { return Err(AcoError::Contract(format!("unknown key {k:?}"))) }
-    if let Some(k) = keys.iter().find(|k| !m.contains_key(**k)) { return Err(AcoError::Contract(format!("missing key {k:?}"))) }
+    if let Some(k) = m.keys().find(|k| !keys.contains(&k.as_str())) {
+        return Err(AcoError::Contract(format!("unknown key {k:?}")));
+    }
+    if let Some(k) = keys.iter().find(|k| !m.contains_key(**k)) {
+        return Err(AcoError::Contract(format!("missing key {k:?}")));
+    }
     Ok(())
 }
 fn str_of<'a>(m: &'a Map<String, Value>, k: &str) -> Result<&'a str, AcoError> {
-    m.get(k).and_then(Value::as_str).ok_or_else(|| AcoError::Contract(format!("{k} must be a string")))
+    m.get(k)
+        .and_then(Value::as_str)
+        .ok_or_else(|| AcoError::Contract(format!("{k} must be a string")))
 }
 fn uint(m: &Map<String, Value>, k: &str) -> Result<u64, AcoError> {
-    m.get(k).and_then(Value::as_u64).ok_or_else(|| AcoError::Contract(format!("{k} must be an unsigned integer")))
+    m.get(k)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AcoError::Contract(format!("{k} must be an unsigned integer")))
 }
 fn u32_of(m: &Map<String, Value>, k: &str) -> Result<u32, AcoError> {
     u32::try_from(uint(m, k)?).map_err(|_| AcoError::Contract(format!("{k} exceeds u32")))
@@ -464,19 +791,32 @@ fn u8_of(m: &Map<String, Value>, k: &str) -> Result<u8, AcoError> {
     u8::try_from(uint(m, k)?).map_err(|_| AcoError::Contract(format!("{k} exceeds u8")))
 }
 fn bool_of(m: &Map<String, Value>, k: &str) -> Result<bool, AcoError> {
-    m.get(k).and_then(Value::as_bool).ok_or_else(|| AcoError::Contract(format!("{k} must be a boolean")))
+    m.get(k)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| AcoError::Contract(format!("{k} must be a boolean")))
 }
 fn array<'a>(m: &'a Map<String, Value>, k: &str) -> Result<&'a Vec<Value>, AcoError> {
-    m.get(k).and_then(Value::as_array).ok_or_else(|| AcoError::Contract(format!("{k} must be an array")))
+    m.get(k)
+        .and_then(Value::as_array)
+        .ok_or_else(|| AcoError::Contract(format!("{k} must be an array")))
 }
 fn axis_of(s: &str) -> Result<Axis, AcoError> {
-    Ok(match s { "x" => Axis::X, "y" => Axis::Y, "z" => Axis::Z, o => return Err(AcoError::Contract(format!("axis {o:?}"))) })
+    Ok(match s {
+        "x" => Axis::X,
+        "y" => Axis::Y,
+        "z" => Axis::Z,
+        o => return Err(AcoError::Contract(format!("axis {o:?}"))),
+    })
 }
 fn hash_of(m: &Map<String, Value>, k: &str) -> Result<[u8; 32], AcoError> {
     let s = str_of(m, k)?;
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(AcoError::Contract(format!("{k} must be 64 hex digits"))) }
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AcoError::Contract(format!("{k} must be 64 hex digits")));
+    }
     let mut out = [0u8; 32];
-    for (i, o) in out.iter_mut().enumerate() { *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex digits checked"); }
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex digits checked");
+    }
     Ok(out)
 }
 
@@ -583,11 +923,16 @@ impl AcoHsaEmission {
 }
 
 fn is_free_sgpr(free: &[RegRef], n: u16) -> bool {
-    free.iter().any(|r| r.kind == Kind::S && r.base <= n && n < r.base + u16::from(r.len))
+    free.iter()
+        .any(|r| r.kind == Kind::S && r.base <= n && n < r.base + u16::from(r.len))
 }
 
 fn sgprs(base: u16, n: u16) -> String {
-    if n == 1 { format!("s{base}") } else { format!("s[{base}:{}]", base + n - 1) }
+    if n == 1 {
+        format!("s{base}")
+    } else {
+        format!("s[{base}:{}]", base + n - 1)
+    }
 }
 
 /// Greedy cover of the loaded dwords `(dst SGPR, kernarg byte offset)` by SMEM loads of
@@ -599,9 +944,15 @@ fn load_runs(dwords: &[(u16, u32)]) -> Vec<(u16, u32, u16)> {
         let mut taken = 1usize;
         for n in [16usize, 8, 4, 2] {
             let fits = i + n <= dwords.len()
-                && (0..n).all(|j| dwords[i + j].0 == dwords[i].0 + j as u16 && dwords[i + j].1 == dwords[i].1 + 4 * j as u32)
+                && (0..n).all(|j| {
+                    dwords[i + j].0 == dwords[i].0 + j as u16
+                        && dwords[i + j].1 == dwords[i].1 + 4 * j as u32
+                })
                 && dwords[i].0 % (n.min(4) as u16) == 0;
-            if fits { taken = n; break }
+            if fits {
+                taken = n;
+                break;
+            }
         }
         runs.push((dwords[i].0, dwords[i].1, taken as u16));
         i += taken;
@@ -612,8 +963,14 @@ fn load_runs(dwords: &[(u16, u32)]) -> Vec<(u16, u32, u16)> {
 /// `(file offset, size)` of the `.text` section of an ELF64 little-endian object.
 fn text_section(elf: &[u8]) -> Result<(usize, usize), String> {
     let u16_at = |o: usize| elf.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-    let u32_at = |o: usize| elf.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")));
-    let u64_at = |o: usize| elf.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().expect("eight bytes")));
+    let u32_at = |o: usize| {
+        elf.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")))
+    };
+    let u64_at = |o: usize| {
+        elf.get(o..o + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("eight bytes")))
+    };
     let short = || "truncated ELF header".to_owned();
     let shoff = u64_at(0x28).ok_or_else(short)? as usize;
     let shentsize = u16_at(0x3a).ok_or_else(short)? as usize;
@@ -621,14 +978,24 @@ fn text_section(elf: &[u8]) -> Result<(usize, usize), String> {
     let shstrndx = u16_at(0x3e).ok_or_else(short)? as usize;
     let header = |i: usize| -> Result<(u32, usize, usize), String> {
         let at = shoff + i * shentsize;
-        Ok((u32_at(at).ok_or_else(short)?, u64_at(at + 24).ok_or_else(short)? as usize, u64_at(at + 32).ok_or_else(short)? as usize))
+        Ok((
+            u32_at(at).ok_or_else(short)?,
+            u64_at(at + 24).ok_or_else(short)? as usize,
+            u64_at(at + 32).ok_or_else(short)? as usize,
+        ))
     };
     let (_, str_off, str_size) = header(shstrndx)?;
-    let names = elf.get(str_off..str_off + str_size).ok_or_else(|| "section name table outside the file".to_owned())?;
+    let names = elf
+        .get(str_off..str_off + str_size)
+        .ok_or_else(|| "section name table outside the file".to_owned())?;
     for i in 0..shnum {
         let (name, offset, size) = header(i)?;
-        let tail = names.get(name as usize..).ok_or_else(|| "section name outside the table".to_owned())?;
-        if tail.starts_with(b".text\0") { return Ok((offset, size)) }
+        let tail = names
+            .get(name as usize..)
+            .ok_or_else(|| "section name outside the table".to_owned())?;
+        if tail.starts_with(b".text\0") {
+            return Ok((offset, size));
+        }
     }
     Err("no .text section".into())
 }
@@ -639,13 +1006,20 @@ fn text_section(elf: &[u8]) -> Result<(usize, usize), String> {
 /// `Aco`, no open obligation). Every contract/raw disagreement, unprovided entry fact or
 /// unsupported feature is an `Err`; success means the emitted object lifts back, preserves
 /// the body words exactly, and passes the shared certifier as an HSA program.
-pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Result<AcoHsaEmission, AcoError> {
+pub fn adapt_to_hsa(
+    raw: &StaticCertificate,
+    contract: &AcoHipContract,
+) -> Result<AcoHsaEmission, AcoError> {
     contract.validate()?;
     if raw.report.domain != IdentityDomain::Raw || raw.report.frontend != Frontend::Aco {
-        return Err(AcoError::Certificate("the input certificate is not a raw ACO certificate".into()));
+        return Err(AcoError::Certificate(
+            "the input certificate is not a raw ACO certificate".into(),
+        ));
     }
     if !raw.analyzed.obligations.is_empty() || !raw.report.obligations.is_empty() {
-        return Err(AcoError::Certificate("the raw certificate carries open obligations".into()));
+        return Err(AcoError::Certificate(
+            "the raw certificate carries open obligations".into(),
+        ));
     }
     let program = &raw.analyzed.program;
     let arch = program.target.arch;
@@ -653,56 +1027,131 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
         return Err(AcoError::Unsupported(format!("{arch:?}: the adapter's entry model (ttmp work-group ids, packed v0, SMEM kernarg loads) is the gfx1201 one")));
     }
     if program.target != contract.target {
-        return Err(AcoError::Mismatch(format!("contract target {:?} but the raw program is {:?}", contract.target, program.target)));
+        return Err(AcoError::Mismatch(format!(
+            "contract target {:?} but the raw program is {:?}",
+            contract.target, program.target
+        )));
     }
     if contract.target.xnack != Setting::Any || contract.target.sramecc != Setting::Any {
-        return Err(AcoError::Unsupported("the native writer emits an object with no xnack/sramecc feature selection".into()));
+        return Err(AcoError::Unsupported(
+            "the native writer emits an object with no xnack/sramecc feature selection".into(),
+        ));
     }
-    let kernel = program.kernels.iter().find(|k| k.symbol == contract.raw_symbol)
-        .ok_or_else(|| AcoError::Mismatch(format!("raw program has no kernel {}", contract.raw_symbol.0)))?;
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| k.symbol == contract.raw_symbol)
+        .ok_or_else(|| {
+            AcoError::Mismatch(format!(
+                "raw program has no kernel {}",
+                contract.raw_symbol.0
+            ))
+        })?;
     match &kernel.origin {
-        KernelOrigin::Frontend { kind: Frontend::Aco, object_sha256, .. } => {
-            if *object_sha256 != contract.raw_binary_sha256 || raw.proof.input_sha256 != contract.raw_binary_sha256 {
-                return Err(AcoError::Mismatch("the contract's whole-binary hash is not the lifted shader.bin hash".into()));
+        KernelOrigin::Frontend {
+            kind: Frontend::Aco,
+            object_sha256,
+            ..
+        } => {
+            if *object_sha256 != contract.raw_binary_sha256
+                || raw.proof.input_sha256 != contract.raw_binary_sha256
+            {
+                return Err(AcoError::Mismatch(
+                    "the contract's whole-binary hash is not the lifted shader.bin hash".into(),
+                ));
             }
         }
-        other => return Err(AcoError::Certificate(format!("kernel origin {other:?} is not an ACO frontend import"))),
+        other => {
+            return Err(AcoError::Certificate(format!(
+                "kernel origin {other:?} is not an ACO frontend import"
+            )))
+        }
     }
-    let Abi::Raw(raw_abi) = &kernel.abi else { return Err(AcoError::Certificate("the kernel is not a raw (non-HSA) kernel".into())) };
-    if kernel.wave != Wave::Wave32 || raw_abi.wave != Wave::Wave32 || contract.wave != Wave::Wave32 {
-        return Err(AcoError::Unsupported("wave64: the native descriptor writer emits wave32 kernels only".into()));
+    let Abi::Raw(raw_abi) = &kernel.abi else {
+        return Err(AcoError::Certificate(
+            "the kernel is not a raw (non-HSA) kernel".into(),
+        ));
+    };
+    if kernel.wave != Wave::Wave32 || raw_abi.wave != Wave::Wave32 || contract.wave != Wave::Wave32
+    {
+        return Err(AcoError::Unsupported(
+            "wave64: the native descriptor writer emits wave32 kernels only".into(),
+        ));
     }
 
     // ---- contract vs raw shader config ------------------------------------------------
-    if raw_abi.fp != contract.fp { return Err(AcoError::Mismatch(format!("FP/mode state: contract {:?}, raw {:?}", contract.fp, raw_abi.fp))) }
-    if raw_abi.resources != contract.resources { return Err(AcoError::Mismatch(format!("resources: contract {:?}, raw {:?}", contract.resources, raw_abi.resources))) }
-    if raw_abi.sidecar_sha256 != contract.sidecar_sha256 { return Err(AcoError::Mismatch("sidecar hash differs from the contract".into())) }
+    if raw_abi.fp != contract.fp {
+        return Err(AcoError::Mismatch(format!(
+            "FP/mode state: contract {:?}, raw {:?}",
+            contract.fp, raw_abi.fp
+        )));
+    }
+    if raw_abi.resources != contract.resources {
+        return Err(AcoError::Mismatch(format!(
+            "resources: contract {:?}, raw {:?}",
+            contract.resources, raw_abi.resources
+        )));
+    }
+    if raw_abi.sidecar_sha256 != contract.sidecar_sha256 {
+        return Err(AcoError::Mismatch(
+            "sidecar hash differs from the contract".into(),
+        ));
+    }
     if contract.aperture != Aperture::Global64 {
         return Err(AcoError::Unsupported(format!("aperture {:?} is not representable on HIP VMM; supporting it needs a byte-oracle-gated address-lowering change, not a pointer fallback", contract.aperture)));
     }
-    if contract.dynamic_lds_max != 0 { return Err(AcoError::Unsupported("dynamic LDS: a lifted kernel carries no dynamic-LDS bound".into())) }
-    if raw_abi.resources.scratch_bytes_per_lane != 0 { return Err(AcoError::Unsupported(format!("scratch {} bytes per lane", raw_abi.resources.scratch_bytes_per_lane))) }
-    if !raw_abi.relocations.is_empty() { return Err(AcoError::Unsupported(format!("{} relocation(s): none are resolved by the adapter", raw_abi.relocations.len()))) }
+    if contract.dynamic_lds_max != 0 {
+        return Err(AcoError::Unsupported(
+            "dynamic LDS: a lifted kernel carries no dynamic-LDS bound".into(),
+        ));
+    }
+    if raw_abi.resources.scratch_bytes_per_lane != 0 {
+        return Err(AcoError::Unsupported(format!(
+            "scratch {} bytes per lane",
+            raw_abi.resources.scratch_bytes_per_lane
+        )));
+    }
+    if !raw_abi.relocations.is_empty() {
+        return Err(AcoError::Unsupported(format!(
+            "{} relocation(s): none are resolved by the adapter",
+            raw_abi.relocations.len()
+        )));
+    }
     if raw_abi.fp.dx10_clamp || raw_abi.fp.ieee_mode {
-        return Err(AcoError::Unsupported("DX10_CLAMP/IEEE_MODE: the gfx12 kernel descriptor has no field that sets them".into()));
+        return Err(AcoError::Unsupported(
+            "DX10_CLAMP/IEEE_MODE: the gfx12 kernel descriptor has no field that sets them".into(),
+        ));
     }
     if raw_abi.fp.exceptions & !0x7f != 0 {
         return Err(AcoError::Unsupported(format!("exception enables {:#x}: bits 7-8 (address watch, memory violation) have no HSA descriptor directive", raw_abi.fp.exceptions)));
     }
 
     // ---- the body: typed re-encode, hashed, compared ---------------------------------
-    let body_words = emit::words(kernel, arch).map_err(|e| AcoError::Body(format!("typed re-encode of the raw body: {e}")))?;
+    let body_words = emit::words(kernel, arch)
+        .map_err(|e| AcoError::Body(format!("typed re-encode of the raw body: {e}")))?;
     let body_bytes: Vec<u8> = body_words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let body_sha256 = sha256(&body_bytes);
     if body_sha256 != contract.raw_exec_sha256 {
-        return Err(AcoError::Body(format!("re-encoded body {} is not the contract's raw executable {}", hex(&body_sha256), hex(&contract.raw_exec_sha256))));
+        return Err(AcoError::Body(format!(
+            "re-encoded body {} is not the contract's raw executable {}",
+            hex(&body_sha256),
+            hex(&contract.raw_exec_sha256)
+        )));
     }
     match raw.proof.streams.as_slice() {
         [s] if s.stream_sha256 == body_sha256 && s.size == body_bytes.len() as u64 => {}
-        other => return Err(AcoError::Body(format!("the round-trip proof does not bind exactly this body stream: {other:?}"))),
+        other => {
+            return Err(AcoError::Body(format!(
+                "the round-trip proof does not bind exactly this body stream: {other:?}"
+            )))
+        }
     }
     for id in &kernel.body.layout {
-        let inst = kernel.body.insts.get(*id).ok_or_else(|| AcoError::Body("layout names a tombstone".into()))?;
+        let inst = kernel
+            .body
+            .insts
+            .get(*id)
+            .ok_or_else(|| AcoError::Body("layout names a tombstone".into()))?;
         match inst.op.name(arch) {
             Some(name @ ("s_getpc_b64" | "s_setpc_b64" | "s_swappc_b64" | "s_call_b64")) =>
                 return Err(AcoError::Unsupported(format!("{name}: PC-relative or indirect control flow needs exact symbol resolution the adapter does not do"))),
@@ -712,15 +1161,28 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
         }
     }
     let summary = summarize(&kernel.body, arch, kernel.wave, raw_abi.resources.lds_bytes);
-    if summary.uses_flat_scratch { return Err(AcoError::Unsupported("the body names flat scratch".into())) }
+    if summary.uses_flat_scratch {
+        return Err(AcoError::Unsupported("the body names flat scratch".into()));
+    }
     if u32::from(summary.max_vgpr) > u32::from(raw_abi.resources.vgprs_allocated) {
-        return Err(AcoError::Mismatch(format!("body uses {} VGPRs, the shader config allocates {}", summary.max_vgpr, raw_abi.resources.vgprs_allocated)));
+        return Err(AcoError::Mismatch(format!(
+            "body uses {} VGPRs, the shader config allocates {}",
+            summary.max_vgpr, raw_abi.resources.vgprs_allocated
+        )));
     }
     if summary.max_vgpr > raw_abi.resources.vgprs_actual {
-        return Err(AcoError::Mismatch(format!("body uses {} VGPRs, the shader config reports {} actual", summary.max_vgpr, raw_abi.resources.vgprs_actual)));
+        return Err(AcoError::Mismatch(format!(
+            "body uses {} VGPRs, the shader config reports {} actual",
+            summary.max_vgpr, raw_abi.resources.vgprs_actual
+        )));
     }
     if summary.max_sgpr > raw_abi.resources.ordinary_sgprs_allocated() {
-        return Err(AcoError::Mismatch(format!("body uses {} ordinary SGPRs, the shader config allocates {} (physical {})", summary.max_sgpr, raw_abi.resources.ordinary_sgprs_allocated(), raw_abi.resources.sgprs_allocated)));
+        return Err(AcoError::Mismatch(format!(
+            "body uses {} ordinary SGPRs, the shader config allocates {} (physical {})",
+            summary.max_sgpr,
+            raw_abi.resources.ordinary_sgprs_allocated(),
+            raw_abi.resources.sgprs_allocated
+        )));
     }
 
     // ---- entry facts: every one is hardware-identical or contract-bound ---------------
@@ -728,7 +1190,10 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
     let mut s_facts: BTreeMap<u16, &EntryValue> = BTreeMap::new();
     let mut wg_ttmp = [false; 3];
     let mut local_ids = None;
-    for (cell, fact) in raw_abi.entry_cells().map_err(|e| AcoError::Entry(format!("malformed entry facts: {e}")))? {
+    for (cell, fact) in raw_abi
+        .entry_cells()
+        .map_err(|e| AcoError::Entry(format!("malformed entry facts: {e}")))?
+    {
         match (cell, &fact.value) {
             (EntryCell::Sgpr(n), v) => { s_facts.insert(n, v); }
             (EntryCell::Ttmp(9), EntryValue::WorkgroupId(Axis::X)) => { wg_ttmp[0] = true; hardware.push("ttmp9 = work-group id x".into()) }
@@ -749,25 +1214,47 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
                         return Err(AcoError::Entry(format!("local id {axis:?} is packed at shift {} width {}; HSA gfx12 v0 packs 10 bits at {}", f.shift, f.bits, 10 * i)));
                     }
                     if contract.shape.block[i] - 1 > f.max {
-                        return Err(AcoError::Entry(format!("block {:?} exceeds the declared local id {axis:?} bound {}", contract.shape.block, f.max)));
+                        return Err(AcoError::Entry(format!(
+                            "block {:?} exceeds the declared local id {axis:?} bound {}",
+                            contract.shape.block, f.max
+                        )));
                     }
                     workitem_id = workitem_id.max(i as u32);
                 }
                 None if contract.shape.block[i] != 1 => {
-                    return Err(AcoError::Entry(format!("local id {axis:?} is not packed but the block has {} items along it", contract.shape.block[i])));
+                    return Err(AcoError::Entry(format!(
+                        "local id {axis:?} is not packed but the block has {} items along it",
+                        contract.shape.block[i]
+                    )));
                 }
                 None => {}
             }
         }
     }
-    let scalar_value = |arg: usize| contract.shape.scalars.iter().find(|(a, _)| *a == arg).map(|(_, v)| *v);
+    let scalar_value = |arg: usize| {
+        contract
+            .shape
+            .scalars
+            .iter()
+            .find(|(a, _)| *a == arg)
+            .map(|(_, v)| *v)
+    };
     let mut covered: BTreeMap<u16, usize> = BTreeMap::new();
     for (i, b) in contract.bindings.iter().enumerate() {
-        for n in b.dst.base..b.dst.base + u16::from(b.dst.len) { covered.insert(n, i); }
+        for n in b.dst.base..b.dst.base + u16::from(b.dst.len) {
+            covered.insert(n, i);
+        }
     }
     let live = Liveness::analyze(&kernel.body);
-    let first = *kernel.body.layout.first().ok_or_else(|| AcoError::Body("empty body".into()))?;
-    let live_at_entry = live.live_before(first).ok_or_else(|| AcoError::Body("no liveness at the first instruction".into()))?.clone();
+    let first = *kernel
+        .body
+        .layout
+        .first()
+        .ok_or_else(|| AcoError::Body("empty body".into()))?;
+    let live_at_entry = live
+        .live_before(first)
+        .ok_or_else(|| AcoError::Body("no liveness at the first instruction".into()))?
+        .clone();
     let mut unbound_dead: Vec<u16> = Vec::new();
     let mut wg_sgpr = [false; 3];
     for (n, value) in &s_facts {
@@ -783,108 +1270,231 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
         };
         let source = contract.bindings[bi].source;
         let ok = match (*value, source) {
-            (EntryValue::Defined, BindingSource::KernargPointer { .. } | BindingSource::KernargScalar { .. }) => true,
-            (EntryValue::Bounded { min, max }, BindingSource::KernargScalar { arg }) =>
-                scalar_value(arg).is_some_and(|v| u64::from(*min) <= v && v <= u64::from(*max)),
-            (EntryValue::Exact(x), BindingSource::KernargScalar { arg }) => scalar_value(arg) == Some(u64::from(*x)),
-            (EntryValue::WorkgroupId(a), BindingSource::WorkgroupId(b)) if *a == b => { wg_sgpr[b as usize] = true; true }
+            (
+                EntryValue::Defined,
+                BindingSource::KernargPointer { .. } | BindingSource::KernargScalar { .. },
+            ) => true,
+            (EntryValue::Bounded { min, max }, BindingSource::KernargScalar { arg }) => {
+                scalar_value(arg).is_some_and(|v| u64::from(*min) <= v && v <= u64::from(*max))
+            }
+            (EntryValue::Exact(x), BindingSource::KernargScalar { arg }) => {
+                scalar_value(arg) == Some(u64::from(*x))
+            }
+            (EntryValue::WorkgroupId(a), BindingSource::WorkgroupId(b)) if *a == b => {
+                wg_sgpr[b as usize] = true;
+                true
+            }
             (EntryValue::Exact(x), BindingSource::Constant(c)) => *x == c,
             _ => false,
         };
-        if !ok { return Err(AcoError::Entry(format!("s{n}: entry fact {value:?} is not satisfied by binding {source:?}"))) }
+        if !ok {
+            return Err(AcoError::Entry(format!(
+                "s{n}: entry fact {value:?} is not satisfied by binding {source:?}"
+            )));
+        }
     }
-    for n in &unbound_dead { hardware.push(format!("s{n} = declared entry value, unbound and dead (overwritten before any read)")) }
+    for n in &unbound_dead {
+        hardware.push(format!(
+            "s{n} = declared entry value, unbound and dead (overwritten before any read)"
+        ))
+    }
     if let Some(n) = covered.keys().find(|n| !s_facts.contains_key(*n)) {
-        return Err(AcoError::Entry(format!("a binding writes s{n}, which the raw entry facts do not define")));
+        return Err(AcoError::Entry(format!(
+            "a binding writes s{n}, which the raw entry facts do not define"
+        )));
     }
-    let mut need_wg = [wg_ttmp[0] || wg_sgpr[0], wg_ttmp[1] || wg_sgpr[1], wg_sgpr[2]];
-    if wg_ttmp[1] && contract.shape.grid[2] > 1 { need_wg[2] = true }
-
+    let mut need_wg = [
+        wg_ttmp[0] || wg_sgpr[0],
+        wg_ttmp[1] || wg_sgpr[1],
+        wg_sgpr[2],
+    ];
+    if wg_ttmp[1] && contract.shape.grid[2] > 1 {
+        need_wg[2] = true
+    }
 
     // ---- prologue plan, temporaries from liveness ------------------------------------
-    let free = live.free_at(&kernel.body, LivePoint { block: BlockId(0), before: Some(first) }).0;
+    let free = live
+        .free_at(
+            &kernel.body,
+            LivePoint {
+                block: BlockId(0),
+                before: Some(first),
+            },
+        )
+        .0;
     let copy_needed = covered.contains_key(&0) || covered.contains_key(&1);
     let (kernarg_base, temps) = if copy_needed {
         let t = (2u16..105).step_by(2)
             .find(|&t| !covered.contains_key(&t) && !covered.contains_key(&(t + 1)) && is_free_sgpr(&free, t) && is_free_sgpr(&free, t + 1))
             .ok_or_else(|| AcoError::Prologue("no even SGPR pair is both free at the body entry (liveness) and unbound by the contract to hold the kernarg pointer".into()))?;
-        let pair = RegRef { kind: Kind::S, base: t, len: 2 };
+        let pair = RegRef {
+            kind: Kind::S,
+            base: t,
+            len: 2,
+        };
         (pair, vec![pair])
     } else {
-        (RegRef { kind: Kind::S, base: 0, len: 2 }, Vec::new())
+        (
+            RegRef {
+                kind: Kind::S,
+                base: 0,
+                len: 2,
+            },
+            Vec::new(),
+        )
     };
     let mut lines: Vec<String> = Vec::new();
     let mut writes: Vec<RegRef> = temps.clone();
-    if copy_needed { lines.push(format!("s_mov_b64 {}, s[0:1]", sgprs(kernarg_base.base, 2))) }
+    if copy_needed {
+        lines.push(format!("s_mov_b64 {}, s[0:1]", sgprs(kernarg_base.base, 2)))
+    }
     let mut dwords: Vec<(u16, u32)> = Vec::new();
     for b in &contract.bindings {
-        let arg = match b.source { BindingSource::KernargPointer { arg } | BindingSource::KernargScalar { arg } => arg, _ => continue };
+        let arg = match b.source {
+            BindingSource::KernargPointer { arg } | BindingSource::KernargScalar { arg } => arg,
+            _ => continue,
+        };
         let a = &contract.args[arg];
-        for j in 0..u32::from(b.dst.len) { dwords.push((b.dst.base + j as u16, a.offset + 4 * j)) }
+        for j in 0..u32::from(b.dst.len) {
+            dwords.push((b.dst.base + j as u16, a.offset + 4 * j))
+        }
     }
     dwords.sort_unstable();
     let loads = !dwords.is_empty();
     for (dst, offset, n) in load_runs(&dwords) {
-        lines.push(format!("s_load_b{} {}, s[{}:{}], {:#x}", 32 * u32::from(n), sgprs(dst, n), kernarg_base.base, kernarg_base.base + 1, offset));
+        lines.push(format!(
+            "s_load_b{} {}, s[{}:{}], {:#x}",
+            32 * u32::from(n),
+            sgprs(dst, n),
+            kernarg_base.base,
+            kernarg_base.base + 1,
+            offset
+        ));
     }
     for b in &contract.bindings {
         let s = b.dst.base;
         match b.source {
             BindingSource::WorkgroupId(Axis::X) => lines.push(format!("s_mov_b32 s{s}, ttmp9")),
-            BindingSource::WorkgroupId(Axis::Y) => lines.push(format!("s_and_b32 s{s}, ttmp7, 0xffff")),
-            BindingSource::WorkgroupId(Axis::Z) => lines.push(format!("s_lshr_b32 s{s}, ttmp7, 16")),
+            BindingSource::WorkgroupId(Axis::Y) => {
+                lines.push(format!("s_and_b32 s{s}, ttmp7, 0xffff"))
+            }
+            BindingSource::WorkgroupId(Axis::Z) => {
+                lines.push(format!("s_lshr_b32 s{s}, ttmp7, 16"))
+            }
             BindingSource::Constant(c) => lines.push(format!("s_mov_b32 s{s}, {c:#x}")),
             BindingSource::KernargPointer { .. } | BindingSource::KernargScalar { .. } => {}
         }
         writes.push(b.dst);
     }
-    if loads { lines.push("s_wait_kmcnt 0x0".into()) }
+    if loads {
+        lines.push("s_wait_kmcnt 0x0".into())
+    }
     let mut prologue: Vec<u32> = Vec::new();
     for line in &lines {
-        let inst = parse_line(line, IrArch::Gfx1201).map_err(|e| AcoError::Prologue(format!("{line}: {e}")))?;
-        let words = gfx12::encode_for(IrArch::Gfx1201, &inst).map_err(|e| AcoError::Prologue(format!("{line}: {e}")))?;
+        let inst = parse_line(line, IrArch::Gfx1201)
+            .map_err(|e| AcoError::Prologue(format!("{line}: {e}")))?;
+        let words = gfx12::encode_for(IrArch::Gfx1201, &inst)
+            .map_err(|e| AcoError::Prologue(format!("{line}: {e}")))?;
         prologue.extend_from_slice(&words);
     }
-    let prologue_sgpr_hi = writes.iter().map(|r| r.base + u16::from(r.len)).max().unwrap_or(0);
+    let prologue_sgpr_hi = writes
+        .iter()
+        .map(|r| r.base + u16::from(r.len))
+        .max()
+        .unwrap_or(0);
 
     // ---- descriptor and metadata, from the shader config and the contract -------------
     // `ns` counts the ordinary file (s0..s105) only; the driver's physical 107/108 (VCC_LO/HI) stays in metadata sgpr_count.
-    let ns = summary.max_sgpr.max(prologue_sgpr_hi).max(raw_abi.resources.ordinary_sgprs_actual());
-    if ns > RawResources::ORDINARY_SGPRS { return Err(AcoError::Mismatch(format!("{ns} ordinary SGPRs exceed the {} a wave can address", RawResources::ORDINARY_SGPRS))) }
+    let ns = summary
+        .max_sgpr
+        .max(prologue_sgpr_hi)
+        .max(raw_abi.resources.ordinary_sgprs_actual());
+    if ns > RawResources::ORDINARY_SGPRS {
+        return Err(AcoError::Mismatch(format!(
+            "{ns} ordinary SGPRs exceed the {} a wave can address",
+            RawResources::ORDINARY_SGPRS
+        )));
+    }
     let nv = raw_abi.resources.vgprs_allocated.max(1);
     let fp = &raw_abi.fp;
     let mut d: Vec<(&str, u64)> = vec![
-        ("group_segment_fixed_size", u64::from(raw_abi.resources.lds_bytes)), ("private_segment_fixed_size", 0), ("kernarg_size", u64::from(contract.kernarg_size)),
-        ("user_sgpr_count", 2), ("user_sgpr_dispatch_ptr", 0), ("user_sgpr_queue_ptr", 0), ("user_sgpr_kernarg_segment_ptr", 1), ("user_sgpr_dispatch_id", 0),
-        ("user_sgpr_private_segment_size", 0), ("wavefront_size32", 1), ("uses_dynamic_stack", 0), ("enable_private_segment", 0),
-        ("system_sgpr_workgroup_id_x", u64::from(need_wg[0])), ("system_sgpr_workgroup_id_y", u64::from(need_wg[1])), ("system_sgpr_workgroup_id_z", u64::from(need_wg[2])),
-        ("system_sgpr_workgroup_info", 0), ("system_vgpr_workitem_id", u64::from(workitem_id)),
-        ("next_free_vgpr", u64::from(nv)), ("next_free_sgpr", u64::from(ns)), ("reserve_vcc", u64::from(summary.uses_vcc)),
-        ("float_round_mode_32", u64::from(fp.round32)), ("float_round_mode_16_64", u64::from(fp.round16_64)),
-        ("float_denorm_mode_32", u64::from(fp.denorm32)), ("float_denorm_mode_16_64", u64::from(fp.denorm16_64)),
-        ("fp16_overflow", u64::from(fp.fp16_overflow)), ("workgroup_processor_mode", u64::from(fp.wgp_mode)),
-        ("memory_ordered", u64::from(fp.mem_ordered)), ("forward_progress", u64::from(fp.forward_progress)),
+        (
+            "group_segment_fixed_size",
+            u64::from(raw_abi.resources.lds_bytes),
+        ),
+        ("private_segment_fixed_size", 0),
+        ("kernarg_size", u64::from(contract.kernarg_size)),
+        ("user_sgpr_count", 2),
+        ("user_sgpr_dispatch_ptr", 0),
+        ("user_sgpr_queue_ptr", 0),
+        ("user_sgpr_kernarg_segment_ptr", 1),
+        ("user_sgpr_dispatch_id", 0),
+        ("user_sgpr_private_segment_size", 0),
+        ("wavefront_size32", 1),
+        ("uses_dynamic_stack", 0),
+        ("enable_private_segment", 0),
+        ("system_sgpr_workgroup_id_x", u64::from(need_wg[0])),
+        ("system_sgpr_workgroup_id_y", u64::from(need_wg[1])),
+        ("system_sgpr_workgroup_id_z", u64::from(need_wg[2])),
+        ("system_sgpr_workgroup_info", 0),
+        ("system_vgpr_workitem_id", u64::from(workitem_id)),
+        ("next_free_vgpr", u64::from(nv)),
+        ("next_free_sgpr", u64::from(ns)),
+        ("reserve_vcc", u64::from(summary.uses_vcc)),
+        ("float_round_mode_32", u64::from(fp.round32)),
+        ("float_round_mode_16_64", u64::from(fp.round16_64)),
+        ("float_denorm_mode_32", u64::from(fp.denorm32)),
+        ("float_denorm_mode_16_64", u64::from(fp.denorm16_64)),
+        ("fp16_overflow", u64::from(fp.fp16_overflow)),
+        ("workgroup_processor_mode", u64::from(fp.wgp_mode)),
+        ("memory_ordered", u64::from(fp.mem_ordered)),
+        ("forward_progress", u64::from(fp.forward_progress)),
         ("round_robin_scheduling", u64::from(fp.wg_round_robin)),
     ];
-    for (bit, name) in ["fp_ieee_invalid_op", "fp_denorm_src", "fp_ieee_div_zero", "fp_ieee_overflow", "fp_ieee_underflow", "fp_ieee_inexact", "int_div_zero"].iter().enumerate() {
+    for (bit, name) in [
+        "fp_ieee_invalid_op",
+        "fp_denorm_src",
+        "fp_ieee_div_zero",
+        "fp_ieee_overflow",
+        "fp_ieee_underflow",
+        "fp_ieee_inexact",
+        "int_div_zero",
+    ]
+    .iter()
+    .enumerate()
+    {
         d.push((*name, u64::from(fp.exceptions >> bit & 1)));
     }
-    let directives: Vec<(String, String)> = d.iter().map(|(n, v)| {
-        let name = if n.starts_with("fp_") || *n == "int_div_zero" { format!(".amdhsa_exception_{n}") } else { format!(".amdhsa_{n}") };
-        (name, v.to_string())
-    }).collect();
+    let directives: Vec<(String, String)> = d
+        .iter()
+        .map(|(n, v)| {
+            let name = if n.starts_with("fp_") || *n == "int_div_zero" {
+                format!(".amdhsa_exception_{n}")
+            } else {
+                format!(".amdhsa_{n}")
+            };
+            (name, v.to_string())
+        })
+        .collect();
     let symbol = contract.hip_symbol.as_str();
     let mut yaml = String::from("amdhsa.kernels:\n  - .args:\n");
     for a in &contract.args {
         let (access, space, value_kind) = match &a.kind {
-            HipArgKind::GlobalPointer { access, .. } => (access.map(Access::name), Some("global"), "global_buffer"),
+            HipArgKind::GlobalPointer { access, .. } => {
+                (access.map(Access::name), Some("global"), "global_buffer")
+            }
             HipArgKind::ByValue => (None, None, "by_value"),
         };
         let mut lead = "      - ";
         for (key, value) in [(".actual_access", access), (".address_space", space)] {
-            if let Some(v) = value { yaml.push_str(&format!("{lead}{key}: {v}\n")); lead = "        " }
+            if let Some(v) = value {
+                yaml.push_str(&format!("{lead}{key}: {v}\n"));
+                lead = "        "
+            }
         }
-        if lead == "      - " { yaml.push_str("      - \n") }
+        if lead == "      - " {
+            yaml.push_str("      - \n")
+        }
         yaml.push_str(&format!("        .name: {}\n        .offset: {}\n        .size: {}\n        .value_kind: {value_kind}\n", a.name, a.offset, a.size));
     }
     let threads: u32 = contract.shape.block.iter().product();
@@ -898,43 +1508,114 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
     // ---- link, find the ranges, lift back, certify -----------------------------------
     let mut words = prologue.clone();
     words.extend_from_slice(&body_words);
-    let elf = native::link_encoded(&[EncodedKernel { symbol, words: &words, directives: &directives }], &yaml, crate::Arch::Gfx1201).map_err(AcoError::Emit)?;
-    let (text_offset, text_size) = text_section(&elf).map_err(|e| AcoError::Emit(format!("locating the code: {e}")))?;
+    let elf = native::link_encoded(
+        &[EncodedKernel {
+            symbol,
+            words: &words,
+            directives: &directives,
+        }],
+        &yaml,
+        crate::Arch::Gfx1201,
+    )
+    .map_err(AcoError::Emit)?;
+    let (text_offset, text_size) =
+        text_section(&elf).map_err(|e| AcoError::Emit(format!("locating the code: {e}")))?;
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    if text_size < code.len() || elf.get(text_offset..text_offset + code.len()) != Some(code.as_slice()) {
-        return Err(AcoError::Emit("the object's .text does not begin with prologue ++ body".into()));
+    if text_size < code.len()
+        || elf.get(text_offset..text_offset + code.len()) != Some(code.as_slice())
+    {
+        return Err(AcoError::Emit(
+            "the object's .text does not begin with prologue ++ body".into(),
+        ));
     }
     let prologue_len = 4 * prologue.len();
-    let prologue_range = CodeRange { offset: text_offset as u64, len: prologue_len as u64, sha256: sha256(&code[..prologue_len]) };
-    let body_range = CodeRange { offset: (text_offset + prologue_len) as u64, len: body_bytes.len() as u64, sha256: sha256(&elf[text_offset + prologue_len..text_offset + code.len()]) };
-    if body_range.sha256 != body_sha256 { return Err(AcoError::Emit("the extracted body differs from the raw body".into())) }
-
-    let relifted = lift_object(&elf, Options { frontend: Frontend::Aco }).map_err(|e| AcoError::Relift(e.to_string()))?;
-    let [back] = relifted.program.kernels.as_slice() else { return Err(AcoError::Relift("the emitted object does not hold exactly one kernel".into())) };
-    if back.symbol.0 != symbol { return Err(AcoError::Relift(format!("relifted symbol {} is not {symbol}", back.symbol.0))) }
-    // The HSA identity domain: same arch/xnack/sramecc as the raw target, code object v6.
-    let hsa_target = Target { arch: contract.target.arch, xnack: contract.target.xnack, sramecc: contract.target.sramecc, abi_version: 6 };
-    if relifted.program.target != hsa_target {
-        return Err(AcoError::Relift(format!("the emitted object's target {:?} is not the HSA target {hsa_target:?}", relifted.program.target)));
+    let prologue_range = CodeRange {
+        offset: text_offset as u64,
+        len: prologue_len as u64,
+        sha256: sha256(&code[..prologue_len]),
+    };
+    let body_range = CodeRange {
+        offset: (text_offset + prologue_len) as u64,
+        len: body_bytes.len() as u64,
+        sha256: sha256(&elf[text_offset + prologue_len..text_offset + code.len()]),
+    };
+    if body_range.sha256 != body_sha256 {
+        return Err(AcoError::Emit(
+            "the extracted body differs from the raw body".into(),
+        ));
     }
-    let back_words = emit::words(back, arch).map_err(|e| AcoError::Relift(format!("re-encode of the relifted kernel: {e}")))?;
-    if back_words != words { return Err(AcoError::Relift("the relifted stream is not prologue ++ body".into())) }
+
+    let relifted = lift_object(
+        &elf,
+        Options {
+            frontend: Frontend::Aco,
+        },
+    )
+    .map_err(|e| AcoError::Relift(e.to_string()))?;
+    let [back] = relifted.program.kernels.as_slice() else {
+        return Err(AcoError::Relift(
+            "the emitted object does not hold exactly one kernel".into(),
+        ));
+    };
+    if back.symbol.0 != symbol {
+        return Err(AcoError::Relift(format!(
+            "relifted symbol {} is not {symbol}",
+            back.symbol.0
+        )));
+    }
+    // The HSA identity domain: same arch/xnack/sramecc as the raw target, code object v6.
+    let hsa_target = Target {
+        arch: contract.target.arch,
+        xnack: contract.target.xnack,
+        sramecc: contract.target.sramecc,
+        abi_version: 6,
+    };
+    if relifted.program.target != hsa_target {
+        return Err(AcoError::Relift(format!(
+            "the emitted object's target {:?} is not the HSA target {hsa_target:?}",
+            relifted.program.target
+        )));
+    }
+    let back_words = emit::words(back, arch)
+        .map_err(|e| AcoError::Relift(format!("re-encode of the relifted kernel: {e}")))?;
+    if back_words != words {
+        return Err(AcoError::Relift(
+            "the relifted stream is not prologue ++ body".into(),
+        ));
+    }
     let shift = lines.len();
-    let raw_ends: BTreeSet<usize> = kernel.body.blocks.iter().map(|b| b.range.1 + shift).collect();
+    let raw_ends: BTreeSet<usize> = kernel
+        .body
+        .blocks
+        .iter()
+        .map(|b| b.range.1 + shift)
+        .collect();
     let mut back_ends: BTreeSet<usize> = back.body.blocks.iter().map(|b| b.range.1).collect();
-    if shift > 0 { back_ends.remove(&shift); }
+    if shift > 0 {
+        back_ends.remove(&shift);
+    }
     if raw_ends != back_ends {
-        return Err(AcoError::Relift(format!("block boundaries moved: raw {raw_ends:?} (shifted by {shift}), emitted {back_ends:?}")));
+        return Err(AcoError::Relift(format!(
+            "block boundaries moved: raw {raw_ends:?} (shifted by {shift}), emitted {back_ends:?}"
+        )));
     }
     let launch = LaunchContract {
-        grid: contract.shape.grid, block: contract.shape.block, dynamic_lds_max: 0,
-        bound_inputs: contract.args.iter().filter_map(|a| match &a.kind {
-            HipArgKind::GlobalPointer { extent_bytes, .. } => Some((a.name.clone(), *extent_bytes)),
-            HipArgKind::ByValue => None,
-        }).collect(),
+        grid: contract.shape.grid,
+        block: contract.shape.block,
+        dynamic_lds_max: 0,
+        bound_inputs: contract
+            .args
+            .iter()
+            .filter_map(|a| match &a.kind {
+                HipArgKind::GlobalPointer { extent_bytes, .. } => {
+                    Some((a.name.clone(), *extent_bytes))
+                }
+                HipArgKind::ByValue => None,
+            })
+            .collect(),
     };
-    let hsa_certificate = certify_program(relifted, &SymbolId(symbol.to_owned()), &launch).map_err(AcoError::Certify)?;
-
+    let hsa_certificate = certify_program(relifted, &SymbolId(symbol.to_owned()), &launch)
+        .map_err(AcoError::Certify)?;
 
     let proof = AdapterProof {
         adapter_version: ADAPTER_VERSION,
@@ -982,7 +1663,13 @@ pub fn adapt_to_hsa(raw: &StaticCertificate, contract: &AcoHipContract) -> Resul
 /// Schema of the producer's `artifact.json`.
 pub const ARTIFACT_SCHEMA: &str = "pm-aco-artifact-v1";
 /// Files an artifact must list and carry (all others it lists are hashed too).
-const REQUIRED_FILES: [&str; 5] = ["shader.spv", "shader.bin", "shader.abi.json", "shader.rawspec.json", "shader.aco.dump"];
+const REQUIRED_FILES: [&str; 5] = [
+    "shader.spv",
+    "shader.bin",
+    "shader.abi.json",
+    "shader.rawspec.json",
+    "shader.aco.dump",
+];
 
 /// What `verify_artifact_dir` proved: every hash below was recomputed from the bytes on disk and
 /// equals the one `artifact.json` records.
@@ -1007,25 +1694,45 @@ pub struct ArtifactBinding {
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) { return None }
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let mut out = [0u8; 32];
-    for (i, o) in out.iter_mut().enumerate() { *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?; }
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
     Some(out)
 }
 
-fn list_files(root: &std::path::Path, dir: &std::path::Path, out: &mut BTreeSet<String>) -> Result<(), AcoError> {
+fn list_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut BTreeSet<String>,
+) -> Result<(), AcoError> {
     let bad = |m: String| AcoError::Artifact(m);
     for entry in std::fs::read_dir(dir).map_err(|e| bad(format!("{}: {e}", dir.display())))? {
         let entry = entry.map_err(|e| bad(format!("{}: {e}", dir.display())))?;
-        let kind = entry.file_type().map_err(|e| bad(format!("{}: {e}", entry.path().display())))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| bad(format!("{}: {e}", entry.path().display())))?;
         let path = entry.path();
         if kind.is_dir() {
             list_files(root, &path, out)?;
         } else if kind.is_file() {
-            let rel = path.strip_prefix(root).map_err(|_| bad("file outside the artifact directory".into()))?;
-            out.insert(rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| bad("file outside the artifact directory".into()))?;
+            out.insert(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
         } else {
-            return Err(bad(format!("{} is neither a regular file nor a directory", path.display())));
+            return Err(bad(format!(
+                "{} is neither a regular file nor a directory",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -1039,54 +1746,121 @@ fn list_files(root: &std::path::Path, dir: &std::path::Path, out: &mut BTreeSet<
 /// edited rawspec (entry facts, FP, resources) cannot ride on an unchanged sidecar hash.
 pub fn verify_artifact_dir(dir: &std::path::Path) -> Result<ArtifactBinding, AcoError> {
     let bad = |m: String| AcoError::Artifact(m);
-    let artifact_bytes = std::fs::read(dir.join("artifact.json")).map_err(|e| bad(format!("artifact.json: {e}")))?;
-    let doc: Value = serde_json::from_slice(&artifact_bytes).map_err(|e| bad(format!("artifact.json: {e}")))?;
-    let top = doc.as_object().ok_or_else(|| bad("artifact.json is not an object".into()))?;
-    if top.get("schema").and_then(Value::as_str) != Some(ARTIFACT_SCHEMA) { return Err(bad(format!("schema is not {ARTIFACT_SCHEMA}"))) }
-    let files = top.get("files").and_then(Value::as_object).ok_or_else(|| bad("artifact.json has no files object".into()))?;
+    let artifact_bytes =
+        std::fs::read(dir.join("artifact.json")).map_err(|e| bad(format!("artifact.json: {e}")))?;
+    let doc: Value =
+        serde_json::from_slice(&artifact_bytes).map_err(|e| bad(format!("artifact.json: {e}")))?;
+    let top = doc
+        .as_object()
+        .ok_or_else(|| bad("artifact.json is not an object".into()))?;
+    if top.get("schema").and_then(Value::as_str) != Some(ARTIFACT_SCHEMA) {
+        return Err(bad(format!("schema is not {ARTIFACT_SCHEMA}")));
+    }
+    let files = top
+        .get("files")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("artifact.json has no files object".into()))?;
 
     let mut on_disk = BTreeSet::new();
     list_files(dir, dir, &mut on_disk)?;
     on_disk.remove("artifact.json");
     if let Some(name) = on_disk.iter().find(|n| !files.contains_key(*n)) {
-        return Err(bad(format!("{name} is in the artifact directory but artifact.json does not list it")));
+        return Err(bad(format!(
+            "{name} is in the artifact directory but artifact.json does not list it"
+        )));
     }
     let mut hashes: BTreeMap<&str, [u8; 32]> = BTreeMap::new();
     for (name, entry) in files {
-        if name.is_empty() || name.starts_with('/') || name.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
-            return Err(bad(format!("{name:?} is not a relative path inside the artifact directory")));
+        if name.is_empty()
+            || name.starts_with('/')
+            || name
+                .split('/')
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(bad(format!(
+                "{name:?} is not a relative path inside the artifact directory"
+            )));
         }
-        let want = entry.get("sha256").and_then(Value::as_str).and_then(parse_hex32)
+        let want = entry
+            .get("sha256")
+            .and_then(Value::as_str)
+            .and_then(parse_hex32)
             .ok_or_else(|| bad(format!("{name}: artifact.json records no 64-hex sha256")))?;
         let bytes = std::fs::read(dir.join(name)).map_err(|e| bad(format!("{name}: {e}")))?;
         let actual = sha256(&bytes);
-        if actual != want { return Err(bad(format!("{name}: SHA-256 {} differs from artifact.json's {}", hex(&actual), hex(&want)))) }
+        if actual != want {
+            return Err(bad(format!(
+                "{name}: SHA-256 {} differs from artifact.json's {}",
+                hex(&actual),
+                hex(&want)
+            )));
+        }
         hashes.insert(name.as_str(), want);
     }
     for name in REQUIRED_FILES {
-        if !hashes.contains_key(name) { return Err(bad(format!("artifact.json lists no {name}"))) }
+        if !hashes.contains_key(name) {
+            return Err(bad(format!("artifact.json lists no {name}")));
+        }
     }
-    let prov = top.get("provenance").and_then(Value::as_object).ok_or_else(|| bad("artifact.json has no provenance object".into()))?;
-    let prov_hash = |key: &str| prov.get(key).and_then(Value::as_str).and_then(parse_hex32)
-        .ok_or_else(|| bad(format!("provenance.{key} is missing or not 64 hex digits")));
-    let mesa_commit = prov.get("mesa_commit").and_then(Value::as_str).filter(|s| !s.is_empty())
-        .ok_or_else(|| bad("provenance.mesa_commit is missing".into()))?.to_owned();
+    let prov = top
+        .get("provenance")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("artifact.json has no provenance object".into()))?;
+    let prov_hash = |key: &str| {
+        prov.get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_hex32)
+            .ok_or_else(|| bad(format!("provenance.{key} is missing or not 64 hex digits")))
+    };
+    let mesa_commit = prov
+        .get("mesa_commit")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("provenance.mesa_commit is missing".into()))?
+        .to_owned();
 
-    let binary = top.get("binary").and_then(Value::as_object).ok_or_else(|| bad("artifact.json has no binary object".into()))?;
+    let binary = top
+        .get("binary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("artifact.json has no binary object".into()))?;
     let binary_sha256 = hashes["shader.bin"];
-    if binary.get("sha256").and_then(Value::as_str).and_then(parse_hex32) != Some(binary_sha256) {
+    if binary
+        .get("sha256")
+        .and_then(Value::as_str)
+        .and_then(parse_hex32)
+        != Some(binary_sha256)
+    {
         return Err(bad("binary.sha256 is not the shader.bin hash".into()));
     }
-    let exec = binary.get("executable").and_then(Value::as_object).ok_or_else(|| bad("binary.executable is missing".into()))?;
+    let exec = binary
+        .get("executable")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("binary.executable is missing".into()))?;
     let (Some(offset), Some(len), Some(exec_sha256)) = (
-        exec.get("offset").and_then(Value::as_u64), exec.get("len").and_then(Value::as_u64),
-        exec.get("sha256").and_then(Value::as_str).and_then(parse_hex32),
-    ) else { return Err(bad("binary.executable needs offset, len and sha256".into())) };
+        exec.get("offset").and_then(Value::as_u64),
+        exec.get("len").and_then(Value::as_u64),
+        exec.get("sha256")
+            .and_then(Value::as_str)
+            .and_then(parse_hex32),
+    ) else {
+        return Err(bad("binary.executable needs offset, len and sha256".into()));
+    };
     let bin = std::fs::read(dir.join("shader.bin")).map_err(|e| bad(format!("shader.bin: {e}")))?;
-    let range = offset.checked_add(len).and_then(|end| Some((usize::try_from(offset).ok()?, usize::try_from(end).ok()?)))
+    let range = offset
+        .checked_add(len)
+        .and_then(|end| Some((usize::try_from(offset).ok()?, usize::try_from(end).ok()?)))
         .filter(|&(_, end)| end <= bin.len())
-        .ok_or_else(|| bad(format!("binary.executable {offset:#x}+{len:#x} is outside the {}-byte shader.bin", bin.len())))?;
-    if sha256(&bin[range.0..range.1]) != exec_sha256 { return Err(bad("binary.executable.sha256 is not the hash of that range of shader.bin".into())) }
+        .ok_or_else(|| {
+            bad(format!(
+                "binary.executable {offset:#x}+{len:#x} is outside the {}-byte shader.bin",
+                bin.len()
+            ))
+        })?;
+    if sha256(&bin[range.0..range.1]) != exec_sha256 {
+        return Err(bad(
+            "binary.executable.sha256 is not the hash of that range of shader.bin".into(),
+        ));
+    }
 
     Ok(ArtifactBinding {
         artifact_sha256: sha256(&artifact_bytes),
@@ -1108,24 +1882,51 @@ pub fn verify_artifact_dir(dir: &std::path::Path) -> Result<ArtifactBinding, Aco
 impl ArtifactBinding {
     /// The raw spec the lifter was given must be the artifact's: same whole binary, executable
     /// range and hash, and sidecar.
-    pub fn check_raw_spec(&self, spec: &peacemaker_ir::inst::RawKernelSpec) -> Result<(), AcoError> {
+    pub fn check_raw_spec(
+        &self,
+        spec: &peacemaker_ir::inst::RawKernelSpec,
+    ) -> Result<(), AcoError> {
         let bad = |m: String| Err(AcoError::Artifact(m));
-        if spec.binary_sha256 != self.binary_sha256 { return bad("the raw spec's binary hash is not the artifact's shader.bin".into()) }
-        if spec.extent.offset != self.exec_offset || spec.extent.len != self.exec_len { return bad("the raw spec's executable extent is not the artifact's".into()) }
-        if spec.exec_sha256 != self.exec_sha256 { return bad("the raw spec's executable hash is not the artifact's".into()) }
-        if spec.sidecar_sha256 != self.sidecar_sha256 { return bad("the raw spec's sidecar hash is not the artifact's shader.abi.json".into()) }
+        if spec.binary_sha256 != self.binary_sha256 {
+            return bad("the raw spec's binary hash is not the artifact's shader.bin".into());
+        }
+        if spec.extent.offset != self.exec_offset || spec.extent.len != self.exec_len {
+            return bad("the raw spec's executable extent is not the artifact's".into());
+        }
+        if spec.exec_sha256 != self.exec_sha256 {
+            return bad("the raw spec's executable hash is not the artifact's".into());
+        }
+        if spec.sidecar_sha256 != self.sidecar_sha256 {
+            return bad("the raw spec's sidecar hash is not the artifact's shader.abi.json".into());
+        }
         Ok(())
     }
 
     /// The contract's identity fields must be the artifact's.
     pub fn check_contract(&self, contract: &AcoHipContract) -> Result<(), AcoError> {
-        let bad = |m: &str| Err(AcoError::Artifact(format!("the contract's {m} is not the artifact's")));
-        if contract.artifact_sha256 != self.artifact_sha256 { return bad("artifact.json hash") }
-        if contract.rawspec_sha256 != self.rawspec_sha256 { return bad("shader.rawspec.json hash") }
-        if contract.spirv_sha256 != self.spirv_sha256 { return bad("shader.spv hash") }
-        if contract.raw_binary_sha256 != self.binary_sha256 { return bad("shader.bin hash") }
-        if contract.raw_exec_sha256 != self.exec_sha256 { return bad("executable hash") }
-        if contract.sidecar_sha256 != self.sidecar_sha256 { return bad("shader.abi.json hash") }
+        let bad = |m: &str| {
+            Err(AcoError::Artifact(format!(
+                "the contract's {m} is not the artifact's"
+            )))
+        };
+        if contract.artifact_sha256 != self.artifact_sha256 {
+            return bad("artifact.json hash");
+        }
+        if contract.rawspec_sha256 != self.rawspec_sha256 {
+            return bad("shader.rawspec.json hash");
+        }
+        if contract.spirv_sha256 != self.spirv_sha256 {
+            return bad("shader.spv hash");
+        }
+        if contract.raw_binary_sha256 != self.binary_sha256 {
+            return bad("shader.bin hash");
+        }
+        if contract.raw_exec_sha256 != self.exec_sha256 {
+            return bad("executable hash");
+        }
+        if contract.sidecar_sha256 != self.sidecar_sha256 {
+            return bad("shader.abi.json hash");
+        }
         Ok(())
     }
 }

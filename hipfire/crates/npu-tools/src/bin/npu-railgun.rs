@@ -95,15 +95,22 @@
 //!     exits 0 without building a mutated program.
 //!
 //! Output ends with `RESULT: PASS|FAIL`; exit status 0 pass, 1 fail, 2 bad usage/shape.
+use npu_tools::util::{lcg, parse_num, percentile};
 use peacemaker_npu::dma::Location;
-use peacemaker_npu::txn::Txn;
-use peacemaker_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
+use peacemaker_npu::kernels::gemm_array::{
+    design_v10, design_v10_prefix, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE,
+};
 use peacemaker_npu::kernels::gemm_core::Control;
 use peacemaker_npu::kernels::gemm_i8::ArgKind;
-use railgun::npu::tape::{verify_fresh, verify_patch, BindingKind, CacheOutcome, ConfigKey, ProgramCache, ProgramSpec, Tape, TapeEntry, Transition};
-use railgun::npu::{encode_start_cu, Bo, Chain, Device, HwCtx, PatchBo, PatchSite, Prepared, ERT_STATE_COMPLETED};
+use peacemaker_npu::txn::Txn;
+use railgun::npu::tape::{
+    verify_fresh, verify_patch, BindingKind, CacheOutcome, ConfigKey, ProgramCache, ProgramSpec,
+    Tape, TapeEntry, Transition,
+};
+use railgun::npu::{
+    encode_start_cu, Bo, Chain, Device, HwCtx, PatchBo, PatchSite, Prepared, ERT_STATE_COMPLETED,
+};
 use std::time::Instant;
-use npu_tools::util::{lcg, percentile, parse_num};
 
 const USAGE: &str = "usage: npu-railgun M N K --gemms G --mode eager|prepared|chain [--variant V9|V10|V10-prefix] [--secs S | --steps S] [--sets 2] [--neg stale-patch|stale-key|collision] [--distinct | --noop] [--lean [--tape]] [--verify-every] [--timeout-ms T]";
 /// Chain limit from the firmware command buffer (36 START_CU slots).
@@ -198,7 +205,6 @@ struct Cfg {
     timeout_ms: u64,
 }
 
-
 /// `Ok(None)` = help requested.
 fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -209,15 +215,44 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
     }
     let dim = |i: usize, name: &str| -> Result<usize, String> {
         let v: usize = parse_num(name, &args[i])?;
-        if v == 0 { Err(format!("{name} must be > 0")) } else { Ok(v) }
+        if v == 0 {
+            Err(format!("{name} must be > 0"))
+        } else {
+            Ok(v)
+        }
     };
     let (m, n, k) = (dim(0, "M")?, dim(1, "N")?, dim(2, "K")?);
-    let (mut gemms, mut mode, mut secs, mut steps, mut sets, mut neg, mut timeout_ms, mut distinct, mut noop, mut lean) = (1usize, None, None, None, 2usize, Neg::None, 3000u64, false, false, false);
+    let (
+        mut gemms,
+        mut mode,
+        mut secs,
+        mut steps,
+        mut sets,
+        mut neg,
+        mut timeout_ms,
+        mut distinct,
+        mut noop,
+        mut lean,
+    ) = (
+        1usize,
+        None,
+        None,
+        None,
+        2usize,
+        Neg::None,
+        3000u64,
+        false,
+        false,
+        false,
+    );
     let (mut tape, mut verify_every, mut variant) = (false, false, DesignVariant::V9);
     let mut i = 3;
     while i < args.len() {
         let flag = args[i].as_str();
-        if matches!(flag, "--distinct" | "--noop" | "--lean" | "--tape" | "--verify-every") {
+        if matches!(
+            flag,
+            "--distinct" | "--noop" | "--lean" | "--tape" | "--verify-every"
+        ) {
             match flag {
                 "--noop" => noop = true,
                 "--lean" => lean = true,
@@ -228,7 +263,10 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
             i += 1;
             continue;
         }
-        let val = args.get(i + 1).map(String::as_str).ok_or_else(|| format!("{flag} needs a value"))?;
+        let val = args
+            .get(i + 1)
+            .map(String::as_str)
+            .ok_or_else(|| format!("{flag} needs a value"))?;
         match flag {
             "--gemms" => gemms = parse_num(flag, val)?,
             "--mode" => {
@@ -236,7 +274,11 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
                     "eager" => Mode::Eager,
                     "prepared" => Mode::Prepared,
                     "chain" => Mode::Chain,
-                    _ => return Err(format!("--mode must be eager, prepared or chain, got {val:?}")),
+                    _ => {
+                        return Err(format!(
+                            "--mode must be eager, prepared or chain, got {val:?}"
+                        ))
+                    }
                 })
             }
             "--secs" => secs = Some(parse_num::<f64>(flag, val)?),
@@ -247,7 +289,11 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
                     "stale-patch" => Neg::StalePatch,
                     "stale-key" => Neg::StaleKey,
                     "collision" => Neg::Collision,
-                    _ => return Err(format!("--neg must be stale-patch, stale-key or collision, got {val:?}")),
+                    _ => {
+                        return Err(format!(
+                            "--neg must be stale-patch, stale-key or collision, got {val:?}"
+                        ))
+                    }
                 };
             }
             "--timeout-ms" => timeout_ms = parse_num(flag, val)?,
@@ -256,7 +302,11 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
                     "V9" => DesignVariant::V9,
                     "V10" => DesignVariant::V10,
                     "V10-prefix" => DesignVariant::V10Prefix,
-                    _ => return Err(format!("--variant must be V9, V10 or V10-prefix, got {val:?}")),
+                    _ => {
+                        return Err(format!(
+                            "--variant must be V9, V10 or V10-prefix, got {val:?}"
+                        ))
+                    }
                 };
             }
             _ => return Err(format!("unknown argument {flag:?}")),
@@ -268,7 +318,9 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
         return Err("--gemms must be >= 1".into());
     }
     if mode == Mode::Chain && gemms > MAX_CHAIN {
-        return Err(format!("--mode chain supports at most {MAX_CHAIN} gemms, got {gemms}"));
+        return Err(format!(
+            "--mode chain supports at most {MAX_CHAIN} gemms, got {gemms}"
+        ));
     }
     if !(1..=16).contains(&sets) {
         return Err("--sets must be in 1..=16".into());
@@ -298,7 +350,10 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
             return Err("--neg stale-patch needs at least 2 steps".into());
         }
         if tape {
-            return Err("--neg stale-patch excludes --tape (it certifies the plain retained patch path)".into());
+            return Err(
+                "--neg stale-patch excludes --tape (it certifies the plain retained patch path)"
+                    .into(),
+            );
         }
     }
     if matches!(neg, Neg::StaleKey | Neg::Collision) && !tape {
@@ -320,7 +375,9 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
         return Err("--noop has no output to verify: it excludes --verify-every".into());
     }
     if tape && !lean {
-        return Err("--tape needs --lean (the tape selects between the full and the lean stream)".into());
+        return Err(
+            "--tape needs --lean (the tape selects between the full and the lean stream)".into(),
+        );
     }
     if tape && mode == Mode::Eager {
         return Err("--tape needs a retained mode (prepared or chain)".into());
@@ -328,9 +385,25 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
     if secs.is_none() && steps.is_none() {
         steps = Some(DEFAULT_STEPS);
     }
-    Ok(Some(Cfg { m, n, k, variant, gemms, mode, secs, steps, sets, neg, distinct, noop, lean, tape, verify_every, timeout_ms }))
+    Ok(Some(Cfg {
+        m,
+        n,
+        k,
+        variant,
+        gemms,
+        mode,
+        secs,
+        steps,
+        sets,
+        neg,
+        distinct,
+        noop,
+        lean,
+        tape,
+        verify_every,
+        timeout_ms,
+    }))
 }
-
 
 /// One buffer set: A, B, C BO of every GEMM.
 struct Set {
@@ -365,8 +438,21 @@ struct Verified {
 /// when there is one. `skip_g0`: leave the negative-test GEMM 0 out entirely. `expect_bad_g0`: GEMM 0 is the stale-patch
 /// GEMM, still checked (counted in `checked`) but an inexact result is the intended outcome (`expected_bad`; no byte
 /// compare of it, not a failure).
-fn verify(d: &ArrayDesign, set: &Set, want: &[Vec<i8>], baseline: Option<&[Vec<u8>]>, skip_g0: bool, expect_bad_g0: bool) -> Verified {
-    let mut v = Verified { exact: 0, checked: 0, bytes_equal: baseline.map(|_| true), bad: Vec::new(), expected_bad: 0 };
+fn verify(
+    d: &ArrayDesign,
+    set: &Set,
+    want: &[Vec<i8>],
+    baseline: Option<&[Vec<u8>]>,
+    skip_g0: bool,
+    expect_bad_g0: bool,
+) -> Verified {
+    let mut v = Verified {
+        exact: 0,
+        checked: 0,
+        bytes_equal: baseline.map(|_| true),
+        bad: Vec::new(),
+        expected_bad: 0,
+    };
     for g in usize::from(skip_g0)..set.c.len() {
         set.c[g].flush();
         let out = set.c[g].as_slice();
@@ -396,16 +482,27 @@ fn matches_reference(d: &ArrayDesign, out: &[u8], want: &[i8]) -> bool {
 /// Indices (word 0 compared without its state nibble) where the two snapshots differ.
 fn diff_words(a: &[u32], b: &[u32]) -> Vec<usize> {
     assert_eq!(a.len(), b.len());
-    (0..a.len()).filter(|&i| if i == 0 { a[0] & STATE_CLEAR != b[0] & STATE_CLEAR } else { a[i] != b[i] }).collect()
+    (0..a.len())
+        .filter(|&i| {
+            if i == 0 {
+                a[0] & STATE_CLEAR != b[0] & STATE_CLEAR
+            } else {
+                a[i] != b[i]
+            }
+        })
+        .collect()
 }
-
 
 /// Builder of every tape lookup: a lookup that is not a cache hit fails here, so nothing is ever built or inserted.
 const CACHE_MISS: &str = "program cache MISS: no retained program for this key";
 
 /// True when every retained command of `pool` uses exactly the instruction BO selected for its entry.
 fn pool_fits(pool: &[Prepared], chosen: &[&Bo]) -> bool {
-    pool.len() == chosen.len() && pool.iter().zip(chosen).all(|(p, bo)| p.inst_addr() == bo.xdna)
+    pool.len() == chosen.len()
+        && pool
+            .iter()
+            .zip(chosen)
+            .all(|(p, bo)| p.inst_addr() == bo.xdna)
 }
 
 /// The recorded one-step tape, its program cache (actual instruction DEV BOs) and its counters.
@@ -434,31 +531,63 @@ struct TapeRun<'a> {
 impl<'a> TapeRun<'a> {
     /// Insert the full and the lean program (both must miss), then record ONE step of `gemms` entries from `set0`.
     #[allow(clippy::too_many_arguments)]
-    fn new(pdi: &'a [u8], full_txn: &'a [u8], lean_txn: &'a [u8], full_bo: &'a Bo, lean_bo: &'a Bo, sites: &[PatchSite], set0: &Set, gemms: usize) -> Result<Self, String> {
+    fn new(
+        pdi: &'a [u8],
+        full_txn: &'a [u8],
+        lean_txn: &'a [u8],
+        full_bo: &'a Bo,
+        lean_bo: &'a Bo,
+        sites: &[PatchSite],
+        set0: &Set,
+        gemms: usize,
+    ) -> Result<Self, String> {
         let mut dyn_list = Vec::with_capacity(sites.len());
         for s in sites {
             if s.bo != PatchBo::Cmd(0) || s.word < 7 || (s.word - 7) / 2 >= NARGS {
                 return Err(format!("tape: unexpected patch site {s:?}"));
             }
-            dyn_list.push((s.word, BindingKind::ArgAddress { arg: ((s.word - 7) / 2) as u8 }));
+            dyn_list.push((
+                s.word,
+                BindingKind::ArgAddress {
+                    arg: ((s.word - 7) / 2) as u8,
+                },
+            ));
         }
         let mut cache: ProgramCache<&'a Bo> = ProgramCache::new();
         let mut misses = 0;
         for (txn, bo) in [(full_txn, full_bo), (lean_txn, lean_bo)] {
-            let spec = ProgramSpec { pdi, txn, dynamic: &dyn_list };
-            let (_, outcome) = cache.get_or_insert_with(spec, || Ok(bo)).map_err(|e| format!("tape cache insert: {e}"))?;
+            let spec = ProgramSpec {
+                pdi,
+                txn,
+                dynamic: &dyn_list,
+            };
+            let (_, outcome) = cache
+                .get_or_insert_with(spec, || Ok(bo))
+                .map_err(|e| format!("tape cache insert: {e}"))?;
             if outcome != CacheOutcome::Miss {
-                return Err("tape: the full and the lean instruction streams share one program key".into());
+                return Err(
+                    "tape: the full and the lean instruction streams share one program key".into(),
+                );
             }
             misses += 1;
         }
-        let lean_key = ProgramSpec { pdi, txn: lean_txn, dynamic: &dyn_list }.program_key();
+        let lean_key = ProgramSpec {
+            pdi,
+            txn: lean_txn,
+            dynamic: &dyn_list,
+        }
+        .program_key();
         let config = ConfigKey::from_pdi(pdi);
         let entries: Vec<TapeEntry> = (0..gemms)
             .map(|g| TapeEntry {
                 program: lean_key,
                 config,
-                bindings: set0.args(g).iter().enumerate().map(|(i, bo)| (BindingKind::ArgAddress { arg: i as u8 }, bo.dev_addr())).collect(),
+                bindings: set0
+                    .args(g)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bo)| (BindingKind::ArgAddress { arg: i as u8 }, bo.dev_addr()))
+                    .collect(),
             })
             .collect();
         let tape = Tape::record(entries);
@@ -492,16 +621,34 @@ impl<'a> TapeRun<'a> {
         for i in 0..self.tape.entries.len() {
             let config = self.tape.entries[i].config;
             let transition = if i == 0 {
-                if self.prev == Some(config) { Transition::Lean } else { Transition::Full }
+                if self.prev == Some(config) {
+                    Transition::Lean
+                } else {
+                    Transition::Full
+                }
             } else {
                 self.trans[i]
             };
             let full = transition == Transition::Full;
-            let spec = ProgramSpec { pdi: self.pdi, txn: if full { self.full_txn } else { self.lean_txn }, dynamic: &self.dyn_list };
-            match self.cache.get_or_insert_with(spec, || Err(CACHE_MISS.to_string())) {
+            let spec = ProgramSpec {
+                pdi: self.pdi,
+                txn: if full { self.full_txn } else { self.lean_txn },
+                dynamic: &self.dyn_list,
+            };
+            match self
+                .cache
+                .get_or_insert_with(spec, || Err(CACHE_MISS.to_string()))
+            {
                 Ok((bo, CacheOutcome::Hit)) => self.chosen.push(*bo),
-                Ok((_, CacheOutcome::Miss)) => return Err(format!("tape entry {i}: unexpected cache insert")),
-                Err(e) => return Err(format!("tape entry {i} ({}): {e}", if full { "full" } else { "lean" })),
+                Ok((_, CacheOutcome::Miss)) => {
+                    return Err(format!("tape entry {i}: unexpected cache insert"))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "tape entry {i} ({}): {e}",
+                        if full { "full" } else { "lean" }
+                    ))
+                }
             }
             self.hits += 1;
             if full {
@@ -524,7 +671,15 @@ impl<'a> TapeRun<'a> {
     }
 
     /// Untimed per-entry certification (header state nibble normalized: the driver owns it).
-    fn certify(&mut self, s: usize, g: usize, pre: &[u32; 17], post: &[u32; 17], fresh: &[u32; 17], declared: &[usize]) {
+    fn certify(
+        &mut self,
+        s: usize,
+        g: usize,
+        pre: &[u32; 17],
+        post: &[u32; 17],
+        fresh: &[u32; 17],
+        declared: &[usize],
+    ) {
         let norm = |w: &[u32; 17]| {
             let mut n = *w;
             n[0] &= STATE_CLEAR;
@@ -550,11 +705,18 @@ impl<'a> TapeRun<'a> {
         let mut stale = self.lean_txn.to_vec();
         let at = stale.len() / 2;
         stale[at] ^= 0x01;
-        let spec = ProgramSpec { pdi: self.pdi, txn: &stale, dynamic: &self.dyn_list };
+        let spec = ProgramSpec {
+            pdi: self.pdi,
+            txn: &stale,
+            dynamic: &self.dyn_list,
+        };
         let new_key = spec.program_key();
         let old_key = self.tape.entries[0].program;
         let before = self.cache.len();
-        let miss = match self.cache.get_or_insert_with(spec, || Err(CACHE_MISS.to_string())) {
+        let miss = match self
+            .cache
+            .get_or_insert_with(spec, || Err(CACHE_MISS.to_string()))
+        {
             Err(e) if e == CACHE_MISS => true,
             Ok((_, outcome)) => {
                 println!("NEG stale-key: NOT detected by cache miss (lookup returned {outcome:?})");
@@ -578,7 +740,9 @@ impl<'a> TapeRun<'a> {
         }
         let replay = replayed.check_replay(self.hash);
         match &replay {
-            Err(e) => println!("NEG stale-key: tape replay with the new key fails check_replay: {e}"),
+            Err(e) => {
+                println!("NEG stale-key: tape replay with the new key fails check_replay: {e}")
+            }
             Ok(()) => println!("NEG stale-key: tape replay with the new key NOT detected"),
         }
         miss && new_key != old_key && untouched && replay.is_err()
@@ -598,7 +762,13 @@ struct Inventory {
 /// `lean_bytes`: the design's lean instruction stream when `--lean` (already validated by `main`, before any hardware).
 fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, String> {
     let (g_n, mode, timeout_ms) = (cfg.gemms, cfg.mode, cfg.timeout_ms);
-    assert!(d.args.len() == NARGS && d.args[0].kind == ArgKind::In && d.args[1].kind == ArgKind::In && d.args[2].kind == ArgKind::Out, "design args are A, B, C");
+    assert!(
+        d.args.len() == NARGS
+            && d.args[0].kind == ArgKind::In
+            && d.args[1].kind == ArgKind::In
+            && d.args[2].kind == ArgKind::Out,
+        "design args are A, B, C"
+    );
     let useful = d.useful_ops();
     // Instruction stream of the TIMED commands: the design's full one, its lean one with --lean, or with --noop the
     // minimal valid TXN: ONE write32 of 0 to memtile col 0 data word 0x7FFC0 (same PDI, hwctx and A/B/C args; the NPU
@@ -638,15 +808,33 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
 
     // ---- setup: heap, PDI, insts, buffers, commands; the context is created LAST so it drops first.
     let mut dev = Device::open().map_err(|e| format!("device open failed: {e}"))?;
-    dev.map_heap(64 << 20).map_err(|e| format!("device heap map failed: {e}"))?;
+    dev.map_heap(64 << 20)
+        .map_err(|e| format!("device heap map failed: {e}"))?;
     let ntiles = dev.meta.cols as u32 * dev.meta.core.0 as u32;
-    let pdi = dev.dev_bo(&d.pdi).map_err(|e| format!("pdi bo failed: {e}"))?;
-    let insts = dev.dev_bo(insts_src).map_err(|e| format!("insts bo failed: {e}"))?;
+    let pdi = dev
+        .dev_bo(&d.pdi)
+        .map_err(|e| format!("pdi bo failed: {e}"))?;
+    let insts = dev
+        .dev_bo(insts_src)
+        .map_err(|e| format!("insts bo failed: {e}"))?;
     // --lean: the full stream's own BO, used ONLY by the untimed warmup/baseline step (timed commands use `insts`).
-    let full_insts = if lean { Some(dev.dev_bo(&d.insts).map_err(|e| format!("full insts bo failed: {e}"))?) } else { None };
+    let full_insts = if lean {
+        Some(
+            dev.dev_bo(&d.insts)
+                .map_err(|e| format!("full insts bo failed: {e}"))?,
+        )
+    } else {
+        None
+    };
     let warm_insts: &Bo = full_insts.as_ref().unwrap_or(&insts);
 
-    let mut sets: Vec<Set> = (0..cfg.sets).map(|_| Set { a: Vec::new(), b: Vec::new(), c: Vec::new() }).collect();
+    let mut sets: Vec<Set> = (0..cfg.sets)
+        .map(|_| Set {
+            a: Vec::new(),
+            b: Vec::new(),
+            c: Vec::new(),
+        })
+        .collect();
     // Operands: one random A/B and ONE reference shared by every GEMM (still distinct BOs per set and GEMM);
     // `--distinct` gives GEMM g its own seeded operands and reference. `--noop`: no operands and no reference at all
     // (A/B stay zero-filled, C is never poisoned or verified).
@@ -654,23 +842,36 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
     let mut packed: Option<[Vec<u8>; 2]> = None;
     for g in 0..g_n {
         if !cfg.noop && (cfg.distinct || packed.is_none()) {
-            let mut seed = if cfg.distinct { 0x5eed_u64 ^ (g as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) } else { 0x5eed_u64 };
+            let mut seed = if cfg.distinct {
+                0x5eed_u64 ^ (g as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            } else {
+                0x5eed_u64
+            };
             let a: Vec<i8> = (0..cfg.m * cfg.k).map(|_| lcg(&mut seed)).collect();
             let b: Vec<i8> = (0..cfg.k * cfg.n).map(|_| lcg(&mut seed)).collect();
             packed = Some(d.pack_in(&a, &b));
             // `reference` is the multi-threaded (row blocks) CPU GEMM + epilogue; results are int8, kept as i8.
-            want.push(d.reference(&a, &b).into_iter().map(|x| i8::try_from(x).expect("reference is int8")).collect());
+            want.push(
+                d.reference(&a, &b)
+                    .into_iter()
+                    .map(|x| i8::try_from(x).expect("reference is int8"))
+                    .collect(),
+            );
         }
         for (s, set) in sets.iter_mut().enumerate() {
             for (i, dst) in [(0, &mut set.a), (1, &mut set.b)] {
-                let mut bo = dev.shmem_bo(d.args[i].bytes).map_err(|e| format!("set {s} gemm {g} arg {i} bo failed: {e}"))?;
+                let mut bo = dev
+                    .shmem_bo(d.args[i].bytes)
+                    .map_err(|e| format!("set {s} gemm {g} arg {i} bo failed: {e}"))?;
                 if let Some(p) = &packed {
                     bo.as_mut_slice().copy_from_slice(&p[i]);
                     bo.flush();
                 }
                 dst.push(bo);
             }
-            let mut c = dev.shmem_bo(d.args[2].bytes).map_err(|e| format!("set {s} gemm {g} C bo failed: {e}"))?;
+            let mut c = dev
+                .shmem_bo(d.args[2].bytes)
+                .map_err(|e| format!("set {s} gemm {g} C bo failed: {e}"))?;
             c.as_mut_slice().fill(0xA5);
             c.flush();
             set.c.push(c);
@@ -679,15 +880,25 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
     // Eager commands: the eager mode's per-GEMM command BOs and the retained modes' baseline step.
     let mut ecmds: Vec<Bo> = Vec::with_capacity(g_n);
     for g in 0..g_n {
-        ecmds.push(dev.cmd_bo().map_err(|e| format!("eager cmd bo {g} failed: {e}"))?);
+        ecmds.push(
+            dev.cmd_bo()
+                .map_err(|e| format!("eager cmd bo {g} failed: {e}"))?,
+        );
     }
     // Retained pools. `Prepared` cannot swap its instruction BO, so with --tape two immutable pools exist: the first
     // step's (GEMM 0 on the full stream's BO) and the steady one (all lean); the tape's selection picks the active one.
     let build_pool = |first_full: bool| -> Result<(Vec<Prepared>, Option<Chain>), String> {
         let mut pool: Vec<Prepared> = Vec::with_capacity(g_n);
         for g in 0..g_n {
-            let ib: &Bo = if first_full && g == 0 { warm_insts } else { &insts };
-            pool.push(Prepared::new(&dev, ib, &sets[0].args(g)).map_err(|e| format!("prepared {g} failed: {e}"))?);
+            let ib: &Bo = if first_full && g == 0 {
+                warm_insts
+            } else {
+                &insts
+            };
+            pool.push(
+                Prepared::new(&dev, ib, &sets[0].args(g))
+                    .map_err(|e| format!("prepared {g} failed: {e}"))?,
+            );
         }
         let ch = if mode == Mode::Chain {
             let refs: Vec<&Prepared> = pool.iter().collect();
@@ -697,15 +908,28 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
         };
         Ok((pool, ch))
     };
-    let (mut prepared, mut chain) = if mode == Mode::Eager { (Vec::new(), None) } else { build_pool(cfg.tape)? };
-    let mut spare = if cfg.tape { Some(build_pool(false)?) } else { None };
+    let (mut prepared, mut chain) = if mode == Mode::Eager {
+        (Vec::new(), None)
+    } else {
+        build_pool(cfg.tape)?
+    };
+    let mut spare = if cfg.tape {
+        Some(build_pool(false)?)
+    } else {
+        None
+    };
 
     // Tape: recorded right after the retained inventory exists and before any hardware context/baseline, so the
     // negatives submit no GEMM.
     let mut tr: Option<TapeRun> = None;
     if cfg.tape {
-        let sites = prepared.first().ok_or("tape needs a retained mode")?.patch_sites();
-        let t = TapeRun::new(&d.pdi, &d.insts, insts_src, warm_insts, &insts, &sites, &sets[0], g_n)?;
+        let sites = prepared
+            .first()
+            .ok_or("tape needs a retained mode")?
+            .patch_sites();
+        let t = TapeRun::new(
+            &d.pdi, &d.insts, insts_src, warm_insts, &insts, &sites, &sets[0], g_n,
+        )?;
         println!("tape: recorded entries={g_n} sequence_hash={:#018x} programs={} (full + lean, cache misses={})", t.tape.sequence_hash, t.cache.len(), t.misses);
         let t = tr.insert(t);
         if cfg.neg == Neg::StaleKey {
@@ -713,12 +937,17 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
         }
     }
     let ctx = HwCtx::create(&dev, ntiles, 2048).map_err(|e| format!("create_hwctx failed: {e}"))?;
-    ctx.config_cu(&pdi).map_err(|e| format!("config_cu failed: {e}"))?;
+    ctx.config_cu(&pdi)
+        .map_err(|e| format!("config_cu failed: {e}"))?;
 
     let eager_step = |set: &Set, ecmds: &mut [Bo], ib: &Bo| -> Result<(), String> {
         for (g, cmd) in ecmds.iter_mut().enumerate() {
-            let seq = ctx.submit(cmd, ib, &set.args(g)).map_err(|e| format!("gemm {g}: submit error: {e}"))?;
-            let st = ctx.wait(cmd, seq, timeout_ms).map_err(|e| format!("gemm {g}: wait error: {e}"))?;
+            let seq = ctx
+                .submit(cmd, ib, &set.args(g))
+                .map_err(|e| format!("gemm {g}: submit error: {e}"))?;
+            let st = ctx
+                .wait(cmd, seq, timeout_ms)
+                .map_err(|e| format!("gemm {g}: wait error: {e}"))?;
             if st != ERT_STATE_COMPLETED {
                 return Err(format!("gemm {g}: state {st} != COMPLETED"));
             }
@@ -733,7 +962,12 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
         sets[0].poison();
         eager_step(&sets[0], &mut ecmds, warm_insts).map_err(|e| format!("eager baseline: {e}"))?;
         let v = verify(d, &sets[0], &want, None, false, false);
-        println!("eager baseline{} (set 0): exact {}/{}", if lean { " (full-TXN warmup)" } else { "" }, v.exact, v.checked);
+        println!(
+            "eager baseline{} (set 0): exact {}/{}",
+            if lean { " (full-TXN warmup)" } else { "" },
+            v.exact,
+            v.checked
+        );
         if v.exact != v.checked {
             println!("eager baseline not exact, inexact gemms {:?}", v.bad);
             return Ok(false);
@@ -748,11 +982,21 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
     let mut allowed_cmd = [false; 17];
     if let Some(p) = prepared.first() {
         for site in p.patch_sites() {
-            assert!(site.bo == PatchBo::Cmd(0) && site.word < 17, "unexpected Prepared patch site {:?}", site);
+            assert!(
+                site.bo == PatchBo::Cmd(0) && site.word < 17,
+                "unexpected Prepared patch site {:?}",
+                site
+            );
             allowed_cmd[site.word] = true;
         }
     }
-    let chain_sites: Vec<usize> = chain.as_ref().map_or(Vec::new(), |c| c.patch_sites().into_iter().inspect(|s| assert!(s.bo == PatchBo::Chain)).map(|s| s.word).collect());
+    let chain_sites: Vec<usize> = chain.as_ref().map_or(Vec::new(), |c| {
+        c.patch_sites()
+            .into_iter()
+            .inspect(|s| assert!(s.bo == PatchBo::Chain))
+            .map(|s| s.word)
+            .collect()
+    });
     let mut pre_cmd: Vec<[u32; 17]> = prepared.iter().map(Prepared::words).collect();
     let mut pre_chain: Vec<u32> = chain.as_ref().map_or(Vec::new(), Chain::words);
     let mut inv = Inventory::default();
@@ -803,7 +1047,10 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                             }
                             if !pool_fits(&prepared, &t.chosen) {
                                 step_secs = 0.0;
-                                break 'step Err("tape: the selected programs match neither retained pool".into());
+                                break 'step Err(
+                                    "tape: the selected programs match neither retained pool"
+                                        .into(),
+                                );
                             }
                         }
                     }
@@ -832,7 +1079,9 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                             for &(kind, value) in &t.tape.entries[g].bindings {
                                 let BindingKind::ArgAddress { arg } = kind else {
                                     step_secs = t0.elapsed().as_secs_f64();
-                                    break 'step Err(format!("tape entry {g}: unexpected binding {kind:?}"));
+                                    break 'step Err(format!(
+                                        "tape entry {g}: unexpected binding {kind:?}"
+                                    ));
                                 };
                                 let bo = args[arg as usize];
                                 if bo.dev_addr() != value {
@@ -861,14 +1110,21 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                             let last_cmd = prepared.last().ok_or("no commands")?;
                             let mut last = 0u64;
                             for (g, p) in prepared.iter().enumerate() {
-                                last = ctx.submit_prepared(p).map_err(|e| format!("gemm {g}: submit error: {e}"))?;
+                                last = ctx
+                                    .submit_prepared(p)
+                                    .map_err(|e| format!("gemm {g}: submit error: {e}"))?;
                             }
-                            ctx.wait(&last_cmd.cmd, last, timeout_ms).map_err(|e| format!("wait error: {e}"))
+                            ctx.wait(&last_cmd.cmd, last, timeout_ms)
+                                .map_err(|e| format!("wait error: {e}"))
                         })(),
                         _ => (|| {
                             let c = chain.as_ref().expect("chain mode has a chain");
-                            let seq = ctx.submit_chain(c).map_err(|e| format!("submit_chain error: {e}"))?;
-                            ctx.wait_chain(c, seq, timeout_ms).map_err(|e| format!("wait_chain error: {e} (error_index {})", c.error_index()))
+                            let seq = ctx
+                                .submit_chain(c)
+                                .map_err(|e| format!("submit_chain error: {e}"))?;
+                            ctx.wait_chain(c, seq, timeout_ms).map_err(|e| {
+                                format!("wait_chain error: {e} (error_index {})", c.error_index())
+                            })
                         })(),
                     };
                     step_secs = t0.elapsed().as_secs_f64();
@@ -880,7 +1136,10 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                     };
                     if st != ERT_STATE_COMPLETED {
                         break 'step Err(match chain.as_ref() {
-                            Some(c) => format!("chain state {st} != COMPLETED, error_index {}", c.error_index()),
+                            Some(c) => format!(
+                                "chain state {st} != COMPLETED, error_index {}",
+                                c.error_index()
+                            ),
                             None => format!("last command state {st} != COMPLETED"),
                         });
                     }
@@ -939,7 +1198,9 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                         let bad = diff_words(&expect, &post);
                         if !bad.is_empty() {
                             inv.mismatched += bad.len();
-                            println!("step {s} chain: words differ from fresh chain layout at {bad:?}");
+                            println!(
+                                "step {s} chain: words differ from fresh chain layout at {bad:?}"
+                            );
                         }
                     }
                     if insts.as_slice() != insts_src {
@@ -952,7 +1213,13 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                             println!("step {s}: full instruction BO changed");
                         }
                     }
-                    if hdr_bad.is_empty() { Ok(()) } else { Err(format!("command header state != COMPLETED for gemms {hdr_bad:?}")) }
+                    if hdr_bad.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "command header state != COMPLETED for gemms {hdr_bad:?}"
+                        ))
+                    }
                 }
             }
         };
@@ -977,7 +1244,14 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
         // Exactness (untimed): first/last step, every step with --verify-every.
         if check_step {
             // With --verify-every the stale-patch step is checked in full: its stale GEMM 0 must be inexact.
-            let v = verify(d, &sets[set_idx], &want, baseline.as_deref(), neg_step && !cfg.verify_every, neg_step && cfg.verify_every);
+            let v = verify(
+                d,
+                &sets[set_idx],
+                &want,
+                baseline.as_deref(),
+                neg_step && !cfg.verify_every,
+                neg_step && cfg.verify_every,
+            );
             exact_ok += v.exact;
             stale_expected += v.expected_bad;
             exact_checked += v.checked;
@@ -985,7 +1259,17 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
                 *all &= this;
             }
             if s == 0 || is_final || !v.bad.is_empty() || v.bytes_equal == Some(false) {
-                println!("step {s}{} set {set_idx}: exact {}/{}{}", if is_final { " (last)" } else { "" }, v.exact, v.checked, if v.bytes_equal == Some(false) { " BYTES DIFFER from eager" } else { "" });
+                println!(
+                    "step {s}{} set {set_idx}: exact {}/{}{}",
+                    if is_final { " (last)" } else { "" },
+                    v.exact,
+                    v.checked,
+                    if v.bytes_equal == Some(false) {
+                        " BYTES DIFFER from eager"
+                    } else {
+                        ""
+                    }
+                );
             }
             if !v.bad.is_empty() {
                 println!("step {s}: inexact gemms {:?}", v.bad);
@@ -1011,7 +1295,11 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
         let (busy_tops, wall_tops, exact) = if cfg.noop {
             ("n/a".to_string(), "n/a".to_string(), "n/a".to_string())
         } else {
-            (format!("{:.4}", ops / (sum_us * 1e-6) / 1e12), format!("{:.4}", ops / wall / 1e12), format!("{exact_ok}/{exact_checked}"))
+            (
+                format!("{:.4}", ops / (sum_us * 1e-6) / 1e12),
+                format!("{:.4}", ops / wall / 1e12),
+                format!("{exact_ok}/{exact_checked}"),
+            )
         };
         println!(
             "railgun: mode={} shape={}x{}x{} gemms={g_n} steps={steps} txn_bytes={} step_us mean={:.1} p50={:.1} p99={:.1} min={:.1} per_gemm_us={:.1} busy_tops={busy_tops} wall_tops={wall_tops} exact={exact} bytes_equal_eager={}",
@@ -1027,7 +1315,10 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
     if mode == Mode::Eager {
         println!("inventory: n.a. (eager encodes every command from scratch)");
     } else {
-        println!("inventory: steps={} changed_words={} undeclared={} mismatched_vs_fresh={}", inv.steps, inv.changed_words, inv.undeclared, inv.mismatched);
+        println!(
+            "inventory: steps={} changed_words={} undeclared={} mismatched_vs_fresh={}",
+            inv.steps, inv.changed_words, inv.undeclared, inv.mismatched
+        );
         if inv.undeclared != 0 || inv.mismatched != 0 {
             pass = false;
         }
@@ -1037,13 +1328,32 @@ fn run(cfg: &Cfg, d: &ArrayDesign, lean_bytes: Option<&[u8]>) -> Result<bool, St
             "tape: entries={g_n} sequence_hash={:#018x} programs={} hits={} misses={} full={} lean={} replay_checks={} fresh_equal={}",
             t.tape.sequence_hash, t.cache.len(), t.hits, t.misses, t.full, t.lean, t.replay_checks, t.fresh_equal
         );
-        if t.bad != 0 || t.fresh_equal != inv.steps * g_n || t.misses != 2 || t.cache.len() != 2 || t.full != 1 || t.hits != t.replay_checks * g_n || t.full + t.lean != t.hits {
+        if t.bad != 0
+            || t.fresh_equal != inv.steps * g_n
+            || t.misses != 2
+            || t.cache.len() != 2
+            || t.full != 1
+            || t.hits != t.replay_checks * g_n
+            || t.full + t.lean != t.hits
+        {
             println!("tape: FAILED (verify errors={} expected fresh_equal={} full=1 misses=2 programs=2)", t.bad, inv.steps * g_n);
             pass = false;
         }
     }
     if neg_patch {
-        println!("NEG stale-patch: fresh-encode diff {} output check {}", if inv.neg_fresh_detected { "detected" } else { "MISSED" }, if inv.neg_output_detected { "detected" } else { "MISSED" });
+        println!(
+            "NEG stale-patch: fresh-encode diff {} output check {}",
+            if inv.neg_fresh_detected {
+                "detected"
+            } else {
+                "MISSED"
+            },
+            if inv.neg_output_detected {
+                "detected"
+            } else {
+                "MISSED"
+            }
+        );
         pass &= inv.neg_fresh_detected && inv.neg_output_detected;
     }
     Ok(pass)

@@ -27,7 +27,8 @@ fn core_program() -> Vec<u8> {
         .push(mova(R(1), 1))
         .nops(4);
     for _ in 0..N {
-        p.push(st_post_imm(R(0), P(0), 4)).push(add_ri(R(0), R(0), 1));
+        p.push(st_post_imm(R(0), P(0), 4))
+            .push(add_ri(R(0), R(0), 1));
     }
     p.nops(8) // let the last store retire before handing the buffer to the DMA
         .push(rel(regs::core::CORE_LOCK_OWN_BASE + LOCK as u64, R(1)))
@@ -38,7 +39,13 @@ fn core_program() -> Vec<u8> {
 }
 
 fn words(b: &[u8]) -> Vec<u32> {
-    b.chunks(4).map(|c| { let mut a = [0u8; 4]; a[..c.len()].copy_from_slice(c); u32::from_le_bytes(a) }).collect()
+    b.chunks(4)
+        .map(|c| {
+            let mut a = [0u8; 4];
+            a[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(a)
+        })
+        .collect()
 }
 
 fn build_cdo(prog: &[u8]) -> Cdo {
@@ -55,17 +62,35 @@ fn build_cdo(prog: &[u8]) -> Cdo {
         .mask_write(t(c::CORE_CONTROL), 0b10, 0)
         .write(t(c::LOCK0_VALUE + 0x10 * LOCK), 0);
     // MM2S0 BD0: wait for lock >= 1 (acquire -1), send N words from BUF_DMA
-    let bd = dma::tile_bd(BUF_DMA, N, dma::BdLocks { acq: Some((LOCK, -1)), rel: None }, None);
-    cdo.dma_write(t(c::DMA_BD0), &bd).write(t(c::DMA_MM2S_0_START_QUEUE), 0);
+    let bd = dma::tile_bd(
+        BUF_DMA,
+        N,
+        dma::BdLocks {
+            acq: Some((LOCK, -1)),
+            rel: None,
+        },
+        None,
+    );
+    cdo.dma_write(t(c::DMA_BD0), &bd)
+        .write(t(c::DMA_MM2S_0_START_QUEUE), 0);
     // circuit route: core DMA_0 -> SOUTH0 -> mem NORTH_0 -> SOUTH0 -> shim NORTH_0 -> SOUTH2 -> S2MM0
-    cdo.write(t(c::SS_MASTER_SOUTH0), regs::ss_master(c::SS_SLAVE_DMA_0, c::SS_SLAVE_BASE))
-        .write(t(c::SS_SLAVE_DMA_0), regs::SS_ENABLE)
-        .write(tile(COL, 1, m::SS_MASTER_SOUTH0), regs::ss_master(m::SS_SLAVE_NORTH_0, m::SS_SLAVE_BASE))
-        .write(tile(COL, 1, m::SS_SLAVE_NORTH_0), regs::SS_ENABLE)
-        .write(tile(COL, 0, s::SS_MASTER_SOUTH2), regs::ss_master(s::SS_SLAVE_NORTH_0, s::SS_SLAVE_BASE))
-        .write(tile(COL, 0, s::SS_SLAVE_NORTH_0), regs::SS_ENABLE)
-        .mask_write(tile(COL, 0, s::DEMUX_CONFIG), 0x30, 0x10); // SOUTH2 -> shim DMA
-    // task-complete token path (TILE_CTRL packets -> SOUTH0 -> controller), needed by TXN sync
+    cdo.write(
+        t(c::SS_MASTER_SOUTH0),
+        regs::ss_master(c::SS_SLAVE_DMA_0, c::SS_SLAVE_BASE),
+    )
+    .write(t(c::SS_SLAVE_DMA_0), regs::SS_ENABLE)
+    .write(
+        tile(COL, 1, m::SS_MASTER_SOUTH0),
+        regs::ss_master(m::SS_SLAVE_NORTH_0, m::SS_SLAVE_BASE),
+    )
+    .write(tile(COL, 1, m::SS_SLAVE_NORTH_0), regs::SS_ENABLE)
+    .write(
+        tile(COL, 0, s::SS_MASTER_SOUTH2),
+        regs::ss_master(s::SS_SLAVE_NORTH_0, s::SS_SLAVE_BASE),
+    )
+    .write(tile(COL, 0, s::SS_SLAVE_NORTH_0), regs::SS_ENABLE)
+    .mask_write(tile(COL, 0, s::DEMUX_CONFIG), 0x30, 0x10); // SOUTH2 -> shim DMA
+                                                            // task-complete token path (TILE_CTRL packets -> SOUTH0 -> controller), needed by TXN sync
     for (a, v) in regs::shim_token_route(COL) {
         cdo.write(a, v);
     }
@@ -101,7 +126,12 @@ fn query(dev: &Device) -> Result<(), String> {
 
 fn run(repeat: usize) -> Result<bool, String> {
     let (prog, pdi_bytes, insts_bytes) = artifacts();
-    println!("program {} B, pdi {} B, insts {} B", prog.len(), pdi_bytes.len(), insts_bytes.len());
+    println!(
+        "program {} B, pdi {} B, insts {} B",
+        prog.len(),
+        pdi_bytes.len(),
+        insts_bytes.len()
+    );
     let mut dev = Device::open()?;
     query(&dev)?;
     dev.map_heap(64 << 20)?;
@@ -125,7 +155,11 @@ fn run(repeat: usize) -> Result<bool, String> {
         let dt = t0.elapsed();
         out.flush();
         let got = words(out.as_slice());
-        let bad = got.iter().enumerate().filter(|&(i, &v)| v != BASE + i as u32).count();
+        let bad = got
+            .iter()
+            .enumerate()
+            .filter(|&(i, &v)| v != BASE + i as u32)
+            .count();
         println!(
             "iter {it}: wait={state:?} ({:.1} us) out[0..4]={:08x?} out[N-1]={:08x} mismatches={bad}/{N}",
             dt.as_secs_f64() * 1e6,
@@ -136,7 +170,10 @@ fn run(repeat: usize) -> Result<bool, String> {
         if !ok {
             let mut st = vec![0u8; 8192];
             match dev.aie_status(&mut st) {
-                Ok(cols) => println!("aie_status cols_filled={cols} first 256 B: {:02x?}", &st[..256]),
+                Ok(cols) => println!(
+                    "aie_status cols_filled={cols} first 256 B: {:02x?}",
+                    &st[..256]
+                ),
                 Err(e) => println!("aie_status: {e}"),
             }
         }
@@ -161,14 +198,24 @@ fn main() {
             std::fs::write(format!("{dir}/core_0_2.bin"), &prog).unwrap();
             std::fs::write(format!("{dir}/hello.pdi"), &pdi).unwrap();
             std::fs::write(format!("{dir}/hello.insts"), &insts).unwrap();
-            println!("wrote {dir}: program {} B, pdi {} B, insts {} B", prog.len(), pdi.len(), insts.len());
+            println!(
+                "wrote {dir}: program {} B, pdi {} B, insts {} B",
+                prog.len(),
+                pdi.len(),
+                insts.len()
+            );
         }
         Some("query") => {
             let dev = Device::open().expect("open");
             query(&dev).expect("query");
         }
         Some("run") => {
-            let repeat = args.iter().position(|a| a == "--repeat").and_then(|i| args.get(i + 1)).map(|s| s.parse().unwrap()).unwrap_or(1);
+            let repeat = args
+                .iter()
+                .position(|a| a == "--repeat")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(1);
             match run(repeat) {
                 Ok(true) => println!("RESULT: PASS"),
                 Ok(false) => {

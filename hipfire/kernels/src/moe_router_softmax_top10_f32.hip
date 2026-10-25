@@ -21,6 +21,33 @@ __device__ __forceinline__ float router_bf16_rt(float v) {
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
 }
 
+// Router fault word (host-mapped, written with plain system-scope stores like the
+// bounded-wait block, so PCIe atomics are not required). 0 = clear; otherwise
+// ((row + 1) << 24) | (layer + 1) with the global row. The smaller code (earliest
+// row, then earliest layer) is kept; with simultaneous writers the last store wins.
+__device__ __forceinline__ void router_record_fault(
+    unsigned long long* fault, int layer, int row) {
+    if (fault == nullptr) return;
+    const unsigned long long code =
+        ((unsigned long long)(unsigned int)(row + 1) << 24) | (unsigned long long)(unsigned int)(layer + 1);
+    const unsigned long long current =
+        __hip_atomic_load(fault, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (current == 0ull || code < current)
+        __hip_atomic_store(fault, code, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Invalid-row result: expert marker -1 and weight 0 for all ten slots of local
+// row `token`, plus the fault record for global row `row`.
+__device__ __forceinline__ void router_fail_row(
+    int* topk_idx, float* topk_w, int token, unsigned long long* fault, int layer, int row) {
+    const size_t output_base = (size_t)token * 10;
+    for (int rank = 0; rank < 10; ++rank) {
+        topk_idx[output_base + rank] = -1;
+        topk_w[output_base + rank] = 0.0f;
+    }
+    router_record_fault(fault, layer, row);
+}
+
 // Wave32 max / min, the result in every lane. Max and min are exact and
 // order-independent, so the reduction shape does not matter; gfx11/gfx12 use
 // row_xmask DPP and permlanex16 instead of LDS-crossbar shuffles.
@@ -62,7 +89,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     int n_exp,
     int top_k,
     int normalize_topk_prob,
-    int round_logits
+    int round_logits,
+    unsigned long long* __restrict__ fault, // host-mapped router fault word, or null
+    int layer,                              // sealed call layer index
+    int row_base                            // global row of this launch's row 0
 ) {
     __shared__ float wave_values[80];
     __shared__ int wave_indices[80];
@@ -83,6 +113,15 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     if (round_logits != 0) {
         first_logit = router_bf16_rt(first_logit);
         second_logit = router_bf16_rt(second_logit);
+    }
+
+    // Any NaN/Inf logit (after the optional BF16 round trip) fails the whole row
+    // closed: expert marker -1, weight 0, and the (row, layer) recorded in the
+    // device fault word. The vote is workgroup-uniform, so every thread returns
+    // together. Finite rows never take this branch and run the original math.
+    if (__syncthreads_or(!isfinite(first_logit) || !isfinite(second_logit))) {
+        if (thread == 0) router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+        return;
     }
     float first_value = first_logit;
     float second_value = second_logit;
@@ -154,7 +193,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
         float denom = 0.0f;
         for (int expert = 0; expert < 512; ++expert)
             denom += exps[expert];
-        if (!(denom > 0.0f) || !isfinite(denom)) return;
+        if (!(denom > 0.0f) || !isfinite(denom)) {
+            router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+            return;
+        }
 
         const float inv_denom = 1.0f / denom;
         for (int rank = 0; rank < top_k; ++rank)
@@ -164,7 +206,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
             float selected_sum = 0.0f;
             for (int rank = 0; rank < top_k; ++rank)
                 selected_sum += probabilities[rank];
-            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) return;
+            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) {
+                router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+                return;
+            }
             const float inv_selected = 1.0f / selected_sum;
             for (int rank = 0; rank < top_k; ++rank)
                 probabilities[rank] *= inv_selected;

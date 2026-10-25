@@ -14,6 +14,7 @@ use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
 use rdna_compute::attention::GFX12_QUERY16_MAX_CTX;
+use rdna_compute::fa_prefill_pm::FaPrefillKvCodec;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
@@ -27,15 +28,16 @@ pub struct AttnParams<'a> {
     /// TODO(ship 3.1b): llama HFQ8/INT8 attend scales
     pub v_scales: Option<&'a GpuTensor>,
     // ── Position (dual-type coexistence per D4/F8) ──
-    /// Single-token position buffer. Used when `batch_size == 1`.
-    /// Ignored when `batch_size > 1` (use `positions` instead).
+    /// Single-token position buffer. Used when `batch_size == 1` and
+    /// `positions` is `None` (decode). Ignored otherwise.
     pub pos_buf: &'a DeviceBuffer,
     /// 0-based physical position index. `dispatch_*` internally computes
     /// `seq_len = pos + 1`. Callers MUST pass `pos`, never `pos + 1`.
     /// Used only for single-token (`batch_size == 1`).
     pub pos: usize,
-    /// Batched position tensor `[n]` i32. Used when `batch_size > 1`.
-    /// `None` when `batch_size == 1` (use `pos_buf` instead).
+    /// Batched position tensor `[n]` i32. A batched caller passes it for every
+    /// chunk; a one-row chunk reads its position from element 0 instead of
+    /// `pos_buf`, which only decode uploads. `None` for decode.
     pub positions: Option<&'a GpuTensor>,
     // ── Dimensions ──
     pub n_heads: usize,
@@ -85,11 +87,168 @@ impl<'a> AttnParams<'a> {
         self.positions
             .expect("positions required for batch_size > 1")
     }
+
+    /// `self` with a one-row batched call's position read from `positions`:
+    /// the single-token kernels read `pos_buf`, and a prefill chunk never
+    /// uploads that decode scratch (stale slot, or a fault before any decode).
+    fn with_row_position(&self) -> AttnParams<'a> {
+        let pos_buf = match self.positions {
+            Some(positions) if self.batch_size == 1 => &positions.buf,
+            _ => self.pos_buf,
+        };
+        AttnParams { pos_buf, ..*self }
+    }
 }
 
 #[inline]
 fn is_contiguous_prefill_prefix(pos: usize, batch_size: usize, max_ctx_len: usize) -> bool {
     pos.checked_add(batch_size) == Some(max_ctx_len)
+}
+
+/// Pure admission inputs for the H16 native-FP8 Raw-Q (Q-resident v2) route.
+///
+/// Boring primitives/booleans only, so CPU tests exercise this exact core
+/// without a device. The thin `native_fp8q_h16_io_admitted` wrapper below wires
+/// `Gpu`/plan/`AttnParams` fields here exactly once; both the `run_attention`
+/// Raw-Q pregate (before the KV write) and the H16 Raw branch of the attend
+/// path call that wrapper, so entry and attend-only can never drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFp8QAdmission {
+    /// `plan.attend_key == AttnFp8E4m3KvBatchedMasked`.
+    attend_native: bool,
+    /// `plan.write_key == KvWriteFp8E4m3Batched`.
+    write_native: bool,
+    /// `gpu.arch == "gfx1201"`.
+    arch_gfx1201: bool,
+    /// `gpu.flags.gfx12_fa2_prefill`.
+    fa2_prefill: bool,
+    /// `gpu.flags.gfx12_fa_prep_fp8q` (the actual private H16 producer flag).
+    prep_fp8q: bool,
+    /// `gpu.flags.attn_qresident`.
+    qresident: bool,
+    /// `gpu.flags.attn_qresident_v2`.
+    qresident_v2: bool,
+    /// `plan.v_mode_bits == 8`.
+    v_mode_8: bool,
+    /// `plan.window <= 0` (full causal).
+    full_window: bool,
+    /// `!plan.uses_givens`.
+    no_givens: bool,
+    /// `io.q.dtype == DType::Raw`.
+    q_raw: bool,
+    /// `io.output.dtype == DType::F32` (no Raw A4-epilogue output here).
+    out_f32: bool,
+    /// `io.output_gate.is_none()`.
+    no_gate: bool,
+    /// `io.output_awq_scale.is_none()`.
+    no_awq: bool,
+    /// `io.tree_bias.is_none()`.
+    no_tree: bool,
+    /// `io.block_cols == 0`.
+    no_block: bool,
+    /// `!ctx.verify_tile_attend` (VERIFY stays rejected).
+    no_verify_tile: bool,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+    pos: usize,
+    max_ctx_len: usize,
+    physical_cap: usize,
+    /// Logical `io.q` elements (the producer builds Raw `[bytes]`).
+    q_numel: usize,
+    /// `io.q` buffer bytes.
+    q_buf_bytes: usize,
+    /// Logical `io.output` elements.
+    out_numel: usize,
+}
+
+/// ONE authoritative H16 native-FP8 Raw-Q admission: true-prefill rows
+/// `2..=32768` (AR1/single-row decode stays excluded) with general tails (no
+/// whole-512 criterion — that stays H24-only), context `2..=262144`, checked
+/// `pos + batch == max_ctx` within the physical cap, and the checked two-plane
+/// QP extent `batch * heads * (D + 4)` (codes then F32 scales). The Raw view's
+/// logical extent must equal that total exactly — so a PM Raw Q16 can never be
+/// reinterpreted as QP — with buffer bytes covering it and F32 output covering
+/// `batch * heads * D`.
+#[inline]
+fn native_fp8q_h16_admitted(admission: &NativeFp8QAdmission) -> bool {
+    let a = *admission;
+    a.attend_native
+        && a.write_native
+        && a.arch_gfx1201
+        && a.fa2_prefill
+        && a.prep_fp8q
+        && a.qresident
+        && a.qresident_v2
+        && a.v_mode_8
+        && a.full_window
+        && a.no_givens
+        && a.q_raw
+        && a.out_f32
+        && a.no_gate
+        && a.no_awq
+        && a.no_tree
+        && a.no_block
+        && a.no_verify_tile
+        && (a.n_heads, a.n_kv_heads, a.head_dim) == (16, 2, 256)
+        && (2..=32768).contains(&a.batch_size)
+        && (2..=262_144).contains(&a.max_ctx_len)
+        && a.pos.checked_add(a.batch_size) == Some(a.max_ctx_len)
+        && a.max_ctx_len <= a.physical_cap
+        && a.batch_size
+            .checked_mul(a.n_heads)
+            .and_then(|codes| {
+                a.head_dim
+                    .checked_add(4)
+                    .and_then(|row| codes.checked_mul(row))
+            })
+            .is_some_and(|extent| a.q_numel == extent && a.q_buf_bytes >= extent)
+        && a.batch_size
+            .checked_mul(a.n_heads)
+            .and_then(|rows| rows.checked_mul(a.head_dim))
+            .is_some_and(|need| a.out_numel >= need)
+}
+
+/// Thin context wrapper wiring `Gpu`/plan/`AttnParams` into
+/// `native_fp8q_h16_admitted` exactly once. No criteria live here — only field
+/// mapping — so the pregate and the attend branch share one contract.
+#[inline]
+fn native_fp8q_h16_io_admitted(
+    ctx: &DispatchCtx,
+    gpu: &Gpu,
+    plan: &crate::families::kv_tier::KvTierPlan,
+    io: &AttnParams,
+) -> bool {
+    native_fp8q_h16_admitted(&NativeFp8QAdmission {
+        attend_native: plan.attend_key == KernelKey::AttnFp8E4m3KvBatchedMasked,
+        write_native: plan.write_key == KernelKey::KvWriteFp8E4m3Batched,
+        arch_gfx1201: gpu.arch == "gfx1201",
+        fa2_prefill: gpu.flags.gfx12_fa2_prefill,
+        prep_fp8q: gpu.flags.gfx12_fa_prep_fp8q,
+        qresident: gpu.flags.attn_qresident,
+        qresident_v2: gpu.flags.attn_qresident_v2,
+        v_mode_8: plan.v_mode_bits == 8,
+        full_window: plan.window <= 0,
+        no_givens: !plan.uses_givens,
+        q_raw: io.q.dtype == DType::Raw,
+        out_f32: io.output.dtype == DType::F32,
+        no_gate: io.output_gate.is_none(),
+        no_awq: io.output_awq_scale.is_none(),
+        no_tree: io.tree_bias.is_none(),
+        no_block: io.block_cols == 0,
+        no_verify_tile: !ctx.verify_tile_attend,
+        n_heads: io.n_heads,
+        n_kv_heads: io.n_kv_heads,
+        head_dim: io.head_dim,
+        batch_size: io.batch_size,
+        pos: io.pos,
+        max_ctx_len: io.max_ctx_len,
+        physical_cap: io.physical_cap,
+        q_numel: io.q.numel(),
+        q_buf_bytes: io.q.buf.size(),
+        out_numel: io.output.numel(),
+    })
 }
 
 #[inline]
@@ -213,6 +372,7 @@ impl AttentionFamily {
         plan: &crate::families::kv_tier::KvTierPlan,
         io: &AttnParams,
     ) -> Result<(), DispatchError> {
+        let io = &io.with_row_position();
         let shape = ShapeInfo {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
@@ -228,7 +388,7 @@ impl AttentionFamily {
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
         if io.q.dtype == DType::Raw
-            && !(plan.attend_key == KernelKey::AttnFp8E4m3KvBatchedMasked
+            && !((plan.attend_key == KernelKey::AttnFp8E4m3KvBatchedMasked
                 && gpu.arch == "gfx1201"
                 && gpu.flags.attn_qresident
                 && gpu.flags.attn_qresident_v2
@@ -239,8 +399,11 @@ impl AttentionFamily {
                 && (io.batch_size <= 512 || io.batch_size % 512 == 0)
                 && (64..=262_144).contains(&io.max_ctx_len)
                 && io.tree_bias.is_none())
+                || native_fp8q_h16_io_admitted(ctx, gpu, plan, io))
         {
-            return Err(DispatchError::Hip("Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into()));
+            return Err(DispatchError::Hip(
+                "Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into(),
+            ));
         }
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
@@ -265,6 +428,7 @@ impl AttentionFamily {
         plan: &crate::families::kv_tier::KvTierPlan,
         io: &AttnParams,
     ) -> Result<(), DispatchError> {
+        let io = &io.with_row_position();
         let shape = ShapeInfo {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
@@ -301,6 +465,30 @@ impl AttentionFamily {
         };
         let variant = self.resolve(io.key, ctx, Some(&shape))?;
         dispatch_full_attention(gpu, io.key, variant.tile, io)
+    }
+
+    /// [`Self::run_full_attention`] on one registered `tile` of `io.key`
+    /// instead of the best admitted one: a caller whose numerics contract is
+    /// a specific kernel (the DFlash drafters' scalar tile) pins it here.
+    pub fn run_full_attention_on(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        io: &FullAttnParams,
+        tile: TileImpl,
+    ) -> Result<(), DispatchError> {
+        let registered = self
+            .registry
+            .variants_for(io.key)
+            .iter()
+            .any(|v| v.tile == tile && v.arch_required.eval_arch(ctx));
+        if !registered {
+            return Err(DispatchError::Hip(format!(
+                "attention {:?}: tile {tile:?} is not admitted on this arch",
+                io.key
+            )));
+        }
+        dispatch_full_attention(gpu, io.key, tile, io)
     }
 }
 
@@ -1230,6 +1418,23 @@ fn dispatch_attend(
                         io.physical_cap,
                         fp,
                     )),
+                    // The flash tile walks head_dim in 128-wide halves (32
+                    // lanes x 4): a 64-wide head (SmolLM2, Llama-3.2-1B) would
+                    // read the next head's Q/K and write past its partials row.
+                    // attention_q8_0_kv reads the position from pos_buf on a
+                    // fixed grid, so it is graph/replay-safe as well.
+                    (None, None) if io.head_dim % 128 != 0 => hip!(gpu.attention_q8_0_kv(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                    )),
                     (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
                         io.k_cache,
@@ -1471,23 +1676,24 @@ fn dispatch_attend(
                     ));
                 }
                 match (io.output_gate, io.output_awq_scale) {
-                    (Some(gate), Some(scale)) => hip!(gpu.attention_flash_asym3_gated_mq_rotate_awq(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.pos_buf,
-                        ct,
-                        st,
-                        seq_len,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.physical_cap,
-                        fp,
-                        gate,
-                        scale,
-                    )),
+                    (Some(gate), Some(scale)) => hip!(gpu
+                        .attention_flash_asym3_gated_mq_rotate_awq(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.pos_buf,
+                            ct,
+                            st,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            fp,
+                            gate,
+                            scale,
+                        )),
                     (Some(gate), None) => hip!(gpu.attention_flash_asym3(
                         io.q,
                         io.k_cache,
@@ -2137,6 +2343,35 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
+                // A3B PM follows its independent typed qualification policy,
+                // not the generic flash defaults. All non-Q8/full-causal
+                // layouts and every refusal keep the incumbent below.
+                if io.tree_bias.is_none()
+                    && plan.window <= 0
+                    && io.block_cols == 0
+                    && io.max_ctx_len <= io.physical_cap
+                    && gpu.fa_prefill_pm_admitted(
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        (plan.v_mode_bits == 8).then_some(FaPrefillKvCodec::Q8_0),
+                    )
+                {
+                    return hip!(gpu.attention_q8_0_fa_prefill_pm_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
+                }
                 // HIPFIRE_FLASH_PREFILL=0 forces off anywhere. Resolve the
                 // single precedence rule before either backend is attempted,
                 // so CK and the native WMMA/scalar routes share one gate.
@@ -2217,7 +2452,8 @@ fn dispatch_attend(
                     && !gpu.flash_attn_ck_loaded()
                     && !matches!(
                         hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                            .ok().as_deref(),
+                            .ok()
+                            .as_deref(),
                         Some("scalar") | Some("batched")
                     )
                     && ctx.workload == crate::context::DispatchWorkload::Standard
@@ -2493,6 +2729,68 @@ fn dispatch_attend(
                 ))
             }
             KernelKey::AttnFp8E4m3KvBatchedMasked => {
+                // Prepared H16 Q is the native FP8 two-plane encoding, not
+                // the PM route's F16 Raw view. Consume it before any F32
+                // fallback and fail closed if caller/consumer admission drifts.
+                if io.q.dtype == DType::Raw
+                    && (io.n_heads, io.n_kv_heads, io.head_dim) == (16, 2, 256)
+                {
+                    if !native_fp8q_h16_io_admitted(ctx, gpu, plan, io) {
+                        return Err(DispatchError::Hip(
+                            "H16 native FP8-Q requires admitted full-causal qresident-v2 attention"
+                                .into(),
+                        ));
+                    }
+                    return hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
+                }
+                // A3B H16/KV2/D256 native-fp8 prefill: the PM direct body (same arithmetic DAG
+                // as the Q8_0 PM route downstream of the KV dequant) behind the same typed
+                // HIPFIRE_FA_PREFILL_PM flag, resolved for fp8 KV (off unless explicitly set
+                // until fp8 is qualified). Full-causal f32 Q and output only: Raw-Q / gate
+                // epilogue calls, tree, block, windowed and DFlash verify-tile layouts keep the
+                // arms below, and every admission refusal falls through unchanged.
+                if io.q.dtype == DType::F32
+                    && io.output.dtype == DType::F32
+                    && io.output_gate.is_none()
+                    && io.output_awq_scale.is_none()
+                    && io.tree_bias.is_none()
+                    && plan.window <= 0
+                    && io.block_cols == 0
+                    && !ctx.verify_tile_attend
+                    && io.max_ctx_len <= io.physical_cap
+                    && gpu.fa_prefill_pm_admitted(
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        (plan.v_mode_bits == 8).then_some(FaPrefillKvCodec::Fp8E4M3),
+                    )
+                {
+                    return hip!(gpu.attention_fp8_e4m3_fa_prefill_pm_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
+                }
                 // gfx1201 FA2 prefill on native fp8 KV, Q0 (slice-B; default
                 // on; `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). F4b: the
                 // launcher pre-converts Q into f16 scratch (Q never mutated)
@@ -2626,12 +2924,11 @@ fn dispatch_attend(
                 // q8: LDS holds occupancy), flash-tile-batched above it.
                 // tree_bias passes through to whichever backend runs; noslots
                 // (null descriptors inside the launchers), like the writer.
-                let crossover: usize =
-                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-                        4096
-                    } else {
-                        8192
-                    };
+                let crossover: usize = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                    4096
+                } else {
+                    8192
+                };
                 // DFlash ChainVerify blocks: always the tile + reduce.
                 if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     let positions = io.positions.unwrap();
@@ -2799,6 +3096,50 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 mod tests {
     use super::*;
 
+    /// HIPF-151: a one-row prefill chunk must take its KV slot from the
+    /// chunk's `positions`, not the decode scratch `pos_buf`.
+    #[test]
+    fn one_row_batched_call_reads_positions() {
+        // Non-owning fake handles: only pointer identity is inspected.
+        let t = |addr: usize| GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, 4) },
+            shape: vec![1],
+            dtype: DType::F32,
+        };
+        let (x, positions, pos_buf) = (t(0x1000), t(0x2000), t(0x3000));
+        let io = |batch_size, positions| AttnParams {
+            q: &x,
+            k: &x,
+            v: &x,
+            k_cache: &x,
+            v_cache: &x,
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &pos_buf.buf,
+            pos: 7,
+            positions,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 1,
+            physical_cap: 8,
+            batch_size,
+            max_ctx_len: 8,
+            flash_partials: None,
+            givens_cos: None,
+            givens_sin: None,
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output_gate: None,
+            output_awq_scale: None,
+            output: &x,
+        };
+        let row_pos = |batch_size, p| io(batch_size, p).with_row_position().pos_buf.as_ptr();
+        assert_eq!(row_pos(1, Some(&positions)), positions.buf.as_ptr());
+        assert_eq!(row_pos(1, None), pos_buf.buf.as_ptr());
+        assert_eq!(row_pos(2, Some(&positions)), pos_buf.buf.as_ptr());
+    }
+
     fn gfx1100_split_model() -> Gfx1100SplitVerifyModel<'static> {
         Gfx1100SplitVerifyModel {
             arch: "gfx1100",
@@ -2939,6 +3280,165 @@ mod tests {
             256,
             128,
         ));
+    }
+
+    fn native_fp8q_base() -> NativeFp8QAdmission {
+        NativeFp8QAdmission {
+            attend_native: true,
+            write_native: true,
+            arch_gfx1201: true,
+            fa2_prefill: true,
+            prep_fp8q: true,
+            qresident: true,
+            qresident_v2: true,
+            v_mode_8: true,
+            full_window: true,
+            no_givens: true,
+            q_raw: true,
+            out_f32: true,
+            no_gate: true,
+            no_awq: true,
+            no_tree: true,
+            no_block: true,
+            no_verify_tile: true,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            batch_size: 8192,
+            pos: 0,
+            max_ctx_len: 8192,
+            physical_cap: 16032,
+            q_numel: 8192 * 16 * 260,
+            q_buf_bytes: 8192 * 16 * 260,
+            out_numel: 8192 * 16 * 256,
+        }
+    }
+
+    fn native_fp8q_with_batch(
+        batch_size: usize,
+        max_ctx_len: usize,
+        pos: usize,
+    ) -> NativeFp8QAdmission {
+        let mut admission = native_fp8q_base();
+        admission.batch_size = batch_size;
+        admission.max_ctx_len = max_ctx_len;
+        admission.pos = pos;
+        admission.q_numel = batch_size * 16 * 260;
+        admission.q_buf_bytes = batch_size * 16 * 260;
+        admission.out_numel = batch_size * 16 * 256;
+        admission
+    }
+
+    #[test]
+    fn native_fp8q_admits_valid_general_shapes() {
+        // Production prefill plus the general tails the actual H16 producer
+        // emits (522-row whole packet caller, tiny effective tails, ragged
+        // 511/513 and sub-64 rows): none requires a whole-512 multiple.
+        for (batch_size, max_ctx_len) in [
+            (8192, 8192),
+            (522, 522),
+            (2, 2),
+            (7, 7),
+            (17, 64),
+            (63, 128),
+            (511, 511),
+            (513, 1024),
+        ] {
+            let pos = max_ctx_len - batch_size;
+            assert!(
+                native_fp8q_h16_admitted(&native_fp8q_with_batch(batch_size, max_ctx_len, pos)),
+                "batch {batch_size} ctx {max_ctx_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_fp8q_rejects_decode_and_bad_geometry() {
+        let mut decode = native_fp8q_with_batch(1, 1, 0);
+        assert!(!native_fp8q_h16_admitted(&decode));
+        decode.batch_size = 1;
+        decode.max_ctx_len = 64;
+        decode.pos = 63;
+        decode.q_numel = 16 * 260;
+        decode.q_buf_bytes = 16 * 260;
+        decode.out_numel = 16 * 256;
+        assert!(!native_fp8q_h16_admitted(&decode));
+        let mut zero_ctx = native_fp8q_with_batch(2, 2, 0);
+        zero_ctx.max_ctx_len = 0;
+        assert!(!native_fp8q_h16_admitted(&zero_ctx));
+        for (n_heads, n_kv_heads, head_dim) in [(24, 4, 256), (16, 4, 256), (16, 2, 128)] {
+            let mut wrong = native_fp8q_base();
+            wrong.n_heads = n_heads;
+            wrong.n_kv_heads = n_kv_heads;
+            wrong.head_dim = head_dim;
+            assert!(
+                !native_fp8q_h16_admitted(&wrong),
+                "{n_heads}/{n_kv_heads}/{head_dim}"
+            );
+        }
+        let mut oversize = native_fp8q_with_batch(32768, 32768, 0);
+        oversize.batch_size = 32769;
+        oversize.max_ctx_len = 32769;
+        oversize.q_numel = 32769 * 16 * 260;
+        oversize.q_buf_bytes = oversize.q_numel;
+        oversize.out_numel = 32769 * 16 * 256;
+        assert!(!native_fp8q_h16_admitted(&oversize));
+        let mut oversize_ctx = native_fp8q_base();
+        oversize_ctx.max_ctx_len = 262_145;
+        assert!(!native_fp8q_h16_admitted(&oversize_ctx));
+    }
+
+    #[test]
+    fn native_fp8q_rejects_wrong_keys_flags_and_layout() {
+        let mutates: [fn(&mut NativeFp8QAdmission); 17] = [
+            |a: &mut NativeFp8QAdmission| a.attend_native = false,
+            |a: &mut NativeFp8QAdmission| a.write_native = false,
+            |a: &mut NativeFp8QAdmission| a.arch_gfx1201 = false,
+            |a: &mut NativeFp8QAdmission| a.fa2_prefill = false,
+            |a: &mut NativeFp8QAdmission| a.prep_fp8q = false,
+            |a: &mut NativeFp8QAdmission| a.qresident = false,
+            |a: &mut NativeFp8QAdmission| a.qresident_v2 = false,
+            |a: &mut NativeFp8QAdmission| a.v_mode_8 = false,
+            |a: &mut NativeFp8QAdmission| a.full_window = false,
+            |a: &mut NativeFp8QAdmission| a.no_givens = false,
+            |a: &mut NativeFp8QAdmission| a.q_raw = false,
+            |a: &mut NativeFp8QAdmission| a.out_f32 = false,
+            |a: &mut NativeFp8QAdmission| a.no_gate = false,
+            |a: &mut NativeFp8QAdmission| a.no_awq = false,
+            |a: &mut NativeFp8QAdmission| a.no_tree = false,
+            |a: &mut NativeFp8QAdmission| a.no_block = false,
+            |a: &mut NativeFp8QAdmission| a.no_verify_tile = false,
+        ];
+        for mutate in mutates {
+            let mut admission = native_fp8q_base();
+            mutate(&mut admission);
+            assert!(!native_fp8q_h16_admitted(&admission));
+        }
+    }
+
+    #[test]
+    fn native_fp8q_rejects_encoding_and_context_extents() {
+        // PM Raw Q16 view reinterpreted as QP: logical extent is the Q16 plane,
+        // never the full batch*heads*(D+4) total.
+        let mut q16 = native_fp8q_base();
+        q16.q_numel = 8192 * 16 * 256;
+        assert!(!native_fp8q_h16_admitted(&q16));
+        // Truncated two-plane QP: one byte short of the checked total.
+        let mut truncated = native_fp8q_base();
+        truncated.q_numel -= 1;
+        truncated.q_buf_bytes -= 1;
+        assert!(!native_fp8q_h16_admitted(&truncated));
+        // Short F32 output plane.
+        let mut short_out = native_fp8q_base();
+        short_out.out_numel -= 1;
+        assert!(!native_fp8q_h16_admitted(&short_out));
+        // Context overflow: pos + batch != max_ctx, and ctx beyond the cap.
+        let mut end = native_fp8q_base();
+        end.pos = 1;
+        assert!(!native_fp8q_h16_admitted(&end));
+        let mut cap = native_fp8q_base();
+        cap.physical_cap = 8191;
+        assert!(!native_fp8q_h16_admitted(&cap));
     }
 
     #[test]

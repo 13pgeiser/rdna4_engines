@@ -74,7 +74,6 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
-
 /// The per-arch multi-slot engine behind the four-method surface
 /// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
 ///
@@ -106,16 +105,13 @@ type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
 /// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
 /// maps it onto its own engine config. `Err` names the arch when no carrier
 /// provides a slot engine.
-fn spawn_slot_engine(
-    arch_id: u32,
-    cfg: SlotEngineConfig,
-) -> Result<AnySlotEngine, String> {
+fn spawn_slot_engine(arch_id: u32, cfg: SlotEngineConfig) -> Result<AnySlotEngine, String> {
     let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
         format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
     })?;
-    carrier.spawn_slot_engine(cfg).map_err(|e| {
-        format!("no multi-slot engine for arch_id {arch_id}: {e}")
-    })
+    carrier
+        .spawn_slot_engine(cfg)
+        .map_err(|e| format!("no multi-slot engine for arch_id {arch_id}: {e}"))
 }
 
 /// Slot-engine load parameters parsed from a `load` message. The daemon's
@@ -150,7 +146,10 @@ impl SlotLoadParams {
     pub fn from_load_msg(msg: &serde_json::Value) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
-        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
+        // `mtp_mode` on/auto only requests a depth here (`mtp_k` > 0); `off`
+        // is 0. Whether the head arms is decided later by the producer-
+        // capability gate (`SlotEngine::spawn`: `auto` arms only a producer
+        // with a measured AR floor, `on` always). mtp_k sets depth. An integer param
         // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
         // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
         // The tri-state survives beside mtp_k: the engine's host-spill
@@ -224,16 +223,33 @@ impl SlotLoadParams {
     }
 }
 
+/// The multi-slot route renders `hfq.chat_template()` directly.
+const SLOT_CHAT_TEMPLATE_SOURCE: &str =
+    "embedded HFQ tokenizer_config.chat_template (multi-slot route renders it directly)";
+
 /// Daemon-owned slot backend. Owns one weight copy via SlotEngine.
 pub struct SlotBackend {
     chat_template: Option<String>,
+    /// `reasoning_effort` capability of the template this route actually
+    /// renders, probed once at load.
+    effort_probe: crate::effort_probe::EffortProbe,
+    /// Provenance of `chat_template` (`None` iff there is no template).
+    chat_template_source: Option<&'static str>,
     engine: AnySlotEngine,
     tokenizer: Tokenizer,
     arch_str: String,
+    /// `params.mtp_mode` after the producer-capability gate (what the engine
+    /// serves: `auto` on a producer without a measured AR floor is `off`).
+    mtp_mode_effective: &'static str,
     dim: usize,
     layers: usize,
     vocab: usize,
     is_vl: bool,
+    /// Post-gate audio-tower / video-leg residency, published verbatim in
+    /// the `loaded` ack (`audio` / `video`) so `/v1/models` can advertise
+    /// the modalities the serve actually accepts.
+    is_audio: bool,
+    is_video: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Per-slot context cap handed to the engine at load. Admission-side
     /// only (the engine re-enforces it per token); kept here so an
@@ -406,12 +422,22 @@ impl SlotBackend {
         let preflight = cpu_preflight(model_path, vision_mode, vision.as_deref())?;
         let arch_id = preflight.arch_id;
         let arch_str = preflight.arch_str.clone();
+        // The engine applies the same gate to its depth (`SlotEngine::spawn`);
+        // this is the verdict the load ack reports.
+        let mtp_mode_effective = hipfire_config::mtp_effective_mode(
+            mtp_mode,
+            hipfire_loader::carrier_for(arch_id)
+                .is_some_and(|carrier| carrier.mtp_measured_ar_floor()),
+        )
+        .name();
         let dim = preflight.dim;
         let layers = preflight.layers;
         let chat_template = preflight.chat_template;
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
+        let is_audio = preflight.audio;
+        let is_video = preflight.video;
         let vision_config = preflight.vision_config;
         let rec_temperature = preflight.rec_temperature;
         let rec_top_p = preflight.rec_top_p;
@@ -548,15 +574,26 @@ impl SlotBackend {
             },
         )?;
 
+        // This route renders the HFQ's embedded template directly (no loader
+        // overrides / built-in fallback), so that is the template probed and
+        // the source reported.
+        let effort_probe =
+            crate::effort_probe::probe_loaded_effort(Some(&tokenizer), chat_template.as_deref());
+        let chat_template_source = chat_template.as_ref().map(|_| SLOT_CHAT_TEMPLATE_SOURCE);
         Ok(Self {
             engine,
+            effort_probe,
+            chat_template_source,
             tokenizer,
             arch_str,
+            mtp_mode_effective,
             dim,
             chat_template,
             layers,
             vocab,
             is_vl,
+            is_audio,
+            is_video,
             vision_config,
             cap_tokens,
             arch_id,
@@ -571,6 +608,10 @@ impl SlotBackend {
     pub fn arch_str(&self) -> &str {
         &self.arch_str
     }
+    /// The MTP mode this slot engine serves after the producer-capability gate.
+    pub fn mtp_mode_effective(&self) -> &'static str {
+        self.mtp_mode_effective
+    }
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -582,6 +623,22 @@ impl SlotBackend {
     }
     pub fn is_vl(&self) -> bool {
         self.is_vl
+    }
+    pub fn is_audio(&self) -> bool {
+        self.is_audio
+    }
+    pub fn is_video(&self) -> bool {
+        self.is_video
+    }
+
+    /// Load-time `reasoning_effort` probe of the rendered template.
+    pub fn effort_probe(&self) -> &crate::effort_probe::EffortProbe {
+        &self.effort_probe
+    }
+
+    /// Provenance of the rendered chat template, for the probe diagnostic.
+    pub fn chat_template_source(&self) -> Option<&'static str> {
+        self.chat_template_source
     }
 
     pub fn active_count(&self) -> usize {
@@ -1682,6 +1739,9 @@ impl SlotBackend {
             "cached_tokens": cached_tokens,
             "prefill_tokens": prefill_tokens,
             "tok_s": (tok_s * 10.0).round() / 10.0,
+            // Pushed on every done because a polled stats request would queue
+            // behind generation; the gateway exports the latest snapshot.
+            "engine_stats": self.engine.stats(),
         });
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 
@@ -1763,6 +1823,10 @@ struct Preflight {
     tokenizer: Tokenizer,
     chat_template: Option<String>,
     is_vl: bool,
+    /// Post-gate audio-tower and video-leg residency (arch 18 only; both
+    /// ride the one `.vl` sidecar the vision gate already resolved).
+    audio: bool,
+    video: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
@@ -1785,6 +1849,28 @@ fn cpu_preflight(
     // reading and the refusals.
     if let Some(over) = hipfire_loader::slot_preflight(std::path::Path::new(model_path)) {
         let p = over?;
+        // The carrier reports the tower it FOUND (an explicit path, or the
+        // `.vl` sibling); the load's ladder owns whether it is used — the
+        // same rule the sequential arm applies (`vision_mode=off` is a hard
+        // override; `on` requires a tower). Without this gate the mode never
+        // reached a carrier-delegated preflight at all, so a multi-slot load
+        // asking for `auto` came back text-only and refused media.
+        let (vl_path, is_vl) = match vision_mode {
+            "off" => (None, false),
+            _ => {
+                let explicit = vision.filter(|v| !v.is_empty()).map(PathBuf::from);
+                match explicit.or(p.vl_path) {
+                    Some(v) => (Some(v), true),
+                    None if vision_mode == "on" && !p.is_vl => {
+                        return Err(format!(
+                            "vision_mode=on: no vision tower resolved for {model_path} \
+                             (no explicit sidecar and no <stem>.vl sibling found)"
+                        ))
+                    }
+                    None => (None, p.is_vl),
+                }
+            }
+        };
         return Ok(Preflight {
             arch_id: p.arch_id,
             arch_str: p.arch_str,
@@ -1796,9 +1882,13 @@ fn cpu_preflight(
             // chat template, no sampling recommendation, no VL splice. The
             // tower is loaded and driven by the arch crate itself.
             chat_template: None,
-            is_vl: p.is_vl,
+            is_vl,
+            // Both towers ride the ONE `.vl` pack, so the mode gate that
+            // stripped `vl_path` strips audio and the video leg with it.
+            audio: p.audio && vl_path.is_some(),
+            video: p.video && vl_path.is_some(),
             vision_config: None,
-            vl_path: p.vl_path,
+            vl_path,
             rec_temperature: None,
             rec_top_p: None,
         });
@@ -1889,6 +1979,9 @@ fn cpu_preflight(
         tokenizer,
         chat_template,
         is_vl,
+        // The HFQ slot route (chat arches) has no embed media legs.
+        audio: false,
+        video: false,
         vision_config,
         vl_path,
     })
@@ -1896,12 +1989,17 @@ fn cpu_preflight(
 
 // ── Validation helpers (pure) ────────────────────────────────────────────────
 
+/// Refuse an arch the daemon's own (qwen35-HFQ-shaped) slot preflight cannot
+/// describe. Only reached for a path no carrier claimed through
+/// `Carrier::preflight_slot_model` — arch 17's encoder answers there, so its
+/// `validate_arch_id` refusal never fires.
 pub fn validate_arch_id(arch_id: u32) -> Result<(), String> {
     if matches!(arch_id, 5 | 6) {
         Ok(())
     } else {
         Err(format!(
-            "experimental multi-slot only supports arch_id 5|6 (qwen3_5), got {arch_id}"
+            "experimental multi-slot supports arch_id 5|6 (qwen3_5) plus any arch whose \
+             carrier provides a slot engine, got {arch_id}"
         ))
     }
 }
@@ -2013,9 +2111,13 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     }
     // The multi-slot DFlash2 path runs the default proposal width only
     // (`auto` resolves to it: this route never stages VMM batching).
-    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.and_then(|p| p.get("dflash_block"))) {
+    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
+        params.and_then(|p| p.get("dflash_block")),
+    ) {
         Err(e) => return Some(e),
-        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED => {
+        Ok(policy)
+            if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED =>
+        {
             return Some(format!(
                 "speculation.dflash_block other than {} not supported in experimental multi-slot",
                 hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED
@@ -2256,8 +2358,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                     );
                 }
             };
-            if let Err(e) =
-                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
             {
                 return Some(format!("response_format json_schema: {e}"));
             }
@@ -2969,12 +3070,22 @@ mod tests {
                 matches!(registered, hipfire_config::DefaultValue::Integer(i) if i == expected),
                 "{key}: registered default is {registered:?}, expected {expected}"
             );
-            assert_eq!(integer_or_registered_default(&empty, key), expected, "{key}");
+            assert_eq!(
+                integer_or_registered_default(&empty, key),
+                expected,
+                "{key}"
+            );
         }
         let mut set = hipfire_config::ConfigLayer::default();
-        set.set("serve.queue_timeout_ms", hipfire_config::ConfigValue::Integer(1234))
-            .unwrap();
-        assert_eq!(integer_or_registered_default(&set, "serve.queue_timeout_ms"), 1234);
+        set.set(
+            "serve.queue_timeout_ms",
+            hipfire_config::ConfigValue::Integer(1234),
+        )
+        .unwrap();
+        assert_eq!(
+            integer_or_registered_default(&set, "serve.queue_timeout_ms"),
+            1234
+        );
     }
 
     #[test]
@@ -3157,7 +3268,10 @@ mod tests {
         // reject (that failure belongs to the render, as validation).
         assert_eq!(slot_jinja_effort(None, Some("high"), None), Some("high"));
         assert_eq!(slot_jinja_effort(None, Some("xhigh"), None), Some("xhigh"));
-        assert_eq!(slot_jinja_effort(Some(true), Some("low"), None), Some("low"));
+        assert_eq!(
+            slot_jinja_effort(Some(true), Some("low"), None),
+            Some("low")
+        );
         // `auto` and absent mean "no preference": leave it undefined so the
         // template's own default applies.
         assert_eq!(slot_jinja_effort(None, Some("auto"), None), None);
@@ -3170,7 +3284,10 @@ mod tests {
         assert_eq!(slot_jinja_effort(None, Some("chat"), None), None);
         assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(1)), None);
         // A finite budget is not a disable: the rung survives it.
-        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(64)), Some("high"));
+        assert_eq!(
+            slot_jinja_effort(Some(true), Some("high"), Some(64)),
+            Some("high")
+        );
     }
 
     #[test]
@@ -3302,11 +3419,24 @@ mod tests {
 
     #[test]
     fn load_caps_admit_only_the_default_dflash_block() {
-        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
-            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
+        for ok in [
+            json!({"params": {}}),
+            json!({"params": {"dflash_block": 16}}),
+            json!({"params": {"dflash_block": "auto"}}),
+        ] {
+            assert!(
+                validate_load_caps(&ok, "gfx1100").is_none(),
+                "{ok} must be admitted"
+            );
         }
-        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
-            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
+        for bad in [
+            json!({"params": {"dflash_block": 8}}),
+            json!({"params": {"dflash_block": 99}}),
+        ] {
+            assert!(
+                validate_load_caps(&bad, "gfx1100").is_some(),
+                "{bad} must be refused"
+            );
         }
     }
 

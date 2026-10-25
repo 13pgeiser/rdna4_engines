@@ -347,7 +347,6 @@ fn main() -> Res<()> {
         xrot_b,
     };
 
-
     let dim = cx.config.dim;
     let hidden = cx.config.hidden_dim;
     let eps = cx.config.norm_eps;
@@ -358,24 +357,27 @@ fn main() -> Res<()> {
     let mut tag_entries: Vec<Value> = vec![];
     let mut layer_types_out: Vec<Value> = vec![];
 
-    let write_cap = |files: &mut Vec<Value>, l: usize, tag: &str, k: usize, cap: &Cap| -> Res<Value> {
-        let xp = format!("L{l}.{tag}.xrot.f32");
-        let ap = format!("L{l}.{tag}.a4.bin");
-        let xb = f32_bytes(&cap.xrot);
-        fs::write(out.join(&xp), xb)?;
-        fs::write(out.join(&ap), &cap.a4)?;
-        let (xm, am) = (md5_hex(xb), md5_hex(&cap.a4));
-        files.push(json!({"file": xp, "bytes": xb.len(), "md5": xm}));
-        files.push(json!({"file": ap, "bytes": cap.a4.len(), "md5": am}));
-        let sc = selfcheck(&cap.xrot, &cap.a4, t, k);
-        eprintln!("selfcheck L{l} {tag} K={k}: {sc}");
-        Ok(json!({"xrot_md5": xm, "a4_md5": am, "selfcheck": sc}))
-    };
+    let write_cap =
+        |files: &mut Vec<Value>, l: usize, tag: &str, k: usize, cap: &Cap| -> Res<Value> {
+            let xp = format!("L{l}.{tag}.xrot.f32");
+            let ap = format!("L{l}.{tag}.a4.bin");
+            let xb = f32_bytes(&cap.xrot);
+            fs::write(out.join(&xp), xb)?;
+            fs::write(out.join(&ap), &cap.a4)?;
+            let (xm, am) = (md5_hex(xb), md5_hex(&cap.a4));
+            files.push(json!({"file": xp, "bytes": xb.len(), "md5": xm}));
+            files.push(json!({"file": ap, "bytes": cap.a4.len(), "md5": am}));
+            let sc = selfcheck(&cap.xrot, &cap.a4, t, k);
+            eprintln!("selfcheck L{l} {tag} K={k}: {sc}");
+            Ok(json!({"xrot_md5": xm, "a4_md5": am, "selfcheck": sc}))
+        };
 
     for &l in &layers {
         let lt0 = Instant::now();
         let is_fa = cx.config.layer_types[l] == LayerType::FullAttention;
-        layer_types_out.push(json!({"layer": l, "type": if is_fa {"full_attention"} else {"linear_attention"}}));
+        layer_types_out.push(
+            json!({"layer": l, "type": if is_fa {"full_attention"} else {"linear_attention"}}),
+        );
         let pre = format!("model.language_model.layers.{l}");
 
         // ---- Run A: layers 0..L -> pbs.x_batch = layer L input residual. ----
@@ -393,7 +395,16 @@ fn main() -> Res<()> {
             };
             let xb = &cx.pbs.x_batch;
             let c = grab!(cx, dim, 0, |gpu, res, xr| {
-                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(xb, norm, awq, Some(xr), res, dim, eps, t)?;
+                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+                    xb,
+                    norm,
+                    awq,
+                    Some(xr),
+                    res,
+                    dim,
+                    eps,
+                    t,
+                )?;
                 Ok(())
             })?;
             (c, awq.is_some())
@@ -412,7 +423,9 @@ fn main() -> Res<()> {
         cx.gpu.hip.memcpy_dtoh(&mut wd_backup, &wd_buf)?;
         // sentinels: detect F1-lite h route (up_batch never written) and FA gate-in-place
         cx.gpu.hip.memset(&cx.pbs.up_batch.buf, 0, t * hidden * 4)?;
-        cx.gpu.hip.memset(&cx.pbs.fa_gate_batch.buf, 0, t * q_dim * 4)?;
+        cx.gpu
+            .hip
+            .memset(&cx.pbs.fa_gate_batch.buf, 0, t * q_dim * 4)?;
         cx.gpu.hip.memset(&wd_buf, 0, wd_size)?;
         cx.gpu.hip.device_synchronize()?;
         let run_b = cx.run(l + 1);
@@ -425,7 +438,11 @@ fn main() -> Res<()> {
             v.iter().filter(|x| x.is_finite()).count()
         };
         let up_untouched = all_zero(&cx.gpu, &cx.pbs.up_batch, t * hidden)?;
-        let gate_untouched = if is_fa { all_zero(&cx.gpu, &cx.pbs.fa_gate_batch, t * q_dim)? } else { false };
+        let gate_untouched = if is_fa {
+            all_zero(&cx.gpu, &cx.pbs.fa_gate_batch, t * q_dim)?
+        } else {
+            false
+        };
         eprintln!(
             "L{l} runB: x_in_finite={x_in_finite}/{} x_mid_finite={x_mid_finite}/{} up_untouched(h-route)={up_untouched} fa_gate_in_place={gate_untouched}",
             t * dim,
@@ -455,7 +472,12 @@ fn main() -> Res<()> {
                     )?;
                     Ok(())
                 })?;
-                (k, c, "gated_norm_rotate_mq_i4_gfx12_batched(x_fmt=F32)", awq.is_some())
+                (
+                    k,
+                    c,
+                    "gated_norm_rotate_mq_i4_gfx12_batched(x_fmt=F32)",
+                    awq.is_some(),
+                )
             }
             LayerWeights::FullAttn(lw) => {
                 let k = lw.wo.k;
@@ -499,7 +521,16 @@ fn main() -> Res<()> {
             };
             let xb = &cx.pbs.x_batch;
             let c = grab!(cx, dim, 0, |gpu, res, xr| {
-                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(xb, norm, awq, Some(xr), res, dim, eps, t)?;
+                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+                    xb,
+                    norm,
+                    awq,
+                    Some(xr),
+                    res,
+                    dim,
+                    eps,
+                    t,
+                )?;
                 Ok(())
             })?;
             (c, awq.is_some())
@@ -523,7 +554,13 @@ fn main() -> Res<()> {
                 let h = &pbs.gate_ffn_batch;
                 // a4 bytes: the production producer (silu_hin) — no f32 store.
                 let a4_only = grab!(cx, k, 1, |gpu, res, _xr| {
-                    gpu.fused_silu_hin_rotate_mq_i4_batched(h, awq.ok_or("w_down has no AWQ")?, res, k, t)?;
+                    gpu.fused_silu_hin_rotate_mq_i4_batched(
+                        h,
+                        awq.ok_or("w_down has no AWQ")?,
+                        res,
+                        k,
+                        t,
+                    )?;
                     Ok(())
                 })?;
                 // xrot: rotate_x producer on h (AWQ, FWHT), emits f32 + a4.
@@ -535,7 +572,12 @@ fn main() -> Res<()> {
                 let mism = if same {
                     0
                 } else {
-                    a4_only.a4.iter().zip(xc.a4.iter()).filter(|(a, b)| a != b).count()
+                    a4_only
+                        .a4
+                        .iter()
+                        .zip(xc.a4.iter())
+                        .filter(|(a, b)| a != b)
+                        .count()
                 };
                 eprintln!("L{l} down: silu_hin a4 vs rotate_x(h) a4 identical={same} (differing bytes={mism})");
                 (
@@ -570,33 +612,37 @@ fn main() -> Res<()> {
         let down_meta = write_cap(&mut files, l, "down", hidden, &down_cap)?;
         drop(down_cap);
 
-        let (attn_consumers, attn_awq_name, o_consumers, o_awq_name): (Vec<String>, String, Vec<String>, String) =
-            if is_fa {
-                (
-                    ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
-                        .iter()
-                        .map(|s| format!("{pre}.{s}.weight"))
-                        .collect(),
-                    format!("{pre}.self_attn.q_proj.awq_scale.weight"),
-                    vec![format!("{pre}.self_attn.o_proj.weight")],
-                    format!("{pre}.self_attn.o_proj.awq_scale.weight"),
-                )
-            } else {
-                (
-                    [
-                        "linear_attn.in_proj_qkv",
-                        "linear_attn.in_proj_z",
-                        "linear_attn.in_proj_b",
-                        "linear_attn.in_proj_a",
-                    ]
+        let (attn_consumers, attn_awq_name, o_consumers, o_awq_name): (
+            Vec<String>,
+            String,
+            Vec<String>,
+            String,
+        ) = if is_fa {
+            (
+                ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
                     .iter()
                     .map(|s| format!("{pre}.{s}.weight"))
                     .collect(),
-                    format!("{pre}.linear_attn.in_proj_qkv.awq_scale.weight"),
-                    vec![format!("{pre}.linear_attn.out_proj.weight")],
-                    format!("{pre}.linear_attn.out_proj.awq_scale.weight"),
-                )
-            };
+                format!("{pre}.self_attn.q_proj.awq_scale.weight"),
+                vec![format!("{pre}.self_attn.o_proj.weight")],
+                format!("{pre}.self_attn.o_proj.awq_scale.weight"),
+            )
+        } else {
+            (
+                [
+                    "linear_attn.in_proj_qkv",
+                    "linear_attn.in_proj_z",
+                    "linear_attn.in_proj_b",
+                    "linear_attn.in_proj_a",
+                ]
+                .iter()
+                .map(|s| format!("{pre}.{s}.weight"))
+                .collect(),
+                format!("{pre}.linear_attn.in_proj_qkv.awq_scale.weight"),
+                vec![format!("{pre}.linear_attn.out_proj.weight")],
+                format!("{pre}.linear_attn.out_proj.awq_scale.weight"),
+            )
+        };
         let attn_prod = "fused_rmsnorm_rotate_mq_i4_gfx12_batched (norm=input_layernorm; one call emits f32 xrot + a4; production producer: try_gfx12_rmsnorm_quant_fused_prepared)";
         let mlp_prod = "fused_rmsnorm_rotate_mq_i4_gfx12_batched (norm=post_attention_layernorm, x=x_mid; one call emits f32 xrot + a4; production producer: try_gfx12_rmsnorm_quant_fused_prepared)";
         tag_entries.push(json!({
@@ -655,7 +701,11 @@ fn main() -> Res<()> {
             },
             "wall_s": lt0.elapsed().as_secs_f64(),
         }));
-        eprintln!("layer {l} done in {:.1}s (total {:.1}s)", lt0.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
+        eprintln!(
+            "layer {l} done in {:.1}s (total {:.1}s)",
+            lt0.elapsed().as_secs_f64(),
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     // sign / token files
@@ -706,7 +756,13 @@ fn main() -> Res<()> {
             "Self-check per file: max_over_tokens_abs_resid_over_d_unsaturated = max |x'-d*q|/d over elements with q not in {-8,7}; saturated (clipped) elements reported separately."
         ],
     });
-    fs::write(out.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
-    eprintln!("manifest written; total wall {:.1}s", t0.elapsed().as_secs_f64());
+    fs::write(
+        out.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    eprintln!(
+        "manifest written; total wall {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }

@@ -16,16 +16,16 @@
 //!
 //! Must run on gfx942 (mi300x).
 
+use hipfire_ds4_parent::attention::{PARENT_DIM, PARENT_RMS_EPS};
+use hipfire_ds4_parent::head::PARENT_HC_EPS;
 use hipfire_ds4_parent::head::{
-    parent_embed, parent_head, parent_logits_to_plog, ParentHeadScratch,
-    PARENT_HC_DIM, PARENT_HC_MULT, PARENT_VOCAB,
+    parent_embed, parent_head, parent_logits_to_plog, ParentHeadScratch, PARENT_HC_DIM,
+    PARENT_HC_MULT, PARENT_VOCAB,
 };
 use hipfire_ds4_parent::inventory::ParentInventory;
 use hipfire_ds4_parent::plog::{PlogReader, PlogWriter};
 use hipfire_ds4_parent::weights::{ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::Ds4ParentBackend;
-use hipfire_ds4_parent::attention::{PARENT_DIM, PARENT_RMS_EPS};
-use hipfire_ds4_parent::head::PARENT_HC_EPS;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
@@ -61,9 +61,7 @@ fn run() -> Result<(), String> {
 
     println!("=== ds4_parent_head_smoke ===");
     println!("model: {}", model_path.display());
-    println!(
-        "shape: rows={ROWS} hc_mult={PARENT_HC_MULT} dim={PARENT_DIM} vocab={PARENT_VOCAB}"
-    );
+    println!("shape: rows={ROWS} hc_mult={PARENT_HC_MULT} dim={PARENT_DIM} vocab={PARENT_VOCAB}");
 
     let source = SafetensorsSource::open(model_path).map_err(|e| {
         format!(
@@ -97,7 +95,10 @@ fn run() -> Result<(), String> {
         res.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
         weights.layers.len()
     );
-    assert!(weights.layers.is_empty(), "globals-only plan must load 0 layers");
+    assert!(
+        weights.layers.is_empty(),
+        "globals-only plan must load 0 layers"
+    );
 
     // ── Scratch sizing ────────────────────────────────────────────────
     let scratch = ParentHeadScratch::new(&mut gpu, &cfg, ROWS)?;
@@ -135,14 +136,7 @@ fn run() -> Result<(), String> {
 
     let embed_out = zeros(&mut gpu, &[ROWS, PARENT_HC_MULT, PARENT_DIM])?;
     let t_emb = Instant::now();
-    parent_embed(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        &token_ids,
-        &embed_out,
-    )?;
+    parent_embed(&mut gpu, backend, &weights, &cfg, &token_ids, &embed_out)?;
     let emb_ms = t_emb.elapsed().as_secs_f64() * 1e3;
     let emb_host = download(&gpu, &embed_out)?;
     let emb_finite = emb_host.iter().all(|v| v.is_finite());
@@ -159,8 +153,8 @@ fn run() -> Result<(), String> {
     for r in 0..ROWS {
         let s0 = &emb_host[r * PARENT_HC_DIM..r * PARENT_HC_DIM + PARENT_DIM];
         for h in 1..PARENT_HC_MULT {
-            let sh = &emb_host[r * PARENT_HC_DIM + h * PARENT_DIM
-                ..r * PARENT_HC_DIM + (h + 1) * PARENT_DIM];
+            let sh = &emb_host
+                [r * PARENT_HC_DIM + h * PARENT_DIM..r * PARENT_HC_DIM + (h + 1) * PARENT_DIM];
             if s0 != sh {
                 return Err(format!(
                     "deepseek4 parent: embed stream {h} != stream 0 at row {r}"
@@ -184,22 +178,17 @@ fn run() -> Result<(), String> {
     let logits_t = zeros(&mut gpu, &[ROWS, PARENT_VOCAB])?;
 
     let t_head = Instant::now();
-    parent_head(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        &x,
-        ROWS,
-        &logits_t,
-    )?;
+    parent_head(&mut gpu, backend, &weights, &cfg, &x, ROWS, &logits_t)?;
     let head_ms = t_head.elapsed().as_secs_f64() * 1e3;
     println!("parent_head: {head_ms:.1} ms");
 
     let logits = download(&gpu, &logits_t)?;
     let finite = logits.iter().all(|v| v.is_finite());
     let l2 = l2_norm(&logits);
-    println!("logits: finite={finite}  L2={l2:.6e}  nelems={}", logits.len());
+    println!(
+        "logits: finite={finite}  L2={l2:.6e}  nelems={}",
+        logits.len()
+    );
     if !finite {
         return Err("deepseek4 parent: logits not finite".into());
     }
@@ -236,9 +225,7 @@ fn run() -> Result<(), String> {
             "deepseek4 parent: logits degenerate (stddev={std:e})"
         ));
     }
-    println!(
-        "logits distribution: sane (not all-equal, max_abs={max_abs:.3e}, std={std:.3e})"
-    );
+    println!("logits distribution: sane (not all-equal, max_abs={max_abs:.3e}, std={std:.3e})");
     // ── f64 oracle on real weights (sampled vocab — full 129k×16 is ~8e12 FLOPs) ──
     println!("downloading head/norm/hc_head weights for oracle…");
     let t_dl = Instant::now();
@@ -258,10 +245,7 @@ fn run() -> Result<(), String> {
         t_dl.elapsed().as_secs_f64(),
         head_bytes.len() as f64 / (1024.0 * 1024.0)
     );
-    println!(
-        "hc_head_scale={:?}  hc_head_base={:?}",
-        hc_scale, hc_base
-    );
+    println!("hc_head_scale={:?}  hc_head_base={:?}", hc_scale, hc_base);
 
     // Build the set of vocab columns to check: strided sample + every
     // per-row argmax + row-0 top-5. Full-vocab f64 GEMM is hours on CPU.
@@ -306,10 +290,8 @@ fn run() -> Result<(), String> {
             let wbase = vcol * PARENT_DIM * 2;
             let mut acc = 0.0f64;
             for k in 0..PARENT_DIM {
-                let bits = u16::from_le_bytes([
-                    head_bytes[wbase + 2 * k],
-                    head_bytes[wbase + 2 * k + 1],
-                ]);
+                let bits =
+                    u16::from_le_bytes([head_bytes[wbase + 2 * k], head_bytes[wbase + 2 * k + 1]]);
                 let w = f32::from_bits((bits as u32) << 16) as f64;
                 acc += (normed[xbase + k] as f64) * w;
             }
@@ -325,8 +307,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let (max_abs_e, _max_rel, mean_abs, mean_rel, l2_rel) =
-        rel_stats(&gpu_sample, &refer_sample);
+    let (max_abs_e, _max_rel, mean_abs, mean_rel, l2_rel) = rel_stats(&gpu_sample, &refer_sample);
     println!(
         "GPU vs f64 oracle ({} cols): max_abs={max_abs_e:.6e} mean_abs={mean_abs:.6e} \
          mean_rel={mean_rel:.6e} l2_rel={l2_rel:.6e}",
@@ -356,18 +337,13 @@ fn run() -> Result<(), String> {
         ));
     }
     if max_abs_e > ABS_TOL * 100.0 {
-        println!(
-            "NOTE: max_abs={max_abs_e:.3e} is large but relative errors are within tol"
-        );
+        println!("NOTE: max_abs={max_abs_e:.3e} is large but relative errors are within tol");
     }
     println!("oracle agreement: PASS");
 
-
     // ── Plog bridge round-trip ────────────────────────────────────────
-    let plog_path = std::env::temp_dir().join(format!(
-        "ds4_parent_head_smoke_{}.plog",
-        std::process::id()
-    ));
+    let plog_path =
+        std::env::temp_dir().join(format!("ds4_parent_head_smoke_{}.plog", std::process::id()));
     {
         let mut w = PlogWriter::create(&plog_path, ROWS, PARENT_VOCAB)?;
         parent_logits_to_plog(&gpu, &logits_t, ROWS, PARENT_VOCAB, &mut w)?;

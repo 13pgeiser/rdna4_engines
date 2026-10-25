@@ -51,7 +51,10 @@ const _: () = assert!(std::mem::size_of::<DraftConvTable>() == 128);
 const _: () = assert!(std::mem::align_of::<DraftConvTable>() == 4);
 
 fn err(msg: impl AsRef<str>) -> HipError {
-    HipError::new(0, &format!("dynamic_causal_conv_f32_lanes: {}", msg.as_ref()))
+    HipError::new(
+        0,
+        &format!("dynamic_causal_conv_f32_lanes: {}", msg.as_ref()),
+    )
 }
 
 impl Gpu {
@@ -258,7 +261,9 @@ impl Gpu {
             ("dynamic", dynamic_ptr, dynamic_need),
         ] {
             if overlaps(output_ptr, output_need, p, n) {
-                return Err(err(format!("output overlaps {name} (no in-place aliasing)")));
+                return Err(err(format!(
+                    "output overlaps {name} (no in-place aliasing)"
+                )));
             }
         }
 
@@ -291,9 +296,7 @@ impl Gpu {
             &offset_i32 as *const _ as *mut c_void,
         ];
         let live_rows: usize = lanes.iter().map(|l| l.rows).sum();
-        let bytes = live_rows * hidden * f32 * 2
-            + base_need
-            + live_rows * dynamic_row_stride * f32;
+        let bytes = live_rows * hidden * f32 * 2 + base_need + live_rows * dynamic_row_stride * f32;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "draft_lane_conv",

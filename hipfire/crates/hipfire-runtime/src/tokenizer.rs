@@ -471,16 +471,16 @@ impl fmt::Display for TokenizerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MetadataMissing { field } => {
-                write!(f, "tokenizer metadata field missing or wrong type: {field}")
+                write!(f, "tokenizer metadata field missing or wrong type: {field}; the model file's tokenizer is damaged or incomplete — re-download the model")
             }
             Self::MalformedJson(e) => write!(f, "tokenizer JSON parse error: {e}"),
             Self::MissingByteSymbol { byte, char } => write!(
                 f,
-                "GPT-2 BPE vocab missing byte symbol: byte 0x{byte:02x} maps to char {char:?} which is not in token_to_id"
+                "GPT-2 BPE vocab missing byte symbol: byte 0x{byte:02x} maps to char {char:?} which is not in token_to_id; the model file's tokenizer vocabulary is damaged — re-download the model"
             ),
             Self::MissingMergeOperand { rank, left, right, missing_side } => write!(
                 f,
-                "merge rule rank {rank} ({left:?}, {right:?}): {missing_side:?} symbol not in vocab"
+                "merge rule rank {rank} ({left:?}, {right:?}): {missing_side:?} symbol not in vocab; the model file's tokenizer is damaged — re-download the model"
             ),
             Self::MissingMergeResult { rank, expected } => write!(
                 f,
@@ -532,9 +532,10 @@ pub struct Tokenizer {
     merge_pair_rank: HashMap<(u32, u32), u32>,
     /// For GPT-2 BPE only: byte `b` → token id of `byte_to_gpt2_char(b).to_string()`.
     /// Construction guarantees every byte 0..=255 has a valid id (else
-    /// `from_*` returns `MissingByteSymbol`), so `encode_gpt2_bpe`'s initial
-    /// seed is infallible. `None` for SentencePiece tokenizers (no
-    /// byte-level encoding).
+    /// `from_*` returns `MissingByteSymbol`), except [`BYTE_ABSENT`] entries an
+    /// HF tokenizer.json without `unk_token`/`byte_fallback` admits; the encoder
+    /// drops those bytes. `None` for SentencePiece tokenizers (no byte-level
+    /// encoding).
     byte_to_id: Option<[u32; 256]>,
     /// Special tokens: strings like "<|im_start|>" → their token ID.
     /// Sorted longest-first for greedy matching.
@@ -553,6 +554,14 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// Exact merge-rank BPE for ▁-style (SentencePiece-derived) HF BPE
+    /// vocabularies — the Gemma family shape: normalizer Replace(' '→'▁'),
+    /// character-identity base symbols, `<0xXX>` byte fallback, merges over
+    /// the whole normalized string. Off by default; enabled per-arch by the
+    /// loaders that need it via [`Self::enable_sp_bpe_merges`] because the
+    /// default SP path (greedy longest match) is what every existing arch's
+    /// token streams were built on.
+    sp_bpe: bool,
     /// HF BPE `ignore_merges`: try the entire byte-encoded pre-token in the
     /// model vocabulary before applying merges. `Some(max_raw_bytes)` enables
     /// the lookup and bounds it to tokens that could exist in that vocabulary.
@@ -665,25 +674,37 @@ fn resolve_merges(
     Ok((merges, merge_pair_rank))
 }
 
+/// `byte_to_id` entry for a byte whose GPT-2 char has no vocab symbol. Only an
+/// HF tokenizer.json BPE with no `unk_token` and no `byte_fallback` admits it
+/// (e.g. SmolLM2's trained vocab lacks bytes like 0x04 and 0xff): HF drops such
+/// a char from the word, and `encode_gpt2_chunk` does the same.
+const BYTE_ABSENT: u32 = u32::MAX;
+
 /// For GPT-2 BPE tokenizers: build the byte → token-id lookup table by
 /// running every byte 0..=255 through `byte_to_gpt2_char` and resolving
 /// the resulting char string against `token_to_id`. Returns `Err` on the
 /// first byte whose char isn't in the vocab — that would silently corrupt
-/// `encode_gpt2_bpe`'s initial seed (#203).
-fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], TokenizerError> {
+/// `encode_gpt2_bpe`'s initial seed (#203) — unless `absent_ok`, where the
+/// byte maps to [`BYTE_ABSENT`] and is dropped at encode time.
+fn build_byte_to_id(
+    token_to_id: &HashMap<String, u32>,
+    absent_ok: bool,
+) -> Result<[u32; 256], TokenizerError> {
     let mut out = [0u32; 256];
     let mut buf = [0u8; 4];
     for b in 0u32..=255 {
         let ch = byte_to_gpt2_char(b as u8);
         let s = ch.encode_utf8(&mut buf);
-        let id = token_to_id
-            .get(s)
-            .copied()
-            .ok_or(TokenizerError::MissingByteSymbol {
-                byte: b as u8,
-                char: ch,
-            })?;
-        out[b as usize] = id;
+        out[b as usize] = match token_to_id.get(s) {
+            Some(&id) => id,
+            None if absent_ok => BYTE_ABSENT,
+            None => {
+                return Err(TokenizerError::MissingByteSymbol {
+                    byte: b as u8,
+                    char: ch,
+                })
+            }
+        };
     }
     Ok(out)
 }
@@ -842,7 +863,7 @@ impl Tokenizer {
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         // For GPT-2 BPE, every byte 0..=255 must have a vocab entry. SP doesn't need this.
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, false)?)
         } else {
             None
         };
@@ -863,6 +884,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1013,11 +1035,21 @@ impl Tokenizer {
         // this bound (added tokens are handled separately before BPE).
         let ignore_merges_max_chunk_bytes = (is_gpt2_bpe
             && model.get("ignore_merges").and_then(|v| v.as_bool()) == Some(true))
-        .then(|| vocab_map.keys().map(|s| s.chars().count()).max().unwrap_or(0));
+        .then(|| {
+            vocab_map
+                .keys()
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+        });
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
+        // HF BPE drops a char it has no symbol for when there is neither an
+        // `unk_token` nor `byte_fallback`; mirror that instead of refusing.
+        let byte_absent_ok = model.get("unk_token").map_or(true, |v| v.is_null())
+            && model.get("byte_fallback").and_then(|v| v.as_bool()) != Some(true);
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, byte_absent_ok)?)
         } else {
             None
         };
@@ -1038,6 +1070,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok,
             normalizer_nfc,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1205,7 +1238,7 @@ impl Tokenizer {
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, false)?)
         } else {
             None
         };
@@ -1226,6 +1259,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1233,7 +1267,9 @@ impl Tokenizer {
     /// GPT-2 BPE pre-tokenizer: the tokenizer.json `Split` chain when one was
     /// loaded, else the shared canonical splitter (compiled once, lazily).
     fn pretokenizer(&self) -> &Gpt2Pretokenizer {
-        self.hf_pretok.as_ref().unwrap_or_else(|| default_pretokenizer())
+        self.hf_pretok
+            .as_ref()
+            .unwrap_or_else(|| default_pretokenizer())
     }
 
     /// True if `id` is any end-of-generation terminator (`eos_id` or the
@@ -1413,6 +1449,9 @@ impl Tokenizer {
 
     /// Encode without special token handling.
     fn encode_raw(&self, text: &str) -> Vec<u32> {
+        if self.sp_bpe {
+            return self.encode_sp_bpe(text);
+        }
         if !self.is_gpt2_bpe {
             return self.encode_sentencepiece(text);
         }
@@ -1518,6 +1557,122 @@ impl Tokenizer {
         tokens
     }
 
+    /// Whether [`Self::enable_sp_bpe_merges`] actually engaged: false when the
+    /// vocabulary carries no merge rules, or the tokenizer is GPT-2 byte-level
+    /// (that path already runs merges).
+    pub fn sp_bpe_merges_enabled(&self) -> bool {
+        self.sp_bpe
+    }
+
+    /// Switch this tokenizer to the exact merge-rank BPE path for
+    /// ▁-style (SentencePiece-derived) HF BPE vocabularies — the Gemma
+    /// family shape, where the serialized `tokenizer.json` is a BPE model
+    /// over ▁-normalized text with character-identity base symbols and
+    /// `<0xXX>` byte fallback.
+    ///
+    /// Why an explicit opt-in: the default SentencePiece path is greedy
+    /// longest-match, which is what every existing arch's token streams and
+    /// pinned tests were built on — flipping it globally would silently
+    /// re-tokenize them. But greedy ≠ BPE on these vocabularies, so an arch
+    /// that needs HF-exact ids enables this instead. No-op when there are no
+    /// merge rules or the tokenizer is GPT-2 byte-level (that path already
+    /// runs merges).
+    ///
+    /// Measured divergence on `google/embeddinggemma-2`'s tokenizer against
+    /// HF `tokenizers`, over 29 prompts (the 9
+    /// `scripts/check_embeddinggemma2_parity.py` fixtures plus 20 others
+    /// sampled from `benchmarks/prompts`):
+    ///
+    /// - greedy, no dummy prefix — what this tokenizer.json resolves to (its
+    ///   normalizer is a bare `Replace`; see `sp_dummy_prefix_from_hf_json`):
+    ///   diverges on **8/29**, and agrees on all 9 parity fixtures. The
+    ///   mechanism is greedy's longest-literal match taking a longer
+    ///   vocabulary piece than the merge ranks would form — e.g. `▁digit`
+    ///   where HF binds `▁dig`, or `]`` where HF emits `]`, because a
+    ///   lower-rank merge fires before the longer literal can be taken. It is
+    ///   not confined to whitespace: code, HTML and technical text diverge.
+    /// - greedy *with* a prepended `▁`: diverges on **29/29**. A divergence
+    ///   count is only meaningful next to the dummy-prefix setting it was
+    ///   measured under — a "24/24 sampled prompts" figure belongs to this
+    ///   arm, not to the shipped default.
+    ///
+    /// The exact path is unconditionally HF-correct, so arch 18 never depends
+    /// on which arm the greedy path would have produced.
+    pub fn enable_sp_bpe_merges(&mut self) {
+        if !self.is_gpt2_bpe && !self.merges.is_empty() {
+            self.sp_bpe = true;
+        }
+    }
+
+    /// ▁-style BPE over the whole normalized string (see
+    /// [`Self::enable_sp_bpe_merges`]): apply the same normalization
+    /// `encode_sentencepiece` does — prepend `▁` iff the config's normalizer
+    /// declares it (`sp_dummy_prefix`; false for embeddinggemma2's bare
+    /// `Replace`), then replace `' '`→`▁` — seed one symbol per character
+    /// (byte-fallback tokens for characters the vocabulary lacks), then the
+    /// shared rank-ordered merge. Only the merge algorithm differs from the
+    /// greedy path; the normalization is shared, so the two are coherent by
+    /// construction. The HF pre-tokenizer (`Split(' ', MergedWithPrevious)`)
+    /// cannot fire after the replacement — no literal `' '` survives — so HF
+    /// itself already runs BPE on the whole normalized string, exactly what
+    /// this path does. The only merges whose right operand starts with `▁`
+    /// (the ones that could glue a following word in) are whitespace runs
+    /// (`▁ⁿ + ▁ᵐ`) and a lone `> + ▁</`; both paths apply them identically.
+    fn encode_sp_bpe(&self, text: &str) -> Vec<u32> {
+        let mut normalized = String::with_capacity(text.len() + 3);
+        if self.sp_dummy_prefix {
+            normalized.push('\u{2581}');
+        }
+        for ch in text.chars() {
+            normalized.push(if ch == ' ' { '\u{2581}' } else { ch });
+        }
+
+        // Seed symbols. A byte-fallback piece is looked up per UTF-8 byte of
+        // an out-of-vocabulary character (Gemma's `<0xE6>`-style tokens,
+        // uppercase hex per the SentencePiece convention). A vocabulary with
+        // neither the piece nor its bytes falls back to `<unk>` — and a
+        // vocabulary without even that drops the character (the same
+        // contract as `encode_sentencepiece`'s single-char fallback).
+        let mut syms: Vec<u32> = Vec::with_capacity(normalized.chars().count());
+        let mut byte_piece = String::with_capacity(8);
+        for ch in normalized.chars() {
+            let mut buf = [0u8; 4];
+            let piece = ch.encode_utf8(&mut buf);
+            if let Some(&id) = self.token_to_id.get(piece) {
+                syms.push(id);
+                continue;
+            }
+            let mut resolved = 0usize;
+            for &b in piece.as_bytes() {
+                byte_piece.clear();
+                let _ = core::fmt::Write::write_fmt(&mut byte_piece, format_args!("<0x{b:02X}>"));
+                if let Some(&id) = self.token_to_id.get(byte_piece.as_str()) {
+                    syms.push(id);
+                    resolved += 1;
+                }
+            }
+            if resolved < piece.len() {
+                if let Some(&id) = self.token_to_id.get("<unk>") {
+                    // Replace this character's partial byte tokens with one
+                    // unknown token (fuse_unk=false keeps independent bytes,
+                    // but a half-resolvable character must not silently lose
+                    // its unresolved bytes).
+                    syms.truncate(syms.len() - resolved);
+                    syms.push(id);
+                } else if resolved == 0 {
+                    // No byte tokens, no <unk>: drop the character.
+                    continue;
+                } else {
+                    syms.truncate(syms.len() - resolved);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(syms.len());
+        self.bpe_merge_symbols(syms, &mut out);
+        out
+    }
+
     /// GPT-2 BPE encoding (for Qwen3, etc.)
     ///
     /// Implementation: O(N log N) priority-queue BPE. The earlier naive
@@ -1593,7 +1748,8 @@ impl Tokenizer {
                         key[used..used + encoded.len()].copy_from_slice(encoded.as_bytes());
                         used += encoded.len();
                     }
-                    self.token_to_id.get(std::str::from_utf8(&key[..used]).unwrap())
+                    self.token_to_id
+                        .get(std::str::from_utf8(&key[..used]).unwrap())
                 } else {
                     let mut owned = String::with_capacity(chunk_bytes.len().saturating_mul(2));
                     for &b in chunk_bytes {
@@ -1611,7 +1767,7 @@ impl Tokenizer {
         // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
         // Construction guarantees `byte_to_id` covers every byte 0..=255
         // for GPT-2 BPE tokenizers (else `from_*` returned
-        // `MissingByteSymbol`), so the table lookup is infallible.
+        // `MissingByteSymbol`) apart from `BYTE_ABSENT` bytes, which HF drops.
         let byte_to_id = self
             .byte_to_id
             .as_ref()
@@ -1619,6 +1775,7 @@ impl Tokenizer {
         let mut syms: Vec<u32> = chunk_bytes
             .iter()
             .map(|&b| byte_to_id[b as usize])
+            .filter(|&id| id != BYTE_ABSENT)
             .collect();
         let n = syms.len();
         if n == 0 {
@@ -1635,9 +1792,26 @@ impl Tokenizer {
         // (was ~50ms per encode for Qwen3+ with ~150K merges; the daemon
         // makes 9+ encode calls per request for chat-template scaffolding,
         // so the per-call rebuild added ~450ms to TTFT for short prompts).
+        self.bpe_merge_symbols(syms, out);
+    }
+
+    /// The shared rank-ordered BPE merge (steps 3–7 of the PQ algorithm —
+    /// see `encode_gpt2_bpe`'s docs for the byte-identicality contract).
+    /// `syms` are the initial symbol ids; the merged sequence is appended to
+    /// `out` in order. Shared by the GPT-2 byte-level path (initial symbols
+    /// from `byte_to_id`) and the SP-BPE path (character-identity symbols —
+    /// see [`Self::enable_sp_bpe_merges`]).
+    fn bpe_merge_symbols(&self, mut syms: Vec<u32>, out: &mut Vec<u32>) {
+        let n = syms.len();
+        if n == 0 {
+            return;
+        }
+        if n == 1 {
+            out.push(syms[0]);
+            return;
+        }
         let merge_pair_rank = &self.merge_pair_rank;
         let merges = &self.merges;
-
         // 3. Doubly-linked-list state. `prev/next` are i32 with -1 sentinel.
         let mut prev: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
         let mut next: Vec<i32> = (0..n as i32)
@@ -1742,6 +1916,17 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// The largest token id this tokenizer can emit (max id over the vocab
+    /// map and the added tokens), or `None` for an empty vocabulary.
+    ///
+    /// This is the bound a caller embedding rows must check — NOT
+    /// [`Self::vocab_size`], whose vector is pre-padded past the last real
+    /// id (from_hf_json reserves +100 slots for added tokens), so it
+    /// over-reports for every HF-JSON tokenizer.
+    pub fn max_token_id(&self) -> Option<u32> {
+        self.token_to_id.values().copied().max()
     }
 
     /// Read-only view of the full vocabulary by token id. Index `i` is the
@@ -2446,6 +2631,111 @@ impl TokenTextStream {
 mod token_text_stream_tests {
     use super::*;
 
+    #[test]
+    fn sp_bpe_merges_match_rank_bpe_with_byte_fallback() {
+        // Gemma-style ▁-BPE: character-identity symbols, space→▁ replacement
+        // (no prepend), rank-ordered merges across the whole string, and
+        // <0xXX> byte fallback for out-of-vocabulary characters.
+        let json = serde_json::json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "b": 2, "\u{2581}": 3, "\u{2581}ab": 4, "ab": 5,
+                          "<unk>": 6, "<0xC3>": 9, "<0xA9>": 10},
+                "merges": ["a b", "\u{2581} ab"]},
+            "added_tokens": []
+        });
+        let mut tok = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        tok.enable_sp_bpe_merges();
+        // Without the ▁ prepend, "ab" starts bare; the a-b merge fires.
+        assert_eq!(tok.encode("ab"), vec![5]);
+        assert_eq!(tok.encode(" ab"), vec![4]);
+        // The ▁ between the letters blocks the a-b merge.
+        assert_eq!(tok.encode("a b"), vec![1, 3, 2]);
+        // é (U+00E9) is not in the vocabulary: its two UTF-8 bytes
+        // byte-fall back to the <0xC3> <0xA9> tokens.
+        assert_eq!(tok.encode("\u{e9}"), vec![9, 10]);
+        // One merge problem spans the whole string.
+        assert_eq!(tok.encode("ab ab"), vec![5, 4]);
+        // A vocab without merges (plain SentencePiece) must stay greedy —
+        // enabling is a no-op there.
+        let sp_only = serde_json::json!({
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "ab": 2}, "merges": []},
+            "added_tokens": []
+        });
+        let mut tok2 = Tokenizer::from_hf_json(&sp_only.to_string()).unwrap();
+        tok2.enable_sp_bpe_merges();
+        assert_eq!(tok2.encode("aa"), vec![1, 1]);
+    }
+
+    /// The default greedy SentencePiece path is *not* merge-rank BPE: it takes
+    /// the longest literal vocabulary piece, so it can pick a token the merge
+    /// ranks never form. Here `abc` is in the vocabulary but no merge builds
+    /// it, and the rank-0 merge binds `b`+`c` first — so greedy emits `abc`
+    /// while HF's BPE emits `a`+`bc`. This is the divergence
+    /// [`Tokenizer::enable_sp_bpe_merges`] exists to avoid; pinning it keeps
+    /// the mechanism from being re-described from memory.
+    #[test]
+    fn greedy_longest_match_diverges_from_merge_rank_bpe() {
+        let json = serde_json::json!({
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "b": 2, "c": 3, "bc": 4, "abc": 5},
+                "merges": ["b c"]},
+            "added_tokens": []
+        });
+        // Default (greedy): longest literal wins.
+        let greedy = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        assert!(!greedy.sp_bpe_merges_enabled());
+        assert_eq!(greedy.encode("abc"), vec![5]);
+        // Exact path: the rank-0 merge fires first.
+        let mut exact = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        exact.enable_sp_bpe_merges();
+        assert!(exact.sp_bpe_merges_enabled());
+        assert_eq!(exact.encode("abc"), vec![1, 4]);
+    }
+
+    /// Enabling the exact path changes **only** the merge algorithm: the
+    /// normalization (space→▁, and the config's dummy-prefix rule) is shared
+    /// with the greedy path, so on a vocabulary with no longest-literal trap
+    /// the two agree id for id. Asserted under both normalizer shapes, because
+    /// the dummy prefix is the config's — not the path's — decision.
+    #[test]
+    fn enabling_the_exact_path_changes_only_the_merge_algorithm() {
+        let vocab = serde_json::json!({"a": 1, "b": 2, "\u{2581}": 3, "ab": 4});
+        let bare = serde_json::json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "model": {"type": "BPE", "vocab": vocab, "merges": ["a b"]},
+            "added_tokens": []
+        });
+        let prepend = serde_json::json!({
+            "normalizer": {"type": "Sequence", "normalizers": [
+                {"type": "Prepend", "prepend": "\u{2581}"},
+                {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}]},
+            "model": {"type": "BPE", "vocab": vocab, "merges": ["a b"]},
+            "added_tokens": []
+        });
+        for json in [&bare, &prepend] {
+            let greedy = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+            let mut exact = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+            exact.enable_sp_bpe_merges();
+            for text in ["a", "ab", "ba", "a b", " ", "a b ab"] {
+                assert_eq!(
+                    greedy.encode(text),
+                    exact.encode(text),
+                    "the two paths must agree on {text:?}"
+                );
+            }
+        }
+        // Bare Replace → dummy prefix false (the embeddinggemma2 shape): no
+        // prepend, and a space is the bare ▁ token.
+        let bare_tok = Tokenizer::from_hf_json(&bare.to_string()).unwrap();
+        assert_eq!(bare_tok.encode(" "), vec![3]);
+        // Prepend normalizer → dummy prefix true: both paths prepend ▁.
+        let mut prepend_tok = Tokenizer::from_hf_json(&prepend.to_string()).unwrap();
+        prepend_tok.enable_sp_bpe_merges();
+        assert_eq!(prepend_tok.encode("a"), vec![3, 1]);
+    }
+
     const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
 
     /// SentencePiece vocab with full byte fallback: ids 0..=255 are the
@@ -2471,6 +2761,7 @@ mod token_text_stream_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: false,
             hf_pretok: None,
@@ -2488,7 +2779,10 @@ mod token_text_stream_tests {
         let mut out = String::new();
         for &t in seq {
             out.push_str(&stream.push(tk, t));
-            assert!(stream.pending.len() <= 3, "holdback grew past one code point");
+            assert!(
+                stream.pending.len() <= 3,
+                "holdback grew past one code point"
+            );
         }
         out.push_str(&stream.flush());
         out
@@ -2500,7 +2794,10 @@ mod token_text_stream_tests {
         let text = "emoji 🎉🔥 中文 ∑";
         let seq = byte_tokens(text);
         let per_token: String = seq.iter().map(|&t| tk.decode(&[t])).collect();
-        assert!(per_token.contains('\u{FFFD}'), "baseline must reproduce the bug");
+        assert!(
+            per_token.contains('\u{FFFD}'),
+            "baseline must reproduce the bug"
+        );
         assert_eq!(stream_all(&tk, &seq), text);
     }
 
@@ -2616,6 +2913,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: true,
             hf_pretok: None,
@@ -2718,7 +3016,6 @@ mod bpe_tests {
         assert_eq!(enabled.encode("ab"), vec![257]);
         assert_ne!(enabled.config_digest(), disabled.config_digest());
     }
-
 
     #[test]
     fn encode_leftmost_on_tie_priority() {
@@ -2914,7 +3211,10 @@ mod pretok_tests {
         assert_eq!(d.pieces("a\n1234\n"), vec!["a\n", "1", "234", "\n"]);
         // A digit run after a letter is still a run (HF has no start constraint).
         assert_eq!(d.pieces("a1 1234"), vec!["a", "1", " ", "1", "234"]);
-        assert_eq!(d.pieces("1234 12a 5678"), vec!["1", "234", " 12a ", "5", "678"]);
+        assert_eq!(
+            d.pieces("1234 12a 5678"),
+            vec!["1", "234", " 12a ", "5", "678"]
+        );
         assert_eq!(d.pieces(""), Vec::<&str>::new());
         // Exact-literal only: other lookaheads stay unsupported.
         assert!(PretokSplitter::compile(r"\d{1,3}(?=\d)").is_err());
@@ -2938,7 +3238,10 @@ mod pretok_tests {
         // it as end-of-piece, so `\s+(?!\S)` takes the whole run.
         assert_eq!(chain.pieces("  2"), vec!["  ", "2"]);
         assert_eq!(chain.pieces("x 1234 "), vec!["x", " ", "1", "234", " "]);
-        assert_eq!(chain.pieces("a\n12345\n"), vec!["a", "\n", "12", "345", "\n"]);
+        assert_eq!(
+            chain.pieces("a\n12345\n"),
+            vec!["a", "\n", "12", "345", "\n"]
+        );
     }
 
     #[test]
@@ -2972,7 +3275,11 @@ mod pretok_tests {
 
     /// Byte-level BPE tokenizer.json: ids 0..=255 are the GPT-2 byte
     /// symbols, `extra` follows at 256.., `merges` as `"a b"` strings.
-    fn byte_level_json(extra: &[&str], merges: &[&str], pre_tokenizer: serde_json::Value) -> String {
+    fn byte_level_json(
+        extra: &[&str],
+        merges: &[&str],
+        pre_tokenizer: serde_json::Value,
+    ) -> String {
         let mut vocab = serde_json::Map::new();
         for b in 0u32..=255 {
             vocab.insert(byte_to_gpt2_char(b as u8).to_string(), json!(b));
@@ -3016,10 +3323,7 @@ mod pretok_tests {
         assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "1", "2", "3"]);
         // Digits are single-char chunks, so the ("1","2") merge never fires.
         assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 49, 50, 51]);
-        assert_eq!(
-            tok.pretokenizer().pieces("x  y"),
-            vec!["x", " ", " y"]
-        );
+        assert_eq!(tok.pretokenizer().pieces("x  y"), vec!["x", " ", " y"]);
     }
 
     #[test]
@@ -3042,6 +3346,32 @@ mod pretok_tests {
             // Canonical `\p{N}{1,3}` keeps "123" together so the merge fires.
             assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 256, 51]);
         }
+    }
+
+    /// SmolLM2's trained vocab has no symbol for some bytes (0x04, 0xff, …).
+    /// HF BPE with neither `unk_token` nor `byte_fallback` drops such a byte;
+    /// with an `unk_token` the vocab still refuses to load.
+    #[test]
+    fn from_hf_json_drops_bytes_without_symbol_like_hf() {
+        let mut tok_json: serde_json::Value =
+            serde_json::from_str(&byte_level_json(&["ab"], &["a b"], serde_json::Value::Null))
+                .unwrap();
+        let absent = byte_to_gpt2_char(0x04).to_string();
+        tok_json["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&absent);
+        tok_json["model"]["unk_token"] = serde_json::Value::Null;
+        let tok = Tokenizer::from_hf_json(&tok_json.to_string())
+            .expect("HF admits a BPE vocab without every byte symbol");
+        // The canonical pre-tokenizer isolates 0x04; HF (tokenizers 0.22) emits
+        // nothing for it and leaves both neighbours intact.
+        assert_eq!(tok.encode_gpt2_bpe("ab\x04ab"), vec![256, 256]);
+        tok_json["model"]["unk_token"] = json!("<unk>");
+        assert!(matches!(
+            Tokenizer::from_hf_json(&tok_json.to_string()),
+            Err(TokenizerError::MissingByteSymbol { byte: 0x04, .. })
+        ));
     }
 
     #[test]
@@ -3191,8 +3521,7 @@ mod pretok_tests {
         added: serde_json::Value,
     ) -> String {
         let mut v: serde_json::Value =
-            serde_json::from_str(&byte_level_json(extra, merges, serde_json::Value::Null))
-                .unwrap();
+            serde_json::from_str(&byte_level_json(extra, merges, serde_json::Value::Null)).unwrap();
         v["normalizer"] = normalizer;
         v["added_tokens"] = added;
         v.to_string()
@@ -3209,7 +3538,9 @@ mod pretok_tests {
         assert!(!normalizer_is_nfc(
             &json!({"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Lowercase"}]})
         ));
-        assert!(!normalizer_is_nfc(&json!({"type": "Sequence", "normalizers": []})));
+        assert!(!normalizer_is_nfc(
+            &json!({"type": "Sequence", "normalizers": []})
+        ));
         assert!(!normalizer_is_nfc(&serde_json::Value::Null));
     }
 
@@ -3231,7 +3562,10 @@ mod pretok_tests {
         // Normalization runs per segment between special tokens (HF
         // `normalized: false` added tokens): a mark after a special token
         // does not compose with the char before it.
-        assert_eq!(tok.encode("e\u{0301}<|x|>\u{0301}"), vec![256, 257, 204, 129]);
+        assert_eq!(
+            tok.encode("e\u{0301}<|x|>\u{0301}"),
+            vec![256, 257, 204, 129]
+        );
         assert_eq!(tok.encode("<|x|>e\u{0301}"), vec![257, 256]);
 
         // Same vocab without a normalizer: no composition.
@@ -3250,7 +3584,10 @@ mod pretok_tests {
 
     #[test]
     fn nfc_fast_path_does_not_allocate_for_nfc_text() {
-        assert!(matches!(nfc_normalize("héllo wörld"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            nfc_normalize("héllo wörld"),
+            std::borrow::Cow::Borrowed(_)
+        ));
         let composed = nfc_normalize("e\u{0301}");
         assert!(matches!(composed, std::borrow::Cow::Owned(_)));
         assert_eq!(composed, "\u{00E9}");
@@ -3467,6 +3804,7 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             // The pre-existing SP unit tests below were written against the
             // unconditional-prefix behavior; keep them on the LLaMA
@@ -4326,7 +4664,10 @@ mod nfc_exactness_tests {
         // composition of the unblocked mark: a + U+0301 + U+0323 → ạ U+0301.
         assert_eq!(nfc_normalize("a\u{0301}\u{0323}"), "\u{1EA1}\u{0301}");
         assert_eq!(nfc_normalize("a\u{0323}\u{0301}"), "\u{1EA1}\u{0301}");
-        assert!(matches!(nfc_normalize("\u{1EA1}\u{0301}"), Cow::Borrowed(_)));
+        assert!(matches!(
+            nfc_normalize("\u{1EA1}\u{0301}"),
+            Cow::Borrowed(_)
+        ));
 
         // Hangul L V T and LV T compose; the syllable stays borrowed.
         assert_eq!(nfc_normalize("\u{1112}\u{1161}\u{11AB}"), "\u{D55C}");
@@ -4366,7 +4707,10 @@ mod nfc_exactness_tests {
         // allocates (SmallVec spill) while ours does not.
         let (lib_ok, lib_allocs) = allocs_during(|| is_nfc(&s));
         assert!(lib_ok);
-        assert!(lib_allocs > 0, "library is_nfc expected to spill on long runs");
+        assert!(
+            lib_allocs > 0,
+            "library is_nfc expected to spill on long runs"
+        );
     }
 
     #[test]
@@ -4376,10 +4720,10 @@ mod nfc_exactness_tests {
         // pairs, QC=No chars, and post-Unicode-9 code points.
         const POOL: &[char] = &[
             'a', 'e', 'o', 'c', 's', 'x', '\u{00E7}', '\u{1EB7}', '\u{1EDB}', '\u{1E69}',
-            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}',
-            '\u{031B}', '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}',
-            '\u{1100}', '\u{1161}', '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}',
-            '\u{0B3E}', '\u{0958}', '\u{065D}', '\u{089B}', '\u{1DF7}',
+            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}', '\u{031B}',
+            '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}', '\u{1100}', '\u{1161}',
+            '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}', '\u{0B3E}', '\u{0958}', '\u{065D}',
+            '\u{089B}', '\u{1DF7}',
         ];
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {

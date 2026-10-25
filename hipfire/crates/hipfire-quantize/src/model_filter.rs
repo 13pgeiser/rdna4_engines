@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
 pub(crate) fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
@@ -292,7 +291,6 @@ pub(crate) fn validate_env_fixed_tier_or_exit() {
     }
 }
 
-
 /// Strict parser for HIPFIRE_FIXED_TIER / --fixed-tier. Returns class->dtype map.
 pub(crate) fn parse_fixed_tier(spec: &str) -> Result<HashMap<String, String>, String> {
     validate_fixed_tier_spec(spec)?;
@@ -504,7 +502,6 @@ pub(crate) fn set_fixed_tier_cli(spec: Option<String>) {
 pub(crate) fn fixed_tier_map_cli() -> Option<HashMap<String, String>> {
     FIXED_TIER_CLI.get().cloned().flatten()
 }
-
 
 static PRODUCT_TIER_CLI: OnceLock<Option<ProductTier>> = OnceLock::new();
 

@@ -94,7 +94,9 @@ pub fn build_programs_for_families(
         EpilogueContract::Bf16Direct => Epilogue::Bf16,
     };
     if !(1..=ROWS_LIMIT).contains(&rows_max) {
-        return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
+        return Err(format!(
+            "npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"
+        ));
     }
     if families.bits() == 0 {
         return Err("npu-trunk: no families selected, nothing to program".to_string());
@@ -103,7 +105,11 @@ pub fn build_programs_for_families(
     let program = |shape: Shape| {
         let map = shape.column_map(families);
         let design = build_panel_program(rows, epilogue).expect("validated G80 rows");
-        let arg_bytes = [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes];
+        let arg_bytes = [
+            design.args[0].bytes,
+            design.args[1].bytes,
+            design.args[2].bytes,
+        ];
         ShapeProgram {
             shape,
             panel_count: map.panel_count(),
@@ -122,9 +128,14 @@ pub fn build_programs_for_families(
 }
 
 /// Compacted row-major pitches; zero-panel shapes are not submitted.
-pub fn build_rowmajor_programs_for_families(rows_max: usize, families: FamilyMask) -> Result<NpuPrograms, String> {
+pub fn build_rowmajor_programs_for_families(
+    rows_max: usize,
+    families: FamilyMask,
+) -> Result<NpuPrograms, String> {
     if !(1..=ROWS_LIMIT).contains(&rows_max) {
-        return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
+        return Err(format!(
+            "npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"
+        ));
     }
     let rows = rows_max.div_ceil(WAVE_ROWS) * WAVE_ROWS;
     let program = |shape: Shape| -> Result<ShapeProgram, String> {
@@ -132,18 +143,25 @@ pub fn build_rowmajor_programs_for_families(rows_max: usize, families: FamilyMas
         // A zero-panel record carries a valid unused design, never an arena.
         let design = build_panel_program_rowmajor(rows, map.padded_cols().max(1280), 0)?;
         Ok(ShapeProgram {
-            shape, panel_count: map.panel_count(), padded_cols: map.padded_cols(),
-            arg_bytes: [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes],
+            shape,
+            panel_count: map.panel_count(),
+            padded_cols: map.padded_cols(),
+            arg_bytes: [
+                design.args[0].bytes,
+                design.args[1].bytes,
+                design.args[2].bytes,
+            ],
             host_bytes_read: design.host_bytes_read(),
-            host_bytes_written: design.host_bytes_written(), design,
+            host_bytes_written: design.host_bytes_written(),
+            design,
         })
     };
     Ok(NpuPrograms {
-        contract: EpilogueContract::Bf16Direct, rows_max: rows,
+        contract: EpilogueContract::Bf16Direct,
+        rows_max: rows,
         per_shape: [program(Shape::GdnIn)?, program(Shape::QsaIn)?],
     })
 }
-
 
 /// The programs of both out-projection shapes: one K6144, N512 BF16 row-major design per shape (the same program and PDI
 /// for [`Shape::GdnOut`] and [`Shape::QsaO`], a PDI distinct from the input shapes').
@@ -167,7 +185,10 @@ impl NpuOutPrograms {
 
 impl std::fmt::Debug for NpuOutPrograms {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NpuOutPrograms").field("rows_max", &self.rows_max).field("per_shape", &self.per_shape).finish()
+        f.debug_struct("NpuOutPrograms")
+            .field("rows_max", &self.rows_max)
+            .field("per_shape", &self.per_shape)
+            .finish()
     }
 }
 
@@ -176,7 +197,9 @@ impl std::fmt::Debug for NpuOutPrograms {
 /// 512-row waves. `Err` for `rows_max` outside `1..=65536`.
 pub fn build_out_programs(rows_max: usize) -> Result<NpuOutPrograms, String> {
     if !(1..=ROWS_LIMIT).contains(&rows_max) {
-        return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
+        return Err(format!(
+            "npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"
+        ));
     }
     let rows = rows_max.div_ceil(OUT_WAVE_ROWS) * OUT_WAVE_ROWS;
     let program = |shape: Shape| -> Result<ShapeProgram, String> {
@@ -185,19 +208,30 @@ pub fn build_out_programs(rows_max: usize) -> Result<NpuOutPrograms, String> {
             shape,
             panel_count: shape.panels(),
             padded_cols: shape.panels() * shape.panel_cols(),
-            arg_bytes: [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes],
+            arg_bytes: [
+                design.args[0].bytes,
+                design.args[1].bytes,
+                design.args[2].bytes,
+            ],
             host_bytes_read: design.host_bytes_read(),
             host_bytes_written: design.host_bytes_written(),
             design,
         })
     };
-    Ok(NpuOutPrograms { rows_max: rows, per_shape: [program(Shape::GdnOut)?, program(Shape::QsaO)?] })
+    Ok(NpuOutPrograms {
+        rows_max: rows,
+        per_shape: [program(Shape::GdnOut)?, program(Shape::QsaO)?],
+    })
 }
 
 /// Rows of a `rows`-row bank rounded up to the whole waves of `shape`'s program: 256-row waves (input shapes), 512-row
 /// waves (out shapes). The relay runs the TXN of exactly this many rows and the producer packs A for exactly this many.
 pub fn wave_padded_rows(shape: Shape, rows: usize) -> usize {
-    let wave = if shape.is_out() { OUT_WAVE_ROWS } else { WAVE_ROWS };
+    let wave = if shape.is_out() {
+        OUT_WAVE_ROWS
+    } else {
+        WAVE_ROWS
+    };
     rows.div_ceil(wave) * wave
 }
 
@@ -205,12 +239,22 @@ pub fn wave_padded_rows(shape: Shape, rows: usize) -> usize {
 /// same fused C pitch (`padded_cols` for input shapes, [`OUT_COLS`] for out shapes) as the full-row program. The 32 cores'
 /// wave loop count is part of the PDI, so every row count is its own PDI (one relay hardware context) and TXN; the two input
 /// shapes of one row count share their PDI. Pure CPU; the relay builds and caches one per (shape, rows).
-pub fn build_program_for_rows(shape: Shape, padded_cols: usize, padded_rows: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
-    if padded_rows == 0 || padded_rows != wave_padded_rows(shape, padded_rows) || padded_rows > ROWS_LIMIT {
+pub fn build_program_for_rows(
+    shape: Shape,
+    padded_cols: usize,
+    padded_rows: usize,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if padded_rows == 0
+        || padded_rows != wave_padded_rows(shape, padded_rows)
+        || padded_rows > ROWS_LIMIT
+    {
         return Err(format!("npu-trunk: {padded_rows} rows is not a whole number of {shape} waves within 1..={ROWS_LIMIT}"));
     }
-    let design = if shape.is_out() { build_panel_program_out(padded_rows, OUT_COLS, 0)? }
-        else { build_panel_program_rowmajor(padded_rows, padded_cols.max(1280), 0)? };
+    let design = if shape.is_out() {
+        build_panel_program_out(padded_rows, OUT_COLS, 0)?
+    } else {
+        build_panel_program_rowmajor(padded_rows, padded_cols.max(1280), 0)?
+    };
     Ok((design.pdi, design.insts))
 }
 
@@ -226,7 +270,10 @@ mod rowmajor_tests {
             assert_eq!(p.arg_bytes[2], 8192 * p.padded_cols * 2);
             assert_eq!(p.panel_count * 1280, p.padded_cols);
         }
-        assert_eq!(programs.per_shape[0].design.pdi, programs.per_shape[1].design.pdi);
+        assert_eq!(
+            programs.per_shape[0].design.pdi,
+            programs.per_shape[1].design.pdi
+        );
     }
     #[test]
     fn qkv_only_compacts_pitch_and_omits_qsa() {
@@ -241,21 +288,39 @@ mod rowmajor_tests {
         use std::time::Instant;
         let full = build_rowmajor_programs_for_families(8192, FamilyMask::ALL).unwrap();
         let out_full = build_out_programs(8192).unwrap();
-        for (shape, rows, padded) in [(Shape::GdnIn, 4672, 4864), (Shape::QsaIn, 4647, 4864), (Shape::GdnIn, 1127, 1280), (Shape::QsaO, 4672, 5120),
-            (Shape::QsaO, 8192, 8192), (Shape::GdnIn, 8192, 8192)] {
+        for (shape, rows, padded) in [
+            (Shape::GdnIn, 4672, 4864),
+            (Shape::QsaIn, 4647, 4864),
+            (Shape::GdnIn, 1127, 1280),
+            (Shape::QsaO, 4672, 5120),
+            (Shape::QsaO, 8192, 8192),
+            (Shape::GdnIn, 8192, 8192),
+        ] {
             assert_eq!(wave_padded_rows(shape, rows), padded);
         }
         // The full-row program is the 8192-row case of the builder, byte for byte.
         for shape in [Shape::GdnIn, Shape::QsaIn] {
             let program = full.get(shape);
             let (pdi, txn) = build_program_for_rows(shape, program.padded_cols, 8192).unwrap();
-            assert_eq!((pdi, txn), (program.design.pdi.clone(), program.design.insts.clone()));
+            assert_eq!(
+                (pdi, txn),
+                (program.design.pdi.clone(), program.design.insts.clone())
+            );
         }
         let (pdi, txn) = build_program_for_rows(Shape::QsaO, OUT_COLS, 8192).unwrap();
-        assert_eq!((pdi, txn), (out_full.get(Shape::QsaO).design.pdi.clone(), out_full.get(Shape::QsaO).design.insts.clone()));
+        assert_eq!(
+            (pdi, txn),
+            (
+                out_full.get(Shape::QsaO).design.pdi.clone(),
+                out_full.get(Shape::QsaO).design.insts.clone()
+            )
+        );
         // Other row counts: the PDI carries the wave loop count (every count differs from the full one), the two input
         // shapes of one row count share it, the TXN shrinks with the waves. Build cost is printed (`--nocapture`).
-        let (gdn_cols, qsa_cols) = (full.get(Shape::GdnIn).padded_cols, full.get(Shape::QsaIn).padded_cols);
+        let (gdn_cols, qsa_cols) = (
+            full.get(Shape::GdnIn).padded_cols,
+            full.get(Shape::QsaIn).padded_cols,
+        );
         let mut previous = 0;
         for rows in [256usize, 1280, 4352, 4864, 6144] {
             let started = Instant::now();
@@ -268,14 +333,30 @@ mod rowmajor_tests {
                 rows / 256, gdn_txn.len(), qsa_txn.len(), gdn_pdi.len());
             assert_eq!(gdn_pdi, qsa_pdi, "{rows}");
             assert_ne!(gdn_pdi, full.get(Shape::GdnIn).design.pdi, "{rows}");
-            assert!(gdn_txn.len() > previous && gdn_txn.len() < full.get(Shape::GdnIn).design.insts.len());
+            assert!(
+                gdn_txn.len() > previous
+                    && gdn_txn.len() < full.get(Shape::GdnIn).design.insts.len()
+            );
             previous = gdn_txn.len();
         }
         let started = Instant::now();
         let (out_pdi, out_txn) = build_program_for_rows(Shape::QsaO, OUT_COLS, 5120).unwrap();
-        println!("program rows=5120 waves=10 qsa_o txn={} B build={:.1} ms pdi={} B", out_txn.len(), started.elapsed().as_secs_f64() * 1e3, out_pdi.len());
+        println!(
+            "program rows=5120 waves=10 qsa_o txn={} B build={:.1} ms pdi={} B",
+            out_txn.len(),
+            started.elapsed().as_secs_f64() * 1e3,
+            out_pdi.len()
+        );
         assert_ne!(out_pdi, out_full.get(Shape::QsaO).design.pdi);
-        for bad in [0usize, 100, 8000, ROWS_LIMIT + 256] { assert!(build_program_for_rows(Shape::GdnIn, 16640, bad).is_err(), "{bad}"); }
-        assert!(build_program_for_rows(Shape::QsaO, OUT_COLS, 4864).is_err(), "out waves are 512 rows");
+        for bad in [0usize, 100, 8000, ROWS_LIMIT + 256] {
+            assert!(
+                build_program_for_rows(Shape::GdnIn, 16640, bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            build_program_for_rows(Shape::QsaO, OUT_COLS, 4864).is_err(),
+            "out waves are 512 rows"
+        );
     }
 }

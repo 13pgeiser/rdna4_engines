@@ -3716,7 +3716,12 @@ fn redline_qwen4_snapshot(
         .as_ref()
         .map(|tensor| ("ple.conv", tensor))
         .into_iter()
-        .chain([("ple.hyper_feedback", &state.hyper_feedback)])
+        .chain(
+            state
+                .hyper_feedback
+                .as_ref()
+                .map(|t| ("ple.hyper_feedback", t)),
+        )
     {
         let mut bytes = Vec::new();
         redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
@@ -3772,6 +3777,10 @@ fn redline_qwen4_arm(
             gpu.hip
                 .device_synchronize()
                 .map_err(|error| error.to_string())?;
+            // The snapshot below reads logits and state raw: a non-finite router row
+            // (layer, row in the message) must fail the arm, not be compared.
+            gpu.take_device_wait_error()
+                .map_err(|error| format!("Qwen4 shadow iteration {i}: {error}"))?;
             snapshots.push(redline_qwen4_snapshot(gpu, bundle, &logits)?);
         }
         Ok((snapshots, started.elapsed().as_secs_f64() * 1_000_000.0))
@@ -3900,6 +3909,8 @@ fn redline_shadow_qwen4(
     position_step: usize,
     replay_only: bool,
 ) -> Result<serde_json::Value, String> {
+    // The replayed decode steps fetch PLE rows: hold the whole-request guard.
+    let _ple_serving = loaded.ple_serving_guard();
     let launches = gpu.replay.recorded_launches().len();
     if launches == 0 {
         return Err("Qwen4 Redline shadow requires a captured decode tape".to_string());

@@ -327,6 +327,16 @@ pub struct DeepseekV4Config {
     #[serde(skip)]
     pub load_dspark: bool,
 
+    /// Whether to load the trunk's in-band native MTP layer (`mtp.0.*`) during
+    /// `load_weights`. Set by the loader from the MTP producer-capability gate
+    /// (`hipfire_config::mtp_mode_admits` with [`crate::MTP_MEASURED_AR_FLOOR`]):
+    /// `speculation.mtp = auto` on this producer (no measured AR floor) leaves
+    /// the layer unloaded so ordinary AR keeps its memory; explicit `on` loads
+    /// it. Defaults to `true` for directly-driven loaders (examples, oracles).
+    /// `HIPFIRE_DEEPSEEK4_LOAD_MTP=0` still skips it. Not (de)serialized.
+    #[serde(skip)]
+    pub load_mtp: bool,
+
     /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
     /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
     /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
@@ -479,6 +489,7 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
             load_dspark: true,
+            load_mtp: true,
             mq2r,
             mq2rxt,
         };
@@ -659,6 +670,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
         load_dspark: true,
+        load_mtp: true,
         mq2r: false,
         mq2rxt: false,
     })
@@ -1614,39 +1626,6 @@ pub struct MainAttentionLayerState {
     pub gathered_v: Option<rdna_compute::GpuTensor>,
 }
 
-/// Reusable host buffers for the hash-router FALLBACK path in
-/// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Clear+reuse
-/// across hash-routed layers; capacity sized to `num_experts_per_tok`.
-#[derive(Debug, Default)]
-pub struct HashTopkHostScratch {
-    pub topk_ids: Vec<u32>,
-    pub idx_i32: Vec<i32>,
-    pub idx_bytes: Vec<u8>,
-    pub w_scaled: Vec<f32>,
-    pub w_bytes: Vec<u8>,
-}
-
-impl HashTopkHostScratch {
-    pub fn with_capacity(k: usize) -> Self {
-        Self {
-            topk_ids: Vec::with_capacity(k),
-            idx_i32: Vec::with_capacity(k),
-            idx_bytes: Vec::with_capacity(k * 4),
-            w_scaled: Vec::with_capacity(k),
-            w_bytes: Vec::with_capacity(k * 4),
-        }
-    }
-
-    /// Drop lengths to 0 while keeping capacity for the next layer.
-    pub fn clear(&mut self) {
-        self.topk_ids.clear();
-        self.idx_i32.clear();
-        self.idx_bytes.clear();
-        self.w_scaled.clear();
-        self.w_bytes.clear();
-    }
-}
-
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
 /// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
@@ -1992,12 +1971,6 @@ pub struct DeepseekV4State {
     /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
     pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
 
-    /// Host-side top-K scratch for the hash-router FALLBACK arm in
-    /// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Sized to
-    /// `num_experts_per_tok` and reused across hash-routed layers so the
-    /// d2h/host-gather/h2d path does not allocate per layer.
-    pub hash_topk_host: HashTopkHostScratch,
-
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -2120,7 +2093,6 @@ impl DeepseekV4State {
             dspark_cap_ones: None,
             dspark_main_hidden: None,
             dspark_verify_pbs: None,
-            hash_topk_host: HashTopkHostScratch::with_capacity(cfg.num_experts_per_tok),
             n_tokens: 0,
             _scaffold: (),
         })

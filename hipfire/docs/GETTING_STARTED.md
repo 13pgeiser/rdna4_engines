@@ -266,9 +266,15 @@ notepad "$env:TEMP\hipfire-install.ps1"
 ```
 
 PowerShell also accepts `-Branch beta`, `-Tag v0.4.1`, and `-Commit <sha>`.
-The native `hipfire update` command remains Linux-only because Windows cannot
-atomically replace the running executable; re-run `install.ps1` with the
-desired selector instead.
+On Windows, `hipfire update` reports the installed version and exits non-zero
+without changing files: Windows updates require re-running `scripts/install.ps1`
+after stopping the engine. For current master:
+
+```powershell
+iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)
+```
+
+Use the reviewed, pinned command above when selecting a specific revision.
 
 Builds `daemon.exe` and the native CLI from the same selected source revision
 under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
@@ -299,11 +305,42 @@ narrower than WSL2 on the same card. Known limits:
 - GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
   (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
   holder PID, as on Linux.
-- hipfire resolves its home and kernel cache from `HOME`; when `HOME` is not
-  set they land in the current directory. Set it once with
-  `setx HOME "%USERPROFILE%"`.
-- `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
-  cannot find a native `serve` process; stop it with Ctrl-C.
+- hipfire uses `HIPFIRE_HOME` when set; otherwise `%USERPROFILE%\.hipfire`,
+  then `%HOME%\.hipfire`. Windows requires an absolute home path and reports an
+  actionable error rather than creating a home in the current directory.
+- `hipfire stop` authenticates to a separate loopback management listener and
+  waits for graceful shutdown. Older `serve.pid` records lack the management
+  credential: stop those servers with Ctrl-C, then restart with the updated CLI.
+  `stop --force` / `--all` never kill processes whose install ownership cannot be
+  proven; Windows cannot prove ownership from another process's environment.
+- `hipfire update` does not replace a running Windows executable; re-run
+  `scripts/install.ps1` as described above.
+
+#### CI developer artifact
+
+The advisory `Windows MSVC (advisory, no GPU)` job in
+[CI](../.github/workflows/ci.yml) builds the native CLI and daemon, tests the
+config/registry/client libraries, and checks `hipfire --version` and parseable
+`hipfire diag --json` output without an AMD HIP runtime. It is promoted to a
+required check after its first green run on `beta`; adding the job is not
+evidence of a passing Windows run or GPU certification.
+
+After successful packaging, that run's `hipfire-windows-msvc` artifact contains
+`hipfire-<version>-x86_64-pc-windows-msvc.zip` and its `.zip.sha256` checksum.
+The ZIP includes `hipfire.exe`, `daemon.exe`, licenses/NOTICE,
+`README-windows.txt`, and a provenance/checksum `manifest.json`. To package
+already-built release binaries locally, use
+`.\scripts\package-windows.ps1` (defaults: `target\release` to `dist`).
+This is an **unsigned developer artifact**, not an installer or signed update:
+no HIP runtime, driver, or kernel packs are bundled. A user-installed AMD HIP
+runtime is required; runtime tuple certification and signing ownership remain
+pending M0. Checksums detect corruption, not publisher authenticity. These
+artifacts do not change the installation instructions above.
+
+The Windows build does not imply support for Unix-only PLE conversion,
+hot-row/direct-read or hot-pack I/O, cache-residency probing, or prewarm paths;
+those I/O entry points report unsupported on Windows. POSIX-FD VMM sharing,
+Redline, and VMM KV are not native Windows capabilities.
 
 ### Source checkout
 
@@ -348,6 +385,7 @@ other shared system dependencies.
 hipfire --version
 hipfire version
 hipfire diag
+hipfire doctor
 ```
 
 `--version` prints the release, source commit, and source ref in one line.
@@ -355,6 +393,17 @@ hipfire diag
 matches the binary and hashes the installed daemon; add `--json` for support
 reports. `diag` reports GPU arch, VRAM, HIP/ROCm, kernel locations, model dir,
 and config overrides.
+
+On Linux, run `hipfire doctor` before the first model load: it checks the amdgpu
+driver, `/dev/kfd` access, the ROCm install and your GPU's device libraries, any
+`HSA_OVERRIDE_GFX_VERSION`, the kernel pack, and that the CLI and the daemon are
+one build, then prints one `fix:` line per problem
+([details](CLI.md#hipfire-doctor-runtime-preflight)).
+
+- Before pulling a large model, run `hipfire fit <tag> --ctx N`: it reports
+  whether the model loads at that context on this machine (no GPU work, no
+  daemon), what the load would choose, and what to change when it does not
+  ([details](CLI.md#hipfire-fit)).
 
 ### Update or switch channels on Linux
 
@@ -404,7 +453,7 @@ Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pr
 
 `hipfire serve --ui` also serves the embedded chat UI at `/ui` on the same listener (`--open` launches it in the default browser and implies `--ui`).
 
-> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
+> **Key optional, TLS absent:** the serve HTTP API has **no TLS**, and bearer authentication is **optional** (`serve.api_key_file` / `--api-key-file`; see [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies)). The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves); without a key anyone who can reach it can call every endpoint, so a key is **recommended** on any non-loopback bind. Expose beyond localhost only on a trusted/firewalled network **or** behind a TLS-terminating reverse proxy you control — never publish the raw port to the internet.
 
 Force a one-shot daemon and skip HTTP:
 
@@ -428,10 +477,10 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
-| `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto` (AR for this Qwen35 producer: it declares no measured AR floor, so only `--spec mtp` arms its head). `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
+| `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`. Native **MTP** under `auto` arms only a producer that declares a measured AR floor (today only Flash-Next / Qwen4); Qwen3.5-class and DeepSeek V4 heads stay AR until `--spec mtp` opts in. An eligible **DSpark** sidecar may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
-| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
+| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no TLS; key optional, recommended off loopback) |
 
 Enable draft-model speculation only when you intend to:
 
@@ -490,13 +539,13 @@ is tagged.
   logs one reason and runs GPU-only. Every other architecture resolves auto
   silently to off. `off` is the kill switch; timings are fixture-bound and live
   in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
-- **EP2 owner-routed prefill and expert staging (gfx1201, two cards).** With
-  `topology.ep = 2`, `HIPFIRE_EP_OWNER_ROUTED_PREFILL` and
-  `HIPFIRE_EP_EXPERT_STAGE` default on when every admission condition holds;
-  the exact value `0` disables each. EP4 owner-routed prefill is refused at
-  admission (`EP4 owner-routed prefill not yet gated`) and keeps the full-table
-  chunk route; single-card runs are unchanged. Setup and gates:
-  [multi-gpu.md](multi-gpu.md); variable semantics: [env-vars.md](env-vars.md).
+- **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
+  `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
+  holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16
+  WMMA grouped route); `HIPFIRE_EP_EXPERT_STAGE` defaults on only on gfx1201.
+  The exact value `0` disables each. Single-card runs are unchanged. Setup and
+  gates: [multi-gpu.md](multi-gpu.md); variable semantics:
+  [env-vars.md](env-vars.md).
 
 ## If something fails
 
@@ -506,7 +555,7 @@ is tagged.
 | HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
-| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present, else only MTP runs) |
+| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present; with the draft absent the load runs AR, because native MTP `auto` arms only Flash-Next, and `--spec mtp` is the opt-in for the 27B MTP head) |
 | Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash

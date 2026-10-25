@@ -40,9 +40,7 @@
 //!
 //! CPU-only. Safe to run while the GPU is busy with another model.
 
-use hipfire_ds4_parent::codec::{
-    dequant_dense_fp8_block128, dequant_expert_fp4_g32,
-};
+use hipfire_ds4_parent::codec::{dequant_dense_fp8_block128, dequant_expert_fp4_g32};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use std::env;
@@ -256,7 +254,12 @@ fn parent_dequant_dense(w: &[u8], s: &[u8], m: usize, k: usize) -> Result<Vec<f6
     Ok(out_f32.iter().map(|&v| v as f64).collect())
 }
 
-fn parent_dequant_expert(w: &[u8], s: &[u8], m: usize, k_logical: usize) -> Result<Vec<f64>, String> {
+fn parent_dequant_expert(
+    w: &[u8],
+    s: &[u8],
+    m: usize,
+    k_logical: usize,
+) -> Result<Vec<f64>, String> {
     let mut out_f32 = vec![0.0f32; m * k_logical];
     dequant_expert_fp4_g32(w, s, m, k_logical, &mut out_f32)?;
     Ok(out_f32.iter().map(|&v| v as f64).collect())
@@ -486,7 +489,10 @@ fn scale_name(weight: &str) -> String {
         .unwrap_or_else(|| format!("{weight}.scale"))
 }
 
-fn read_bytes(src: &SafetensorsSource, name: &str) -> Result<(Vec<u8>, String, Vec<usize>), String> {
+fn read_bytes(
+    src: &SafetensorsSource,
+    name: &str,
+) -> Result<(Vec<u8>, String, Vec<usize>), String> {
     let (info, data) = src
         .tensor_data(name)
         .ok_or_else(|| format!("missing tensor {name:?}"))?;
@@ -528,11 +534,7 @@ fn compare_case(src: &SafetensorsSource, case: &'static Case) -> Result<Row, Str
             // Both sides read the same bytes the same way — this is the
             // pure load floor (bit-exact expected).
             let m = metrics(&vals, &vals, &w_shape, &w_shape);
-            Ok(Row {
-                case,
-                m,
-                alt: None,
-            })
+            Ok(Row { case, m, alt: None })
         }
         Tier::DenseFp8 => {
             if w_dtype != "F8_E4M3" && w_dtype != "I8" {
@@ -582,11 +584,7 @@ fn compare_case(src: &SafetensorsSource, case: &'static Case) -> Result<Row, Str
                 }
                 let _ = alt;
             }
-            Ok(Row {
-                case,
-                m,
-                alt: None,
-            })
+            Ok(Row { case, m, alt: None })
         }
         Tier::ExpertFp4 => {
             if w_dtype != "I8" {
@@ -608,14 +606,8 @@ fn compare_case(src: &SafetensorsSource, case: &'static Case) -> Result<Row, Str
             let (m_dim, k_packed) = (w_shape[0], w_shape[1]);
             let k_logical = k_packed * 2;
 
-            let (oracle, oshape) = oracle_dequant_e2m1_ue8m0(
-                &w_bytes,
-                &w_shape,
-                &s_bytes,
-                &s_shape,
-                false,
-                false,
-            )?;
+            let (oracle, oshape) =
+                oracle_dequant_e2m1_ue8m0(&w_bytes, &w_shape, &s_bytes, &s_shape, false, false)?;
             let ours = parent_dequant_expert(&w_bytes, &s_bytes, m_dim, k_logical)?;
             let ours_shape = vec![m_dim, k_logical];
             let m = metrics(&ours, &oracle, &ours_shape, &oshape);
@@ -697,10 +689,7 @@ fn print_table(rows: &[Row]) {
             );
         }
         if r.m.n_nan_ours + r.m.n_nan_oracle > 0 {
-            println!(
-                "  nan: ours={} oracle={}",
-                r.m.n_nan_ours, r.m.n_nan_oracle
-            );
+            println!("  nan: ours={} oracle={}", r.m.n_nan_ours, r.m.n_nan_oracle);
         }
     }
 }
@@ -779,10 +768,8 @@ fn summarize(rows: &[Row]) -> i32 {
         || exp_min_cos < cos_tol
         || exp_l2_dev > l2_tol
         || any_shape;
-    let control_bad = ctrl_max_abs > 1e-5
-        || ctrl_max_rel > 1e-6
-        || ctrl_min_cos < 0.999999
-        || ctrl_l2_dev > 1e-5;
+    let control_bad =
+        ctrl_max_abs > 1e-5 || ctrl_max_rel > 1e-6 || ctrl_min_cos < 0.999999 || ctrl_l2_dev > 1e-5;
 
     if control_bad {
         println!(
@@ -836,9 +823,7 @@ fn summarize(rows: &[Row]) -> i32 {
     } else {
         "MIXED / OTHER"
     };
-    println!(
-        "FAIL: expert_fp4 tier disagrees. signature={signature}"
-    );
+    println!("FAIL: expert_fp4 tier disagrees. signature={signature}");
     println!(
         "  experts: max|d|={} relFro={} |L2ratio-1|={} min cosine={:.9}",
         fmt_sci(exp_max_abs),
@@ -885,9 +870,8 @@ fn parse_args() -> Result<PathBuf, String> {
     }
     Ok(model.unwrap_or_else(|| {
         PathBuf::from(
-            env::var("HIPFIRE_DEEPSEEK4_PARENT_MODEL").unwrap_or_else(|_| {
-                "/mnt/scratch/models/DeepSeek-V4-Flash-0731".to_string()
-            }),
+            env::var("HIPFIRE_DEEPSEEK4_PARENT_MODEL")
+                .unwrap_or_else(|_| "/mnt/scratch/models/DeepSeek-V4-Flash-0731".to_string()),
         )
     }))
 }
@@ -913,19 +897,13 @@ fn run() -> Result<i32, String> {
 
     println!("=== ds4_parent_loader_oracle ===");
     println!("model: {}", model.display());
-    println!(
-        "oracle: from-scratch f64 dequant (quantizer/kernel.py/convert.py semantics)"
-    );
+    println!("oracle: from-scratch f64 dequant (quantizer/kernel.py/convert.py semantics)");
     println!("parent: parent::codec::{{dequant_dense_fp8_block128, dequant_expert_fp4_g32}}");
     println!();
 
     let t0 = Instant::now();
-    let src = SafetensorsSource::open(&model).map_err(|e| {
-        format!(
-            "SafetensorsSource::open({}): {e}",
-            model.display()
-        )
-    })?;
+    let src = SafetensorsSource::open(&model)
+        .map_err(|e| format!("SafetensorsSource::open({}): {e}", model.display()))?;
     println!(
         "opened: {} tensors in {:.2}s",
         src.tensor_names().len(),

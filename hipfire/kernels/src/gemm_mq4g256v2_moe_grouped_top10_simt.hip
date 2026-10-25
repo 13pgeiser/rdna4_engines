@@ -33,7 +33,8 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_simt(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    int n_experts
 ) {
     const int row = blockIdx.x;
     const int slot_start = blockIdx.y * 16;
@@ -41,7 +42,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_simt(
     if (row >= M || slot_start >= grouped_rows || tid >= 32) return;
 
     const int expert_id = expert_tile_ids[blockIdx.y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 

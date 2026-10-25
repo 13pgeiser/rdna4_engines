@@ -26,7 +26,10 @@ fn main() {
     if gpu.rocblas.is_none() {
         match hip_bridge::Rocblas::load() {
             Ok(rb) => {
-                println!("[bench] forced rocBLAS load on {} (try_init_rocblas is CDNA3-gated)", gpu.arch);
+                println!(
+                    "[bench] forced rocBLAS load on {} (try_init_rocblas is CDNA3-gated)",
+                    gpu.arch
+                );
                 gpu.rocblas = Some(rb);
             }
             Err(e) => {
@@ -45,24 +48,32 @@ fn main() {
         (768, 3072, true, "fc2          3072->768"),
     ];
 
-    println!("\n{:26} {:>9} {:>11} {:>10} {:>11} {:>9}",
-             "shape (B=7600)", "roc us", "roc GFLOP/s", "cur us", "cur GFLOP/s", "speedup");
+    println!(
+        "\n{:26} {:>9} {:>11} {:>10} {:>11} {:>9}",
+        "shape (B=7600)", "roc us", "roc GFLOP/s", "cur us", "cur GFLOP/s", "speedup"
+    );
     let (mut roc_block_us, mut cur_block_us) = (0.0f64, 0.0f64);
 
     for &(m, k, per_block, label) in shapes {
         let w = gpu.hip.malloc(m * k * 2).expect("malloc W");
         let x = gpu.hip.malloc(B * k * 2).expect("malloc X");
         let y = gpu.hip.malloc(B * m * 4).expect("malloc Y");
-        gpu.hip.memcpy_htod(&w, &vec![0x3Cu8; m * k * 2]).expect("copy W");
-        gpu.hip.memcpy_htod(&x, &vec![0x34u8; B * k * 2]).expect("copy X");
+        gpu.hip
+            .memcpy_htod(&w, &vec![0x3Cu8; m * k * 2])
+            .expect("copy W");
+        gpu.hip
+            .memcpy_htod(&x, &vec![0x34u8; B * k * 2])
+            .expect("copy X");
 
         for _ in 0..WARMUP {
-            gpu.rocblas_gemm_hfq4_prefill(&w, &x, &y, m, B, k).expect("rocblas warmup");
+            gpu.rocblas_gemm_hfq4_prefill(&w, &x, &y, m, B, k)
+                .expect("rocblas warmup");
         }
         gpu.hip.device_synchronize().expect("sync");
         let t0 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.rocblas_gemm_hfq4_prefill(&w, &x, &y, m, B, k).expect("rocblas trial");
+            gpu.rocblas_gemm_hfq4_prefill(&w, &x, &y, m, B, k)
+                .expect("rocblas trial");
         }
         gpu.hip.device_synchronize().expect("sync");
         let roc_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -76,19 +87,25 @@ fn main() {
         let xt = gpu.zeros(&[B * k], DType::F32).expect("x f32");
         let yt = gpu.zeros(&[m * B], DType::F32).expect("y f32");
         for _ in 0..WARMUP {
-            gpu.gemm_f16(&wt, &xt, &yt, m, k, B).expect("gemm_f16 warmup");
+            gpu.gemm_f16(&wt, &xt, &yt, m, k, B)
+                .expect("gemm_f16 warmup");
         }
         gpu.hip.device_synchronize().expect("sync");
         let t1 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.gemm_f16(&wt, &xt, &yt, m, k, B).expect("gemm_f16 trial");
+            gpu.gemm_f16(&wt, &xt, &yt, m, k, B)
+                .expect("gemm_f16 trial");
         }
         gpu.hip.device_synchronize().expect("sync");
         let cur_us = t1.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
 
         let flops = 2.0 * m as f64 * k as f64 * B as f64;
-        println!("{label:26} {roc_us:9.1} {:11.1} {cur_us:10.1} {:11.1} {:8.1}x",
-                 flops / roc_us / 1e3, flops / cur_us / 1e3, cur_us / roc_us);
+        println!(
+            "{label:26} {roc_us:9.1} {:11.1} {cur_us:10.1} {:11.1} {:8.1}x",
+            flops / roc_us / 1e3,
+            flops / cur_us / 1e3,
+            cur_us / roc_us
+        );
         if per_block {
             roc_block_us += roc_us;
             cur_block_us += cur_us;
@@ -105,7 +122,10 @@ fn main() {
     println!("\nPer-block projections (qkv+attn_out+fc1+fc2), x12 blocks:");
     println!("  rocBLAS      : {:.3} s", roc_block_us * 12.0 / 1e6);
     println!("  current path : {:.3} s", cur_block_us * 12.0 / 1e6);
-    println!("  saving       : {:.3} s", (cur_block_us - roc_block_us) * 12.0 / 1e6);
+    println!(
+        "  saving       : {:.3} s",
+        (cur_block_us - roc_block_us) * 12.0 / 1e6
+    );
     println!("\nMeasured full vision tower on the OvisOCR2 fixture: 8.22 s.");
     println!("Attention (2*n^2*h*2 = 177 GFLOP/block, ~62% of tower FLOPs) is a separate kernel.");
 }

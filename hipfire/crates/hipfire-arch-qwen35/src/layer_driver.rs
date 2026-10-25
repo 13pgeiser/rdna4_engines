@@ -447,6 +447,7 @@ mod tests {
                 expert_execution_plan,
                 expert_table,
                 expert_binding,
+                expert_iu4: None,
             })
         }
 

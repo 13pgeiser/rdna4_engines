@@ -62,9 +62,14 @@
 //! ->wait-return. rt_us: paced = per-run (seq published -> done seen); prepublish = per-run done-to-done interval (the
 //! first is submit->first done). firstdone_us = submit -> first observed done. Exit 0 = everything verified (negatives
 //! detected), 1 = failure, 2 = usage.
-use peacemaker_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
+use peacemaker_npu::kernels::gemm_array::{
+    apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE,
+};
 use peacemaker_npu::kernels::gemm_core::Control;
-use peacemaker_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9, persistent_v9_lean, producer_may_publish, Neg, PatchKind, RingLayout, SlotPlan};
+use peacemaker_npu::kernels::ring::{
+    empty_persistent, patch_seq, persistent_v9, persistent_v9_lean, producer_may_publish, Neg,
+    PatchKind, RingLayout, SlotPlan,
+};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -78,17 +83,34 @@ const USAGE: &str = "usage: npu-ring M N K --slots S [--nslots R] [--rounds N | 
 const MAX_OPC: u32 = 2048;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode { Prepublish, Paced, EmptyPaced, EmptyPrepublish }
+enum Mode {
+    Prepublish,
+    Paced,
+    EmptyPaced,
+    EmptyPrepublish,
+}
 impl Mode {
-    fn empty(self) -> bool { matches!(self, Mode::EmptyPaced | Mode::EmptyPrepublish) }
-    fn paced(self) -> bool { matches!(self, Mode::Paced | Mode::EmptyPaced) }
+    fn empty(self) -> bool {
+        matches!(self, Mode::EmptyPaced | Mode::EmptyPrepublish)
+    }
+    fn paced(self) -> bool {
+        matches!(self, Mode::Paced | Mode::EmptyPaced)
+    }
     fn name(self) -> &'static str {
-        match self { Mode::Prepublish => "prepublish", Mode::Paced => "paced", Mode::EmptyPaced => "empty-paced", Mode::EmptyPrepublish => "empty-prepublish" }
+        match self {
+            Mode::Prepublish => "prepublish",
+            Mode::Paced => "paced",
+            Mode::EmptyPaced => "empty-paced",
+            Mode::EmptyPrepublish => "empty-prepublish",
+        }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NegKind { SkipDone, StaleSeq }
+enum NegKind {
+    SkipDone,
+    StaleSeq,
+}
 
 struct Cfg {
     m: usize,
@@ -108,7 +130,6 @@ struct Cfg {
     verify_every: bool,
 }
 
-
 fn parse(args: &[String]) -> Result<Cfg, String> {
     let mut pos = Vec::new();
     let mut slots = None;
@@ -123,7 +144,11 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
     let mut verify_every = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
+        let mut val = |name: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
         match a.as_str() {
             "--slots" => slots = Some(parse_num::<usize>("--slots", &val("--slots")?)?),
             "--nslots" => nslots = Some(parse_num::<usize>("--nslots", &val("--nslots")?)?),
@@ -156,7 +181,11 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
     if pos.len() != 3 {
         return Err("need exactly M N K".into());
     }
-    let (m, n, k) = (parse_num::<usize>("M", &pos[0])?, parse_num::<usize>("N", &pos[1])?, parse_num::<usize>("K", &pos[2])?);
+    let (m, n, k) = (
+        parse_num::<usize>("M", &pos[0])?,
+        parse_num::<usize>("N", &pos[1])?,
+        parse_num::<usize>("K", &pos[2])?,
+    );
     let slots = slots.ok_or("--slots is required")?;
     if slots == 0 {
         return Err("--slots must be >= 1".into());
@@ -166,7 +195,10 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
         return Err(format!("--nslots {nslots} must be a power of two"));
     }
     if matches!(mode, Mode::Prepublish | Mode::EmptyPrepublish) && nslots < slots {
-        return Err(format!("{} needs --nslots >= --slots ({nslots} < {slots})", mode.name()));
+        return Err(format!(
+            "{} needs --nslots >= --slots ({nslots} < {slots})",
+            mode.name()
+        ));
     }
     if rounds == Some(0) || timeout_ms == 0 {
         return Err("--rounds/--timeout-ms must be >= 1".into());
@@ -175,7 +207,10 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
         return Err("--neg needs a GEMM mode (prepublish|paced)".into());
     }
     if neg == Some(NegKind::SkipDone) && slots / 2 + nslots < slots {
-        return Err(format!("--neg skip-done needs S/2 + nslots >= S (skipped run {} would have its slot reused)", slots / 2));
+        return Err(format!(
+            "--neg skip-done needs S/2 + nslots >= S (skipped run {} would have its slot reused)",
+            slots / 2
+        ));
     }
     if neg == Some(NegKind::StaleSeq) {
         if nslots < slots {
@@ -188,7 +223,8 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
             return Err("--neg stale-seq needs --rounds >= 2".into());
         }
     }
-    let multi_round = rounds.is_some_and(|r| r > 1) || fit_ms.is_some() || neg == Some(NegKind::StaleSeq);
+    let multi_round =
+        rounds.is_some_and(|r| r > 1) || fit_ms.is_some() || neg == Some(NegKind::StaleSeq);
     if multi_round && slots % nslots != 0 {
         return Err(format!(
             "multi-round needs --slots divisible by --nslots (S={slots}, R={nslots}): the retained command bakes slot j%R and only seq words are patched \
@@ -198,10 +234,22 @@ fn parse(args: &[String]) -> Result<Cfg, String> {
     if lean && mode.empty() {
         return Err("--lean needs a GEMM mode (prepublish|paced)".into());
     }
-    Ok(Cfg { m, n, k, slots, nslots, rounds, fit_ms, mode, neg, timeout_ms, allow_hang, lean, verify_every })
+    Ok(Cfg {
+        m,
+        n,
+        k,
+        slots,
+        nslots,
+        rounds,
+        fit_ms,
+        mode,
+        neg,
+        timeout_ms,
+        allow_hang,
+        lean,
+        verify_every,
+    })
 }
-
-
 
 /// `p50`, `p99`, `min` of a sample set (`None` when empty).
 fn stats(v: &mut [f64]) -> Option<(f64, f64, f64)> {
@@ -211,7 +259,6 @@ fn stats(v: &mut [f64]) -> Option<(f64, f64, f64)> {
     v.sort_by(|a, b| a.total_cmp(b));
     Some((percentile(v, 0.5), percentile(v, 0.99), v[0]))
 }
-
 
 // ---- ring access (non-coherent CPU view: flush before reading device-written lines, after writing) ----
 
@@ -236,18 +283,28 @@ fn read_done(ring: &Bo, layout: RingLayout, slot: usize) -> (u32, u32, u32) {
 }
 
 /// Block until done line `slot` carries `seq` (equality, wrap-safe) and is well formed. Returns the observation time.
-fn spin_done(ring: &Bo, layout: RingLayout, slot: usize, seq: u32, deadline: Instant) -> Result<Instant, String> {
+fn spin_done(
+    ring: &Bo,
+    layout: RingLayout,
+    slot: usize,
+    seq: u32,
+    deadline: Instant,
+) -> Result<Instant, String> {
     loop {
         let (s, sl, magic) = read_done(ring, layout, slot);
         if s == seq {
             let t = Instant::now();
             if sl != slot as u32 || magic != DONE_MAGIC {
-                return Err(format!("malformed done line slot {slot}: seq {s:#x} slot field {sl} magic {magic:#x}"));
+                return Err(format!(
+                    "malformed done line slot {slot}: seq {s:#x} slot field {sl} magic {magic:#x}"
+                ));
             }
             return Ok(t);
         }
         if Instant::now() >= deadline {
-            return Err(format!("timeout waiting for done[{slot}] seq {seq:#x} (last seen {s:#x})"));
+            return Err(format!(
+                "timeout waiting for done[{slot}] seq {seq:#x} (last seen {s:#x})"
+            ));
         }
         core::hint::spin_loop();
     }
@@ -280,7 +337,13 @@ impl Producer {
     /// Safe rescue: publish every unpublished run whose slot is free (its previous seq has its done line). Never
     /// overwrites a slot whose previous seq is not done, so a seq the command may still poll for is never replaced.
     /// Retries until `deadline`; returns the runs still pending.
-    fn rescue(&mut self, ring: &Bo, published: &mut [bool], seq_of: &dyn Fn(usize) -> u32, deadline: Instant) -> Vec<usize> {
+    fn rescue(
+        &mut self,
+        ring: &Bo,
+        published: &mut [bool],
+        seq_of: &dyn Fn(usize) -> u32,
+        deadline: Instant,
+    ) -> Vec<usize> {
         loop {
             for j in 0..published.len() {
                 if !published[j] && self.publish(ring, j, seq_of(j)).is_ok() {
@@ -321,10 +384,21 @@ impl Producer {
 
 /// Patch the declared seq words of the retained insts BO in place; returns the patched word count. Every word that
 /// differs must be in the inventory; only those cache lines are flushed; the BO is then read back and compared.
-fn patch_insts(bo: &Bo, host: &mut [u8], sites: &[(usize, PatchKind)], seq0: u32) -> Result<usize, String> {
+fn patch_insts(
+    bo: &Bo,
+    host: &mut [u8],
+    sites: &[(usize, PatchKind)],
+    seq0: u32,
+) -> Result<usize, String> {
     let old = host.to_vec();
     patch_seq(host, sites, seq0);
-    let changed: Vec<usize> = old.chunks_exact(4).zip(host.chunks_exact(4)).enumerate().filter(|(_, (o, n))| o != n).map(|(w, _)| w).collect();
+    let changed: Vec<usize> = old
+        .chunks_exact(4)
+        .zip(host.chunks_exact(4))
+        .enumerate()
+        .filter(|(_, (o, n))| o != n)
+        .map(|(w, _)| w)
+        .collect();
     let mut declared: Vec<usize> = sites.iter().map(|s| s.0).collect();
     declared.sort_unstable();
     declared.dedup();
@@ -401,7 +475,14 @@ struct RoundOut {
     failure: Option<String>,
 }
 
-fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize, stale: bool) -> Result<RoundOut, String> {
+fn run_round(
+    rig: &mut Rig,
+    cfg: &Cfg,
+    pl: &Plan,
+    prod: &mut Producer,
+    r: usize,
+    stale: bool,
+) -> Result<RoundOut, String> {
     let s_runs = cfg.slots;
     let seq0 = 1 + (r * s_runs) as u32;
     let mut out = RoundOut::default();
@@ -455,7 +536,13 @@ fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize,
                 continue;
             }
             let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
-            match spin_done(&rig.ring, prod.layout, prod.plans[j].slot, expect(j), deadline) {
+            match spin_done(
+                &rig.ring,
+                prod.layout,
+                prod.plans[j].slot,
+                expect(j),
+                deadline,
+            ) {
                 Ok(t) => {
                     t_done[j] = Some(t);
                     out.done_seen += 1;
@@ -466,7 +553,9 @@ fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize,
                         let (off, len) = (slot * pl.c_bytes, pl.c_bytes);
                         unsafe { clflush(rig.c.host.add(off), len) };
                         out.early_total += 1;
-                        out.early_ok += (rig.c.as_slice()[off..off + len] == *pl.eager[slot % pl.sets]) as usize;
+                        out.early_ok += (rig.c.as_slice()[off..off + len]
+                            == *pl.eager[slot % pl.sets])
+                            as usize;
                         rig.c.as_mut_slice()[off..off + len].fill(POISON);
                         unsafe { clflush(rig.c.host.add(off), len) };
                     }
@@ -480,9 +569,17 @@ fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize,
     }
     if obs_err.is_some() && !cfg.allow_hang {
         // Never leave the NPU polling for a seq we owe it, and never overwrite a slot whose seq is not done yet.
-        let pending = prod.rescue(&rig.ring, &mut published, &expect, Instant::now() + Duration::from_millis(cfg.timeout_ms));
+        let pending = prod.rescue(
+            &rig.ring,
+            &mut published,
+            &expect,
+            Instant::now() + Duration::from_millis(cfg.timeout_ms),
+        );
         if !pending.is_empty() {
-            obs_err = Some(format!("{}; rescue could not publish runs {pending:?} (slots still busy)", obs_err.take().unwrap()));
+            obs_err = Some(format!(
+                "{}; rescue could not publish runs {pending:?} (slots still busy)",
+                obs_err.take().unwrap()
+            ));
         }
     }
     let waited = rig.ctx.wait(&rig.cmd, seq, cfg.timeout_ms);
@@ -491,8 +588,18 @@ fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize,
     out.wall_us = us(t_end - t_wall0);
     match (&waited, &obs_err) {
         (Ok(s), None) if *s == ERT_STATE_COMPLETED => {}
-        (Ok(s), e) => out.failure = Some(format!("state {s} (want {ERT_STATE_COMPLETED}){}", e.as_ref().map(|e| format!("; {e}")).unwrap_or_default())),
-        (Err(e), o) => out.failure = Some(format!("wait failed: {e}{}", o.as_ref().map(|o| format!("; {o}")).unwrap_or_default())),
+        (Ok(s), e) => {
+            out.failure = Some(format!(
+                "state {s} (want {ERT_STATE_COMPLETED}){}",
+                e.as_ref().map(|e| format!("; {e}")).unwrap_or_default()
+            ))
+        }
+        (Err(e), o) => {
+            out.failure = Some(format!(
+                "wait failed: {e}{}",
+                o.as_ref().map(|o| format!("; {o}")).unwrap_or_default()
+            ))
+        }
     }
     if out.failure.is_some() {
         return Ok(out);
@@ -531,7 +638,13 @@ fn run_round(rig: &mut Rig, cfg: &Cfg, pl: &Plan, prod: &mut Producer, r: usize,
 
 /// One eager `design_v9` submit per operand set on the ring's own hardware context (its PDI is the identical V9 PDI,
 /// already configured); returns the packed C bytes per set.
-fn eager_runs(dev: &Device, ctx: &HwCtx, d: &ArrayDesign, packs: &[[Vec<u8>; 2]], timeout_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+fn eager_runs(
+    dev: &Device,
+    ctx: &HwCtx,
+    d: &ArrayDesign,
+    packs: &[[Vec<u8>; 2]],
+    timeout_ms: u64,
+) -> Result<Vec<Vec<u8>>, String> {
     let insts = dev.dev_bo(&d.insts)?;
     let mut cmd = dev.cmd_bo()?;
     let mut result = Vec::new();
@@ -577,10 +690,16 @@ fn main() {
 
 fn run(cfg: &Cfg) -> Result<bool, String> {
     let empty = cfg.mode.empty();
-    let (m, n, k) = if empty { (512, 512, 64) } else { (cfg.m, cfg.n, cfg.k) };
+    let (m, n, k) = if empty {
+        (512, 512, 64)
+    } else {
+        (cfg.m, cfg.n, cfg.k)
+    };
     let s_runs = cfg.slots;
     let layout = RingLayout { nslots: cfg.nslots };
-    let d = match catch_unwind(AssertUnwindSafe(|| design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast))) {
+    let d = match catch_unwind(AssertUnwindSafe(|| {
+        design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast)
+    })) {
         Ok(d) => d,
         Err(_) => {
             eprintln!("npu-ring: design_v9({m},{n},{k}) rejected this shape\n{USAGE}");
@@ -591,14 +710,24 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let (a_bytes, b_bytes, c_bytes) = (d.args[0].bytes, d.args[1].bytes, d.args[2].bytes);
     let useful = d.useful_ops();
     let used = s_runs.min(cfg.nslots);
-    let sets = (if (m as u64) * (n as u64) * (k as u64) <= 1 << 24 { used.min(4) } else { 1 }).max(1);
-    let neg_skip = (cfg.neg == Some(NegKind::SkipDone)).then_some(if s_runs >= 2 { s_runs / 2 } else { 0 });
+    let sets = (if (m as u64) * (n as u64) * (k as u64) <= 1 << 24 {
+        used.min(4)
+    } else {
+        1
+    })
+    .max(1);
+    let neg_skip =
+        (cfg.neg == Some(NegKind::SkipDone)).then_some(if s_runs >= 2 { s_runs / 2 } else { 0 });
     let max_rounds = cfg.rounds.unwrap_or(match (cfg.fit_ms, cfg.neg) {
         (Some(_), _) => 1000,
         (None, Some(NegKind::StaleSeq)) => 2,
         _ => 1,
     });
-    let min_rounds = if cfg.neg == Some(NegKind::StaleSeq) { 2 } else { 1 };
+    let min_rounds = if cfg.neg == Some(NegKind::StaleSeq) {
+        2
+    } else {
+        1
+    };
 
     // Operand sets (not for the empty modes). The silicon CPU reference is the exact separable O(M*N) closed form
     // A[r,kk] = ra(r) (constant over kk), B[kk,c] = cb(c) => C[r,c] = epilogue(K * ra(r) * cb(c)); amplitudes 7..19 and
@@ -608,15 +737,28 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let mut refs: Vec<Vec<i32>> = Vec::new();
     if !empty {
         for set in 0..sets {
-            let ra: Vec<i32> = (0..m).map(|r| (7 + (r * 5 + set * 3) % 13) as i32 * if (r * 7 + set) % 3 == 0 { -1 } else { 1 }).collect();
-            let cb: Vec<i32> = (0..n).map(|c| (7 + (c * 3 + set * 7) % 13) as i32 * if (c * 5 + set * 2) % 4 == 1 { -1 } else { 1 }).collect();
+            let ra: Vec<i32> = (0..m)
+                .map(|r| {
+                    (7 + (r * 5 + set * 3) % 13) as i32
+                        * if (r * 7 + set) % 3 == 0 { -1 } else { 1 }
+                })
+                .collect();
+            let cb: Vec<i32> = (0..n)
+                .map(|c| {
+                    (7 + (c * 3 + set * 7) % 13) as i32
+                        * if (c * 5 + set * 2) % 4 == 1 { -1 } else { 1 }
+                })
+                .collect();
             let a: Vec<i8> = (0..m * k).map(|i| ra[i / k] as i8).collect();
             let b: Vec<i8> = (0..k * n).map(|i| cb[i % n] as i8).collect();
             packs.push(d.pack_in(&a, &b));
             let mut want = Vec::with_capacity(m * n);
             for &x in &ra {
                 for &y in &cb {
-                    want.push(apply_epilogue((k as i32).wrapping_mul(x * y), V8_DEFAULT_EPILOGUE));
+                    want.push(apply_epilogue(
+                        (k as i32).wrapping_mul(x * y),
+                        V8_DEFAULT_EPILOGUE,
+                    ));
                 }
             }
             refs.push(want);
@@ -627,9 +769,19 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let slot_plans: Vec<SlotPlan> = (0..s_runs)
         .map(|j| {
             if empty {
-                SlotPlan { slot: j % cfg.nslots, a_off: 0, b_off: 0, c_off: 0 }
+                SlotPlan {
+                    slot: j % cfg.nslots,
+                    a_off: 0,
+                    b_off: 0,
+                    c_off: 0,
+                }
             } else {
-                SlotPlan { slot: j % cfg.nslots, a_off: ((j % cfg.nslots) * a_bytes) as u64, b_off: ((j % cfg.nslots) * b_bytes) as u64, c_off: ((j % cfg.nslots) * c_bytes) as u64 }
+                SlotPlan {
+                    slot: j % cfg.nslots,
+                    a_off: ((j % cfg.nslots) * a_bytes) as u64,
+                    b_off: ((j % cfg.nslots) * b_bytes) as u64,
+                    c_off: ((j % cfg.nslots) * c_bytes) as u64,
+                }
             }
         })
         .collect();
@@ -645,7 +797,11 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
             persistent_v9(m, n, k, layout, &slot_plans, 1, neg)
         }
     };
-    let pd = if empty { empty_persistent(layout, &slot_plans, 1) } else { build(cfg.lean) };
+    let pd = if empty {
+        empty_persistent(layout, &slot_plans, 1)
+    } else {
+        build(cfg.lean)
+    };
     // Same operands/slots/neg: the full body is the reference length for the lean report (lean run 0 is full, runs 1.. lean).
     let (insts_full_bytes, insts_lean_bytes) = if cfg.lean {
         (build(false).insts.len(), pd.insts.len())
@@ -656,10 +812,20 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         return Err(format!("lean design has {} patch sites for {s_runs} runs, expected exactly 2 seq words per run", pd.patch_sites.len()));
     }
     if pd.args.len() != 4 {
-        return Err(format!("persistent design has {} args, expected A, B, C, ring", pd.args.len()));
+        return Err(format!(
+            "persistent design has {} args, expected A, B, C, ring",
+            pd.args.len()
+        ));
     }
-    let need = [if empty { 0 } else { used * a_bytes }, if empty { 0 } else { used * b_bytes }, if empty { 0 } else { used * c_bytes }, layout.bytes()];
-    let sizes: Vec<usize> = (0..4).map(|i| round_up(pd.args[i].bytes.max(need[i]).max(4096), 4096)).collect();
+    let need = [
+        if empty { 0 } else { used * a_bytes },
+        if empty { 0 } else { used * b_bytes },
+        if empty { 0 } else { used * c_bytes },
+        layout.bytes(),
+    ];
+    let sizes: Vec<usize> = (0..4)
+        .map(|i| round_up(pd.args[i].bytes.max(need[i]).max(4096), 4096))
+        .collect();
     println!(
         "setup: mode={} variant={} shape={m}x{n}x{k} slots={s_runs} nslots={} sets={sets} pdi {} B ({}) insts {} B patch_sites {} ({} per run) arenas A {} B {} C {} ring {} B",
         cfg.mode.name(),
@@ -699,7 +865,8 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     }
 
     let mut dev = Device::open().map_err(|e| format!("device open failed: {e}"))?;
-    dev.map_heap(64 << 20).map_err(|e| format!("device heap map failed: {e}"))?;
+    dev.map_heap(64 << 20)
+        .map_err(|e| format!("device heap map failed: {e}"))?;
     let ntiles = dev.meta.cols as u32 * dev.meta.core.0 as u32;
     // ONE hardware context + PDI for the eager baseline and the persistent command: the V9 PDI is byte-identical.
     let ctx = HwCtx::create(&dev, ntiles, MAX_OPC)?;
@@ -741,10 +908,34 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
 
     let insts = dev.dev_bo(&pd.insts)?;
     let cmd = dev.cmd_bo()?;
-    let mut rig = Rig { cmd, insts, a, b, c, ring, pdi, insts_host: pd.insts.clone(), insts_seq0: 1, ctx };
+    let mut rig = Rig {
+        cmd,
+        insts,
+        a,
+        b,
+        c,
+        ring,
+        pdi,
+        insts_host: pd.insts.clone(),
+        insts_seq0: 1,
+        ctx,
+    };
     let _ = &rig.pdi;
-    let plan = Plan { empty, sites: pd.patch_sites.clone(), c_bytes, skip: neg_skip, sets, eager: eager_c };
-    let mut prod = Producer { layout, plans: slot_plans, m: m as u32, flags: empty as u32, prev: vec![0; cfg.nslots] };
+    let plan = Plan {
+        empty,
+        sites: pd.patch_sites.clone(),
+        c_bytes,
+        skip: neg_skip,
+        sets,
+        eager: eager_c,
+    };
+    let mut prod = Producer {
+        layout,
+        plans: slot_plans,
+        m: m as u32,
+        flags: empty as u32,
+        prev: vec![0; cfg.nslots],
+    };
     let inventory = pd.patch_sites.len();
 
     let mut busy = Vec::new();
@@ -807,7 +998,16 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         }
         last_verified_cpu = false;
         if !empty && (r == 0 || (cfg.verify_every && !stale)) {
-            cpu_verify(&rig.c, &d, &refs, used, sets, c_bytes, &format!("round {r}"), &mut all_ok);
+            cpu_verify(
+                &rig.c,
+                &d,
+                &refs,
+                used,
+                sets,
+                c_bytes,
+                &format!("round {r}"),
+                &mut all_ok,
+            );
             last_verified_cpu = true;
         }
         match cfg.neg {
@@ -826,7 +1026,8 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
                 neg_detected = Some(neg_detected.unwrap_or(true) && detected);
             }
             Some(NegKind::StaleSeq) if stale => {
-                let detected = o.patched == 0 && o.new_done == 0 && o.old_done == s_runs && inventory > 0;
+                let detected =
+                    o.patched == 0 && o.new_done == 0 && o.old_done == s_runs && inventory > 0;
                 println!(
                     "NEG stale-seq: patched_words={}/{inventory} (inventory requires all), new done lines {} of {s_runs}, done lines still showing old seqs {} of {s_runs} -> {}",
                     o.patched,
@@ -848,15 +1049,42 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         }
     }
     if !empty && rounds_done > 1 && !last_verified_cpu && all_ok {
-        cpu_verify(&rig.c, &d, &refs, used, sets, c_bytes, "final round", &mut all_ok);
+        cpu_verify(
+            &rig.c,
+            &d,
+            &refs,
+            used,
+            sets,
+            c_bytes,
+            "final round",
+            &mut all_ok,
+        );
     }
 
     let cpu_total = if empty { 0 } else { cpu_counts().0 };
     let cpu_ok = if empty { 0 } else { cpu_counts().1 };
-    let mean = |v: &[f64]| if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
     let (per_round, per_wall) = (mean(&busy), mean(&wall));
-    let tops = |t_us: f64| if empty { 0.0 } else { s_runs as f64 * useful as f64 / (t_us * 1e6) };
-    let fmt3 = |x: f64| if x.is_nan() { "n/a".to_string() } else { format!("{x:.3}") };
+    let tops = |t_us: f64| {
+        if empty {
+            0.0
+        } else {
+            s_runs as f64 * useful as f64 / (t_us * 1e6)
+        }
+    };
+    let fmt3 = |x: f64| {
+        if x.is_nan() {
+            "n/a".to_string()
+        } else {
+            format!("{x:.3}")
+        }
+    };
     let rt = stats(&mut rts);
     let fd = stats(&mut firstdone);
     println!(
@@ -881,7 +1109,14 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         all_ok = false;
     }
     if cfg.neg.is_some() && neg_detected != Some(true) {
-        println!("NEG {}: not detected", if cfg.neg == Some(NegKind::SkipDone) { "skip-done" } else { "stale-seq" });
+        println!(
+            "NEG {}: not detected",
+            if cfg.neg == Some(NegKind::SkipDone) {
+                "skip-done"
+            } else {
+                "stale-seq"
+            }
+        );
         all_ok = false;
     }
     if !empty {
@@ -891,26 +1126,44 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     Ok(all_ok)
 }
 
+use npu_tools::util::{parse_num, percentile, round_up, us};
 use std::sync::atomic::AtomicUsize;
-use npu_tools::util::{percentile, parse_num, round_up, us};
 static CPU_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static CPU_OK: AtomicUsize = AtomicUsize::new(0);
 fn cpu_counts() -> (usize, usize) {
-    (CPU_TOTAL.load(Ordering::Relaxed), CPU_OK.load(Ordering::Relaxed))
+    (
+        CPU_TOTAL.load(Ordering::Relaxed),
+        CPU_OK.load(Ordering::Relaxed),
+    )
 }
 
 /// Exact CPU check of every slot currently in the C arena (unpack + reference compare).
 #[allow(clippy::too_many_arguments)]
-fn cpu_verify(c: &Bo, d: &ArrayDesign, refs: &[Vec<i32>], s_runs: usize, sets: usize, c_bytes: usize, what: &str, all_ok: &mut bool) {
+fn cpu_verify(
+    c: &Bo,
+    d: &ArrayDesign,
+    refs: &[Vec<i32>],
+    s_runs: usize,
+    sets: usize,
+    c_bytes: usize,
+    what: &str,
+    all_ok: &mut bool,
+) {
     c.flush();
     let cs = c.as_slice();
     for j in 0..s_runs {
-        let bad = count_mismatch(&d.unpack_out(&cs[j * c_bytes..(j + 1) * c_bytes]), &refs[j % sets]);
+        let bad = count_mismatch(
+            &d.unpack_out(&cs[j * c_bytes..(j + 1) * c_bytes]),
+            &refs[j % sets],
+        );
         CPU_TOTAL.fetch_add(1, Ordering::Relaxed);
         if bad == 0 {
             CPU_OK.fetch_add(1, Ordering::Relaxed);
         } else {
-            println!("{what}: slot {j} (set {}): {bad} mismatches vs CPU", j % sets);
+            println!(
+                "{what}: slot {j} (set {}): {bad} mismatches vs CPU",
+                j % sets
+            );
             *all_ok = false;
         }
     }

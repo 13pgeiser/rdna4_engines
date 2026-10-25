@@ -56,7 +56,7 @@ extern "C" __global__ void gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed(
     const float* __restrict__ rot_batch,                 // [k_top × K] FWHT-rotated
     float*       __restrict__ x_residual,                // [M]
     float cb0, float cb1, float cb2, float cb3,          // global codebook
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -64,6 +64,7 @@ extern "C" __global__ void gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;
