@@ -365,6 +365,7 @@ TEST(fp8_qk_attention_normalizes_before_neox_rope) {
     CHECK_OK(geom_from(g, &meta, &ctx, "bf16", RAD_BF16));
 
     RadBuilder b;
+    b.refuse.insert("qkv_norm_rope_kv_store"); // exercise the original unfused order
     Names nm("");
     RadKVGroupDecl kd{};
     kd.kind = RAD_KV_FULL; kd.dtype = RAD_BF16; kd.n_head_kv = g.n_head_kv;
@@ -686,6 +687,37 @@ TEST(hyv3_bf16_selects_block_fp8_and_mxfp4_expert_formats) {
             RadBatch batch = decode_batch();
             RadCtx run{}; run.b = &b; run.batch = &batch;
             hyv3_bf16::step(&run, &batch);
+            CHECK(lint_step(b, {&run}).empty());
+        }
+    }
+}
+
+TEST(hyv3_decode_fuses_qk_norm_rope_and_store_with_unfused_fallbacks) {
+    for (int form = 0; form < 3; ++form) {
+        RadModelMeta meta = hyv3_fp8_test_meta();
+        RadBuildCtx ctx = build_ctx();
+        RadBuilder b;
+        if (form == 1) b.refuse.insert("qkv_norm_rope_kv_store");
+        if (form == 2) ctx.kv_dtype = RAD_F8E4M3;
+        CHECK_OK(hyv3_fp8::declare(&b, &meta, &ctx));
+        const auto& a = hyv3_fp8::models[0].layers[0].attn;
+        CHECK_EQ(a.op_qkr_store != 0, form == 0);
+        for (const int rows : {1, 64, 65}) {
+            RadBatch batch = decode_batch();
+            batch.n_tok = rows; batch.max_q_len = rows;
+            RadCtx run{}; run.b = &b; run.batch = &batch;
+            hyv3_fp8::step(&run, &batch);
+            auto issued = [&](rad_op h) {
+                return std::any_of(run.issues.begin(), run.issues.end(),
+                                   [&](const auto& i) { return i.op == h; });
+            };
+            const bool folded = form == 0 && rows <= 64;
+            CHECK_EQ(issued(a.op_qkr_store), folded);
+            CHECK_EQ(issued(a.op_q_norm), !folded);
+            CHECK_EQ(issued(a.op_k_norm), !folded);
+            CHECK_EQ(issued(a.op_rope_q), !folded);
+            CHECK_EQ(issued(a.op_rope_k), !folded);
+            CHECK_EQ(issued(a.op_kv_store), !folded);
             CHECK(lint_step(b, {&run}).empty());
         }
     }

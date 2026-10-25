@@ -54,6 +54,8 @@ struct AttnQKFP8 {
     rad_op op_q_norm = 0, op_k_norm = 0;
     rad_op op_k_descale = 0, op_v_descale = 0;
     rad_op op_rope_q = 0, op_rope_k = 0, op_attn = 0, op_kv_store = 0;
+    rad_op op_qkr_store = 0; /* Q/K norms, NeoX rotary and BF16 cache store, decode band */
+    int64_t qkr_rows = 0;
     rad_op op_ar = 0, op_add = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
@@ -151,6 +153,28 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                          RAD_NOWEIGHTS),
                      {w.k, w.v}, {});
 
+    /* The standalone chain stays available for prefill, scaled/multicomponent rotary, FP8 KV,
+     * and libraries without the fold. A 128-channel BF16 decode prologue is otherwise five tiny
+     * launches; the fused kernel preserves the BF16 norm rounding before the rotary. */
+    if (g.head_dim == 128 && !std::strcmp(g.dtype, "bf16") &&
+        !std::strcmp(g.kv_dtype, "bf16") &&
+        !g.rope_mc && g.yarn.factor == 0.0f &&
+        rad_op_declared(b, "qkv_norm_rope_kv_store")) {
+        qkr_rows = qk_fuse_rows(g);
+        op_qkr_store = RAD_OP(b, "qkv_norm_rope_kv_store",
+                         RAD_PARAMS(RAD_RANGE("M", 1, qkr_rows), RAD_INT("head_dim", g.head_dim),
+                                    RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
+                                    RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                    RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
+                                    RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
+                                    RAD_INT("v_norm", 0), RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                    RAD_STR("kv_dtype", g.kv_dtype)),
+                         RAD_WEIGHTS(w_q_norm, w_k_norm));
+        if (!op_qkr_store || !rad_op_resolved(b, op_qkr_store)) op_qkr_store = 0;
+        if (op_qkr_store)
+            op_qkr_store = rw(b, op_qkr_store, {w.q, w.k, w.v}, {w.q, w.k, w.v});
+    }
+
     RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), {src.o}, w.attn, w.h.x));
@@ -183,12 +207,18 @@ inline void AttnQKFP8::step(RadCtx* c, const RadBatch* batch) const {
     q.step(c, w.h, w.q, T);
     k.step(c, w.h, w.k, T);
     v.step(c, w.h, w.v, T);
-    RAD_ISSUE_N(c, op_q_norm, T * g.n_head, brows(w.q, T), RAD_W(w_q_norm), brows(w.q, T));
-    RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
-    RAD_ISSUE(c, op_rope_q, brows(w.q, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_kv_store, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
-              kv_cache(kv, layer));
+    if (op_qkr_store && T <= qkr_rows) {
+        RAD_ISSUE_N(c, op_qkr_store, T, brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                    rope_posmc(g, batch, T), RAD_W(w_q_norm), RAD_W(w_k_norm),
+                    praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    } else {
+        RAD_ISSUE_N(c, op_q_norm, T * g.n_head, brows(w.q, T), RAD_W(w_q_norm), brows(w.q, T));
+        RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
+        RAD_ISSUE(c, op_rope_q, brows(w.q, T), rope_posmc(g, batch, T));
+        RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
+        RAD_ISSUE(c, op_kv_store, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
+                  kv_cache(kv, layer));
+    }
     if (op_k_descale) {
         RAD_ISSUE_N(c, op_k_descale, batch->n_seq, brows(k_descale, batch->n_seq));
         RAD_ISSUE_N(c, op_v_descale, batch->n_seq, brows(v_descale, batch->n_seq));
