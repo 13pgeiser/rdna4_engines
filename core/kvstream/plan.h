@@ -80,7 +80,11 @@ struct KVStreamRing {
                                 * already asked for that much: the ring is not the operator's
                                 * number when this is set */
     int64_t floor_blocks = 0;  /* the shipped floor (kStreamFloorTokens) in blocks, or 0 when the
-                                * context is smaller than it: which of the two bound the raise */
+                                * context is smaller than it */
+    /* Which floor bound the raise: true when it was the decode-step union rather than the shipped
+     * floor. Both are applied in kvstream_ring_shape/kvstream_ring; this only tells the two
+     * startup lines which sentence to print. */
+    bool by_union = false;
     int64_t ctx_blocks  = 0;   /* max_seqs x ceil(ctx / block_size): the group's whole context */
     /* A ring that covers the context is not a streamed group. The pool then holds every block
      * with its own id, so the group keeps the base engine's path exactly: no mirror, no residency

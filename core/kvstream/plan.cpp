@@ -189,6 +189,8 @@ void kvstream_ring(const Config& cfg, int64_t ctx, int64_t block_size, int64_t s
     if (out->ring_blocks < ceiling) {
         out->ring_blocks   = ceiling < out->ctx_blocks ? ceiling : out->ctx_blocks;
         out->raised_blocks = out->ring_blocks;
+        /* The union above the floor, or above the flag: either way it is the union that bound. */
+        out->by_union      = true;
     }
 }
 
