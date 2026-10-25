@@ -962,6 +962,116 @@ extern "C" int r4d_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int oper
                  : r4d_rad_relayout_mxfp4(p, n_p, o, enc, sel, pl, n, dst, dst_bytes);
 }
 
+/* ---- M2XFP4: the M2 analogue of MXFP4 above, the paper's weight-side Sg-EM (arXiv 2601.19213
+ * §4.4.2). The quantiser's own scheme "m2xfp4", three TILED planes over the same 32-column groups:
+ *
+ *   codes  fp4_e2m1  [1 x 1]   element 2j in bits 0-3 of byte j -- radiance MXFP4's codes
+ *   scale  e8m0      [1 x 32]  per group, the adaptive bias already folded into the stored byte
+ *   meta   u8        [1 x 32]  one byte a group: subgroup s = columns [8s, 8s+8), bits [2s, 2s+2)
+ *
+ * The exact element is e2m1mag[c&7] . sign(c) . 2^(scale-127) . (1 + k_s/4). What the kernels read
+ * is the mxfp4 arrangement with the meta plane riding the stored weight's tail, in the scale
+ * plane's [K/32][N] order: codes in fragment order, then K/32 rows of N meta bytes, so both GEMM
+ * rows read it with the exponents' own geometry (r4d_gemm_m2xfp4a8_*.hip). b_ref stays each row's
+ * largest exponent byte, the same derivation a reader of the plane could compute -- and it is what
+ * bounds the fold: d >= 0 for every block, so the largest e4m3 a table cell holds is the x1.75
+ * magnitude 10.5 scaled by 2^-d, a normal at every d >= 0.
+ *
+ * Anything else is refused, a transform included: this kernel library decodes one scheme, and a
+ * weight whose meta plane said something else would decode to other numbers. */
+namespace {
+bool m2_planes(const RadEncoding* enc) {
+    if (!enc || !rad_enc_is(enc, "m2xfp4")) return false;
+    if (enc->transform[0] || enc->n_planes != 3) return false;
+    if (enc->plane[0].dtype != RAD_FP4E2M1 || enc->plane[0].block[0] != 1 ||
+        enc->plane[0].block[1] != 1)
+        return false;
+    const int s = rad_enc_find(enc, "scale"), m = rad_enc_find(enc, "meta");
+    if (s < 0 || m < 0) return false;
+    if (enc->plane[s].dtype != RAD_E8M0 || enc->plane[s].kind != RAD_PLANE_TILED ||
+        enc->plane[s].block[0] != 1 || enc->plane[s].block[1] != R4D_MXFP4_GROUP)
+        return false;
+    if (enc->plane[m].dtype != RAD_U8 || enc->plane[m].kind != RAD_PLANE_TILED ||
+        enc->plane[m].block[0] != 1 || enc->plane[m].block[1] != R4D_MXFP4_GROUP)
+        return false;
+    return true;
+}
+
+int m2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                  const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
+    if (!out || !pl) return RAD_E_INVAL;
+    WGeom g;
+    int rc = wgeom(p, n_p, R4D_MXFP4_GROUP, &g);
+    if (rc != RAD_OK) return rc;
+    if (g.group != R4D_MXFP4_GROUP || g.K % 16) return RAD_E_SHAPE;
+    if (!m2_planes(enc)) return RAD_E_DTYPE;
+    if (gout) *gout = g;
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    if (operand == Q_BSCALE || operand == Q_BREF) {
+        if (!selects(enc, sel, n, "scale") || !dims(pl[0], g.N, nblk)) return RAD_E_SHAPE;
+        if (operand == Q_BSCALE) fill(out, "r4d.mxfp4.e8m0", R4D_DT_E8M0, nblk, g.N, nblk * g.N);
+        else                     fill(out, "r4d.mxfp4.wref", R4D_DT_E8M0, g.N, 1, g.N);
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    /* The weight operand takes codes and meta: the codes go to fragment order, the meta to the
+     * stored blob's tail. */
+    if (!selects(enc, sel, n, "codes", "meta") || !dims(pl[0], g.N, g.K) ||
+        !dims(pl[1], g.N, nblk))
+        return RAD_E_SHAPE;
+    fill(out, "r4d.m2xfp4.frag.g32.meta", R4D_DT_M2XFP4_FRAG, g.N, g.K,
+         g.N * g.K / 2 + nblk * g.N);
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_m2xfp4(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, RadLayout* out) {
+    return m2_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
+}
+
+extern "C" int r4d_rad_relayout_m2xfp4(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                       int n, void* dst, int64_t dst_bytes) {
+    RadLayout L;
+    WGeom g;
+    const int rc = m2_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    std::memset(dst, 0, (size_t)dst_bytes);
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    uint8_t* d = (uint8_t*)dst;
+    if (operand == Q_BSCALE || operand == Q_BREF) {
+        const uint8_t* e = pdata(pl[0]);
+        for (long long nn = 0; nn < g.N; ++nn) {
+            uint8_t mx = 0;
+            for (long long b = 0; b < nblk; ++b) {
+                const uint8_t v = e[nn * nblk + b];
+                if (operand == Q_BSCALE) d[b * g.N + nn] = v;
+                if (v > mx) mx = v;
+            }
+            if (operand == Q_BREF) d[nn] = mx;
+        }
+        return RAD_OK;
+    }
+    /* Codes to fragment order (mx_slot, as r4d_rad_relayout_mxfp4), then the meta plane appended:
+     * canonical [N][K/32] read into stored [K/32][N]. */
+    const uint8_t* meta = pdata(pl[1]);
+    uint8_t* md = d + g.N * g.K / 2;
+    for (long long nn = 0; nn < g.N; ++nn) {
+        const uint8_t* row = pdata(pl[0]) + nn * (g.K / 2);
+        for (long long k = 0; k < g.K; ++k) {
+            const uint8_t code = (uint8_t)((row[k >> 1] >> (4 * (k & 1))) & 0xF);
+            const long long idx = mx_slot(g, nn, k);
+            if (k & 1) d[idx] = (uint8_t)((d[idx] & 0x0Fu) | (uint32_t)(code << 4));
+            else       d[idx] = (uint8_t)((d[idx] & 0xF0u) | code);
+        }
+        for (long long b = 0; b < nblk; ++b) md[b * g.N + nn] = meta[nn * nblk + b];
+    }
+    return RAD_OK;
+}
+
 /* ---- the MoE experts. The weight is staged through LDS, so it is not permuted: the int4 plane is
  * the canonical one with each dword's nibbles reordered for the expansion (byte b holds element b
  * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same

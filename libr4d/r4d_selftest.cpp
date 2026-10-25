@@ -4848,6 +4848,141 @@ static void mxfp4a8_m_invariant(const Plugin& pl, const char* row, int64_t N, in
 }
 
 
+/* The M2XFP4 rows (r4d_gemm_m2xfp4a8_*.hip): mxfp4a8_numeric's shape checks at the m2xfp4
+ * encoding -- a third plane of per-subgroup multipliers, whose every byte value is valid, drawn
+ * full range so k = 3 is in regular rotation, beside the bias-folded exponents. The bound is the
+ * mxfp4 row's plus the table's accepted k = 3 rounding: a quarter of the weights at up to 2^-4.4
+ * each is about 1.2% of a whole dot, so 4e-2 holds the same margin the 1e-2 does there. The
+ * relayout is exercised for real: the weight operand takes codes and meta, and the stored blob the
+ * launch reads is this hook's output. The output starts as NaN, as there. */
+static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
+                             int tn, bool ablk = false, std::vector<RadParam> extra = {}) {
+    if (!sel(row)) return;
+    char nm[160];
+    std::string ex;
+    for (const RadParam& p : extra) ex += std::string(" ") + p.key + "=" + std::to_string(p.ival);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld tn=%d%s%s", row, (long long)M,
+                  (long long)N, (long long)K, tn, ablk ? " ascale=row x 128" : "", ex.c_str());
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    const int64_t nblk = K / 32;
+
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "m2xfp4");
+    rad_enc_add_plane(&p.enc, "codes", RAD_FP4E2M1, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_E8M0, 1, 32);
+    rad_enc_add_plane(&p.enc, "meta", RAD_U8, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale"), im = p.find("meta");
+    if (ic < 0 || is < 0 || im < 0) { ok(nm, false, "encoding has no m2xfp4 planes"); return; }
+    /* codes and exponents as mxfp4_fill draws them (deep: exponents the fold's subnormal floor
+     * reaches), the meta full range so every multiplier and every subgroup phase appears */
+    mxfp4_fill(p, ic, is, N, K, 0x71u, true);
+    for (int64_t i = 0; i < (int64_t)p.data[(size_t)im].size(); ++i)
+        p.data[(size_t)im][(size_t)i] = (uint8_t)st_mix32((uint32_t)i ^ 0x4d2eu);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    const int rw = stored(r, lp, 2, p, { "codes", "meta" }, &wq);
+    const int rs = stored(r, lp, 3, p, { "scale" }, &ws);
+    const int rr = stored(r, lp, 6, p, { "scale" }, &wr);
+    if (rw != RAD_OK || rs != RAD_OK || rr != RAD_OK) {
+        ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs) + "/" +
+                      std::to_string(rr));
+        return;
+    }
+
+    const int64_t nkb = (K + 127) / 128, asc = ablk ? nkb : 1;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> av((size_t)(M * K)), as((size_t)(M * asc));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t c = 0; c < asc; ++c) {
+            const uint32_t h = st_mix32((uint32_t)(i * asc + c) ^ 0xa5u);
+            as[(size_t)(i * asc + c)] =
+                ablk ? ((i + c) % 11 == 5 ? 0.0f : 0.002f * (float)(1 + h % 97))
+                     : 0.0125f * (float)(1 + h % 5);
+        }
+        for (int64_t k = 0; k < K; ++k) {
+            const bool zero = ablk && as[(size_t)(i * asc + k / 128)] == 0.0f;
+            const float v = zero ? 0.0f : mxfp4_act(i, k, 0x3cu);
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, v);
+            av[(size_t)(i * K + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * K + k);
+        }
+    }
+    std::vector<uint16_t> hy((size_t)(M * N), 0x7fc0);    /* bf16 NaN */
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    void* d_y = dalloc(hy.size() * 2);
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_y, hy.data(), hy.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_F8E4M3, { M, K }),
+        ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+        T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+        T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
+    };
+    absent(ts[5]);
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                 PS("dtype", "m2xfp4") };
+    if (tn) ps.push_back(PI("tn", tn));
+    for (const RadParam& p : extra) ps.push_back(p);
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    if (r->scratch) {
+        const int64_t sb = r->scratch(&a);
+        if (sb > 0) {
+            a.scratch = dalloc((size_t)sb);
+            a.scratch_bytes = sb;
+            if (!a.scratch) { ok(nm, false, "hipMalloc failed"); return; }
+        }
+    }
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+        ok(nm, false, "rc=" + std::to_string(rc));
+        return;
+    }
+    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+
+    /* Every column for small N, an odd stride otherwise (as mxfp4a8_numeric), always including the
+     * last column. The exact decode: the e2m1 code, the subgroup's stored multiplier, and the
+     * folded exponent. */
+    const int64_t nstep = N > 96 ? (N / 96) | 1 : 1;
+    double num = 0, den = 0;
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const uint8_t meta = p.data[(size_t)im][(size_t)(n * nblk + k / 32)];
+                const int kk = (int)(((meta >> (2 * ((k % 32) / 8))) & 3));
+                const double w =
+                    (double)rad_load_f32(p.data[(size_t)ic].data(), RAD_FP4E2M1, n * K + k) *
+                    (1.0 + kk / 4.0) *
+                    (double)rad_load_f32(p.data[(size_t)is].data(), RAD_E8M0, n * nblk + k / 32);
+                acc += (double)av[(size_t)(i * K + k)] * w *
+                       (ablk ? (double)as[(size_t)(i * asc + k / 128)] : 1.0);
+            }
+            if (!ablk) acc *= (double)as[(size_t)i];
+            const double d = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
+            num += d * d;
+            den += acc * acc;
+        }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    char d[96];
+    std::snprintf(d, sizeof d, "rel_l2 %.3e", rel);
+    ok(nm, rel < 4e-2, d);
+}
+
 /* What givens_numeric runs: the sequential rotation to f16, or the dense rotation with either
  * quantiser. */
 enum class GvCase { Rotate, DenseFp8, DenseI8 };
@@ -28003,6 +28138,18 @@ static void device_phase(const Plugin& pl) {
                     mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 13, 272, 1152, 0, false,
                                     { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
                 }
+        /* The M2XFP4 rows: the decode band's rule and band edges, the tiled row at both widths and
+         * past the tn crossover, and both activation grids, at the three-plane encoding. */
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 8, 272, 640, 0, false);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 8, 272, 640, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 40, 400, 2560, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 128, 512, 2560, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 5, 1040, 576, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 96, 14336, 640, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 40, 272, 640, 2, false);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 400, 640, 4, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 2100, 512, 2560, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 272, 576, 2, true);
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);

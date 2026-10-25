@@ -149,6 +149,10 @@ set(R4D_UNITS
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
   "r4d_gemm_mxfp4a8_gemv|"
+  # M2XFP4 (arXiv 2601.19213 §4.4.2): the decode and tiled rows at the m2xfp4 encoding, one meta
+  # plane more. Same bands and fold as the OCP rows; the meta multipliers ride r4d_m2xfp4.h's table.
+  "r4d_gemm_m2xfp4a8_tiled|"
+  "r4d_gemm_m2xfp4a8_decode|"
   # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"

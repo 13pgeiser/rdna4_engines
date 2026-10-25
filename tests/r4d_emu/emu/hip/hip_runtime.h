@@ -169,7 +169,9 @@ inline void __threadfence() {}
 template <typename T> inline T emu_atomic_fetch_add(T* p, T v) { const T o = *p; *p = o + v; return o; }
 /* The device allocations a unit makes for itself (counter blocks): host memory here. */
 inline hipError_t hipMalloc(void** p, size_t n) { *p = std::calloc(n ? n : 1, 1); return *p ? 0 : 2; }
+inline hipError_t hipMemset(void* p, int v, size_t n) { std::memset(p, v, n); return 0; }
 inline hipError_t hipMemsetAsync(void* p, int v, size_t n, hipStream_t) { std::memset(p, v, n); return 0; }
+inline hipError_t hipFree(void* p) { std::free(p); return 0; }
 
 struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };

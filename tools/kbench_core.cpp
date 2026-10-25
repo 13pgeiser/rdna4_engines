@@ -60,6 +60,10 @@ const std::vector<TolRow> g_tol = {
      * gated GEMM also writes an E4M3 twin of its result, which a rounding difference in the GEMM
      * moves by whole code steps (see g_opd_tol). */
     { "gemm_nt_q_gated", "*",     3e-2 },
+    /* The m2xfp4 fold's k = 3 multipliers round the odd-mantissa magnitudes as r4d_m2xfp4.h
+     * documents, up to 2^-4.4 relative on a quarter of the weights; r4d_selftest holds these rows
+     * to the same 4e-2. */
+    { "gemm_nt_q",    "m2xfp4",   4e-2 },
     { "gemm_nt",      "bf16",     8e-3 },
     { "gemm_nt",      "f16",      4e-3 },
     { "gemm_nt",      "f32",      2e-5 },

@@ -466,6 +466,12 @@ int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
 int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs*, RadStream);
 int r4d_rad_gemm_mxfp4a8_gated(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_mxfp4a8_gated_scratch(const RadArgs*);
+/* M2XFP4 (the paper's weight-side Sg-EM): the same GEMM bands at the m2xfp4 encoding, one meta
+ * plane more (r4d_layout.cpp, m2xfp4). */
+int r4d_rad_gemm_m2xfp4a8_tiled(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_m2xfp4a8_tiled_scratch(const RadArgs*);
+int r4d_rad_gemm_m2xfp4a8_decode(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_m2xfp4a8_decode_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
@@ -676,6 +682,10 @@ int r4d_rad_layout_mxfp4_gated(const RadParam*, int, int, const RadEncoding*, co
                                const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4_gated(const RadParam*, int, int, const RadEncoding*, const int*,
                                  const RadTensor*, int, void*, int64_t);
+int r4d_rad_layout_m2xfp4(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_m2xfp4(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, void*, int64_t);
 int r4d_rad_layout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,

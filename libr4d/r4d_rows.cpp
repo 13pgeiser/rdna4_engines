@@ -5003,6 +5003,16 @@ static const RadConstraint cGemmMxfp4A8DecodeShortK[] = {
 static const RadConstraint cGemmMxfp4A8Tiled[] = {
     C_GE("M", 1), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
+/* The M2XFP4 rows (r4d_gemm_m2xfp4a8_*.hip): the same bands at the m2xfp4 encoding, whose dtype
+ * string alone separates them -- no skinny M2 row exists, so the decode row takes M <= 128
+ * (N <= 36864) and the tiled row the rest: MXDEC outranks TILED wherever both match, as for
+ * mxfp4a8. */
+static const RadConstraint cGemmM2xfp4A8Decode[] = {
+    C_LE("M", 128), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "m2xfp4"),
+};
+static const RadConstraint cGemmM2xfp4A8Tiled[] = {
+    C_GE("M", 1), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "m2xfp4"),
+};
 /* r4d_gemm_w8a8_tiled: the same kernel at radix 8. Its asym arm is not declared in r4d.h, so
  * `w8a8_asym` is absent from the dtype set. */
 static const RadConstraint cGemmW8A8Tiled[] = {
@@ -7830,6 +7840,42 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
   r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
+
+/* M2XFP4: the mxfp4a8 rows at the paper's weight-side Sg-EM (arXiv 2601.19213 §4.4.2) -- per 32 K
+ * one more byte of weight, four two-bit subgroup multipliers, folded into the same e4m3 staging
+ * bytes through r4d_m2xfp4.h's table. The bands, tunables (ks/bk/nt and tn resolve through the
+ * same cfg readers) and relayout contract are the OCP rows', with the meta plane in the stored
+ * weight's tail (r4d_layout.cpp, m2xfp4) and no skinny row: at these row counts the decode kernel
+ * covers the whole M <= 128 band, the tiled one prefill. */
+{ "gemm_m2xfp4a8_decode", "gemm_nt_q", "gemm",
+  "the M2XFP4 GEMM for the DECODE band: the mxfp4a8 decode kernel's split-K across workgroups with "
+  "a fused last-arriver reduction, the weight unpacked through LDS with its per-subgroup meta "
+  "multiplier, streaming weight loads",
+  "M <= 128; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent, and the [K/32][N] meta plane in the "
+  "stored weight's tail; the split partial in the op's scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K (bias "
+  "folded) and a two-bit multiplier per 8 K folded into the element against a per-row reference, "
+  "bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXDEC,
+  ROW(cGemmM2xfp4A8Decode), ROW(tGemmMxfp4Decode), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_m2xfp4a8_decode, r4d_rad_gemm_m2xfp4a8_decode_scratch,
+  r4d_rad_layout_m2xfp4, r4d_rad_relayout_m2xfp4 },
+
+{ "gemm_m2xfp4a8_tiled", "gemm_nt_q", "gemm",
+  "the M2XFP4 GEMM tiled for PREFILL row counts: the mxfp4a8 tiled kernel's 256-row block, the "
+  "activation re-tiled into the op's scratch, the weight with its meta multipliers unpacked once "
+  "per K slab into LDS",
+  "any M; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent, and the [K/32][N] meta plane in the "
+  "stored weight's tail; the re-tiled activation in the op's scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K (bias "
+  "folded) and a two-bit multiplier per 8 K folded into the element against a per-row reference, "
+  "bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_TILED,
+  ROW(cGemmM2xfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_m2xfp4a8_tiled, r4d_rad_gemm_m2xfp4a8_tiled_scratch,
+  r4d_rad_layout_m2xfp4, r4d_rad_relayout_m2xfp4 },
 
 /* Band read off the entry point's own rejection tests. */
 { "gemm_w4a8_prefill", "gemm_nt_q", "gemm",
