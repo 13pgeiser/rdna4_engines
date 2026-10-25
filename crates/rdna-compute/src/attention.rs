@@ -8098,7 +8098,9 @@ impl Gpu {
     /// used). Production ingress is the opt-in branch in the
     /// `AttnFlashAsym3FwhtBatchedMasked` dispatch arm; call this directly
     /// only from the throwaway oracle/bench harness.
-    /// `max_ctx_len` is max(positions)+1; the kernel never reads it
+    /// `max_ctx_len` is max(positions)+1 (up to [`GFX12_Q8_FA2_MAX_CTX`]; the body
+    /// walks KT64 tiles with 64-bit K/V row offsets and guards partial 8-row
+    /// query tiles, so any batch size is valid); the kernel never reads it
     /// (causal bounds come from `positions[]`); it exists only for profile
     /// byte attribution, mirroring the incumbent.
     #[allow(clippy::too_many_arguments)]
@@ -8144,11 +8146,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > GFX12_Q8_FA2_MAX_CTX {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx1201 requires 1 <= max_ctx_len <= {GFX12_Q8_FA2_MAX_CTX}, got {max_ctx_len}"
                 ),
             ));
         }
@@ -8186,6 +8188,205 @@ impl Gpu {
         // The pre-convert symbol is KMODE-distinct from the Q8 module's
         // (function cache is symbol-keyed).
         const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_gfx1201";
+        if !self.functions.contains_key(symbol) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(symbol, src, symbol)?;
+            self.ensure_kernel(symbol, src, PRECONVERT)?;
+        }
+        // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
+        // H24/D256 above), Gpu-owned, grows-never-shrinks.
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the Q8 FA2 launcher
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
+        // F4b: pre-convert (rotation fused) f32 Q -> f16 scratch on the same
+        // stream, then run the body against the scratch. Both via
+        // launch_maybe_blob so graph capture stays valid. The body blob ABI
+        // below drops the signs (q16 reuses the old f32 Q slot: same offset
+        // 0, same size); the signs travel only to the pre-convert launch.
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            signs1.buf.as_ptr(),
+            signs2.buf.as_ptr(),
+            batch_size,
+            1,
+        )?;
+        // U0: keep 65536 for `_fp8_` too. Ua: 32768 once e4m3 planes land.
+        let result = self.launch_maybe_blob(
+            symbol,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            65536, // Ua: 32768
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q16_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// gfx1201-only GQA-fused FA2 prefill for fwht4 K (research opt-in).
+    ///
+    /// Same contract as [`Self::attention_q8_0_fa2_gqa_gfx1201`] except K is
+    /// read as fwht4 records (`k_bytes_per_head = 132`, `k_bytes_per_pos =
+    /// 528`, head offset `kv_h * 132` — the
+    /// contract) and V stays Q8_0. F4b: the launcher pre-converts f32 `q`
+    /// into f16 scratch (`attention_fa2_q_preconvert_fwht4_gfx1201`, rotation
+    /// fused, same stream) and the body reads the scratch — `q` is never
+    /// mutated, so this launcher is replay-idempotent and capture-safe
+    /// (no recorder/capture gates; the dispatch ingress gates tree-verify
+    /// off only because FA2 has no tree path). `signs1`/`signs2`
+    /// are the 128-entry per-half FWHT sign tables (the same tensors the fwht4 K-write used) (same tensors the fwht4 K-write
+    /// used). Production ingress is the opt-in branch in the
+    /// `AttnFlashAsym4FwhtBatchedMasked` dispatch arm; call this directly
+    /// only from the throwaway oracle/bench harness.
+    /// `max_ctx_len` is max(positions)+1 (up to [`GFX12_Q8_FA2_MAX_CTX`]; the body
+    /// walks KT64 tiles with 64-bit K/V row offsets and guards partial 8-row
+    /// query tiles, so any batch size is valid); the kernel never reads it
+    /// (causal bounds come from `positions[]`); it exists only for profile
+    /// byte attribution, mirroring the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht4k_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > GFX12_Q8_FA2_MAX_CTX {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 requires 1 <= max_ctx_len <= {GFX12_Q8_FA2_MAX_CTX}, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if signs1.numel() < 128 || signs2.numel() < 128 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx1201 requires >=128-element sign tables, got \
+                     {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        // Stage b defines no fwht4 (KMODE=3) twin (§14.3): fwht4-K always
+        // runs this f16 body.
+        let symbol = "attention_q8_0_fa2_gqa_fwht4k_gfx1201";
+        let src = kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX1201_SRC;
+        // F4b: the body reads pre-rotated, pre-converted f16 Q from
+        // Gpu-owned scratch (same stream just below); the entry symbol and
+        // the pre-convert symbol both resolve out of this module's source.
+        // The pre-convert symbol is KMODE-distinct from the Q8 module's
+        // (function cache is symbol-keyed).
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht4_gfx1201";
         if !self.functions.contains_key(symbol) || !self.functions.contains_key(PRECONVERT) {
             self.ensure_kernel(symbol, src, symbol)?;
             self.ensure_kernel(symbol, src, PRECONVERT)?;
@@ -9119,6 +9320,199 @@ impl Gpu {
             &self.hip,
             "attention",
             "attention_q8_0_fa2_gqa_fwht3k_gfx11",
+            bytes,
+        );
+        // F4b: pre-convert (rotate + cast) f32 Q -> f16 scratch on the same
+        // stream, then run the body against the scratch. Both via
+        // launch_maybe_blob so graph capture stays valid. The body blob ABI
+        // is the shared Q8 pack (q16 reuses the old f32 Q slot: offset 0,
+        // same size); the signs travel only to the pre-convert launch.
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            signs1.buf.as_ptr(),
+            signs2.buf.as_ptr(),
+            batch_size,
+            1,
+        )?;
+        let result = self.launch_maybe_blob(
+            module,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+                    q16_arg, k_ptr, v_ptr, out_ptr, pos_ptr, nh, nkv, hd, bs, sc,
+                )
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx11 fwht4-K FA2 prefill (4-bit FWHT-rotated K, Q8_0 V): clone of
+    /// [`Self::attention_q8_0_fa2_gqa_fwht3k_gfx11`] on the KMODE=4 module.
+    /// `signs1`/`signs2` are the 128-element per-half FWHT sign tables the
+    /// fwht4 K-write uses (>=128 elements validated).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht4k_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 requires a gfx11 arch, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        // F2 production envelope: exact gfx1151 allows N1024 on the direct
+        // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
+        // pair path reaches this kernel through the widened dispatch arm.
+        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
+        if batch_size == 0 || batch_size > max_fa2_batch {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
+                ),
+            ));
+        }
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if signs1.numel() < 128 || signs2.numel() < 128 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht4k_gfx11 requires >=128-element sign tables, got \
+                     {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        let module = "attention_q8_0_fa2_gqa_fwht4k_gfx11";
+        // KT32 pinned (see the Q8 launcher): KT64 path removed.
+        // F4b: the body takes pre-rotated + pre-converted f16 Q (same kernarg
+        // list as the Q8 entry — no signs); the rotation moved to the
+        // fwht4 pre-convert symbol, resolved out of this module's (KMODE=4)
+        // source. The symbol MUST differ from the Q8 pre-convert symbol: the
+        // function cache is keyed by symbol, and the Q8 module's KMODE=0
+        // build compiles the rotation out.
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht4_gfx11";
+        if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC
+            );
+            self.ensure_kernel(module, &src, module)?;
+            self.ensure_kernel(module, &src, PRECONVERT)?;
+        }
+        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the Q8 FA2 launcher
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_fa2_gqa_fwht4k_gfx11",
             bytes,
         );
         // F4b: pre-convert (rotate + cast) f32 Q -> f16 scratch on the same
