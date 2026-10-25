@@ -426,6 +426,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_IMAGE_DECODE` | VL image JPEG decode path: `cpu` (default) / `vcn` / `auto` | Env-compat for config `image.decode`; read via process snapshot in `hipfire-arch-qwen35-vl`. The standard daemon build compiles the `vcn-jpeg` path in (default feature). Runtime default remains `cpu`, which never enters the VCN prepass. `vcn` and `auto` attempt shared VCN JPEG decode and fall back to CPU for unsupported inputs, platforms where VCN is unavailable, or recoverable decode failure. A failed terminal GPU completion fails closed by quarantining the shared VA session, emitting a request error, and exiting the daemon nonzero (restart required) instead of unsafe same-device CPU fallback. When VCN runs, pooled decode surfaces stay leased until GPU preprocessing completes; the learned vision tower is unchanged. |
 | `HIPFIRE_VL_FILE` | explicit `.vl` tower file for the multi-slot engine | Checked before the `<stem>.vl` sibling probe in `hipfire-runtime` `sidecar::resolve_vl_sidecar`; a set-but-missing path is reported, not silently ignored. |
 | `HIPFIRE_VIT_ATTN` | `auto\|wmma\|qtiled\|naive` (default `auto`) selects the ViT attention kernel | `auto`: WMMA flash kernel (`vit_attention_wmma_f16`, head_dim <= 80 padded to 80) on wave32-WMMA arches (gfx11/gfx12), else the scalar Q-tiled kernel for head_dim <= 128, else naive. `wmma` errors if the arch lacks WMMA or head_dim > 80; `qtiled` and `naive` force those kernels for rollback/A-B. |
+| `HIPFIRE_VIT_GEMM` | `auto` (default) / `mb8` | Selects the ViT tower linear GEMM in `hipfire-arch-qwen35-vl`. `auto` runs the LDS-tiled WMMA GEMM (X cast to F16, F32 accumulate: the same rounding mb8 applies inside its kernel, bit-identical on the gfx1201 tower shapes) on gfx1201 and gfx11 wave32-WMMA arches for `out_dim >= 256`, with fc2 (K = 4304) stored zero-padded to K = 4352 at load. `mb8` keeps the register-blocked `gemm_f16_wmma_mb8` + `bias_add_f32` path (packed weights, no LDS staging) as rollback/A-B. Read once per process; set before loading the tower since it decides the fc2 weight layout. |
 
 ### Graph / MMQ / prefill
 
@@ -2591,6 +2592,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_VISION_MODE` | crates/hipfire-arch-embeddinggemma2/src/carrier.rs, crates/hipfire-arch-embeddinggemma2/src/slot_engine.rs | stable |
 | `HIPFIRE_VISION_SIDECAR` | crates/hipfire-arch-embeddinggemma2/src/carrier.rs, crates/hipfire-cli/src/fit/mod.rs | developer |
 | `HIPFIRE_VIT_ATTN` | crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs | developer |
+| `HIPFIRE_VIT_GEMM` | crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs | developer |
 | `HIPFIRE_VLLM_CHECKOUT` | crates/hipfire-arch-qwen4/reference_oracle/upstream.py | harness |
 | `HIPFIRE_VL_DUMP_DIR` | crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs, crates/saddle-lab/examples/infer.rs | developer |
 | `HIPFIRE_VL_FILE` | crates/hipfire-arch-embeddinggemma2/examples/vision_parity.rs, crates/hipfire-arch-embeddinggemma2/src/carrier.rs | developer |

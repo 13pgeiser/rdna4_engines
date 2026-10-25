@@ -17,7 +17,7 @@
 //! * One warm-up `vision_forward` (kernel JIT), then `--reps` (default 3) timed
 //!   runs. `DIR/post_merger.bin` (F32 `[n/4, out_hidden]`) comes from the last
 //!   run; `DIR/receipt.json` records sha256 of the model, grid, per-rep ms,
-//!   median ms, arch and the `HIPFIRE_VIT_ATTN` selector.
+//!   median ms, arch and the `HIPFIRE_VIT_ATTN` / `HIPFIRE_VIT_GEMM` selectors.
 //! * `--stages 1` additionally produces the per-block stage dumps
 //!   (`HIPFIRE_VL_DUMP_DIR`) in DIR. The dump directory is latched in the
 //!   process config snapshot at first use, so enabling it for only one
@@ -271,6 +271,7 @@ fn main() -> Res<()> {
         "median_ms": median,
         "stages": stages,
         "HIPFIRE_VIT_ATTN": selector("HIPFIRE_VIT_ATTN"),
+        "HIPFIRE_VIT_GEMM": selector("HIPFIRE_VIT_GEMM"),
     });
     fs::write(
         out.join("receipt.json"),

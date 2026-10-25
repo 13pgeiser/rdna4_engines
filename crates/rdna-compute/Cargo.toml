@@ -1153,3 +1153,7 @@ required-features = ["lab"]
 [[example]]
 name = "gate_up_tiles_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_gemm_shapes"
+required-features = ["lab"]
