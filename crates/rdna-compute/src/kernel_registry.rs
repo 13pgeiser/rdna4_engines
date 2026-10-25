@@ -1796,6 +1796,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
             ["qwen4_hc_down_fused_gfx1151"]
         );
+        // Qwen4 HC read up+mix, persistent W-stationary (HIPFIRE_QWEN4_HC_UP_V2;
+        // tensor_ops.rs hyper_read_up_wmma_launch).
+        add!(
+            "hyper_read_up_wmma_gfx1151_v2",
+            crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
+            ["hyper_read_up_wmma_bf16_gfx1151_v2"]
+        );
         // QSA gathered F16 WMMA attention (`tensor_ops::qsa_gathered_wmma_launch_with`
         // and the QSA F16 arena producer): the route is gfx1151-only for F32/Q8
         // K/V (`qsa_gathered_wmma_enabled`); the Q8 converter stays HIP even when
@@ -3097,11 +3104,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen4_hc_down_fused",
             kernels::QWEN4_HC_DOWN_FUSED_SRC,
             ["qwen4_hc_down_fused_b64_k32"]
-        );
-        add!(
-            "hyper_read_up_wmma_gfx1151_v2",
-            crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
-            ["hyper_read_up_wmma_bf16_gfx1151_v2"]
         );
         add!(
             "hyper_read_up_wmma_gfx1201",
