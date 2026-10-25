@@ -682,6 +682,46 @@ TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
     CHECK(g.tokens == want);
 }
 
+/* A last frame ALONE is presented as <Picture 1>: the ordinal counts the images the request
+ * carries, not the keyframe's role -- the reference numbers its presentation by presence, and so
+ * does ref2va's own photo numbering. fl2va (both ends) keeps first = 1, last = 2. */
+TEST(l2va_presents_its_sole_frame_as_picture_1) {
+    FakeMultimodal mm;
+    mm.expand = { 900, 901 };
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "l2va" },
+               FormPart{ "last_frame", "l.png", "image/png", "PL" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    REQUIRE_EQ(gen.last().refs.size(), (size_t)1);
+    CHECK_EQ((int)gen.last().refs[0].kind, (int)gen::VideoRefMedia::LAST_FRAME);
+    CHECK_EQ(gen.last().refs[0].index, 1);   /* the sole picture: <Picture 1>, not the role's 2 */
+    CHECK(mm.cenc_cover);                    /* it still takes the last frame's centre crop */
+    REQUIRE(gen.last().media != nullptr);
+    REQUIRE_EQ(gen.last().media->items.size(), (size_t)1);
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& s) { for (unsigned char c : s) want.push_back((int32_t)c); };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("fox");
+    CHECK(gen.last().tokens == want);
+}
+
 /* first_frame_mode=center: the FIRST anchor is cover-cropped to the canvas instead of stretched --
  * the no-distortion answer for a portrait photo pinned into a landscape output. The flag reaches
  * encoder_image_canvas on the first call; the last frame keeps its centre crop either way. */

@@ -335,10 +335,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 gen::VideoRefMedia m;
                 m.kind = p.name == "first_frame" ? gen::VideoRefMedia::FIRST_FRAME
                                                  : gen::VideoRefMedia::LAST_FRAME;
-                /* The keyframe's <Picture k> ordinal, so its vision-anchor block is labelled the way
-                 * the source workflow names it (first = <Picture 1>, last = <Picture 2>). A keyframe
-                 * request carries no reference media (checked below), so these numbers cannot collide
-                 * with a reference's own <Picture k>. */
+                /* The keyframe's <Picture k> ordinal, provisionally by role; the presence rule in
+                 * the count check below settles it once every part has parsed (parts may arrive in
+                 * either order). A keyframe request carries no reference media (checked there), so
+                 * these numbers cannot collide with a reference's own <Picture k>. */
                 m.index = m.kind == gen::VideoRefMedia::FIRST_FRAME ? 1 : 2;
                 m.name = p.name;
                 m.filename = p.filename;
@@ -502,6 +502,12 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (m.kind == gen::VideoRefMedia::FIRST_FRAME) ++n_first; else ++n_last;
         if (n_first > 1) return bad("first_frame", "at most one first_frame part");
         if (n_last > 1) return bad("last_frame", "at most one last_frame part");
+        /* The <Picture k> ordinal counts the images the request PRESENTS, not the keyframe's role:
+         * the reference numbers its presentation by presence (a last-frame-only request is its
+         * picture ONE), exactly as ref2va numbers reference photos 1..n. With both ends the roles
+         * and the positions agree, so fl2va keeps first = 1, last = 2. */
+        for (gen::VideoRefMedia& m : keys)
+            if (m.kind == gen::VideoRefMedia::LAST_FRAME) m.index = n_first ? 2 : 1;
         if (!keys.empty()) {
             if (!info.encodes)
                 return bad("first_frame", "this model has no video encoder, so it cannot pin a "
@@ -762,7 +768,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * always AFTER every reference: the driver lays the reference rows down first, then folds each
      * FIRST_FRAME/LAST_FRAME into the pack's keyframe table. Sort first before last (a client may send
      * the file parts in either order) so they keyframe-order 0 and 1, take image slots 1 and 2, and
-     * present as <Picture 1> then <Picture 2>. */
+     * present as <Picture 1> then <Picture 2> -- or <Picture 1> alone when only one end is given
+     * (the presence ordinal was settled by the count check). */
     std::stable_sort(keys.begin(), keys.end(), [](const gen::VideoRefMedia& a,
                                                   const gen::VideoRefMedia& b) {
         return a.kind < b.kind;   /* FIRST_FRAME (4) before LAST_FRAME (5) */

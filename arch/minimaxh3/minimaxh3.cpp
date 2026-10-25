@@ -122,7 +122,7 @@ enum { kMaxSteps = 64, kDefSteps = 50 };
 /* Time: 24 frames a second; a video of n chunks is 17 n + 5 frames over 5 n + 2 latent frames,
  * and a decode pass reads 7 latent frames from 5 c. 5 to 15 seconds: 7 to 20 chunks. */
 enum { kFps = 24, kFpc = 17, kFtail = 5, kLpc = 5, kLtail = 2, kDecLat = 7 };
-enum { kMinChunks = 4, kMaxChunks = 20, kDefChunks = 7 };  /* EXPERIMENT: short-chunk test */
+enum { kMinChunks = 7, kMaxChunks = 20, kDefChunks = 7 };
 /* Space: 16 pixels a latent, 2 x 2 latents a patch; sides multiples of 32 from 256, at most the
  * 1344 x 768 canvas's area, 4:1 at most. */
 enum { kScale = 16, kPatch = 2, kMult = 32, kMinSide = 256, kMaxAspect = 4 };
