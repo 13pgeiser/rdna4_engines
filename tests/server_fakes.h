@@ -405,6 +405,18 @@ struct FakeMultimodal : IMultimodal {
         *out = std::move(it);
         return RAD_OK;
     }
+    /* The keyframe path shows the tower the canvas frame itself, not the file: counted, with each
+     * frame's side, so a test can confirm the tower saw the very pixels the VAE was handed. */
+    int n_pframe = 0;
+    std::vector<std::pair<int32_t, int32_t>> pframe_wh;
+    int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string*) override {
+        ++n_pframe;
+        pframe_wh.emplace_back(f.w, f.h);
+        auto it = std::make_shared<mm::Item>();
+        it->expand = expand;
+        *out = std::move(it);
+        return RAD_OK;
+    }
     /* The video/audio VAE form, which the server fills only when a generator declares `encodes`.
      * Synthetic frames and a mono tone of a fixed length, each call counted, so a test can watch the
      * server decode each reference, spread the mono tone across the encoder's channels and hand it to

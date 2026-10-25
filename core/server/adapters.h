@@ -746,6 +746,18 @@ public:
         return rc;
     }
 
+    /* The frame arrives already decoded (a keyframe on the output canvas), so no decoder is
+     * needed -- only the tower the processor patchifies for. It smart-resizes internally, exactly
+     * as a prepared file would, but from the caller's pixels. */
+    int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out,
+                      std::string* why) override {
+        if (!accepts(MediaKind::Image)) {
+            if (why) *why = "this model's vision tower serves no pictures";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->image_from(f, out, why);
+    }
+
     int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
                       mm::Frame* out, std::string* why) override {
         if (!p_ || !mm::decoder_available()) {

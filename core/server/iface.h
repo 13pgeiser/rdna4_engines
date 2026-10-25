@@ -568,6 +568,19 @@ public:
     virtual int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                         std::shared_ptr<mm::Item>* out, std::string* why) = 0;
 
+    /* Process an ALREADY-DECODED frame for the language model's vision tower. The caller built the
+     * pixels itself -- a keyframe resized to the exact output canvas -- and the tower must see
+     * exactly those, not a fresh decode of the source file at its own size: the reference shows the
+     * tower the same resized tensor it hands the video VAE, so an anchor's identity and its pinned
+     * latent are the same pixels. A server whose tower can read host-built frames implements this;
+     * the rest leave it unsupported. */
+    virtual int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out,
+                              std::string* why) {
+        (void)f; (void)out;
+        if (why) *why = "this server cannot show a pre-decoded frame to the vision tower";
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* A picture in a video VAE's encoder-ready form: decoded under the same guard as prepare() and
      * resized so both sides are multiples of `ratio` and neither exceeds `max_side`. The video
      * generator's server uses it to fill a reference's encoder pixels; a server with no video VAE

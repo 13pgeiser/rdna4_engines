@@ -643,13 +643,16 @@ TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
                FormPart{ "last_frame", "l.png", "image/png", "PL" } };
     HttpResponse r = f->srv->router().dispatch(q);
     REQUIRE_EQ(r.status, 200);
-    /* Both anchors reach the vision tower as images (the anchor channel) ... */
-    REQUIRE_EQ(mm.got.size(), (size_t)2);
-    CHECK(mm.got[0].first == MediaKind::Image);
-    CHECK(mm.got[0].second == std::vector<uint8_t>({ 'P', 'F' }));
-    CHECK(mm.got[1].second == std::vector<uint8_t>({ 'P', 'L' }));
-    /* ... and are BOTH canvas-resized for the VAE pin (the second, independent channel). */
-    CHECK_EQ(mm.n_cenc, 2);
+    /* Both anchors reach the vision tower -- as the CANVAS frames, the same pixels the VAE is
+     * handed (the reference feeds the tower its resized tensor too), never the files re-decoded
+     * at their own size. So: no raw-file prepare for keyframes, two canvas frames of the output
+     * size, and the ONE decode per frame serving both channels. */
+    CHECK(mm.got.empty());
+    REQUIRE_EQ(mm.n_pframe, 2);
+    REQUIRE_EQ(mm.pframe_wh.size(), (size_t)2);
+    CHECK(mm.pframe_wh[0] == std::make_pair((int32_t)256, (int32_t)256));
+    CHECK(mm.pframe_wh[1] == std::make_pair((int32_t)256, (int32_t)256));
+    CHECK_EQ(mm.n_cenc, 2);                  /* one canvas-resize per frame, pin AND tower */
     CHECK_EQ(mm.n_ienc, 0);                 /* a keyframe is never snapped like a reference */
     CHECK_EQ(mm.cenc_w, 256);
     CHECK_EQ(mm.cenc_h, 256);
@@ -711,6 +714,8 @@ TEST(l2va_presents_its_sole_frame_as_picture_1) {
     CHECK_EQ((int)gen.last().refs[0].kind, (int)gen::VideoRefMedia::LAST_FRAME);
     CHECK_EQ(gen.last().refs[0].index, 1);   /* the sole picture: <Picture 1>, not the role's 2 */
     CHECK(mm.cenc_cover);                    /* it still takes the last frame's centre crop */
+    CHECK(mm.got.empty());                   /* the tower reads the canvas frame, not the file */
+    CHECK_EQ(mm.n_pframe, 1);
     REQUIRE(gen.last().media != nullptr);
     REQUIRE_EQ(gen.last().media->items.size(), (size_t)1);
     std::vector<int32_t> want;

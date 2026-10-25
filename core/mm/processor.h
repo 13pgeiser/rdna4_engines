@@ -368,7 +368,9 @@ public:
               std::string* why, int64_t max_pixels = 0, const ImageMode& mode = ImageMode{}) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
-    /* From an already-decoded picture or frame list; for tests. */
+    /* From an already-decoded picture or frame list: tests feed synthetic frames, and the video
+     * server feeds the canvas frame of a keyframe so the tower sees the very pixels the video VAE
+     * is handed (server/iface.h prepare_frame). The smart-resize and patch staging match image(). */
     int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
                    const ImageMode& mode = ImageMode{}) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;

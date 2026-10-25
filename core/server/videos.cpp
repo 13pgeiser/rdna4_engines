@@ -777,6 +777,44 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     r->refs.insert(r->refs.end(), keys.begin(), keys.end());
     const bool has_keys = !keys.empty();
 
+    /* A keyframe decodes ONCE, onto the output canvas, and both of its consumers take their share
+     * of that single frame: the VAE pin (enc_pixels, staged into the encode pass below) and the
+     * vision tower (prepare_frame, in the prompt block). The reference hands the tower the same
+     * resized tensor it hands the vae.encode — the same pixels, never a second decode of the
+     * source file at its own size — so the identity the tower reads is the identity that gets
+     * pinned. The count check already required a model that encodes, and a keyframe never shares a
+     * request with reference pictures, so this loop owns every FIRST/LAST_FRAME part's pixels.
+     * `canvas` parallels `r->refs`; a zero side marks "no canvas frame" (only when the server
+     * carries no media at all, where the tower sees nothing either). */
+    std::vector<mm::Frame> canvas;
+    if (has_keys && info.encodes && deps_.mm) {
+        canvas.resize(r->refs.size());
+        for (size_t i = 0; i < r->refs.size(); ++i) {
+            gen::VideoRefMedia& m = r->refs[i];
+            if (m.kind != gen::VideoRefMedia::FIRST_FRAME &&
+                m.kind != gen::VideoRefMedia::LAST_FRAME) continue;
+            /* Resized to the EXACT output canvas: the first a plain stretch ("disabled" -- the
+             * reference's own resize) unless the request asked first_frame_mode=center, the last
+             * always a centre crop ("center"). Its latent grid is then the target's, so the pack's
+             * pinned rows (frame_rows wide) match what the encoder writes into the image slot. */
+            mm::Frame fr;
+            std::string why;
+            if (deps_.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
+                                               (int32_t)W, (int32_t)H,
+                                               m.kind == gen::VideoRefMedia::LAST_FRAME
+                                                   || first_center,
+                                               &fr, &why) < 0)
+                return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
+            m.enc_frames = 1;
+            m.enc_h = fr.h;
+            m.enc_w = fr.w;
+            m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
+            for (size_t k = 0; k < m.enc_pixels.size(); ++k)
+                m.enc_pixels[k] = (float)fr.rgb[k];
+            canvas[i] = std::move(fr);
+        }
+    }
+
     /* ---- the prompt: the template's text with special tokens, the reference media in its
      * presentation order, the prompt last (docs/PORT-REF2VA.md §3: images, then videos each
      * after its soundtrack's label, then the standalone audios). Each `<Picture k>: ` label is
@@ -815,20 +853,33 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             mo.max_pixels = (int64_t)W * (int64_t)H;   /* `match`: scaled to the output's area */
             /* A reference image and an endpoint keyframe are both fed to the vision tower: the keyframe
              * gets a <Picture k> anchor block here (the soft tokens the reference also feeds) IN
-             * ADDITION to the VAE-latent pin it takes from `enc_pixels` below — the reference's own
-             * split (clip.tokenize + vae.encode). A reference picture and a keyframe never share a
-             * request, so `pics` holds one or the other. */
+             * ADDITION to the VAE-latent pin its canvas frame took from the pre-loop above — the
+             * reference's own split (clip.tokenize + vae.encode). The two channels of a keyframe are
+             * the SAME pixels: the tower reads the canvas frame itself (prepare_frame), never a second
+             * decode of the file at the match size `mo`. A reference picture and a keyframe never share
+             * a request, so `pics` holds one or the other. */
             auto anchor = [](const gen::VideoRefMedia& m) {
                 return m.kind == gen::VideoRefMedia::IMAGE ||
                        m.kind == gen::VideoRefMedia::FIRST_FRAME ||
                        m.kind == gen::VideoRefMedia::LAST_FRAME;
             };
-            for (const gen::VideoRefMedia& m : r->refs) {
+            auto keyframe = [](const gen::VideoRefMedia& m) {
+                return m.kind == gen::VideoRefMedia::FIRST_FRAME ||
+                       m.kind == gen::VideoRefMedia::LAST_FRAME;
+            };
+            for (size_t i = 0; i < r->refs.size(); ++i) {
+                const gen::VideoRefMedia& m = r->refs[i];
                 if (!anchor(m)) continue;
-                const std::vector<uint8_t> bytes(m.data.begin(), m.data.end());
                 std::shared_ptr<mm::Item> it;
                 std::string why;
-                if (deps_.mm->prepare(MediaKind::Image, bytes, mo, &it, &why) < 0 || !it)
+                int rc;
+                if (keyframe(m) && !canvas.empty() && canvas[i].w > 0)
+                    rc = deps_.mm->prepare_frame(canvas[i], &it, &why);
+                else {
+                    const std::vector<uint8_t> bytes(m.data.begin(), m.data.end());
+                    rc = deps_.mm->prepare(MediaKind::Image, bytes, mo, &it, &why);
+                }
+                if (rc < 0 || !it)
                     return bad(m.name.c_str(), "'" + m.name + "' could not be used: " + why);
                 pics.push_back(std::move(it));
             }
@@ -927,7 +978,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
 
     /* ---- the encoder's own view of every reference the VAEs consume: pictures and videos through
      * the video VAE (enc_pixels), soundtracks and standalone audios through the audio VAE
-     * (enc_samples). The text encoder saw the pictures above for identity; now each reference is
+     * (enc_samples); keyframes are absent, the canvas pre-loop already built their one frame. The
+     * text encoder saw the pictures above for identity; now each reference is
      * decoded to the encoder's own grid so the driver can stage it into a Vencode or Aencode pass.
      * These are the NATURAL decoded shapes — the driver's encode pass, which owns the encoder's
      * geometry, clip-pads a video's frames and zero-pads an audio's samples to what it reports. The
@@ -939,25 +991,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             const uint8_t* p = (const uint8_t*)m.data.data();
             const size_t   n = m.data.size();
             if (m.kind == gen::VideoRefMedia::FIRST_FRAME ||
-                m.kind == gen::VideoRefMedia::LAST_FRAME) {
-                /* A keyframe anchor resized to the EXACT output canvas: the first a plain stretch
-                 * ("disabled" -- the reference's own resize) unless the request asked
-                 * first_frame_mode=center, the last always a centre crop ("center"). Its latent
-                 * grid is then the target's, so the pack's pinned rows (frame_rows wide) match
-                 * what the encoder writes into the image slot. */
-                mm::Frame fr;
-                if (deps_.mm->encoder_image_canvas(p, n, (int32_t)W, (int32_t)H,
-                                                  m.kind == gen::VideoRefMedia::LAST_FRAME
-                                                      || first_center,
-                                                  &fr, &why) < 0)
-                    return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
-                m.enc_frames = 1;
-                m.enc_h = fr.h;
-                m.enc_w = fr.w;
-                m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
-                for (size_t i = 0; i < m.enc_pixels.size(); ++i)
-                    m.enc_pixels[i] = (float)fr.rgb[i];
-            } else if (m.kind == gen::VideoRefMedia::IMAGE) {
+                m.kind == gen::VideoRefMedia::LAST_FRAME)
+                continue;   /* the canvas pre-loop built its pixels — one decode, two consumers */
+            if (m.kind == gen::VideoRefMedia::IMAGE) {
                 mm::Frame fr;
                 if (deps_.mm->encoder_image(p, n, (int32_t)info.enc_ratio,
                                             (int32_t)info.max_enc_side, &fr, &why) < 0)
