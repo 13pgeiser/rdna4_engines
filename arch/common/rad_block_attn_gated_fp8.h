@@ -758,8 +758,23 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * `q_len` (rows = max_seqs * q_len_max * heads); more rows are refused as RAD_E_SCRATCH at
      * issue. Rows of q_len 1 up to the declared max_seqs always fit. */
     const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    /* A streamed group whose ring is *smaller than its id space* must never take the dense path:
+     * there a block id is not a pool address, so the attention would read ring slots as pages
+     * (fluent wrong output, not a fault). A stream whose ring covers the context is the ordinary
+     * resident plan -- ids and slots coincide, and the dense path is exactly right.
+     *
+     * Probe the stage -- a no-op unless this pass is staged -- because the choice cannot be made
+     * from the row shape alone: with speculation T = n_seq x (1 + n_spec), so `T == n_seq` is false
+     * and a context under qsa_exact_to would otherwise fall through to the dense branch
+     * (docs/KV-STREAMING.md §5.2: `T == n_seq` is about a *decode step*, not about every pass that
+     * carries more rows). */
+    const RadKVStream* st = kvb ? kvb->stream : nullptr;
+    const int64_t st_blocks = (st && st->block_bytes > 0) ? st->host_layer_stride / st->block_bytes : 0;
+    const bool ring_addressed = st && st->slots > 0 && st_blocks > 0 && st->slots < st_blocks;
+    const bool ring_bound = ring_addressed && !kv_stage_layer(c, kv, kvb, layer);
     const bool    sparse = qsa_sel && qsa_sequ &&
-                           (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
+                           (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
+                            reach > qsa_exact_to);
     const bool gated = sparse && op_attn_gq;
     /* Make this launch's rows resident and rewrite their `sel` entries before the attention reads
      * them. The store above must come first: a block this step writes may not be in the ring yet,
@@ -860,8 +875,19 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         /* Below qsa_exact_to the dense path reads a block id straight out of the block table and
          * never resolves. A staged pass addresses blocks by their id, so this layer must be staged
          * here too or a short prompt on a small ring would read slots out of an unstaged pool
-         * (docs/KV-STREAMING.md §3.5). A no-op for a group with no stage view. */
-        if (kvb && kvb->stream) (void)kv_stage_layer(c, kv, kvb, layer);
+         * (docs/KV-STREAMING.md §3.5). A no-op for a group with no stage view.
+         *
+         * A ring-bound pass has no such addressing: if we are here with a streamed group and no
+         * stage, there is no `sel` to resolve either, and issuing the dense attention would read
+         * ring slots as block ids. Fail the step by name rather than serve the result. */
+        if (ring_bound) {
+            rad_step_fail(c, "kv streaming: this pass is on the streamed group's ring, so a block "
+                             "id is not a pool address, but it has no selection to resolve into "
+                             "ring slots; the attention cannot read it. Report this: a decode pass "
+                             "wider than one row a sequence must reach `resolve_sel`");
+        } else if (kvb && kvb->stream) {
+            (void)kv_stage_layer(c, kv, kvb, layer);
+        }
         RAD_ISSUE_N(c, op_attn, batch->max_q_len,
                     brows(w.q, T), kv_cache(kv, layer),
                     praw2(table, RAD_I32, batch->n_seq,
