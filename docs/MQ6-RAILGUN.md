@@ -80,3 +80,62 @@ or kernargs. No-write, poison, wrong-binding and real device-corruption
 controls must be detected. Raw per-case program/plan/ABI identities and a
 summary are written to the requested directory. This is component correctness
 and retained-replay evidence; it does not measure model quality or speed.
+
+## Recorded validation (2026-10-25)
+
+Tested implementation: `5a197256c324d3c9571d97f2346ac60708803923`, based on
+beta `9cb35862c400286067b91ef6b5275c40fb571f4c`. The checkout was clean when
+the hardware binary was built and frozen. Hardware: gfx1151, PCI
+`0000:c5:00.0`, HIP 7.16; both machine GPU locks held.
+
+The oracle passed 40 shape/batch cases and 120 exact changing-input replays:
+38 single-node cases plus two two-node RAW-chain cases. The chain stayed in
+one PM4 segment with a planned WaitIdle + System RAW boundary; both the device
+intermediate and final output matched the independent HIP reference. Each of
+seven base fixtures detected no-write, one-word poison, wrong-X binding and
+actual device-output corruption controls. No mandatory oracle case was skipped.
+
+```json
+{
+  "status": "PASS",
+  "shape_width_cases": 40,
+  "exact_replays": 120,
+  "single_node_cases": 38,
+  "raw_chain_cases": 2,
+  "raw_chain_replays": 6,
+  "raw_chain_nodes": 2,
+  "raw_chain_segments": 1,
+  "raw_wait_idle_system": true,
+  "mandatory_skipped": 0,
+  "no_write_controls": 7,
+  "one_word_controls": 7,
+  "wrong_binding_controls": 7,
+  "device_corruption_controls": 7
+}
+```
+
+The frozen oracle binary SHA-256 was
+`a35ecc1233da4d7b35bcaf137bc8dccec90a75564406a75ce1933338d215b310`.
+The real bundle receipt SHA-256 was
+`c343fa457e16e95a9d76e144dcd31d25d81d66cd1a3b25a3ff3cedf36fa8c285`;
+both target kernels were A1 Proven and G8 pass. Source, process retirement,
+binary identity, certificate, full per-case program/plan/ABI reports and raw
+logs are retained on Nahida under
+`/home/husrcf/Code/hipfireQC/tmpOutput/hipfire-mq6-railgun-20261025/`.
+
+CPU checks: `cargo test --release --locked -p railgun --lib` passed 23 tests;
+the equivalent rdna-compute run passed 1,120 with 29 pre-existing ignored
+tests. The targeted lab example and certifier built successfully. The six
+required static checks (leanup ratchets, crate maps, scratch growth, released
+changelog, expectation ratchet diff and supply-chain bans/licenses/sources)
+passed, as did env-docs, lifecycle and named-file rustfmt checks.
+
+`cargo test --release --locked -p railgun-cert --lib` passed 5 tests and failed
+the tree inventory test. Its six missing sites are all in beta's existing
+Qwen4 decode-share code. The frozen parent certifier scanning a `git archive`
+of the exact beta base produced byte-identical errors to the candidate
+certifier scanning the candidate tree. The new explicit-MQ6 refusal site is
+inventoried; this PR does not repair the unrelated baseline omissions.
+
+These results cover the explicit component API. Automatic model capture,
+model quality and end-to-end performance have no result or claim here.
