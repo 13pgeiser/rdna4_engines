@@ -860,13 +860,17 @@ extern "C" int r4d_rad_vtile_plan(const RadArgs* a, RadStream s) {
     if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 ||
         r4d_numel(geom) < 3)
         return R4D_NO(RAD_E_SHAPE);
+    /* The tile count comes from y: the engine binds the ranged parameter to the band's bound,
+     * not to this call's rows (ref_common.h's `band_rows` rule), and r4d_rows_pitch already
+     * read y narrowed to them. The parameter is a ceiling only. */
     long long ry = 0;
     const long long yl = r4d_rows_pitch(y, 22, &ry);
-    if (yl < 0 || !r4d_contig(geom) || ry < M) return R4D_NO(RAD_E_STRIDE);
-    const int64_t total = (int64_t)M * 22;
+    if (yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
+    const int64_t total = ry * 22;
     hipLaunchKernelGGL(vtile_plan_kernel, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,
                        (const int*)geom->data, (int*)y->data, (int)tile, (int)overlap, (int)ratio,
-                       (int)yl, M, ry);
+                       (int)yl, ry, ry);
     return st_of(hipGetLastError());
 }
 
@@ -881,13 +885,16 @@ extern "C" int r4d_rad_vtile_crop(const RadArgs* a, RadStream s) {
         r4d_numel(geom) < 3)
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, ry = 0;
+    /* y's rows are the tiles' pixel rows this call cuts; the ranged `M` is the band's bound, a
+     * ceiling only (ref_common.h's `band_rows` rule). The kernel re-walks the tiles and stops at
+     * their sum, so rows past it -- when the band overshoots the cut -- write nothing. */
     const long long xl = r4d_rows_pitch(x, 3, &rx), yl = r4d_rows_pitch(y, 3, &ry);
     if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
-    if (ry < M) return R4D_NO(RAD_E_SHAPE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
 #define R4D_VTC(T)                                                                                \
-    hipLaunchKernelGGL((vtile_crop_kernel<T>), dim3(blocks_for(M)), dim3(kT), 0, (hipStream_t)s,  \
+    hipLaunchKernelGGL((vtile_crop_kernel<T>), dim3(blocks_for(ry)), dim3(kT), 0, (hipStream_t)s, \
                        (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
-                       (int)overlap, (int)ratio, (int)xl, (int)yl, M, rx, ry)
+                       (int)overlap, (int)ratio, (int)xl, (int)yl, ry, rx, ry)
     if (is_f32(x)) R4D_VTC(float);
     else           R4D_VTC(uint16_t);
 #undef R4D_VTC
@@ -904,13 +911,15 @@ extern "C" int r4d_rad_vtile_join(const RadArgs* a, RadStream s) {
     if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || r4d_numel(geom) < 3)
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, ry = 0;
+    /* The canvas is y: its rows are the join's threads. The ranged `M` is the band's bound, a
+     * ceiling only (ref_common.h's `band_rows` rule). */
     const long long xl = r4d_rows_pitch(x, n, &rx), yl = r4d_rows_pitch(y, n, &ry);
     if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
-    if (ry < M) return R4D_NO(RAD_E_SHAPE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
 #define R4D_VTJ(T)                                                                                \
-    hipLaunchKernelGGL((vtile_join_kernel<T>), dim3(blocks_for(M)), dim3(kT), 0, (hipStream_t)s,  \
+    hipLaunchKernelGGL((vtile_join_kernel<T>), dim3(blocks_for(ry)), dim3(kT), 0, (hipStream_t)s, \
                        (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
-                       (int)overlap, (int)n, (int)xl, (int)yl, M, rx, ry)
+                       (int)overlap, (int)n, (int)xl, (int)yl, ry, rx, ry)
     if (is_f32(x)) R4D_VTJ(float);
     else           R4D_VTJ(uint16_t);
 #undef R4D_VTJ

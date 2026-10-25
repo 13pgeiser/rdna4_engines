@@ -1564,14 +1564,18 @@ one latent plane. The encoder itself is the existing per-level ops, issued per t
 geometries; these three ops are the plan, the cut and the blend. Their axis split is vae.py's
 `split_tiles`, whose multi-tile branch is the decoder's rule above exactly but whose single-tile
 branch answers one tile `[0, L)` even when `tile > L` -- a lone short tile, which the decoder's
-exact-fit split refuses. MiniMax-H3: `tile` 16 latents, `overlap` 4, `ratio` 16.
+exact-fit split refuses. MiniMax-H3: `tile` 16 latents, `overlap` 4, `ratio` 16. An `M` written
+in a shape below is that operand's row count, which the kernels read from the operand; the ranged
+`M` argument is a ceiling only, as everywhere else -- the engine binds a ranged parameter to the
+band's bound, never to this call's rows.
 
 - `vtile_plan`: the plan for one frame of `geom` = `(clip, H, W)` pixels, split in latent units
   over the spatial axes and numbered row-major over (row band, column band). Row `t` of the i32
   `y [M, 22]`: the tile's first pixel `(y0, x0)` at [0] [1], its pixel extent `(th, tw)` at
   [2] [3] (`tile ratio`, save the lone short tile), and level `L`'s volume
   `(1, th / 2^min(L, 4), tw / 2^min(L, 4))` at `3 L + 4` for `L = 0..5` -- the encoder's five
-  levels and the deepest one's repeat, which shares it. `M` is the tile count.
+  levels and the deepest one's repeat, which shares it. The tile count is `y`'s row count, the
+  `M` argument a ceiling only.
 - `vtile_crop`: the frame's pixel plane `x [>= H W, 3]` (pixel `(Y, X)` at row `Y W + X`) cut into
   the plan's tiles: `y [M, 3]` holds the tiles' pixels tile-major, tile `t`'s `(th, tw)` rows in
   plane order at their offset in the sum; `M` is the tiles' pixel count. The tiles' union covers

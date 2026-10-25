@@ -7537,9 +7537,11 @@ void vtile_plan_cases(const Plugin& pl) {
         void* dy = dalloc((size_t)(M * 22) * 4);
         const std::string nm = fmt("vtile_plan %lld x %lld in %lld x %lld tiles", (long long)H,
                                    (long long)W, (long long)nh, (long long)nw);
+        /* M rides the band's bound (m.tiles), as the engine binds it -- never this call's tile
+         * count; the tile count comes from geom and y's rows. */
         const int rc = launch(r, { TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_I32, { M, 22 }) },
-                              { PI("M", M), PI("tile", 16), PI("overlap", 4), PI("ratio", 16) });
+                              { PI("M", 33), PI("tile", 16), PI("overlap", 4), PI("ratio", 16) });
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
         std::vector<int32_t> want((size_t)(M * 22));
         for (int64_t i = 0; i < nh; ++i)
@@ -7594,9 +7596,10 @@ void vtile_crop_cases(const Plugin& pl) {
             void* dy = dalloc((size_t)(M * 3) * (bf ? 2 : 4));
             const std::string nm = fmt("vtile_crop %lld x %lld %s tile %lld", (long long)H,
                                        (long long)W, bf ? "bf16" : "f32", (long long)tile);
+            /* M rides the band's bound, as the engine binds it; the cut's rows come from y. */
             const int rc = launch(r, { T(dx, dt, { H * W, 3 }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
                                        T(dy, dt, { M, 3 }) },
-                                  { PI("M", M), PI("tile", tile), PI("overlap", ov),
+                                  { PI("M", 33 * 256 * 256), PI("tile", tile), PI("overlap", ov),
                                     PI("ratio", ratio), PS("dtype", bf ? "bf16" : "f32") });
             if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
             std::vector<float> want((size_t)(M * 3));
@@ -7638,9 +7641,10 @@ void vtile_join_cases(const Plugin& pl) {
         void* dy = dalloc((size_t)(M * n) * 2);
         const std::string nm = fmt("vtile_join %lld x %lld bf16 tile %lld", (long long)H,
                                    (long long)W, (long long)tile);
+        /* M rides the band's bound, as the engine binds it; the canvas rows come from y. */
         const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_BF16, { M, n }) },
-                              { PI("M", M), PI("tile", tile), PI("overlap", ov), PI("n", n),
+                              { PI("M", 320 * 320), PI("tile", tile), PI("overlap", ov), PI("n", n),
                                 PS("dtype", "bf16") });
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
         /* The blends round to bf16 at every step, as the kernel's rdv does. */
@@ -7686,7 +7690,7 @@ void vtile_join_cases(const Plugin& pl) {
         const int rc = launch(r, { T(dx, RAD_F32, { 9 * tile * tile, n }),
                                    TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_F32, { H * W, n }) },
-                              { PI("M", H * W), PI("tile", tile), PI("overlap", ov), PI("n", n),
+                              { PI("M", 320 * 320), PI("tile", tile), PI("overlap", ov), PI("n", n),
                                 PS("dtype", "f32") });
         if (rc != RAD_OK) { ok("vtile_join 32 x 32 exact f32", false, "rc " + std::to_string(rc)); }
         else {

@@ -733,13 +733,14 @@ int ref_cond_aug(const RadArgs* a, RadStream) {
  *               encoder's five levels and the deepest one's repeat, which shares it (no
  *               downsampler between them), exactly venc_geom's level layout for one frame.
  *
- * M is the tile count; any other count is refused. */
+ * The tile count comes from `geom`: the engine binds a ranged parameter to its band's bound,
+ * not to this call, so `M` is a ceiling only (band_rows) and y must hold the tiles. */
 int ref_vtile_plan(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *geom = &a->t[0], *y = &a->t[1];
-    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
-    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
+    if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
     std::vector<int64_t> sy, sx, oy, ox;
@@ -748,7 +749,8 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
         !split_tiles_axis(W / ratio, tile, overlap, &sx, &ox))
         return RAD_E_SHAPE;
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
-    if (M != nh * nw || rows_of(y, 22) < M) return RAD_E_SHAPE;
+    const int64_t M = band_rows(nh * nw, band);
+    if (M <= 0 || rows_of(y, 22) < M) return RAD_E_SHAPE;
     REF_PAR_FOR(M)
     for (int64_t t = 0; t < M; ++t) {
         const int64_t i = t / nw, j = t % nw;
@@ -766,15 +768,16 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ vtile_crop */
 /* One frame's pixel plane cut into vtile_plan's tiles: x f32 [>= H W, 3] is the plane (pixel
  * (Y, X) at row Y W + X) of geom = (clip, H, W) in pixels; y f32 [M, 3] holds the tiles' pixels
- * tile-major, tile t's (th, tw) rows in plane order at their offset in the sum. M is the tiles'
- * pixel count, sum of th tw over the plan. Only the row the tile stands on is read; the tiles'
- * union covers the plane, but their sum may exceed it -- that is why y is its own buffer. */
+ * tile-major, tile t's (th, tw) rows in plane order at their offset in the sum. The cut's row
+ * count -- the sum of th tw over the plan -- comes from `geom`; `M` is a ceiling only
+ * (band_rows). Only the row the tile stands on is read; the tiles' union covers the plane, but
+ * their sum may exceed it -- that is why y is its own buffer. */
 int ref_vtile_crop(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
-    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
-    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
+    if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
     std::vector<int64_t> sy, sx, oy, ox;
@@ -791,7 +794,8 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
                 off[(size_t)(i * nw + j)] +
                 th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
     }
-    if (M != off.back() || rows_of(x, 3) < H * W || rows_of(y, 3) < M) return RAD_E_SHAPE;
+    const int64_t M = band_rows(off.back(), band);
+    if (M <= 0 || rows_of(x, 3) < H * W || rows_of(y, 3) < M) return RAD_E_SHAPE;
     REF_PAR_FOR(M * 3)
     for (int64_t r = 0; r < M; ++r) {
         const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), r) - off.begin()) - 1;
@@ -823,13 +827,14 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
  *
  * the first when i > 0 and ly < ev, the second when j > 0 and lx < eh. Only a lone tile is
  * short, and it has no neighbour, so a neighbour's extent along the blended axis is always
- * `tile`. */
+ * `tile`. The canvas' row count -- lat_h lat_w -- comes from `geom`; `M` is a ceiling only
+ * (band_rows). */
 int ref_vtile_join(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
-    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
     const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
-    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(geom) < 3)
+    if (tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
     std::vector<int64_t> sy, sx, oy, ox;
@@ -837,7 +842,7 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
         !split_tiles_axis(W, tile, overlap, &sx, &ox))
         return RAD_E_SHAPE;
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
-    if (M != H * W) return RAD_E_SHAPE;
+    const int64_t M = band_rows(H * W, band);
     std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
     for (int64_t i = 0; i < nh; ++i) {
         const int64_t th = std::min(tile, H - sy[(size_t)i]);
@@ -845,7 +850,7 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
             off[(size_t)(i * nw + j + 1)] =
                 off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
     }
-    if (rows_of(x, n) < off.back() || rows_of(y, n) < M) return RAD_E_SHAPE;
+    if (M <= 0 || rows_of(x, n) < off.back() || rows_of(y, n) < M) return RAD_E_SHAPE;
     /* The owner tile of every canvas row and column. */
     std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
     for (int64_t Y = 0, i = 0; Y < H; ++Y) {

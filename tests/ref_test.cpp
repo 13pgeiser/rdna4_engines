@@ -6949,6 +6949,16 @@ TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
     T g2(RAD_I32, {3}); g2.n({1, 100, 96});
     A d; d.t(g2).t(y1).i("M", 1).i("tile", 16).i("overlap", 4).i("ratio", 16);
     CHECK_EQ(run("vtile_plan", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound (m.tiles), never to this call: a ceiling above the
+     * tiles plans the same rows, and a y that cannot hold them is still refused. */
+    T yb(RAD_I32, {6, 22});
+    A f; f.t(geom).t(yb).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", f));
+    for (int64_t t = 0; t < 6; ++t) CHECK_EQ(yb.iat(t * 22 + 0), y0[t]);
+    T ys(RAD_I32, {5, 22});
+    A g; g.t(geom).t(ys).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", g), RAD_E_SHAPE);
 }
 
 /* A 20 x 20 px plane in ratio 4, tiles of 3 latents (12 px) with overlap 1: each axis splits at
@@ -7016,6 +7026,16 @@ TEST(vtile_crop_cuts_the_plane_tile_major) {
     T x2(RAD_F32, {399, 3});
     A d; d.t(x2).t(geom).t(y).i("M", 576).i("tile", 3).i("overlap", 1).i("ratio", 4);
     CHECK_EQ(run("vtile_crop", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound, never to this call: a ceiling above the cut copies
+     * the same rows, and a y that cannot hold the tiles is still refused. */
+    T yb(RAD_F32, {576, 3});
+    A f; f.t(x).t(geom).t(yb).i("M", 33 * 256 * 256).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", f));
+    CHECK_EQ(yb.at(575 * 3 + 2), (float)399);
+    T ys(RAD_F32, {575, 3});
+    A g; g.t(x).t(geom).t(ys).i("M", 33 * 256 * 256).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", g), RAD_E_SHAPE);
 }
 
 /* A 6 x 6 latent canvas, tiles of 4 with overlap 2: each axis splits at 0 and 2, the kept ranges
@@ -7089,6 +7109,18 @@ TEST(vtile_join_blends_raw_neighbours_down_then_across) {
     T x2(RAD_BF16, {63, 1});
     A d; d.t(x2).t(geom).t(y).i("M", 36).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
     CHECK_EQ(run("vtile_join", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound, never to this call: a ceiling above the canvas
+     * blends the same rows, and a y short of the canvas is still refused. */
+    T yb(RAD_BF16, {36, 1});
+    A f; f.t(x).t(geom).t(yb).i("M", 320 * 320).i("tile", 4).i("overlap", 2).i("n", 1)
+             .s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", f));
+    CHECK_EQ(yb.at(5 * 6 + 5), 32.0f);
+    T ys(RAD_BF16, {35, 1});
+    A g; g.t(x).t(geom).t(ys).i("M", 320 * 320).i("tile", 4).i("overlap", 2).i("n", 1)
+             .s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", g), RAD_E_SHAPE);
 }
 
 /* ================================================================== the latent upscaler
