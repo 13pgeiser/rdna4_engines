@@ -1452,6 +1452,9 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
 | `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
+| `vtile_plan` | `M`(range) `tile` `overlap` `ratio` | `geom` → `y` |
+| `vtile_crop` | `M`(range) `tile` `overlap` `ratio` `dtype` | `x`, `geom` → `y` |
+| `vtile_join` | `M`(range) `tile` `overlap` `n` `dtype` | `x`, `geom` → `y` |
 | `grid_pos3` | `M`(range) `T` `H` `W` `period` `scale`:f64 | → `y` |
 
 **The transformer.** `cu_seqlens` partitions the rows into entries as for `ln_mod`, and each row
@@ -1549,6 +1552,41 @@ written.
   component-major, at its own row pitch: a `[3, M]` view of a wider plane, which `qk_norm_rope`
   `axial` then reads as f32 positions. MiniMax-H3: `T` 7, `H` 16, `W` 16, `period` 1797,
   `scale` `2 pi`.
+
+**The tiled encoder** encodes a one-frame media bigger than the encoder's per-volume side the way
+vae.py's `tiled_encode` encodes it (`comfy/ldm/minimax/vae.py`): the pixel plane is cut into tiles,
+every tile goes through the whole encoder on its own, and the tiles' moments are blended back into
+one latent plane. The encoder itself is the existing per-level ops, issued per tile at the plan's
+geometries; these three ops are the plan, the cut and the blend. Their axis split is vae.py's
+`split_tiles`, whose multi-tile branch is the decoder's rule above exactly but whose single-tile
+branch answers one tile `[0, L)` even when `tile > L` -- a lone short tile, which the decoder's
+exact-fit split refuses. MiniMax-H3: `tile` 16 latents, `overlap` 4, `ratio` 16.
+
+- `vtile_plan`: the plan for one frame of `geom` = `(clip, H, W)` pixels, split in latent units
+  over the spatial axes and numbered row-major over (row band, column band). Row `t` of the i32
+  `y [M, 22]`: the tile's first pixel `(y0, x0)` at [0] [1], its pixel extent `(th, tw)` at
+  [2] [3] (`tile ratio`, save the lone short tile), and level `L`'s volume
+  `(1, th / 2^min(L, 4), tw / 2^min(L, 4))` at `3 L + 4` for `L = 0..5` -- the encoder's five
+  levels and the deepest one's repeat, which shares it. `M` is the tile count.
+- `vtile_crop`: the frame's pixel plane `x [>= H W, 3]` (pixel `(Y, X)` at row `Y W + X`) cut into
+  the plan's tiles: `y [M, 3]` holds the tiles' pixels tile-major, tile `t`'s `(th, tw)` rows in
+  plane order at their offset in the sum; `M` is the tiles' pixel count. The tiles' union covers
+  the plane but their sum may exceed it, so `y` is its own buffer.
+- `vtile_join`: the tiles' `n`-channel moments (`vtile_crop`'s row layout at latent extent)
+  blended into the canvas `y [M, n]` of `geom` = `(clip, lat_h, lat_w)` in latent units, `M`
+  `lat_h lat_w`. As in the stitch, canvas position `(Y, X)` belongs to the tile `(i, j)` whose
+  kept range holds it, `[start_i, start_{i+1})` (the last band to its end), at `(ly, lx)` within
+  it, `T(i, j, ly, lx)` that tile's stored value; but unlike the stitch the neighbours are **raw**
+  -- the encoder's output, never already blended -- and `rd`, `wa` and `wb` are as defined there,
+  rounding to `x`'s dtype:
+
+      V = rd(rd(T(i-1, j, ly + tile - ev, lx) wa(ly, ev)) + rd(T(i, j, ly, lx) wb(ly, ev)))
+          when i > 0 and ly < ev = ov_y[i-1], else T(i, j, ly, lx)
+      y[(Y, X)] = rd(rd(T(i, j-1, ly, lx + tile - eh) wa(lx, eh)) + rd(V wb(lx, eh)))
+          when j > 0 and lx < eh = ov_x[j-1], else V
+
+  Only a lone tile is short, and it has no neighbour, so a neighbour's extent along the blended
+  axis is always `tile`.
 
 ### Video sparse attention
 

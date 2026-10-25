@@ -63,6 +63,21 @@ bool split_tiles(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t
     return true;
 }
 
+/* The encoder's split over one axis -- vae.py's `split_tiles` (comfy/ldm/minimax/vae.py), whose
+ * multi-tile branch is `split_tiles`' exactly, but whose single-tile branch answers ([0], [len]):
+ * a tile at least as long as the axis is ONE tile over the whole axis, short if need be, where
+ * the decoder's split demands an exact fit. */
+bool split_tiles_axis(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t>* start,
+                      std::vector<int64_t>* ov) {
+    if (tile >= len) {
+        start->clear();
+        ov->clear();
+        start->push_back(0);
+        return len > 0 && tile > 0 && overlap >= 0 && overlap < tile;
+    }
+    return split_tiles(len, tile, overlap, start, ov);
+}
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ patch_unfold */
@@ -691,6 +706,181 @@ int ref_cond_aug(const RadArgs* a, RadStream) {
         for (int64_t c = 0; c < n; ++c) {
             const float z = rad_philox_normal_s(sd, (uint64_t)stream, (uint64_t)(k * n + c));
             stt(x, xb + c * xs, av * ldt(x, xb + c * xs) + omv * z);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ================================================================== the tiled encoder
+ * A one-frame media bigger than the encoder's per-volume side (a reference picture or an
+ * endpoint keyframe) is encoded the way vae.py's `tiled_encode` encodes it: the pixel plane is
+ * cut into `split_tiles_axis`' tiles, every tile goes through the whole encoder on its own, and
+ * the tiles' moments are blended back into one latent plane. The three ops below are the cut,
+ * the plan the cut and the per-tile volumes read, and the blend; the encoder itself is the
+ * existing per-level ops, issued per tile at the plan's geometries. `geom` is always the
+ * request's (clip, H, W) read off the device -- tile starts, extents and counts come from the
+ * split, never from the parameters, which are fixed at declare. */
+
+/* ------------------------------------------------------------------ vtile_plan */
+/* The plan one frame's encode runs over: `geom` = (clip, H, W) the frame's extent in pixels,
+ * split by split_tiles_axis over the spatial axes in latent units -- `tile` a side, `overlap`
+ * its minimum blend, `ratio` the VAE's pixels per latent -- and the tiles numbered row-major
+ * over (row band, column band). Row t of y (i32 [M, 22]):
+ *
+ *   [0] [1]     the tile's first pixel (y0, x0)
+ *   [2] [3]     the tile's pixel extent (th, tw): `tile` ratio, save the lone short tile
+ *   3 L + 4..6  level L's volume (1, th / 2^min(L, 4), tw / 2^min(L, 4)) for L = 0..5 -- the
+ *               encoder's five levels and the deepest one's repeat, which shares it (no
+ *               downsampler between them), exactly venc_geom's level layout for one frame.
+ *
+ * M is the tile count; any other count is refused. */
+int ref_vtile_plan(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *geom = &a->t[0], *y = &a->t[1];
+    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
+        !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W / ratio, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    if (M != nh * nw || rows_of(y, 22) < M) return RAD_E_SHAPE;
+    REF_PAR_FOR(M)
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t i = t / nw, j = t % nw;
+        const int64_t th = std::min(tile, H / ratio - sy[(size_t)i]) * ratio;
+        const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+        const int64_t yb = rowoff(y, t, 22), ys = laststride(y);
+        const int64_t v[22] = { sy[(size_t)i] * ratio, sx[(size_t)j] * ratio, th, tw,
+                                1, th, tw,   1, th / 2, tw / 2,   1, th / 4, tw / 4,
+                                1, th / 8, tw / 8,   1, th / 16, tw / 16,   1, th / 16, tw / 16 };
+        for (int64_t c = 0; c < 22; ++c) st_int(y->dtype, y->data, yb + c * ys, v[c]);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vtile_crop */
+/* One frame's pixel plane cut into vtile_plan's tiles: x f32 [>= H W, 3] is the plane (pixel
+ * (Y, X) at row Y W + X) of geom = (clip, H, W) in pixels; y f32 [M, 3] holds the tiles' pixels
+ * tile-major, tile t's (th, tw) rows in plane order at their offset in the sum. M is the tiles'
+ * pixel count, sum of th tw over the plan. Only the row the tile stands on is read; the tiles'
+ * union covers the plane, but their sum may exceed it -- that is why y is its own buffer. */
+int ref_vtile_crop(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
+    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
+        !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W / ratio, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
+    for (int64_t i = 0; i < nh; ++i) {
+        const int64_t th = std::min(tile, H / ratio - sy[(size_t)i]) * ratio;
+        for (int64_t j = 0; j < nw; ++j)
+            off[(size_t)(i * nw + j + 1)] =
+                off[(size_t)(i * nw + j)] +
+                th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+    }
+    if (M != off.back() || rows_of(x, 3) < H * W || rows_of(y, 3) < M) return RAD_E_SHAPE;
+    REF_PAR_FOR(M * 3)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), r) - off.begin()) - 1;
+        const int64_t i = t / nw, j = t % nw;
+        const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+        const int64_t k = r - off[(size_t)t];
+        const int64_t src = (sy[(size_t)i] * ratio + k / tw) * W + sx[(size_t)j] * ratio + k % tw;
+        const int64_t xb = rowoff(x, src, 3), yb = rowoff(y, r, 3), xs = laststride(x);
+        const int64_t ys = laststride(y);
+        for (int64_t c = 0; c < 3; ++c) stt(y, yb + c * ys, ldt(x, xb + c * xs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vtile_join */
+/* The per-tile moments blended back into one latent plane, vae.py's `tiled_encode` blend: x
+ * holds the tiles' n-channel moments tile-major (vtile_crop's row layout at latent extent),
+ * geom = (clip, lat_h, lat_w) in latent units, and y f32-or-bf16 [M, n] is the canvas, M
+ * lat_h lat_w. Canvas position (Y, X) belongs to the tile (i, j) whose kept range holds it,
+ * [start, next start) (the last band to the end), at (ly, lx) within it; T(i, j, ly, lx) is
+ * that tile's stored value. As in vae.py the neighbours are RAW (as the per-tile encoder left
+ * them, never already blended) and the top blend runs before the left one; every product and
+ * sum rounds to x's dtype (`rd`), as its bf16 blends round, with wa(p, e) = rd(1 - rd(p / e))
+ * and wb(p, e) = rd(p / e):
+ *
+ *   v = T(i, j, ly, lx)
+ *   v = rd(rd(T(i - 1, j, ly + tile - ev) * wa(ly, ev)) + rd(v * wb(ly, ev)))  ev = ov_y[i - 1]
+ *   v = rd(rd(T(i, j - 1, lx + tile - eh) * wa(lx, eh)) + rd(v * wb(lx, eh)))  eh = ov_x[j - 1]
+ *
+ * the first when i > 0 and ly < ev, the second when j > 0 and lx < eh. Only a lone tile is
+ * short, and it has no neighbour, so a neighbour's extent along the blended axis is always
+ * `tile`. */
+int ref_vtile_join(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
+    const int64_t M = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(geom) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || !split_tiles_axis(H, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    if (M != H * W) return RAD_E_SHAPE;
+    std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
+    for (int64_t i = 0; i < nh; ++i) {
+        const int64_t th = std::min(tile, H - sy[(size_t)i]);
+        for (int64_t j = 0; j < nw; ++j)
+            off[(size_t)(i * nw + j + 1)] =
+                off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
+    }
+    if (rows_of(x, n) < off.back() || rows_of(y, n) < M) return RAD_E_SHAPE;
+    /* The owner tile of every canvas row and column. */
+    std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
+    for (int64_t Y = 0, i = 0; Y < H; ++Y) {
+        while (i + 1 < nh && Y >= sy[(size_t)(i + 1)]) ++i;
+        own_y[(size_t)Y] = i;
+    }
+    for (int64_t X = 0, j = 0; X < W; ++X) {
+        while (j + 1 < nw && X >= sx[(size_t)(j + 1)]) ++j;
+        own_x[(size_t)X] = j;
+    }
+    const uint32_t dt = x->dtype;
+    auto rd = [dt](float v) { return round_dt(dt, v); };
+    auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
+    auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
+    auto T = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+        const int64_t row = off[(size_t)(i * nw + j)] + ly * std::min(tile, W - sx[(size_t)j]) + lx;
+        return ldt(x, rowoff(x, row, n) + c * laststride(x));
+    };
+    const int64_t ys = laststride(y);
+    REF_PAR_FOR(M * n)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t Y = r / W, X = r % W;
+        const int64_t i = own_y[(size_t)Y], j = own_x[(size_t)X];
+        const int64_t ly = Y - sy[(size_t)i], lx = X - sx[(size_t)j];
+        const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0, eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
+        const int64_t yb = rowoff(y, r, n);
+        for (int64_t c = 0; c < n; ++c) {
+            float v = T(i, j, ly, lx, c);
+            if (ly < ev)
+                v = rd(rd(T(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                       rd(v * wb(ly, ev)));
+            if (lx < eh)
+                v = rd(rd(T(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                       rd(v * wb(lx, eh)));
+            stt(y, yb + c * ys, v);
         }
     }
     return RAD_OK;

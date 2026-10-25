@@ -7493,6 +7493,234 @@ void vtile_stitch_cases(const Plugin& pl) {
     }
 }
 
+/* libref's split_tiles_axis: the ENCODER's split, vae.py's `split_tiles` -- like `split` above,
+ * but a single axis no longer than the tile is one short tile rather than a refusal. */
+bool split_axis(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t>* st,
+                std::vector<int64_t>* ov) {
+    if (len > 0 && tile >= len) {
+        st->clear();
+        ov->clear();
+        st->push_back(0);
+        return overlap >= 0 && overlap < tile;
+    }
+    return split(len, tile, overlap, st, ov);
+}
+
+/* The tiles' tile-major row offsets and per-band extents over a latent plane (libref's
+ * ref_vtile_join prefix sum; ref_vtile_crop's is the same with each extent ratio-squared). */
+void tile_offsets(const std::vector<int64_t>& sy, const std::vector<int64_t>& sx, int64_t H,
+                  int64_t W, int64_t tile, std::vector<int64_t>* off) {
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    off->assign((size_t)(nh * nw + 1), 0);
+    for (int64_t i = 0; i < nh; ++i) {
+        const int64_t th = std::min(tile, H - sy[(size_t)i]);
+        for (int64_t j = 0; j < nw; ++j)
+            (*off)[(size_t)(i * nw + j + 1)] =
+                (*off)[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
+    }
+}
+
+/* vtile_plan: real H3 canvases and their encoder tiling -- 640 x 320 (2 x 2 ... 6 full tiles),
+ * a 128 x 96 lone short tile, 96 x 768 (one short row band, four columns whose overlaps 6, 5, 5
+ * come out of the round-robin), and 320 x 560 (rows at 0, 4 with overlap 12, columns at 0, 9, 19
+ * with overlaps 7 and 6). */
+void vtile_plan_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vtile_plan");
+    if (!r) { ok("vtile_plan", false, "row absent"); return; }
+    const int64_t gs[][2] = { { 640, 320 }, { 128, 96 }, { 96, 768 }, { 320, 560 } };
+    for (const auto& g : gs) {
+        const int64_t H = g[0], W = g[1];
+        std::vector<int64_t> sy, sx, oy, ox;
+        split_axis(H / 16, 16, 4, &sy, &oy);
+        split_axis(W / 16, 16, 4, &sx, &ox);
+        const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size(), M = nh * nw;
+        void* dy = dalloc((size_t)(M * 22) * 4);
+        const std::string nm = fmt("vtile_plan %lld x %lld in %lld x %lld tiles", (long long)H,
+                                   (long long)W, (long long)nh, (long long)nw);
+        const int rc = launch(r, { TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+                                   T(dy, RAD_I32, { M, 22 }) },
+                              { PI("M", M), PI("tile", 16), PI("overlap", 4), PI("ratio", 16) });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<int32_t> want((size_t)(M * 22));
+        for (int64_t i = 0; i < nh; ++i)
+            for (int64_t j = 0; j < nw; ++j) {
+                const int64_t th = std::min((int64_t)16, H / 16 - sy[(size_t)i]) * 16;
+                const int64_t tw = std::min((int64_t)16, W / 16 - sx[(size_t)j]) * 16;
+                int32_t* w = want.data() + (size_t)(i * nw + j) * 22;
+                w[0] = (int32_t)(sy[(size_t)i] * 16);
+                w[1] = (int32_t)(sx[(size_t)j] * 16);
+                w[2] = (int32_t)th;
+                w[3] = (int32_t)tw;
+                for (int L = 0; L < 6; ++L) {
+                    const int64_t d = (int64_t)1 << std::min(L, 4);
+                    w[4 + 3 * L] = 1;
+                    w[5 + 3 * L] = (int32_t)(th / d);
+                    w[6 + 3 * L] = (int32_t)(tw / d);
+                }
+            }
+        const int64_t bad = differ(down_i32(dy, want.size()), want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld ints differ", (long long)bad));
+    }
+}
+
+/* vtile_crop: the plane cut tile-major over ratio-4 test shapes and the encoder's real ratio 16
+ * -- a 96 x 768 short-row plane (the overlap column cut twice) and 320 x 560 -- in f32 and bf16.
+ * The crop is a copy, so both dtypes compare bit for bit. */
+void vtile_crop_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vtile_crop");
+    if (!r) { ok("vtile_crop", false, "row absent"); return; }
+    const int64_t gs[][4] = { { 20, 20, 3, 1 }, { 8, 20, 3, 1 }, { 96, 768, 16, 4 },
+                              { 320, 560, 16, 4 } };
+    for (const auto& g : gs) {
+        const int64_t H = g[0], W = g[1], tile = g[2], ov = g[3];
+        const int64_t ratio = tile > 4 ? 16 : 4;
+        std::vector<int64_t> sy, sx, oy, ox, off;
+        split_axis(H / ratio, tile, ov, &sy, &oy);
+        split_axis(W / ratio, tile, ov, &sx, &ox);
+        const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+        off.assign((size_t)(nh * nw + 1), 0);  /* pixel counts: tile t covers th tw pixels */
+        for (int64_t i = 0; i < nh; ++i) {
+            const int64_t th = std::min(tile, H / ratio - sy[(size_t)i]) * ratio;
+            for (int64_t j = 0; j < nw; ++j)
+                off[(size_t)(i * nw + j + 1)] =
+                    off[(size_t)(i * nw + j)] +
+                    th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+        }
+        const int64_t M = off.back();
+        for (const bool bf : { false, true }) {
+            std::vector<float> x = randv((size_t)(H * W * 3), 2.0f);
+            void* dx = bf ? up_bf16(x) : up_f32(x);
+            const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+            void* dy = dalloc((size_t)(M * 3) * (bf ? 2 : 4));
+            const std::string nm = fmt("vtile_crop %lld x %lld %s tile %lld", (long long)H,
+                                       (long long)W, bf ? "bf16" : "f32", (long long)tile);
+            const int rc = launch(r, { T(dx, dt, { H * W, 3 }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+                                       T(dy, dt, { M, 3 }) },
+                                  { PI("M", M), PI("tile", tile), PI("overlap", ov),
+                                    PI("ratio", ratio), PS("dtype", bf ? "bf16" : "f32") });
+            if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+            std::vector<float> want((size_t)(M * 3));
+            for (int64_t rr = 0; rr < M; ++rr) {
+                int64_t t = 0;
+                while (t + 1 < (int64_t)off.size() && rr >= off[(size_t)(t + 1)]) ++t;
+                const int64_t k = rr - off[(size_t)t], i = t / nw, j = t % nw;
+                const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+                const int64_t src = (sy[(size_t)i] * ratio + k / tw) * W + sx[(size_t)j] * ratio + k % tw;
+                for (int64_t c = 0; c < 3; ++c)
+                    want[(size_t)(rr * 3 + c)] = x[(size_t)(src * 3 + c)];
+            }
+            const std::vector<float> got = bf ? down_bf16(dy, want.size()) : down_f32(dy, want.size());
+            const int64_t bad = differ(got, want);
+            ok((nm + " exact").c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+        }
+    }
+}
+
+/* vtile_join: the per-tile moments blended back, top then left, against RAW neighbours. bf16 over
+ * random values (the tile walks, the uneven 6 x 9 and 20 x 35 splits, a short lone row and a
+ * lone short tile), and one f32 geometry -- 32 x 32 in 3 x 3 tiles split at 0, 8, 16, where every
+ * weight is an eighth and every blend is exact to the last bit. */
+void vtile_join_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vtile_join");
+    if (!r) { ok("vtile_join", false, "row absent"); return; }
+    const int64_t gs[][5] = { { 6, 9, 4, 1, 5 }, { 3, 3, 4, 2, 1 }, { 1, 20, 16, 4, 3 },
+                              { 20, 35, 16, 4, 48 } };
+    for (const auto& g : gs) {
+        const int64_t H = g[0], W = g[1], tile = g[2], ov = g[3], n = g[4];
+        std::vector<int64_t> sy, sx, oy, ox, off;
+        split_axis(H, tile, ov, &sy, &oy);
+        split_axis(W, tile, ov, &sx, &ox);
+        const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+        tile_offsets(sy, sx, H, W, tile, &off);
+        const int64_t Sm = off.back(), M = H * W;
+        std::vector<float> x = randv((size_t)(Sm * n), 2.0f);
+        void* dx = up_bf16(x);
+        void* dy = dalloc((size_t)(M * n) * 2);
+        const std::string nm = fmt("vtile_join %lld x %lld bf16 tile %lld", (long long)H,
+                                   (long long)W, (long long)tile);
+        const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+                                   T(dy, RAD_BF16, { M, n }) },
+                              { PI("M", M), PI("tile", tile), PI("overlap", ov), PI("n", n),
+                                PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        /* The blends round to bf16 at every step, as the kernel's rdv does. */
+        auto rd = [](float v) { return bfr(v); };
+        auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
+        auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
+        auto Tv = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+            return x[(size_t)((off[(size_t)(i * nw + j)] +
+                               ly * std::min(tile, W - sx[(size_t)j]) + lx) * n + c)];
+        };
+        std::vector<float> want((size_t)(M * n));
+        for (int64_t rr = 0; rr < M; ++rr) {
+            const int64_t Y = rr / W, X = rr % W;
+            int64_t i = 0, j = 0;
+            while (i + 1 < nh && Y >= sy[(size_t)(i + 1)]) ++i;
+            while (j + 1 < nw && X >= sx[(size_t)(j + 1)]) ++j;
+            const int64_t ly = Y - sy[(size_t)i], lx = X - sx[(size_t)j];
+            const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0;
+            const int64_t eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
+            for (int64_t c = 0; c < n; ++c) {
+                float v = Tv(i, j, ly, lx, c);
+                if (ly < ev)
+                    v = rd(rd(Tv(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                           rd(v * wb(ly, ev)));
+                if (lx < eh)
+                    v = rd(rd(Tv(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                           rd(v * wb(lx, eh)));
+                want[(size_t)(rr * n + c)] = v;
+            }
+        }
+        const int64_t bad = differ(down_bf16(dy, want.size()), want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+    }
+    /* 32 x 32 in 3 x 3 tiles split at 0, 8, 16 (the slack of 8 round-robin makes both overlaps
+     * 8): every weight is an eighth and every blend of these integer values is exact to the
+     * last bit, so f32 device and host must agree bit for bit. */
+    {
+        const int64_t H = 32, W = 32, tile = 16, ov = 4, n = 3;
+        std::vector<float> x((size_t)(9 * tile * tile * n));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = (float)(i % 5 + 1);
+        void* dx = up_f32(x);
+        void* dy = dalloc((size_t)(H * W * n) * 4);
+        const int rc = launch(r, { T(dx, RAD_F32, { 9 * tile * tile, n }),
+                                   TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+                                   T(dy, RAD_F32, { H * W, n }) },
+                              { PI("M", H * W), PI("tile", tile), PI("overlap", ov), PI("n", n),
+                                PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok("vtile_join 32 x 32 exact f32", false, "rc " + std::to_string(rc)); }
+        else {
+            const int64_t st[3] = { 0, 8, 16 };
+            auto Tv = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+                return x[(size_t)(((i * 3 + j) * tile * tile + ly * tile + lx) * n + c)];
+            };
+            std::vector<float> want((size_t)(H * W * n));
+            for (int64_t Y = 0; Y < H; ++Y)
+                for (int64_t X = 0; X < W; ++X) {
+                    int64_t i = 0, j = 0;
+                    while (i + 1 < 3 && Y >= st[i + 1]) ++i;
+                    while (j + 1 < 3 && X >= st[j + 1]) ++j;
+                    const int64_t ly = Y - st[i], lx = X - st[j];
+                    const int64_t ev = i > 0 ? 8 : 0, eh = j > 0 ? 8 : 0;
+                    for (int64_t c = 0; c < n; ++c) {
+                        float v = Tv(i, j, ly, lx, c);
+                        if (ly < ev) {
+                            const float wa = 1.0f - (float)ly / 8.0f, wb = (float)ly / 8.0f;
+                            v = (Tv(i - 1, j, ly + 16 - 8, lx, c) * wa) + (v * wb);
+                        }
+                        if (lx < eh) {
+                            const float wa = 1.0f - (float)lx / 8.0f, wb = (float)lx / 8.0f;
+                            v = (Tv(i, j - 1, ly, lx + 16 - 8, c) * wa) + (v * wb);
+                        }
+                        want[(size_t)((Y * W + X) * n + c)] = v;
+                    }
+                }
+            const int64_t bad = differ(down_f32(dy, want.size()), want);
+            ok("vtile_join 32 x 32 exact f32", bad == 0, fmt("%lld values differ", (long long)bad));
+        }
+    }
+}
+
 
 /* rms_mod and rms_mod_quant_fp8 at the DiT's width over three segments, the table and the gate a
  * column slice of a wider row as the plugin reads them, gated and not. The residual is exact; the
@@ -27892,6 +28120,9 @@ static void device_phase(const Plugin& pl) {
     if (sel("patch_unfold_f32")) vid::patch_unfold_cases(pl);
     if (sel("vtile_gather")) vid::vtile_gather_cases(pl);
     if (sel("vtile_stitch")) vid::vtile_stitch_cases(pl);
+    if (sel("vtile_plan")) vid::vtile_plan_cases(pl);
+    if (sel("vtile_crop")) vid::vtile_crop_cases(pl);
+    if (sel("vtile_join")) vid::vtile_join_cases(pl);
     if (sel("rms_mod_bf16")) vid::rms_mod_cases(pl, false);
     if (sel("rms_mod_quant_fp8_bf16")) vid::rms_mod_cases(pl, true);
     if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);

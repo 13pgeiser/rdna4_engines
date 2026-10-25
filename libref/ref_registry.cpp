@@ -845,6 +845,17 @@ static const RadParamSpec pVtileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("o
                                              P_INT("keep"), P_INT("blend"), P_INT("period"),
                                              P_STR("mean"), P_STR("std") };
 static const RadOperandSpec oVtileStitch[] = { OPD("x"), OPD("geom"), INOUT("prev"), OUT("y") };
+/* The tiled encoder (ref_video.cpp): the plan, the cut and the blend. `geom` is the request's
+ * (clip, H, W); plan and crop take it in pixels, join in latent units. */
+static const RadParamSpec pVtilePlan[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio") };
+static const RadOperandSpec oVtilePlan[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileCrop[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oVtileCrop[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileJoin[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oVtileJoin[] = { OPD("x"), OPD("geom"), OUT("y") };
 /* `y` is [3, >= M], component-major at its own row pitch. */
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
@@ -1764,6 +1775,20 @@ static const RadOpSchema kSchemas[] = {
   "with `prev` unless the chunk is first, prev refilled from the chunk's tail (also emitted "
   "when it is last), then bytes round(255 clamp(v std + mean, 0, 1)); geom = (frames, H, W, "
   "first, last), u8 out." },
+{ "vtile_plan", ARR(pVtilePlan), ARR(oVtilePlan),
+  "the tiled encoder's plan for one frame of geom = (clip, H, W) pixels: split_tiles_axis over "
+  "the spatial axes in latent units (tile, overlap, pixels per latent ratio), tiles row-major; "
+  "row t of the i32 [M, 22] y is the tile's first pixel (y0, x0), its pixel extent (th, tw) and "
+  "level L's volume (1, th / 2^min(L, 4), tw / 2^min(L, 4)) for L = 0..5; M is the tile count." },
+{ "vtile_crop", ARR(pVtileCrop), ARR(oVtileCrop),
+  "one frame's pixel plane [>= H W, 3] (geom = (clip, H, W) pixels) cut into vtile_plan's tiles: "
+  "y [M, 3] the tiles' pixels tile-major, M the tiles' pixel count (sum of th tw)." },
+{ "vtile_join", ARR(pVtileJoin), ARR(oVtileJoin),
+  "the tiled encoder's per-tile moments (vtile_crop's row layout at latent extent) blended into "
+  "the canvas y [M, n], M = geom's (clip, lat_h, lat_w) lat_h lat_w: a canvas position's tile "
+  "kept range, blended with the tile above and then the tile to the left, both RAW (never "
+  "already blended), the products and sums rounding to x's dtype as the reference's bf16 blends "
+  "do." },
 { "grid_pos3", ARR(pGridPos3), ARR(oGridPos3),
   "a video decoder's rotary positions over tiles of `period` rows: token (t, i, j) of a tile's "
   "T x H x W gets f32(scale) * (2 (c + 0.5) / n - 1) on each axis, in f32 as torch makes it, "
@@ -2439,6 +2464,12 @@ SIMPLE("ref_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out 
 SIMPLE("ref_vtile_stitch", "vtile_stitch", "elem",
        "decoded tiles blended into frames, the chunk overlap, bytes out", DT_FLOAT,
        ref_vtile_stitch),
+SIMPLE("ref_vtile_plan", "vtile_plan", "elem", "the tiled encoder's per-tile geometry table",
+       DT_ANY, ref_vtile_plan),
+SIMPLE("ref_vtile_crop", "vtile_crop", "elem", "a frame's pixel plane cut into encode tiles",
+       DT_FLOAT, ref_vtile_crop),
+SIMPLE("ref_vtile_join", "vtile_join", "elem",
+       "per-tile encoder moments blended into the latent canvas", DT_FLOAT, ref_vtile_join),
 SIMPLE("ref_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions over its tiles",
        DT_FLOAT, ref_grid_pos3),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",

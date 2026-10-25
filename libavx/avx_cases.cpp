@@ -897,6 +897,22 @@ std::vector<Case> build_cases() {
     add("grid_pos3", { HI("M", 40), HI("T", 2), HI("H", 3), HI("W", 4), HI("period", 27),
                        HF("scale", 6.283185307179586) });
 
+    /* The tiled encoder over the shape functions' 20 x 20 latent plane: the encoder's tile 16
+     * with its 4 overlap (two tiles an axis), and a 3-overlap-1 split (ten tiles an axis, one of
+     * slack round-robin) that puts a live blend on every interior row and column. crop is drawn
+     * at ratio 1 -- the plane is 20 x 20 pixels, its tiles' sum 30 x 30 either way; join reads
+     * the moments' 30 x 30 rows into the 400-row canvas. */
+    add("vtile_plan", { HI("M", 4), HI("tile", 16), HI("overlap", 4), HI("ratio", 16) });
+    add("vtile_plan", { HI("M", 100), HI("tile", 3), HI("overlap", 1), HI("ratio", 1) });
+    add("vtile_crop", { HI("M", 1024), HI("tile", 16), HI("overlap", 4), HI("ratio", 1),
+                        HS("dtype", "f32") });
+    add("vtile_crop", { HI("M", 900), HI("tile", 3), HI("overlap", 1), HI("ratio", 1),
+                        HS("dtype", "bf16") });
+    add("vtile_join", { HI("M", 400), HI("tile", 16), HI("overlap", 4), HI("n", 48),
+                        HS("dtype", "bf16") });
+    add("vtile_join", { HI("M", 400), HI("tile", 3), HI("overlap", 1), HI("n", 5),
+                        HS("dtype", "f32") });
+
     /* The latent upscaler over libref's cube volumes (c x c x c, the largest M holds; every geom
      * entry c, so the resize is the identity here): the 3-D convolution at odd channel counts,
      * kernels 3 x 3 x 3 and 3 x 1 x 1, with the residual (a separate buffer), and at MiniMax-H3's

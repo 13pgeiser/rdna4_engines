@@ -2991,6 +2991,22 @@ static int64_t tile_count(int64_t len, int64_t tile, int64_t overlap) {
     return nt;
 }
 
+/* The encoder's split (ref_video.cpp split_tiles_axis) over one axis: the tile count and the
+ * tiles' extent sum along it, a lone tile short of `tile` if the axis is. -1 where the split
+ * refuses. The drawn encode planes are `axis_len` long, so the shape fns can size the tile
+ * operands exactly. */
+static int64_t axis_split(int64_t len, int64_t tile, int64_t overlap, int64_t* ext) {
+    if (len <= 0 || tile <= 0 || overlap < 0 || overlap >= tile) return -1;
+    if (tile >= len) {
+        *ext = len;
+        return 1;
+    }
+    const int64_t nt = tile_count(len, tile, overlap);
+    /* The extents telescope: sum of the tiles = len + sum of the overlaps = `tile` nt. */
+    *ext = tile * nt;
+    return nt;
+}
+
 /* A 2 x 2 x 2 grid of patches. */
 int ref_patch_unfold_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "C", 0);
@@ -3152,6 +3168,50 @@ int ref_cond_aug_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ 2 }, (int64_t)1 << 30, -1, 0);                  /* seed: two words */
     o.t((uint32_t)RAD_F32, { M, n });                         /* x, INOUT */
     return o.finish("cond_aug", operand, out);
+}
+
+/* ---- the tiled encoder. The drawn frame is 20 latent units a side; with the sweep's tile of
+ * 16 and overlap of 4 the split lays 2 x 2 full tiles over it, so the crops, the plan's level
+ * triples and the blends all draw non-trivial. The kernels size by the geom; these only draw a
+ * plane that one gives them. */
+int ref_vtile_plan_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), ratio = gi(p, n_p, "ratio", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || ratio <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ 3 }, 0, 20 * ratio, 0);                         /* geom: (_, H, W) pixels */
+    o.t((uint32_t)RAD_I32, { M, 22 });                        /* y: one row a tile */
+    return o.finish("vtile_plan", operand, out);
+}
+
+int ref_vtile_crop_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), ratio = gi(p, n_p, "ratio", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || ratio <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { 20 * ratio * (20 * ratio), 3 });                 /* x: the pixel plane */
+    o.t_idx({ 3 }, 0, 20 * ratio, 0);                         /* geom: (_, H, W) pixels */
+    o.t(D, { M, 3 });                                         /* y: the tiles' pixels */
+    return o.finish("vtile_crop", operand, out);
+}
+
+int ref_vtile_join_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), n = gi(p, n_p, "n", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { e * e, n });                                     /* x: the tiles' moments */
+    o.t_idx({ 3 }, 0, 20, 0);                                 /* geom: (_, lat_h, lat_w) */
+    o.t(D, { M, n });                                         /* y: the canvas */
+    return o.finish("vtile_join", operand, out);
 }
 
 /* ================================================================== video sparse attention

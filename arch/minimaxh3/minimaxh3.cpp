@@ -555,6 +555,13 @@ struct Model {
     std::string ve_pix_mul, ve_pix_add, ve_fold_mul, ve_fold_add;   /* pixel and latent norms */
     rad_buf b_epix32 = 0, b_epix = 0, b_eq48 = 0, b_eq2 = 0, b_egn = 0;
     rad_buf b_evc = 0;               /* [kEncSlotsV * kEncSlotRowsV, kPatchVals] f32 PERSIST */
+    /* The tiled encode of one-frame media too big for one volume (comfy/ldm/minimax/vae.py's
+     * `tiled_encode`, step_venc_tiled): `b_tplan` the per-tile geometry table (PERSIST: every
+     * tile's level geometries are read back off it through raw pointers, so it lives the whole
+     * pass, not the plan op), `b_vtile` the picture's pixels cut tile-major, `b_eqt` the
+     * quant_conv moments tile-major (its rows can exceed the canvas: overlaps are kept twice). */
+    rad_buf b_tplan = 0, b_vtile = 0, b_eqt = 0;
+    rad_op  op_vt_plan = 0, op_vt_crop = 0, op_vt_join = 0;
     /* A persistent f32 twin of the quant_conv output (b_eq2), written by a debug-only cast op so the
      * R4D_ENC stage readback can observe the RAW (pre-fold) encoder latent reliably. b_eq2 itself is
      * bf16 arena scratch whose readback lags the pass (the audio b_ax2 lesson); an f32 PERSIST copy is
@@ -2582,6 +2589,32 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.b_epix = decl_b(b, nm.f("venc.pix"), RAD_BF16, { Rmax, 3 });
     m.b_egn = decl_b(b, nm.f("venc.gn"), RAD_F32, { G * (2 + 3 * 1024) });
     const rad_buf st = m.b_egn;
+    /* The tiled encode's two scratch planes and the quant_conv, declared AHEAD of the trunk on
+     * purpose. The arena packs by declared lifetime (core/build/rad_bufplan.cpp), and the tiled
+     * pass runs the whole trunk once a tile: `b_vtile` holds every tile's pixels while the trunk
+     * buffers are rewritten tile after tile, and `b_eqt` holds the finished tiles' moments while
+     * the next tile's trunk runs. So both must overlap the trunk's every declared use, or the
+     * packer may place a trunk buffer right on top of them: `b_vtile`'s lifetime spans the first
+     * trunk op that reads it (op_ve_pix below, whose reads declare it) to op_vt_crop at the tail,
+     * `b_eqt`'s spans op_ve_q here to op_vt_join at the tail -- the trunk's whole op range sits
+     * inside both. The tiled ops themselves are therefore declared last. */
+    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.tiles, 22 }, RAD_BUF_PERSIST);
+    m.b_vtile = decl_b(b, nm.f("venc.vtile"), RAD_F32,
+                       { m.tiles * (int64_t)kEncMaxSide * kEncMaxSide, 3 });
+    m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 });
+    m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 });
+    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.tiles * (int64_t)kTile * kTile, 48 });
+    m.ve_qw = wh(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
+    m.ve_qb = wh(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
+    /* The whole-canvas pass writes b_eq2 (then the fold reads it); the tiled pass writes one
+     * tile's slice of b_eqt, and op_vt_join blends the whole tile-major plane into b_eq2. */
+    m.op_ve_q = rw(b, RAD_OP(b, "conv3d_ndhwc",
+                             RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("cin", 48),
+                                        RAD_INT("cout", 48), RAD_INT("k", 1), RAD_INT("kt", 1),
+                                        RAD_STR("dtype", "bf16")),
+                             RAD_WEIGHTS(m.ve_qw, m.ve_qb)),
+                   { m.b_eq48 }, { m.b_eq2, m.b_eqt });
+    if (!m.op_ve_q) return RAD_E_INVAL;
     m.op_ve_pix = rw(b, RAD_OP(b, "chan_affine",
                                RAD_PARAMS(RAD_RANGE("M", 1, Rmax), RAD_INT("n", 3),
                                           RAD_STR("mul", m.ve_pix_mul.c_str()),
@@ -2589,7 +2622,7 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("mode", "fma"), RAD_INT("round", 0),
                                           RAD_STR("dtype", "f32")),
                                RAD_NOWEIGHTS),
-                     {}, { m.b_epix32 });
+                     { m.b_vtile }, { m.b_epix32 });
     m.op_ve_pcast = rw(b, RAD_OP(b, "cast",
                                  RAD_PARAMS(RAD_RANGE("M", 1, Rmax), RAD_INT("n", 3),
                                             RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
@@ -2691,23 +2724,13 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.ve_now = wt(nm.f("venc.nout.weight"), nm.ckpt("vae.encoder.norm_out.weight"),
                   { (int64_t)dims[5] });
     m.ve_nob = wt(nm.f("venc.nout.bias"), nm.ckpt("vae.encoder.norm_out.bias"), { (int64_t)dims[5] });
-    m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 });
-    m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 });
     m.op_ve_nout = venc_gn(b, R[5], (int64_t)dims[5], G, eps, m.ve_now, m.ve_nob, m.v_lv[5].a,
                            m.v_lv[5].b, st);
     m.ve_coutw = wb(nm.f("venc.cout.weight"), nm.ckpt("vae.encoder.conv_out.weight"),
                     { 48, (int64_t)dims[5], 3, 3, 3 });
     m.ve_coutb = wt(nm.f("venc.cout.bias"), nm.ckpt("vae.encoder.conv_out.bias"), { 48 });
-    m.ve_qw = wh(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
-    m.ve_qb = wh(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
     m.op_ve_cout = venc_conv(b, R[5], (int64_t)dims[5], 48, 3, m.ve_coutw, m.ve_coutb,
                              m.v_lv[5].b, 0, m.b_eq48);
-    m.op_ve_q = rw(b, RAD_OP(b, "conv3d_ndhwc",
-                             RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("cin", 48),
-                                        RAD_INT("cout", 48), RAD_INT("k", 1), RAD_INT("kt", 1),
-                                        RAD_STR("dtype", "bf16")),
-                             RAD_WEIGHTS(m.ve_qw, m.ve_qb)),
-                   { m.b_eq48 }, { m.b_eq2 });
     m.b_evc = decl_b(b, nm.f("lane.evc"), RAD_F32,
                      { (int64_t)kEncSlotsV * kEncSlotRowsV, kPatchVals }, RAD_BUF_PERSIST);
     m.op_ve_fold = rw(b, RAD_OP(b, "patch_fold",
@@ -2794,6 +2817,29 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         if (!m.op_ve_ldbg[L]) return RAD_E_INVAL;
         m.ve_l_bytes[L] = (int64_t)PF[L] * (int64_t)dims[L] * 4;
     }
+    /* The tiled encode's three ops, declared LAST so their buffers' lifetimes (b_vtile from
+     * op_ve_pix's reads to op_vt_crop's write, b_eqt from op_ve_q's writes to op_vt_join's read)
+     * bracket the whole trunk above -- the tiled pass runs that trunk once a tile, so neither
+     * plane may share arena bytes with any of it. See step_venc_tiled. */
+    m.op_vt_plan = rw(b, RAD_OP(b, "vtile_plan",
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles), RAD_INT("tile", kTile),
+                                           RAD_INT("overlap", kOverlap),
+                                           RAD_INT("ratio", kVaeRatio)),
+                                RAD_NOWEIGHTS),
+                     {}, { m.b_tplan });
+    m.op_vt_crop = rw(b, RAD_OP(b, "vtile_crop",
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles * (int64_t)kEncMaxSide * kEncMaxSide),
+                                           RAD_INT("tile", kTile), RAD_INT("overlap", kOverlap),
+                                           RAD_INT("ratio", kVaeRatio), RAD_STR("dtype", "f32")),
+                                RAD_NOWEIGHTS),
+                     {}, { m.b_vtile });
+    m.op_vt_join = rw(b, RAD_OP(b, "vtile_join",
+                                RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("tile", kTile),
+                                           RAD_INT("overlap", kOverlap), RAD_INT("n", 48),
+                                           RAD_STR("dtype", "bf16")),
+                                RAD_NOWEIGHTS),
+                     { m.b_eqt }, { m.b_eq2 });
+    if (!m.op_vt_plan || !m.op_vt_crop || !m.op_vt_join) return RAD_E_INVAL;
     return RAD_OK;
 }
 
@@ -4285,6 +4331,112 @@ static bool venc_dbg_shadows() {
  * through the six levels to the 48-column moments, the first 24 quantised and folded into the
  * lane's `b_evc` at the media's slot. The volumes come from the same geometry the driver staged
  * — re-derived here, which is also the batch's validation. */
+/* The tiled encode of a one-frame media -- comfy/ldm/minimax/vae.py's `tiled_encode`. A picture
+ * wider than a tile's side cannot ride the level buffers as one volume, so the reference cuts it
+ * into overlapping tiles, encodes each tile alone, and blends every tile's RAW moments with its
+ * raw top and left neighbours -- top first, then left, never an already-blended neighbour --
+ * into the whole latent canvas. The three tiled ops above do exactly that: vtile_plan lays each
+ * tile's geometry rows the way vae.py splits, vtile_crop cuts the pixels tile-major, and
+ * vtile_join blends the tile-major moments into b_eq2. The loop here runs one tile through the
+ * plain trunk -- pixels in b_vtile, moments out to one slice of b_eqt, and the tile's own
+ * geometries read back off b_tplan through raw pointers, the same way every clip's geometries
+ * come off enc_geom_d. No debug shadows ride a tile: they shadow the whole canvas. The split is
+ * tile_starts' (diffusers' _split_tiles) with vae.py's one-tile answer -- an axis no longer than
+ * a tile is one tile, and the min() below lets that one tile be short. Returns the slot row one
+ * past this media's latents, like the clip loop below. */
+static int64_t step_venc_tiled(RadCtx* c, const RadVideoGenBatch* V, const Model& m,
+                               const int32_t* gd, int64_t H, int64_t W, int64_t ppc,
+                               const RadOperand st, int64_t row0) {
+    const int64_t lat_h = H / kVaeRatio, lat_w = W / kVaeRatio;
+    const std::vector<int64_t> ty = tile_starts(lat_h), tx = tile_starts(lat_w);
+    const int64_t nh = (int64_t)ty.size(), nw = (int64_t)tx.size(), nt = nh * nw;
+    if (nt > m.tiles) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass whose picture splits into more tiles than "
+                         "the encoder declares room for");
+        return row0;
+    }
+    /* The host mirror of vtile_plan: each tile's side in latents and its first row in each of
+     * the two tile-major planes. */
+    struct Tile { int64_t prow, mrow, ny, nx; };
+    std::vector<Tile> tl;
+    tl.reserve((size_t)nt);
+    int64_t spx = 0, smom = 0;
+    for (int64_t i = 0; i < nh; ++i)
+        for (int64_t j = 0; j < nw; ++j) {
+            const int64_t ny = std::min((int64_t)kTile, lat_h - ty[(size_t)i]),
+                          nx = std::min((int64_t)kTile, lat_w - tx[(size_t)j]);
+            tl.push_back({ spx, smom, ny, nx });
+            spx += ny * nx * (int64_t)kVaeRatio * kVaeRatio;
+            smom += ny * nx;
+        }
+    RAD_ISSUE_N(c, m.op_vt_plan, nt, praw(gd, RAD_I32, 3), brows(m.b_tplan, nt));
+    RAD_ISSUE_N(c, m.op_vt_crop, spx, praw2(V->enc_pixels, RAD_F32, H * W, 3),
+                praw(gd, RAD_I32, 3), brows(m.b_vtile, spx));
+    const int32_t* tp = static_cast<const int32_t*>(rad_buf_ptr(c, m.b_tplan));
+    for (size_t t = 0; t < tl.size(); ++t) {
+        const Tile& T = tl[t];
+        const int64_t th = T.ny * kVaeRatio, tw = T.nx * kVaeRatio;   /* the tile, in pixels */
+        const int64_t Rpix = th * tw, R5 = T.ny * T.nx;
+        int64_t R[6];
+        for (int L = 0; L < 6; ++L) {
+            const int64_t d = 1 << std::min(L, 4);   /* the level's spatial divisor */
+            R[L] = (th / d) * (tw / d);
+        }
+        /* The tile's plan row: its six {1, side, side} geometry entries, one frame deep. */
+        const int32_t* tr = tp + 22 * (int64_t)t;
+        const RadOperand gg[6] = { praw(tr + 4, RAD_I32, 3), praw(tr + 7, RAD_I32, 3),
+                                   praw(tr + 10, RAD_I32, 3), praw(tr + 13, RAD_I32, 3),
+                                   praw(tr + 16, RAD_I32, 3), praw(tr + 19, RAD_I32, 3) };
+        RAD_ISSUE_N(c, m.op_ve_pix, Rpix, brow_slice(m.b_vtile, T.prow, Rpix, 3),
+                    brows(m.b_epix32, Rpix));
+        RAD_ISSUE_N(c, m.op_ve_pcast, Rpix, brows(m.b_epix32, Rpix), brows(m.b_epix, Rpix));
+        RAD_ISSUE_N(c, m.op_ve_cin, Rpix, brows(m.b_epix, Rpix), RAD_W(m.ve_cinw),
+                    RAD_W(m.ve_cinb), gg[0], RAD_NONE, brows(m.v_lv[0].a, Rpix));
+        for (int L = 0; L < 6; ++L) {
+            const Model::VEncLevel& E = m.v_lv[(size_t)L];
+            const bool sc = E.op_sc;
+            for (int blk = 0; blk < 2; ++blk) {
+                const Model::VEncBlock& B = E.blk[blk];
+                const bool f0 = blk == 0 && sc;
+                const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
+                /* The shortcut convolves the raw input, before norm1 normalises it -- exactly
+                 * the ordering note of the plain loop. */
+                if (f0)
+                    RAD_ISSUE_N(c, E.op_sc, R[L], brows(E.in, R[L]), RAD_W(E.scw), RAD_W(E.scb),
+                                gg[L], RAD_NONE, brows(E.a, R[L]));
+                RAD_ISSUE_N(c, B.op_n1, R[L], brows(xa, R[L]), RAD_W(B.n1w), RAD_W(B.n1b),
+                            RAD_NONE, st, brows(nb, R[L]));
+                RAD_ISSUE_N(c, B.op_c1, R[L], brows(nb, R[L]), RAD_W(B.c1w), RAD_W(B.c1b),
+                            gg[L], RAD_NONE, brows(E.c, R[L]));
+                RAD_ISSUE_N(c, B.op_n2, R[L], brows(E.c, R[L]), RAD_W(B.n2w), RAD_W(B.n2b),
+                            RAD_NONE, st, brows(E.b, R[L]));
+                RAD_ISSUE_N(c, B.op_c2, R[L], brows(E.b, R[L]), RAD_W(B.c2w), RAD_W(B.c2b),
+                            gg[L], brows(E.a, R[L]), brows(E.a, R[L]));
+            }
+            if (L < 4) {
+                const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
+                const rad_buf y = X.op_sc ? X.in : X.a;
+                RAD_ISSUE_N(c, E.op_dn, R[L + 1], brows(E.a, R[L]), RAD_W(E.dnw), RAD_W(E.dnb),
+                            gg[L], RAD_NONE, brows(y, R[L + 1]));
+            }
+        }
+        RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
+                    RAD_NONE, st, brows(m.v_lv[5].b, R5));
+        RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
+                    RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
+        RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
+                    RAD_NONE, brow_slice(m.b_eqt, T.mrow, R5, 48));
+    }
+    /* The blend over the whole canvas (gd's level-4/5 volume entry gives it in latents), then
+     * the plain path's fold -- the canvas is byte-identical in form to a one-clip encode's
+     * b_eq2, so nothing past here can tell the two paths apart. */
+    RAD_ISSUE_N(c, m.op_vt_join, lat_h * lat_w, brows(m.b_eqt, smom), praw(gd + 12, RAD_I32, 3),
+                brows(m.b_eq2, lat_h * lat_w));
+    RAD_ISSUE_N(c, m.op_ve_fold, ppc, bcol(m.b_eq2, 0, kC, lat_h * lat_w),
+                praw(gd + 18, RAD_I32, 3), brow_slice(m.b_evc, row0, ppc, kPatchVals));
+    return row0 + ppc;
+}
+
 static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadVideoGenBatch* V = batch->vgen_b;
     int32_t g[25];
@@ -4318,6 +4470,13 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
      * there is no downsampler between the 512- and the 1024-wide level. */
     static const int kVOrg[6] = { 0, 3, 6, 9, 12, 12 };
     int64_t frow = row0;
+    /* A one-frame media wider than a tile's side (the reference's own condition: vae.py tiles
+     * its image encodes at exactly this size) goes through the tiled path; a clip never can,
+     * its volume forcing each side back to kEncMaxSide in venc_geom. */
+    const bool tiled = V->enc_frames == 1 && (H / kVaeRatio > kTile || W / kVaeRatio > kTile);
+    if (tiled)
+        frow = step_venc_tiled(c, V, m, gd, H, W, ppc, st, row0);
+    else
     for (int64_t cc = 0; cc < n_clips; ++cc) {
         const bool last = cc == n_clips - 1;
         const int64_t R0 = (int64_t)g[0] * H * W;

@@ -2660,6 +2660,23 @@ static const RadOperandSpec oVtileStitch[] = {
     { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "prev", RAD_OPD_INOUT, 0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+/* The tiled encoder (r4d_video.hip): the plan, the cut and the blend. `geom` is the request's
+ * (clip, H, W); plan and crop take it in pixels, join in latent units. */
+static const RadParamSpec pVtilePlan[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio") };
+static const RadOperandSpec oVtilePlan[] = {
+    { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileCrop[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oVtileCrop[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileJoin[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oVtileJoin[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
@@ -3600,6 +3617,19 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("vtile_stitch", pVtileStitch, oVtileStitch,
            "a decoded chunk's tiles stitched into RGB bytes, blended with the previous chunk's "
            "tail."),
+    SCHEMA("vtile_plan", pVtilePlan, oVtilePlan,
+           "the tiled encoder's plan for one frame of geom = (clip, H, W) pixels: the encoder's "
+           "tile split over the spatial axes in latent units, tiles row-major; row t of the "
+           "i32 [M, 22] y is the tile's first pixel, its pixel extent and the six level "
+           "volumes (1, th / 2^min(L, 4), tw / 2^min(L, 4)); M is the tile count."),
+    SCHEMA("vtile_crop", pVtileCrop, oVtileCrop,
+           "one frame's pixel plane [>= H W, 3] (geom = (clip, H, W) pixels) cut into "
+           "vtile_plan's tiles: y [M, 3] the tiles' pixels tile-major, M the tiles' pixel "
+           "count."),
+    SCHEMA("vtile_join", pVtileJoin, oVtileJoin,
+           "the tiled encoder's per-tile moments blended into the canvas y [M, n] of "
+           "geom = (clip, lat_h, lat_w): each position blended with the tile above and then "
+           "the tile to the left, both RAW, the products and sums rounding to x's dtype."),
     SCHEMA("grid_pos3", pGridPos3, oGridPos3,
            "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
     SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
@@ -9312,6 +9342,27 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_vtile_stitch },
+
+{ "vtile_plan", "vtile_plan", "elem",
+  "the tiled encoder's per-tile geometry table: a thread a (tile, entry)",
+  "any M; the split reads geom on the device", "i32 table, i32 geom",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_plan },
+
+{ "vtile_crop", "vtile_crop", "elem",
+  "a frame's pixel plane cut into the encode tiles: a thread a tile pixel row",
+  "row pitches honoured", "f32 or bf16 plane and tiles",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_crop },
+
+{ "vtile_join", "vtile_join", "elem",
+  "the encode tiles' moments blended into the latent canvas: a thread a canvas row",
+  "row pitches honoured", "f32 or bf16 moments and canvas",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_join },
 
 { "grid_pos3", "grid_pos3", "elem",
   "a video decoder's rotary positions over its tiles", "a [3, M] view at its own pitch", "f32",

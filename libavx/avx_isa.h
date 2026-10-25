@@ -128,6 +128,7 @@ int         avx_par_force(int threads);
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)           X(cond_aug)         \
+    X(vtile_plan)           X(vtile_crop)           X(vtile_join)                                 \
     /* ---- LTX-2 */                                                                              \
     X(rope_split)           X(head_gate)            X(ltx_guide)            X(pixel_norm)         \
     X(d2s3d)                X(s2d3d)                X(pix_patch)                                  \

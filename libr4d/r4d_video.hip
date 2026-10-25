@@ -1,7 +1,8 @@
 // R4D -- the video generator's ops (docs/OPS.md, "Video generation"): a diffusion transformer's
 // modulated RMS norm and its sampler step, the video decoder's patch unfold, the tiles it runs
-// over, their stitch back into frames and their rotary positions; and its soundtrack decoder's
-// alias-free SnakeBeta (docs/OPS.md, "Audio generation").
+// over, their stitch back into frames and their rotary positions; the video encoder's plan, cut
+// and blend for a picture bigger than one volume; and its soundtrack decoder's alias-free
+// SnakeBeta (docs/OPS.md, "Audio generation").
 //
 // Each kernel rounds where its libref function does (libref/ref_gen.cpp, libref/ref_video.cpp,
 // libref/ref_audio.cpp), under the library's -ffp-contract=off. The norm's sum of squares is a
@@ -277,6 +278,21 @@ __device__ __forceinline__ Tiles split_tiles(int len, int tile, int overlap) {
     return t;
 }
 
+// The encoder's split over one axis (libref's split_tiles_axis, vae.py's `split_tiles`): a tile at
+// least as long as the axis is ONE tile over the whole axis, short if need be, where the decoder's
+// split above demands an exact fit. A lone tile reads no overlap and starts at 0, which the closed
+// form above already gives at n = 1.
+__device__ __forceinline__ Tiles split_tiles_axis(int len, int tile, int overlap) {
+    if (tile >= len && len > 0 && tile > 0 && overlap >= 0 && overlap < tile) {
+        Tiles t;
+        t.n = 1;
+        t.tile = tile;
+        t.overlap = overlap;
+        return t;
+    }
+    return split_tiles(len, tile, overlap);
+}
+
 // ---------------------------------------------------------------------------- vtile_gather
 // A workgroup a tile row: its voxel from x, a register token from `reg`, or zeros.
 template <typename TX, typename TR, typename TY>
@@ -380,6 +396,119 @@ __global__ __launch_bounds__(kT) void vtile_stitch_kernel(
         const float v = stitch(2 * skip + keep + k);
         if (last) byte(keep + k, v);
         stv(prev, (k * npx + px) * p_ld + c, v);
+    }
+}
+
+// ---------------------------------------------------------------------------- the tiled encoder
+// A one-frame media bigger than the encoder's per-volume side is encoded the way vae.py's
+// `tiled_encode` encodes it: the plan, the cut and the blend (libref's ref_vtile_plan/crop/join);
+// the encoder itself is the existing per-level ops, issued per tile at the plan's geometries.
+
+// A thread a (tile, entry): the tile's first pixel, its pixel extent and the six level volumes,
+// as ref_vtile_plan's row of 22 i32.
+__global__ __launch_bounds__(kT) void vtile_plan_kernel(
+    const int* __restrict__ geom, int* __restrict__ y, int tile, int overlap, int ratio, int y_ld,
+    int64_t M, int64_t y_rows) {
+    const int64_t id = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (id >= M * 22 || id >= y_rows * 22 || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
+    const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
+    const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
+    if (ty.n == 0 || tx.n == 0) return;
+    const int64_t t = id / 22;
+    const int c = (int)(id % 22);
+    const int nh = ty.n, nw = tx.n;
+    if (t >= (int64_t)nh * nw) return;
+    const int i = (int)(t / nw), j = (int)(t % nw);
+    const int th = min(tile, H / ratio - ty.start(i)) * ratio;
+    const int tw = min(tile, W / ratio - tx.start(j)) * ratio;
+    int v;
+    if (c < 4) {
+        v = c == 0 ? ty.start(i) * ratio : c == 1 ? tx.start(j) * ratio : c == 2 ? th : tw;
+    } else {
+        const int L = (c - 4) / 3, k = (c - 4) % 3, d = 1 << min(L, 4);
+        v = k == 0 ? 1 : k == 1 ? th / d : tw / d;
+    }
+    y[t * y_ld + c] = v;
+}
+
+// A thread a tile pixel row: its plane row copied. The tile is found by walking the tiles' sizes,
+// at most a hundred of them (libref's upper_bound over the same prefix sums).
+template <typename T>
+__global__ __launch_bounds__(kT) void vtile_crop_kernel(
+    const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
+    int overlap, int ratio, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
+    const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (r >= M || r >= y_rows || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
+    const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
+    const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
+    if (ty.n == 0 || tx.n == 0 || (int64_t)H * W > x_rows) return;
+    const int nh = ty.n, nw = tx.n;
+    int t = -1;
+    int64_t acc = 0, k = 0;
+    for (int tt = 0; tt < nh * nw; ++tt) {
+        const int64_t sz = (int64_t)min(tile, H / ratio - ty.start(tt / nw)) * ratio *
+                           min(tile, W / ratio - tx.start(tt % nw)) * ratio;
+        if (r < acc + sz) { t = tt; k = r - acc; break; }
+        acc += sz;
+    }
+    if (t < 0) return;  // r past the tiles' sum: M was not it
+    const int tw = min(tile, W / ratio - tx.start(t % nw)) * ratio;
+    const int64_t src = ((int64_t)ty.start(t / nw) * ratio + k / tw) * W +
+                        (int64_t)tx.start(t % nw) * ratio + k % tw;
+    for (int c = 0; c < 3; ++c) stv(y + r * (int64_t)y_ld, c, ldv(x + src * (int64_t)x_ld, c));
+}
+
+// A thread a canvas row: its three tiles' moments blended, top first then left, RAW neighbours,
+// every product and sum rounded to x's dtype -- ref_vtile_join's rule, vae.py's `tiled_encode`
+// blend. A thread per (row, channel) would recompute the tile walk n times.
+template <typename T>
+__global__ __launch_bounds__(kT) void vtile_join_kernel(
+    const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
+    int overlap, int n, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
+    const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (r >= M || r >= y_rows || r >= (int64_t)H * W || H <= 0 || W <= 0) return;
+    const Tiles ty = split_tiles_axis(H, tile, overlap), tx = split_tiles_axis(W, tile, overlap);
+    if (ty.n == 0 || tx.n == 0) return;
+    const int nh = ty.n, nw = tx.n;
+    // The tiles' row extents and their prefix sums, in tile-major order.
+    const int64_t ext_y = nh == 1 ? H : (int64_t)tile * nh, ext_x = nw == 1 ? W : (int64_t)tile * nw;
+    if (ext_y * ext_x > x_rows) return;
+    auto sz = [&](int ii, int jj) {
+        return (int64_t)min(tile, H - ty.start(ii)) * min(tile, W - tx.start(jj));
+    };
+    auto off = [&](int ii, int jj) {
+        int64_t a = 0;
+        for (int t = 0; t < ii * nw + jj; ++t) a += sz(t / nw, t % nw);
+        return a;
+    };
+    const int Y = (int)(r / W), X = (int)(r % W);
+    int i = 0;
+    while (i + 1 < nh && Y >= ty.start(i + 1)) ++i;
+    int j = 0;
+    while (j + 1 < nw && X >= tx.start(j + 1)) ++j;
+    const int ly = Y - ty.start(i), lx = X - tx.start(j);
+    const int ev = i > 0 ? ty.ov(i - 1) : 0, eh = j > 0 ? tx.ov(j - 1) : 0;
+    const int64_t own = off(i, j), up = i > 0 ? off(i - 1, j) : 0, left = j > 0 ? off(i, j - 1) : 0;
+    // Each tile's own width: own and up share this tile's column (`own_w`, short only in the
+    // last column); the left neighbour sits in column j-1, never the last, so its width is the
+    // full `tile`. libref indexes every tile by its own column's width, and these are those.
+    const int own_w = min(tile, W - tx.start(j));
+    const auto fetch = [&](int64_t base, int w, int ay, int ax, int c) {
+        return ldv(x, (base + (int64_t)ay * w + ax) * x_ld + c);
+    };
+    auto rd = [&](float v) { return rdv(x, v); };
+    auto wb = [&](int p, int e) { return rd((float)p / (float)e); };
+    auto wa = [&](int p, int e) { return rd(1.0f - rd((float)p / (float)e)); };
+    for (int c = 0; c < n; ++c) {
+        float v = fetch(own, own_w, ly, lx, c);
+        if (ly < ev)
+            v = rd(rd(fetch(up, own_w, ly + tile - ev, lx, c) * wa(ly, ev)) + rd(v * wb(ly, ev)));
+        if (lx < eh)
+            v = rd(rd(fetch(left, tile, ly, lx + tile - eh, c) * wa(lx, eh)) + rd(v * wb(lx, eh)));
+        stv(y + r * (int64_t)y_ld, c, v);
     }
 }
 
@@ -719,6 +848,72 @@ extern "C" int r4d_rad_vtile_stitch(const RadArgs* a, RadStream s) {
     else           R4D_VTS_P(uint16_t);
 #undef R4D_VTS_P
 #undef R4D_VTS
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_plan(const RadArgs* a, RadStream s) {
+    const RadTensor *geom = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!geom || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_i32(geom) || !is_i32(y)) return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 ||
+        r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    long long ry = 0;
+    const long long yl = r4d_rows_pitch(y, 22, &ry);
+    if (yl < 0 || !r4d_contig(geom) || ry < M) return R4D_NO(RAD_E_STRIDE);
+    const int64_t total = (int64_t)M * 22;
+    hipLaunchKernelGGL(vtile_plan_kernel, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,
+                       (const int*)geom->data, (int*)y->data, (int)tile, (int)overlap, (int)ratio,
+                       (int)yl, M, ry);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_crop(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !geom || !y) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(x) && !is_bf16(x)) || x->dtype != y->dtype || !is_i32(geom))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 ||
+        r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    const long long xl = r4d_rows_pitch(x, 3, &rx), yl = r4d_rows_pitch(y, 3, &ry);
+    if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry < M) return R4D_NO(RAD_E_SHAPE);
+#define R4D_VTC(T)                                                                                \
+    hipLaunchKernelGGL((vtile_crop_kernel<T>), dim3(blocks_for(M)), dim3(kT), 0, (hipStream_t)s,  \
+                       (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
+                       (int)overlap, (int)ratio, (int)xl, (int)yl, M, rx, ry)
+    if (is_f32(x)) R4D_VTC(float);
+    else           R4D_VTC(uint16_t);
+#undef R4D_VTC
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_join(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !geom || !y) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(x) && !is_bf16(x)) || x->dtype != y->dtype || !is_i32(geom))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), n = r4d_geti_or(a, "n", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    const long long xl = r4d_rows_pitch(x, n, &rx), yl = r4d_rows_pitch(y, n, &ry);
+    if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry < M) return R4D_NO(RAD_E_SHAPE);
+#define R4D_VTJ(T)                                                                                \
+    hipLaunchKernelGGL((vtile_join_kernel<T>), dim3(blocks_for(M)), dim3(kT), 0, (hipStream_t)s,  \
+                       (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
+                       (int)overlap, (int)n, (int)xl, (int)yl, M, rx, ry)
+    if (is_f32(x)) R4D_VTJ(float);
+    else           R4D_VTJ(uint16_t);
+#undef R4D_VTJ
     return st_of(hipGetLastError());
 }
 

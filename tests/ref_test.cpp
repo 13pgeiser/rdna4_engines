@@ -1034,6 +1034,9 @@ TEST(op_vocabulary) {
          * the fold back into patch rows and the re-noising. */
         "conv3d_ndhwc", "group_norm", "tconv_dw", "resize_bilinear", "patch_fold",
         "flow_renoise", "cond_aug",
+        /* Its encoder's tiling for one-frame media bigger than a tile: the plan, the cut and
+         * the moments' blend back into the latent canvas. */
+        "vtile_plan", "vtile_crop", "vtile_join",
         /* The joint image generators' (Krea 2, FLUX.3): attention over separate key bounds, a
          * per-layer table added to every row, a learned mix of consecutive rows, and the VAE's
          * channel statistics. */
@@ -6883,6 +6886,211 @@ TEST(grid_pos3_places_each_tile_token_and_zeroes_the_rest) {
     CHECK_EQ(at3(2, 29), 1.5f);
 }
 
+/* ================================================================== the tiled encoder
+ * docs/OPS.md "Video generation", the tiled encoder: vae.py's split over a one-frame plane, the
+ * plane cut into tiles, and the per-tile moments blended back with the RAW neighbours. */
+
+/* 640 x 320 px in latent units is 40 x 20: the rows split at 0, 12, 24 and the columns at 0, 4
+ * -- six tiles, every one 16 latents a side (256 px). Level L's volume is the tile over
+ * 2^min(L,4) pixels a side, and a plane smaller than one tile is one short tile (vae.py's
+ * ([0], [len], [])), 128 x 96 px here with levels down to 8 x 6. */
+TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
+    T geom(RAD_I32, {3}); geom.n({1, 640, 320});
+    T y(RAD_I32, {6, 22});
+    A a; a.t(geom).t(y).i("M", 6).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", a));
+    const int64_t y0[6] = { 0, 0, 192, 192, 384, 384 }, x0[6] = { 0, 64, 0, 64, 0, 64 };
+    for (int64_t t = 0; t < 6; ++t) {
+        CHECK_EQ(y.iat(t * 22 + 0), y0[t]);
+        CHECK_EQ(y.iat(t * 22 + 1), x0[t]);
+        CHECK_EQ(y.iat(t * 22 + 2), 256);
+        CHECK_EQ(y.iat(t * 22 + 3), 256);
+        const int64_t d[6] = { 1, 2, 4, 8, 16, 16 };
+        for (int L = 0; L < 6; ++L) {
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 0), 1);
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 1), 256 / d[L]);
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 2), 256 / d[L]);
+        }
+    }
+    T g1(RAD_I32, {3}); g1.n({1, 128, 96});
+    T y1(RAD_I32, {1, 22});
+    A b; b.t(g1).t(y1).i("M", 1).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", b));
+    const int64_t lone[22] = { 0, 0, 128, 96,   1, 128, 96,   1, 64, 48,   1, 32, 24,
+                               1, 16, 12,   1, 8, 6,   1, 8, 6 };
+    for (int i = 0; i < 22; ++i) CHECK_EQ(y1.iat(i), lone[i]);
+
+    /* A 96 x 768 px plane: one short row band (6 latents) and 48 latents a row, split at 0, 10,
+     * 21, 32 -- the slack of 4 going to the overlaps one at a time round-robin (6, 5, 5),
+     * so the last column still runs the full 16 latents to the plane's edge. A short band only
+     * ever stands alone on its axis, but it still has the other axis' neighbours. */
+    T g3(RAD_I32, {3}); g3.n({1, 96, 768});
+    T y3(RAD_I32, {4, 22});
+    A e; e.t(g3).t(y3).i("M", 4).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", e));
+    const int64_t x3[4] = { 0, 160, 336, 512 };
+    for (int64_t t = 0; t < 4; ++t) {
+        CHECK_EQ(y3.iat(t * 22 + 0), 0);
+        CHECK_EQ(y3.iat(t * 22 + 1), x3[t]);
+        CHECK_EQ(y3.iat(t * 22 + 2), 96);
+        CHECK_EQ(y3.iat(t * 22 + 3), 256);
+        const int64_t d[6] = { 1, 2, 4, 8, 16, 16 };
+        for (int L = 0; L < 6; ++L) {
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 0), 1);
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 1), 96 / d[L]);
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 2), 256 / d[L]);
+        }
+    }
+
+    /* A row count that is not the tile count, and a plane the ratio does not divide. */
+    T y2(RAD_I32, {5, 22});
+    A c; c.t(geom).t(y2).i("M", 5).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", c), RAD_E_SHAPE);
+    T g2(RAD_I32, {3}); g2.n({1, 100, 96});
+    A d; d.t(g2).t(y1).i("M", 1).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", d), RAD_E_SHAPE);
+}
+
+/* A 20 x 20 px plane in ratio 4, tiles of 3 latents (12 px) with overlap 1: each axis splits at
+ * 0 and 2 -- four tiles of 12 x 12 px, 576 rows, tile-major (row band first). x holds
+ * (Y, X, Y W + X) per row, so every tile row says which plane pixel it cut. */
+TEST(vtile_crop_cuts_the_plane_tile_major) {
+    T x(RAD_F32, {400, 3});
+    std::vector<float> xv(1200);
+    for (int64_t i = 0; i < 400; ++i)
+        xv[(size_t)i * 3] = (float)(i / 20), xv[(size_t)i * 3 + 1] = (float)(i % 20),
+        xv[(size_t)i * 3 + 2] = (float)i;
+    x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 20, 20});
+    T y(RAD_F32, {576, 3});
+    A a; a.t(x).t(geom).t(y).i("M", 576).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", a));
+    const int64_t sy[2] = { 0, 8 }, sx[2] = { 0, 8 };   /* latent starts 0 and 2, in px */
+    for (int64_t i = 0; i < 2; ++i)
+        for (int64_t j = 0; j < 2; ++j) {
+            const int64_t off = (i * 2 + j) * 144;
+            for (int64_t k = 0; k < 144; ++k) {
+                const int64_t py = sy[i] + k / 12, pxx = sx[j] + k % 12;
+                CHECK_EQ(y.at((off + k) * 3 + 0), (float)py);
+                CHECK_EQ(y.at((off + k) * 3 + 1), (float)pxx);
+                CHECK_EQ(y.at((off + k) * 3 + 2), (float)(py * 20 + pxx));
+            }
+        }
+
+    /* A plane whose row axis is below one tile and whose column axis is not: one short row band
+     * with two column neighbours -- 8 x 20 px in ratio 4 is 2 x 5 latents, columns at 0 and 2
+     * (8 px), so two tiles of 8 x 12 px, 192 rows, the overlap column range cut twice. */
+    T g4(RAD_I32, {3}); g4.n({1, 8, 20});
+    T x4(RAD_F32, {160, 3});
+    std::vector<float> x4v(480);
+    for (int64_t i = 0; i < 160; ++i)
+        x4v[(size_t)i * 3] = (float)(i / 20), x4v[(size_t)i * 3 + 1] = (float)(i % 20),
+        x4v[(size_t)i * 3 + 2] = (float)i;
+    x4.f(x4v);
+    T y4(RAD_F32, {192, 3});
+    A e4; e4.t(x4).t(g4).t(y4).i("M", 192).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", e4));
+    for (int64_t j = 0; j < 2; ++j)
+        for (int64_t k = 0; k < 96; ++k) {
+            const int64_t py = k / 12, pxx = 8 * j + k % 12;
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 0), (float)py);
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 1), (float)pxx);
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 2), (float)(py * 20 + pxx));
+        }
+
+    /* A plane below one tile is a lone tile -- the crop is the plane itself. */
+    T g1(RAD_I32, {3}); g1.n({1, 8, 8});
+    T x1(RAD_F32, {64, 3});
+    std::vector<float> x1v(192);
+    for (int64_t i = 0; i < 64; ++i) x1v[(size_t)i * 3] = (float)i;
+    x1.f(x1v);
+    T y1(RAD_F32, {64, 3});
+    A b; b.t(x1).t(g1).t(y1).i("M", 64).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", b));
+    for (int64_t i = 0; i < 64; ++i) CHECK_EQ(y1.at(i * 3), (float)i);
+
+    /* A row count that is not the tiles' pixel sum, and a plane short of geom. */
+    T y2(RAD_F32, {575, 3});
+    A c; c.t(x).t(geom).t(y2).i("M", 575).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", c), RAD_E_SHAPE);
+    T x2(RAD_F32, {399, 3});
+    A d; d.t(x2).t(geom).t(y).i("M", 576).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", d), RAD_E_SHAPE);
+}
+
+/* A 6 x 6 latent canvas, tiles of 4 with overlap 2: each axis splits at 0 and 2, the kept ranges
+ * are [0, 2) and [2, 6), and the blends are two rows and two columns wide. Tile (i, j) is the
+ * constant 4 << (2 i + j) -- [[4, 8], [16, 32]] -- so every blend shows its two sources: (2, 0)
+ * is the top row of the bottom-left tile fully from the tile above (wb(0, 2) = 0), (3, 0) is its
+ * second row, half and half; (2, 2) is the bottom-right tile's corner blended up (8) and then
+ * left (16 -- the RAW tile to the left, never a blended one), and (3, 3) takes half of 8 up and
+ * then half of 16 left of that: rd(rd(8 0.5) + rd(32 0.5)) = 20, then rd(rd(16 0.5) + rd(20 0.5))
+ * = 18. Blending across first, or reading a blended neighbour, gives other numbers. */
+TEST(vtile_join_blends_raw_neighbours_down_then_across) {
+    T x(RAD_BF16, {64, 1});
+    std::vector<float> xv(64);
+    const float base[4] = { 4, 8, 16, 32 };
+    for (int64_t k = 0; k < 4; ++k)
+        for (int64_t r = 0; r < 16; ++r) xv[(size_t)(k * 16 + r)] = base[k];
+    x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 6, 6});
+    T y(RAD_BF16, {36, 1});
+    A a; a.t(x).t(geom).t(y).i("M", 36).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", a));
+    auto px = [&](int64_t Y, int64_t X) { return y.at(Y * 6 + X); };
+    CHECK_EQ(px(0, 0), 4.0f);    CHECK_EQ(px(0, 2), 4.0f);   /* left blend at wb(0, 2) = 0 */
+    CHECK_EQ(px(0, 3), 6.0f);    CHECK_EQ(px(2, 0), 4.0f);   /* top blend at wa(0, 2) = 1 */
+    CHECK_EQ(px(2, 2), 16.0f);   CHECK_EQ(px(3, 0), 10.0f);
+    CHECK_EQ(px(4, 3), 24.0f);   CHECK_EQ(px(3, 3), 18.0f);
+    CHECK_EQ(px(5, 5), 32.0f);   CHECK_EQ(px(4, 0), 16.0f);
+
+    /* A 6 x 9 latent canvas, tiles of 4 with overlap 1: rows split at 0, 2 (slack 1 -> overlap
+     * 2) and columns at 0, 2, 5 (slack 1 to the FIRST boundary: overlaps 2 then 1 -- distributing
+     * the slack to every boundary instead would start the columns at 0, 2, 4). Six tiles of 4 x 4,
+     * tile
+     * (i, j) the constant 1 << (2 i + j) -- [[1, 2, 4], [8, 16, 32]]. Top before left, RAW
+     * neighbours, in bf16 halves: (3, 0) is half of 1 up and half of 8 = 4.5; (3, 5) blends up to
+     * half of 4 and half of 8 = 6 and then fully to the RAW left 16; (1, 2) has no top (i = 0)
+     * and takes 1 fully left; (5, 3) takes half of 8 left of 16 = 12; (2, 5) takes 4 fully up,
+     * then 16 fully left; (3, 6) takes half of 4 up of its 32 = 18 and no left at lx = 1.
+     */
+    T g5(RAD_I32, {3}); g5.n({1, 6, 9});
+    T x5(RAD_BF16, {96, 1});
+    std::vector<float> x5v(96);
+    for (int64_t t = 0; t < 6; ++t)
+        for (int64_t r = 0; r < 16; ++r) x5v[(size_t)t * 16 + r] = (float)(1 << t);
+    x5.f(x5v);
+    T y5(RAD_BF16, {54, 1});
+    A e5; e5.t(x5).t(g5).t(y5).i("M", 54).i("tile", 4).i("overlap", 1).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", e5));
+    auto qx = [&](int64_t Y, int64_t X) { return y5.at(Y * 9 + X); };
+    CHECK_EQ(qx(0, 0), 1.0f);    CHECK_EQ(qx(1, 2), 1.0f);    /* no top at i = 0; 1 fully left */
+    CHECK_EQ(qx(0, 3), 1.5f);    CHECK_EQ(qx(0, 5), 2.0f);    /* half of 1 left of 2; 2 fully */
+    CHECK_EQ(qx(3, 0), 4.5f);    CHECK_EQ(qx(2, 5), 16.0f);   /* half up, then RAW left overrides */
+    CHECK_EQ(qx(3, 5), 16.0f);   CHECK_EQ(qx(3, 6), 18.0f);   /* left fully at lx = 0; half up at 1 */
+    CHECK_EQ(qx(5, 2), 8.0f);    CHECK_EQ(qx(5, 3), 12.0f);   /* fully left at lx = 0, half at 1 */
+    CHECK_EQ(qx(0, 8), 4.0f);    CHECK_EQ(qx(4, 2), 8.0f);    /* past every blend: own or fully left */
+
+    /* A canvas below one tile is a lone tile: the join is the copy. */
+    T g1(RAD_I32, {3}); g1.n({1, 3, 3});
+    T x1(RAD_BF16, {9, 1});
+    std::vector<float> x1v(9);
+    for (int64_t i = 0; i < 9; ++i) x1v[(size_t)i] = (float)(i + 1);
+    x1.f(x1v);
+    T y1(RAD_BF16, {9, 1});
+    A b; b.t(x1).t(g1).t(y1).i("M", 9).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", b));
+    for (int64_t i = 0; i < 9; ++i) CHECK_EQ(y1.at(i), (float)(i + 1));
+
+    /* M is the canvas, x holds every tile. */
+    T y2(RAD_BF16, {35, 1});
+    A c; c.t(x).t(geom).t(y2).i("M", 35).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", c), RAD_E_SHAPE);
+    T x2(RAD_BF16, {63, 1});
+    A d; d.t(x2).t(geom).t(y).i("M", 36).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", d), RAD_E_SHAPE);
+}
+
 /* ================================================================== the latent upscaler
  * docs/OPS.md "The latent upscaler": voxel rows (t, i, j) of a T x H x W volume, channels
  * innermost, the volume in `geom`. */
@@ -8964,6 +9172,15 @@ std::vector<Geo> geometries() {
         G("flow_renoise", "M", 3, a.i("M", R).i("n", 8).i("stream", 1).s("dtype", "f32")),
         G("cond_aug", "M", 3, a.i("M", R).i("n", 8).i("stream", 2).d("aug", 0.999)
                              .s("dtype", "f32")),
+        /* The drawn frame is 20 latent units a side (ref_shapes.cpp), so a tile of 16 with
+         * overlap 4 splits it 2 x 2: the plan has 4 rows, the crop (ratio 16) 4 tiles of 256
+         * pixels -- 512 x 512 px of plane into 4 x 256 x 256 = 262144 rows -- and the join
+         * blends 4 x 16 x 16 = 1024 moment rows into the 400-row canvas. */
+        G("vtile_plan", "M", 4, a.i("M", R).i("tile", 16).i("overlap", 4).i("ratio", 16)),
+        G("vtile_crop", "M", 262144, a.i("M", R).i("tile", 16).i("overlap", 4).i("ratio", 16)
+                                    .s("dtype", "f32")),
+        G("vtile_join", "M", 400, a.i("M", R).i("tile", 16).i("overlap", 4).i("n", 48)
+                                 .s("dtype", "bf16")),
         G("attn_cross", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
                                 .s("dtype", "f32").i("n_head", 2)),
         G("table_add", "M", 3, a.i("M", R).i("n", 8).i("L", 3).s("dtype", "f32")),
