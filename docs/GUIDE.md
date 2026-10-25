@@ -1620,7 +1620,9 @@ below.
   that stops with `VRAM pool budgets are empty: … vram_kv resolved to 0 MiB`. Lowering
   `--max-num-batched-tokens` cannot buy the room back on a video generator — the auto value is a
   floor (the largest denoise step must fit the arena) and a lower one is refused at declare.
-  Default to `--max-loras 1` on tight cards.
+  The squeeze is only against GPU processes on the server's OWN machine; on a split deployment
+  (client UI on another box, this server headless) the cards are otherwise idle and two slots fit.
+  Default to `--max-loras 1` on a shared machine.
 - An unload of an idle adapter answers 200 and frees its slot. An unload of an adapter requests
   are still using **drains** it and answers 202
   `{"action": "draining", "lora_name": "x", "in_flight": N}`: from then on a request naming `x`

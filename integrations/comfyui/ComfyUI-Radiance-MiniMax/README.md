@@ -44,9 +44,14 @@ other GPU process). The failure signature is a boot that stops with
 `VRAM pool budgets are empty: … vram_kv resolved to 0 MiB` (exit 1).
 Lowering `--max-num-batched-tokens` to claw room back does NOT work for a
 video generator: its auto value is a floor — the largest denoise step must fit
-the arena — and a lower one is refused at declare. **Recommendation: serve
-with `--max-loras 1` as the default** (this node's `lora 1` keeps working,
-keep `lora 2` at `none`); raise to 2 when the cards are otherwise idle.
+the arena — and a lower one is refused at declare. **This contention exists
+only between GPU processes on the machine that HOSTS radiance.** The node is a
+pure HTTP client, so the standard split topology — ComfyUI on its own box/GPU,
+radiance headless on another — leaves the server's cards otherwise idle and
+`--max-loras 2` fits fine there; that is the way to run two slots. **On one
+shared machine, serve with `--max-loras 1` as the default** (this node's
+`lora 1` keeps working, keep `lora 2` at `none`); go to 2 only when nothing
+else on that box touches the GPU.
 
 ## Inputs
 
