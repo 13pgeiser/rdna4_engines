@@ -279,6 +279,10 @@ pub struct DecodeShareRanges {
     pub mirror_alias: usize,
     /// Number of donor experts.
     pub donors: usize,
+    /// Bytes at the start of the donor tail that hold the borrowed weight
+    /// shadows ([`crate::expert_tier_plan::DecodeShareTail::shadow_bytes`]);
+    /// the scratch backing starts right after them. 0 without borrowed shadows.
+    pub shadow_bytes: usize,
 }
 
 /// CPU-built state of one BorrowPrefill class view, before its tables are
@@ -468,6 +472,8 @@ fn build_decode_share(
         ),
         mirror_alias: checked_address(host_alias, tail.mirror_offset)?,
         donors: tail.donors.len(),
+        shadow_bytes: usize::try_from(tail.shadow_bytes)
+            .map_err(|_| ExpertTierOwnerError::Overflow)?,
     };
     Ok(Some(DecodeShareCpu {
         views,
