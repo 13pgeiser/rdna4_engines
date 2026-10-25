@@ -90,10 +90,11 @@ static const Flag g_flags[] = {
     "                                    the card. At or above the group's context (sequences x\n"
     "                                    --max-model-len) nothing streams either: the group stays a\n"
     "                                    plain resident pool and the engine takes its ordinary path,\n"
-    "                                    with no mirror, no stage and no resolve. Below it, the rest\n"
-    "                                    of each block lives in pinned host memory and the ring must\n"
-    "                                    hold one decode step's whole selection; a smaller ring is\n"
-    "                                    raised to that many blocks at startup, with a warning" },
+    "                                    with no mirror, no stage and no resolve. Under 32768 the\n"
+    "                                    ring is raised to it (and to one decode step's selection\n"
+    "                                    when that is larger); below it a decode pays more in misses\n"
+    "                                    than the ring saves. A context under 32768 tokens streams\n"
+    "                                    nothing at all" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },

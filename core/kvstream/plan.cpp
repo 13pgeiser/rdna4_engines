@@ -156,6 +156,16 @@ KVStreamRing kvstream_ring_shape(const Config& cfg, int64_t ctx, int64_t block_s
     const int64_t bs = block_size > 0 ? block_size : 1;
     out.ctx_blocks  = kv_context_blocks(bs, ctx, cfg.max_seqs);
     out.ring_blocks = cfg.kv_resident > 0 ? (cfg.kv_resident + bs - 1) / bs : 0;
+    /* The shipped floor, unless the context is smaller than it (a model that cannot hold 32 768
+     * tokens of this group streams nothing at all, which is the pre-existing behaviour). */
+    if (out.ring_blocks > 0) {
+        out.floor_blocks = (kStreamFloorTokens + bs - 1) / bs;
+        if (out.floor_blocks > out.ctx_blocks) out.floor_blocks = out.ctx_blocks;
+        if (out.ring_blocks < out.floor_blocks) {
+            out.ring_blocks    = out.floor_blocks;
+            out.raised_blocks  = out.floor_blocks;
+        }
+    }
     if (out.ring_blocks > out.ctx_blocks) out.ring_blocks = out.ctx_blocks;
     return out;
 }
@@ -178,7 +188,7 @@ void kvstream_ring(const Config& cfg, int64_t ctx, int64_t block_size, int64_t s
     const int64_t ceiling = kvstream_ceiling_blocks(cfg, sel_pitch);
     if (out->ring_blocks < ceiling) {
         out->ring_blocks   = ceiling < out->ctx_blocks ? ceiling : out->ctx_blocks;
-        out->raised_blocks = ceiling;
+        out->raised_blocks = out->ring_blocks;
     }
 }
 
