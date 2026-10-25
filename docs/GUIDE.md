@@ -1066,7 +1066,9 @@ own slice of the cache.
   throughput, is what it buys.
 - It is budgeted beside the prefix cache's host tier: at four conversations the two want 9.38 GiB
   and 4 GiB on a box with 8.2 GiB spare, so the start is refused short by ~1.2 GiB. Lower
-  `--prefix-cache-mib` (4096 today, 2048 is a fine floor); never delete the tier.
+  `--prefix-cache-mib` (4096 today, 2048 is a fine floor); never delete the tier. When a group
+  really streams, that tier is switched off automatically and its MiB are not reserved at all
+  (`docs/KV-STREAMING.md` §3.8), so on a streaming run this line is not the constraint.
 - Streaming's copies cost about 3% of decode at `--tp 2` with a small context, and 0% at
   `--tp 1`, where the longer step hides them.
 - Quality: perplexity 3.994 streaming off, 4.015 with a window covering the context, 4.014 with a
@@ -1532,6 +1534,11 @@ radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
   gives the rest up; the startup log warns when the tier holds less than one `--max-model-len`
   conversation and says how many MiB would, and a `kv tiers: ... got no host copy` line appears when
   it happens (`/sessions` `moved.held_back`).
+  With `--kv-resident` on a model that actually streams, this tier is turned off at startup and its
+  MiB are not reserved: a cached conversation contains the streamed group, whose bytes live in that
+  group's pinned mirror at the ids the conversation used, so they cannot be copied into a slot. The
+  startup line says which happened; the rule and its measurements are in `docs/KV-STREAMING.md`
+  §3.8. Everything above still applies when nothing streams.
 - `--prefix-cache-ttl S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
   the memory is wanted.
 

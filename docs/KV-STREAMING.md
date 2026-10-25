@@ -399,21 +399,64 @@ depth and the measured maxima (`ctl[10..12]`).
 
 The mirror is the largest host allocation after the experts' pool: up to 4.69 GiB a rank at the
 four-sequence target, 9.38 GiB over two. `kvstream_host_gate` checks it once, before any rank takes
-it, against everything still to be pinned after it (the prefix cache's host tier, the activation
-arenas, the checkpoint store when fixed) plus `--host-headroom-mib`, and a refusal names this tier
-and the flag that started streaming, not `--host-pool-mib`: that pool holds experts and shrinking it
-cannot make room here.
+it, against everything still to be pinned after it (the prefix cache's host tier when it is on; when a
+group streams it is off, see below), the activation arenas, the checkpoint store when fixed, plus
+`--host-headroom-mib`. A refusal names this tier and the flag that started streaming, not
+`--host-pool-mib`: that pool holds experts and shrinking it cannot make room here.
 
-The prefix cache's host tier **stays** — it holds finished conversations while the mirror holds
-live ones — and the mirror is budgeted alongside it:
+The prefix cache's host tier is **not** part of that budget when a group streams, because it cannot
+hold anything: an entry covers every cached group, and a streamed group's rows are addressed by the
+block id its sequence used, so a slot cannot stand in for them and their ids cannot be given up in
+exchange for one (§4.1, `PrefixCache::demotable`). `--prefix-cache-mib` is therefore turned off at
+bring-up, before anything is sized from it, and its bytes are left to the host pool and the page
+cache:
+
+    a streamed KV group has no host cache: --prefix-cache-mib 2048 would hold nothing (its entries
+    could never be demoted), so it is off; the 2048 MiB go to the host pool and the page cache
+    instead
+    kv tiers: off (no --prefix-cache-mib); a finished conversation's KV stays in VRAM until the
+    cache evicts it
+    --prefix-cache-mib    0 (off)
+
+"Streaming" here is the engine's answer, not the flag's (`kvstream_prefix_host_off`,
+`kvstream/plan.cpp`; `cfg.kv_streams`): the ring must be under the group's context and the
+architecture must declare the streamed path.
+
+| `--kv-resident` | model | `--prefix-cache-mib` | result |
+|---|---|---|---|
+| absent or `0` | any | any | nothing streams; host tier exactly as configured |
+| at/above the group's context (131 072 on the reference model) | streams | any | ring covers the context, nothing streams; host tier as configured |
+| under the context | no `kv_resolve` / no streamed store row | any | flag ignored with one sentence; host tier as configured |
+| under the context | streams | `0` | host tier off by choice: the prefix cache is VRAM-only |
+| under the context | streams | `> 0` | **host tier switched off at startup, its MiB not reserved**; the flag reports `0 (off)` |
+
+The rows that keep the tier are the pre-existing behaviour, unchanged: a flag absent or `0`, a ring
+that covers the context, and a model with no `kv_resolve` all leave `--prefix-cache-mib` exactly as
+configured. The price of the last row is that a conversation whose VRAM the loan or a request took is
+prefilled again instead of restored; the levers for cache depth are then `--kv-resident` and
+`--max-num-seqs`.
+
+Measured on 2×16 GB gfx1201 with `qwen3.8-next-flash-fp8-iq4r-moe`, three 44 220-token
+conversations and a replay of the first after the third displaced it: with `--kv-resident 32768` the
+replay came back as 44 160 cached tokens in 0.4 s when still resident and as a full prefill (16.1 s)
+once evicted; the same transcript with the flag left out had 33 163 entries moved to host memory and
+restored the replay in 0.4 s. Before this rule the streaming run moved 22 109 entries to the host
+tier, could not rebind one of them (`RAD_E_SHAPE`: the slot holds one group, the entry two), and
+dropped the record — the copies were pure waste, and `engine.cpp`'s failure path released the
+reserved ids against the wrong pools. Tests: `an_entry_with_a_streamed_group_is_never_demoted` and
+`the_prefix_cache_host_tier_is_off_only_when_streaming_is_really_on` (`tests/mem_test.cpp`).
+
+The mirror is still budgeted alongside the checkpoint store and the activation arenas:
 
     kv streaming: the host mirror for 2 streamed KV group(s) is up to 4.69 GiB a rank (9.38 GiB
     over 2) ... and this wants 9.38 GiB with 4.00 GiB to spare (--host-headroom-mib)
 
 At the target the gate had 8.2 GiB spare (16.18 GiB of `MemAvailable`, less 4.02 GiB still to
-allocate, less the 4.00 GiB headroom), so that configuration is refused, short by ~1.2 GiB; with
-`--prefix-cache-mib 2048` it serves, leaving 4.48 GiB `MemAvailable` and 1.07 GiB `MemFree`. The
-lever is that flag — lowering the prefix tier, never deleting it. The resident indexer is sized
+allocate, less the 4.00 GiB headroom), so that configuration is refused, short by ~1.2 GiB. Freeing
+the prefix tier is one lever (`--prefix-cache-mib 2048` took it to 4.48 GiB `MemAvailable` and 1.07
+GiB `MemFree` in that measurement, before the tier was turned off automatically); with this rule the
+same 2 GiB is never reserved in the first place when the group streams, so the gate sees it as
+available. The resident indexer is sized
 from the same `vram_kv` the streamed group no longer spends: **51 280 blocks = 205 120 tokens**,
 above the 51 200 / 204 800 one `--max-model-len` conversation needs, so the per-conversation cap is
 the advertised 204 800.
@@ -526,7 +569,16 @@ adopt** (a stage addresses every logical block identically, so it needs no secon
 `cached_groups()` is unchanged so a prefix hit adopts the same ids); **`kv_resolve`'s rows and the
 oracle** (a staged pass does not resolve); **`TierExec`'s gather/scatter** (`kv_tier_cached` narrows
 the list, because a gather of layer L from a one-layer pool would be "the last staged layer, 13
-times", and the residency map restores a block on the next resolve); **`PrefillStager`/`Mover`**
+times", and the residency map restores a block on the next resolve); **the prefix cache's host
+tier** (`--prefix-cache-mib`): an entry covers every cached group, and a streamed group's rows are
+addressed by the block id a sequence used, so those rows cannot be copied into a host slot and their
+ids cannot be given up in exchange for one. An entry that contains a streamed group is therefore
+never demoted: the cache stays a VRAM cache for it and evicts it whole, and the mirror is the only
+cold copy that group has (`PrefixCache::demotable()`, `core/mem/prefix.cpp`). So `--prefix-cache-mib`
+is turned off, before anything is sized from it, whenever a group really streams
+(`kvstream_prefix_host_off`, `kvstream/plan.cpp`): the flag still set but the ring covering the
+context, or a model with no streaming kernel, is not "streaming", and the tier stays on. The startup
+line says which happened either way. **`PrefillStager`/`Mover`**
 (`lendable()` is false for a streamed group, and a 30-line driver issuing one ranged copy a layer is
 smaller than teaching the expert stager KV geometry); **`qsa_select`** (`sel` already holds ids).
 
