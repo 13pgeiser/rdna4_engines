@@ -52,39 +52,53 @@ exact and 112/113 executable cases versus 105/113 and 113/113 in an earlier base
 intervening engine changes. This was a small curated executable subset, not a broad quality test;
 the unmatched baseline prevents attributing the difference, but it does not clear a quality gate.
 
-## Validation on upstream 2d2f638
+## Rebased validation on merged main `2d2f638`
 
-- Host architecture suite, including existing other-model graph pins and HYV3 TP1/TP2 and
-  multi-pass checks: passed.
-- Architecture suite under ASan/UBSan/leak checking: passed.
-- `libr4d`, `r4d_selftest`, and all three HYV3 plugins: compiled for `gfx1201`; no GPU execution.
-- Stored-layout parity suite: 1,145 checks over 20 cases passed, including independent canonical
-  nibble addresses, GPTQ and rotated experts, subgroup codebooks and unaffected dense formats.
-  `libquant` was present and the cases were exercised rather than skipped.
-- Reference arithmetic: 136,622 checks over 254 cases passed with the two incomplete upstream
+- Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed.
+- `gfx1201` `libr4d`, `r4d_selftest`, and all three HYV3 plugins: compiled.
+- Stored-layout parity: 1,145 checks over 20 cases passed, including independent canonical nibble
+  addresses, GPTQ and rotated experts, subgroup codebooks and unaffected dense formats.
+- Reference arithmetic: 136,622 checks over 254 cases passed with the incomplete upstream
   inventory/sweep cases excluded. The new exhaustive BF16-add/cast-chain case passed separately.
-  The full reference suite's three failed assertions were reproduced using unchanged upstream
-  test source: it lists 208 operations while the plugin ships 210 and lacks sweep geometry for
-  `kv_store_streamed` and `kv_resolve`.
+  The unfiltered reference suite's three failed assertions were reproduced with unchanged upstream
+  test source: an operation-count mismatch and missing sweep geometry for `kv_store_streamed` and
+  `kv_resolve`.
+- Full rebased GPU selftest on the designated last R9700 (`gfx1201`, UUID
+  `GPU-7f082536d27449f3`): 9,057 `ok` results, 194 skips, and two failing assertions in one
+  `hc_read_e4m3` test case at M=2048; overall exit 1. The same untouched HC-read test family
+  failed with the pre-follow-up baseline plugin at M=2048 and M=700 (the particular stream/form
+  varied). The PR does not change that kernel or test. This is not a clean full-suite pass.
+- Focused GPU checks passed for `gemm_w4a16_asym_nt_m64`, `moe_gather_bf16`,
+  `qkv_norm_rope_kv_store_h128_bf16` (including byte parity to the split norm/RoPE/store chain),
+  and `rmsnorm_bf16`. The signed-I4 `moe_gemm_w4a8` case had no failures; its exit status was the
+  harness's intentional-skip status for unsupported large-expert aligned tiles. The full run also
+  exercised its HYV3 top-8 gate/up and down cases without failures.
 
-Current upstream runtime sources also include missing `kvstream/bind.h` and `kvstream/stage.h`.
-That blocks a fresh full engine/unit build. The layout/reference checks above compile the existing
-host format/plugin/device sources in a standalone harness, without modifying production sources
-or substituting a runtime. They are not a claim that the complete upstream suite passes.
+A full host engine/unit build was attempted and stops at `core/runtime/ctx.cpp:6` because merged
+main references missing `core/runtime/kvstream/bind.h`, `stage.h` and `plan.h`; they are not in the
+tree or a submodule. This also prevents building the matching ABI-30 HIP-enabled engine needed for
+whole-model tests. The older available GPU engine is ABI 27 and refuses the ABI-30 plugin; the
+current-main host engine has no HIP backend. Accordingly, no fresh HYV3 or Qwen inference A/B ran.
 
-No serving process was stopped, replaced or used for these checks. No GPU correctness run or new
-inference/performance measurement was made during this rebasing pass.
+The user's local Qwen `.rad` was inspected without downloading anything:
+`/mnt/gostar_data/models/StillDeadcode/qwen3.8-27b-mxfp4/qwen3.8-27b-mxfp4.rad` is a 19.4 GB
+`Qwen3_5ForConditionalGeneration` container with `n_expert=0` and group-32 MXFP4 weights. It does
+not exercise this PR's asymmetric W4/W5 or per-128 I4 paths; if run once the engine build is
+available, it can only be a no-regression control for the unchanged MXFP4 path. The attempted
+launches exited before model load. No model was downloaded, no serving route was edited, and no
+serving process was stopped or replaced.
 
 ## Before this PR is ready
 
-1. Clear the upstream full-build and reference-inventory blockers and rerun the full unit suite.
-2. Rerun GPU numerical/guard suites, including asymmetric W4/W5, rotated/mixed-class MoE and
-   normalization/KV-store cases, on the rebased kernels.
-3. Run matched current-base HYV3 control/candidate comparisons on ordinary prose, code and tools,
-   with cold/uncached prompts and unchanged model, precision and deployment settings.
-4. Benchmark and quality-check the other affected W4/W5 and per-128 I4 model paths, including
-   prefill and TP configurations. Unchanged subgroup paths need regression coverage, not an
-   assumed throughput improvement.
+1. Restore/fix the missing upstream KV-stream source and build a matched ABI-30 HIP engine; rerun
+   the full host/unit suite.
+2. Resolve or formally baseline the existing `hc_read_e4m3` GPU test failure so the full GPU suite
+   has a clean, interpretable result; keep any unrelated fix separate from this PR.
+3. Run current-base vs PR HYV3 TP1/TP2 A/Bs on ordinary prose, code and native tools, with cold
+   prompts, identical deployment settings and quality checks.
+4. Use the local Qwen 27B only as an MXFP4 no-regression control. It is not an affected W4/I4 model;
+   check for another already-local artifact that actually uses those encodings, but download none.
+   Measure prefill/decode and quality for every affected model that is available locally.
 
 The cold-weight diagnostics are `r4d_selftest --perfw4`, `--perfw4bf16`, `--perfbf16` and
 `--perfhyv3moe`; see [libr4d/README.md](../../libr4d/README.md). Their byte/canonical checks and
