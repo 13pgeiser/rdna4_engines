@@ -29133,8 +29133,12 @@ impl Gpu {
         let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
             hip_bridge::HipError::new(1, "F32 GEMM dimensions or byte extents overflow")
         })?;
-        if a.dtype != DType::F32
-            || b.dtype != DType::F32
+        // Either input may be a loaded weight (A for the PARO/DeltaNet alpha/beta
+        // projections, B for the DFlash fc). Loaded weights are untyped `Raw`
+        // byte buffers whose logical F32 dtype the caller has already matched.
+        let f32_view = |t: &GpuTensor| matches!(t.dtype, DType::F32 | DType::Raw);
+        if !f32_view(a)
+            || !f32_view(b)
             || y.dtype != DType::F32
             || a.buf.size() < bytes[0]
             || b.buf.size() < bytes[1]
