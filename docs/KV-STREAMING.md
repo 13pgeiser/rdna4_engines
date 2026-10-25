@@ -476,15 +476,16 @@ the advertised 204 800.
 
 ### 3.9 What it costs
 
-Two floors bound `--kv-resident`:
+Two floors bound `--kv-resident`, and the carve takes the larger:
 
 - **Correctness floor**: the largest block union one decode launch selects, 513 blocks (2052
   tokens) at 16k, 64k and 160k of history. A ring under it is **raised to it** at startup, with
   one warning naming both numbers, because a request under it cannot be served from the selection
   table. Under speculation it is `max_seqs x (1 + n_spec) x 513` — **16 416 tokens at 2 sequences
-  and spec 3** — so an 8 192-token request under speculation becomes a 16k ring, and any "8k"
-  label on such an arm is wrong.
-- **Performance floor**: the 24 576 default. The reference implementation measured
+  and spec 3**.
+- **Performance floor**: **32 768 tokens** (`kStreamFloorTokens`), the shipped depth, and the one
+  the engine now **enforces**: any `--kv-resident` under it is raised to it at startup, with a
+  warning that says so. The reference implementation measured
   10 x 2048 = 20 480 cells as the point a smaller ring starts costing, and the decode union is
   four times smaller, so sizing from the union alone lands under it: at 64k of history 24 576 runs
   **37.9 tok/s with 81 908 misses**, 8 192 runs **37.1 with 143 071**, and a ring larger than the
@@ -492,6 +493,12 @@ Two floors bound `--kv-resident`:
   overflow check is a hard requirement. **Run 32 768** (8 192 blocks): above the decode selection
   and well under a 64k context. Starvation is done by the context, never by shrinking the ring —
   a shorter ring is a configuration the engine raises or that no operator deploys.
+
+Both bounds are applied in `kvstream_ring_shape` and clamped to the group's context
+(`--max-model-len` x `--max-num-seqs`), so a context under 32 768 tokens cannot stream at all:
+the ring covers it and the group keeps the base engine's path. The same raised number is what
+`RadBuildCtx::kv_resident_blocks` carries into the declare, because `kv_resolve` sizes its
+residency table from it — a carve deeper than the declared table is refused by the kernel.
 
 A marginal miss is **~0.72-0.83 us** and `kv_resolve`'s per-call cost is **flat across a 6x range
 of slot counts**, so ring size is nearly free; the gap is the miss copies. A decode launch body is
@@ -668,10 +675,13 @@ anything streams. The graph is the one it had plus a buffer the unstreamed path 
 
 ### 5.1 The ring's depth
 
-`--kv-resident` is off by default. When it is used, size it at **32 768**, the performance floor
-(§3.9), not at the decode union. The union (<= 513 blocks, 2052 tokens) is the validation
-ceiling, and a flag under it is raised to it at startup with one warning; under speculation it
-is `max_seqs x (1 + n_spec) x 513`.
+`--kv-resident` is off by default. When it is used, it is never carved below **32 768 tokens**
+(`kStreamFloorTokens`, §3.9): a flag under it is raised to it at startup, and a flag under one
+decode step's selection is raised to that union instead when the union is larger
+(`max_seqs x (1 + n_spec) x 513`). Either way the raise is clamped to the group's context, so a
+model whose whole context is under the floor streams nothing at all. Both bounds are applied in
+one place — `kvstream_ring_shape`, which the budget probe, the carve and the declared
+`kv_resolve.slots` all read — so the ring that is carved is the ring the kernel was sized for.
 
 `kv_pass_view` decides the view: a decode pass within `1 + n_spec` rows a sequence takes the
 ring; every other pass — prefill, a mixed prefill+decode step, and a decode-classified pass
