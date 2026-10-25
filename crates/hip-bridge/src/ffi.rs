@@ -8,11 +8,54 @@
 use crate::error::{HipError, HipResult};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::{DeviceBuffer, MemcpyKind};
+#[cfg(unix)]
+use core::ffi::CStr;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(unix)]
+extern "C" {
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+#[repr(C)]
+#[cfg(unix)]
+struct DlInfo {
+    dli_fname: *const c_char,
+    dli_fbase: *mut c_void,
+    dli_sname: *const c_char,
+    dli_saddr: *mut c_void,
+}
+
+/// Loader-reported path backing `ptr`, for diagnostics only, not object identity.
+#[cfg(unix)]
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = DlInfo {
+        dli_fname: ptr::null(),
+        dli_fbase: ptr::null_mut(),
+        dli_sname: ptr::null(),
+        dli_saddr: ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call.
+    if unsafe { dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(unix))]
+fn dladdr_fname(_ptr: *const c_void) -> Option<String> {
+    None
+}
 
 #[cfg(feature = "kernel-timing")]
 pub mod kernel_timing;
@@ -857,6 +900,22 @@ fn host_maps_qwen4_experts() -> bool {
 }
 
 impl HipRuntime {
+    /// Address of this runtime's resolved `hipEventRecord` implementation.
+    ///
+    /// Compare only while both runtime owners are alive, in the same process.
+    /// Unlike a pathname, this identifies the live implementation even after a
+    /// library is renamed or replaced. It makes no HIP call and does not use a
+    /// process-global first-loader cache: each GPU's actual runtime is checked.
+    pub fn event_record_address(&self) -> usize {
+        self.fn_event_record as usize
+    }
+
+    /// Loader-reported library path for diagnostics. Identity comparisons must
+    /// use [`Self::event_record_address`]; a missing path never proves equality.
+    pub fn mapped_hip_library(&self) -> Option<String> {
+        dladdr_fname(self.fn_event_record as *const c_void)
+    }
+
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
@@ -5301,6 +5360,24 @@ pub struct GraphExec(HipGraphExec);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
+
+#[cfg(test)]
+mod mapped_library_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_lookup_resolves_a_live_symbol_without_hip() {
+        let path = dladdr_fname(dladdr as *const c_void)
+            .expect("the dynamic loader must resolve its own dladdr symbol");
+        assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_lookup_handles_an_unknown_address() {
+        assert_eq!(dladdr_fname(ptr::null()), None);
+    }
+}
 
 #[cfg(test)]
 mod pageable_copy_staging_tests {
