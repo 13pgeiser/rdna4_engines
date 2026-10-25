@@ -342,13 +342,18 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
     const bool once = p_int(a, "norm_once", 0) != 0;
     const char* nk = p_str(a, "norm", "rms");
     const bool layer = std::strcmp(nk, "layer") == 0, none = std::strcmp(nk, "none") == 0;
+    /* The optional trailing column map (slot 9 quant, slot 7 plain): each sequence reads the
+     * modulation table through its mapped COLUMN, so `s` and `g` may hold fewer rows than there
+     * are sequences -- the map's own bound is the issuer's, as in libr4d and libref. */
+    const RadTensor* cm = rad_arg_in(a, quant ? 9 : 7);
     if ((!layer && !none && std::strcmp(nk, "rms") != 0) || (none && W)) return RAD_E_INVAL;
     if (n <= 0 || grp <= 0 || n % grp || (gated && (!Yv || !G))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(quant ? Q : Z, n), n_seq = numel(cu) - 1, ngrp = n / grp;
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
     if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || (W && numel(W) < n) ||
-        numel(S) < n_seq * 2 * n)
+        (!cm && numel(S) < n_seq * 2 * n))
         return RAD_E_SHAPE;
-    if (gated && (rows_of(Yv, n) < rows || numel(G) < n_seq * n)) return RAD_E_SHAPE;
+    if (gated && (rows_of(Yv, n) < rows || (!cm && numel(G) < n_seq * n))) return RAD_E_SHAPE;
     if (quant && (numel(SC) < rows * ngrp || (Z && rows_of(Z, n) < rows))) return RAD_E_SHAPE;
     const uint32_t dt = quant ? (uint32_t)RAD_BF16 : Z->dtype;
     /* The tables from one scratch_raw call, [gain | shift | gate] a sequence and the weight row:
@@ -358,13 +363,15 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
     {
         const int64_t s_rs = row_stride(S, 2 * n), s_cs = laststride(S);
         const int64_t g_rs = gated ? row_stride(G, n) : 0, g_cs = gated ? laststride(G) : 0;
-        for (int64_t e = 0; e < n_seq; ++e)
+        for (int64_t e = 0; e < n_seq; ++e) {
+            const int64_t col = cm ? (int64_t)ldt(cm, e) : e;  /* the sequence's table column */
             for (int64_t i = 0; i < n; ++i) {
                 float* row = tabs + e * tw;
-                row[i] = narrow1(dt, 1.0f + ldt(S, e * s_rs + (n + i) * s_cs));
-                row[n + i] = ldt(S, e * s_rs + i * s_cs);
-                if (gated) row[2 * n + i] = ldt(G, e * g_rs + i * g_cs);
+                row[i] = narrow1(dt, 1.0f + ldt(S, col * s_rs + (n + i) * s_cs));
+                row[n + i] = ldt(S, col * s_rs + i * s_cs);
+                if (gated) row[2 * n + i] = ldt(G, col * g_rs + i * g_cs);
             }
+        }
         for (int64_t i = 0; i < n; ++i)
             tabs[n_seq * tw + i] = W ? ldt(W, i * laststride(W)) + wadd : 1.0f;
     }

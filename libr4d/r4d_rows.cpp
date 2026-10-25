@@ -2620,7 +2620,7 @@ static const RadParamSpec pRmsMod[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_
 static const RadOperandSpec oRmsMod[] = {
     { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
     { "w", RAD_OPD_WEIGHT, 1 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
-    { "z", RAD_OPD_OUT, 0 },
+    { "z", RAD_OPD_OUT, 0 }, { "colmap", RAD_OPD_IN, 1 },
 };
 static const RadParamSpec pRmsModQ[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                          P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
@@ -2629,6 +2629,7 @@ static const RadOperandSpec oRmsModQ[] = {
     { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
     { "w", RAD_OPD_WEIGHT, 1 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
     { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 }, { "z", RAD_OPD_OUT, 1 },
+    { "colmap", RAD_OPD_IN, 1 },
 };
 static const RadOperandSpec oFlowX0[] = {
     { "v", RAD_OPD_IN, 0 }, { "t", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 },

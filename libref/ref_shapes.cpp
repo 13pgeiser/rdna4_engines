@@ -2597,6 +2597,7 @@ int ref_rms_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
     o.t(D, { M, n });                                         /* x, INOUT */
     o.t(D, { M, n });                                         /* z */
+    o.skip();                                                 /* colmap: the sweep passes none */
     return o.finish("rms_mod", operand, out);
 }
 int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2620,6 +2621,7 @@ int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdD
     o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
     o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
     o.t(D, { M, n });                                         /* z */
+    o.skip();                                                 /* colmap: the sweep passes none */
     return o.finish("rms_mod_quant_fp8", operand, out);
 }
 /* The sampler's three scalars in (0, 1), the state f32. */

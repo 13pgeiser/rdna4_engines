@@ -1444,9 +1444,9 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 
 | op | params | operands |
 |---|---|---|
-| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `z` |
-| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
-| `rms_mod_quant_i8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `z`, `colmap`? |
+| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
+| `rms_mod_quant_i8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
 | `flow_res_multistep` | `M`(range) `n` `dtype` | `v`, `x0`:inout, `sigma`, `r`, `hb1`, `hb2`, `order`, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
@@ -1474,6 +1474,10 @@ reads its entry's rows of `s` and `g`.
   `eps`. Without `w` the norm has no gain and rounds once, `n2 = bf16((x - mean) rsqrt(var +
   eps))` (FLUX.3's LayerNorm without an affine). `norm` `none` takes no norm and no gain,
   `n2 = x`, and refuses `w` (LTX-2's text keys and values, modulated as they are).
+  `colmap` (optional, trailing, i32 one per sequence) reads the tables through a column map: every
+  `[e]` above becomes `[colmap[e]]`, so groups that share a modulation cell address one table row
+  across non-contiguous boundaries; when it is bound the `s` and `g` row-count checks drop (the
+  table is sized by columns, not sequences) and the map's own bound is the issuer's.
 - `rms_mod_quant_fp8` is `rms_mod` with the norm chain in bf16, then `quant_act_fp8` of that bf16
   row per `group` as `ln_mod_quant_fp8` takes it; `z` written when bound.
 - `rms_mod_quant_i8` is the same with `quant_act_i8g` in place of `quant_act_fp8`: symmetric int8

@@ -769,13 +769,14 @@ static const RadParamSpec pRmsMod[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P
                                          P_STR("dtype"), P_F64O("wadd"),
                                          P_INTO("norm_once"), P_STRO("norm") };
 static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
-                                          OPD("cu_seqlens"), INOUT("x"), OUT("z") };
+                                          OPD("cu_seqlens"), INOUT("x"), OUT("z"),
+                                          OPD_O("colmap") };
 static const RadParamSpec pRmsModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                           P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
                                          P_INTO("norm_once"), P_STRO("norm") };
 static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                            OPD("cu_seqlens"), INOUT("x"), OUT("q"), OUT("scale"),
-                                           OUT_O("z") };
+                                           OUT_O("z"), OPD_O("colmap") };
 /* `t`, `sigma` and `sigma_next` are one f32 value each. */
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
