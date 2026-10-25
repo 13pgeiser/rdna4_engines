@@ -52,9 +52,15 @@ exact and 112/113 executable cases versus 105/113 and 113/113 in an earlier base
 intervening engine changes. This was a small curated executable subset, not a broad quality test;
 the unmatched baseline prevents attributing the difference, but it does not clear a quality gate.
 
-## Rebased validation on merged main `2d2f638`
+## Validation on the rebased optimization branch
 
-- Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed.
+The GPU, layout and reference results below were recorded with the candidate based on merged main
+`2d2f638`. Main later advanced to `d650eca` with two Gemma4 changes, and the PR branch was rebased
+on it. On that final rebased tip, `arch_test` was rebuilt and passed (`ctest -R arch_test`, 1/1).
+The full host/unit, GPU and inference suites were not rerun after this base advance.
+
+- Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed
+  before the base advance.
 - `gfx1201` `libr4d`, `r4d_selftest`, and all three HYV3 plugins: compiled.
 - Stored-layout parity: 1,145 checks over 20 cases passed, including independent canonical nibble
   addresses, GPTQ and rotated experts, subgroup codebooks and unaffected dense formats.
