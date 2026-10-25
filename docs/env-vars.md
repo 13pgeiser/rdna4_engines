@@ -872,7 +872,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1750
+**Count:** 1755
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1289,7 +1289,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |
 | `HIPFIRE_EMU` | crates/hipfire-arch-deepseek4/src/heterogeneous.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
-| `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
+| `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs | developer |
 | `HIPFIRE_EMU_BF16_H` | crates/hipfire-config/src/emu.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_EMU_CARVEOUT_BYTES` | crates/hipfire-config/src/emu.rs | developer |
 | `HIPFIRE_EMU_GTT_BYTES` | crates/hipfire-cli/src/emu.rs, crates/hipfire-config/src/emu.rs | developer |
@@ -1656,6 +1656,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GLIMMER_SWA_PREFETCH_V` | crates/rdna-compute/examples/bench_glimmer_verify_attention.rs, crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GLIMMER_TAP_LAYERS` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_TIMING` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-generate/src/dense.rs | developer |
+| `HIPFIRE_GLIMMER_TP_CHUNK` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_GLIMMER_TP_GREEDY` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_GLIMMER_TP_MODEL` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_GLIMMER_TP_PARTS` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_GLIMMER_TP_ROWS` | crates/hipfire-arch-muse-glimmer/src/mesh_tp.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_GLIMMER_WMMA_FULL` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GPTQ_BLOCK` | crates/hipfire-quantize/src/gptq.rs | developer |
 | `HIPFIRE_GPTQ_DAMPING` | crates/hipfire-quantize/src/quant_mq.rs | developer |
