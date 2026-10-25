@@ -8379,11 +8379,15 @@ impl DecodeShareBanks {
     }
 }
 
-/// The restore stream and its two events (compute -> restore handoff, restore
-/// completion).
+/// The restore-completion event. The restore copy runs on the compute stream
+/// itself: a dedicated restore stream (even one only ever used for this copy
+/// and its events) left every later compute-stream dispatch ~11 us slower for
+/// the rest of the process whenever HIP mapped the two streams onto one
+/// hardware queue (rocprofv3: median inter-kernel gap 3.1 -> 14.6 us, MTP
+/// decode -20%; reproducible every time with `DEBUG_HIP_DYNAMIC_QUEUES=0`).
+/// The overlap a second stream would buy is kept anyway: the host does not
+/// wait for the copy until the next forward needs the donor tail.
 struct LoanHw {
-    stream: hip_bridge::Stream,
-    ready: hip_bridge::Event,
     done: hip_bridge::Event,
 }
 
@@ -8485,19 +8489,11 @@ impl crate::decode_share_loan::LoanOps for GpuLoanOps<'_> {
         let compute = self.compute()?;
         let hip = &self.gpu.hip;
         let fail = |error: hip_bridge::HipError| error.to_string();
-        // Everything the compute stream ran so far (the borrowed tile that
-        // dirtied the tail, earlier readers) finishes before the copy lands.
-        hip.event_record(&self.hw.ready, Some(compute))
-            .map_err(fail)?;
-        hip.stream_wait_event(&self.hw.stream, &self.hw.ready)
-            .map_err(fail)?;
-        hip.memcpy_htod_async(&dst, src, &self.hw.stream)
-            .map_err(fail)?;
-        hip.event_record(&self.hw.done, Some(&self.hw.stream))
-            .map_err(fail)?;
-        // Later compute-stream work is ordered after the restore even before
-        // the host waits for it.
-        hip.stream_wait_event(compute, &self.hw.done).map_err(fail)
+        // Stream order makes the copy land after every scratch consumer of the
+        // prompt and before any later compute work; the host wait on `done`
+        // is deferred to the next borrowed acquire or resident-bank entry.
+        hip.memcpy_htod_async(&dst, src, compute).map_err(fail)?;
+        hip.event_record(&self.hw.done, Some(compute)).map_err(fail)
     }
 
     fn wait_restore(&mut self) -> Result<(), String> {
@@ -8557,25 +8553,10 @@ impl DonorLoan {
         f(&mut self.controller, &mut ops)
     }
 
-    /// Destroy the restore stream and events after proving them idle, then
-    /// release the claim. Call only after a successful teardown restore.
+    /// Destroy the restore event, then release the claim. Call only after a
+    /// successful teardown restore (the event has completed).
     fn release(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
-        let mut first = gpu.hip.stream_synchronize(&self.hw.stream).err();
-        let LoanHw {
-            stream,
-            ready,
-            done,
-        } = self.hw;
-        for result in [
-            gpu.hip.event_destroy(ready),
-            gpu.hip.event_destroy(done),
-            gpu.hip.stream_destroy(stream),
-        ] {
-            if let Err(error) = result {
-                first.get_or_insert(error);
-            }
-        }
-        first
+        gpu.hip.event_destroy(self.hw.done).err()
     }
 }
 
@@ -9584,28 +9565,9 @@ impl Qwen4GpuForward {
         }
         let claim = lease.claim_decode_share().map_err(invalid)?;
         gpu.ensure_capture_stream()?;
-        let stream = gpu.hip.stream_create_non_blocking()?;
-        let ready = match gpu
+        let done = gpu
             .hip
-            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
-        {
-            Ok(event) => event,
-            Err(error) => {
-                let _ = gpu.hip.stream_destroy(stream);
-                return Err(error.into());
-            }
-        };
-        let done = match gpu
-            .hip
-            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
-        {
-            Ok(event) => event,
-            Err(error) => {
-                let _ = gpu.hip.event_destroy(ready);
-                let _ = gpu.hip.stream_destroy(stream);
-                return Err(error.into());
-            }
-        };
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
         Ok((
             DecodeShareBacking::Donor { base, bytes },
             DonorLoan {
@@ -9614,11 +9576,7 @@ impl Qwen4GpuForward {
                     crate::decode_share::decode_share_log_enabled(),
                 ),
                 claim,
-                hw: LoanHw {
-                    stream,
-                    ready,
-                    done,
-                },
+                hw: LoanHw { done },
                 base,
                 bytes,
                 mirror_cpu,
