@@ -730,7 +730,10 @@ class RadianceMiniMax(io.ComfyNode):
                      f"{KEEPALIVE_SECONDS:.0f}s); `docker logs -f` on the server shows the "
                      "same pace per STEP (a server built after Oct 2026)")
         while True:
-            jr = s.get(f"{base}/v1/videos/{job_id}", timeout=30)
+            # 60 s per request: a healthy status GET answers instantly, but a
+            # busy server (big workflow saturating the box) must not be able to
+            # kill an otherwise-healthy wait on one slow reply
+            jr = s.get(f"{base}/v1/videos/{job_id}", timeout=60)
             jr.raise_for_status()
             j = jr.json()
             status = j.get("status")
