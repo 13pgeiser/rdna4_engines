@@ -8954,6 +8954,72 @@ mod tests {
         }
     }
 
+    /// HIPF-137: a Paro shared gate/up rotates into `x_rot_batch`, so the routed
+    /// Paro input basis must be lowered after the shared stages, not before
+    /// them (otherwise the routed GEMMs read the shared up's rotation).
+    #[test]
+    fn paro_prefill_lowers_the_routed_input_basis_after_the_shared_stages() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_1000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = prefill_scratch(0xE9_1000);
+        let params = MoePrefillParams {
+            batch_size: 21,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            )
+        };
+        let resolution = crate::families::moe::MoePrefillResolution {
+            use_path2: true,
+            paro_mode: true,
+            ..crate::families::moe::MoePrefillResolution::sealed_fp8()
+        };
+        let selection = MoeKernelSelection::Prefill(MoePrefillSelection {
+            resolution,
+            path2_m_total: params.m_total_max,
+            force_mq4_grouped_fp16: false,
+            coalesced_verify: false,
+            route: None,
+            cpu_deferred_experts: false,
+            cpu_split: false,
+            cpwait: false,
+        });
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+        let stages = moe_program::lowered_stages(&call).unwrap();
+        let at = |stage: MoeStage| stages.iter().position(|s| *s == stage).unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|s| **s == MoeStage::InputBasis)
+                .count(),
+            1,
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::SharedGateUp) < at(MoeStage::InputBasis),
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::SharedDown) < at(MoeStage::InputBasis),
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::InputBasis) < at(MoeStage::Scatter),
+            "{stages:?}"
+        );
+    }
+
     /// `with` is `without` plus exactly one `RowGather`, right after the
     /// mutation fence and right before the combine.
     fn assert_gather_between_fence_and_combine(with: &[MoeStage], without: &[MoeStage]) {
