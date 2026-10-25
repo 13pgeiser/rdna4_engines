@@ -939,6 +939,29 @@ extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
+/* gemm_nt_q_gated_mx's weights are gemm_nt_q's mxfp4a8 planes in the same stored forms, but its
+ * `b_ref` is operand 4, where gemm_nt_q has `y`: mapped to gemm_nt_q's index, so both ops ask for
+ * the reference plane in one form and the loader stores it once. */
+static int mx_gated_operand(int operand) {
+    return operand == Q_B || operand == Q_BSCALE ? operand : operand == 4 ? Q_BREF : -1;
+}
+
+extern "C" int r4d_rad_layout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout* out) {
+    const int o = mx_gated_operand(operand);
+    return o < 0 ? RAD_E_UNSUPPORTED : r4d_rad_layout_mxfp4(p, n_p, o, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const RadTensor* pl, int n, void* dst,
+                                            int64_t dst_bytes) {
+    const int o = mx_gated_operand(operand);
+    return o < 0 ? RAD_E_UNSUPPORTED
+                 : r4d_rad_relayout_mxfp4(p, n_p, o, enc, sel, pl, n, dst, dst_bytes);
+}
+
 /* ---- the MoE experts. The weight is staged through LDS, so it is not permuted: the int4 plane is
  * the canonical one with each dword's nibbles reordered for the expansion (byte b holds element b
  * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same

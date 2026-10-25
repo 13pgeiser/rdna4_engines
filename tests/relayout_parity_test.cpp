@@ -9,10 +9,13 @@
  * see. Where the kernel has an inverse, it must give the planes back exactly.
  *
  * libr4d needs a HIP toolchain to build but its layouts do not, so their host sources are compiled
- * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin.
+ * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin. One
+ * test here therefore reaches back into tools/opshapes.cpp: the fallback table sizes the packed
+ * weights these hooks own, and only this file can hold both sides of that claim.
  */
 #include "quant_fixture.h"
 #include "r4d_plugin.h"
+#include "opshapes.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -344,6 +347,87 @@ TEST(mxfp4_codes_exponents_and_the_row_reference) {
     golden("mxfp4", stored("mxfp4", nMx, kp, "rtn", g, "blk.0.ffn_up.weight", N, K, w,
                            { { B, { "codes" } }, { BSCALE, { "scale" } }, { BREF, { "scale" } } }),
            0xc35d26b146836d77ull);
+}
+
+/* tools/opshapes.cpp sizes a packed weight from the kernel's stored form, because no schema states
+ * an extent and libref declines every grid with a zero point (ref_planes.h joins scale and zero
+ * into one operand a description cannot state). A stale entry is not a failed check: rad-tune
+ * allocates what the table says and hands the kernel the short buffer, which is a read past the
+ * allocation on the card, not a refusal. So the table's byte total and the hook's `bytes` must
+ * agree. The table's shapes are the tool's own view -- mxfp4's exponents are [K/32][N] there and
+ * [N][K/32] in the store -- so the totals, not the shapes, are the contract. */
+TEST(the_tool_table_sizes_packed_weights_as_the_kernel_stores_them) {
+    NEED_LIBQUANT();
+    const int64_t N = 128, K = 512, M = 8;
+    auto check = [&](const char* dtype, int64_t group, const Hooks& hk,
+                     const std::vector<const char*>& bscale_roles, Opts qo) {
+        const std::vector<float> w = weight(N, K, 21, 1, group);
+        const Quantised q = quantise(quantizer("rtn"), qo, "output.weight", N, K, w);
+        if (q.status != RAD_OK) {
+            CHECK_EQ(q.status, RAD_OK);
+            return;
+        }
+        Opts kp;
+        kp.i("N", N).i("K", K);
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", N); g.set_i("K", K); g.set_i("group", group);
+        g.set_s("dtype", dtype);
+        std::vector<rad::OpdShape> tab;
+        if (rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab) != RAD_OK) {
+            std::fprintf(stderr, "    %s: the table refuses the geometry\n", dtype);
+            CHECK(false);
+            return;
+        }
+        CHECK_EQ((int)tab.size(), 7);
+        struct P { int operand; size_t opd; std::vector<const char*> roles; };
+        const std::vector<P> ops = { { B, 2, { "codes" } }, { BSCALE, 3, bscale_roles } };
+        for (const P& o : ops) {
+            const Selection s = select(q, N, K, o.roles);
+            RadLayout L{};
+            CHECK_EQ(hk.layout(kp.data(), kp.n(), o.operand, &q.enc, s.sel.data(), s.t.data(),
+                               (int)s.t.size(), &L), RAD_OK);
+            const rad::OpdShape& t = tab[o.opd];
+            const int64_t got = t.absent ? 0 : rad_dtype_bytes(t.dtype, rad::rad_numel(t.shape));
+            if (got != (int64_t)L.bytes)
+                std::fprintf(stderr, "    %s operand %d: the table sizes %lld byte(s), the kernel "
+                                     "stores %lld\n", dtype, o.operand, (long long)got,
+                             (long long)L.bytes);
+            CHECK_EQ(got, (int64_t)L.bytes);
+        }
+    };
+    {
+        Opts qo;
+        qo.s("codes", "u2").s("zero", "u8").i("group", 128).s("scale", "f16");
+        check("w2a8", 128, nW2, { "scale", "zero" }, qo);
+    }
+    {
+        Opts qo;
+        qo.s("codes", "fp4_e2m1").i("group", 32).s("scale", "e8m0");
+        check("mxfp4a8", 32, nMx, { "scale" }, qo);
+    }
+    /* The guards are the kernel's own: K a whole number of 128-column blocks
+     * (r4d_layout.cpp refuses a weight whose K is not), N a whole number of 16-row tiles (the
+     * row's constraint), and the group the stored form has. A geometry the kernel would refuse has
+     * to be refused here too, or rad-tune would size buffers for a launch that never happens. */
+    auto refuses = [&](int64_t n, int64_t k, int64_t group) {
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", n); g.set_i("K", k); g.set_i("group", group);
+        g.set_s("dtype", "w2a8");
+        std::vector<rad::OpdShape> tab;
+        CHECK_EQ(rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab), RAD_E_UNSUPPORTED);
+    };
+    refuses(128, 500, 128);      /* K leaves a partial block */
+    refuses(120, 512, 128);      /* N leaves a partial tile */
+    refuses(128, 512, 64);       /* a group the stored form does not have */
+    /* The shape the DFlash2 draft head tunes at on a two-rank serve, which the kernel takes. */
+    {
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", 124160); g.set_i("K", 2560); g.set_i("group", 128);
+        g.set_s("dtype", "w2a8");
+        std::vector<rad::OpdShape> tab;
+        CHECK_EQ(rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab), RAD_OK);
+        CHECK_EQ((int)tab.size(), 7);
+    }
 }
 
 TEST(moe_int4_experts_plain_and_rotated_both_classes) {

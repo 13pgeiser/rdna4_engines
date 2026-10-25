@@ -535,6 +535,7 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
 
 extern "C" {
 
+int  rad_dev_peer_access(int self, int peer)      { return rad::dev_peer_access(self, peer); }
 
 int  rad_event_create_as(RadEvent* out, unsigned flags) {
     const int s = dev()->event_create(out, flags);

@@ -25,6 +25,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
+| Ornith-1.5-122B FP8, MTP, vision, four cards | `ornith-1.5-122b-fp8.rad` (118 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8) | `ornith-1.5-122b.yaml` |
+| Ornith-1.5-122B FP8, DFlash2 drafter, vision, four cards | `ornith-1.5-122b-fp8-dflash2.rad` (116 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8-dflash2) | `ornith-1.5-122b-df2.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), MTP, vision, four cards | `ornith-1.5-122b-w4a8.rad` (65 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8) | `ornith-1.5-122b-w4a8.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), DFlash2 drafter, vision, four cards | `ornith-1.5-122b-w4a8-dflash2.rad` (64 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8-dflash2) | `ornith-1.5-122b-w4a8-df2.yaml` |
 | Sage-A1.5 FP8, MTP, vision | `sage-a1.5-fp8.rad` (35 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8) | `sage-a1.5.yaml`, `sage-a1.5-tp1.yaml` |
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
@@ -36,6 +40,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-bf16.rad` (16 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-i8g.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B 4-bit (int4 feed-forward, GPTQ, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-a4.rad` (11 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-a4) | `nemotron-3.5-bolt-e4b-a4.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |

@@ -415,13 +415,18 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     unsigned int* const Lpk = (unsigned int*)loc_pack;
     float* const Lsc = (float*)(loc_pack + loc_scale_off);
 
+    unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
     if constexpr (WIRE == 0) {
         /* Push my rows into the peer's slot. `x` is a tight [M][n] of bf16 (the launcher refuses a
          * pitched one), so a row range is a 16B-word range. */
         const int wpr = (int)(n >> 3);
         const int wend = r1 * wpr;
         const int4* const in4 = (const int4*)x;
-        for (int k = r0 * wpr + (int)tid; k < wend; k += (int)THR) ps[k] = in4[k];
+        for (int k = r0 * wpr + (int)tid; k < wend; k += (int)THR) {
+            const int4 v = in4[k];
+            ps[k] = v;
+            hck += r4d_archk_u4(v, 4u * (unsigned)k);
+        }
     } else {
         /* Rotate, amax, quantise and pack straight into the peer's slot. A wave owns whole chunks,
          * so every lane emits ARQ_NWORD dwords per chunk and the flush is lane-uniform. No group is
@@ -449,8 +454,10 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 float sc = (a > 0.0f) ? bf2f(f2bf(a * (1.0f / (float)ARQ_QMAX))) : 1.0f;
                 if (!(sc > 0.0f)) sc = 1.0f;
                 if (lig == 0) {
-                    p_sc[g] = (unsigned short)(__float_as_uint(sc) >> 16);
+                    const unsigned short sc16 = (unsigned short)(__float_as_uint(sc) >> 16);
+                    p_sc[g] = sc16;
                     Lsc[g] = sc;
+                    hck += r4d_archk_mix(sc16, R4D_ARCHK_U16 + (unsigned)g);
                 }
                 const float inv = 1.0f / sc;
 #pragma unroll
@@ -464,21 +471,33 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
             }
             /* Flush lane-contiguously, widest region first, so each is one coalesced store. */
             char* const pb = p_pay + (size_t)c * ARQ_CBYTES;
+            const unsigned int cd = (unsigned)c * (ARQ_CBYTES / 4);   // the chunk's first dword
 #pragma unroll
-            for (int w4 = 0; w4 + 4 <= ARQ_NWORD; w4 += 4)
+            for (int w4 = 0; w4 + 4 <= ARQ_NWORD; w4 += 4) {
                 *(uint4*)(pb + w4 * 4 * ARQ_WV + lane * 16) =
                     make_uint4(acc[w4], acc[w4 + 1], acc[w4 + 2], acc[w4 + 3]);
-            if constexpr (ARQ_NWORD % 4 >= 2)
+                hck += r4d_archk_u4(make_uint4(acc[w4], acc[w4 + 1], acc[w4 + 2], acc[w4 + 3]),
+                                    cd + (unsigned)(w4 * ARQ_WV) + lane * 4u);
+            }
+            if constexpr (ARQ_NWORD % 4 >= 2) {
                 *(uint2*)(pb + (ARQ_NWORD & ~3) * 4 * ARQ_WV + lane * 8) =
                     make_uint2(acc[ARQ_NWORD & ~3], acc[(ARQ_NWORD & ~3) + 1]);
-            if constexpr (ARQ_NWORD % 2 == 1)
+                const unsigned int e = cd + (unsigned)((ARQ_NWORD & ~3) * ARQ_WV) + lane * 2u;
+                hck += r4d_archk_mix(acc[ARQ_NWORD & ~3], e) +
+                       r4d_archk_mix(acc[(ARQ_NWORD & ~3) + 1], e + 1u);
+            }
+            if constexpr (ARQ_NWORD % 2 == 1) {
                 *(unsigned int*)(pb + (ARQ_NWORD - 1) * 4 * ARQ_WV + lane * 4) =
                     acc[ARQ_NWORD - 1];
+                hck += r4d_archk_mix(acc[ARQ_NWORD - 1],
+                                     cd + (unsigned)((ARQ_NWORD - 1) * ARQ_WV) + lane);
+            }
 #pragma unroll
             for (int wi = 0; wi < ARQ_NWORD; ++wi)
                 Lpk[((size_t)c * ARQ_NWORD + wi) * ARQ_WV + lane] = acc[wi];
         }
     }
+    r4d_archk_put(hck, peer_flags, nbw, s_slot, (unsigned)b, sq);
     /* The drain modes are r4d_ar_oneshot_2rank_exact's, selected by the same variant table. */
     if (drain == 1) __threadfence_system();
     else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
@@ -495,6 +514,37 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     }
     __syncthreads();
     if (acq) __threadfence_system();
+    r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, sq, [&](unsigned int& h) {
+        if constexpr (WIRE == 0) {
+            const int wpr = (int)(n >> 3);
+            const int4* const m4 = (const int4*)ms;
+            for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR)
+                h += r4d_archk_u4(m4[k], 4u * (unsigned)k);
+        } else {
+            for (int ci = (int)wave; ci < cpb; ci += (int)(THR / ARQ_WV)) {
+                const int c = c00 + ci;
+                const char* const pb = m_pay + (size_t)c * ARQ_CBYTES;
+                const unsigned int cd = (unsigned)c * (ARQ_CBYTES / 4);
+#pragma unroll
+                for (int w4 = 0; w4 + 4 <= ARQ_NWORD; w4 += 4)
+                    h += r4d_archk_u4(*(const uint4*)(pb + w4 * 4 * ARQ_WV + lane * 16),
+                                      cd + (unsigned)(w4 * ARQ_WV) + lane * 4u);
+                if constexpr (ARQ_NWORD % 4 >= 2) {
+                    const uint2 u = *(const uint2*)(pb + (ARQ_NWORD & ~3) * 4 * ARQ_WV + lane * 8);
+                    const unsigned int e = cd + (unsigned)((ARQ_NWORD & ~3) * ARQ_WV) + lane * 2u;
+                    h += r4d_archk_mix(u.x, e) + r4d_archk_mix(u.y, e + 1u);
+                }
+                if constexpr (ARQ_NWORD % 2 == 1)
+                    h += r4d_archk_mix(*(const unsigned int*)(pb + (ARQ_NWORD - 1) * 4 * ARQ_WV + lane * 4),
+                                       cd + (unsigned)((ARQ_NWORD - 1) * ARQ_WV) + lane);
+#pragma unroll
+                for (int t = 0; t < ARQ_ITERS; ++t) {
+                    const int g = c * ARQ_CG + t * ARQ_GPW + gw;
+                    if (lig == 0) h += r4d_archk_mix(m_sc[g], R4D_ARCHK_U16 + (unsigned)g);
+                }
+            }
+        }
+    });
 
     if constexpr (WIRE == 6) {
         /* Reduce: unpack both halves of every chunk this block owns, add in fp32, inverse-rotate,
