@@ -29,6 +29,7 @@
 //! ([`Via::Slot`]).
 pub mod copy;
 pub mod kernel;
+pub mod mq6;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod plan;
