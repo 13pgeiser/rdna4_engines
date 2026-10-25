@@ -154,6 +154,11 @@ void kvstream_ring(const Config& cfg, int64_t ctx, int64_t block_size, int64_t s
  * than once a rank. A group whose architecture declares no streamed ops (kvstream_ops) is not
  * priced for streaming at all: that is the same RAD_OK, with `cfg.kv_streams` left false, so the
  * configuration is exactly the one without --kv-resident. */
+/* Turn the host tier off when a streamed group means no entry can be demoted to it. Returns the
+ * MiB it turned off (0 if the tier was not on, or nothing streams), so the caller states it once.
+ * Call after kvstream_cap_probe, before anything is sized from --prefix-cache-mib. */
+int64_t kvstream_prefix_host_off(Config& cfg);
+
 int kvstream_cap_probe(KVManager& probe, Config& cfg, const Program& prog, int64_t ctx);
 
 }  /* namespace rad */
