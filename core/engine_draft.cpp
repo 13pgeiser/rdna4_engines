@@ -30,6 +30,8 @@ int Engine::step_state_init() {
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+    /* The scheduler's rule for a step that ends its requests reads the same ids (step_next). */
+    sched_.set_eog(eog);
     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
     for (auto& rk : ranks_) {

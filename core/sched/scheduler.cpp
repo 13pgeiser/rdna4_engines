@@ -1823,6 +1823,42 @@ const RadBatch* Scheduler::step_next() {
     return b;
 }
 
+void Scheduler::set_eog(std::vector<int32_t> ids) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    eog_ = std::move(ids);
+}
+
+bool Scheduler::is_eog(int32_t id) const {
+    return std::binary_search(eog_.begin(), eog_.end(), id);
+}
+
+/* Whether the step just issued ends every request it carries: when it can bring each to its
+ * max_tokens -- certainly with the token it emits, possibly with the drafts it verifies, since it
+ * commits that token and every draft it accepts -- or, most likely, when those drafts hold an
+ * end-of-generation id (not for an ignore_eos request). A step issued ahead behind it would verify
+ * nothing, its rows' requests finished by the commit in between, yet the card runs its whole
+ * forward pass and the drafter's passes behind it, and a request that arrives once the last token
+ * is out (a client's next turn, sent as this one ends) queues behind them: a decode step of TTFT
+ * (#225). A guess that misses (a drafted end the verify rejects, or too few drafts accepted to
+ * reach max_tokens) costs one step built after the commit instead of before it. */
+bool Scheduler::ends_every_request() const {
+    for (const StepEntry& e : plan_.e) {
+        if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) return false;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (!s.req || s.req->state != ReqState::Running) return false;
+        const Request& r = *s.req;
+        const int32_t n_drafts = e.draft ? std::min(e.n_spec, e.n_draft) : 0;
+        if (r.max_tokens > 0 && (int64_t)r.output.size() + 1 + n_drafts >= r.max_tokens) continue;
+        if (r.ignore_eos || n_drafts == 0) return false;
+        bool end = false;
+        for (int32_t k = 0; k < n_drafts && !end; ++k) end = is_eog(e.draft[k]);
+        if (!end) return false;
+    }
+    return !plan_.e.empty();
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes. */
@@ -1830,6 +1866,9 @@ const RadBatch* Scheduler::step_next_locked() {
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* Nothing behind a step that ends every request it carries (ends_every_request). Before the
+     * loop below, which reserves the next step's KV. */
+    if (ends_every_request()) return nullptr;
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -2118,6 +2157,20 @@ int Scheduler::commit(const StepResult& res) {
             close_request(s, ReqState::Finished, "length", carried);
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
+        }
+        /* -v: a step issued ahead behind a request this commit ended verifies nothing; why the
+         * rule in step_next_locked let it through (ends_every_request). */
+        if (carried && r.state != ReqState::Running && (int)log_level() >= (int)Log::Debug) {
+            const int32_t acc = res.n_accepted ? res.n_accepted[i] : 0;
+            bool drafted_end = false;
+            for (int32_t k = 0; e.draft && k < std::min(e.n_spec, e.n_draft); ++k)
+                drafted_end = drafted_end || is_eog(e.draft[k]);
+            RAD_DEBUG("request %llu ended (%s) with a step issued ahead behind it: %d token(s) "
+                      "this step, %d of %d draft(s) accepted, %zu of max_tokens %d, %s",
+                      (unsigned long long)r.id, r.finish_reason.c_str(), (int)acc + 1, (int)acc,
+                      (int)e.n_spec, r.output.size(), (int)r.max_tokens,
+                      drafted_end ? "an end-of-generation id among the drafts"
+                                  : "no end-of-generation id among the drafts");
         }
         committed_.push_back({e.seq, (uint64_t)r.output.size(), r.state == ReqState::Running});
     }

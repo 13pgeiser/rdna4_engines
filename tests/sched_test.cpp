@@ -4012,6 +4012,64 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     CHECK(f.sch.step_next() != nullptr);
 }
 
+/* No step is issued ahead behind one that ends every request it carries (#225): its rows would
+ * belong to finished requests, and a request arriving after the last token would wait out its
+ * forward pass. The verify ends a request most likely when its drafts hold an end-of-generation
+ * id, certainly when its first token is the request's last (max_tokens), and possibly when that
+ * token and its accepted drafts reach max_tokens. An ignore_eos request's drafted end ends
+ * nothing, nor do drafts without one, and a request that even every draft accepted leaves short
+ * of max_tokens goes on. The refusal reserves nothing for the step it does not issue. */
+TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
+    constexpr int32_t kEog = 2;
+    int32_t ends[4] = { 21, kEog, 23, 24 }, goes_on[4] = { 21, 22, 23, 24 };
+    /* One request: its prompt's token committed, then the verify of `draft`. */
+    auto ahead = [&](const int32_t* draft, int max_tokens, bool ignore_eos) -> bool {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog, 3 });
+        const uint64_t id = f.submit(160, max_tokens, 0, ignore_eos);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, draft, 4));
+        const bool verify = f.sch.step() != nullptr;
+        CHECK(verify);
+        if (!verify) return false;
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+        f.sch.find(id)->speculation_fixed = true;
+        f.sch.expect_draft(id, 4);
+        const int64_t free_before = f.kv.free_blocks(0);
+        const bool issued = f.sch.step_next() != nullptr;
+        if (!issued) CHECK_EQ(f.kv.free_blocks(0), free_before);
+        return issued;
+    };
+    CHECK(ahead(goes_on, 64, false));
+    CHECK(!ahead(ends, 64, false));               /* a drafted end */
+    CHECK(ahead(ends, 64, true));                 /* ignore_eos: an end-of-text like any token */
+    CHECK(!ahead(goes_on, 2, false));             /* one token committed, its next the last */
+    CHECK(!ahead(goes_on, 6, false));             /* 1 + its token + 4 accepted drafts reach it */
+    CHECK(ahead(goes_on, 7, false));              /* all four accepted leave it a token short */
+
+    /* Two requests: one ends, the other goes on, so the step is issued ahead for both. */
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    f.sch.set_eog({ kEog });
+    const uint64_t a = f.submit(160, 64), b = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, ends, 4));
+    CHECK_OK(f.sch.set_draft(b, goes_on, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);
+}
+
 /* The context bounds a sequence whatever max_tokens says, "no limit" included. Positions past the
  * last one the deployment can address have no rotary row or block-table column; a sequence
  * running into them would corrupt memory instead of stopping. */
@@ -4966,13 +5024,15 @@ TEST(a_cancel_while_a_step_runs_ahead_keeps_the_request_until_that_step_commits)
 }
 
 /* A request that finishes at the commit of a step whose successor is already issued keeps its
- * blocks for that successor, which writes them, and returns them at its commit. */
+ * blocks for that successor, which writes them, and returns them at its commit. The end is one
+ * the scheduler could not see coming (an end-of-text it did not draft): a step known to end the
+ * request issues nothing ahead (no_step_is_issued_ahead_behind_one_that_ends_its_requests). */
 TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_step) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
     const int64_t before = f.kv.free_blocks(0);
-    auto r = f.request(40, /*max_tokens=*/2);
+    auto r = f.request(40, /*max_tokens=*/64);
     r->speculation_fixed = true;
     const uint64_t a = f.add(std::move(r));
     REQUIRE(f.sch.step() != nullptr);
@@ -4980,7 +5040,7 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     REQUIRE(f.sch.step() != nullptr);
     REQUIRE(f.sch.step_next() != nullptr);
     const int64_t held = f.kv.free_blocks(0);
-    f.commit_plain();                              /* the second token: finished */
+    CHECK_OK(f.commit(7, /*eos=*/1));              /* the second token, an end of text: finished */
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
     CHECK_EQ(f.kv.free_blocks(0), held);
     f.sch.promote_next();

@@ -1813,6 +1813,29 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
     CHECK_EQ(spec.stop(), 0);
 }
 
+/* The step that emits a request's last token issues nothing behind it: a step issued ahead for a
+ * request the commit then finishes verifies nothing, and the next request would wait out its
+ * forward pass (#225). A reply of 32 tokens is the prefill's token and 31 decode steps, each
+ * issued ahead of the one before it, and no 32nd. Twice, so the second request starts behind the
+ * first's last step. */
+TEST(a_requests_last_step_issues_no_step_ahead) {
+    REQUIRE(world().ok);
+    Server plain;
+    REQUIRE(plain.start(world().lfm2, kPlain));
+    for (uint64_t seed : { 6, 7 }) {
+        const std::vector<int32_t> t =
+            tokens_of(post(plain.port, "/completion", completion(prompt_ids(seed, 80), 32)));
+        CHECK_EQ(t.size(), (size_t)32);
+    }
+    const double decode = metric(plain.port, "radiance:engine_steps_decode_total");
+    const double ahead = metric(plain.port, "radiance:engine_steps_ahead_total");
+    if (decode != 62.0 || ahead != 62.0)
+        fprintf(stderr, "    decode steps %g, issued ahead %g\n", decode, ahead);
+    CHECK_EQ(decode, 62.0);
+    CHECK_EQ(ahead, 62.0);
+    CHECK_EQ(plain.stop(), 0);
+}
+
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones
  * over the whole prompt. Each decoded position's probabilities must be what a cold prefill of the
  * prompt and the tokens before it gives: exactly where both paths compute each row the same way

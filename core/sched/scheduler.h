@@ -274,6 +274,10 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* The vocabulary's end-of-generation ids, the ones the card's acceptance reads: step_next()
+     * issues no step ahead behind one whose drafts end every request it carries. Set once at
+     * start; none (the default) leaves only the max_tokens half of that rule. */
+    void     set_eog(std::vector<int32_t> ids);
     /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
      * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
      * conversation is queued or running: its blocks would be skipped as live and its close
@@ -307,6 +311,8 @@ public:
     void            expect_draft(uint64_t id, int n);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
+    /* Whether the step just issued ends every request it carries (step_next_locked). */
+    bool            ends_every_request() const;
     void            promote_next();
     /* Fold the step's outcome back in: append tokens, roll back rejected speculation, retire
      * finished requests, feed the draft controller. */
@@ -475,6 +481,9 @@ private:
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
      * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
     bool          hit_holes_trunk_ = false;
+    /* The end-of-generation ids, sorted and unique (set_eog), and a lookup in them. */
+    std::vector<int32_t> eog_;
+    bool          is_eog(int32_t id) const;
     /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
      * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
      * not declare one, in which case admission and commit are exactly as before. A sequence with
