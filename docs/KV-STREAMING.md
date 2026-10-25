@@ -432,11 +432,15 @@ declared **and linked** both ops for that group — `kv_resolve` and a streamed 
 
 | `--kv-resident` | the group that would stream | `--prefix-cache-mib` | result |
 |---|---|---|---|
-| absent or `0` | any | any | nothing streams; host tier exactly as configured |
-| at or above the group's context limit | any | any | the ring covers the context, so nothing streams; host tier as configured |
-| above zero, under the context limit | no streamed path: dense attention, a windowed group, or a packed `fp8_v4` / `k6_v4` cache | any | flag ignored with one sentence naming what is missing; host tier as configured |
-| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `0` | nothing to hold; the prefix cache is VRAM-only |
-| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `> 0` | **host tier switched off at startup, its MiB not reserved**, and the flag reports `0 (off)` |
+| absent or `0` | any | any | **streaming off** (nobody asked); prefix cache and host tier exactly as configured |
+| at or above the group's context limit | any | any | **streaming off** — the ring would cover the context, so every block keeps its own slot; host tier as configured |
+| above zero, under the context limit | no streamed path: dense attention, a windowed group, or a packed `fp8_v4` / `k6_v4` cache | any | **streaming off** — flag ignored with one sentence naming what is missing; host tier as configured |
+| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `0` | **streaming on**; prefix cache works from VRAM only (no host tier was configured, none is used) |
+| above zero, under the context limit | streams: full group, fp8/bf16 cache, resolve and store both linked | `> 0` | **streaming on**; the host tier is switched off at startup, its MiB not reserved, and the flag reports `0 (off)` |
+
+The two "on" rows both mean: streaming works, prefix-cache hits work, and only the RAM overflow tier
+is gone — in the fourth row because it was never sized, in the fifth because streaming makes it
+unusable.
 
 "Streaming" here is the engine's answer, not the flag's (`kvstream_prefix_host_off`,
 `kvstream/plan.cpp`; `cfg.kv_streams`): the ring must be under the group's context and the
