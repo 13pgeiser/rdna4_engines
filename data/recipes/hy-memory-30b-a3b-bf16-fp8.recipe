@@ -1,0 +1,19 @@
+# HYV3 from the BF16 checkpoint, with attention, dense/shared projections and routed experts rounded
+# to block FP8. F32 scale planes are intentional: MoeFP8 format 9 consumes a 128x128 grid with
+# F32 scales. Activations are dynamically quantized to E4M3 at runtime; the BF16 output head, router,
+# norms and embeddings stay as stored.
+#
+#   rad-convert <Hy-Memory-30B-A3B-BF16> \
+#       --recipe data/recipes/hy-memory-30b-a3b-bf16-fp8.recipe -o hy-memory-30b-a3b-fp8.rad
+
+blk.*.attn_q.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.*.attn_k.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.*.attn_v.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=f32
+
+blk.0.ffn_gate_up.weight             rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.0.ffn_down.weight                rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp8_e4m3 block=128x128 scale=f32
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=f32
+
+blk.*.ffn_*_exps.*.weight            rtn  codes=fp8_e4m3 block=128x128 scale=f32

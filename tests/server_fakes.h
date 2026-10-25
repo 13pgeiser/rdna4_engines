@@ -370,6 +370,34 @@ inline std::shared_ptr<IReplyParser> qwen_reply_parser(const json& tools) {
     return std::make_shared<ReplyParserBridge>(rp);
 }
 
+/* Hy-Memory's native outer call section, name prefix, and tagged argument wire format. */
+inline std::shared_ptr<IReplyParser> hyv3_reply_parser(const json& tools) {
+    ChatFormat f;
+    f.reasoning_open = "<think>";
+    f.reasoning_close = "</think>";
+    f.reasoning_breaks = { "<tool_calls>" };
+    f.section_open = "<tool_calls>";
+    f.section_close = "</tool_calls>";
+    f.name_prefix = "<tool_call>";
+    f.name_suffix = "<tool_sep>";
+    f.call_end = "</tool_call>";
+    f.arg_prefix = "<arg_key>";
+    f.arg_name_suffix = "</arg_key>\n";
+    f.arg_value_prefix = "<arg_value>";
+    f.arg_value_suffix = "</arg_value>";
+    f.string_value = ChatValue::Raw;
+    f.other_value = ChatValue::Json;
+    f.triggers = { "<tool_calls>" };
+    std::shared_ptr<const ReplyFormat> rf;
+    std::string why;
+    if (ReplyFormat::compile(f, &rf, &why) < 0) return nullptr;
+    ReplyOptions ro;
+    ro.tools = &tools;
+    std::shared_ptr<const ReplyParser> rp;
+    if (ReplyParser::create(rf, ro, &rp, &why) < 0) return nullptr;
+    return std::make_shared<ReplyParserBridge>(rp);
+}
+
 struct FakeGrammar : IGrammarCompiler {
     int from_json_schema(const json&, std::string& out, std::string&) const override {
         out = "root ::= object";

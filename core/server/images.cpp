@@ -65,7 +65,7 @@ struct ImgReq {
     std::string background = "auto", format = "png", quality = "auto";
     int32_t     compression = -1;
     bool        stream = false;
-    bool        rebalance = false;
+    int32_t     rebalance = 0;   /* RadGenBatch::cond_opts: RAD_GEN_COND_REBALANCE and its preset */
     std::vector<mm::FrameRGBA> images;
     bool        has_mask = false;
     mm::FrameRGBA mask;
@@ -397,14 +397,32 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         r.seed = (uint64_t)body["seed"].get<int64_t>();
         r.seed_given = body["seed"].is_number_unsigned() || body["seed"].get<int64_t>() != -1;
     }
-    /* The conditioning at the plugin's fixed rebalance gains (Krea 2: its text taps at
-     * ConditioningKrea2Rebalance's defaults). `false` is accepted everywhere. */
+    /* The conditioning at the plugin's fixed rebalance gains (Krea 2: its text taps). true or
+     * "legacy" ConditioningKrea2Rebalance's defaults; "balanced", "detail", "subtle" the
+     * comfyui-krea2-conditioning presets at the taps' RMS, on a model that declares presets
+     * (RAD_GEN_COND_REBALANCE_PRESET). `false` is accepted everywhere. */
     if (body.contains("rebalance") && !body["rebalance"].is_null()) {
-        if (!body["rebalance"].is_boolean())
-            return error_response(err_bad("rebalance", "expected true or false"), req.peer);
-        r.rebalance = body["rebalance"].get<bool>();
+        const json& rb = body["rebalance"];
+        static const char* const kPresets[] = { "legacy", "balanced", "detail", "subtle" };
+        bool ok = rb.is_boolean();
+        if (ok) r.rebalance = rb.get<bool>() ? RAD_GEN_COND_REBALANCE : 0;
+        else if (rb.is_string())
+            for (int i = 0; i < 4; ++i)
+                if (rb.get<std::string>() == kPresets[i]) {
+                    r.rebalance = RAD_GEN_COND_REBALANCE | (i << RAD_GEN_COND_REBALANCE_PRESET_SHIFT);
+                    ok = true;
+                }
+        if (!ok)
+            return error_response(err_bad("rebalance", "expected true, false, \"legacy\", "
+                                                       "\"balanced\", \"detail\" or \"subtle\""),
+                                  req.peer);
         if (r.rebalance && !(info.cond_opts & RAD_GEN_COND_REBALANCE))
             return error_response(err_unsupported("rebalance", "this model has no rebalance"),
+                                  req.peer);
+        if ((r.rebalance & RAD_GEN_COND_REBALANCE_PRESET) &&
+            !(info.cond_opts & RAD_GEN_COND_REBALANCE_PRESET))
+            return error_response(err_unsupported("rebalance", "this model's rebalance has no "
+                                                               "presets; use true"),
                                   req.peer);
     }
     if (str("negative_prompt", &r.negative) < 0)
@@ -539,7 +557,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     g->scheduler = r.scheduler;
     g->seed = r.seed;
     g->previews = r.previews;
-    g->cond_opts = r.rebalance ? RAD_GEN_COND_REBALANCE : 0;
+    g->cond_opts = r.rebalance;
     /* The driver guides as uncond + cfg (cond - uncond); a card's cond + s (cond - uncond) is
      * that at s + 1. */
     g->cfg = (float)(info.cfg_original ? r.cfg + 1.0 : r.cfg);

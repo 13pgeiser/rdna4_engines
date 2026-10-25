@@ -720,12 +720,15 @@ struct ReplyFormat::Impl {
     ChatFormat  f;
     /* Each tag split into its core and the whitespace around it that is optional to match. */
     std::string open_core, open_trail, close_core, close_trail, ns_core, ns_trail, end_core,
-                end_trail, co_core, co_trail;
+                end_trail, co_core, co_trail, section_open_core, section_close_core;
     /* What begins a call in content. First the format's own opener: call_open's core, or
      * name_prefix when calls are not wrapped. A wrapped format also takes name_prefix alone,
      * second, since models often write a call without its wrapper; a wrapper written without
      * its trailing whitespace is read too. */
-    std::vector<std::string> openers;
+    std::vector<std::string> openers, text_markers;
+    size_t section_open_hit = (size_t)-1, section_close_hit = (size_t)-1;
+    size_t think_open_hit = (size_t)-1, think_close_hit = (size_t)-1;
+    size_t body_section_close_hit = (size_t)-1;
     /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. */
     std::string name_end;
     /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so it was
@@ -792,6 +795,16 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     split_ws(f.call_open, &m.co_core, &m.co_trail);
     if (f.call_open.empty()) m.openers = { f.name_prefix };
     else m.openers = { m.co_core, f.name_prefix };
+    m.text_markers = m.openers;
+    if (!f.section_open.empty()) {
+        std::string section_trail;
+        split_ws(f.section_open, &m.section_open_core, &section_trail);
+        split_ws(f.section_close, &m.section_close_core, &section_trail);
+        m.section_open_hit = m.text_markers.size();
+        m.text_markers.push_back(m.section_open_core);
+        m.section_close_hit = m.text_markers.size();
+        m.text_markers.push_back(m.section_close_core);
+    }
     m.name_end = f.arg_name_suffix + f.arg_value_prefix;
     m.object = f.has_tools() && f.object_args();
     m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
@@ -808,15 +821,16 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.think_breaks.build(b);
     }
     if (f.reasoning_anywhere && f.has_reasoning()) {
-        std::vector<std::string> t;
-        if (f.has_tools()) t = m.openers;
+        std::vector<std::string> t = m.text_markers;
+        m.think_open_hit = t.size();
         t.push_back(m.open_core);
+        m.think_close_hit = t.size();
         t.push_back(m.close_core);
         m.text_think.build(t);
         m.think_only.build({ m.open_core, m.close_core });
     }
     if (m.object) {
-        m.text.build(m.openers);
+        m.text.build(m.text_markers);
         std::string trail;
         split_ws(f.call_close, &m.cc_core, &trail);
         std::vector<std::string> bare{ ",", "}", "]" }, key{ ":", ",", "}" };
@@ -851,7 +865,7 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.obj_bare.build(bare);
         m.obj_key.build(key);
     } else if (f.has_tools()) {
-        m.text.build(m.openers);
+        m.text.build(m.text_markers);
         m.arg_name.build({ m.name_end });
         m.value.build({ f.arg_value_suffix });
         std::string trail;
@@ -864,11 +878,17 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
             return a.find(b) == std::string::npos && b.find(a) == std::string::npos;
         };
         if (!apart(m.cc_core, f.arg_prefix) || !apart(m.cc_core, m.end_core)) m.cc_core.clear();
-        if (m.cc_core.empty()) m.junk.build({ f.arg_prefix, m.end_core });
-        else m.junk.build({ f.arg_prefix, m.end_core, m.cc_core });
+        std::vector<std::string> junk{ f.arg_prefix, m.end_core };
+        if (!m.cc_core.empty()) junk.push_back(m.cc_core);
+        if (!m.section_close_core.empty()) {
+            m.body_section_close_hit = junk.size();
+            junk.push_back(m.section_close_core);
+        }
+        m.junk.build(junk);
     }
-    const std::string* const delims[] = { &f.reasoning_open, &f.reasoning_close, &f.call_open,
-                                          &f.call_close, &f.name_prefix, &f.name_suffix,
+    const std::string* const delims[] = { &f.reasoning_open, &f.reasoning_close, &f.section_open,
+                                          &f.section_close, &f.call_open, &f.call_close,
+                                          &f.name_prefix, &f.name_suffix,
                                           &f.call_end, &f.arg_prefix, &m.name_end,
                                           &f.arg_value_suffix, &f.object_string_open,
                                           &f.object_string_close };
@@ -1139,6 +1159,11 @@ struct ReplyStream::Impl {
     St   st;
     bool strict = true, finished = false, fed_tail = false;
     bool post_call = false;             /* content after a call */
+    bool section_active = false;
+    size_t section_calls_at_open = 0;
+    /* The last completed inner call is not executable until another call starts or the outer
+     * section closes. Deferring CallEnd keeps truncation consistent with the one-shot parse. */
+    size_t pending_section_call = (size_t)-1;
 
     /* delimiter scan */
     uint16_t    ds = 0;
@@ -1413,6 +1438,40 @@ struct ReplyStream::Impl {
         return p + 1;
     }
 
+    void complete_section_call() {
+        if (pending_section_call == (size_t)-1) return;
+        msg.calls[pending_section_call].closed = true;
+        event(ReplyEvent::CallEnd, (uint32_t)pending_section_call, {});
+        pending_section_call = (size_t)-1;
+    }
+
+    void open_section() {
+        if (section_active) { lenient(); return; }
+        section_active = true;
+        section_calls_at_open = calls;
+    }
+
+    void close_section() {
+        if (!section_active) { lenient(); return; }
+        if (calls == section_calls_at_open) lenient();
+        complete_section_call();
+        section_active = false;
+    }
+
+    /* A section close before call_end leaves the last call incomplete: it must never be exposed
+     * as an executable tool call. Keep its bytes available to content_with_open_call(). */
+    void abandon_call_at_section_close() {
+        lenient();
+        if (cur == 2) publish(2, true);
+        cur = -1;
+        section_active = false;
+        post_call = false;
+        ds = 0;
+        hold.clear();
+        lhold.clear();
+        st = St::Text;
+    }
+
     /* The call opener has matched at `att`; whether a call follows is decided below. */
     void begin_attempt(St from) {
         origin = from;
@@ -1472,6 +1531,7 @@ struct ReplyStream::Impl {
     }
 
     void begin_call(bool exact) {
+        complete_section_call();
         if (!exact || tool < 0) lenient();
         if (!P.opt.parallel_tool_calls && calls > 0) lenient();
         if (cur >= 0) publish(cur, false);
@@ -1810,8 +1870,12 @@ struct ReplyStream::Impl {
             args_out(close);
         }
         publish(2, true);
-        msg.calls.back().closed = true;
-        event(ReplyEvent::CallEnd, (uint32_t)msg.calls.size() - 1, {});
+        if (section_active) {
+            pending_section_call = msg.calls.size() - 1;
+        } else {
+            msg.calls.back().closed = true;
+            event(ReplyEvent::CallEnd, (uint32_t)msg.calls.size() - 1, {});
+        }
         cur = -1;
         lpos = 0;
         lhold.clear();
@@ -1984,9 +2048,19 @@ struct ReplyStream::Impl {
             p = scan(d, p, e, &hit, [this](const char* q, size_t n) { think_out(q, n); });
             if (hit == 0) { trail = 0; st = St::ThinkCloseWs; }
             else if (hit > 0) {
-                att = d.pattern(hit);
-                att_at = here(p) - att.size();
-                begin_attempt(St::Think);
+                const std::string& marker = d.pattern(hit);
+                if (!F.section_open_core.empty() && marker == F.section_open_core) {
+                    open_section();
+                    st = St::Text;
+                } else if (!F.section_open_core.empty() && !section_active) {
+                    /* A call-looking tag cannot bypass the required outer section, including
+                     * when it appears in an unclosed reasoning block. */
+                    think_out(marker.data(), marker.size());
+                } else {
+                    att = marker;
+                    att_at = here(p) - att.size();
+                    begin_attempt(St::Think);
+                }
             }
             return p;
         }
@@ -2004,14 +2078,35 @@ struct ReplyStream::Impl {
             }
             p = scan(*text_dfa, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
             if (hit < 0) return p;
+            if (P.anywhere && !P.calls) {
+                if (hit == 0) { trail = 0; st = St::ThinkOpenWs; }
+                else lenient();  /* A reasoning close with no block open. */
+                return p;
+            }
             if ((size_t)hit < n_open) {
-                att_at = here(p) - F.openers[(size_t)hit].size();
-                begin_text_attempt(hit);
-            } else if ((size_t)hit == n_open) {
+                if (!F.section_open_core.empty() && !section_active) {
+                    /* The call-looking tag is ordinary content outside the required wrapper. */
+                    const std::string& marker = F.text_markers[(size_t)hit];
+                    text_out(marker.data(), marker.size());
+                } else {
+                    att_at = here(p) - F.openers[(size_t)hit].size();
+                    begin_text_attempt(hit);
+                }
+            } else if ((size_t)hit == F.section_open_hit) {
+                open_section();
+            } else if ((size_t)hit == F.section_close_hit) {
+                if (!section_active) {
+                    lenient();
+                    const std::string& marker = F.text_markers[(size_t)hit];
+                    text_out(marker.data(), marker.size());
+                } else {
+                    close_section();
+                }
+            } else if ((size_t)hit == F.think_open_hit) {
                 /* A reasoning block opens again, later in the reply. */
                 trail = 0;
                 st = St::ThinkOpenWs;
-            } else {
+            } else if ((size_t)hit == F.think_close_hit) {
                 /* Its close with no block open: not part of the answer. */
                 lenient();
             }
@@ -2153,10 +2248,12 @@ struct ReplyStream::Impl {
             const std::string& ap = F.f.arg_prefix;
             const std::string& fc = F.end_core;
             const std::string& cc = F.cc_core;
+            const std::string& sc = F.section_close_core;
             const bool a_ok = extends(ap, c);
             const bool f_ok = extends(fc, c);
             const bool c_ok = wrapped && extends(cc, c);
-            if (!a_ok && !f_ok && !c_ok) {
+            const bool s_ok = !sc.empty() && extends(sc, c);
+            if (!a_ok && !f_ok && !c_ok && !s_ok) {
                 lenient();
                 st = St::Junk;
                 ds = 0;
@@ -2171,6 +2268,7 @@ struct ReplyStream::Impl {
             if (a_ok && lpos == ap.size()) { start_arg(); return p + 1; }
             if (f_ok && lpos == fc.size()) { finish_call_strictness(); end_core_done(); return p + 1; }
             if (c_ok && lpos == cc.size()) { end_call_at_close(); return p + 1; }
+            if (s_ok && lpos == sc.size()) { abandon_call_at_section_close(); return p + 1; }
             return p + 1;
         }
 
@@ -2251,6 +2349,8 @@ struct ReplyStream::Impl {
             p = scan(F.junk, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
             if (hit == 0) start_arg();
             else if (hit == 1) end_core_done();
+            else if (hit >= 0 && (size_t)hit == F.body_section_close_hit)
+                abandon_call_at_section_close();
             else if (hit == 2 && wrapped) end_call_at_close();
             else if (hit == 2) text_out(F.cc_core.data(), F.cc_core.size());
             return p;
@@ -2803,6 +2903,10 @@ struct ReplyStream::Impl {
             break;
         default:
             break;
+        }
+        if (section_active) {
+            lenient();
+            section_active = false;
         }
         hold.clear();
         ds = 0;

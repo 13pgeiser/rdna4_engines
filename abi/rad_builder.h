@@ -1554,14 +1554,13 @@ typedef struct RadChatFormat {
     const char* reasoning_open;      /* "" when the model does not reason */
     const char* reasoning_close;
     /* Literals that end a reasoning block the model forgot to close, when a call starts there.
-     * Each must be the call opener: `call_open`, or `name_prefix` when there is no call_open. */
+     * Each must be a call opener (`call_open`, or `name_prefix` without one) or section_open. */
     const char* const* reasoning_breaks;
     uint32_t    n_reasoning_breaks;
     uint32_t    reasoning_in_prompt; /* RAD_CHAT_THINK_* */
 
-    /* Around all of a turn's calls, and between two calls beyond whitespace. The parser does not
-     * read these yet, so a format that sets one is refused at startup by name; they are fields so
-     * supporting them later does not change the struct. */
+    /* Around the complete list of calls. section_open and section_close must be set together.
+     * call_separator is additional text between calls beyond whitespace; it is not supported. */
     const char* section_open;
     const char* section_close;
     const char* call_separator;

@@ -273,6 +273,9 @@ and runs.
 | `qwen35_fp8` | the same, block-scaled fp8 |
 | `qwen35_w8a8` | the same, an int8 trunk rotated by a 128-wide Hadamard |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
+| `hyv3_bf16` | Tencent Hy-Memory-30B-A3B BF16 checkpoint; BF16, W4, W8A8, block-FP8 and MXFP4 recipes, TP1/2 |
+| `hyv3_fp8` | Tencent Hy-Memory-30B-A3B FP8 checkpoint: imported FP8 weights, dense-first MoE, TP1/2, BF16 or static-scaled E4M3 KV |
+| `hyv3_gguf` | llama.cpp Hy-Memory Q4_K_M input converted via `hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`; requires `--tokenizer <BF16-checkpoint>/tokenizer.json` |
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
 | `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
@@ -2385,7 +2388,7 @@ more field:
 
 | field | |
 |---|---|
-| `rebalance` | `true` multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1); it applies to the negative prompt's conditioning too. `false` (the default) is the plain model. A boolean, or `true`/`false`/`1`/`0` in a form; a model without it refuses `true` with a 400 |
+| `rebalance` | `true` (or `"legacy"`) multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1), about nine times the taps' RMS; it applies to the negative prompt's conditioning too. `"balanced"`, `"detail"` and `"subtle"` are comfyui-krea2-conditioning's presets (renormalize on, multiplier 1): their per-layer weights times a constant that keeps the taps' RMS, measured over twenty prompts through Krea 2 Turbo's text encoder (`scripts/krea2_rebalance_calib.py`; the node's per-prompt factor stayed within 1.7 % of it), so they shift the balance between layers without the default's overall gain. `false` (the default) is the plain model. A boolean or a preset's name, also in a form (`true`/`false`/`1`/`0` or the name); a model without it refuses anything but `false` with a 400 |
 
 **Anima** makes RGB pictures, 1024x1024 by default, sides rounded down to multiples of 16, up to
 1536x1536 (9216 latent tokens; the card's range is 512x512 to 1536x1536). Base and Aesthetic run 30

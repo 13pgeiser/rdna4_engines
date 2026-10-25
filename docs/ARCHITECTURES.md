@@ -11,6 +11,9 @@ plugin claims.
 | `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made block fp8 by a recipe or kept bf16. MiniCPM5-2B |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
+| `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4, W8A8, block-FP8 or MXFP4 weights by recipe; TP1/2, BF16 KV |
+| `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8; imported per-tensor E4M3 weights, one dense layer then sigmoid-routed MoE; TP1/2, BF16 or static-scaled E4M3 KV |
+| `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
@@ -285,6 +288,57 @@ depth 7 it accepts ~49% of the proposals and decodes 1.40x faster than the same 
 head (393 against 282 tok/s on two R9700s). `sage-a1.5-mxfp4-df2.rad` is the same with the trunk,
 the experts and the drafter's linears at MXFP4. `--num-speculative-tokens auto` takes the depth the
 drafter states.
+
+## `hyv3`
+
+`arch/hyv3_bf16` supports the Tencent BF16 safetensors checkpoint, and `arch/hyv3_fp8` supports
+Tencent's FP8 checkpoint. Both use the same graph: 48 layers, with a dense first
+MLP followed by 47 layers routing top-8 of 128 experts. The routed and shared MLP widths are both
+768 in the checkpoint tensors. Attention applies per-head Q/K RMSNorm before NeoX RoPE. Routing selects
+with sigmoid scores plus the correction bias, but normalizes the selected unbiased scores and
+multiplies them by 2.826. Routed and shared BF16 outputs are reduced independently at TP2, then added
+in FP32 and rounded once to BF16 before the residual add.
+
+Convert the public FP8 checkpoint with
+`data/recipes/hy-memory-30b-a3b-fp8.recipe`; it preserves the E4M3 codes and expands the checkpoint's
+scalar F32 scales to the 128x128 F32 scale planes the GEMMs read. Norms and the router projection
+are widened to F32. Linear activations use Radiance's dynamic FP8 quantization; the checkpoint's
+static `.input_scale` calibration scalars are ignored, so numerical parity with vendor quantization
+is not established. The checkpoint index includes scalar per-layer K/V descales from
+`kv_cache_scales.safetensors`; conversion carries them into metadata for `kv_store` and paged
+attention. Use `--kv-cache-dtype fp8` for the checkpoint's static-scaled E4M3 cache, or `bf16` for a
+higher-precision cache. The plugin refuses the unrelated `fp8_v4` and `k6_v4` cache layouts.
+The vendor FP8-source import and static-scaled FP8 KV path have structural/unit coverage only;
+an end-to-end conversion and serving run of Tencent's FP8 checkpoint is not yet validated.
+This is distinct from the BF16-derived block-FP8 artifact tested below.
+
+The BF16 checkpoint can be converted without quantizing any weights, or with
+`data/recipes/hy-memory-30b-a3b-bf16-w4.recipe`, which quantizes attention projections, the first
+dense MLP and routed experts to INT4. Shared MLPs, router, norms, embeddings and the output head stay
+BF16. The asymmetric linear W4A8 and signed expert W4A8 kernels use dynamic INT8 activations.
+BF16-source block-FP8 and MXFP4 recipes quantize experts and regular linears; the W8 recipe quantizes
+regular linears and the output head while routed experts remain BF16. Use TP2 at serve time if one
+device cannot hold the model and cache.
+
+The local llama.cpp Q4_K_M source is supported by `arch/hyv3_gguf` and
+`data/recipes/hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`. It decodes Q4_K/Q6_K source tensors and
+re-quantizes them to native Radiance encodings; this adds loss to an already-quantized checkpoint.
+The GGUF's `hunyuan-dense` pre-tokenizer name is not in Radiance's tokenizer table, so pass the
+matching BF16 repository's `tokenizer.json` with `--tokenizer`. Prefer the BF16 source recipe when
+available. Both the BF16 W4 and GGUF-to-W4 artifacts passed a short TP2 generation smoke test; the
+BF16-source W8, block-FP8 and MXFP4 variants did too. These checks establish basic loading and
+inference only, not numerical parity or broad quality.
+
+The plugins declare the native OpenAI tool-call format: an outer `<tool_calls>` section,
+`<tool_call>NAME<tool_sep>` calls, and tagged `<arg_key>`/`<arg_value>` arguments. The parser and
+grammar preserve that section in non-streaming and streaming responses and accept replayed
+OpenAI tool results through the checkpoint's chat template. When `reasoning_effort` is `low` or
+`high`, the template opens `<think>` in the generation prompt and the parser returns that block
+as reasoning rather than answer text. The default template effort is `no_think`.
+
+Architecture tests cover geometry, GGUF tensor maps, dense-to-MoE scheduling, TP1/TP2 graph lint,
+and FP32 combine order; checkpoint tests cover Q4_K/Q6_K block decoding. Numerical parity against Tencent/llama.cpp
+remains untested.
 
 ## `qwen35_w8a8`
 

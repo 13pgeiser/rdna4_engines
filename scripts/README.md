@@ -24,6 +24,7 @@ and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname 
 | `convfn.sh` | Rebuilds the container `fnserve.sh` serves, as `w4nl64-i8lm.new.rad` beside it, from `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`. Needs `CALIB=<dir>`: the recipe's expert rule runs GPTQ against the calibration Grams there (`docs/MOE-W4.md`). |
 | `hfget.sh` | Fetches a Hugging Face repo with `curl` and `jq`. Resumable, and skips the duplicate weight formats a repo often carries beside its safetensors. `radiance --model <repo id>` runs it. |
 | `krea2_native.py` | Rewrites a Krea 2 DiT single file in Krea's own key names (`turbo.safetensors`, civitai and ComfyUI finetunes) as diffusers' transformer file, bytes unchanged, so it converts as the `transformer/` of a Krea 2 pipeline directory (`docs/GUIDE.md`). |
+| `krea2_rebalance_calib.py` | Measures the constant of each Krea 2 rebalance preset (`rebalance`: balanced, detail, subtle): the taps' mean squares over twenty prompts through a pipeline's text encoder, and the renormalising factor arch/krea2 holds for them (`docs/GUIDE.md`). Needs torch and transformers. |
 
 ## Measuring
 

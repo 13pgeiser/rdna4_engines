@@ -104,7 +104,7 @@ struct ChatFormat {
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
      * format has no tool calls. */
-    std::string section_open, section_close;  /* around all calls; not read yet, must be empty */
+    std::string section_open, section_close;  /* around the complete list of calls */
     /* Between two calls, beyond whitespace (a JSON-array format would use ", "). Tagged calls are
      * self-delimiting. Not read yet, must be empty. */
     std::string call_separator;

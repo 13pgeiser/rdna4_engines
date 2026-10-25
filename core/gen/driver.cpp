@@ -119,10 +119,11 @@ int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>&
     kv_     = kv;
     ranks_  = ranks;
     table_  = DiscreteTable{};
-    if (decl_.cond_opts & ~(uint32_t)RAD_GEN_COND_REBALANCE) {
+    if (decl_.cond_opts & ~(uint32_t)(RAD_GEN_COND_REBALANCE | RAD_GEN_COND_REBALANCE_PRESET)) {
         RAD_ERR("image generator: '%s' declares conditioning options 0x%x, and this engine knows "
-                "only RAD_GEN_COND_REBALANCE (0x%x)", decl_.name ? decl_.name : "",
-                (unsigned)decl_.cond_opts, (unsigned)RAD_GEN_COND_REBALANCE);
+                "only RAD_GEN_COND_REBALANCE (0x%x) and its preset (0x%x)",
+                decl_.name ? decl_.name : "", (unsigned)decl_.cond_opts, (unsigned)RAD_GEN_COND_REBALANCE,
+                (unsigned)RAD_GEN_COND_REBALANCE_PRESET);
         return RAD_E_UNSUPPORTED;
     }
     if (discrete()) {

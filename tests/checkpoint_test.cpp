@@ -60,7 +60,8 @@ void write_shard(const std::string& path, const std::vector<T>& ts) {
     const uint64_t n = hdr.size();
     std::fwrite(&n, 8, 1, f);
     std::fwrite(hdr.data(), 1, hdr.size(), f);
-    for (const T& t : ts) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
+    for (const T& t : ts)
+        if (!t.bytes.empty()) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
     std::fclose(f);
 }
 
@@ -85,6 +86,12 @@ T bf16(const std::string& name, std::vector<int64_t> shape, float tag) {
     for (int64_t s : shape) n *= s;
     t.bytes.resize((size_t)n * 2);
     for (int64_t i = 0; i < n; ++i) rad_store_f32(t.bytes.data(), RAD_BF16, i, tag + (float)(i % 64));
+    return t;
+}
+
+T cache_scale_f32(const std::string& name, float value) {
+    T t{ name, "F32", {1}, std::vector<uint8_t>(4) };
+    std::memcpy(t.bytes.data(), &value, sizeof value);
     return t;
 }
 
@@ -1684,6 +1691,53 @@ struct ConfigCase {
 
 }  /* namespace */
 
+TEST(hyv3_static_kv_cache_scales_are_carried_into_model_metadata) {
+    const std::string dir = fresh_dir();
+    write_file(dir + "/config.json", R"({"model_type":"hy_v3","num_hidden_layers":1})");
+    write_shard(dir + "/kv_cache_scales.safetensors", {
+        cache_scale_f32("model.layers.0.self_attn.k_cache.scale", 0.0376674123f),
+        cache_scale_f32("model.layers.0.self_attn.v_cache.scale", 0.0004359654f),
+    });
+    write_file(dir + "/model.safetensors.index.json",
+               R"({"weight_map":{"model.layers.0.self_attn.k_cache.scale":"kv_cache_scales.safetensors","model.layers.0.self_attn.v_cache.scale":"kv_cache_scales.safetensors"}})");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const char* k = ck.meta().get("hyv3.kv_cache.0.k_scale");
+    const char* v = ck.meta().get("hyv3.kv_cache.0.v_scale");
+    REQUIRE(k && v);
+    CHECK(std::fabs(std::strtod(k, nullptr) - 0.0376674123) < 1e-9);
+    CHECK(std::fabs(std::strtod(v, nullptr) - 0.0004359654) < 1e-10);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(hyv3_static_kv_cache_scales_reject_invalid_values_and_shapes) {
+    const char* name = "model.layers.0.self_attn.k_cache.scale";
+    std::vector<T> invalid;
+    for (float value : {0.0f, -1.0f, NAN, INFINITY})
+        invalid.push_back(cache_scale_f32(name, value));
+    invalid.push_back(bf16(name, {1}, 1.0f));
+    T nonscalar = cache_scale_f32(name, 1.0f);
+    nonscalar.shape = {2};
+    nonscalar.bytes.resize(8);
+    invalid.push_back(std::move(nonscalar));
+    for (const T& t : invalid) {
+        const std::string dir = write_checkpoint({t},
+            R"({"model_type":"hy_v3","num_hidden_layers":1})");
+        Checkpoint ck;
+        CHECK_EQ(ck.open(dir), RAD_E_FORMAT);
+    }
+    /* A true rank-zero scalar and a one-element vector both satisfy the checkpoint contract. */
+    T scalar = cache_scale_f32(name, 0.5f);
+    scalar.shape.clear();
+    const std::string dir = write_checkpoint({scalar},
+        R"({"model_type":"hy_v3","num_hidden_layers":1})");
+    Checkpoint ck;
+    CHECK_OK(ck.open(dir));
+    const char* scale = ck.meta().get("hyv3.kv_cache.0.k_scale");
+    REQUIRE(scale != nullptr);
+    CHECK_EQ(std::strtod(scale, nullptr), 0.5);
+}
+
 TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
     const ConfigCase cases[] = {
         { "a multimodal MoE: text_config first, head_dim read rather than derived, the expert "
@@ -1815,8 +1869,7 @@ TEST(a_concat_declared_in_pieces_joins_every_piece_in_order) {
 /* ================================================================== GGUF as a source
  *
  * A GGUF tensor's dimensions are stored fastest first and are reversed once into the row-major
- * shape everything else uses; the legacy block types decode by their definitions; a K-quant is
- * refused with its name, not decoded as something else. */
+ * shape everything else uses; the legacy and Q4_K/Q6_K block types decode by their definitions. */
 namespace {
 
 struct GKv {
@@ -1951,7 +2004,22 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     const std::string dir = fresh_dir();
     const std::string path = dir + "/m.gguf";
     std::vector<float> w8, w40, w41, w50, w51;
-    GTensor k4{ "t.q4_k", 12, { 256, 2 }, std::vector<uint8_t>(2 * 144, 0) };
+    std::vector<uint8_t> q4k(144, 0);
+    const uint16_t q4d = h16(0.5f), q4min = h16(0.25f);
+    std::memcpy(q4k.data(), &q4d, 2);
+    std::memcpy(q4k.data() + 2, &q4min, 2);
+    const uint8_t q4scales[12] = {0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+                                   0x47, 0x48, 0x21, 0x32, 0x43, 0x54};
+    std::memcpy(q4k.data() + 4, q4scales, sizeof q4scales);
+    q4k[16] = 0x21;       /* low/high nibbles of values 0 and 32 */
+    q4k[16 + 64] = 0x32;  /* values 128 and 160, including packed high scale bits */
+    GTensor k4{ "t.q4_k", 12, { 256, 1 }, q4k };
+    std::vector<uint8_t> q6k(210, 0);
+    const uint16_t q6d = h16(0.5f);
+    std::memcpy(q6k.data() + 208, &q6d, 2);
+    q6k[0] = 0x21; q6k[32] = 0x43; q6k[128] = 0xD3;
+    q6k[192] = 2; q6k[194] = 3; q6k[196] = 4; q6k[198] = 5;
+    GTensor k6{ "t.q6_k", 14, { 256, 1 }, q6k };
     GTensor f16{ "t.f16", 1, { 64, 4, 2 }, {} };
     for (int i = 0; i < 64 * 4 * 2; ++i) {
         const uint16_t v = h16((float)i * 0.5f);
@@ -1961,7 +2029,7 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     write_gguf(path, llama_kvs(7),
                { legacy_blocks("t.q8_0", 8, &w8), legacy_blocks("t.q4_0", 2, &w40),
                  legacy_blocks("t.q4_1", 3, &w41), legacy_blocks("t.q5_0", 6, &w50),
-                 legacy_blocks("t.q5_1", 7, &w51), k4, f16 });
+                 legacy_blocks("t.q5_1", 7, &w51), k4, k6, f16 });
     Checkpoint ck;
     REQUIRE_EQ(ck.open(path), RAD_OK);
     CHECK(ck.is_gguf());
@@ -1973,6 +2041,7 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         { "t.q5_1", &w51 } };
     for (const auto& l : legacy) prog.name_map.push_back(map(l.name, RAD_MAP_COPY, { l.name }));
     prog.name_map.push_back(map("t.q4_k", RAD_MAP_COPY, { "t.q4_k" }));
+    prog.name_map.push_back(map("t.q6_k", RAD_MAP_COPY, { "t.q6_k" }));
     prog.name_map.push_back(map("t.f16", RAD_MAP_COPY, { "t.f16" }));
     std::string why;
     for (const auto& l : legacy) {
@@ -1996,11 +2065,24 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     {
         CkptWeight w;
         REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q4_k", false, &w, &why), RAD_OK);
-        CHECK_EQ(w.shape[0], (int64_t)2);
+        CHECK_EQ(w.shape[0], (int64_t)1);
         CHECK_EQ(w.shape[1], (int64_t)256);
         std::vector<float> f(256);
-        CHECK_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), (int)RAD_E_UNSUPPORTED);
-        CHECK(has(why, "q4_K"));
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+        CHECK_EQ(f[0], -0.75f);
+        CHECK_EQ(f[32], 0.5f);
+        CHECK_EQ(f[128], 12.5f);
+        CHECK_EQ(f[160], 22.25f);
+    }
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q6_k", false, &w, &why), RAD_OK);
+        std::vector<float> f(256);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+        CHECK_EQ(f[0], 17.0f);
+        CHECK_EQ(f[32], -43.5f);
+        CHECK_EQ(f[64], -28.0f);
+        CHECK_EQ(f[96], 50.0f);
     }
     {
         /* A plain f16 tensor of rank 3 is trivial and reversed in every dimension. */
@@ -2042,6 +2124,59 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         REQUIRE_EQ(c2.open(p2), RAD_OK);
         CHECK_EQ(c2.meta().quant, std::string());
     }
+}
+
+TEST(hyv3_gguf_metadata_normalizes_architecture_and_config_fields) {
+    const std::string path = fresh_dir() + "/hyv3.gguf";
+    const std::vector<GKv> kvs = {
+        { "general.architecture", 8, 0, { "hy_v3" } },
+        { "hy_v3.block_count", 4, 2, {} },
+        { "hy_v3.embedding_length", 4, 4, {} },
+        { "hy_v3.attention.head_count", 4, 2, {} },
+        { "hy_v3.attention.head_count_kv", 4, 1, {} },
+        { "hy_v3.attention.key_length", 4, 2, {} },
+        { "hy_v3.feed_forward_length", 4, 8, {} },
+        { "hy_v3.context_length", 4, 1024, {} },
+        { "hy_v3.expert_count", 4, 4, {} },
+        { "hy_v3.expert_used_count", 4, 2, {} },
+        { "hy_v3.expert_feed_forward_length", 4, 2, {} },
+        { "hy_v3.expert_shared_feed_forward_length", 4, 2, {} },
+        { "hy_v3.expert_weights_norm", 4, 1, {} },
+        { "hy_v3.expert_weights_scale", 6, 2.826, {} },
+        { "hy_v3.expert_gating_func", 4, 2, {} },
+        { "hy_v3.attention.layer_norm_rms_epsilon", 6, 1e-5, {} },
+        { "hy_v3.rope.freq_base", 6, 11158840.0, {} },
+        { "tokenizer.ggml.tokens", 9, 0, { "a", "b" } },
+        { "general.file_type", 4, 15, {} },
+    };
+    auto f32 = [](const char* name, std::vector<uint64_t> ne) {
+        size_t count = 1;
+        for (uint64_t d : ne) count *= (size_t)d;
+        return GTensor{ name, 0, std::move(ne), std::vector<uint8_t>(count * sizeof(float), 0) };
+    };
+    write_gguf(path, kvs, { f32("token_embd.weight", {4, 4}),
+                             f32("blk.0.attn_q_norm.weight", {2}),
+                             f32("blk.0.attn_k_norm.weight", {2}),
+                             f32("blk.0.ffn_gate.weight", {4, 4}),
+                             f32("blk.1.ffn_gate_inp.weight", {4, 4}),
+                             f32("blk.1.exp_probs_b", {4}) });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("hyv3"));
+    CHECK_EQ(ck.meta().quant, std::string("gguf_ftype_15"));
+    CHECK_EQ(ck.meta().m.n_vocab, (int64_t)4);  /* matrix rows exceed tokenizer strings */
+    CHECK_EQ(std::string(ck.meta().get("qk_norm")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("moe_router_use_sigmoid")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("moe_router_enable_expert_bias")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("enable_moe_fp32_combine")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("route_norm")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("first_k_dense_replace")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("num_shared_experts")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("expert_hidden_dim")), std::string("2"));
+    CHECK_EQ(std::string(ck.meta().get("moe_intermediate_size")), std::string("4"));
+    CHECK_EQ(std::string(ck.meta().get("num_experts")), std::string("4"));
+    CHECK_EQ(std::string(ck.meta().get("num_experts_per_tok")), std::string("2"));
+    CHECK_EQ(ck.meta().get("router_scaling_factor") != nullptr, true);
 }
 
 /* ================================================================== a diffusers pipeline

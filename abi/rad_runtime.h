@@ -453,8 +453,13 @@ typedef struct RadGenBatch {
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
 enum {
-    RAD_GEN_COND_REBALANCE = 1   /* the conditioning at the plugin's fixed rebalance gains (the
+    RAD_GEN_COND_REBALANCE = 1,  /* the conditioning at the plugin's fixed rebalance gains (the
                                   * request field `rebalance`; Krea 2: its text taps) */
+    /* which of the plugin's rebalance presets, beside RAD_GEN_COND_REBALANCE: 0 its default
+     * gains, Krea 2: 1 balanced, 2 detail, 3 subtle (arch/krea2). A plugin declares these bits in
+     * RadGeneratorDecl::cond_opts when it has presets. */
+    RAD_GEN_COND_REBALANCE_PRESET = 0xff00,
+    RAD_GEN_COND_REBALANCE_PRESET_SHIFT = 8
 };
 
 /* An entry's flags on a DENOISE pass. */

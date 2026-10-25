@@ -173,15 +173,34 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         return reasoning_anywhere_check(f, why);
     }
 
-    if (!f.section_open.empty() || !f.section_close.empty())
-        return no("a section around all calls (section_open/section_close) is not read by the "
-                  "streaming parser");
+    if (f.section_open.empty() != f.section_close.empty())
+        return no("section_open and section_close must be set together");
+    if (!f.section_open.empty()) {
+        const std::string so = trim_ws(f.section_open), sc = trim_ws(f.section_close);
+        if (so.empty() || sc.empty()) return no("section_open/section_close may not be whitespace");
+        if (so != f.section_open || sc != f.section_close)
+            return no("section_open/section_close must not have surrounding whitespace");
+        if (confusable(so, sc))
+            return no("section_open " + show(so) + " and section_close " + show(sc) +
+                      " cannot be told apart");
+        for (const std::string* d : { &f.reasoning_open, &f.reasoning_close, &f.call_open,
+                                      &f.call_close, &f.name_prefix, &f.name_suffix,
+                                      &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
+                                      &f.arg_value_prefix, &f.arg_value_suffix }) {
+            if (!d->empty() && confusable(so, trim_ws(*d)))
+                return no("section_open " + show(so) + " overlaps delimiter " + show(*d));
+            if (!d->empty() && confusable(sc, trim_ws(*d)))
+                return no("section_close " + show(sc) + " overlaps delimiter " + show(*d));
+        }
+    }
     if (!f.call_separator.empty())
         return no("a separator between calls (call_separator " + show(f.call_separator) +
                   ") is not read by the streaming parser; tagged calls separate on whitespace");
     if (f.call_open.empty() && !f.call_close.empty())
         return no("call_close without call_open");
     const bool object = f.object_args();
+    if (object && !f.section_open.empty())
+        return no("section-wrapped object arguments are not supported");
     /* Without a suffix the name ends at what follows it: the object's `{`, or a tagged call's
      * first argument or close. */
     if (!f.name_suffix.empty()) {
@@ -238,9 +257,10 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
                       show(f.name_prefix) + " cannot be told apart");
     }
     const std::string opener = f.call_open.empty() ? f.name_prefix : f.call_open;
+    const std::string section_opener = trim_ws(f.section_open);
     for (const std::string& b : f.reasoning_breaks)
-        if (b != opener)
-            return no("reasoning break " + show(b) + " is not the call opener " + show(opener));
+        if (b != opener && (section_opener.empty() || b != section_opener))
+            return no("reasoning break " + show(b) + " is not a call or section opener");
     if (!f.reasoning_breaks.empty() && !f.has_reasoning())
         return no("reasoning_breaks without a reasoning block");
     for (const std::string& t : f.triggers)
@@ -432,6 +452,8 @@ std::string chat_format_describe(const ChatFormat& f) {
              (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
+    if (f.has_tools() && !f.section_open.empty())
+        s += "; section " + show(f.section_open) + ".." + show(f.section_close);
     if (f.has_tools() && f.object_args()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " {OBJECT";
@@ -912,11 +934,17 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                             ? seq({ wrapped, rep(seq({ space(), wrapped }), 0, -1), space() })
                             : seq({ wrapped, space() });
             } else {
-                G next = seq({ space(), opt(wrap(leaf(until_pattern({ opener })))), choice });
+                /* Section-wrapped dialects contain only calls and whitespace. In particular,
+                 * inter-call prose must not consume a section close and admit later calls. */
+                G next = f.section_open.empty()
+                             ? seq({ space(), opt(wrap(leaf(until_pattern({ opener })))), choice })
+                             : seq({ space(), choice });
                 calls = req.parallel_tool_calls
-                            ? seq({ lit(""), space(), choice, rep(next, 0, -1), space(), lit("") })
-                            : seq({ lit(""), space(), choice, space(), lit("") });
+                            ? seq({ choice, rep(next, 0, -1), space() })
+                            : seq({ choice, space() });
             }
+            if (!f.section_open.empty())
+                calls = seq({ lit(f.section_open), space(), calls, space(), lit(f.section_close) });
             b.add_rule("tool-call", render(calls));
             if (req.require_call) {
                 /* Nothing after the calls: a complete grammar admits only the end of the turn,
