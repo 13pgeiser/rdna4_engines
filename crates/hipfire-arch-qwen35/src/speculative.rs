@@ -7266,9 +7266,12 @@ pub fn download_hidden_block(
 /// Returns `true` when the fast path ran. Returns `false` — leaving every
 /// buffer untouched — when the route predicates fail, in which case the
 /// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
-/// exact gfx1100, `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, `1 <= b <=
-/// max_block_size`. The batched kernel dequantizes each row with the same
-/// per-element math as the scalar loop, so the plane is bit-identical.
+/// `1 <= b <= max_block_size`, and either exact gfx1100 with
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset or the gfx1201 batched noise lookup
+/// ([`noise_embed_batch_admitted`], kill switch
+/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0`) that the lane-batched draft already
+/// uses. The batched kernel dequantizes each row with the same per-element
+/// math as the scalar loop, so the plane is bit-identical.
 ///
 /// Weights-based core shared with the dense-TP mesh (which owns rank shards,
 /// not a `ModelSlot`).
@@ -7285,11 +7288,13 @@ pub fn build_dflash_noise_embeddings_weights(
     ) {
         return Ok(false);
     }
-    if !gpu.draft_collapse_fused_enabled() {
-        return Ok(false);
-    }
     let b = block.len();
     if b == 0 || b > draft_scratch.max_block_size {
+        return Ok(false);
+    }
+    if !gpu.draft_collapse_fused_enabled()
+        && !noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b)
+    {
         return Ok(false);
     }
     let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
@@ -12681,20 +12686,48 @@ pub fn dflash_seed_checkpoint_count(
     interval: usize,
     cap: usize,
 ) -> usize {
+    dflash_seed_checkpoint_positions(prompt_len, ceiling, interval, cap).len()
+}
+
+/// Positions (the ring's final contents, oldest first) of the DeltaNet
+/// checkpoints a cold DFlash prompt seed of `prompt_len` rows takes under
+/// outer-chunk `ceiling`; same simulation of [`take_dn_checkpoint`] as
+/// [`dflash_seed_checkpoint_count`], which is its length.
+pub fn dflash_seed_checkpoint_positions(
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> Vec<usize> {
+    let mut ring = std::collections::VecDeque::new();
     if cap == 0 {
-        return 0;
+        return Vec::new();
     }
-    let (mut pos, mut last, mut len) = (0usize, None::<usize>, 0usize);
+    let (mut pos, mut last) = (0usize, None::<usize>);
     while pos < prompt_len {
         pos += dflash_seed_outer_chunk_len(prompt_len - pos, ceiling);
         if last.is_some_and(|p| pos < p.saturating_add(interval)) {
             continue;
         }
-        len = (len + 1).min(cap);
+        if ring.len() >= cap {
+            ring.pop_front();
+        }
+        ring.push_back(pos);
         last = Some(pos);
     }
-    len
+    ring.into()
 }
+
+/// Outer chunk ceiling of the most recent cold DFlash prompt seed
+/// (`seed_target_hidden_from_prompt_abortable_parts`) in this process; `0`
+/// before any. Read by the state oracle to compare checkpoint positions
+/// between walks that planned the same ceiling.
+pub fn last_dflash_seed_ceiling() -> usize {
+    LAST_DFLASH_SEED_CEILING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LAST_DFLASH_SEED_CEILING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Upper bound on [`dflash_seed_checkpoint_count`] for every outer-chunk
 /// ceiling the seed can take at least `min_ceiling`: the maximum over
@@ -12967,6 +13000,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
         }
     }
     let mut seed = SeedPrefill::plan(gpu, target);
+    LAST_DFLASH_SEED_CEILING.store(seed.ceiling, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> HipResult<bool> {
         let mut seq_pos: usize = 0;
         while seq_pos < prompt_tokens.len() {

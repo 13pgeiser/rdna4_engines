@@ -97,6 +97,7 @@ pub mod sampled_rows_compact;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
+pub mod shadow_borrow;
 pub mod shared_i8;
 pub mod slab_moe;
 pub mod spec_sampling_cpu_ar;
