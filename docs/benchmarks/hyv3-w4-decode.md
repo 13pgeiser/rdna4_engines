@@ -57,7 +57,8 @@ the unmatched baseline prevents attributing the difference, but it does not clea
 The GPU, layout and reference results below were recorded with the candidate based on merged main
 `2d2f638`. Main later advanced to `d650eca` with two Gemma4 changes, and the PR branch was rebased
 on it. On that final rebased tip, `arch_test` was rebuilt and passed (`ctest -R arch_test`, 1/1).
-The full host/unit, GPU and inference suites were not rerun after this base advance.
+I then retried the `radiance` build target from this latest source; it still fails on the missing
+KV-stream headers noted below. The full unit, GPU and inference suites were not rerun after rebasing.
 
 - Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed
   before the base advance.
@@ -80,11 +81,12 @@ The full host/unit, GPU and inference suites were not rerun after this base adva
   harness's intentional-skip status for unsupported large-expert aligned tiles. The full run also
   exercised its HYV3 top-8 gate/up and down cases without failures.
 
-A full host engine/unit build was attempted and stops at `core/runtime/ctx.cpp:6` because merged
-main references missing `core/runtime/kvstream/bind.h`, `stage.h` and `plan.h`; they are not in the
-tree or a submodule. This also prevents building the matching ABI-30 HIP-enabled engine needed for
-whole-model tests. The older available GPU engine is ABI 27 and refuses the ABI-30 plugin; the
-current-main host engine has no HIP backend. Accordingly, no fresh HYV3 or Qwen inference A/B ran.
+The latest-source `radiance` target build stops at `ctx.cpp:6`, `kvbind.cpp:4`, `issue.cpp:22`,
+and `tierexec.cpp:4`: the runtime includes `kvstream/bind.h`, `kvstream/stage.h` and
+`kvstream/plan.h`, but current `main` has no engine-side `core/kvstream/` module. This blocks
+building the matching ABI-30 HIP engine needed for whole-model tests. The older available GPU
+engine is ABI 27 and refuses the ABI-30 plugin; the current-main host build has no HIP backend.
+Accordingly, no fresh HYV3 or Qwen inference A/B ran.
 
 The user's local Qwen `.rad` was inspected without downloading anything:
 `/mnt/gostar_data/models/StillDeadcode/qwen3.8-27b-mxfp4/qwen3.8-27b-mxfp4.rad` is a 19.4 GB
