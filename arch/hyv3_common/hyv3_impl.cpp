@@ -51,7 +51,7 @@ struct Model {
     MoeFP8::Wire mw{};
 
     rad_weight token = 0, final_norm = 0, lm_head = 0;
-    rad_op embed = 0, embed_ar = 0, final_rms = 0, gather = 0, logits_op = 0;
+    rad_op embed = 0, embed_ar = 0, shared_one = 0, final_rms = 0, gather = 0, logits_op = 0;
     std::vector<Layer> layers;
 };
 
@@ -234,6 +234,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mc.route_scale = meta_text_getf(meta, "router_scaling_factor", 2.826);
     mc.shared_ungated = 1;
     mc.shared_fp32_combine = 1;
+    mc.shared_one_external = g.world == 1;
     mc.router_fuse = 1;
     mc.rows = T < 2048 ? T : 2048;
     block_slice_128(m.n_ff_shared, g.world, g.rank, &mc.shared_lo, &mc.shared_hi);
@@ -266,6 +267,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      !HYV3_FP8_SOURCE));
     m.mw.sout = decl_b(b, nm.f("shared_out"), RAD_BF16, {T, g.n_embd});
     m.mw.sgate = decl_b(b, nm.f("shared_one"), RAD_BF16, {T, 1});
+    if (mc.shared_one_external) {
+        m.shared_one = rw(b, RAD_OP(b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", 1),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("value", 1.0)),
+                             RAD_NOWEIGHTS), {}, {m.mw.sgate});
+        if (!m.shared_one) return RAD_E_INVAL;
+    }
 
     /* ---- Token embedding and head. */
 #if HYV3_GGUF_SOURCE
@@ -350,7 +358,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
         // Each norm folds its predecessor's residual add. The first attention reads the
         // embedding directly; the final feed-forward keeps its add for the plain output norm.
-        // Keep the collectives in the same places and the routed/shared FP32 combine separate.
+        // Keep collective placement and both routed/shared BF16 rounding points.
         status = lay.attn.declare(b, nm, g, (int)l, m.kv_full, aw, as, l > 0, false);
         if (status < 0) {
             fprintf(stderr, "radiance: hyv3: attention layer %lld declaration failed (%d)\n",
@@ -461,6 +469,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.x, batch->n_tok), RAD_NONE);
 
+    // All TP1 ungated gathers read this same ones plane; no per-layer fill or combine launch.
+    if (m.shared_one)
+        RAD_ISSUE_N(c, m.shared_one, batch->n_tok, brows(m.mw.sgate, batch->n_tok));
     for (Layer& layer : m.layers) {
         layer.attn.step(c, batch);
         if (layer.dense) layer.dense_mlp.step(c, batch);

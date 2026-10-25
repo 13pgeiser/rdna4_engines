@@ -3296,7 +3296,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
                 if (shared) want = h_to_bf16(h_bf16(want) + h_bf16(shv[t * n + c]));
                 exact = exact && base[t * n + c] == want;
             }
-        ok(("GLM gather preserves F32 mixture weights" + at).c_str(), exact);
+        ok(("MoE gather preserves F32 weights and BF16 arm rounding" + at).c_str(), exact);
     }
     struct Var { int form; const char* name; bool wide; };
     static const Var kVar[] = {
@@ -3368,9 +3368,12 @@ static void moe_gather_case(const Plugin& pl) {
         { 2048, 2560, 10, "sigmoid", true  },   /* Qwen3.8-Flash-Next's chunk, timed */
     };
     for (const MoeGatherShape& sh : kSh) moe_gather_at(pl, r, sh);
+    // HYV3's TP1 shared combine is the unity-gate form. Preserve the routed BF16 narrow
+    // before adding the shared BF16 output, at decode and past the self-scan boundary.
     for (int64_t m : { 1, 4, 65 })
-        for (bool shared : { false, true })
-            moe_gather_at(pl, r, { m, 4096, 8, shared ? "none" : nullptr, false }, true);
+        for (int64_t n : { 2048, 4096 })
+            for (bool shared : { false, true })
+                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, false }, true);
 }
 
 /* ------------------------------------------------------- the vocab-parallel top-R, end to end
@@ -6248,8 +6251,8 @@ static void i8a8h_rot(const Plugin& pl, const char* row, int64_t M, int64_t N, i
 }
 
 
-/* Single-row reduction vs the unchanged padded-row epilogue. MB=2 forces the latter without
- * changing a split or a WMMA. Check ragged columns, narrow projections and HYV3's shared MLP. */
+/* A single row's outputs must not depend on covering one or two M tiles per block. Keep each
+ * split fixed and check ragged columns, narrow projections and HYV3's shared MLP, with guards. */
 static void bf16_one_row_identity(const Plugin& pl, int64_t N, int64_t K) {
     const RadKernelInfo* r = find(pl, "gemm_bf16_nt_m64");
     if (!r) { ok("bf16 one-row bytes", false, "row absent"); return; }

@@ -297,7 +297,10 @@ MLP followed by 47 layers routing top-8 of 128 experts. The routed and shared ML
 768 in the checkpoint tensors. Attention applies per-head Q/K RMSNorm before NeoX RoPE. Routing selects
 with sigmoid scores plus the correction bias, but normalizes the selected unbiased scores and
 multiplies them by 2.826. Routed and shared BF16 outputs are reduced independently at TP2, then added
-in FP32 and rounded once to BF16 before the residual add.
+in FP32 and rounded once to BF16 before the residual add. At TP1 the existing ungated gather
+preserves those two arm roundings and folds their addition; the plugin prepares one shared ones
+plane for the whole step. Each residual add except the final one folds into the following norm,
+which normalizes the BF16-rounded sum. The final norm still reads a materialized residual stream.
 
 Convert the public FP8 checkpoint with
 `data/recipes/hy-memory-30b-a3b-fp8.recipe`; it preserves the E4M3 codes and expands the checkpoint's
@@ -315,10 +318,11 @@ This is distinct from the BF16-derived block-FP8 artifact tested below.
 The BF16 checkpoint can be converted without quantizing any weights, or with
 `data/recipes/hy-memory-30b-a3b-bf16-w4.recipe`, which quantizes attention projections, the first
 dense MLP and routed experts to INT4. Shared MLPs, router, norms, embeddings and the output head stay
-BF16. The asymmetric linear W4A8 and signed expert W4A8 kernels use dynamic INT8 activations.
-BF16-source block-FP8 and MXFP4 recipes quantize experts and regular linears; the W8 recipe quantizes
-regular linears and the output head while routed experts remain BF16. Use TP2 at serve time if one
-device cannot hold the model and cache.
+BF16. At decode the asymmetric linear W4 kernel narrows BF16 activations to F16 on load;
+above 64 rows its tiled path uses dynamic INT8 activations. The signed-I4 expert path uses
+block-scaled E4M3 activations. BF16-source block-FP8 and MXFP4 recipes quantize experts and regular
+linears; the W8 recipe quantizes regular linears and the output head while routed experts remain
+BF16. Use TP2 at serve time if one device cannot hold the model and cache.
 
 The local llama.cpp Q4_K_M source is supported by `arch/hyv3_gguf` and
 `data/recipes/hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`. It decodes Q4_K/Q6_K source tensors and

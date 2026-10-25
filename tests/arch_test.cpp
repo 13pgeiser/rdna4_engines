@@ -722,6 +722,7 @@ TEST(hyv3_folds_residual_adds_into_the_next_norm_but_materializes_the_final_outp
         CHECK_EQ(m.layers[0].attn.nq_h.src, m.x);
         CHECK_EQ(m.layers[0].dense_mlp.nq_h.res, m.x);
         CHECK_EQ(m.layers[0].dense_mlp.op_add, (rad_op)0);
+        CHECK_EQ(m.shared_one != 0, world == 1);
         for (size_t l = 0; l < m.layers.size(); ++l) {
             CHECK_EQ(m.layers[l].attn.op_add, (rad_op)0);
             if (l == 0) continue;
@@ -730,22 +731,28 @@ TEST(hyv3_folds_residual_adds_into_the_next_norm_but_materializes_the_final_outp
             CHECK_EQ(m.layers[l].moe.nq_h.src, m.h.x);
             CHECK_EQ(m.layers[l].moe.nq_h.res, m.x);
             CHECK_EQ(m.layers[l].moe.op_add != 0, l + 1 == m.layers.size());
-            CHECK(m.layers[l].moe.op_combine != 0); // retain the separate BF16-rounded arms
+            CHECK_EQ(m.layers[l].moe.op_combine != 0, world > 1);
+            CHECK_EQ(m.layers[l].moe.gfold, world == 1); // both arms still round before adding
             const RecOp* norm = b.op_of(m.layers[l].moe.nq_h.op);
             REQUIRE(norm);
             CHECK(std::find(norm->reads.begin(), norm->reads.end(), m.x) != norm->reads.end());
             CHECK(std::find(norm->writes.begin(), norm->writes.end(), m.x) != norm->writes.end());
         }
-        CHECK_EQ(count_op(b, "add"), 3); // two routed/shared combines, one final residual
+        CHECK_EQ(count_op(b, "add"), world > 1 ? 3 : 1); // TP2 combines each reduced arm separately
         for (int rows : { 1, 8, 65, 2049, 4096 }) {
             RadBatch batch = decode_batch(); batch.n_tok = rows; batch.max_q_len = rows;
             RadCtx run{}; run.b = &b; run.batch = &batch; run.rank = rank;
             hyv3_bf16::step(&run, &batch);
             CHECK(lint_step(b, {&run}).empty());
-            int final_adds = 0;
-            for (const auto& issue : run.issues)
+            int final_adds = 0, ones = 0;
+            for (const auto& issue : run.issues) {
                 if (issue.op == m.layers.back().moe.op_add) ++final_adds;
+                if (issue.op == m.shared_one) ++ones;
+                for (size_t l = 1; l < m.layers.size(); ++l)
+                    CHECK(issue.op != m.layers[l].moe.op_sgate); // no per-layer ones fills
+            }
             CHECK_EQ(final_adds, (rows + 2047) / 2048);
+            CHECK_EQ(ones, world == 1 ? 1 : 0);
         }
     }
 }
@@ -814,18 +821,16 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
     CHECK_EQ(moe.c.n_ff_exp, 768); CHECK_EQ(moe.c.n_ff_shared, 768);
     CHECK_EQ(moe.c.expert_f32_scale, 1);
     CHECK_EQ(moe.c.route_scale, 2.826); CHECK_EQ(moe.c.sigmoid_router, 1);
-    CHECK_EQ(moe.c.shared_fp32_combine, 1); CHECK_EQ(moe.gfold, false);
+    CHECK_EQ(moe.c.shared_fp32_combine, 1); CHECK_EQ(moe.gfold, true);
     const RecOp* gather = b.op_of(moe.op_gather);
     CHECK(gather != nullptr);
     CHECK_EQ(gather->writes.size(), 1u);
-    CHECK_EQ(gather->writes[0], moe.w.moe);
-    REQUIRE(moe.op_combine);
-    const RecOp* combine = b.op_of(moe.op_combine);
-    REQUIRE(combine);
-    CHECK_EQ(combine->op, std::string("add"));
-    CHECK_EQ(std::string(pstr(combine, "dtype")), std::string("bf16"));
-    CHECK(combine->reads == (std::vector<rad_buf>{moe.w.moe, moe.w.sout}));
-    CHECK(combine->writes == (std::vector<rad_buf>{moe.w.h.x}));
+    CHECK_EQ(gather->writes[0], moe.w.h.x);
+    CHECK_EQ(moe.op_combine, (rad_op)0);
+    CHECK(model.shared_one != 0);
+    CHECK(gather->reads == (std::vector<rad_buf>{moe.w.edn, moe.w.ew,
+                                               moe.gather_inv ? moe.w.inv : moe.w.sorted,
+                                               moe.w.sout, moe.w.sgate}));
 
     RadBatch batch = decode_batch();
     RadCtx run{}; run.b = &b; run.batch = &batch;
@@ -835,7 +840,7 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
             if (run.issues[i].op == h) return (int)i;
         return -1;
     };
-    const int gather_i = issue_of(moe.op_gather), add_i = issue_of(moe.op_combine);
+    const int gather_i = issue_of(moe.op_gather), add_i = issue_of(moe.op_add);
     CHECK(gather_i >= 0 && add_i >= 0 && gather_i < add_i);
     REQUIRE(moe.op_sigmoid_scatter);
     CHECK(issue_of(moe.op_sigmoid_scatter) >= 0);
@@ -862,6 +867,7 @@ TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
         CHECK_EQ(moe.c.shared_lo, rank * 384);
         CHECK_EQ(moe.c.shared_hi, (rank + 1) * 384);
         CHECK(moe.op_moe_ar && moe.op_shared_ar && !moe.op_ar);
+        CHECK(moe.op_combine && !moe.gfold && !model.shared_one);
         CHECK(find_w(b, rank == 0 ? "blk.1.ffn_gate_up_exps.0.weight"
                                    : "blk.1.ffn_gate_up_exps.64.weight") != nullptr);
         CHECK_EQ(model.g.n_ff, 3456);

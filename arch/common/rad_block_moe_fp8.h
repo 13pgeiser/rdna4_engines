@@ -189,8 +189,12 @@ struct MoeFP8 {
         int     swiglu_quant = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
-        /* Add the routed and shared BF16 outputs in FP32, then round once to BF16, as HYV3's
-         * enable_moe_fp32_combine path does. This bypasses moe_gather's fused shared-arm add. */
+        /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
+         * rather than each layer/pass filling the same plane again. */
+        int     shared_one_external = 0;
+        /* Add the already-rounded routed and shared BF16 outputs in FP32, then round to BF16.
+         * At TP1 the ungated gather preserves both roundings; TP>1 reduces each arm separately
+         * before combining, so its gather cannot fold the shared output. */
         int     shared_fp32_combine = 0;
         /* 4-bit experts (`i4*bf16[1x128]`) rather than E4M3 (`fp8_e4m3*bf16[128x128]`); for
          * Qwen3.8-Flash-Next this decides whether the model fits two cards (see the `moe_gemm_w4a8`
@@ -628,6 +632,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                          src.shared)) return RAD_E_INVAL;
     const bool shared = c.n_ff_shared > 0 && (src.shared || src.shared_mlp_gate);
     if (shared && c.shared_ungated && src.shared_gate) return RAD_E_INVAL;
+    if (c.shared_one_external && (!shared || !c.shared_ungated || !w.sgate || g.world != 1))
+        return RAD_E_INVAL;
     if (c.shared_fp32_combine && (!shared || !w.moe || std::strcmp(g.dtype, "bf16"))) {
         fprintf(stderr, "radiance: layer %d requests an FP32 shared/routed combine without its "
                         "BF16 shared arm and routed output\n", l);
@@ -1318,10 +1324,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         if (!b_gram_dne || !op_gram_dne) return RAD_E_INVAL;
     }
 
-    /* Normally the gather folds the shared arm in, saving a dispatch and round trip. HYV3 asks
-     * for an FP32 addition of the two already-rounded BF16 outputs, so it gathers routed output
-     * separately and combines the two arms below. */
-    const bool separate_fp32_combine = shared && c.shared_fp32_combine;
+    /* The gather rounds the routed sum to BF16 before adding the rounded shared product.
+     * At TP1 a unity gate therefore preserves HYV3's FP32 combine exactly. TP>1 must first
+     * reduce each arm independently, and cannot combine them inside the local gather. */
+    const bool separate_fp32_combine = shared && c.shared_fp32_combine &&
+                                       (g.world > 1 || !c.shared_ungated);
     gfold = shared && !separate_fp32_combine;
     for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
         rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
@@ -1414,7 +1421,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (separate_fp32_combine) {
         /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: exactly the
          * former cast + cast + F32 add + cast chain. Keep the routed gather's BF16 rounding
-         * and the separate TP reductions; folding the shared arm into the gather is different. */
+         * and the separate TP reductions; a local gather cannot fold those reductions. */
         op_combine = rw(b, RAD_OP(b, "add",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                       RAD_STR("dtype", "bf16")),
@@ -1575,10 +1582,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * buffers are step-tall, so the pass offset applies as in an MlpFP8 slice. */
 inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
-    /* `gate_done`: the fused router already wrote this pass's gate. An FP32 combine does not
-     * consume the ungated arm's ones plane, so skip its otherwise redundant fill. */
+    /* `gate_done`: the fused router already wrote this pass's gate. A separate FP32 combine
+     * reads no ones plane. At TP1 an ungated folded gather does, unless the caller prepared the
+     * whole step's ones plane once (shared_one_external). */
     if (!gate_done && c.shared_ungated) {
-        if (!c.shared_fp32_combine)
+        if (gfold && !c.shared_one_external)
             RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
     } else if (!gate_done) {
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
@@ -1783,12 +1791,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
 
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. */
-    if (c.shared_fp32_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
+    if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
                     gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
-                    brow_slice(c.shared_fp32_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
+                    brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
     if (op_moe_ar)
         RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd,
                     brow_slice(w.moe, r0, rows, g.n_embd), RAD_NONE);
