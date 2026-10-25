@@ -287,6 +287,7 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
     /* Dimensions come from GGUF's `<arch>.<field>` keys, so one plugin covers a family; other keys
      * pass through in the free-form list. */
     const std::string a = out->arch;
+    if (a == "hy_v3") out->arch = "hyv3";
     auto gi = [&](const char* suffix, int64_t dflt) -> int64_t {
         int64_t v = 0;
         return g.get_i64(a + "." + suffix, &v) ? v : dflt;
@@ -353,6 +354,36 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
     std::vector<std::string> toks;
     if (g.get_strs("tokenizer.ggml.tokens", &toks)) m.n_vocab = (int64_t)toks.size();
     if (m.n_vocab == 0) m.n_vocab = gi("vocab_size", 0);
+    if (a == "hy_v3") {
+        /* GGUF keeps reserved vocabulary rows beyond the tokenizer string array. The model matrices
+         * are authoritative for the row count (Hy-Memory has 120832 rows and 120818 strings). */
+        const GgufTensor* emb = g.tensor("token_embd.weight");
+        if (emb && emb->n_dims >= 2) m.n_vocab = emb->ne[1];
+
+        int64_t gating = 0, norm = 0;
+        double route_scale = 1.0;
+        g.get_i64("hy_v3.expert_gating_func", &gating);
+        g.get_i64("hy_v3.expert_weights_norm", &norm);
+        g.get_f64("hy_v3.expert_weights_scale", &route_scale);
+        const int64_t expert_width = gi("expert_feed_forward_length", 0);
+        const int64_t shared_width = gi("expert_shared_feed_forward_length", 0);
+        out->kv("qk_norm", g.tensor("blk.0.attn_q_norm.weight") &&
+                             g.tensor("blk.0.attn_k_norm.weight") ? "1" : "0");
+        out->kv("moe_router_use_sigmoid", gating == 2 ? "1" : "0");
+        out->kv("moe_router_enable_expert_bias", g.tensor("blk.1.exp_probs_b") ? "1" : "0");
+        out->kv("enable_moe_fp32_combine", shared_width > 0 ? "1" : "0");
+        out->kv("route_norm", norm ? "1" : "0");
+        out->kv("router_scaling_factor", fmt("%.17g", route_scale));
+        out->kv("first_k_dense_replace", g.tensor("blk.0.ffn_gate.weight") &&
+                                           g.tensor("blk.1.ffn_gate_inp.weight") ? "1" : "0");
+        out->kv("num_shared_experts", shared_width > 0 ? "1" : "0");
+        out->kv("expert_hidden_dim", fmt("%lld", (long long)expert_width));
+        out->kv("moe_intermediate_size", fmt("%lld", (long long)(2 * expert_width)));
+        out->kv("num_experts", fmt("%lld", (long long)m.n_expert));
+        out->kv("num_experts_per_tok", fmt("%lld", (long long)m.n_expert_used));
+        out->kv("attention_bias", "0");
+        out->kv("mlp_bias", "0");
+    }
 
     /* Everything else, stringified, for the plugin. Arrays are summarised (small integer arrays
      * spelled out); tokenizer keys are skipped, since the vocab has its own section. */
@@ -858,6 +889,33 @@ int Checkpoint::open_safetensors(const std::string& path) {
     if (!is_file && !is_index) {
         RAD_TRY(add_companions());
         RAD_TRY(add_torch_files());
+    }
+    /* HYV3's FP8 release indexes its static per-layer K/V cache descales as scalar F32 tensors in
+     * kv_cache_scales.safetensors. They are runtime attention parameters, not model weights; carry
+     * them through metadata so the architecture can bake them into kv_store and descale operands. */
+    if (meta_.arch == "hyv3") {
+        for (int64_t l = 0; l < meta_.m.n_layers; ++l) {
+            for (const char* which : {"k", "v"}) {
+                const std::string source = "model.layers." + std::to_string(l) +
+                                           ".self_attn." + which + "_cache.scale";
+                const SrcTensor* t = find(source);
+                if (!t) continue;
+                if (t->rad_dtype != RAD_F32 || !t->data || t->bytes < 4 ||
+                    (!t->shape.empty() && t->numel() != 1)) {
+                    RAD_ERR("%s: HYV3 KV cache scale must be a scalar F32", source.c_str());
+                    return RAD_E_FORMAT;
+                }
+                float scale = 0.0f;
+                std::memcpy(&scale, t->data, sizeof scale);
+                if (!std::isfinite(scale) || scale <= 0.0f) {
+                    RAD_ERR("%s: HYV3 KV cache scale must be positive and finite", source.c_str());
+                    return RAD_E_FORMAT;
+                }
+                char value[32];
+                std::snprintf(value, sizeof value, "%.9g", (double)scale);
+                meta_.set("hyv3.kv_cache." + std::to_string(l) + "." + which + "_scale", value);
+            }
+        }
     }
     /* FP8's block, where the checkpoint states one. */
     if (const char* bs = meta_.get("quantization_config.weight_block_size")) {
@@ -2302,9 +2360,9 @@ namespace {
 /* ---------------------------------------------------------------- GGUF block types
  *
  * ggml block types decodable to f32. Their geometry lives in core/text; decoding lives here, where
- * weights are read. K-quants are refused rather than half-implemented. */
+ * weights are read. Q4_K and Q6_K are the K-quants this HYV3 GGUF adapter needs. */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
-       GGML_Q8_0 = 8, GGML_BF16 = 30 };
+       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q6_K = 14, GGML_BF16 = 30 };
 
 int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
     auto half = [&](const uint8_t* q) { uint16_t h; std::memcpy(&h, q, 2); return rad_f16_to_f32(h); };
@@ -2354,6 +2412,45 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                     const int hi = (int)((p[8 + j] >> 4)   | (((qh >> (j + 16)) & 1u) << 4));
                     dst[b * 32 + j]      = d * (float)lo + m;
                     dst[b * 32 + j + 16] = d * (float)hi + m;
+                }
+            }
+            return RAD_OK;
+        case GGML_Q4_K:
+            for (int64_t b = 0; b < n / 256; ++b, p += 144) {
+                const float d = half(p), dmin = half(p + 2);
+                const uint8_t* scales = p + 4;
+                const uint8_t* qs = p + 16;
+                for (int j = 0; j < 8; ++j) {
+                    uint32_t sc, mn;
+                    if (j < 4) {
+                        sc = scales[j] & 63u;
+                        mn = scales[j + 4] & 63u;
+                    } else {
+                        sc = (scales[j + 4] & 15u) | ((uint32_t)(scales[j - 4] >> 6) << 4);
+                        mn = (scales[j + 4] >> 4) | ((uint32_t)(scales[j] >> 6) << 4);
+                    }
+                    const float ds = d * (float)sc, ms = dmin * (float)mn;
+                    for (int l = 0; l < 32; ++l) {
+                        const int v = j * 32 + l;
+                        const uint8_t q = qs[32 * (v / 64) + v % 32];
+                        const int code = (v % 64) < 32 ? q & 15 : q >> 4;
+                        dst[b * 256 + v] = ds * (float)code - ms;
+                    }
+                }
+            }
+            return RAD_OK;
+        case GGML_Q6_K:
+            for (int64_t b = 0; b < n / 256; ++b, p += 210) {
+                const uint8_t* ql = p;
+                const uint8_t* qh = p + 128;
+                const int8_t* scales = (const int8_t*)(p + 192);
+                const float d = half(p + 208);
+                for (int k = 0; k < 256; ++k) {
+                    const int n128 = k / 128, t = (k % 128) / 32, l = k % 32;
+                    const uint8_t lo = ql[64 * n128 + l + 32 * (t & 1)];
+                    const int code = (int)((t < 2 ? lo & 15 : lo >> 4) |
+                                           (((qh[32 * n128 + l] >> (2 * t)) & 3) << 4));
+                    dst[b * 256 + k] = d * (float)scales[k / 16] * (float)(code - 32);
                 }
             }
             return RAD_OK;
