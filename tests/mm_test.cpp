@@ -1427,6 +1427,41 @@ TEST(each_audio_front_end_runs_its_fft_at_any_length_it_takes) {
     CHECK(!p.has_audio());
 }
 
+/* Gemma 4's feature extractor settings come from preprocessor_config.json (`preprocessor.`, as
+ * EmbeddingGemma 2 ships them) or from processor_config.json's `feature_extractor` object (as
+ * Gemma 4 E2B/E4B ship them); where both are present, the first wins. */
+TEST(gemma4_audio_settings_come_from_either_processor_file) {
+    const char* keys[] = { "audio_config.model_type", "audio_token_id", "boa_token_id",
+                           "eoa_token_id", "processor.feature_extractor.sampling_rate",
+                           "processor.feature_extractor.frame_length",
+                           "processor.feature_extractor.hop_length",
+                           "processor.feature_extractor.feature_size",
+                           "processor.feature_extractor.fft_length",
+                           "processor.feature_extractor.mel_floor",
+                           "processor.feature_extractor.dither", "preprocessor.hop_length" };
+    const char* vals[] = { "gemma4_audio", "258881", "256000", "258883", "16000", "320", "160",
+                           "128", "1024", "0.002", "0", "200" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof keys / sizeof keys[0]) - 1;   /* without preprocessor.hop_length */
+    m.kv_key = keys;
+    m.kv_val = vals;
+    mm::AudioConfig c;
+    std::string why;
+    REQUIRE_EQ(c.from_meta(m, &why), RAD_OK);
+    CHECK_EQ(c.fft, 1024);
+    CHECK_EQ(c.hop, 160);
+    CHECK_NEAR(c.mel_floor, 0.002, 1e-12);
+    m.n_kv += 1;
+    mm::AudioConfig d;
+    REQUIRE_EQ(d.from_meta(m, &why), RAD_OK);
+    CHECK_EQ(d.hop, 200);
+
+    /* a dithering extractor is refused from either file */
+    vals[10] = "1e-5";
+    mm::AudioConfig e;
+    CHECK_EQ(e.from_meta(m, &why), RAD_E_UNSUPPORTED);
+}
+
 /* A whole chunk keeps 13 rows: three convolutions of kernel 3, stride 2, padding 1 -- and the
  * chunk shorter than that keeps what the reference's _post_cnn_length gives it. */
 TEST(a_chunk_keeps_the_rows_three_convolutions_leave) {

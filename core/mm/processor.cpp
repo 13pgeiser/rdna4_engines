@@ -1891,32 +1891,39 @@ int AudioConfig::from_meta(const RadModelMeta& m, std::string* why) {
                         "model_type gemma4_audio or qwen3_asr_encoder)";
         return RAD_E_NOTFOUND;
     }
-    rate         = (int32_t)rad_meta_geti(&m, "preprocessor.sampling_rate", 16000);
-    frame_length = (int32_t)rad_meta_geti(&m, "preprocessor.frame_length", 320);
-    hop          = (int32_t)rad_meta_geti(&m, "preprocessor.hop_length", 160);
-    n_mels       = (int32_t)rad_meta_geti(&m, "preprocessor.feature_size", 128);
-    fft          = (int32_t)rad_meta_geti(&m, "preprocessor.fft_length", 0);
+    /* preprocessor_config.json's keys (`preprocessor.`), else processor_config.json's
+     * `feature_extractor` object, where Gemma 4 E2B/E4B keep them. */
+    auto key = [&m](const char* k) {
+        std::string pp = std::string("preprocessor.") + k;
+        if (rad_meta_gets(&m, pp.c_str(), nullptr)) return pp;
+        return std::string("processor.feature_extractor.") + k;
+    };
+    rate         = (int32_t)rad_meta_geti(&m, key("sampling_rate").c_str(), 16000);
+    frame_length = (int32_t)rad_meta_geti(&m, key("frame_length").c_str(), 320);
+    hop          = (int32_t)rad_meta_geti(&m, key("hop_length").c_str(), 160);
+    n_mels       = (int32_t)rad_meta_geti(&m, key("feature_size").c_str(), 128);
+    fft          = (int32_t)rad_meta_geti(&m, key("fft_length").c_str(), 0);
     if (fft <= 0) {
         fft = 1;
         while (fft < frame_length) fft *= 2;
     }
-    if (rad_meta_geti(&m, "preprocessor.fft_overdrive", 0)) fft *= 2;
-    min_freq    = rad_meta_getf(&m, "preprocessor.min_frequency", 0.0);
-    max_freq    = rad_meta_getf(&m, "preprocessor.max_frequency", 8000.0);
-    mel_floor   = rad_meta_getf(&m, "preprocessor.mel_floor", 1e-3);
-    preemphasis = rad_meta_getf(&m, "preprocessor.preemphasis", 0.0);
-    preemphasis_htk = rad_meta_geti(&m, "preprocessor.preemphasis_htk_flavor", 1) != 0;
-    input_scale = rad_meta_getf(&m, "preprocessor.input_scale_factor", 1.0);
-    bin_mean = read_list(m, "preprocessor.per_bin_mean");
-    bin_std  = read_list(m, "preprocessor.per_bin_stddev");
+    if (rad_meta_geti(&m, key("fft_overdrive").c_str(), 0)) fft *= 2;
+    min_freq    = rad_meta_getf(&m, key("min_frequency").c_str(), 0.0);
+    max_freq    = rad_meta_getf(&m, key("max_frequency").c_str(), 8000.0);
+    mel_floor   = rad_meta_getf(&m, key("mel_floor").c_str(), 1e-3);
+    preemphasis = rad_meta_getf(&m, key("preemphasis").c_str(), 0.0);
+    preemphasis_htk = rad_meta_geti(&m, key("preemphasis_htk_flavor").c_str(), 1) != 0;
+    input_scale = rad_meta_getf(&m, key("input_scale_factor").c_str(), 1.0);
+    bin_mean = read_list(m, key("per_bin_mean").c_str());
+    bin_std  = read_list(m, key("per_bin_stddev").c_str());
     max_samples = 480000;
     tok_audio = (int32_t)rad_meta_geti(&m, "audio_token_id", -1);
     tok_start = (int32_t)rad_meta_geti(&m, "boa_token_id", -1);
     tok_end   = (int32_t)rad_meta_geti(&m, "eoa_token_id", rad_meta_geti(&m, "eoa_token_index", -1));
     /* Dither adds Gaussian noise of this deviation to every sample, a new draw each call, so no
      * deterministic front end can reproduce it. */
-    if (rad_meta_getf(&m, "preprocessor.dither", 0.0) != 0.0) {
-        if (why) *why = "the feature extractor dithers its input (preprocessor.dither), which no "
+    if (rad_meta_getf(&m, key("dither").c_str(), 0.0) != 0.0) {
+        if (why) *why = "the feature extractor dithers its input (dither), which no "
                         "deterministic front end reproduces";
         return RAD_E_UNSUPPORTED;
     }
