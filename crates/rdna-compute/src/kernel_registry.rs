@@ -1327,6 +1327,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_gqa_q8_gfx1201",
                 "attention_verify_gqa_fp8_gfx1201",
                 "attention_verify_gqa_fp8_gqa8_gfx1201",
+                "attention_verify_gqa_fwht4_gfx1201",
+                "attention_verify_gqa_fwht3_gfx1201",
                 "attention_verify_reduce_gfx1201"
             ]
         );
@@ -1508,6 +1510,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
             [
                 "attention_verify_gqa_q8_gfx1100",
+                "attention_verify_gqa_fwht4_gfx1100",
+                "attention_verify_gqa_fwht3_gfx1100",
                 "attention_verify_gqa_q8_rows_gfx1100",
                 "attention_verify_reduce_gfx1100"
             ]
@@ -1789,6 +1793,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1151" {
+        // Qwen4 HC input_mix_down (320 x 10240) + activation, one launch
+        // (HIPFIRE_QWEN4_HC_DOWN_FUSED; gemm.rs gemm_bf16_xf16_hc_down_fused).
+        add!(
+            "qwen4_hc_down_fused_gfx1151",
+            kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
+            ["qwen4_hc_down_fused_gfx1151"]
+        );
+        // Qwen4 HC read up+mix, persistent W-stationary (HIPFIRE_QWEN4_HC_UP_V2;
+        // tensor_ops.rs hyper_read_up_wmma_launch).
+        add!(
+            "hyper_read_up_wmma_gfx1151_v2",
+            crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
+            ["hyper_read_up_wmma_bf16_gfx1151_v2"]
+        );
         // QSA gathered F16 WMMA attention (`tensor_ops::qsa_gathered_wmma_launch_with`
         // and the QSA F16 arena producer): the route is gfx1151-only for F32/Q8
         // K/V (`qsa_gathered_wmma_enabled`); the Q8 converter stays HIP even when
@@ -3507,6 +3525,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MQ_ROTATE_X_I4_SRC,
             ["mq_rotate_x_i4"]
         );
+        // Qwen4 MoE front producer (HIPFIRE_QWEN4_MOE_FRONT_FUSE): the F16-output twin.
+        add!(
+            "mq_rotate_x_i4_f16out",
+            kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
+            ["mq_rotate_x_i4_f16out"]
+        );
         add!(
             "qwen4_gemv_q8_0_wide",
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
@@ -4700,6 +4724,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
                 "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_k5120",
                 "npu_trunk_pack_a_bf16_old",
             ]
         );
@@ -10588,6 +10613,8 @@ mod tests {
                     "attention_verify_gqa_q8_gfx1201",
                     "attention_verify_gqa_fp8_gfx1201",
                     "attention_verify_gqa_fp8_gqa8_gfx1201",
+                    "attention_verify_gqa_fwht4_gfx1201",
+                    "attention_verify_gqa_fwht3_gfx1201",
                     "attention_verify_reduce_gfx1201",
                 ][..],
             ),
@@ -10597,6 +10624,8 @@ mod tests {
                 kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
                 &[
                     "attention_verify_gqa_q8_gfx1100",
+                    "attention_verify_gqa_fwht4_gfx1100",
+                    "attention_verify_gqa_fwht3_gfx1100",
                     "attention_verify_gqa_q8_rows_gfx1100",
                     "attention_verify_reduce_gfx1100",
                 ][..],

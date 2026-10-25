@@ -2113,6 +2113,24 @@ fn qwen4_decode_share_table_bytes(
         .ok_or_else(|| "decode-share table bytes overflow".to_string())
 }
 
+/// Record the borrowed weight-shadow region (`shadow_bytes` at the start of
+/// the donor tail; every class span of `plan` already includes it) on a plan
+/// that carries a donor tail built for `sharing`. A plan without a donor tail
+/// (sharing refused or ineligible) is returned untouched: its shadows stay
+/// resident.
+fn qwen4_record_shadow_region(
+    plan: hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
+    sharing: bool,
+    shadow_bytes: u64,
+) -> Result<hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan, String> {
+    if sharing && plan.decode_share_tail().is_some() {
+        plan.with_decode_share_shadows(shadow_bytes)
+            .map_err(|error| format!("decode-share shadow region: {error}"))
+    } else {
+        Ok(plan)
+    }
+}
+
 /// The production hotset/stage fixed point, without I/O or admission effects.
 ///
 /// `decode_share_need` is `Some(S)` when decode-share `bind` is admitted: the
@@ -4596,6 +4614,47 @@ fn load_qwen4_rank_scoped(
     // below admits sharing and the plan carries a donor tail; every other
     // load never reads it (and the plain reserve is byte-identical).
     let decode_share_mode = hipfire_arch_qwen4::decode_share::DecodeShareMode::from_env();
+    // The weight shadows an admitted `on` / `fixed` load keeps in the donor
+    // tail instead of resident VRAM (F16 weight shadows + shared-expert INT8
+    // shadows, read only by the borrowed >= 512-row prompt tiles; rebuilt per
+    // borrow epoch). `None`: they stay resident and charged as today. The
+    // region is laid out by the one pure plan the forward re-derives at attach.
+    let decode_share_shadow_region: Option<
+        hipfire_arch_qwen4::decode_share_shadows::ShadowRegionPlan,
+    > = if band.is_none()
+        && decode_share_mode.borrows_shadows(
+            &ctx.gpu.arch,
+            hipfire_arch_qwen4::decode_share::decode_share_shadows_enabled(),
+        )
+        && placement_chunk > hipfire_arch_qwen4::gpu_forward::QWEN4_DECODE_SHARE_RESIDENT_ROWS
+    {
+        match hipfire_arch_qwen4::decode_share_shadows::shadow_flags(
+            &ctx.gpu.arch,
+            ctx.gpu.qwen4_f16_shadow_capable(),
+            ctx.gpu.qwen4_shared_i8_enabled(),
+            placement_chunk,
+        ) {
+            Ok((f16, shared_i8)) => hipfire_arch_qwen4::decode_share_shadows::plan_shadow_region(
+                &manifest.weights,
+                config.num_hidden_layers,
+                f16,
+                shared_i8,
+            )
+            .map_err(|error| format!("qwen4 decode-share: {error}"))?
+            .into_nonempty(),
+            Err(reason) => {
+                if hipfire_arch_qwen4::decode_share::DecodeShareMode::explicit() {
+                    eprintln!("  qwen4 decode-share: weight shadows stay resident ({reason})");
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let decode_share_shadow_bytes: u64 = decode_share_shadow_region
+        .as_ref()
+        .map_or(0, |region| region.total_bytes);
     let shared_placement_inputs = if band.is_none()
         && decode_share_mode.grows_hot_budget()
         && ctx.gpu.arch == "gfx1201"
@@ -4636,6 +4695,7 @@ fn load_qwen4_rank_scoped(
                 Some(hipfire_arch_qwen4::expert_residency::DecodeShareForward {
                     dedicated,
                     borrowed,
+                    shadows_borrowed: decode_share_shadow_bytes,
                 }),
             )
             .ok(),
@@ -4996,11 +5056,15 @@ fn load_qwen4_rank_scoped(
                 None
             }
             Ok(()) => {
-                let span = hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_borrow_bytes(
+                // The donor tail holds the borrowed weight shadows (if any)
+                // and then the largest class's scratch: the largest class span.
+                let span = hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_class_spans(
                     &config,
                     placement_chunk,
                     scratch_mode,
-                );
+                    decode_share_shadow_bytes,
+                )
+                .and_then(|spans| spans.last().copied());
                 if span.is_none() && decode_share_explicit {
                     eprintln!(
                         "  qwen4 decode-share: refused: the borrowed scratch span cannot be sized; plain placement"
@@ -5019,6 +5083,7 @@ fn load_qwen4_rank_scoped(
             &config,
             placement_chunk,
             scratch_mode,
+            decode_share_shadow_bytes,
         )
         .unwrap_or_default()
     } else {
@@ -5085,6 +5150,10 @@ fn load_qwen4_rank_scoped(
                 need,
                 &decode_share_class_spans,
             )?;
+            // Every class span already includes the borrowed weight-shadow
+            // region at the start of the donor tail; record it so the lease
+            // (and the forward) know the scratch backing starts after it.
+            let plan = qwen4_record_shadow_region(plan, need.is_some(), decode_share_shadow_bytes)?;
             let growth = if grow && plan.decode_share_tail().is_some() {
                 // What the plain reserve would have placed, for the load log.
                 let plain_total = hotsets::require_budget(residency::expert_hotset_budget(
@@ -5996,8 +6065,20 @@ fn load_qwen4_rank_scoped(
             };
             let mut donor_layers: Vec<u32> = tail.donors.iter().map(|id| id / 512).collect();
             donor_layers.dedup();
+            // `, shadows S MiB in donor tail (F16 F MiB, INT8 I MiB)` when the
+            // weight shadows are borrowed inside the tail; empty otherwise.
+            let shadows_text = match (tail.shadow_bytes, decode_share_shadow_region.as_ref()) {
+                (0, _) => String::new(),
+                (bytes, Some(region)) => format!(
+                    ", shadows {} MiB in donor tail (F16 {} MiB, INT8 {} MiB)",
+                    bytes / MIB,
+                    region.f16_bytes / MIB,
+                    region.i8_bytes / MIB,
+                ),
+                (bytes, None) => format!(", shadows {} MiB in donor tail", bytes / MIB),
+            };
             eprintln!(
-                "  qwen4 decode-share: mode {}, {} donors ({} MiB) from {} layers, device tail [{}, {}), mirror host +{} MiB, guard {} B, borrow digest {}, resident digest {}",
+                "  qwen4 decode-share: mode {}, {} donors ({} MiB) from {} layers, device tail [{}, {}), mirror host +{} MiB, guard {} B, borrow digest {}, resident digest {}{shadows_text}",
                 decode_share_mode.name(),
                 tail.donors.len(),
                 tail.donor_bytes / MIB,
@@ -6035,7 +6116,7 @@ fn load_qwen4_rank_scoped(
                     )
                     .unwrap_or(0);
                 eprintln!(
-                    "  qwen4 decode-share: on, hot budget +{} MiB (+{} experts: {} -> {}), {} donors ({} MiB) from {} layers, resident bank {} rows ({} MiB dedicated), prefill classes {:?}, restore <= {} MiB",
+                    "  qwen4 decode-share: on, hot budget +{} MiB (+{} experts: {} -> {}), {} donors ({} MiB) from {} layers, resident bank {} rows ({} MiB dedicated), prefill classes {:?}, restore <= {} MiB{shadows_text}",
                     grown_bytes / MIB,
                     experts.saturating_sub(plain_experts),
                     plain_experts,
@@ -11362,6 +11443,67 @@ mod qwen4_admission_tests {
             budget + overhead + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
             free
         );
+    }
+
+    /// The borrowed weight-shadow region is part of the class spans (every class
+    /// dirties it), recorded on the plan's tail, and absent (plain placement,
+    /// shadows resident) when sharing was refused or the region is zero.
+    #[test]
+    fn decode_share_shadow_region_is_recorded_in_the_tail_and_in_every_class_span() {
+        use hipfire_arch_qwen4::{expert_hotset::HotsetBudget, expert_residency as residency};
+        const PADDED: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let shadow = 3 * 256u64;
+        let scratch = [PADDED, 2 * PADDED, 4 * PADDED];
+        let spans: Vec<u64> = scratch.iter().map(|span| span + shadow).collect();
+        let need = *spans.last().unwrap();
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (24u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        let (plan, _, _) = super::qwen4_plan_hotset_placement(
+            &slabs,
+            &rank,
+            HotsetBudget::parse(None).unwrap(),
+            total,
+            true,
+            (48, 512, false),
+            Some(need),
+            &spans,
+        )
+        .unwrap();
+        let shared = super::qwen4_record_shadow_region(plan.clone(), true, shadow).unwrap();
+        let tail = shared.decode_share_tail().unwrap();
+        assert_eq!(tail.shadow_bytes, shadow);
+        assert_eq!(tail.class_spans, spans);
+        // Every class dirties at least the donors the shadow region spans.
+        let region_donors = shadow.div_ceil(PADDED) as usize;
+        assert!(tail
+            .class_donors
+            .iter()
+            .all(|&donors| donors >= region_donors));
+        assert_eq!(*tail.class_donors.last().unwrap(), tail.donors.len());
+        // The donor tail covers the shadows and the largest scratch class.
+        assert!(tail.donor_bytes >= need);
+        // Refused sharing (`need` absent) records nothing and changes nothing.
+        let (plain, _, _) = super::qwen4_plan_hotset_placement(
+            &slabs,
+            &rank,
+            HotsetBudget::parse(None).unwrap(),
+            total,
+            true,
+            (48, 512, false),
+            None,
+            &[],
+        )
+        .unwrap();
+        let same = super::qwen4_record_shadow_region(plain.clone(), false, shadow).unwrap();
+        assert!(same.decode_share_tail().is_none());
+        assert_eq!(same.logical_digest(), plain.logical_digest());
+        // A zero region (shadows stay resident) leaves a sharing plan's tail at 0.
+        let none = super::qwen4_record_shadow_region(plan, true, 0).unwrap();
+        assert_eq!(none.decode_share_tail().unwrap().shadow_bytes, 0);
+        // A region the donor tail cannot hold is a load error, never a silent shrink.
+        let too_big = *tail.class_spans.first().unwrap() + 256;
+        assert!(super::qwen4_record_shadow_region(shared, true, too_big).is_err());
     }
 
     /// `on` against the real Flash-Next expert size (2,611,200 B padded) and the

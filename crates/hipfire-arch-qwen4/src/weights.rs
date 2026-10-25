@@ -2807,6 +2807,16 @@ impl Qwen4Weights {
         self.resident_named(&reference.name, reference.layer, self.device, 0)
     }
 
+    /// [`Self::resident`] by manifest name and layer (the decode-share
+    /// weight-shadow region plan names its sources, not typed references).
+    pub fn resident_by_name(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+    ) -> Result<&GpuTensor, WeightError> {
+        self.resident_named(name, layer, self.device, 0)
+    }
+
     fn resident_named(
         &self,
         name: &str,
