@@ -420,6 +420,54 @@ It prints old/new pack GPU-event timings and bandwidth for each row count, plus
 full-width consumer and integer GEMM timings; any mismatch exits 1. CPU layout/map tests:
 `cargo test --release -p hipfire-arch-qwen4 --lib npu_trunk::gpu::tests -j 12`.
 
+## Generic co-processor stage (`hipfire_runtime::coproc`, 0.4.4)
+
+The route's topology-free parts are shared runtime code; the Qwen4 module keeps
+only Flash-Next's shape description, weight packing, programs and the hooks of
+one (layer, bank) visit.
+
+* **Op-level stage map** (`coproc::stage::StageMap`). Per layer kind (0 = GDN,
+  1 = attention) the layer count, input-projection K and out family; the input
+  projection families the NPU may own, in fused order; and the ownership groups
+  (families that move as a unit, one contiguous fused-column range each). Mixer
+  core, recurrent/KV state, residual, FFN and head always stay on the GPU
+  (`StageMap::owner`). Flash-Next's map is `npu_trunk::FLASH_NEXT`: 36 GDN and 12
+  QSA layers, K = 2560, groups `qkv`, `zab`, `q`, `kvidx`.
+* **Ownership table** (`FamilySet`). The EP-like table of the families the NPU
+  owns, whole groups only, chosen by the planner per load (`select_families`) or
+  per request (`choose_families`).
+* **Numerics contract** (`EpilogueContract::Bf16Direct`, calibration spelling
+  `bf16`). Every NPU-owned output is exact integer accumulation over the whole K
+  with grid15-up scale sidecars and one BF16 rounding; no int32 partial, combine or
+  fold exists on either device.
+* **Calibration and planner** (`coproc::{calibration, plan, rates}`). The schema-4
+  record below is validated against a map (group names, kind names, out
+  families); the planner, crossover, selection, rate estimator and the
+  max-window budget (`admit_wave_budget`, at most four row-adaptive programs per
+  load) take the map. The arithmetic and the goldens are unchanged.
+* **Pair schedule** (`coproc::schedule`). A chunk pair is two micro-batches walked
+  layer-major: `Prepare(0,A)`, `Init(B)`, `Prepare(0,B)`, then per layer
+  `Run(l,A)`, `Prepare(l+1,A)`, `Run(l,B)`, `Prepare(l+1,B)`. `pair_edges` lists the
+  dependencies the order respects (activation pack to the NPU and its result
+  back, A-arena reuse after retire, residual rows, layer state A before B); the
+  Flash-Next pair executor iterates `pair_schedule`. Placing `Init(B)` after the
+  first kick is a latency choice (the pipeline fill), not a dependency.
+* **Model check.** At open, `StageMap::check_model` compares each kind's layer count
+  with the loaded model's mixers and `in_k` with its hidden size. A mismatch leaves
+  the route off with that reason (`on`: load error), so a map can never price
+  another model's plans.
+
+Limits of the stage as it stands (a third kind or a fifth group is a schema change):
+
+* Exactly two layer kinds (`KINDS = 2`) and four ownership groups (`GROUPS = 4`);
+  the planner enumerates the 15 nonempty group subsets.
+* Kind 1 is the attention mixer: the `qsa_*` GPU terms, `qsa_order` and the
+  attention out-family order stall price it; kind 0 takes `gdn_core_per_layer_ms`.
+* A pair's fill is the first bank-A chain of kind 0 when kind 0 moves anything,
+  else of kind 1 (the layer stack is assumed to start with kind 0).
+* A map with more natural families than four groups must merge them; the dense
+  27B test map owns FA `k` and `v` as one `kv` group.
+
 ## Stored calibration and deterministic planning (0.4.2)
 
 `Calibration::{load,store,validate,key_matches}` uses schema version **4** JSON
