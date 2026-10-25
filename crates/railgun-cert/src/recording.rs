@@ -1315,12 +1315,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-flash-next-gfx1151-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS)",
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: exact gfx1201 or exact gfx1151, symmetric IU4 descriptor present; on gfx1151 the producer also feeds the fused shared gate/up PeaceMaker launch's router + selector groups)",
         effect: KernelSelection,
-        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; recorded/captured: the incumbent launches",
+        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer mq_rotate_x_i4_f16out; recorded/captured: the incumbent launches",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "GPU byte oracles on Halo (gfx1151) of every output byte against the incumbent launches: HC down 36/36 vs the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal), halo-prefill-044/a-down/ORACLE.md; HC up v2 152/152 vs hyper_read_up_wmma_bf16_swap, random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region, halo-prefill-044/a-up/ORACLE.md. Eager exact-gfx1151 prefill arms; the recorded body keeps the incumbent launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        evidence: "GPU byte oracles on Halo (gfx1151) of every output byte against the incumbent launches: HC down 36/36 vs the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal), halo-prefill-044/a-down/ORACLE.md; HC up v2 152/152 vs hyper_read_up_wmma_bf16_swap, random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region, halo-prefill-044/a-up/ORACLE.md; MoE front 55/55 (examples/qwen4_moe_front_oracle.rs) over rows 1..16384 with ragged tails and adversarial rows, F16 X and IU4 sidecar vs convert_f32_to_f16 + mq_rotate_x_i4 and the router/selector/gate/up and shared gate/up PM outputs vs the chain, halo-prefill-044/a-front/ORACLE.md. Eager exact-gfx1151 prefill arms; the recorded body keeps the incumbent launches. No railgun default program is a qwen4 program, so nothing reaches one",
         reaches: &[],
     },
     Decision {
@@ -3606,7 +3606,10 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_moe_front_fuse_applies",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/hc_row_fold.rs",
