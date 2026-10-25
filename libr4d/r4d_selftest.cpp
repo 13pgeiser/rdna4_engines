@@ -5999,6 +5999,15 @@ static int launch_row(const RadKernelInfo* r, std::vector<RadTensor> ts,
     a.t = ts.data(); a.n_t = (int)ts.size();
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.world_size = 1;
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need < 0) return (int)need;
+        if (need > 0) {
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (!a.scratch) return RAD_E_NOMEM;
+        }
+    }
     const int rc = r->launch(&a, (RadStream)nullptr);
     if (rc != RAD_OK) return rc;
     return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
@@ -6071,6 +6080,162 @@ static void w4a8_multi_user_exact(const Plugin& pl) {
                    std::to_string(nz) + " nonzero");
         }
     }
+}
+
+/* ---- the MXFP4 gated fold, against the pair it replaces -------------------------------------
+ *
+ * gemm_mxfp4a8_gated_gemv (gemm_nt_q_gated_mx) against gemm_mxfp4a8_gemv followed by
+ * gated_quant_fp8, on the same weight bytes (one relayout, through the gemv row's hooks, which the
+ * gated row shares) and activation. Codes, scales and the bf16 product must be identical, and the
+ * codes mostly non-zero (zeroed buffers compare equal). Run twice: with `out_bf16`, and without it,
+ * where the codes and scales must still match. */
+static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K, bool ablk,
+                               bool gelu = false) {
+    const char* row = "gemm_mxfp4a8_gated_gemv";
+    if (!sel(row)) return;
+    char nm[192];
+    std::snprintf(nm, sizeof nm, "%s byte-identical to gemv + %s, M=%lld N=%lld K=%lld%s", row,
+                  gelu ? "gelu_mul + quant_act_fp8" : "gated_quant_fp8", (long long)M, (long long)N,
+                  (long long)K, ablk ? " ascale=row x 128" : "");
+    const RadKernelInfo* rg = find(pl, row);
+    const RadKernelInfo* rv = find(pl, "gemm_mxfp4a8_gemv");
+    const RadKernelInfo* rq = find(pl, gelu ? "quant_act_fp8" : "gated_quant_fp8");
+    const RadKernelInfo* rm = find(pl, "gelu_mul_bf16");
+    if (!rg || !rv || !rq || (gelu && !rm) || !rg->layout || !rg->relayout) {
+        ok(nm, false, "row or hooks absent");
+        return;
+    }
+
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) { ok(nm, false, "encoding has no codes/scale plane"); return; }
+    mxfp4_fill(p, ic, is, N, K, 0x51u, true);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    /* Stored through the gated row's own hooks (its `b_ref` is operand 4), so the gemv row reading
+     * the same bytes also checks that both ops store the planes in one form. */
+    if (stored(rg, lp, 2, p, { "codes" }, &wq) != RAD_OK || stored(rg, lp, 3, p, { "scale" }, &ws) != RAD_OK ||
+        stored(rg, lp, 4, p, { "scale" }, &wr) != RAD_OK) {
+        ok(nm, false, "relayout refused");
+        return;
+    }
+    /* The reference plane through the gemv row's own hook (its operand 6) must be the same bytes:
+     * a remap that handed the gated row's b_ref another form would otherwise pass, both kernels
+     * reading the same wrong plane. */
+    {
+        std::vector<uint8_t> wr_gemv;
+        if (stored(rv, lp, 6, p, { "scale" }, &wr_gemv) != RAD_OK || wr_gemv != wr) {
+            ok(nm, false, "b_ref stored differently by the gated and gemv rows");
+            return;
+        }
+    }
+    const int64_t nkb = K / 128, n = N / 2, gkb = n / 128;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> as((size_t)(M * (ablk ? nkb : 1)));
+    for (int64_t i = 0; i < M; ++i) {
+        if (ablk)
+            for (int64_t c = 0; c < nkb; ++c)
+                as[(size_t)(i * nkb + c)] = 0.002f * (float)(1 + st_mix32((uint32_t)(i * nkb + c)) % 97);
+        else
+            as[(size_t)i] = 0.0125f * (float)(1 + st_mix32((uint32_t)i ^ 0xa5u) % 5);
+        for (int64_t k = 0; k < K; ++k) rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, mxfp4_act(i, k, 0x3cu));
+    }
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    void* d_y = dalloc((size_t)(M * N * 2));
+    void* d_q[3] = { dalloc((size_t)(M * n)), dalloc((size_t)(M * n)), dalloc((size_t)(M * n)) };
+    void* d_z[3] = { dalloc((size_t)(M * gkb * 4)), dalloc((size_t)(M * gkb * 4)), dalloc((size_t)(M * gkb * 4)) };
+    void* d_b[2] = { dalloc((size_t)(M * n * 2)), dalloc((size_t)(M * n * 2)) };
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y || !d_q[2] || !d_z[2] || !d_b[1]) {
+        ok(nm, false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    const RadTensor ta = T(d_a, RAD_F8E4M3, { M, K });
+    const RadTensor tas = ablk ? T(d_s, RAD_F32, { M, nkb }) : T(d_s, RAD_F32, { M });
+    const RadTensor tw = T(d_w, RAD_U8, { (int64_t)wq.size() }), te = T(d_e, RAD_U8, { (int64_t)ws.size() });
+    const RadTensor tr = T(d_r, RAD_U8, { (int64_t)wr.size() });
+
+    /* The pair. */
+    RadTensor none = T(nullptr, RAD_F32, { 1 });
+    absent(none);
+    int rc = launch_row(rv, { ta, tas, tw, te, T(d_y, RAD_BF16, { M, N }), none, tr },
+                        { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8") });
+    if (rc == RAD_OK && !gelu)
+        rc = launch_row(rq, { T(d_y, RAD_BF16, { M, N }), T(d_q[0], RAD_F8E4M3, { M, n }),
+                              T(d_z[0], RAD_F32, { M, gkb }), T(d_b[0], RAD_BF16, { M, n }) },
+                        { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") });
+    if (rc == RAD_OK && gelu) {
+        rc = launch_row(rm, { T(d_y, RAD_BF16, { M, N }), T(d_b[0], RAD_BF16, { M, n }) },
+                        { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(rq, { T(d_b[0], RAD_BF16, { M, n }), T(d_q[0], RAD_F8E4M3, { M, n }),
+                                  T(d_z[0], RAD_F32, { M, gkb }) },
+                            { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16") });
+    }
+    if (rc != RAD_OK) { ok(nm, false, "the chain: rc=" + std::to_string(rc)); return; }
+
+    /* The fold, with and without the bf16 product (the GeGLU form refuses it, asserted). */
+    const std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                       PS("dtype", "mxfp4a8"), PS("act", gelu ? "gelu_tanh" : "silu") };
+    for (int v = 1; v <= 2; ++v) {
+        st_memset(d_q[v], 0, (size_t)(M * n));
+        st_memset(d_z[v], 0, (size_t)(M * gkb * 4));
+    }
+    st_memset(d_b[1], 0, (size_t)(M * n * 2));
+    rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[1], RAD_F8E4M3, { M, n }),
+                          T(d_z[1], RAD_F32, { M, gkb }), T(d_b[1], RAD_BF16, { M, n }) }, gp);
+    if (gelu) {
+        if (rc == RAD_OK) { ok(nm, false, "the GeGLU fold served out_bf16"); return; }
+        rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[1], RAD_F8E4M3, { M, n }),
+                              T(d_z[1], RAD_F32, { M, gkb }), none }, gp);
+        st_memcpy(d_b[1], d_b[0], (size_t)(M * n * 2), hipMemcpyDeviceToDevice);
+    }
+    /* Twice into one output, cleared between: the split's arrival counters are keyed on the output,
+     * so the second launch reduces only if the first left them zero. */
+    for (int rep = 0; rep < 2 && rc == RAD_OK; ++rep) {
+        st_memset(d_q[2], 0, (size_t)(M * n));
+        st_memset(d_z[2], 0, (size_t)(M * gkb * 4));
+        rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[2], RAD_F8E4M3, { M, n }),
+                              T(d_z[2], RAD_F32, { M, gkb }), none }, gp);
+    }
+    if (rc != RAD_OK) { ok(nm, false, "the fold: rc=" + std::to_string(rc)); return; }
+
+    std::vector<uint8_t> c[3];
+    std::vector<float> z[3];
+    for (int v = 0; v < 3; ++v) {
+        c[v].resize((size_t)(M * n));
+        z[v].resize((size_t)(M * gkb));
+        st_memcpy(c[v].data(), d_q[v], c[v].size(), hipMemcpyDeviceToHost);
+        st_memcpy(z[v].data(), d_z[v], z[v].size() * 4, hipMemcpyDeviceToHost);
+    }
+    std::vector<uint16_t> b0((size_t)(M * n)), b1((size_t)(M * n));
+    st_memcpy(b0.data(), d_b[0], b0.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(b1.data(), d_b[1], b1.size() * 2, hipMemcpyDeviceToHost);
+    int nc = 0, nz = 0, nb = 0, nc2 = 0, nz2 = 0, live = 0;
+    for (size_t i = 0; i < c[0].size(); ++i) {
+        nc += c[0][i] != c[1][i];
+        nc2 += c[0][i] != c[2][i];
+        live += c[1][i] != 0;
+    }
+    for (size_t i = 0; i < z[0].size(); ++i) {
+        nz += std::memcmp(&z[0][i], &z[1][i], 4) != 0;
+        nz2 += std::memcmp(&z[0][i], &z[2][i], 4) != 0;
+    }
+    for (size_t i = 0; i < b0.size(); ++i) nb += b0[i] != b1[i];
+    ok(nm, nc == 0 && nz == 0 && nb == 0 && nc2 == 0 && nz2 == 0 && live > (int)c[1].size() / 2,
+       "codes differ " + std::to_string(nc) + "/" + std::to_string(nc2) + ", scales " +
+           std::to_string(nz) + "/" + std::to_string(nz2) + ", bf16 " + std::to_string(nb) +
+           ", nonzero " + std::to_string(live) + " of " + std::to_string(c[1].size()));
 }
 
 /* ---- the audio generator's ops and their optional forms, against libref's arithmetic ----------
@@ -13140,6 +13305,31 @@ static void mx_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
         std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
                                      PS("dtype", "mxfp4a8") };
         perf_row(pl, row, ts, ps, d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
+        /* At a gate_up shape the gemv row's GEMM is half of a pair: time the other half
+         * (gated_quant_fp8 over its output) and the fold that replaces both. */
+        if (!std::strcmp(row, "gemm_mxfp4a8_gemv") && N % 256 == 0 && K % 128 == 0) {
+            const int64_t n = N / 2;
+            void* d_q = dalloc((size_t)(M * n));
+            void* d_z = dalloc((size_t)(M * (n / 128) * 4));
+            if (!d_q || !d_z) { std::printf("  gated: hipMalloc failed\n"); continue; }
+            RadTensor nob = T(nullptr, RAD_BF16, { M, n });
+            absent(nob);
+            perf_row(pl, "gated_quant_fp8", { T(d_y, RAD_BF16, { M, N }), T(d_q, RAD_F8E4M3, { M, n }),
+                                              T(d_z, RAD_F32, { M, n / 128 }), nob },
+                     { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") },
+                     d_y, (size_t)(M * N * 2), 1, (double)(M * N * 2), iters, 0);
+            const RadKernelInfo* rg = find(pl, "gemm_mxfp4a8_gated_gemv");
+            std::vector<uint8_t> gr;
+            if (rg && stored(rg, lp, 4, p, { "scale" }, &gr) == RAD_OK && gr == wr)
+                perf_row(pl, "gemm_mxfp4a8_gated_gemv",
+                         { T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
+                           T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+                           T(d_r, RAD_U8, { (int64_t)wr.size() }), T(d_q, RAD_F8E4M3, { M, n }),
+                           T(d_z, RAD_F32, { M, n / 128 }), nob },
+                         { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8"),
+                           PS("act", "silu") },
+                         d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
+        }
     }
 }
 
@@ -22832,6 +23022,32 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, co
     if (row->fini) { row->fini(a.inst); row->fini(b.inst); }
 }
 
+/* Every peer push landing after its flag (the kernel's test mode, R4D_AR_TEST_LATE_PUSH): a push
+ * over PCIe P2P sometimes lands a microsecond or more after the release flag that follows it, so a
+ * reader that trusted the flag would sum the slot's previous contents. The push check
+ * (r4d_ar_seq.h) makes the reader wait for the bytes; here every launch of the sweep needs it. */
+static void ar_two_rank_late(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    setenv("R4D_AR_TEST_LATE_PUSH", "1", 1);
+    ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
+    std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
+    ta.join();
+    tb.join();
+    unsetenv("R4D_AR_TEST_LATE_PUSH");
+    ok("2-rank all-reduce init, pushes landing after their flags",
+       a.rc_init == RAD_OK && b.rc_init == RAD_OK,
+       "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init));
+    if (a.rc_init != RAD_OK || b.rc_init != RAD_OK) return;
+    ok("2-rank all-reduce, every push landing ~20 us after its flag, 32 rounds, every sum exact on "
+       "both ranks",
+       a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && a.bad == 0 && b.bad == 0,
+       "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + ", " +
+       std::to_string(a.bad + b.bad) + " elements wrong");
+    if (row->fini) { row->fini(a.inst); row->fini(b.inst); }
+}
+
 /* ------------------------------------------------------------------ the two-rank all-gather */
 /* The payload is what the vocab-parallel sampler gathers: (u32 global token id, f32 logit) pairs.
  * A token id's bit pattern read as f32 is a denormal, so an all-gather emulated by an all-reduce
@@ -27203,6 +27419,16 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1088, 576, true);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1056, 576, false);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_decode", 5120, 5120, true);
+        /* The gated fold against the pair it replaces (gemv + gated_quant_fp8): Qwen's and
+         * TranslateGemma's per-rank gate_up at every M of the band, one group of 128 at the smallest
+         * K, and the per-row activation scale. */
+        for (const int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8 }) mxfp4a8_gated_case(pl, m, 17408, 5120, true);
+        mxfp4a8_gated_case(pl, 8, 21504, 5376, true);
+        mxfp4a8_gated_case(pl, 3, 256, 256, true);
+        mxfp4a8_gated_case(pl, 5, 1024, 640, false);
+        for (const int64_t m : { 1, 4, 8 }) mxfp4a8_gated_case(pl, m, 21504, 5376, true, true);
+        mxfp4a8_gated_case(pl, 3, 256, 256, true, true);
+        mxfp4a8_gated_case(pl, 2, 1024, 640, false, true);
         /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
          * kernel's tile, two and three parts, at every band. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 400, 640, 0, true, {}, 144);
@@ -28299,6 +28525,7 @@ static void device_phase(const Plugin& pl) {
                 if (!std::strcmp(base, "ar_oneshot_2rank_exact")) {
                     ar_two_rank(pl, devs, n.c_str());
                     ar_two_rank_sweep(pl, devs, n.c_str());
+                    ar_two_rank_late(pl, devs, n.c_str());
                 } else {
                     gather_two_rank(pl, devs, n.c_str());
                 }

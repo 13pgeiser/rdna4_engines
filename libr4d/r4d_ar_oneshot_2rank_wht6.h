@@ -129,7 +129,8 @@ struct Wht6Chunk {
 template <int CG = CHUNK_GROUPS, typename Ld>
 __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_groups, int lane,
                                                 int lig, int gw, uint4* p_pay,
-                                                unsigned short* p_sc, uint4* l_pay, float* l_sc) {
+                                                unsigned short* p_sc, uint4* l_pay, float* l_sc,
+                                                unsigned int& hck) {
   using Ch = Wht6Chunk<CG>;
   const int qmin = -(1 << (BITS - 1)), qmax = (1 << (BITS - 1)) - 1;
   unsigned int acc[Ch::NW];
@@ -157,8 +158,10 @@ __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_group
     float sc = (a > 0.f) ? bf16_round(a * (1.0f / (float)qmax)) : 1.0f;
     if (!(sc > 0.f)) sc = 1.0f;
     if (lig == 0 && live) {
-      p_sc[g] = (unsigned short)(__float_as_uint(sc) >> 16);
+      const unsigned short sc16 = (unsigned short)(__float_as_uint(sc) >> 16);
+      p_sc[g] = sc16;
       l_sc[g] = sc;
+      hck += r4d_archk_mix(sc16, R4D_ARCHK_U16 + (unsigned)g);
     }
     const float inv = 1.0f / sc;
 #pragma unroll
@@ -177,6 +180,7 @@ __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_group
       const long o = (long)c * (Ch::NW / 4 * WAVE) + (long)u * WAVE + lane;
       p_pay[o] = q;
       l_pay[o] = q;
+      hck += r4d_archk_u4(q, 4u * (unsigned)o);
     }
   } else {
     unsigned int* pp = reinterpret_cast<unsigned int*>(p_pay);
@@ -186,6 +190,7 @@ __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_group
       const long o = (long)c * (Ch::NW * WAVE) + (long)u * WAVE + lane;
       pp[o] = acc[u];
       lp[o] = acc[u];
+      hck += r4d_archk_mix(acc[u], (unsigned)o);
     }
   }
 }
@@ -207,6 +212,34 @@ __device__ __forceinline__ void wht6_handshake(unsigned int* peer_flags, unsigne
   }
   __syncthreads();
   if (acq) __threadfence_system();
+}
+
+// The push check's re-hash of one chunk (r4d_ar_seq.h): the payload words and live scales the
+// reduce below reads, at the indices wht6_push_chunk hashed them.
+template <int CG = CHUNK_GROUPS>
+__device__ __forceinline__ void wht6_rehash_chunk(unsigned int& h, int c, int n_groups, int lane,
+                                                  int lig, int gw, const uint4* m_pay,
+                                                  const unsigned short* m_sc) {
+  using Ch = Wht6Chunk<CG>;
+  if constexpr (Ch::U4) {
+#pragma unroll
+    for (int u = 0; u < Ch::NW / 4; ++u) {
+      const long o = (long)c * (Ch::NW / 4 * WAVE) + (long)u * WAVE + lane;
+      h += r4d_archk_u4(m_pay[o], 4u * (unsigned)o);
+    }
+  } else {
+    const unsigned int* mp = reinterpret_cast<const unsigned int*>(m_pay);
+#pragma unroll
+    for (int u = 0; u < Ch::NW; ++u) {
+      const long o = (long)c * (Ch::NW * WAVE) + (long)u * WAVE + lane;
+      h += r4d_archk_mix(mp[o], (unsigned)o);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < Ch::ITERS; ++t) {
+    const int g = c * CG + t * GPW + gw;
+    if (lig == 0 && g < n_groups) h += r4d_archk_mix(m_sc[g], R4D_ARCHK_U16 + (unsigned)g);
+  }
 }
 
 // Reduce: unpack both halves, add in fp32, inverse-rotate, pass each live group's EPL elements to st.
@@ -300,10 +333,16 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
 #pragma unroll
     for (int i = 0; i < EPL; ++i) v[i] = rd_to_f(in[off + i]);
   };
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
   for (int c = c0 + wid; c < c1; c += nwarp)
-    wht6_push_chunk(ld, c, n_groups, lane, lig, gw, w.p_pay, w.p_sc, w.l_pay, w.l_sc);
+    wht6_push_chunk(ld, c, n_groups, lane, lig, gw, w.p_pay, w.p_sc, w.l_pay, w.l_sc, hck);
+  r4d_archk_put(hck, peer_flags, nbw, s_slot, (unsigned)b, s);
 
   wht6_handshake(peer_flags, my_flags, b, s, tid, drain, acq);
+  r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int c = c0 + wid; c < c1; c += nwarp)
+      wht6_rehash_chunk(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc);
+  });
 
   const auto st = [&](long off, const float* v) {
 #pragma unroll

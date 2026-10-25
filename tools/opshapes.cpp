@@ -154,11 +154,15 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         add((uint32_t)RAD_F32, {M, (n + group - 1) / group});
     }
     else if (op == "gemm_nt_q") {
-        /* Block-scaled fp8 and mxfp4 only. `gemm_nt_q` covers six weight formats whose scale grids
-         * (per row, per row-group, per output-row-block, e8m0 exponents, zero points, reference
-         * exponents) belong to the reading kernel, not the schema. The fp8 grid is fixed by the
-         * checkpoint: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)] scale plane, `group`
-         * being the 128. Other formats are skipped and counted.
+        /* Block-scaled fp8, mxfp4 and the 2-bit asymmetric grid. `gemm_nt_q` covers six weight
+         * formats whose scale grids (per row, per row-group, per output-row-block, e8m0 exponents,
+         * zero points, reference exponents) belong to the reading kernel, not the schema. The fp8
+         * grid is fixed by the checkpoint: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)]
+         * scale plane, `group` being the 128. libref describes the symmetric integer grids, so a
+         * tool takes those from its hook and never reaches this table for them; every grid with a
+         * zero point is declined there (ref_planes.h joins scale and zero into one operand a
+         * description cannot state), and the ones named here are sized from the kernel's own
+         * stored layout instead. Anything else is skipped and counted.
          *
          * `a_sum` and `b_ref` belong to the asymmetric-integer and mxfp4 grids. */
         const char* q = g.get_s("dtype");
@@ -175,6 +179,24 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add((uint32_t)RAD_BF16,   {M, N});         /* y */
             skip_opd();                                /* a_sum */
             add((uint32_t)RAD_U8,     {N});            /* b_ref   -- the per-row reference */
+        } else if (q && std::strcmp(q, "w2a8") == 0) {
+            /* The DFlash2 draft head's grid (libr4d/r4d_gemm_w2a8_nt.hip): unsigned 2-bit codes in
+             * the kernel's fragment order, N*K/4 bytes (`r4d.w2a8.frag.g128`), and one dword per
+             * row and `group` of K holding that group's f16 scale and integer zero, tile-major,
+             * N*K/group of them (`r4d.w2a8.sz.g128`) -- both extents owned by
+             * libr4d/r4d_layout.cpp's r4d_rad_layout_w2a8, which is what sizes the real weight.
+             * The activation pair and the group sums are quant_act_i8's own outputs above, and the
+             * grid is asymmetric, so the kernel refuses the case without `a_sum`. `b_ref` is
+             * mxfp4's. Sizes are the stored bytes; random bytes suffice for timing. */
+            if (N <= 0 || K <= 0 || group != 128 || (K % 128) || (N % 16))
+                return RAD_E_UNSUPPORTED;
+            add((uint32_t)RAD_I8,   {M, K});                /* a       -- int8 codes */
+            add((uint32_t)RAD_F32,  {M, 1});                /* a_scale -- one f32 per row */
+            add((uint32_t)RAD_U8,   {N, K / 4});            /* b       -- u2 codes, fragment order */
+            add((uint32_t)RAD_U32,  {N, K / group});        /* b_scale -- scale+zero dwords */
+            add((uint32_t)RAD_BF16, {M, N});                /* y */
+            add((uint32_t)RAD_F32,  {K / group, (M + 15) / 16 * 16});  /* a_sum, group-major */
+            skip_opd();                                      /* b_ref */
         } else {
             const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
             const bool a16 = q && std::strcmp(q, "fp8a16") == 0;

@@ -425,6 +425,10 @@ int Engine::step_loop() {
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
+    /* Names where the step loop waits when nothing has been logged for a while: a freeze reports
+     * the blocked thread, its syscall and its stack; long quiet generations report sparsely (the
+     * silence doubles) and the reports read as the ordinary GPU wait. */
+    rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
