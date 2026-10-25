@@ -97,6 +97,24 @@ available, it can only be a no-regression control for the unchanged MXFP4 path. 
 launches exited before model load. No model was downloaded, no serving route was edited, and no
 serving process was stopped or replaced.
 
+### Release-tag plus PR build experiment
+
+To isolate the later mainline KV-stream integration, a temporary worktree was based on release tag
+`v1.12.0`, then given the HYV3 model-support patch (from `32881da` to `79487d2`) and the PR #237
+delta (`d650eca` to this PR head). One context conflict in `libr4d/r4d_layout.cpp` came from a
+post-release MXFP4-gated wrapper absent from the tag; the resolution kept the release's unrelated
+MXFP4 code and applied the PR's I4 layout changes. No changes were made to the published branch for
+this experiment.
+
+- Full Release host build: passed (694 targets).
+- Full `gfx1201` HIP build: passed (809 targets).
+- Focused `arch_test`, `chat_test`, `chatparse_test`, and `checkpoint_test`: 4/4 passed.
+
+This shows the release-based tree plus HYV3 support and PR changes compiles; it does not establish
+GPU execution correctness or model performance. No GPU selftest or Qwen inference was run from this
+temporary tree. Current-main build results above remain separate: its missing `core/kvstream/`
+module still blocks the newer engine target.
+
 ## Before this PR is ready
 
 1. Restore/fix the missing upstream KV-stream source and build a matched ABI-30 HIP engine; rerun
