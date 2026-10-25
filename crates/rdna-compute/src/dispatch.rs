@@ -2071,6 +2071,27 @@ impl Gpu {
         }
     }
 
+    /// Whether this device is a unified-memory APU whose device allocations
+    /// come from GTT (host RAM through TTM) rather than a carve-out: the device
+    /// pool is larger than the carve-out ([`crate::uma_memory::gtt_backed`]).
+    /// Every allocation of such a device, not only host-mapped memory, takes
+    /// pages from TTM's page pool first. `false` for a discrete GPU, a
+    /// carve-out APU, or when the device pool cannot be read.
+    pub fn is_gtt_backed_apu(&self) -> bool {
+        if !self.is_uma() || self.bind_thread().is_err() {
+            return false;
+        }
+        let Ok((_, total)) = self.hip.get_vram_info() else {
+            return false;
+        };
+        let carveout_total = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| crate::uma_memory::carveout_total_bytes(&bdf));
+        crate::uma_memory::gtt_backed(total as u64, carveout_total)
+    }
+
     /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
     /// with the free figure of a GTT-backed unified-memory APU clamped to
     /// the host RAM a GTT allocation can take (`MemAvailable - CMA` plus

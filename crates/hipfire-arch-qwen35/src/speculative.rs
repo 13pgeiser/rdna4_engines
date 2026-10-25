@@ -1126,7 +1126,16 @@ impl ModelSlot {
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
-        let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
+        // Size flash partials for the slot's real KV capacity (as the carrier
+        // path does). `Qwen35Scratch::new` assumes 8192, which at long context
+        // leaves room for one verify row, so VerifyAttn re-scans the whole KV
+        // once per verify row.
+        let scratch = Qwen35Scratch::new_with_kv_max(
+            gpu,
+            &config,
+            slot_config.repeat_window,
+            slot_config.max_seq.max(8192),
+        )?;
 
         Ok(Self {
             name,

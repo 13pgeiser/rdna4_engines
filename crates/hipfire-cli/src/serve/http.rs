@@ -1029,6 +1029,9 @@ async fn handle_request(
                 // Baseline render error of the daemon's effort probe, `null`
                 // when it rendered (or no model is resident).
                 "reasoning_effort_probe_error": meta.loaded.reasoning_effort_probe_error,
+                // Multi-slot swap tier: effective budgets, live usage and
+                // eviction/restore/failure counters from the last `done`.
+                "swap": meta.loaded.swap.clone(),
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -1048,6 +1051,7 @@ async fn handle_request(
                 "retries_succeeded": meta.retries_succeeded,
                 "recent_tok_s": meta.recent_tok_s,
                 "loaded_config": loaded_config_json(&meta),
+                "swap": meta.loaded.swap.clone(),
             });
             json_response(body, 200)
         }

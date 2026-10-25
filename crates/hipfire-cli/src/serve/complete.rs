@@ -2717,6 +2717,11 @@ pub(crate) fn complete_request_attempt(
         .unwrap_or_else(|error| error.into_inner());
     meta.requests_served = meta.requests_served.saturating_add(1);
     meta.recent_tok_s = done.get("tok_s").and_then(serde_json::Value::as_f64);
+    // Multi-slot `done` events carry the live swap-tier snapshot; publish it
+    // here (meta, not runtime) so `/health` stays lock-free.
+    if let Some(swap) = done.get("swap") {
+        meta.loaded.swap = swap.clone();
+    }
     // Same payload the gateway already had; previously only `tok_s` survived, as a
     // scalar overwritten by the next request. Distributions are what make a stall
     // visible.

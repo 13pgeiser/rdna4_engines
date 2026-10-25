@@ -2055,6 +2055,39 @@ impl AutoReserve {
     }
 }
 
+/// The byte terms of a decode-share load against the baseline forward charge. Pure arithmetic;
+/// not yet wired into [`auto_vram_reserve`], [`state_census`] or the carriers.
+///
+/// Both of those take [`crate::gpu_forward::qwen4_forward_device_bytes`] as their forward term,
+/// so substituting `dedicated_bytes` for it lowers [`AutoReserve::bytes`] by exactly
+/// [`Self::reserve_delta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeShareCharge {
+    /// `S`: the donor span the borrowed prefill bank occupies
+    /// ([`crate::gpu_forward::qwen4_decode_share_borrow_bytes`]).
+    pub borrow_bytes: u64,
+    /// `D_bytes`: the dedicated forward the load charges instead of the baseline
+    /// ([`crate::gpu_forward::qwen4_decode_share_dedicated_bytes`]).
+    pub dedicated_bytes: u64,
+    /// `F`: the baseline forward charge
+    /// ([`crate::gpu_forward::qwen4_forward_device_bytes`]).
+    pub baseline_forward: u64,
+    /// `O`: the donor guard plus the second device pointer tables.
+    pub overhead: u64,
+}
+
+impl DecodeShareCharge {
+    /// `F - D_bytes`: how far the reserve falls (zero if the dedicated bank is not smaller).
+    pub fn reserve_delta(&self) -> u64 {
+        self.baseline_forward.saturating_sub(self.dedicated_bytes)
+    }
+
+    /// `F - D_bytes - O`: the net bytes the expert budget gains (zero if the overhead eats it).
+    pub fn expert_headroom(&self) -> u64 {
+        self.reserve_delta().saturating_sub(self.overhead)
+    }
+}
+
 /// The largest trunk-layer count whose routed experts fit in `free_vram`
 /// after the non-expert weights and `reserve` ([`auto_vram_reserve`]). The S1
 /// admission's [`crate::slowlink_admission::PlacementBudget::largest_fitting_layers`]
@@ -3388,13 +3421,28 @@ fn host_mapped_is_gtt() -> bool {
 /// pressure (`echo 2 | sudo tee /proc/sys/vm/drop_caches` empties it at
 /// once). 0 unless host-mapped memory is GTT-backed
 /// (`HSA_USERPTR_FOR_PAGED_MEM=0`), or when sysfs or `/proc/meminfo` is
-/// unreadable. Unified-memory sizing counts the pool through
-/// `Gpu::device_mem_info` instead.
+/// unreadable. Loads that hold a [`rdna_compute::Gpu`] use
+/// [`ttm_pool_estimate_on`], which also counts the pool on a GTT-backed APU.
 pub fn ttm_pool_estimate() -> u64 {
     if !host_mapped_is_gtt() {
         return 0;
     }
     rdna_compute::uma_memory::ttm_pool_bytes()
+}
+
+/// [`ttm_pool_estimate`] for a load on `gpu`. A GTT-backed unified-memory APU
+/// (Strix Halo: a 1 GiB carve-out, the rest of the device pool is GTT) takes
+/// every allocation, weights and scratch included, from GTT, so a previous
+/// process's freed pages parked in TTM's page pool are available to it whether
+/// or not `HSA_USERPTR_FOR_PAGED_MEM=0` is set (hip-bridge leaves it unset on
+/// an APU, which ignores it). Without this count a reload after any exit
+/// reads the ~80 GiB the last process parked as `MemAvailable` it does not
+/// have.
+pub fn ttm_pool_estimate_on(gpu: &rdna_compute::Gpu) -> u64 {
+    if gpu.is_gtt_backed_apu() {
+        return rdna_compute::uma_memory::ttm_pool_bytes();
+    }
+    ttm_pool_estimate()
 }
 
 /// GTT room on the host: TTM's cap and what amdgpu devices already hold.
@@ -4240,6 +4288,286 @@ mod tests {
             Full,
             0,
         )
+    }
+
+    /// Both reserve formulas read `qwen4_forward_device_bytes` as their forward term, once and
+    /// additively; swapping it for the dedicated bank lowers the reserve by `F - D_bytes`.
+    #[test]
+    fn decode_share_dedicated_forward_lowers_both_reserves_by_exactly_the_delta() {
+        let config = crate::config::compact_test_config();
+        let (chunk, mode) = (16384usize, FnSymGfx1201);
+        let forward = |rows, mode| {
+            crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
+        };
+        let f = forward(chunk, mode);
+        let d =
+            crate::gpu_forward::qwen4_decode_share_dedicated_bytes(&config, chunk, mode).unwrap();
+        let s = crate::gpu_forward::qwen4_decode_share_borrow_bytes(&config, chunk, mode).unwrap();
+        let charge = DecodeShareCharge {
+            borrow_bytes: s,
+            dedicated_bytes: d,
+            baseline_forward: f,
+            overhead: 12_345,
+        };
+        assert!(d < f);
+        assert_eq!(charge.reserve_delta(), f - d);
+        assert_eq!(charge.expert_headroom(), f - d - 12_345);
+        assert_eq!(
+            DecodeShareCharge {
+                overhead: u64::MAX,
+                ..charge
+            }
+            .expert_headroom(),
+            0
+        );
+
+        // auto_vram_reserve: reserve = base + forward(rows, mode), base independent of both.
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let reserve = |rows, mode| {
+            auto_vram_reserve(&config, &measured, rows, mode, F32, None, None).unwrap()
+        };
+        let base = reserve(chunk, mode) - f;
+        for (rows, mode) in [(4096, Full), (8192, FnSymGfx1201), (2048, FnSymGfx1201)] {
+            assert_eq!(
+                reserve(rows, mode) - forward(rows, mode),
+                base,
+                "{rows} rows"
+            );
+        }
+        assert_eq!(reserve(chunk, mode) - (base + d), charge.reserve_delta());
+
+        // state_census: its forward term is that same query.
+        let ctx = crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, 16384, 16384, 2 << 20);
+        let state = state_census(&config, target_state_format(), &ctx, chunk, mode).unwrap();
+        assert_eq!(state.forward, f);
+
+        // Census-only path (historical retired) and the historical path where the census wins.
+        let census = census_at(&config, 16384, chunk, mode, 700 << 20);
+        assert_eq!(census.forward, f);
+        let dedicated = ReserveCensus {
+            forward: d,
+            ..census
+        };
+        for historical in [None, Some(1u64)] {
+            let before = AutoReserve::new(historical, census).unwrap();
+            let after = AutoReserve::new(historical, dedicated).unwrap();
+            if historical.is_some() {
+                assert_eq!(before.winner(), "census");
+                assert_eq!(after.winner(), "census");
+            }
+            assert_eq!(
+                before.bytes() - after.bytes(),
+                charge.reserve_delta(),
+                "historical {historical:?}"
+            );
+        }
+    }
+
+    /// R9700 receipt (beta load log, arm a) replayed through the real Flash-Next plan sizes.
+    #[test]
+    fn decode_share_r9700_receipt_fixture() {
+        use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+        use crate::expert_slabs::ExpertFormat;
+        use crate::expert_tier_plan::{plan_expert_tiers_from_slabs, Placement};
+
+        const MIB: u64 = 1 << 20;
+        const EXPERT: u64 = 2_611_200;
+        let (chunk, mode) = (16384usize, FnSymGfx1201);
+        let config = crate::config::compact_test_config();
+
+        // Receipt.
+        let free = 32_550 * MIB;
+        let non_expert = 5_115 * MIB;
+        let census_reserve = 10_393 * MIB;
+        let receipt_forward_mib = 4_836u64;
+        let base_tables = 417_792u64;
+        let safety = 512 * MIB;
+        let stage = 2_002 * MIB;
+        let extra_tables = 393_216u64;
+        let hot_budget = 14_525 * MIB;
+        let hot_experts = 5_833u64;
+
+        let f = crate::gpu_forward::qwen4_forward_device_bytes(&config, chunk, mode).unwrap();
+        let f_mib = (f + MIB / 2) >> 20;
+        eprintln!("F = {f} B ({f_mib} MiB rounded; receipt {receipt_forward_mib} MiB)");
+        if f_mib != receipt_forward_mib {
+            eprintln!("RECEIPT MISMATCH: forward term is {f_mib} MiB, not {receipt_forward_mib}");
+        }
+        // The receipt's budget chain: free - non-expert - census - safety - stage - tables.
+        let chain =
+            free - non_expert - census_reserve - safety - stage - base_tables - extra_tables;
+        eprintln!(
+            "receipt chain budget = {} B ({:.3} MiB) -> floor {} experts; receipt hot budget {} MiB = {hot_experts} experts ({} B)",
+            chain,
+            chain as f64 / MIB as f64,
+            chain / EXPERT,
+            hot_budget / MIB,
+            hot_experts * EXPERT
+        );
+        assert_eq!(
+            chain / EXPERT,
+            hot_experts,
+            "receipt chain disagrees with the receipt's expert count"
+        );
+
+        let d =
+            crate::gpu_forward::qwen4_decode_share_dedicated_bytes(&config, chunk, mode).unwrap();
+        let s = crate::gpu_forward::qwen4_decode_share_borrow_bytes(&config, chunk, mode).unwrap();
+        let guard = ((crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).max(256) + 255) & !255;
+        let pointer_tables = 24_576u64 * 2 * 8;
+        let o = guard + pointer_tables;
+        let k = s.div_ceil(EXPERT);
+        let charge = DecodeShareCharge {
+            borrow_bytes: s,
+            dedicated_bytes: d,
+            baseline_forward: f,
+            overhead: o,
+        };
+        let new_budget = hot_budget + charge.reserve_delta() - o;
+        let delta_k = new_budget / EXPERT - hot_experts;
+        eprintln!("D_bytes = {d} B ({:.3} MiB)", d as f64 / MIB as f64);
+        eprintln!("S = {s} B ({:.3} MiB)", s as f64 / MIB as f64);
+        eprintln!(
+            "F - D_bytes = {} B ({:.3} MiB)",
+            charge.reserve_delta(),
+            charge.reserve_delta() as f64 / MIB as f64
+        );
+        eprintln!("O = {o} B (guard {guard} + pointer tables {pointer_tables})");
+        eprintln!("K = ceil(S / {EXPERT}) = {k}");
+        eprintln!(
+            "new budget = {new_budget} B ({:.3} MiB); dK = {delta_k}; dK/K = {:.4}",
+            new_budget as f64 / MIB as f64,
+            delta_k as f64 / k as f64
+        );
+        let chain_new = chain + charge.reserve_delta() - o;
+        eprintln!(
+            "  (chain-derived budget instead of the rounded 14,525 MiB: dK = {})",
+            chain_new / EXPERT - hot_experts
+        );
+
+        // Second scenario: F16 weight shadows 1,238 + INT8 shared-expert shadows 239 MiB.
+        let shadows = 1_477 * MIB;
+        let s2 = s + shadows;
+        let k2 = s2.div_ceil(EXPERT);
+        let new_budget2 = hot_budget + charge.reserve_delta() + shadows - o;
+        let delta_k2 = new_budget2 / EXPERT - hot_experts;
+        eprintln!(
+            "with shadows: S = {s2} B ({:.3} MiB), K = {k2}, reserve delta = {} B, new budget = {new_budget2} B ({:.3} MiB), dK = {delta_k2}, dK/K = {:.4}",
+            s2 as f64 / MIB as f64,
+            charge.reserve_delta() + shadows,
+            new_budget2 as f64 / MIB as f64,
+            delta_k2 as f64 / k2 as f64
+        );
+
+        // Capacity classes and the ideal restore time at 56.9 GB/s (decimal).
+        for class in crate::gpu_forward::qwen4_decode_share_classes(chunk) {
+            let span =
+                crate::gpu_forward::qwen4_decode_share_borrow_bytes(&config, class, mode).unwrap();
+            eprintln!(
+                "class {class:>5} rows: span_bytes = {span} B ({:.3} MiB), ideal restore at 56.9 GB/s = {:.3} ms",
+                span as f64 / MIB as f64,
+                span as f64 / 56.9e9 * 1e3
+            );
+        }
+
+        // Kill assertions (verdict change 4).
+        let reserve_fall = {
+            let census = census_at(&config, 16384, chunk, mode, 0);
+            let dedicated = ReserveCensus {
+                forward: d,
+                ..census
+            };
+            AutoReserve::new(None, census).unwrap().bytes()
+                - AutoReserve::new(None, dedicated).unwrap().bytes()
+        };
+        assert_eq!(
+            reserve_fall,
+            f - d,
+            "KILL: reserve falls by {reserve_fall} B, expected F - D_bytes = {} B",
+            f - d
+        );
+        assert!(
+            delta_k as f64 >= 0.8 * k as f64,
+            "KILL: dK = {delta_k} < 0.8 * K = {:.1} (K = {k}, S = {s} B, F = {f} B, D_bytes = {d} B, O = {o} B)",
+            0.8 * k as f64
+        );
+        assert!(
+            delta_k2 as f64 >= 0.8 * k2 as f64,
+            "KILL (shadows): dK = {delta_k2} < 0.8 * K = {:.1} (K = {k2})",
+            0.8 * k2 as f64
+        );
+
+        // A real plan over uniform slabs at the new budget donates exactly K experts.
+        let slabs: Vec<ExpertSlab> = (0..24_576usize)
+            .map(|i| {
+                let base = i * EXPERT as usize;
+                ExpertSlab {
+                    format: ExpertFormat::Mq4Xts,
+                    gate_up: ExpertSlabSpan {
+                        offset: base,
+                        len: 1_740_800,
+                    },
+                    down: ExpertSlabSpan {
+                        offset: base + 1_740_800,
+                        len: 870_400,
+                    },
+                }
+            })
+            .collect();
+        let rank: Vec<u32> = (0..24_576u64)
+            .map(|k| ((k * 7919 + 13) % 24_576) as u32)
+            .collect();
+        let plan = plan_expert_tiers_from_slabs(&slabs, &rank, new_budget).unwrap();
+        let resident = plan.device_experts() as u64;
+        assert_eq!(resident, (new_budget - guard) / EXPERT);
+        assert!(
+            resident > k,
+            "{resident} resident experts cannot donate {k}"
+        );
+        let (shared, tail) = plan.clone().with_decode_share(&rank, s).unwrap();
+        assert_eq!(tail.donors.len() as u64, k);
+        assert_eq!(tail.donor_bytes, k * EXPERT);
+        assert!(tail.donor_bytes >= s && tail.donor_bytes - EXPERT < s);
+        assert_eq!(shared.device_experts() as u64, resident);
+        assert_eq!(tail.donor_offset, tail.guard_offset + guard);
+        assert_eq!(
+            shared.owner_bytes(Placement::Device),
+            tail.donor_offset + tail.donor_bytes + guard
+        );
+        let window = shared.host_windows().last().unwrap();
+        assert_eq!(window.spans[0].1, tail.mirror_offset);
+        for (i, &id) in tail.donors.iter().enumerate() {
+            let e = shared.entry(id as usize / 512, id as usize % 512).unwrap();
+            assert_eq!(e.tier, Placement::Device);
+            // Contiguous, back to back.
+            assert_eq!(e.gate_up_offset, tail.donor_offset + i as u64 * EXPERT);
+            assert_eq!(e.down_offset, e.gate_up_offset + 1_740_800);
+            // Mirror equality: one copy of donor_bytes restores the tail.
+            assert_eq!(
+                window.spans[2 * i].1 - tail.mirror_offset,
+                e.gate_up_offset - tail.donor_offset
+            );
+            assert_eq!(
+                window.spans[2 * i + 1].1 - tail.mirror_offset,
+                e.down_offset - tail.donor_offset
+            );
+            assert_eq!(tail.borrow_entries[id as usize].tier, Placement::HostMapped);
+        }
+        // Nothing else lives in or past the donor tail.
+        for id in 0..24_576usize {
+            let e = shared.entry(id / 512, id % 512).unwrap();
+            if e.tier == Placement::Device && !tail.donors.contains(&(id as u32)) {
+                assert!(e.down_offset + e.down_len <= tail.guard_offset);
+            }
+        }
+        eprintln!(
+            "plan: {resident} resident experts at the new budget, {} donors, guard at {}, donor tail [{}, {}), mirror at {}",
+            tail.donors.len(),
+            tail.guard_offset,
+            tail.donor_offset,
+            tail.donor_offset + tail.donor_bytes,
+            tail.mirror_offset
+        );
     }
 
     /// Placement of the reproduction card with the real census: the layers

@@ -569,6 +569,7 @@ mod tests {
             prefill_chunk: 1024,
             host_budget_bytes: 0,
             swap_dir: PathBuf::new(),
+            swap_disk_bytes: 0,
             is_vl: true,
             vl_path: None,
             mtp_k: 0,

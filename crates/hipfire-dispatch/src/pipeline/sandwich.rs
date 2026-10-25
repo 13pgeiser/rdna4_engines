@@ -919,6 +919,10 @@ pub struct SandwichAttentionOp<'a> {
     pub kv: SandwichKv<'a>,
     /// Device position scalar (decode).
     pub pos_buf: &'a DeviceBuffer,
+    /// Last key position and its device scalar for a single query-only row
+    /// whose own row is not cached (a draft head querying at the pending
+    /// token's position). `None` attends through `position`.
+    pub attend_through: Option<(usize, &'a DeviceBuffer)>,
     /// Per-row i32 positions (batched rows).
     pub positions: Option<&'a GpuTensor>,
     /// Output gate ([`SandwichRoute::Steps`] only).
@@ -964,6 +968,15 @@ impl SandwichAttentionOp<'_> {
                 .positions
                 .ok_or_else(|| invalid(format!("{L}: batched rows need per-row positions")))?;
             need(positions, rows, L, "positions")?;
+        }
+        if let Some((through, _)) = self.attend_through {
+            let tier = matches!(self.kv.route, KvRoute::Tier { .. });
+            if s.batched() || self.kv_proj.is_some() || !tier || through >= self.position {
+                return Err(invalid(format!(
+                    "{L}: attending through {through} needs one query-only Tier row past it (position {})",
+                    self.position
+                )));
+            }
         }
         let mut weights = vec![&self.wq, &self.wo];
         weights.extend(self.wk());
@@ -1311,8 +1324,9 @@ impl SandwichAttentionOp<'_> {
         flash_partials: &GpuTensor,
     ) -> Result<(), DispatchError> {
         let kv = &self.kv;
+        let (pos, pos_buf) = self.attend_through.unwrap_or((self.position, self.pos_buf));
         let mut plan = KvTierPlan::derive(KvTierInputs {
-            pos: self.position,
+            pos,
             batch_size: 1,
             q8_windowed: true,
             window: kv.window as i32,
@@ -1330,8 +1344,8 @@ impl SandwichAttentionOp<'_> {
             v_cache: kv.v_cache,
             k_scales: None,
             v_scales: None,
-            pos_buf: self.pos_buf,
-            pos: self.position,
+            pos_buf,
+            pos,
             positions: None,
             n_heads: self.n_heads,
             n_kv_heads: self.n_kv_heads,
@@ -2875,6 +2889,7 @@ mod validation_tests {
                 },
             },
             pos_buf: &pos_buf,
+            attend_through: None,
             positions: Some(&big),
             gate: None,
             wo: weight(&big),

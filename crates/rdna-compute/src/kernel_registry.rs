@@ -1991,14 +1991,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "quantize_int4_mmq_ds128"
             ]
         );
-        // Exact-gfx1151 1..=16-row MQ4V2 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernels).
+        // Exact-gfx1151 1..=16-row MQ4V2 + HFQ4G256/MQ4G256 v1 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernels).
         add!(
             "gemm_mq4g256v2_wmma_gfx1151_xlds",
             kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC,
             [
+                "gemm_gate_up_hfq4g256_wmma_gfx1151_xlds",
                 "gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds",
+                "gemm_hfq4g256_residual_wmma_gfx1151_xlds",
                 "gemm_mq4g256v2_residual_wmma_gfx1151_xlds",
+                "gemm_qkv_hfq4g256_wmma_gfx1151_xlds",
                 "gemm_qkv_mq4g256v2_wmma_gfx1151_xlds",
+                "gemm_qkvza_hfq4g256_wmma_gfx1151_xlds",
                 "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds"
             ]
         );
@@ -3914,6 +3918,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1151" {
+        add!(
+            "attention_dflash_wmma_kvsplit_gfx1151",
+            kernels::ATTENTION_DFLASH_WMMA_KVSPLIT_GFX1151_SRC,
+            ["attention_dflash_wmma_kvsplit_gfx1151"]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,

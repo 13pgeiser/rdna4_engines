@@ -196,8 +196,8 @@ Caveats:
   `-mq2-xts`; see [the tier table](#qwen-38-flash-next-split-ple-tiers-043).
 - **Container image.** `compose.yml` runs a ROCm 10.1 `full` image (default)
   or a slim `runtime` image with baked gfx1100, gfx1151 and gfx1201 kernel
-  packs. The 0.4.3 image `ghcr.io/warpfront/hipfire:0.4.3` is being published
-  with this release; until it appears, compose builds the image locally.
+  packs. The image is published as `ghcr.io/warpfront/hipfire:0.4.3.1` (and
+  `:latest`).
 - **Strix Halo repetitive-prompt NaN fix**, with no prefill cost. A long
   prompt with many repeated tokens could turn Flash-Next/Qwen GDN prefill NaN
   on Strix Halo and the 7900 XTX.
@@ -513,9 +513,9 @@ docker compose up -d      # or: podman compose up -d
 curl http://127.0.0.1:11435/v1/models
 ```
 
-The 0.4.3 image is `ghcr.io/warpfront/hipfire:0.4.3` (being published with
-this release). Once it is up, `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.3`
-pins compose to it; the default is `:latest`.
+The image is `ghcr.io/warpfront/hipfire:latest` (`docker pull
+ghcr.io/warpfront/hipfire:0.4.3.1`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.3.1`
+pins compose to a release.
 
 ## Deprecated features
 
