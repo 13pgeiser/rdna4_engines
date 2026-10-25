@@ -2066,11 +2066,11 @@ fn cpu_preflight(
     // tensors. If no .vl file exists, fall back to inline (backward compat).
     //
     // `vision_mode` is the SAME documented ladder the sequential load arm
-    // applies (`apply_vision_mode_gate`): `off` (the default) never wires a
+    // applies (`apply_vision_mode_gate`): `off` never wires a
     // sidecar — not even an explicit one — so a text load pays no tower
     // VRAM; `on` requires a tower to resolve. The multi-slot arm used to
     // discover the sibling unconditionally, so a VL trunk paid the tower's
-    // ~1 GB even under the documented text-only default, and `serve --vision`
+    // ~1 GB even under `vision_mode=off`, and `serve --vision`
     // was dropped on this route entirely.
     let has_inline_vision = is_vision_hfq(&hfq);
     let vl_path: Option<PathBuf> = if vision_mode == "off" {

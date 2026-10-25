@@ -1719,10 +1719,10 @@ fn main() {
                 // admission validates (arch 5|6, tower tensor present) and the
                 // Qwen35 carrier loads the tower from it.
                 //
-                // `vision_mode=off` (the default) is a hard daemon-side override,
+                // `vision_mode=off` is a hard daemon-side override,
                 // mirroring the `dflash_mode=off` guard above: even an explicit
-                // sidecar is skipped, so a default load never pays the +~1 GB
-                // tower VRAM. CLI-side gating is the primary path; this guard
+                // sidecar is skipped, so an `off` load never pays the +~1 GB
+                // tower VRAM (the schema default is `auto`). CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
                 //
                 // One implementation for both load arms: `resolve_vision_ladder`

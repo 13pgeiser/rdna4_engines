@@ -1680,7 +1680,7 @@ pub static FIELDS: &[ConfigField] = &[
         "vision_mode",
         Vision,
         ModelLoad,
-        DefaultValue::String("off"),
+        DefaultValue::String("auto"),
         ValueRule::Enum(AUTO_ON_OFF),
         true,
         false,
@@ -4030,6 +4030,17 @@ pub fn field(key: &str) -> Option<&'static ConfigField> {
     FIELDS
         .iter()
         .find(|candidate| candidate.key == key || candidate.legacy_key == key)
+}
+
+/// The schema default of `vision.mode` (`off`/`auto`/`on`), for a load
+/// request that carries no `params.vision_mode` (a daemon-protocol client that
+/// does not project the config ladder). Every consumer that needs a fallback
+/// reads it here so no caller hardcodes a mode of its own.
+pub fn vision_mode_default() -> &'static str {
+    match field("vision.mode").map(|schema| schema.default) {
+        Some(DefaultValue::String(mode)) => mode,
+        _ => unreachable!("vision.mode is a string-valued schema field"),
+    }
 }
 
 const DEVELOPER_PREFIX: &str = "developer.";
@@ -8397,11 +8408,11 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(field.parse_cli("7").is_err());
     }
     #[test]
-    fn vision_mode_defaults_off_with_auto_on_off_values() {
+    fn vision_mode_defaults_auto_with_auto_on_off_values() {
         let field = field("vision.mode").expect("vision.mode schema field");
         assert_eq!(field.legacy_key, "vision_mode");
         assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
-        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
+        assert_eq!(field.default.to_value(), ConfigValue::String("auto".into()));
         for mode in ["off", "auto", "on"] {
             assert_eq!(
                 field.parse_cli(mode).unwrap(),
@@ -8409,6 +8420,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+        assert_eq!(vision_mode_default(), "auto");
     }
     #[test]
     fn npu_trunk_calibration_schema_and_snapshot() {

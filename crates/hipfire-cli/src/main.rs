@@ -5284,7 +5284,9 @@ fn resolve_vision_sidecar(
     // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
     // override and the only place that decides; leaving the resolved path in
     // the params lets it tell an image request which sidecar it declined.
-    let mode = params["vision_mode"].as_str().unwrap_or("off");
+    let mode = params["vision_mode"]
+        .as_str()
+        .unwrap_or(hipfire_config::vision_mode_default());
     if !matches!(mode, "off" | "auto" | "on") {
         return Ok(());
     }
@@ -7221,6 +7223,21 @@ struct BenchLoadOpts {
     continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
+/// `bench` measures text generation and has no image/audio/video input, so
+/// its load is text-only whatever `vision.mode` resolves to. Under the schema
+/// default `auto` a pulled `qwen3.8-27b-vision.hfq` would otherwise be wired
+/// into every bench load: ~1.05 GB of resident tower VRAM that shifts KV and
+/// admission headroom (and, on cards where `max_seq` is derived from free
+/// memory, the context the run is sized to) relative to earlier releases.
+/// Projects `off` and drops the resolved sidecar so no `skipping tower
+/// sidecar` line fires either.
+fn pin_bench_text_only(params: &mut serde_json::Value) {
+    params["vision_mode"] = serde_json::json!("off");
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("vision");
+    }
+}
+
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
@@ -7300,6 +7317,7 @@ fn open_bench_engine(
         // No --head on this path yet; the model's own head is used.
         None,
     )?;
+    pin_bench_text_only(&mut params);
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
@@ -13815,6 +13833,38 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn bench_load_is_text_only_under_the_default_vision_mode() {
+        // The schema default is `auto`, which wires a pulled sidecar into
+        // `run`/`serve`; `bench` has no media input and must not pay the tower.
+        let paths = test_paths("bench-vision-pin");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut params = load_params(
+            &defaults,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "auto");
+        assert!(params["vision"].is_string());
+        pin_bench_text_only(&mut params);
+        assert_eq!(params["vision_mode"], "off");
+        assert!(params.get("vision").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

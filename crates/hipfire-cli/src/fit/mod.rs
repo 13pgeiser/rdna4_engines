@@ -1277,7 +1277,9 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         .then(|| str_param(params, "draft"))
         .flatten();
     // vision_ladder.rs:43-71, same ladder and hard mode gate.
-    let vision_mode = params["vision_mode"].as_str().unwrap_or("off");
+    let vision_mode = params["vision_mode"]
+        .as_str()
+        .unwrap_or(hipfire_config::vision_mode_default());
     let vision = (vision_mode != "off")
         .then(|| str_param(params, "vision"))
         .flatten();
@@ -1614,7 +1616,7 @@ mod tests {
         let a = admission_inputs(&empty);
         assert_eq!((a.tp, a.pp, a.max_seq), (1, 1, 0));
         assert_eq!(a.request, KvBackendRequest::Automatic);
-        assert_eq!(a.vision_mode, "off");
+        assert_eq!(a.vision_mode, hipfire_config::vision_mode_default());
         assert!(a.error.is_none());
         assert_eq!(
             admission_inputs(&json!({"max_seq": 2_000_000})).max_seq,
