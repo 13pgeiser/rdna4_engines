@@ -119,6 +119,8 @@ const EMBED_OFF_DIM: usize = 20;
 pub struct DraftStagingLayout {
     /// One u32 word: the window's seed token.
     pub seed_off: usize,
+    /// `B` u32 words `[seed, mask x (B-1)]` (noise ids).
+    pub ids_off: usize,
     /// `B` i32 absolute Q positions.
     pub q_off: usize,
     /// `min(L, full_w) + B` i32 words: the live K-position suffix then the B
@@ -131,6 +133,9 @@ pub struct DraftStagingLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftStagedWords {
     pub seed: u32,
+    /// `[seed, mask x (B-1)]`: the noise-token id plane the eager route uploads
+    /// before `embedding_q8_batched`.
+    pub noise_ids: Vec<u32>,
     pub q_positions: Vec<u32>,
     pub k_positions: Vec<u32>,
 }
@@ -143,6 +148,7 @@ pub fn draft_staged_words(
     position: usize,
     compact_offset: i32,
     seed: u32,
+    mask_token: u32,
     b: usize,
     full_w: usize,
 ) -> DraftStagedWords {
@@ -154,8 +160,11 @@ pub fn draft_staged_words(
         .collect();
     let mut k: Vec<u32> = suffix.iter().map(|&p| p as u32).collect();
     k.extend((0..b).map(|p| (position as i32 + p as i32 + compact_offset) as u32));
+    let mut ids = vec![seed];
+    ids.extend(std::iter::repeat(mask_token).take(b - 1));
     DraftStagedWords {
         seed,
+        noise_ids: ids,
         q_positions: q,
         k_positions: k,
     }
@@ -501,16 +510,23 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     if gpu.draft_collapse_fused_enabled() {
         return Err("refused: fused draft-collapse route (exact gfx1100) is not the gfx1201 body".into());
     }
+    // Mirrors build_dflash_noise_embeddings_weights: batched route when admitted.
+    let batched_embed =
+        crate::speculative::noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b);
     if !dflash::ordered_draft() {
         return Err("refused: HIPFIRE_DFLASH_ORDERED_DRAFT=0 uses synchronous null-stream copies".into());
     }
     if draft_scratch.online.is_some() {
         return Err("refused: online draft tuner".into());
     }
-    if draft_cfg.block_size != b || batch > verify_scratch.max_n || b > draft_scratch.max_block_size {
+    // Whole16 is the RUNTIME block (DflashState.block_size == 16); the draft's
+    // trained block (draft_cfg.block_size, 8 for the 27B registry draft) is
+    // irrelevant to the eager body, which runs `block.len()` rows. max_n only
+    // needs the 15 head rows (verify scratch carries B+1 headroom).
+    if batch > verify_scratch.max_n || b > draft_scratch.max_block_size {
         return Err(format!(
-            "refused: draft block {} / verify max_n {} / scratch max block {} is not Whole16",
-            draft_cfg.block_size, verify_scratch.max_n, draft_scratch.max_block_size
+            "refused: runtime block {b} needs verify max_n >= {batch} (have {}) and scratch max block >= {b} (have {})",
+            verify_scratch.max_n, draft_scratch.max_block_size
         ));
     }
     let (w, full_w) = match draft_scratch.ctx_mode {
@@ -807,6 +823,16 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     let block: Vec<u32> = std::iter::once(seed_token)
         .chain(std::iter::repeat(mask_token).take(b - 1))
         .collect();
+    // Design §2: materialize lazy JIT/module loads OUTSIDE plan mode. The
+    // selector is the one module the eager draft never launches; everything
+    // else the body emits (embedding, topk, argmax, GEMM/norm/rope/attention)
+    // was loaded by the eager window of the same shape that precedes a plan.
+    // Pending route-module preloads (the launch funnels' first-launch hook)
+    // are drained here too.
+    gpu.ensure_route_modules_preloaded().map_err(herr)?;
+    if selector.is_some() {
+        gpu.ensure_dflash_selector_greedy_exact().map_err(herr)?;
+    }
     let mut sink = PlanSink::default();
     let staged = DraftStagedInputs {
         buf: staging,
@@ -818,20 +844,35 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
         if let Some((_, blk)) = selector {
             gpu.memcpy_dtod_at_ordered_async(blk.seed_buffer(), 0, staging, layout.seed_off, 4)?;
         }
-        // Scalar noise embeddings: draft_dflash_forward_rank's fallback loop.
-        for (i, &tok) in block.iter().enumerate() {
-            let dst = draft_scratch.x.sub_offset(i * h, h);
-            match target_weights.embd_format {
-                llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
+        if batched_embed {
+            // Eager route: one id upload + one embedding_q8_batched. The ids
+            // [seed, mask x15] are staged; the upload becomes a typed D2D copy.
+            gpu.memcpy_dtod_at_ordered_async(
+                &draft_scratch.noise_tokens.buf,
+                0,
+                staging,
+                layout.ids_off,
+                b * 4,
+            )?;
+            let ids_view = draft_scratch.noise_tokens.sub_offset(0, b);
+            let out_view = draft_scratch.x.sub_offset(0, b * h);
+            gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &ids_view, b, h)?;
+        } else {
+            // Scalar noise embeddings: draft_dflash_forward_rank's fallback loop.
+            for (i, &tok) in block.iter().enumerate() {
+                let dst = draft_scratch.x.sub_offset(i * h, h);
+                match target_weights.embd_format {
+                    llama::EmbeddingFormat::HFQ4G256 => {
+                        gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::HFQ4G128 => {
+                        gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::Q8_0 => {
+                        gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    _ => unreachable!("admission checked the embedding format"),
                 }
-                llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
-                }
-                _ => unreachable!("admission checked the embedding format"),
             }
         }
         dflash::draft_forward_planned(
@@ -979,7 +1020,16 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                         while hi < w + b && attn_block(hi + 1, hd) == blk {
                             hi += 1;
                         }
-                        let dom = (lo - b) as u64..=(hi - b) as u64;
+                        // The kernel's `l` is `min(L, W) + b`: once the plan
+                        // sits on the saturated block (hi reached W + b) every
+                        // larger logical context maps to the same `l`, so the
+                        // logical domain is unbounded above.
+                        let dom_hi = if hi >= w + b {
+                            u64::MAX
+                        } else {
+                            (hi - b) as u64
+                        };
+                        let dom = (lo - b) as u64..=dom_hi;
                         l_domain = Some(match l_domain.take() {
                             None => dom,
                             Some(prev) => {
@@ -1055,8 +1105,16 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
             }
         }
     }
-    if embed_seen != b {
-        return Err(format!("{embed_seen} scalar embedding launches, expected {b}"));
+    let want_scalar = if batched_embed { 0 } else { b };
+    if embed_seen != want_scalar {
+        return Err(format!(
+            "{embed_seen} scalar embedding launches, expected {want_scalar}"
+        ));
+    }
+    if batched_embed
+        && !kernels.iter().any(|s| s == "embedding_q8_batched")
+    {
+        return Err("batched noise route planned no embedding_q8_batched launch".into());
     }
     let attn_count = kernels.iter().filter(|s| *s == SLIDING_ATTENTION_SYMBOL).count();
     if attn_count != n_layers {
@@ -1107,7 +1165,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
         concat_segments: fam.concat_segments,
         l_domain: l_domain.unwrap_or(1..=w as u64),
         attention_lds_saturated: lds_saturated,
-        scalars_required: vec![SCALAR_DRAFT_SEED],
+        scalars_required: if batched_embed { vec![] } else { vec![SCALAR_DRAFT_SEED] },
         completion_surfaces,
         shape,
         mask_token,

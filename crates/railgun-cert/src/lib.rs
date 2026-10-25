@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 use peacemaker_ir::edit::analyze;
 use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, KernelOrigin, Program};
 use peacemaker_ir::kernarg::{
-    AccessClass, AccessMode, ArgFacts, ArgRole, KernargFacts, KernelStatus, MemPath,
-    ReadCacheClass, RegionBound,
+    AccessClass, AccessMode, ArgFacts, ArgRole, Guard, IndexExt, IndexLoad, IndexedArgEffect,
+    KernargFacts, KernelStatus, MemPath, ReadCacheClass, RegionBound,
 };
 use peacemaker_ir::passes::kernargs;
 use peacemaker_lift::kd::DescriptorCodec;
@@ -44,9 +44,10 @@ use radiowave::{
 use sha2::{Digest, Sha256};
 
 pub use railgun_corpus::receipt::{
-    ArgCheck, ArgRecord, Check, Differential, DwordRecord, ImplicitRecord, KernelIdentity,
-    KernelRecord, RailgunSection, Receipt, SideRecord, Tool, UnresolvedRecord,
-    RAILGUN_SECTION_VERSION, RECEIPT_SCHEMA, RECEIPT_SCHEMA_VERSION,
+    case_digest, ArgCheck, ArgRecord, Check, Differential, DwordRecord, GuardRecord,
+    ImplicitRecord, IndexLoadRecord, IndexedEffectRecord, KernelIdentity, KernelRecord,
+    RailgunSection, Receipt, SideRecord, Tool, UnresolvedRecord, RAILGUN_SECTION_VERSION,
+    RECEIPT_SCHEMA, RECEIPT_SCHEMA_VERSION, STATUS_CONDITIONAL, STATUS_PROVEN, STATUS_UNKNOWN,
 };
 
 /// Stated in every receipt: what a `Proven` A1 verdict rests on.
@@ -135,6 +136,7 @@ pub struct MetadataEffects {
 
 /// The A1 ⊆ metadata-conservative differential for one kernel.
 pub fn cross_check(facts: &KernargFacts, meta: &MetadataEffects) -> Differential {
+    let guarded = facts.status == KernelStatus::Conditional;
     let mut out = Differential {
         source: meta.source.clone(),
         status: "not_applicable".into(),
@@ -143,11 +145,19 @@ pub fn cross_check(facts: &KernargFacts, meta: &MetadataEffects) -> Differential
             MutableReadCache::VmemOnly => "vmem_only".into(),
             MutableReadCache::ScalarOrUnknown => "scalar_or_unknown".into(),
         }),
+        guards: if guarded { guard_records(&facts.guards) } else { Vec::new() },
+        guarded,
     };
     let Some(effects) = &meta.effects else {
         return out;
     };
-    let proven = facts.status == KernelStatus::Proven;
+    // A Conditional summary is complete *under its guards* (indexed effects
+    // are credited to their arguments), so the G8 comparison applies to it in
+    // full; the result is reported with `guards`, not as an unconditional proof.
+    let proven = matches!(
+        facts.status,
+        KernelStatus::Proven | KernelStatus::Conditional
+    );
     let mut failed = false;
     for &(offset, access, explicit) in effects {
         let arg = facts.arg_at(offset);
@@ -266,11 +276,13 @@ pub fn kernel_record(
             .iter()
             .any(|k| k.starts_with(kind))
     };
+    let conditional = facts.status == KernelStatus::Conditional;
     KernelRecord {
         symbol: kernel.symbol.0.clone(),
         status: match facts.status {
-            KernelStatus::Proven => "proven",
-            KernelStatus::Unknown => "unknown",
+            KernelStatus::Proven => STATUS_PROVEN,
+            KernelStatus::Conditional => STATUS_CONDITIONAL,
+            KernelStatus::Unknown => STATUS_UNKNOWN,
         }
         .into(),
         unresolved: facts
@@ -313,7 +325,178 @@ pub fn kernel_record(
         differential: cross_check(facts, meta),
         pm_obligations: BTreeMap::new(),
         pm_analyze_error: None,
+        unguarded_unresolved: Vec::new(),
+        guards: if conditional { guard_records(&facts.guards) } else { Vec::new() },
+        indexed_effects: if conditional {
+            facts.indexed.iter().map(indexed_record).collect()
+        } else {
+            Vec::new()
+        },
+        required_witnesses: if conditional {
+            vec![WITNESS_INDEXED_BIND.to_owned()]
+        } else {
+            Vec::new()
+        },
+        case_digest: String::new(),
     }
+}
+
+/// The witness kind a Conditional indexed summary needs (design A §A9.2
+/// `IndexedBindWitness`); the runtime bind supplies it.
+pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
+
+fn guard_record(g: &Guard) -> GuardRecord {
+    match *g {
+        Guard::KernargEq { offset, size, value } => GuardRecord {
+            kind: "kernarg_eq".into(),
+            arg_offset: offset,
+            size,
+            value: value.to_string(),
+        },
+        Guard::GridDim { axis, value } => GuardRecord {
+            kind: "grid_dim".into(),
+            arg_offset: u32::from(axis),
+            size: 0,
+            value: value.to_string(),
+        },
+        Guard::BlockDim { axis, value } => GuardRecord {
+            kind: "block_dim".into(),
+            arg_offset: u32::from(axis),
+            size: 0,
+            value: value.to_string(),
+        },
+    }
+}
+fn guard_records(guards: &[Guard]) -> Vec<GuardRecord> {
+    let mut out: Vec<GuardRecord> = guards.iter().map(guard_record).collect();
+    out.sort_by(|a, b| {
+        (&a.kind, a.arg_offset, a.size, &a.value).cmp(&(&b.kind, b.arg_offset, b.size, &b.value))
+    });
+    out.dedup();
+    out
+}
+fn guard_name(g: &Guard) -> String {
+    let r = guard_record(g);
+    format!("{}@{}:{}={}", r.kind, r.arg_offset, r.size, r.value)
+}
+fn cache_text(c: peacemaker_ir::kernarg::CacheBits) -> String {
+    format!(
+        "th={} scope={} glc={} slc={} dlc={} nv={}",
+        c.th,
+        c.scope,
+        u8::from(c.glc),
+        u8::from(c.slc),
+        u8::from(c.dlc),
+        u8::from(c.nv)
+    )
+}
+fn ext_name(e: IndexExt) -> &'static str {
+    match e {
+        IndexExt::Sext64 => "sext64",
+        IndexExt::Zext64 => "zext64",
+        IndexExt::Raw32 => "raw32",
+    }
+}
+fn index_load_record(l: &IndexLoad) -> IndexLoadRecord {
+    IndexLoadRecord {
+        pc: l.pc,
+        source_arg_offset: l.src_arg_offset,
+        element: match l.elem {
+            peacemaker_ir::kernarg::IndexElem::I32 => "i32",
+        }
+        .into(),
+        offset_expr: l.byte_offset.to_string(),
+        extension: l.ext.iter().map(|e| ext_name(*e)).collect::<Vec<_>>().join(","),
+        class: class_name(l.class),
+        path: path_name(l.path).into(),
+        cache: cache_text(l.cache),
+        width: 4,
+    }
+}
+fn indexed_record(e: &IndexedArgEffect) -> IndexedEffectRecord {
+    IndexedEffectRecord {
+        pc: e.pc,
+        base_arg_offset: e.base_arg_offset,
+        mode: mode_name(e.mode).into(),
+        class: class_name(e.class),
+        path: path_name(e.path).into(),
+        cache: cache_text(e.cache),
+        width: u32::from(e.width_bytes),
+        address_expr: format!("(add arg:{} {})", e.base_arg_offset, e.displacement),
+        index_loads: e.index_loads.iter().map(index_load_record).collect(),
+        guards: e.guards.iter().map(guard_name).collect(),
+    }
+}
+
+/// A guarded case the certifier tries on an object whose unguarded analysis is
+/// `Unknown` (design A §A9.1). The table only *selects* which guards to
+/// substitute; it grants nothing: the case is attempted only when the
+/// object's own metadata has exactly these explicit arguments, and the result
+/// is Conditional only if the guarded analysis of the lifted ISA says so.
+struct GuardedCase {
+    symbol: &'static str,
+    /// `(offset, size, value_kind)` of every explicit argument, asserted
+    /// against the loaded object's metadata.
+    args: &'static [(u32, u32, &'static str)],
+    guards: &'static [Guard],
+}
+
+/// `kv_cache_write_fp8_e4m3_batched`: dst +0, src +8, positions +16,
+/// n_kv_heads +24, head_dim +28, batch_size +32, slot_descs +40, row_slot +48;
+/// HD256, B16, both optional slot tables null, grid `[n_kv_heads,16,1]`,
+/// block `[32,1,1]` (the x extent `n_kv_heads` is a bind-time check).
+const GUARDED_CASES: &[GuardedCase] = &[GuardedCase {
+    symbol: "kv_cache_write_fp8_e4m3_batched",
+    args: &[
+        (0, 8, "global_buffer"),
+        (8, 8, "global_buffer"),
+        (16, 8, "global_buffer"),
+        (24, 4, "by_value"),
+        (28, 4, "by_value"),
+        (32, 4, "by_value"),
+        (40, 8, "global_buffer"),
+        (48, 8, "global_buffer"),
+    ],
+    guards: &[
+        Guard::KernargEq { offset: 28, size: 4, value: 256 },
+        Guard::KernargEq { offset: 32, size: 4, value: 16 },
+        Guard::KernargEq { offset: 40, size: 8, value: 0 },
+        Guard::KernargEq { offset: 48, size: 8, value: 0 },
+        Guard::GridDim { axis: 1, value: 16 },
+        Guard::GridDim { axis: 2, value: 1 },
+        Guard::BlockDim { axis: 0, value: 32 },
+        Guard::BlockDim { axis: 1, value: 1 },
+        Guard::BlockDim { axis: 2, value: 1 },
+    ],
+}];
+
+/// The guarded facts for `kernel`, when its unguarded analysis is Unknown, a
+/// guarded case names it, the metadata ABI matches that case exactly, and the
+/// guarded analysis of the original ISA returns Conditional with indexed
+/// effects under every one of the case's guards. Otherwise `None` and the
+/// unguarded (Unknown) result stands.
+fn guarded_facts(kernel: &Kernel, arch: Arch, unguarded: &KernargFacts) -> Option<KernargFacts> {
+    if unguarded.status != KernelStatus::Unknown {
+        return None;
+    }
+    let case = GUARDED_CASES.iter().find(|c| c.symbol == kernel.symbol.0)?;
+    let explicit: Vec<&ArgFacts> = unguarded.args.iter().filter(|a| !a.is_hidden()).collect();
+    if explicit.len() != case.args.len()
+        || !case.args.iter().all(|&(offset, size, kind)| {
+            explicit
+                .iter()
+                .any(|a| a.offset == offset && a.size == size && a.value_kind == kind)
+        })
+    {
+        return None;
+    }
+    let facts = kernargs::analyze_guarded(kernel, arch, case.guards);
+    let mut want = case.guards.to_vec();
+    want.sort();
+    let mut have = facts.guards.clone();
+    have.sort();
+    (facts.status == KernelStatus::Conditional && !facts.indexed.is_empty() && have == want)
+        .then_some(facts)
 }
 
 /// `.actual_access` per argument from the kernel's own metadata note.
@@ -582,18 +765,32 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         identities.push(identity);
         let (facts, pm, pm_error) = kernel_facts(program, index);
         let meta = metadata_effects(&source, cert.as_ref(), &kernel.symbol.0);
-        let mut record = kernel_record(kernel, &facts, &meta);
+        let guarded = guarded_facts(kernel, arch, &facts);
+        let mut record = kernel_record(kernel, guarded.as_ref().unwrap_or(&facts), &meta);
+        if guarded.is_some() {
+            record.unguarded_unresolved = kernel_record(kernel, &facts, &meta).unresolved;
+            record.case_digest =
+                case_digest(&sha256_hex(bytes), &device_sha, arch_name(arch), &record);
+        }
         record.pm_obligations = pm;
         record.pm_analyze_error = pm_error;
+        let facts = guarded.unwrap_or(facts);
         if facts.args.iter().any(|a| a.bound.is_some()) {
             obligations.insert("InBoundsNoAlias".to_owned());
         }
-        if facts.status == KernelStatus::Proven {
-            obligations.insert("AddressArithmetic".to_owned());
+        match facts.status {
+            KernelStatus::Proven => {
+                obligations.insert("AddressArithmetic".to_owned());
+            }
+            KernelStatus::Conditional => {
+                obligations.insert("IndexedBindWitness".to_owned());
+            }
+            KernelStatus::Unknown => {}
         }
         records.push(record);
     }
-    let proven = records.iter().filter(|r| r.status == "proven").count();
+    let proven = records.iter().filter(|r| r.status == STATUS_PROVEN).count();
+    let conditional = records.iter().filter(|r| r.status == STATUS_CONDITIONAL).count();
     let failed: Vec<&str> = records
         .iter()
         .filter(|r| r.differential.status == "fail")
@@ -612,11 +809,16 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
             id: "railgun-a1".into(),
             status: if proven == records.len() {
                 "proven"
+            } else if proven + conditional == records.len() {
+                "conditional"
             } else {
                 "unknown"
             }
             .into(),
-            detail: format!("{proven}/{} kernels Proven", records.len()),
+            detail: format!(
+                "{proven}/{} kernels Proven, {conditional} Conditional (witness required)",
+                records.len()
+            ),
         },
         Check {
             id: "g8-metadata-differential".into(),

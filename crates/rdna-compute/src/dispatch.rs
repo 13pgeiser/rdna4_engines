@@ -9400,6 +9400,9 @@ impl Gpu {
     /// Growth inside a capture keeps the historical behaviour (warmup-first
     /// flows size scratch before capturing, so this is not expected).
     pub fn invalidate_for_scratch_growth(&mut self) {
+        // Every growth is announced here first: cached railgun skeletons key on
+        // this epoch (pointers into a replaced scratch buffer go stale).
+        crate::scratch::note_scratch_growth();
         if !crate::scratch::scratch_growth_invalidates(
             crate::graph::any_graph_captured(),
             self.graphs.capture_mode,

@@ -231,8 +231,9 @@ impl Rig {
         self.set_thlog(l, c, c);
         let layout = DraftStagingLayout {
             seed_off: 0,
-            q_off: 4,
-            k_off: 4 + DRAFT_ROWS * 4,
+            ids_off: 4,
+            q_off: 4 + DRAFT_ROWS * 4,
+            k_off: 4 + 2 * DRAFT_ROWS * 4,
         };
         let a = DraftEmitArgs {
             target_weights: &self.slot.weights,
@@ -260,13 +261,21 @@ impl Rig {
             l,
             0,
             seed,
+            self.df.draft_config.mask_token_id,
             DRAFT_ROWS,
             self.w,
         );
-        let offs = self
-            .pinned
-            .pack(&[&[words.seed], &words.q_positions, &words.k_positions])?;
-        assert_eq!(offs, vec![0, 4, 4 + DRAFT_ROWS * 4], "staging layout");
+        let offs = self.pinned.pack(&[
+            &[words.seed],
+            &words.noise_ids,
+            &words.q_positions,
+            &words.k_positions,
+        ])?;
+        assert_eq!(
+            offs,
+            vec![0, 4, 4 + DRAFT_ROWS * 4, 4 + 2 * DRAFT_ROWS * 4],
+            "staging layout"
+        );
         self.pinned.submit(&self.gpu, &self.staging.buf, &self.stream)?;
         self.pinned.complete(&self.gpu)?;
         Ok(())
@@ -449,7 +458,7 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
     }
 
     // ---- twin arms
-    let mut run_twin = |r: &mut Rig, ops: &[PlannedOp], label: &str, fails: &mut Vec<String>| -> R<Snapshot> {
+    let run_twin = |r: &mut Rig, ops: &[PlannedOp], label: &str, fails: &mut Vec<String>| -> R<Snapshot> {
         r.restore(&s0)?;
         r.set_thlog(l, l0, l0);
         r.stage(l, seed)?;
@@ -466,8 +475,10 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
 
     // ---- proposal block / scores / verify tokens (twin A state)
     let status = le_u32s(snap_get(&t_a, "selector_status"))[0];
-    let block = le_u32s(snap_get(&t_a, "selector_block"));
-    let scores: Vec<f32> = le_u32s(snap_get(&t_a, "selector_scores"))
+    // The selector block/score buffers are allocated with headroom; only the
+    // live prefix (16 block ids, rows x k scores) is the window's output.
+    let block_all = le_u32s(snap_get(&t_a, "selector_block"));
+    let scores_all: Vec<f32> = le_u32s(snap_get(&t_a, "selector_scores"))
         .into_iter()
         .map(f32::from_bits)
         .collect();
@@ -475,16 +486,45 @@ fn run_case(r: &mut Rig, l0: usize, d: usize, idx: usize) -> R<CaseOutcome> {
     if status != 0 {
         fails.push(format!("selector status {status:#x}"));
     }
-    if block != drafted {
+    let block = &block_all[..drafted.len().min(block_all.len())];
+    if block != drafted.as_slice() {
         fails.push(format!("proposal block {block:?} != eager {drafted:?}"));
     }
+    let scores = &scores_all[..cpu_scores.len().min(scores_all.len())];
     if scores.len() != cpu_scores.len()
         || scores
             .iter()
             .zip(&cpu_scores)
             .any(|(a, b)| a.to_bits() != b.to_bits())
     {
-        fails.push("device scores != CPU scorer scores (bytes)".into());
+        let first = scores
+            .iter()
+            .zip(&cpu_scores)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        let k = (cpu_scores.len() / drafted.len().saturating_sub(1).max(1)).max(1);
+        let detail = first.map(|i| {
+            format!(
+                " (row {} lane {}: gpu {:#010x} {:e} vs cpu {:#010x} {:e}; differing {} of {})",
+                i / k,
+                i % k,
+                scores[i].to_bits(),
+                scores[i],
+                cpu_scores[i].to_bits(),
+                cpu_scores[i],
+                scores
+                    .iter()
+                    .zip(&cpu_scores)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count(),
+                scores.len()
+            )
+        });
+        fails.push(format!(
+            "device scores != CPU scorer scores (bytes): len {} vs {}, first diff {first:?}{}",
+            scores.len(),
+            cpu_scores.len(),
+            detail.unwrap_or_default()
+        ));
     }
     if tokens[1..] != drafted[1..] {
         fails.push(format!("verify tokens[1..16] {:?} != eager {:?}", &tokens[1..], &drafted[1..]));
@@ -531,8 +571,9 @@ fn controls(r: &mut Rig, report: &mut String) -> R<bool> {
     );
     // missing scalar
     line(
-        "refuse missing draft_seed",
-        bind_draft_ops(&em, &em.shape, &Default::default()).is_err(),
+        "refuse missing declared scalars",
+        em.scalars_required.is_empty()
+            || bind_draft_ops(&em, &em.shape, &Default::default()).is_err(),
     );
     // live seed patch: seed+1 must not reproduce the eager state
     let drafted = r.eager(l, seed)?;
@@ -541,7 +582,9 @@ fn controls(r: &mut Rig, report: &mut String) -> R<bool> {
     r.restore(&s0)?;
     r.set_thlog(l, l0, l0);
     let bound = bind_draft_ops(&em, &em.shape, &em.scalars(seed + 1))?;
-    r.stage(l, seed)?;
+    // Batched route: the seed lives in the staged id plane; scalar route: the
+    // `draft_seed` patch. Either way a different window seed must diverge.
+    r.stage(l, seed + 1)?;
     r.gpu.run_planned_ops(&bound)?;
     r.gpu.hip.device_synchronize()?;
     let t = r.snapshot()?;

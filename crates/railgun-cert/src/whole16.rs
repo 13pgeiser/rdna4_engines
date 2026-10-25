@@ -54,7 +54,10 @@ pub struct ClassSpec {
 pub const REQUIRED_CLASSES: &[ClassSpec] = &[
     ClassSpec {
         id: "draft_embedding",
-        any_of: &["embedding_lookup"],
+        // Loaded symbols: `embedding_q8` / `embedding_hfq4g*` (scalar) and their
+        // `_batched` twins; the launcher name `embedding_lookup_*` never appears
+        // in a plan.
+        any_of: &["embedding_"],
         exact: false,
     },
     ClassSpec {
@@ -69,7 +72,9 @@ pub const REQUIRED_CLASSES: &[ClassSpec] = &[
     },
     ClassSpec {
         id: "draft_topk",
-        any_of: &["topk_values_batched"],
+        // gfx1201 routes the raw top-K through the re-grid kernel (+ the fixup
+        // body on tied rows); the shipping kernel is `topk_logsumexp_batched_f32`.
+        any_of: &["topk_values_regrid", "topk_logsumexp_batched"],
         exact: false,
     },
     ClassSpec {
@@ -461,7 +466,14 @@ pub fn build_with(
             );
             continue;
         };
-        if record.status != "proven" {
+        if let Err(why) = record.validate_case(
+            &receipt.object_sha256,
+            &receipt.device_elf_sha256,
+            &receipt.arch,
+        ) {
+            refuse(&mut refusals, format!("guarded case invalid: {why}"));
+        }
+        if record.status != "proven" && record.status != "conditional" {
             let rules: BTreeSet<&str> = record.unresolved.iter().map(|u| u.rule.as_str()).collect();
             refuse(
                 &mut refusals,
@@ -542,6 +554,8 @@ pub fn build_with(
             metadata_sha256: identity.metadata_sha256.clone(),
             receipt_sha256: facts_sha256(record),
             a1_status: record.status.clone(),
+            case_sha256: record.case_digest.clone(),
+            required_witnesses: record.required_witnesses.clone(),
             kernarg_size: record.kernarg_size,
             explicit_end: explicit_end(record),
             hidden_loaded: record.implicit.hidden_loaded.clone(),
@@ -998,9 +1012,16 @@ mod tests {
                 status: "pass".into(),
                 args: vec![],
                 radiowave_mutable_read_cache: None,
+                guards: vec![],
+                guarded: false,
             },
             pm_obligations: BTreeMap::new(),
             pm_analyze_error: None,
+            unguarded_unresolved: vec![],
+            guards: vec![],
+            indexed_effects: vec![],
+            required_witnesses: vec![],
+            case_digest: String::new(),
         }
     }
 

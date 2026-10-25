@@ -90,6 +90,7 @@ pub mod profiler;
 pub mod qsa_pooled_mirror;
 pub mod qwen35_fa_batch;
 pub mod railgun_check;
+pub mod railgun_window;
 pub mod rdna;
 pub mod replay;
 pub mod rope;

@@ -28,6 +28,7 @@
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
 pub mod copy;
+pub mod index_bind;
 pub mod kernel;
 #[cfg(feature = "npu")]
 pub mod npu;

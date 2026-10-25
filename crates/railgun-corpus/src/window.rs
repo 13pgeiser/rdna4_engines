@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::sha256_hex;
 
 pub const WINDOW_MANIFEST_SCHEMA: &str = "railgun-window-manifest";
-pub const WINDOW_MANIFEST_VERSION: u32 = 1;
+pub const WINDOW_MANIFEST_VERSION: u32 = 2;
+/// `a1_status` values a generated manifest may carry.
+pub const NODE_PROVEN: &str = "proven";
+/// `conditional, witness required`: the node's facts hold only in the guarded
+/// case `case_sha256` and only with a matching runtime bind witness.
+pub const NODE_CONDITIONAL: &str = "conditional";
 /// The only shape this manifest family describes.
 pub const WHOLE16_SHAPE: &str = "whole16";
 
@@ -54,8 +59,13 @@ pub struct WindowNodeRecord {
     /// SHA-256 of the canonical JSON of this kernel's receipt fact record
     /// (`receipt.railgun.kernels[symbol]`; tool versions excluded).
     pub receipt_sha256: String,
-    /// A1 status of the kernel: always `proven` in a generated manifest.
+    /// A1 status of the kernel: `proven`, or `conditional` (witness required).
     pub a1_status: String,
+    /// The receipt's guarded-case digest; empty unless `conditional`.
+    pub case_sha256: String,
+    /// Witness kinds the runtime must present for this node; empty unless
+    /// `conditional`.
+    pub required_witnesses: Vec<String>,
     /// Loader kernarg segment size from the descriptor/metadata.
     pub kernarg_size: u32,
     /// End of the explicit (non-hidden) arguments.
@@ -112,7 +122,7 @@ pub fn sequence_digest(nodes: &[WindowNodeRecord]) -> String {
     let mut text = String::new();
     for n in nodes {
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             n.index,
             n.symbol,
             n.artifact_sha256,
@@ -120,10 +130,24 @@ pub fn sequence_digest(nodes: &[WindowNodeRecord]) -> String {
             n.text_sha256,
             n.kd_sha256,
             n.metadata_sha256,
-            n.receipt_sha256
+            n.receipt_sha256,
+            n.a1_status,
+            n.case_sha256,
+            n.required_witnesses.join(",")
         ));
     }
     sha256_hex(text.as_bytes())
+}
+
+/// A runtime-held bind witness reference for one conditional node: the
+/// manifest node index, the guarded case digest it was bound for, and the
+/// witness kind. Produced only by the runtime bind (not constructible from a
+/// manifest or receipt alone).
+#[derive(Clone, Copy, Debug)]
+pub struct ConditionalWitness<'a> {
+    pub index: u32,
+    pub case_sha256: &'a str,
+    pub kind: &'a str,
 }
 
 /// A node of a requested window plan, as the runtime sees it.
@@ -194,27 +218,73 @@ impl WindowManifest {
             if n.index as usize != i {
                 out.push(WindowRefusal::node(i, &n.symbol, "node index out of order"));
             }
-            if n.a1_status != "proven" {
-                out.push(WindowRefusal::node(
+            match n.a1_status.as_str() {
+                NODE_PROVEN => {
+                    if !n.case_sha256.is_empty() || !n.required_witnesses.is_empty() {
+                        out.push(WindowRefusal::node(
+                            i,
+                            &n.symbol,
+                            "proven node carries a guarded case",
+                        ));
+                    }
+                }
+                NODE_CONDITIONAL => {
+                    if n.case_sha256.is_empty() || n.required_witnesses.is_empty() {
+                        out.push(WindowRefusal::node(
+                            i,
+                            &n.symbol,
+                            "conditional node lacks a case digest or required witnesses",
+                        ));
+                    }
+                }
+                other => out.push(WindowRefusal::node(
                     i,
                     &n.symbol,
-                    format!("A1 facts are {}, not proven", n.a1_status),
-                ));
+                    format!("A1 facts are {other}, not proven or conditional"),
+                )),
             }
         }
         out
     }
 
-    /// Admit a requested window plan: the same nodes, in the same order, each
-    /// a railgun node over the manifest's exact artifact, under the manifest's
-    /// arch and toolchain pin. Every violation is reported; none is ignored.
+    /// Admit a requested window plan with no bind witnesses: a manifest with
+    /// any `conditional` node is refused ("conditional, witness required").
     pub fn admit(
         &self,
         arch: &str,
         toolchain_pin: &str,
         plan: &[RuntimeNode],
     ) -> Result<(), Vec<WindowRefusal>> {
+        self.admit_with(arch, toolchain_pin, plan, &[])
+    }
+
+    /// Admit a requested window plan: the same nodes, in the same order, each
+    /// a railgun node over the manifest's exact artifact, under the manifest's
+    /// arch and toolchain pin. Every `conditional` node additionally needs one
+    /// witness per required kind with its index and case digest. Every
+    /// violation is reported; none is ignored.
+    pub fn admit_with(
+        &self,
+        arch: &str,
+        toolchain_pin: &str,
+        plan: &[RuntimeNode],
+        witnesses: &[ConditionalWitness],
+    ) -> Result<(), Vec<WindowRefusal>> {
         let mut out = self.validate();
+        for n in self.nodes.iter().filter(|n| n.a1_status == NODE_CONDITIONAL) {
+            for kind in &n.required_witnesses {
+                let held = witnesses.iter().any(|w| {
+                    w.index == n.index && w.case_sha256 == n.case_sha256 && w.kind == *kind
+                });
+                if !held {
+                    out.push(WindowRefusal::node(
+                        n.index as usize,
+                        &n.symbol,
+                        format!("conditional, witness required: no {kind} witness for case"),
+                    ));
+                }
+            }
+        }
         if self.arch != arch {
             out.push(WindowRefusal::whole(format!(
                 "manifest arch {} is not {arch}",
@@ -289,6 +359,8 @@ mod tests {
             metadata_sha256: "m".into(),
             receipt_sha256: "r".into(),
             a1_status: "proven".into(),
+            case_sha256: String::new(),
+            required_witnesses: Vec::new(),
             kernarg_size: 16,
             explicit_end: 16,
             hidden_loaded: vec![],

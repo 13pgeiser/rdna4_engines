@@ -21,14 +21,21 @@
 //!   `railgun::window::WindowQueue` over it (write images, patch grids,
 //!   publish, replay).
 
+use std::collections::BTreeMap;
+
 use railgun::kernel as rk;
 use railgun::plan::{self as rp, Pm4Op, Rung};
+use redline_dispatch::aql::{load_symbols, Executable, GpuSelector, Runtime};
 
 use super::railgun_shadow::Transport;
 use super::{
-    Gfx12DispatchPacing, GpuDevice, KernargBuffer, Kernel, LaunchGeometry, Pm4Commands,
-    ReplayQuiescence, SingleQueuePm4Ib,
+    gfx10_dispatch_initiator_policy, gfx1151_cu_count_knob_refusal, gfx1151_dispatch_interleave,
+    gfx1151_entry_acquire_policy, gfx1151_resource_limits_policy, retained_kernarg_pool,
+    Gfx12DispatchPacing, GpuDevice, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    LegacyDependencyMode, Pm4Architecture, Pm4Commands, Pm4RegisterPolicy, ReplayQuiescence,
+    SingleQueuePm4Ib,
 };
+use crate::code_object::{CodeObjectId, RecordedArtifact};
 
 /// A fresh command buffer from Redline's builder, paced per `lowering`.
 pub(super) fn paced_commands(transport: &Transport<'_>, lowering: rp::ArchLowering) -> Pm4Commands {
@@ -76,8 +83,34 @@ pub(super) fn emit_segment(
     Ok(commands)
 }
 
+/// One kernarg buffer whose bytes differ from the bound image.
+#[derive(Clone, Debug)]
+pub(crate) struct KernargMismatch {
+    pub(crate) node: usize,
+    pub(crate) symbol: String,
+    /// VA of the buffer, its length and the pool allocation extent it owns.
+    pub(crate) address: u64,
+    pub(crate) length: usize,
+    pub(crate) allocation: usize,
+    /// First differing byte and the dwords around it.
+    pub(crate) offset: usize,
+    pub(crate) expected: u32,
+    pub(crate) actual: u32,
+    pub(crate) differing_bytes: usize,
+    pub(crate) expected_head: Vec<u8>,
+    pub(crate) actual_head: Vec<u8>,
+}
+
+/// A failed pre-submit self-check of the lowered state.
+#[derive(Clone, Debug)]
+pub(crate) struct SelfCheckFailure {
+    /// The one-line description of the first mismatch.
+    pub(crate) first: String,
+    /// Every kernarg buffer that differs from its bound image.
+    pub(crate) kernarg: Vec<KernargMismatch>,
+}
+
 /// A failed replay and what is known of the queue afterwards.
-#[allow(dead_code)] // consumed by the WindowQueue implementation (slice A6)
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedReplayFailure {
     pub error: String,
@@ -88,7 +121,6 @@ pub(crate) struct OwnedReplayFailure {
 /// queue reads owned. Field order is drop order: the indirect buffer first,
 /// then the kernels it dispatches, then the kernarg buffers it points at
 /// (the order `PreparedPm4Replay` uses).
-#[allow(dead_code)] // consumed by the WindowQueue implementation (slice A6)
 pub(crate) struct OwnedWindowLowering {
     graph: SingleQueuePm4Ib,
     _kernels: Vec<Kernel>,
@@ -100,14 +132,17 @@ pub(crate) struct OwnedWindowLowering {
 
 /// Lower `program` (one segment spanning every node, every node PM4) through
 /// railgun's own plan with railgun's kernarg images. `kernels[i]` is the
-/// loaded object of node `i`. Nothing is submitted.
-#[allow(dead_code)] // consumed by the WindowQueue implementation (slice A6)
-pub(crate) fn lower_owned(
+/// loaded object of node `i`. Kernarg buffers come from `transport.pool`
+/// (Redline's retained pool); the indirect buffer and its host-read
+/// completion surfaces come from `graph_pool` (Redline's host pool). Nothing
+/// is submitted.
+fn lower_owned(
     program: &rk::KernelProgram,
     plan: &rp::Pm4Plan,
     arch_lowering: rp::ArchLowering,
     kernels: Vec<Kernel>,
     transport: &Transport<'_>,
+    graph_pool: &KernargPool,
     device: &GpuDevice,
 ) -> Result<OwnedWindowLowering, String> {
     let nodes = program.nodes.len();
@@ -169,7 +204,7 @@ pub(crate) fn lower_owned(
         .map(|(i, b)| b.ok_or_else(|| format!("node {i} was never dispatched")))
         .collect::<Result<_, _>>()?;
     let command_dwords = commands.len_dwords();
-    let graph = commands.create_graph(device, transport.pool, None, false)?;
+    let graph = commands.create_graph(device, graph_pool, None, false)?;
     let publish = kernargs
         .iter()
         .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty());
@@ -183,7 +218,155 @@ pub(crate) fn lower_owned(
     })
 }
 
-#[allow(dead_code)] // consumed by the WindowQueue implementation (slice A6)
+/// Everything a gfx12 owned lowering needs that does not depend on one window,
+/// built ONCE per owner (the window builder) and shared by every skeleton it
+/// lowers: one HSA [`Runtime`] and [`GpuDevice`], the host pool (indirect
+/// buffers, completion surfaces), the retained kernarg pool (Redline's, VRAM by
+/// default) and every loaded code object. A skeleton's kernels, kernarg buffers
+/// and indirect buffer each hold an `Arc` to what they use (kernarg buffer ->
+/// pool -> runtime, kernel -> executable -> runtime), so they outlive this
+/// context and are released only when the skeleton is dropped.
+pub(crate) struct LoweringContext {
+    // Field order is drop order: loaded objects before the pools before the
+    // device and runtime they belong to.
+    executables: BTreeMap<CodeObjectId, Executable>,
+    resolved: BTreeMap<(CodeObjectId, String), Kernel>,
+    kernarg_pool: KernargPool,
+    host_pool: KernargPool,
+    device: GpuDevice,
+    architecture: Pm4Architecture,
+    register_policy: Pm4RegisterPolicy,
+    dispatch_initiator_policy: super::Gfx10DispatchInitiatorPolicy,
+    dispatch_interleave: Option<super::Gfx11DispatchInterleave>,
+    resource_limits_policy: super::Gfx11ComputeResourceLimitsPolicy,
+    entry_policy: super::Gfx11EntryAcquirePolicy,
+    gcr_trim: bool,
+    _runtime: Runtime,
+}
+
+impl LoweringContext {
+    /// The context of device ordinal `ordinal` with exactly the transport
+    /// parameters Redline's gfx12 PM4 prepare uses
+    /// (`ReplayController::prepare_pm4_prefix_inner`): the same dispatch-initiator,
+    /// interleave, resource-limits and entry-acquire policies, the retained
+    /// kernarg pool, the `HIPFIRE_REPLAY_PM4_GCR_TRIM` setting and
+    /// `LegacyDependencyMode::CsPartialFlush`. gfx12 only.
+    pub(crate) fn new(ordinal: usize) -> Result<Self, String> {
+        let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let device = runtime
+            .select_gpu(GpuSelector::Ordinal(ordinal))
+            .map_err(|error| error.to_string())?;
+        let architecture = Pm4Architecture::from_device(&device)?;
+        if architecture != Pm4Architecture::Gfx12 {
+            return Err(format!(
+                "an owned window lowers gfx12 command buffers only; device {} is not gfx12",
+                device.name()
+            ));
+        }
+        let dispatch_initiator_policy =
+            gfx10_dispatch_initiator_policy(architecture, device.name());
+        let dispatch_interleave = gfx1151_dispatch_interleave(architecture, device.name());
+        let resource_limits_policy = gfx1151_resource_limits_policy(architecture, device.name());
+        gfx1151_cu_count_knob_refusal()?;
+        let entry_policy = gfx1151_entry_acquire_policy(architecture, device.name());
+        let host_pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
+        let kernarg_pool = retained_kernarg_pool(&device, &host_pool, entry_policy);
+        let register_policy = Pm4RegisterPolicy::from_config();
+        let gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        Ok(Self {
+            executables: BTreeMap::new(),
+            resolved: BTreeMap::new(),
+            kernarg_pool,
+            host_pool,
+            device,
+            architecture,
+            register_policy,
+            dispatch_initiator_policy,
+            dispatch_interleave,
+            resource_limits_policy,
+            entry_policy,
+            gcr_trim,
+            _runtime: runtime,
+        })
+    }
+
+    /// Distinct code objects loaded so far (each is loaded once per context).
+    pub(crate) fn loaded_objects(&self) -> usize {
+        self.executables.len()
+    }
+
+    /// [`lower_owned`] over this context. `artifacts[i]` is the loaded code
+    /// object that owns node `i`'s symbol; each distinct object is loaded once
+    /// for the whole context and node `i` resolves `{symbol}.kd` in it.
+    /// Nothing is submitted.
+    pub(crate) fn lower(
+        &mut self,
+        program: &rk::KernelProgram,
+        plan: &rp::Pm4Plan,
+        arch_lowering: rp::ArchLowering,
+        artifacts: &[RecordedArtifact],
+    ) -> Result<OwnedWindowLowering, String> {
+        if artifacts.len() != program.nodes.len() {
+            return Err(format!(
+                "{} code objects for {} nodes",
+                artifacts.len(),
+                program.nodes.len()
+            ));
+        }
+        let mut kernels = Vec::with_capacity(program.nodes.len());
+        for (node, artifact) in program.nodes.iter().zip(artifacts) {
+            let id = artifact.id();
+            if !self.executables.contains_key(&id) {
+                let executable = Executable::load(&self.device, artifact.image().clone())
+                    .map_err(|error| format!("load {artifact}: {error}"))?;
+                self.executables.insert(id, executable);
+            }
+            let key = (id, format!("{}.kd", node.symbol));
+            if !self.resolved.contains_key(&key) {
+                let kernel = self.executables[&id]
+                    .kernel(&key.1)
+                    .map_err(|error| format!("resolve {}: {error}", key.1))?;
+                self.resolved.insert(key.clone(), kernel);
+            }
+            kernels.push(self.resolved[&key].clone());
+        }
+        let (architecture, register_policy) = (self.architecture, self.register_policy);
+        let (initiator, interleave, limits) = (
+            self.dispatch_initiator_policy,
+            self.dispatch_interleave,
+            self.resource_limits_policy,
+        );
+        let new_commands = || {
+            Pm4Commands::new_with_dependency(
+                architecture,
+                register_policy,
+                initiator,
+                interleave,
+                limits,
+                LegacyDependencyMode::CsPartialFlush,
+            )
+        };
+        let transport = Transport {
+            pool: &self.kernarg_pool,
+            new_commands: &new_commands,
+            gcr_trim: self.gcr_trim,
+            entry_policy: self.entry_policy,
+        };
+        lower_owned(
+            program,
+            plan,
+            arch_lowering,
+            kernels,
+            &transport,
+            &self.host_pool,
+            &self.device,
+        )
+    }
+}
+
 impl OwnedWindowLowering {
     /// Command dwords of the retained indirect buffer.
     pub(crate) fn command_dwords(&self) -> u32 {
@@ -222,6 +405,141 @@ impl OwnedWindowLowering {
         self.graph
             .patch_dispatch_dimensions(node, workitems)
             .map_err(|e| e.to_string())
+    }
+
+    /// Read back the lowered state exactly as the command processor and the
+    /// kernels will see it and compare it with what the window bound: every
+    /// node's kernarg buffer (explicit and hidden bytes) against its bound
+    /// image, and every `DISPATCH_DIRECT` in the retained indirect buffer
+    /// against the bound grid (work-items) and the node's block. Quiescent
+    /// use only. Every kernarg buffer is scanned (after a publish, so a
+    /// posted-but-unlanded write cannot hide); the failure names the first
+    /// mismatch and carries every mismatching buffer with its VA range.
+    pub(crate) fn verify_state(
+        &mut self,
+        symbols: &[String],
+        images: &[&[u8]],
+        grids: &[[u32; 3]],
+    ) -> Result<(), SelfCheckFailure> {
+        let nodes = self.kernargs.len();
+        let plain = |first: String| SelfCheckFailure {
+            first,
+            kernarg: Vec::new(),
+        };
+        if images.len() != nodes || grids.len() != nodes || symbols.len() != nodes {
+            return Err(plain(format!(
+                "{} images, {} grids, {} symbols for {nodes} lowered nodes",
+                images.len(),
+                grids.len(),
+                symbols.len()
+            )));
+        }
+        self.publish_host_writes();
+        let mut bad: Vec<KernargMismatch> = Vec::new();
+        let mut shape_error: Option<String> = None;
+        for (node, (buffer, image)) in self.kernargs.iter_mut().zip(images).enumerate() {
+            let address = buffer.address() as usize as u64;
+            let allocation = buffer.allocation_size();
+            let actual: &[u8] = buffer.as_mut_bytes();
+            if actual.len() != image.len() {
+                shape_error.get_or_insert_with(|| {
+                    format!(
+                        "node {node} {}: kernarg buffer is {} bytes, the bound image {}",
+                        symbols[node],
+                        actual.len(),
+                        image.len()
+                    )
+                });
+                continue;
+            }
+            let Some(at) = actual.iter().zip(*image).position(|(a, b)| a != b) else {
+                continue;
+            };
+            let word = at & !3;
+            let get = |bytes: &[u8]| {
+                let mut w = [0u8; 4];
+                let end = (word + 4).min(bytes.len());
+                w[..end - word].copy_from_slice(&bytes[word..end]);
+                u32::from_le_bytes(w)
+            };
+            let head = image.len().min(16);
+            bad.push(KernargMismatch {
+                node,
+                symbol: symbols[node].clone(),
+                address,
+                length: actual.len(),
+                allocation,
+                offset: at,
+                expected: get(image),
+                actual: get(actual),
+                differing_bytes: actual.iter().zip(*image).filter(|(a, b)| a != b).count(),
+                expected_head: image[..head].to_vec(),
+                actual_head: actual[..head].to_vec(),
+            });
+        }
+        if let Some(first) = shape_error {
+            return Err(SelfCheckFailure { first, kernarg: bad });
+        }
+        if let Some(m) = bad.first() {
+            return Err(SelfCheckFailure {
+                first: format!(
+                    "node {} {}: kernarg byte +{} (dword +{}) expected {:#010x} actual {:#010x} \
+                     ({} of {} kernarg buffers differ)",
+                    m.node,
+                    m.symbol,
+                    m.offset,
+                    m.offset & !3,
+                    m.expected,
+                    m.actual,
+                    bad.len(),
+                    nodes
+                ),
+                kernarg: bad,
+            });
+        }
+        let decoded = self
+            .graph
+            .decode_dispatches()
+            .map_err(|e| plain(e.to_string()))?;
+        if decoded.len() != nodes {
+            return Err(plain(format!(
+                "the retained IB holds {} dispatches for {nodes} lowered nodes",
+                decoded.len()
+            )));
+        }
+        for (node, d) in decoded.iter().enumerate() {
+            let block = self.blocks[node];
+            let mut want = [0u32; 3];
+            for axis in 0..3 {
+                want[axis] = grids[node][axis].checked_mul(block[axis]).ok_or_else(|| {
+                    plain(format!(
+                        "node {node} {}: bound grid {:?} x block {block:?} overflows",
+                        symbols[node], grids[node]
+                    ))
+                })?;
+            }
+            if d.dimensions != want {
+                return Err(plain(format!(
+                    "node {node} {}: IB dispatch dimensions expected {want:?} (grid {:?} x block {block:?}) actual {:?}",
+                    symbols[node], grids[node], d.dimensions
+                )));
+            }
+            if d.workgroup != Some(block) {
+                return Err(plain(format!(
+                    "node {node} {}: IB workgroup size expected {block:?} actual {:?}",
+                    symbols[node], d.workgroup
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `(address, length, allocation size)` of every node's kernarg buffer.
+    pub(crate) fn kernarg_ranges(&self) -> Vec<(u64, usize, usize)> {
+        self.kernargs
+            .iter()
+            .map(|k| (k.address() as usize as u64, k.len(), k.allocation_size()))
+            .collect()
     }
 
     /// Make every host kernarg write since the last call GPU-visible.

@@ -5747,7 +5747,8 @@ pub fn default_route_entries(
 /// Modules railgun's own lowering launches (design §1.1 `Node::Copy` and
 /// `Node::CopyBatch`): the hipfire-owned copy kernels, JIT-compiled as module
 /// `railgun::copy::MODULE` from `railgun::copy::SOURCE`, on every arch
-/// railgun certifies. No Redline program loads them.
+/// railgun certifies, the typed fill, and on exact gfx1201 the DFlash window's
+/// device selector. No Redline program loads them.
 pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
     let arch: &'static str = SUPPORTED_ARCHES
         .iter()
@@ -5768,6 +5769,19 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
             "railgun_fill",
             &["railgun_fill_u32"],
             kernels::RAILGUN_FILL_SRC.into(),
+            extra_flags,
+        ));
+    }
+    // The certified DFlash window's (design A, exact gfx1201) device greedy
+    // selector: a node of the window program, JIT-loaded by
+    // `Gpu::ensure_dflash_selector_greedy_exact`. The window refuses any node
+    // whose exact object has no corpus record, so it is inventoried here.
+    if arch == "gfx1201" {
+        entries.push(entry(
+            arch,
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_MODULE,
+            &[crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SYMBOL],
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SRC.into(),
             extra_flags,
         ));
     }
@@ -12558,5 +12572,40 @@ extern "C" __global__ void NAMED(int* p) {}
         assert!(parse_walked_route_plan(concat!(base!(), "#! sealed turbo\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,4\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,x,256\n")).is_err());
+    }
+
+    /// Every node kernel of the certified DFlash window that is not a default
+    /// Redline route kernel has a corpus record on exact gfx1201: the window
+    /// refuses a node whose object the corpus lacks.
+    #[test]
+    fn corpus_entries_cover_the_dflash_window_node_kernels_on_gfx1201() {
+        let entries = corpus_entries("gfx1201", "").unwrap();
+        let has = |module: &str, symbol: &str| {
+            entries
+                .iter()
+                .any(|e| e.module == module && e.symbols.contains(&symbol))
+        };
+        for (module, symbol) in [
+            ("dflash_selector_greedy_exact", "dflash_selector_greedy_exact"),
+            ("railgun_copy", "railgun_copy"),
+            ("railgun_fill", "railgun_fill_u32"),
+            ("select_regrid", "topk_values_regrid_f32"),
+            ("topk_values_fixup_f32", "topk_values_fixup_f32"),
+            ("select_regrid", "argmax_f32_batched_regrid"),
+            ("attention_dflash_sliding_f32", "attention_dflash_sliding_f32"),
+            ("dflash_hidden_commit5_gfx1100", "dflash_hidden_commit5_gfx1100"),
+            ("embedding_q8_batched", "embedding_q8_batched"),
+        ] {
+            assert!(has(module, symbol), "gfx1201 corpus lacks {module}/{symbol}");
+        }
+        for arch in ["gfx1100", "gfx1151"] {
+            assert!(
+                !corpus_entries(arch, "")
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.module == "dflash_selector_greedy_exact"),
+                "{arch} must not inventory the gfx1201 window selector"
+            );
+        }
     }
 }

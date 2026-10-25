@@ -143,7 +143,18 @@ impl Gpu {
         let declared = DECLARED.with(|d| std::mem::take(&mut *d.borrow_mut()));
         let mut patches = PATCHES.with(|p| std::mem::take(&mut *p.borrow_mut()));
 
-        if let Some(why) = tape.refusal {
+        if let Some(mut why) = tape.refusal {
+            if let Some(pos) = why.find("function handle 0x") {
+                let hex: String = why[pos + 18..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                if let Ok(handle) = usize::from_str_radix(&hex, 16) {
+                    if let Some(Some(name)) = self.loaded_function_names().get(&handle) {
+                        why = format!("{why} ({name})");
+                    }
+                }
+            }
             sink.refusal = Some(why.clone());
             return Err(HipError::new(0, &format!("plan refused: {why}")));
         }
@@ -420,4 +431,32 @@ pub fn diff_plans(a: &[PlannedOp], b: &[PlannedOp]) -> Result<Vec<KernargDiff>, 
         }
     }
     Ok(diffs)
+}
+
+impl Gpu {
+    /// A `kernelParams`-form launch that plan mode can also record: outside
+    /// plan mode it is the original raw launch (same stream, same params);
+    /// in plan mode it goes through the blob funnel with `blob_builder`'s
+    /// exact kernarg bytes (the same values, natural alignment).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_params_or_plan(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut [*mut c_void],
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        if self.hip.plan_active() {
+            return self.launch_maybe_blob(func_name, grid, block, shared_mem, params, blob_builder);
+        }
+        let func = &self.functions[func_name];
+        // SAFETY: forwarded from the typed launch wrapper that assembled
+        // `params` for this kernel signature.
+        unsafe {
+            self.hip
+                .launch_kernel(func, grid, block, shared_mem, self.stream_ref(), params)
+        }
+    }
 }

@@ -5419,10 +5419,15 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
 /// Actual verify-route facts the decision→commit body needs. These are
 /// measured by whoever ran the verify forward, never assumed by the commit.
 ///
-/// * `verify_on_hip`: the verify ran the ordinary HIP/HipGraph body (no
-///   retained-PM4 route, or a PM4 route that planned this window as an ordinary
-///   HIP window). Only then may a full accept keep the verify-advanced DeltaNet
-///   state (pre-factor singleton `spec_step_dflash` lines 7174-7180).
+/// * `same_as_hip_graph`: certified state parity
+///   (`railgun::window::WindowVerifyReceipt::same_as_hip_graph`): the verify
+///   left exactly the state the ordinary HIP/HipGraph body leaves (live
+///   DeltaNet, tape, KV, hidden staging, frames). True for the ordinary
+///   HIP/HipGraph route (or a PM4 route that planned this window as an
+///   ordinary HIP window) and for a railgun window whose plan was certified;
+///   false for legacy retained-PM4 windows. Only then may a full accept keep
+///   the verify-advanced DeltaNet state (pre-factor singleton
+///   `spec_step_dflash` lines 7174-7180).
 /// * `tape_populated`: the verify actually captured the GDN tape into the
 ///   state's `gdn_tape` at offset 0 (caller supplied a tape AND
 ///   `prefill_batch_pbs_eligible` held; the singleton's
@@ -5430,13 +5435,13 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
 ///   forward fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DflashVerifyReceipt {
-    pub verify_on_hip: bool,
+    pub same_as_hip_graph: bool,
     pub tape_populated: bool,
 }
 
 /// Receipt for a window whose verify ran the shared eager HIP route
 /// (`forward_prefill_batch` + tape capture) over `b` rows on explicit trunk
-/// owners: `verify_on_hip = true`, `tape_populated` = the actual
+/// owners: `same_as_hip_graph = true`, `tape_populated` = the actual
 /// `prefill_batch_pbs_eligible` decision the verify used (pre-factor greedy
 /// lines 3839-3853).
 pub fn dflash_eager_hip_verify_receipt(
@@ -5460,7 +5465,7 @@ pub fn dflash_eager_hip_verify_receipt(
         moe_router_logits_present,
     );
     DflashVerifyReceipt {
-        verify_on_hip: true,
+        same_as_hip_graph: true,
         tape_populated: dflash_use_gdn_tape_replay(true, verify_populates_tape),
     }
 }
@@ -5493,7 +5498,7 @@ struct DflashCommitWindow<'a> {
     seed_token: u32,
     block: &'a [u32],
     decision: SampledWindowDecision,
-    verify_on_hip: bool,
+    same_as_hip_graph: bool,
     phase_on: bool,
 }
 
@@ -5533,7 +5538,7 @@ fn dflash_commit_decision_borrowed(
         seed_token,
         block,
         decision,
-        verify_on_hip,
+        same_as_hip_graph,
         phase_on,
     } = window;
     let b = block.len();
@@ -5608,7 +5613,7 @@ fn dflash_commit_decision_borrowed(
         tape.replay_from_snapshot_admits(gpu, &*target.dn_state, target_snap, accept_len + 1)
     });
     let keep_verified = replay_from_snapshot
-        && verify_on_hip
+        && same_as_hip_graph
         && accept_len + 1 == b
         && !target.dn_state.s_ef_residual.is_empty();
     if !replay_from_snapshot {
@@ -5732,7 +5737,7 @@ pub fn dflash_commit_decision_parts(
             seed_token: draft.seed,
             block,
             decision,
-            verify_on_hip: verify.verify_on_hip,
+            same_as_hip_graph: verify.same_as_hip_graph,
             phase_on: false,
         },
     )?;
@@ -8053,7 +8058,7 @@ static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLo
 /// `(float)half(d) * (float)int8(q)` with the same 256-thread element
 /// striding — one block per row instead of one launch per row — so each
 /// row's bytes cannot differ.
-fn noise_embed_batch_admitted(
+pub(crate) fn noise_embed_batch_admitted(
     gpu: &Gpu,
     target_weights: &Qwen35Weights,
     shared: &DflashScratch,
@@ -8597,6 +8602,16 @@ pub trait DflashTailSource {
     /// `Some(k)` with `1 <= k` and the tail (`1..=b-1-k` tokens) written into
     /// `tail` (cleared first); `None` keeps the incumbent window unchanged.
     fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize>;
+
+    /// `NoTailAction` (railgun design A "Whole16 vs HostSplice"): a pure,
+    /// conservative predicate over the source's current (immutable) decision
+    /// state. `true` only when **no** `splice` over a `candidates`-candidate
+    /// learned block can return `Some`, whatever the learned tokens and
+    /// whatever the lookup context offers. The default `false` never proves
+    /// it, so an unknown source always keeps the HostSplice shape.
+    fn declines_every_tail(&self, _candidates: usize) -> bool {
+        false
+    }
 }
 
 fn lookup_err(msg: &str) -> hip_bridge::HipError {
@@ -8864,6 +8879,87 @@ pub fn spec_step_dflash(
     verify_pm4: Option<&mut DflashVerifyPm4>,
     lookup: Option<DflashLookup<'_>>,
 ) -> HipResult<SpecStepResult> {
+    spec_step_dflash_with_railgun(
+        gpu,
+        target,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        hidden_rb,
+        target_hidden_host,
+        target_snap,
+        verify_scratch,
+        position,
+        seed_token,
+        ctx_slice,
+        gdn_tape,
+        temp,
+        top_p,
+        top_k,
+        rng_state,
+        block_size_override,
+        ngram_cache,
+        prev_committed,
+        cactus_delta,
+        pld_spine,
+        repeat_penalty,
+        repeat_window,
+        max_accept,
+        verify_pm4,
+        lookup,
+        None,
+    )
+}
+
+/// The railgun window owner a `DflashSpeculator` lends one DFlash window
+/// (`None` everywhere else: [`spec_step_dflash`] passes `None`, so every
+/// other caller keeps the incumbent route byte for byte).
+pub struct RailgunStep<'a> {
+    pub owner: &'a mut crate::dflash_railgun::RailgunWindowOwner,
+    /// The lookup layer planned this window as a price probe (it keeps its
+    /// HIP owner).
+    pub probe: bool,
+}
+
+/// [`spec_step_dflash`] with an optional certified-window owner (design A
+/// slice A6). With `railgun = None` this is `spec_step_dflash` exactly. With
+/// `Some`, an admitted window runs `Whole16` (draft + selector + verify +
+/// hidden commit in one lowered segment, then the unchanged CPU accept /
+/// clamp / scatter / GDN repair) or `HostSplice` (draft segment, then the
+/// existing host splice and the incumbent verify at its actual B); any
+/// refusal before the queue is touched runs the window on the ordinary HIP
+/// route with nothing changed.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_dflash_with_railgun(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    verify_scratch: &VerifyScratch,
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    mut gdn_tape: Option<&mut GdnTape>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+    block_size_override: Option<usize>,
+    ngram_cache: Option<&NgramCache>,
+    prev_committed: &[u32],
+    cactus_delta: f32,
+    pld_spine: Option<&[u32]>,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_accept: Option<usize>,
+    verify_pm4: Option<&mut DflashVerifyPm4>,
+    lookup: Option<DflashLookup<'_>>,
+    mut railgun: Option<RailgunStep<'_>>,
+) -> HipResult<SpecStepResult> {
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
         if pld_spine.is_some() {
@@ -9035,7 +9131,126 @@ pub fn spec_step_dflash(
     let mut c8_draft_tokens_dev: Option<GpuTensor> = None;
     let mut c8_draft_p_at_token_dev: Option<GpuTensor> = None;
 
-    if let Some(pld) = pld_spine {
+    // ── Railgun certified window (design A slice A6) ────────────────────
+    // Inert unless the speculator lends an owner (`HIPFIRE_DFLASH_RAILGUN_WINDOW=1`
+    // at build): with `railgun = None` nothing below this comment block
+    // executes and every later stage is the incumbent code unchanged.
+    // `Whole16` supplies the proposals AND the verify picks; `HostSplice`
+    // supplies the proposals only (splice and verify stay incumbent).
+    // Every refusal leaves all state untouched and falls through to HIP.
+    let mut railgun_draft: Option<Vec<u32>> = None;
+    let mut railgun_verify: Option<crate::dflash_railgun::RailgunVerify> = None;
+    let mut railgun_shape: Option<railgun::window::WindowShape> = None;
+    if let Some(rg) = railgun.as_mut() {
+        use crate::dflash_railgun as drg;
+        railgun_shape = drg::RailgunWindowOwner::shape_hint(
+            position,
+            draft_scratch,
+            hidden_rb,
+            target.kv_cache.compact_offset,
+            target.kv_cache.physical_cap,
+        );
+        let static_verdict = rg.owner.static_verdict(|| {
+            let kv = &target.kv_cache;
+            drg::StaticFacts {
+                arch: gpu.arch.clone(),
+                num_experts: target.config.num_experts,
+                dim: target.config.dim,
+                ffn_dim: target.config.hidden_dim,
+                n_heads: target.config.n_heads,
+                n_kv_heads: target.config.n_kv_heads,
+                kv_fp8: kv.quant_fp8,
+                kv_other_quant: kv.quant_q8
+                    || kv.quant_int8
+                    || kv.quant_hfq4
+                    || kv.quant_asym4
+                    || kv.quant_asym3
+                    || kv.quant_asym2
+                    || kv.quant_fwht
+                    || kv.quant_bf16,
+                // The runtime proposal width (16 on the 27B pair, whose draft
+                // was trained at block 8), not the draft's trained block.
+                draft_block: requested_b,
+                ctx_mode: draft_scratch.ctx_mode,
+                retained_pm4_admitted: verify_pm4.as_deref().map_or(false, |r| r.admitted()),
+                online_tuner: draft_scratch.online.is_some(),
+            }
+        });
+        match static_verdict {
+            Err(why) => rg.owner.refuse(why, ""),
+            Ok(()) => {
+                // `NoTailAction`: an armed Tail source is Whole16 only when
+                // it proves every legal tail decision declines; Copy and
+                // price-probe windows planned before the draft keep HIP.
+                let lookup_facts = if rg.probe {
+                    drg::LookupFacts::Probe
+                } else {
+                    match &lookup {
+                        None => drg::LookupFacts::None,
+                        Some(DflashLookup::Copy(_)) => drg::LookupFacts::Copy,
+                        Some(DflashLookup::Tail(src)) => {
+                            if src.declines_every_tail(b.saturating_sub(1)) {
+                                drg::LookupFacts::TailDeclinesAll
+                            } else {
+                                drg::LookupFacts::TailMayAct
+                            }
+                        }
+                    }
+                };
+                let seed_oracle = hipfire_config::developer_var("HIPFIRE_DFLASH_SEED_ORACLE")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+                let facts = drg::WindowFacts {
+                    b,
+                    greedy: !use_temp_sampling,
+                    cactus: cactus_delta != 0.0,
+                    pld: pld_spine.is_some(),
+                    ngram_cache: ngram_cache.is_some(),
+                    repeat_penalty: repeat_penalty != 1.0,
+                    host_path: host_path_active,
+                    diagnostics: phase_on || seed_oracle,
+                    ctx_slice: ctx_slice.is_some(),
+                    gdn_tape: gdn_tape.is_some(),
+                    gdn_frame_independent: target.dn_state.quant != qwen35::StateQuant::Q8
+                        || !target.dn_state.s_ef_residual.is_empty(),
+                    lookup: lookup_facts,
+                };
+                match drg::admit_window(&facts) {
+                    Err(why) => rg.owner.refuse(why, ""),
+                    Ok(execution) => {
+                        let attempt = rg.owner.run(
+                            drg::WindowOwners {
+                                gpu: &mut *gpu,
+                                target: &mut *target,
+                                draft_weights,
+                                draft_cfg,
+                                draft_scratch: &mut *draft_scratch,
+                                hidden_rb: &mut *hidden_rb,
+                                verify_scratch,
+                                gdn_tape: gdn_tape.as_deref_mut(),
+                                target_snap: &mut *target_snap,
+                                position,
+                                seed: seed_token,
+                            },
+                            execution,
+                        )?;
+                        if let drg::RailgunAttempt::Ran(run) = attempt {
+                            railgun_draft = Some(run.block);
+                            railgun_verify = run.verify;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let railgun_ran = railgun_draft.is_some();
+
+    if let Some(rail_block) = railgun_draft.take() {
+        // The certified segment already produced the proposal block (the
+        // selector-greedy block with the seed at [0]).
+        drafted = rail_block;
+    } else if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
         // context-deterministic, not a softmax. The rejection math below
@@ -9566,6 +9781,14 @@ pub fn spec_step_dflash(
             }
         }
     };
+    if railgun_verify.is_some() && b != 16 {
+        // `NoTailAction` proved the splice declines; a splice here means the
+        // proof was wrong after the window already ran. Fail loud.
+        return Err(hip_bridge::HipError::new(
+            0,
+            "railgun Whole16 window: the host splice changed the verify rows (NoTailAction violated)",
+        ));
+    }
     block.truncate(b);
     for i in 1..b {
         block[i] = drafted[i];
@@ -9622,7 +9845,9 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    if railgun_verify.is_none() {
+        target_snap.save_from(&target.dn_state, gpu)?;
+    }
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
@@ -9637,7 +9862,10 @@ pub fn spec_step_dflash(
         gpu.arch.as_str(),
         moe_router_logits_present,
     );
-    let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
+    let use_tape_replay = match &railgun_verify {
+        Some(rv) => rv.tape_populated,
+        None => dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape),
+    };
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
 
     if phase_on {
@@ -9653,8 +9881,16 @@ pub fn spec_step_dflash(
     // Railgun D8: a kept full accept relies on the HIP/HipGraph verify body —
     // no route, or a route that planned this window as its ordinary HIP window
     // (`full_hip`/`partial_hip` advanced; prime/capture/PM4 windows do not).
-    let mut verify_on_hip = verify_pm4.is_none();
-    let verify_out = match verify_pm4 {
+    let mut same_as_hip_graph = verify_pm4.is_none();
+    let verify_out = if let Some(rv) = railgun_verify.take() {
+        // `Whole16`: the lowered segment ran the verify, the hidden commit and
+        // the head; the state is exactly the HIP graph body's iff certified.
+        same_as_hip_graph = rv.same_as_hip_graph;
+        DflashVerifyOutput {
+            argmax_per_pos: rv.argmax_per_pos,
+            logits_per_pos: Vec::new(),
+        }
+    } else { match verify_pm4 {
         Some(route) => {
             let replay_failures_before = route.counters().replay_failures;
             let hip_windows =
@@ -9672,7 +9908,7 @@ pub fn spec_step_dflash(
                 route,
             ) {
                 Ok(out) => {
-                    verify_on_hip = hip_windows(route) == hip_windows_before + 1;
+                    same_as_hip_graph = hip_windows(route) == hip_windows_before + 1;
                     out
                 }
                 Err(error) => {
@@ -9718,7 +9954,7 @@ pub fn spec_step_dflash(
             want_full_logits,
             verify_scratch,
         )?,
-    };
+    } };
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -10118,7 +10354,7 @@ pub fn spec_step_dflash(
                 seed_token,
                 block: &block,
                 decision,
-                verify_on_hip,
+                same_as_hip_graph,
                 phase_on,
             },
         )?
@@ -10164,6 +10400,14 @@ pub fn spec_step_dflash(
         );
     }
     let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end);
+    // A chain window that ran on the ordinary HIP route has materialized the
+    // lazy scratch/JIT of its shape family: later windows of the family may
+    // be planned (never before: planning refuses a `hipModuleLoad`/`hipMalloc`).
+    if let (Some(rg), Some(shape), false, 16) =
+        (railgun.as_mut(), railgun_shape.as_ref(), railgun_ran, b)
+    {
+        rg.owner.note_hip_window(shape);
+    }
 
     Ok(SpecStepResult {
         accepted: accept_len,

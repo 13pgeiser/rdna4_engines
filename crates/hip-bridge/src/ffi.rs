@@ -3016,7 +3016,16 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
-        self.plan_deny("hipModuleLaunchKernel(kernelParams)")?;
+        if self.plan.active() {
+            return Err(self.plan.refuse(&format!(
+                "HIP API hipModuleLaunchKernel(kernelParams) function handle {:#x} reached in plan mode",
+                func.0 as usize
+            )));
+        }
+        if self.plan.witnessing() {
+            // kernelParams form: the kernarg bytes are not recoverable here.
+            self.plan.witness_launch(func.0 as usize, grid, block, shared_mem, &[]);
+        }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;

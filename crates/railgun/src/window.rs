@@ -35,6 +35,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::kernel::{
     Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole,
 };
+use crate::index_bind::{
+    abi as writer_abi, BindInputs, IndexBindError, IndexedBindWitness, SealedPositions, WriterExtent,
+};
 use crate::plan::Pm4Plan;
 use crate::{Binding, ResourceId, WordId};
 
@@ -107,6 +110,10 @@ pub enum Refusal {
     },
     #[error("all 32 prepared skeletons are in flight or quarantined")]
     CacheFull,
+    #[error("indexed bind: {0}")]
+    Indexed(IndexBindError),
+    #[error("node {node} ({symbol}) is conditional: submit needs an indexed bind witness")]
+    IndexedWitnessMissing { node: usize, symbol: String },
 }
 
 /// What is known about the queue after a failure (§2: "failure distinguishes
@@ -465,6 +472,9 @@ pub struct WindowPlan {
     execution: WindowExecution,
     hip_graph_certified: bool,
     tape_populated: bool,
+    /// The one sealed-positions resource every conditional node indexes
+    /// (`None` when the plan has no conditional node).
+    indexed_positions: Option<ResourceId>,
 }
 
 impl WindowPlan {
@@ -659,6 +669,37 @@ impl WindowPlan {
                 ));
             }
         }
+        // Conditional (loaded-index) nodes: all must index one positions
+        // resource, which is the resource the sealed positions occupy.
+        let mut indexed_positions: Option<ResourceId> = None;
+        for (node, n) in program.nodes.iter().enumerate() {
+            let Some(case) = &n.indexed else { continue };
+            let source = case
+                .effects
+                .iter()
+                .flat_map(|e| e.index_loads.iter().map(|l| l.source_arg_offset))
+                .collect::<BTreeSet<_>>();
+            if source != BTreeSet::from([writer_abi::POSITIONS]) {
+                return malformed(format!(
+                    "node {node}: index loads read arguments {source:?}, the sealed-positions case reads +{}",
+                    writer_abi::POSITIONS
+                ));
+            }
+            let Some(resource) = n.args.iter().find_map(|(offset, arg)| match arg {
+                Arg::Resource { resource, .. } if *offset == writer_abi::POSITIONS => Some(*resource),
+                _ => None,
+            }) else {
+                return malformed(format!("node {node}: positions argument is not a resource"));
+            };
+            if indexed_positions.is_some_and(|r| r != resource) {
+                return malformed(format!(
+                    "node {node}: indexes positions resource {}, another conditional node indexes {}",
+                    resource.0,
+                    indexed_positions.expect("checked").0
+                ));
+            }
+            indexed_positions = Some(resource);
+        }
         let kernels = program
             .nodes
             .iter()
@@ -683,6 +724,7 @@ impl WindowPlan {
             execution,
             hip_graph_certified,
             tape_populated,
+            indexed_positions,
         })
     }
 
@@ -712,6 +754,23 @@ impl WindowPlan {
 
     pub fn completion_surfaces(&self) -> &[ResourceId] {
         &self.completion_surfaces
+    }
+
+    /// True only for a certified exact route: what the window's
+    /// [`WindowVerifyReceipt::same_as_hip_graph`] reports on completion.
+    pub fn hip_graph_certified(&self) -> bool {
+        self.hip_graph_certified
+    }
+
+    /// Whether the verify portion populates the GDN tape (its receipt's
+    /// `tape_populated`).
+    pub fn tape_populated(&self) -> bool {
+        self.tape_populated
+    }
+
+    /// The sealed-positions resource of the plan's conditional nodes.
+    pub fn indexed_positions(&self) -> Option<ResourceId> {
+        self.indexed_positions
     }
 }
 
@@ -793,6 +852,11 @@ pub struct BoundWindow {
     epoch: u64,
     generation: u64,
     host_delta: WindowHostDelta,
+    /// The consumed-at-submit bind witness of a plan with conditional nodes.
+    indexed: Option<(IndexedBindWitness, SealedPositions)>,
+    /// A certified exact route for **this** window: the manifest admitted the
+    /// plan with this bind's witnesses ([`PreparedWindow::certify_exact`]).
+    exact: bool,
 }
 
 impl BoundWindow {
@@ -802,6 +866,11 @@ impl BoundWindow {
 
     pub fn host_delta(&self) -> &WindowHostDelta {
         &self.host_delta
+    }
+
+    /// The attached bind witness, when the plan has conditional nodes.
+    pub fn indexed_witness(&self) -> Option<&IndexedBindWitness> {
+        self.indexed.as_ref().map(|(w, _)| w)
     }
 }
 
@@ -844,6 +913,7 @@ pub struct Submission {
     receipt_hip: bool,
     receipt_tape: bool,
     host_delta: WindowHostDelta,
+    sealed: Option<SealedPositions>,
 }
 
 impl Submission {
@@ -856,6 +926,9 @@ impl Submission {
         match shared.queue.wait() {
             Ok(()) => {
                 shared.phase = Phase::Retired;
+                if let Some(s) = &self.sealed {
+                    s.finish(Quiescence::Proven);
+                }
                 Ok(CompleteWindow {
                     generation: self.generation,
                     execution: self.execution,
@@ -872,6 +945,9 @@ impl Submission {
                     Quiescence::Proven => Phase::Retired,
                     Quiescence::Unknown => Phase::Quarantined,
                 };
+                if let Some(s) = &self.sealed {
+                    s.finish(f.quiescence);
+                }
                 Err(CompletionFailure {
                     generation: self.generation,
                     quiescence: f.quiescence,
@@ -1287,7 +1363,71 @@ impl PreparedWindow {
             epoch,
             generation: shape.generation,
             host_delta,
+            indexed: None,
+            exact: false,
         })
+    }
+
+    /// Bind the sealed positions to this window's bound state (§A9.4): the
+    /// per-writer and full-program proofs run against the **encoded kernarg
+    /// images** and the window's allocation identities, and the resulting
+    /// [`IndexedBindWitness`] is held by `bound` until [`Self::submit`]
+    /// consumes it. A stale `bound` is refused before any proof runs.
+    pub fn attach_indexed_witness(
+        &self,
+        bound: &mut BoundWindow,
+        sealed: &SealedPositions,
+        writers: &[WriterExtent],
+    ) -> Result<(), Refusal> {
+        {
+            let shared = lock(&self.shared);
+            if bound.prepared != self.id || bound.epoch != shared.epoch || shared.phase != Phase::Bound {
+                return Err(Refusal::StaleBound);
+            }
+        }
+        let Some(positions_resource) = self.plan.indexed_positions else {
+            return Err(Refusal::Indexed(IndexBindError::Closure(
+                "the plan has no conditional node".into(),
+            )));
+        };
+        let witness = sealed
+            .bind_writers(&BindInputs {
+                window: self.id,
+                shape_generation: bound.generation,
+                program: &self.plan.program,
+                steps: &self.plan.steps,
+                bindings: &self.bindings,
+                allocations: &self.key.allocations,
+                images: &self.images,
+                grids: &self.grids,
+                positions_resource,
+                writers,
+            })
+            .map_err(Refusal::Indexed)?;
+        bound.indexed = Some((witness, sealed.clone()));
+        Ok(())
+    }
+
+    /// Record that the window manifest admitted this plan **together with
+    /// this bind's witnesses** (a plan with conditional nodes is not
+    /// certified exact by its plan alone). The owner calls it after
+    /// [`Self::attach_indexed_witness`] and a witnessed manifest admission;
+    /// the completion receipt's `same_as_hip_graph` then reports it.
+    pub fn certify_exact(&self, bound: &mut BoundWindow) -> Result<(), Refusal> {
+        {
+            let shared = lock(&self.shared);
+            if bound.prepared != self.id || bound.epoch != shared.epoch || shared.phase != Phase::Bound {
+                return Err(Refusal::StaleBound);
+            }
+        }
+        if self.plan.indexed_positions.is_some() && bound.indexed.is_none() {
+            return Err(Refusal::IndexedWitnessMissing {
+                node: self.plan.program.conditional_nodes().first().copied().unwrap_or(0),
+                symbol: "certify_exact".into(),
+            });
+        }
+        bound.exact = true;
+        Ok(())
     }
 
     /// `PreparedWindow::submit` (§2): consume the bound generation and queue
@@ -1304,6 +1444,39 @@ impl PreparedWindow {
             Phase::Quarantined => return Err(Refusal::Quarantined),
             Phase::Retired => return Err(Refusal::StaleBound),
         }
+        // A plan with conditional nodes is PM4-ineligible until every one of
+        // them has this window's matching witness (§A9.2).
+        let sealed = if self.plan.indexed_positions.is_some() {
+            let Some((witness, sealed)) = &bound.indexed else {
+                let node = self
+                    .plan
+                    .program
+                    .conditional_nodes()
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                return Err(Refusal::IndexedWitnessMissing {
+                    node,
+                    symbol: self.plan.program.nodes[node].symbol.clone(),
+                });
+            };
+            witness
+                .matches_window(self.id, bound.generation, &self.images, &self.grids)
+                .map_err(Refusal::Indexed)?;
+            // The witness must cover exactly the plan's conditional nodes.
+            let covered: Vec<usize> = witness.writers().iter().map(|w| w.node).collect();
+            if covered != self.plan.program.conditional_nodes() {
+                return Err(Refusal::Indexed(IndexBindError::Stale(format!(
+                    "witness covers nodes {covered:?}, the plan's conditional nodes are {:?}",
+                    self.plan.program.conditional_nodes()
+                ))));
+            }
+            sealed.check_witness(witness).map_err(Refusal::Indexed)?;
+            sealed.mark_submitted(witness).map_err(Refusal::Indexed)?;
+            Some(sealed.clone())
+        } else {
+            None
+        };
         let nodes: Vec<NodeImage<'_>> = self
             .images
             .iter()
@@ -1321,9 +1494,10 @@ impl PreparedWindow {
                     shared: Arc::clone(&self.shared),
                     generation: bound.generation,
                     execution: self.plan.execution,
-                    receipt_hip: self.plan.hip_graph_certified,
+                    receipt_hip: self.plan.hip_graph_certified || bound.exact,
                     receipt_tape: self.plan.tape_populated,
                     host_delta: bound.host_delta,
+                    sealed,
                 })
             }
             Err(f) => {
@@ -1331,6 +1505,9 @@ impl PreparedWindow {
                     Quiescence::Proven => Phase::Retired,
                     Quiescence::Unknown => Phase::Quarantined,
                 };
+                if let Some(s) = &sealed {
+                    s.submit_failed(f.quiescence);
+                }
                 Err(Refusal::SubmitFailed {
                     message: f.message,
                     quiescence: f.quiescence,
@@ -2261,5 +2438,183 @@ mod tests {
             w.bind(&shape(300, 1), &bindings(), &shadow).unwrap_err(),
             Refusal::Inputs(m) if m.contains("shadows")
         ));
+    }
+
+    // ---- §A9.4 sealed positions through the window (tests 7 and 8) ----------
+
+    use crate::index_bind::tests as ib;
+    use crate::index_bind::{IndexBindError, PositionsState, SealedPositions};
+
+    fn indexed_parts(fx: &ib::Fixture) -> WindowPlanParts {
+        WindowPlanParts {
+            program: fx.program.clone(),
+            steps: fx.steps.clone(),
+            patches: Vec::new(),
+            host_delta: HostDeltaSpec::default(),
+            completion_surfaces: vec![ResourceId(0), ResourceId(3)],
+            projection_rows: vec![],
+            execution: WindowExecution::Whole16,
+            hip_graph_certified: false,
+            tape_populated: false,
+        }
+    }
+
+    fn indexed_key(fx: &ib::Fixture) -> WindowBindingKey {
+        WindowBindingKey {
+            allocations: fx.allocations.clone(),
+            object_digests: vec!["aa".into(); fx.program.nodes.len()],
+            ..key()
+        }
+    }
+
+    fn indexed_window() -> (ib::Fixture, PreparedWindow, Arc<Mutex<Log>>) {
+        let fx = ib::Fixture::new(Vec::new());
+        let log = Arc::new(Mutex::new(Log::default()));
+        let plan = make_plan(indexed_parts(&fx)).expect("a conditional plan under assumed witnesses");
+        assert_eq!(plan.indexed_positions(), Some(fx.p_res));
+        let w = PreparedWindow::new(plan, indexed_key(&fx), Box::new(MockQueue(log.clone()))).expect("prepared");
+        (fx, w, log)
+    }
+
+    fn indexed_bind(w: &mut PreparedWindow, fx: &ib::Fixture, generation: u64) -> BoundWindow {
+        let bindings = WindowBindings { key: indexed_key(fx) };
+        w.bind(&shape(300, generation), &bindings, &inputs()).expect("bind")
+    }
+
+    #[test]
+    fn a_conditional_node_is_not_pm4_without_its_witness_and_submit_refuses() {
+        // The cached program (nodes still `Conditional`) never plans as PM4.
+        let fx = ib::Fixture::new(Vec::new());
+        let mut parts = indexed_parts(&fx);
+        parts.program = {
+            let mut p = fx.program.clone();
+            for n in &mut p.nodes {
+                n.lowering = crate::kernel::Lowering::Conditional { reason: "w".into() };
+            }
+            p
+        };
+        assert!(matches!(make_plan(parts), Err(Refusal::NotPm4 { node: 0, .. })));
+
+        let (fx, mut w, log) = indexed_window();
+        let bound = indexed_bind(&mut w, &fx, 1);
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::IndexedWitnessMissing { node: 0, .. })
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0, "the queue was never touched");
+    }
+
+    #[test]
+    fn bind_attach_submit_complete_walks_the_sealed_lifecycle() {
+        let (fx, mut w, log) = indexed_window();
+        let sealed = ib::ready(&ib::contiguous(300));
+        let mut bound = indexed_bind(&mut w, &fx, 1);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        assert_eq!(sealed.state(), PositionsState::SealedReady);
+        let submission = w.submit(bound).unwrap();
+        assert_eq!(sealed.state(), PositionsState::SubmittedReadOnly);
+        assert_eq!(log.lock().unwrap().submits, 1);
+        // While in flight nothing may touch P.
+        assert!(sealed.overwrite().is_err() && sealed.recycle().is_err());
+        submission.complete().unwrap();
+        assert_eq!(sealed.state(), PositionsState::Retired);
+
+        // The next window cannot reuse the previous witness or sealed bytes:
+        // it needs its own check, upload and bind.
+        let mut bound = indexed_bind(&mut w, &fx, 2);
+        assert!(matches!(
+            w.attach_indexed_witness(&mut bound, &sealed, &fx.extents),
+            Err(Refusal::Indexed(IndexBindError::State { found: PositionsState::Retired, .. }))
+        ));
+        assert!(matches!(w.submit(bound), Err(Refusal::IndexedWitnessMissing { .. })));
+    }
+
+    #[test]
+    fn a_post_bind_kernarg_or_grid_change_and_a_superseded_bind_are_refused_at_submit() {
+        let (fx, mut w, log) = indexed_window();
+        let sealed = ib::ready(&ib::contiguous(300));
+        let mut bound = indexed_bind(&mut w, &fx, 1);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        // Patch the bound kernarg image of the V writer after the bind.
+        w.images[1][24] ^= 1;
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::Indexed(IndexBindError::Writer { node: 1, .. }))
+        ));
+        assert_eq!(sealed.state(), PositionsState::SealedReady, "nothing was submitted");
+        assert_eq!(log.lock().unwrap().submits, 0);
+
+        // A shape/grid change after bind.
+        let mut bound = indexed_bind(&mut w, &fx, 2);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.grids[0] = [ib::H, 16, 2];
+        assert!(matches!(w.submit(bound), Err(Refusal::Indexed(IndexBindError::Writer { node: 0, .. }))));
+
+        // A later bind supersedes the attached one.
+        let mut stale = indexed_bind(&mut w, &fx, 3);
+        w.attach_indexed_witness(&mut stale, &sealed, &fx.extents).unwrap();
+        let _fresh = indexed_bind(&mut w, &fx, 4);
+        assert!(matches!(w.submit(stale), Err(Refusal::StaleBound)));
+        sealed.release_unsubmitted().unwrap();
+
+        // A witness bound to another payload/generation: re-seal then submit.
+        let mut bound = indexed_bind(&mut w, &fx, 5);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap_err();
+        ib::seal(&sealed, &ib::contiguous(300));
+        let mut bound = indexed_bind(&mut w, &fx, 6);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        w.submit(bound).unwrap().complete().unwrap();
+    }
+
+    #[test]
+    fn unknown_quiescence_after_submit_quarantines_the_sealed_positions() {
+        let (fx, mut w, log) = indexed_window();
+        let sealed: SealedPositions = ib::ready(&ib::contiguous(300));
+        let mut bound = indexed_bind(&mut w, &fx, 1);
+        w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+        let submission = w.submit(bound).unwrap();
+        log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+        assert!(submission.complete().is_err());
+        assert_eq!(sealed.state(), PositionsState::Quarantined);
+        assert!(sealed.recycle().is_err() && sealed.overwrite().is_err());
+        assert!(matches!(
+            w.bind(&shape(300, 2), &WindowBindings { key: indexed_key(&fx) }, &inputs()),
+            Err(Refusal::Quarantined)
+        ));
+
+        // A submit failure with unknown quiescence quarantines too; a proven
+        // one retires the positions (they must be re-checked and re-uploaded).
+        for (q, state) in [
+            (Quiescence::Unknown, PositionsState::Quarantined),
+            (Quiescence::Proven, PositionsState::Retired),
+        ] {
+            let (fx, mut w, log) = indexed_window();
+            let sealed = ib::ready(&ib::contiguous(300));
+            let mut bound = indexed_bind(&mut w, &fx, 1);
+            w.attach_indexed_witness(&mut bound, &sealed, &fx.extents).unwrap();
+            log.lock().unwrap().submit_failure = Some(q);
+            assert!(matches!(w.submit(bound), Err(Refusal::SubmitFailed { .. })));
+            assert_eq!(sealed.state(), state);
+        }
+    }
+
+    #[test]
+    fn a_conditional_plan_whose_nodes_index_different_positions_is_malformed() {
+        let mut fx = ib::Fixture::new(Vec::new());
+        // Node 1 indexes the V resource as its "positions".
+        let alt = fx.program.nodes[1]
+            .args
+            .iter()
+            .find_map(|(o, a)| match a {
+                Arg::Resource { resource, .. } if *o == 0 => Some(*resource),
+                _ => None,
+            })
+            .unwrap();
+        for (o, a) in &mut fx.program.nodes[1].args {
+            if *o == 16 {
+                *a = Arg::Resource { resource: alt, interior: 0 };
+            }
+        }
+        assert!(matches!(make_plan(indexed_parts(&fx)), Err(Refusal::Malformed(m)) if m.contains("another conditional node")));
     }
 }

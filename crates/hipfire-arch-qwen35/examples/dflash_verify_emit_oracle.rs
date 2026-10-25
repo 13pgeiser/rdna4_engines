@@ -323,7 +323,9 @@ fn compare_kernels(plan: &[&PlannedKernel], witness: &[PlannedKernel]) -> Vec<St
         if p.dynamic_lds != w.dynamic_lds {
             why.push(format!("lds {} vs {}", p.dynamic_lds, w.dynamic_lds));
         }
-        if p.kernarg != w.kernarg {
+        // A witness kernarg of 0 bytes is a kernelParams-form launch (bytes
+        // not recoverable): symbol/geometry/LDS only.
+        if !w.kernarg.is_empty() && p.kernarg != w.kernarg {
             let at = p
                 .kernarg
                 .iter()

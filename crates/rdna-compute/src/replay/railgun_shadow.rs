@@ -237,27 +237,7 @@ impl RailgunShadow {
                 .toolchain_pin
                 .as_deref()
                 .ok_or("no compiler toolchain was observed")?;
-            match corpus.lookup(&ArtifactKey {
-                arch,
-                toolchain_pin: pin,
-                artifact_sha256: sha,
-            }) {
-                Ok(Lookup::Hit(hit)) => {
-                    NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new)
-                }
-                Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
-                    Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
-                    None if pin != corpus.toolchain_pin() => {
-                        format!(
-                            "toolchain pin {} is not the corpus pin {}",
-                            &pin[..16],
-                            &corpus.toolchain_pin()[..16]
-                        )
-                    }
-                    None => format!("no record for {arch} object {}", &sha[..16]),
-                }),
-                Err(e) => Err(e.to_string()),
-            }
+            lookup_facts(&corpus, arch, pin, sha, symbol)
         })();
         self.facts.insert(key, result.clone());
         result
@@ -554,7 +534,38 @@ impl RailgunShadow {
     }
 }
 
-fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
+/// The receipt-corpus lookup of one `(artifact, symbol)` under `arch` and
+/// `pin`, with the refusal messages both the M1 shadow and the window corpus
+/// report. `sha` is a full SHA-256 hex digest.
+pub(crate) fn lookup_facts(
+    corpus: &JitCorpus,
+    arch: &str,
+    pin: &str,
+    sha: &str,
+    symbol: &str,
+) -> Result<Arc<NodeFacts>, String> {
+    match corpus.lookup(&ArtifactKey {
+        arch,
+        toolchain_pin: pin,
+        artifact_sha256: sha,
+    }) {
+        Ok(Lookup::Hit(hit)) => NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new),
+        Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
+            Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
+            None if pin != corpus.toolchain_pin() => {
+                format!(
+                    "toolchain pin {} is not the corpus pin {}",
+                    &pin[..16],
+                    &corpus.toolchain_pin()[..16]
+                )
+            }
+            None => format!("no record for {arch} object {}", &sha[..16]),
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub(crate) fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
     hip.mem_get_address_range(value as usize as *mut std::ffi::c_void)
         .map(|(base, bytes)| Binding {
             base: base as usize as u64,
@@ -566,7 +577,7 @@ fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
 /// railgun's per-arch lowering parameters for `arch`. On gfx1201 an explicit
 /// `HIPFIRE_GFX1201_PM4_PACING` (`off` / `nop:N`, the documented knob of the
 /// gfx1201 tape pacing) replaces the arch default; unset or `auto` keeps it.
-fn arch_lowering(arch: &str) -> rp::ArchLowering {
+pub(crate) fn arch_lowering(arch: &str) -> rp::ArchLowering {
     let mut lowering = rp::ArchLowering::for_arch(arch);
     if arch == "gfx1201" {
         if let Some(pacing) = super::gfx1201_pm4_pacing_override() {
@@ -854,6 +865,7 @@ fn facts_summary(program: &rk::KernelProgram) -> FactsSummary {
             Lowering::Pm4 => ("pm4", None),
             Lowering::Graph { reason } => ("graph", Some(reason.clone())),
             Lowering::HipDirect { reason } => ("hip_direct", Some(reason.clone())),
+            Lowering::Conditional { reason } => ("conditional", Some(reason.clone())),
         };
         if let Some(reason) = &reason {
             not_pm4.push(format!("{k} {}: {reason}", node.symbol));

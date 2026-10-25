@@ -130,7 +130,12 @@ __global__ void dflash_selector_greedy_exact(
                 for (unsigned int d = 0; d < rank; ++d) {
                     const float p = dsg_load(pred_cb, po + d, pred_f16);
                     const float s = dsg_load(succ_cb, so + d, succ_f16);
-                    const float t = __fmul_rn(__fmul_rn(p, pr[d]), s);
+                    float t = __fmul_rn(__fmul_rn(p, pr[d]), s);
+                    // HIP's __fmul_rn/__fadd_rn are plain operators, so
+                    // fp-contract can still fuse `dot + t` into v_fmac.
+                    // The empty asm makes t opaque, forcing a separately
+                    // rounded multiply then add (the CPU scorer's order).
+                    asm volatile("" : "+v"(t));
                     dot = __fadd_rn(dot, t);
                 }
                 score = __fadd_rn(top_vals[r * k + lane], dot);

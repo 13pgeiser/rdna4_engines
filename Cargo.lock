@@ -2666,6 +2666,7 @@ name = "peacemaker-ir"
 version = "0.4.4"
 dependencies = [
  "insta",
+ "peacemaker-lift",
  "petgraph",
  "proptest",
  "serde_json",

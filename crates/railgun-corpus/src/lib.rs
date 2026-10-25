@@ -140,7 +140,7 @@ pub struct RejectedObject {
 #[serde(deny_unknown_fields)]
 pub struct KernelVerdict {
     pub symbol: String,
-    /// A1 status: `proven` or `unknown`.
+    /// A1 status: `proven`, `conditional` (witness required) or `unknown`.
     pub status: String,
     /// G8 differential: `pass`, `fail` or `not_applicable`.
     pub differential: String,
@@ -446,6 +446,10 @@ impl JitCorpus {
         {
             return Err(invalid(format!("receipt schema {} v{} section v{} is not {RECEIPT_SCHEMA} v{RECEIPT_SCHEMA_VERSION} section v{RAILGUN_SECTION_VERSION}",
                 receipt.schema, receipt.schema_version, receipt.railgun.section_version)));
+        }
+        for k in &receipt.railgun.kernels {
+            k.validate_case(&receipt.object_sha256, &receipt.device_elf_sha256, &receipt.arch)
+                .map_err(invalid)?;
         }
         if receipt.object_sha256 != key.artifact_sha256 || receipt.arch != key.arch {
             return Err(invalid(format!(

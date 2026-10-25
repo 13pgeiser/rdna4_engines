@@ -109,11 +109,68 @@ pub struct ArgFact {
     pub role: ArgRole,
 }
 
+/// Witness kind the receipt names for the loaded-index case (§A9.2).
+pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
+
+/// `IndexLoad` (§A9.2): an immutable `I32` index loaded from a pointer
+/// argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexLoad {
+    pub pc: u32,
+    pub source_arg_offset: u32,
+    pub element: String,
+    pub offset_expr: String,
+    pub extension: String,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+}
+
+/// `IndexedArgEffect` (§A9.2): one access whose address is `direct base +
+/// bounded integer expression`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedArgEffect {
+    pub pc: u32,
+    pub base_arg_offset: u32,
+    pub mode: String,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+    pub address_expr: String,
+    pub index_loads: Vec<IndexLoad>,
+    pub guards: Vec<String>,
+}
+
+/// One launch/argument guard of the guarded case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgGuard {
+    pub kind: String,
+    pub arg_offset: u32,
+    pub size: u32,
+    pub value: String,
+}
+
+/// The guarded case of a `Conditional` kernel: valid only while every guard
+/// holds and every `witnesses` kind has a matching runtime bind witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConditionalFacts {
+    pub guards: Vec<ArgGuard>,
+    pub indexed: Vec<IndexedArgEffect>,
+    pub witnesses: Vec<String>,
+    pub case_digest: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FactStatus {
     Proven,
     /// Rules of the accesses A1 could not attribute.
     Unknown(Vec<String>),
+    /// `KernelStatus::Conditional`: neither `Proven` nor `Unknown`. Not
+    /// PM4-eligible until a matching [`crate::index_bind::IndexedBindWitness`]
+    /// is consumed by the window; the cached fact is never mutated.
+    Conditional(ConditionalFacts),
 }
 
 /// A hidden (implicit) argument the code object's metadata declares.
@@ -183,6 +240,68 @@ pub struct KernelFacts {
     pub differential: String,
 }
 
+fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, String> {
+    let sym = &record.symbol;
+    if record.guards.is_empty()
+        || record.indexed_effects.is_empty()
+        || record.required_witnesses.is_empty()
+        || record.case_digest.is_empty()
+    {
+        return Err(format!(
+            "{sym}: conditional record lacks guards, indexed effects, witnesses or case digest"
+        ));
+    }
+    for w in &record.required_witnesses {
+        if w != WITNESS_INDEXED_BIND {
+            return Err(format!("{sym}: unknown required witness kind {w:?}"));
+        }
+    }
+    let mut indexed = Vec::with_capacity(record.indexed_effects.len());
+    for e in &record.indexed_effects {
+        let mut loads = Vec::with_capacity(e.index_loads.len());
+        for l in &e.index_loads {
+            loads.push(IndexLoad {
+                pc: l.pc,
+                source_arg_offset: l.source_arg_offset,
+                element: l.element.clone(),
+                offset_expr: l.offset_expr.clone(),
+                extension: l.extension.clone(),
+                class: MemClass::parse(&l.class).map_err(|m| format!("{sym}: {m}"))?,
+                path: l.path.clone(),
+                cache: l.cache.clone(),
+                width: l.width,
+            });
+        }
+        indexed.push(IndexedArgEffect {
+            pc: e.pc,
+            base_arg_offset: e.base_arg_offset,
+            mode: e.mode.clone(),
+            class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: e.path.clone(),
+            cache: e.cache.clone(),
+            width: e.width,
+            address_expr: e.address_expr.clone(),
+            index_loads: loads,
+            guards: e.guards.clone(),
+        });
+    }
+    Ok(ConditionalFacts {
+        guards: record
+            .guards
+            .iter()
+            .map(|g| ArgGuard {
+                kind: g.kind.clone(),
+                arg_offset: g.arg_offset,
+                size: g.size,
+                value: g.value.clone(),
+            })
+            .collect(),
+        indexed,
+        witnesses: record.required_witnesses.clone(),
+        case_digest: record.case_digest.clone(),
+    })
+}
+
 impl KernelFacts {
     pub fn from_record(record: &KernelRecord) -> Result<Self, String> {
         let status = match record.status.as_str() {
@@ -193,6 +312,9 @@ impl KernelFacts {
                 rules.sort();
                 rules.dedup();
                 FactStatus::Unknown(rules)
+            }
+            railgun_corpus::receipt::STATUS_CONDITIONAL => {
+                FactStatus::Conditional(conditional_from_record(record)?)
             }
             other => return Err(format!("{}: unknown A1 status {other:?}", record.symbol)),
         };
@@ -641,6 +763,11 @@ pub enum Lowering {
     HipDirect {
         reason: String,
     },
+    /// A `Conditional` kernel (§A9.2) whose bind witness has not been
+    /// consumed: PM4-ineligible, a full barrier like `HipDirect`.
+    Conditional {
+        reason: String,
+    },
 }
 
 impl Lowering {
@@ -672,6 +799,22 @@ pub struct KernelNode {
     pub effects: Vec<RegionEffect>,
     pub read_cache: ReadCache,
     pub lowering: Lowering,
+    /// The guarded case of a `Conditional` kernel (a copy of the receipt's
+    /// facts, not a mutation of them). A node carrying it is admitted to a
+    /// window only while the window holds a matching
+    /// [`crate::index_bind::IndexedBindWitness`].
+    pub indexed: Option<IndexedNode>,
+}
+
+/// What a window needs to bind a `Conditional` node: the explicit arguments
+/// of the loaded object, the guarded case and its receipt identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedNode {
+    pub args: Vec<ArgFact>,
+    pub effects: Vec<IndexedArgEffect>,
+    pub guards: Vec<ArgGuard>,
+    pub witnesses: Vec<String>,
+    pub case_digest: String,
 }
 
 /// A word of the program and where it is patched.
@@ -717,6 +860,17 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         if let FactStatus::Unknown(rules) = &f.status {
             refusals.push(format!("A1 Unknown ({})", rules.join(", ")));
         }
+        let conditional = match &f.status {
+            FactStatus::Conditional(c) => {
+                for g in &c.guards {
+                    if let Err(why) = guard_holds(g, launch) {
+                        refusals.push(format!("conditional guard {}@{} fails: {why}", g.kind, g.arg_offset));
+                    }
+                }
+                Some(c)
+            }
+            _ => None,
+        };
         if f.differential == "fail" {
             refusals.push("G8 differential fails".to_owned());
         }
@@ -785,6 +939,22 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             };
+            // A conditional kernel's indexed effects add their base access
+            // and index-source reads to the argument's classes (still
+            // allocation-wide; no narrower hazard region).
+            let mut classes = classes.clone();
+            if let Some(c) = conditional {
+                for e in &c.indexed {
+                    if e.base_arg_offset == arg.offset && !classes.contains(&e.class) {
+                        classes.push(e.class);
+                    }
+                    for l in &e.index_loads {
+                        if l.source_arg_offset == arg.offset && !classes.contains(&l.class) {
+                            classes.push(l.class);
+                        }
+                    }
+                }
+            }
             if arg.size != 8 {
                 refusals.push(format!(
                     "pointer argument +{} is {} bytes",
@@ -853,7 +1023,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 effects.push(RegionEffect {
                     arg_offset: arg.offset,
                     resource,
-                    classes: classes.clone(),
+                    classes,
                 });
             }
         }
@@ -872,6 +1042,10 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         let lowering = if !refusals.is_empty() {
             Lowering::HipDirect {
                 reason: refusals.join("; "),
+            }
+        } else if conditional.is_some() {
+            Lowering::Conditional {
+                reason: "indexed_bind witness not consumed".to_owned(),
             }
         } else if non_commutative_atomic {
             Lowering::Graph {
@@ -893,6 +1067,13 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             effects,
             read_cache: f.read_cache,
             lowering,
+            indexed: conditional.map(|c| IndexedNode {
+                args: f.args.clone(),
+                effects: c.indexed.clone(),
+                guards: c.guards.clone(),
+                witnesses: c.witnesses.clone(),
+                case_digest: c.case_digest.clone(),
+            }),
         });
     }
     KernelProgram {
@@ -900,6 +1081,68 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         resources,
         words,
         nodes,
+    }
+}
+
+/// Evaluate one receipt guard against the recorded launch. `grid`/`block`
+/// guards whose value is symbolic (not `x,y,z` integers) are enforced by the
+/// window bind, which recomputes them from the bound arguments.
+fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
+    let at = g.arg_offset as usize;
+    let size = g.size as usize;
+    match g.kind.as_str() {
+        "ptr_null" => {
+            let bytes = launch.kernarg.get(at..at + size).ok_or("outside the kernarg")?;
+            if bytes.iter().all(|b| *b == 0) {
+                Ok(())
+            } else {
+                Err("pointer is not null".into())
+            }
+        }
+        // `kernarg_eq` is railgun-cert's serialization of the analyzer's
+        // `Guard::KernargEq` (a null optional pointer is `size 8, value 0`).
+        "scalar_eq" | "kernarg_eq" => {
+            let want: u64 = g.value.parse().map_err(|_| format!("bad value {:?}", g.value))?;
+            if size == 0 || size > 8 {
+                return Err(format!("bad size {size}"));
+            }
+            let bytes = launch.kernarg.get(at..at + size).ok_or("outside the kernarg")?;
+            let mut le = [0u8; 8];
+            le[..size].copy_from_slice(bytes);
+            let got = u64::from_le_bytes(le);
+            if got == want {
+                Ok(())
+            } else {
+                Err(format!("kernarg is {got}, guard {want}"))
+            }
+        }
+        kind @ ("grid" | "block") => {
+            let dims: Option<Vec<u32>> = g.value.split(',').map(|v| v.trim().parse().ok()).collect();
+            match dims.as_deref() {
+                Some(&[x, y, z]) => {
+                    let have = if kind == "grid" { launch.grid } else { launch.block };
+                    if have == [x, y, z] {
+                        Ok(())
+                    } else {
+                        Err(format!("{have:?} != [{x}, {y}, {z}]"))
+                    }
+                }
+                _ => Ok(()),
+            }
+        }
+        // railgun-cert's `Guard::GridDim` / `Guard::BlockDim`: `arg_offset`
+        // carries the axis, `value` the workgroup count / block extent.
+        kind @ ("grid_dim" | "block_dim") => {
+            let axis = g.arg_offset as usize;
+            let want: u32 = g.value.parse().map_err(|_| format!("bad value {:?}", g.value))?;
+            let have = if kind == "grid_dim" { launch.grid } else { launch.block };
+            match have.get(axis) {
+                Some(&v) if v == want => Ok(()),
+                Some(&v) => Err(format!("{kind}[{axis}] is {v}, guard {want}")),
+                None => Err(format!("bad axis {axis}")),
+            }
+        }
+        other => Err(format!("unknown guard kind {other:?}")),
     }
 }
 
@@ -917,6 +1160,7 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         effects: Vec::new(),
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
+        indexed: None,
     }
 }
 
@@ -1030,6 +1274,33 @@ impl KernelProgram {
     /// Authored value of every word, indexed by `WordId`.
     pub fn authored_words(&self) -> Vec<u32> {
         self.words.iter().map(|w| w.authored).collect()
+    }
+
+    /// Indices of the nodes that need an
+    /// [`crate::index_bind::IndexedBindWitness`] (receipt `Conditional`).
+    pub fn conditional_nodes(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.indexed.is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The program a window plan is laid out against *assuming* its bind
+    /// witness: every `Conditional` node that carries its guarded case is
+    /// lowered as PM4. This is a derived value; the cached node facts and
+    /// this program are never promoted to `Proven`. The resulting plan keeps
+    /// the node's `indexed` case, and `PreparedWindow` refuses to submit
+    /// without a witness for every such node.
+    pub fn assume_indexed_witness(&self) -> KernelProgram {
+        let mut p = self.clone();
+        for n in &mut p.nodes {
+            if n.indexed.is_some() && matches!(n.lowering, Lowering::Conditional { .. }) {
+                n.lowering = Lowering::Pm4;
+            }
+        }
+        p
     }
 }
 
