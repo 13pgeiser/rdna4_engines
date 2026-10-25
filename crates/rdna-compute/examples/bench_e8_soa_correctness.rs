@@ -1136,11 +1136,12 @@ fn main() {
 /// blocks plus a ragged tail, and Y starts as NaN, so a launcher that leaves
 /// tokens unwritten fails here (HIPF-93).
 fn run_grouped_prefill_parity(gpu: &mut Gpu) {
-    assert_eq!(
-        gpu.arch, "gfx1151",
-        "grouped E8 WMMA prefill is gfx1151-only"
-    );
-    let (groups, batch, m, k) = (8usize, 100usize, 128usize, 2048usize);
+    assert!(matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201"));
+    let batch = std::env::args()
+        .nth(1)
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(100);
+    let (groups, m, k) = (8usize, 128usize, 2048usize);
     let aos = synth_e8_aos(groups * m, k, 0xE84B_10C8);
     let soa = aos_to_soa_full(&aos, groups * m, k);
     let row_bytes = soa.len() / (groups * m);
@@ -1164,14 +1165,29 @@ fn run_grouped_prefill_parity(gpu: &mut Gpu) {
     gpu.hip
         .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
         .unwrap();
-    for tiles in [1usize, 2] {
+    for tiles in if gpu.arch == "gfx1201" {
+        vec![1usize]
+    } else {
+        vec![1usize, 2]
+    } {
         gpu.hip
             .memset(&y_wmma.buf, 0xff, y_wmma.byte_size())
             .unwrap();
-        match tiles {
-            1 => gpu.gemm_mfp4g32_e8_soa_grouped_wmma(&weights, &x, &y_wmma, groups, m, k, batch),
-            _ => {
-                gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(&weights, &x, &y_wmma, groups, m, k, batch)
+        if gpu.arch == "gfx1201" {
+            let x_f16 = gpu.alloc_tensor(&[batch * groups * k], DType::F16).unwrap();
+            gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, (batch * groups * k) as i64)
+                .unwrap();
+            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+                &weights, &x_f16, &y_wmma, groups, m, k, batch,
+            )
+        } else {
+            match tiles {
+                1 => {
+                    gpu.gemm_mfp4g32_e8_soa_grouped_wmma(&weights, &x, &y_wmma, groups, m, k, batch)
+                }
+                _ => gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(
+                    &weights, &x, &y_wmma, groups, m, k, batch,
+                ),
             }
         }
         .unwrap();
