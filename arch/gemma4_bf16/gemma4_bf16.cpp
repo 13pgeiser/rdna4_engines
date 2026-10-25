@@ -1712,12 +1712,14 @@ struct Model {
     /* Per-layer embeddings (hidden_size_per_layer_input > 0): the token-identity table
      * (embed_tokens_per_layer, n_layer x n_ple wide), the context projection of the scaled
      * embedding and its per-(token, layer) norm, combined into `b_ple` [max_tok, n_layer * n_ple]
-     * that every layer reads its slice of. */
+     * that every layer reads its slice of. At two ranks the table is vocab-sharded like the token
+     * table, and its lookup is reduced the same way (op_ple_ar). The rest of the branch is
+     * replicated, so no layer reduces it. */
     int64_t    n_ple = 0;
     rad_weight w_ple_tok = 0, w_ple_norm = 0;
     G4Linear   ln_ple_proj{};
     rad_buf    b_ple = 0, b_ple_tok = 0, b_pg = 0;
-    rad_op     op_ple_tok = 0, op_ple_norm = 0, op_ple_add = 0;
+    rad_op     op_ple_tok = 0, op_ple_ar = 0, op_ple_norm = 0, op_ple_add = 0;
     /* An image's placeholder positions take the token-identity row of pad_token_id, as the
      * reference looks them up (Gemma4Model.forward: llm_input_ids = pad where multimodal): that row
      * times sqrt(n_ple), made as fill(sqrt(n_ple)) * the row, scattered over the image rows. */
@@ -2030,10 +2032,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.n_ple < 0) { fprintf(stderr, "radiance: gemma4: hidden_size_per_layer_input %lld is negative\n", (long long)m.n_ple); return RAD_E_INVAL; }
     if (m.n_ple > 0) {
         const int64_t v_ple = meta_text_geti(meta, "vocab_size_per_layer_input", g.n_vocab_all);
-        if (g.world > 1) {
+        if (g.world > 2) {
             fprintf(stderr, "radiance: gemma4: per-layer embeddings (hidden_size_per_layer_input %lld) "
-                            "are served at one rank only; this model is small enough for one card\n",
-                    (long long)m.n_ple);
+                            "are served at one or two ranks, not %d: the four-rank junctions keep "
+                            "a rank's rows only, and the per-layer branch reads every row\n",
+                    (long long)m.n_ple, g.world);
             return RAD_E_UNSUPPORTED;
         }
         if (v_ple != g.n_vocab_all) {
@@ -2216,6 +2219,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      RAD_F64("mult", std::sqrt((double)m.n_ple))),
                           RAD_WEIGHTS(m.w_ple_tok)),
                          {}, {m.b_ple_tok});
+        /* A rank's lookup writes zeros for ids outside its vocabulary slice; the all-reduce makes
+         * every row whole. */
+        if (g.world > 1) {
+            m.op_ple_ar = rw(b, RAD_OP(b, "all_reduce",
+                                 RAD_PARAMS(RAD_INT("world_size", g.world),
+                                            RAD_RANGE("numel", P, g.max_tok * P),
+                                            RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
+                                 RAD_NOWEIGHTS),
+                             {m.b_ple_tok}, {m.b_ple_tok});
+            if (!m.op_ple_ar) return RAD_E_INVAL;
+        }
         RAD_ARCH_TRY(m.ln_ple_proj.declare(b, nm, g, nm.f("ple_model_proj"),
                                            { nm.ckpt("model.language_model.per_layer_model_projection.weight") },
                                            P, g.n_embd, RAD_SHARD_NONE, grp_model(), m.b_x, m.b_ple));
@@ -2417,7 +2431,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
      * arena's sharing, which the runtime asks of every buffer a second lane touches; it lives
      * across the whole trunk already. */
-    m.overlap = g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
+    /* Not with per-layer embeddings: the slices close each layer through j_ma alone, without the
+     * per-layer branch. */
+    m.overlap = g.world > 1 && g.wire_exact && m.fuse && m.n_ple == 0 &&
+                g.max_tok >= 2 * kOverlapRows;
     for (const Layer& lay : m.layers)
         m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
@@ -2602,6 +2619,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             rad_note(b, "prefill overlap: off (%s)",
                      !g.wire_exact ? "the lossy all-reduce wire"
                      : !m.fuse     ? "the residual junctions are not fused"
+                     : m.n_ple > 0 ? "the per-layer branch is not split into slices"
                                    : "a step holds fewer than two slices");
     }
     if (m.fuse && (g.world == 2 || g.world == 4)) {
@@ -2827,6 +2845,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.n_ple > 0) {
         RAD_ISSUE(c, m.op_ple_tok, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_ple_tok),
                   brows(m.b_ple_tok, T));
+        /* before the pad rows of image positions go in: every rank writes those whole */
+        if (m.op_ple_ar)
+            RAD_ISSUE_N(c, m.op_ple_ar, T * m.g.n_layer * m.n_ple, brows(m.b_ple_tok, T), RAD_NONE);
         if (m.op_ple_pscat && batch->n_mm_rows > 0) {
             const int64_t nm_rows = batch->n_mm_rows;
             RAD_ISSUE_N(c, m.op_ple_pfill, nm_rows, brows(m.b_ple_pad, nm_rows));
@@ -2864,8 +2885,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             }
         }
         if (m.fuse && !last) {
-            /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
-            l.j_ma.step(c, T, far);
+            /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op.
+             * With per-layer embeddings it closes the branch, whose output every rank holds whole
+             * (the feed-forward's reduction ran above): no all-reduce in front. */
+            l.j_ma.step(c, T, far && !ple);
         } else {
             /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after
              * the mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The

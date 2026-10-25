@@ -3853,13 +3853,103 @@ TEST(a_gemma4_e4b_form_shares_kv_and_runs_the_per_layer_branch) {
     }
 }
 
-/* The per-layer branch is not split across ranks, and a model whose every layer shares KV has no
- * cache to read. */
+/* At two ranks the per-layer table is vocab-sharded like the token table and its lookup is reduced
+ * like the token lookup, before anything reads it; the rest of the branch is replicated. A step
+ * reduces the two lookups and, a layer, attention's and the feed-forward's partial sums -- folded
+ * into the attention junction where it resolves -- and never the branch's output, which every rank
+ * holds whole. The prefill overlap, whose slices skip the branch, stays off. */
+TEST(the_gemma4_e4b_form_runs_at_two_ranks) {
+    const int64_t L = 12, P = 12 * 64;
+    for (bool w4 : { false, true }) {
+        for (int rank : { 0, 1 }) {
+            RadBuilder b;
+            if (w4) {
+                const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                b.encs = { { "attn_q.", e }, { "attn_k.", e }, { "attn_v.", e }, { "attn_o.", e },
+                           { "ffn_gate_up.", e }, { "ffn_down.", e } };
+            }
+            RadModelMeta meta = gemma4_e4b_meta();
+            RadBuildCtx  ctx  = build_ctx(rank, 2);
+            ctx.max_tok = 4096;   /* past two slices of the overlap */
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            CHECK(!gemma4_bf16::g_model[rank].overlap);
+            CHECK_EQ(gemma4_bf16::g_model[rank].fuse, w4);
+
+            /* the per-layer table takes the token table's slice of the vocabulary */
+            const RecOp* tok = find_op(b, "embed_lookup", 0);
+            const RecOp* ple = find_op(b, "embed_lookup", 1);
+            REQUIRE(tok != nullptr && ple != nullptr);
+            CHECK_EQ(pint(ple, "n_embd"), P);
+            CHECK_EQ(pint(ple, "n_vocab"), pint(tok, "n_vocab"));
+            CHECK_EQ(pint(ple, "vocab_offset"), pint(tok, "vocab_offset"));
+
+            RadBatch batch = decode_batch();
+            RadCtx c; c.b = &b; c.rank = rank; c.world = 2; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK_LINT(b, &c);
+            CHECK(c.step_fail.empty());
+            const std::vector<std::string> ops = issued_ops(b, c);
+            REQUIRE(ops.size() > 4);
+            CHECK_EQ(ops[0], std::string("embed_lookup"));
+            CHECK_EQ(ops[1], std::string("all_reduce"));
+            CHECK_EQ(ops[2], std::string("embed_lookup"));
+            CHECK_EQ(ops[3], std::string("all_reduce"));
+            CHECK_EQ(c.issues[3].n, batch.n_tok * P);
+            const int folded = count_issued(ops, "ar_rmsnorm_quant_i8");
+            CHECK_EQ(count_issued(ops, "all_reduce") + folded, (int)(2 + 2 * L));
+            CHECK_EQ(folded, w4 ? (int)L : 0);
+        }
+    }
+}
+
+/* With an image at two ranks, the pad rows of the image positions go into the per-layer inputs
+ * after their lookup's all-reduce: every rank writes them whole, so before it they would count
+ * twice. */
+TEST(the_gemma4_e4b_form_writes_image_pad_rows_after_the_per_layer_all_reduce) {
+    std::vector<const char*> keys(std::begin(k_gem4e_keys), std::end(k_gem4e_keys));
+    std::vector<const char*> vals(std::begin(k_gem4e_vals), std::end(k_gem4e_vals));
+    const char* vk[] = { "vision_config.model_type", "vision_config.hidden_size",
+                         "vision_config.num_attention_heads", "vision_config.head_dim",
+                         "vision_config.intermediate_size", "vision_config.pooling_kernel_size",
+                         "vision_config.position_embedding_size", "vision_config.num_hidden_layers",
+                         "vision_config.patch_size", "vision_config.rope_parameters.rope_theta",
+                         "vision_config.rope_parameters.rope_type", "vision_config.hidden_activation" };
+    const char* vv[] = { "gemma4_vision", "768", "12", "64", "3072", "3", "10240", "2", "16", "100",
+                         "default", "gelu_pytorch_tanh" };
+    keys.insert(keys.end(), std::begin(vk), std::end(vk));
+    vals.insert(vals.end(), std::begin(vv), std::end(vv));
+    static const int32_t rows[] = { 4, 5, 6, 7, 8, 9, 10, 11 };
+    static uint16_t embd[8 * 5376];
+    for (int rank : { 0, 1 }) {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_e4b_meta();
+        meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        ctx.max_enc_patches = 9 * 64;
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        RadBatch batch = prefill_batch();
+        batch.n_mm_rows = 8; batch.mm_rows = rows; batch.mm_embd = embd;
+        RadCtx c; c.b = &b; c.rank = rank; c.world = 2; c.batch = &batch;
+        gemma4_bf16::step(&c, &batch);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        size_t i = 0;   /* the per-layer lookup: the second embed_lookup */
+        for (int seen = 0; i < ops.size(); ++i)
+            if (ops[i] == "embed_lookup" && ++seen == 2) break;
+        REQUIRE(i + 4 < ops.size());
+        const std::vector<std::string> want = { "all_reduce", "fill", "mul_weight", "scatter_rows" };
+        CHECK(std::vector<std::string>(ops.begin() + (long)i + 1, ops.begin() + (long)i + 5) == want);
+    }
+}
+
+/* The per-layer branch is served at one or two ranks, and a model whose every layer shares KV has
+ * no cache to read. */
 TEST(the_gemma4_e4b_form_is_refused_where_it_cannot_run) {
     {
         RadBuilder b;
         RadModelMeta meta = gemma4_e4b_meta();
-        RadBuildCtx  ctx  = build_ctx(0, 2);
+        RadBuildCtx  ctx  = build_ctx(0, 4);
         CHECK_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
     }
     {
