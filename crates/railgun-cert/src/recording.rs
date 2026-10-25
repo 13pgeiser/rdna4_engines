@@ -1346,6 +1346,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "vl-batched-prefill-capture-refusal",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Qwen3.5/3.8 batched image-token prefill (qwen35 vl_prefill.rs `vl_batched_prefill_admitted`, evaluated by generate_vl before any prefill work, and `ChunkRoute::refusal`, whose `capturing` input is `gpu.graphs.capture_mode || gpu.replay.is_recording()` in forward_batch_chunk_impl before any scratch, KV or recurrent write): a VL prompt refuses the batched route when HIP graph capture or Redline recording is active",
+        effect: Refusal,
+        switches: "outside capture and recording: the image prompt prefills in batched chunks (tower embeddings spliced over the image-pad rows, batched M-RoPE); under capture or recording: the batched route is refused up front and generate_vl falls back to the per-token VL prefill path (forward_scratch_embed_mrope)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branch launches nothing and returns Err (admission) or the refusal string (chunk route) before any prefill work, so no captured or recorded body can contain a batched image prefill; the fallback is the existing per-token VL path, which is unchanged. No railgun default program is a batched-VL prefill",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-prefill-token-id-reuse",
         predicates: &[CaptureMode],
         condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the device `token_ids` rows of a chunk's whole-row host upload are recorded as reusable by the MTP prompt-fill head Append (HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS) only when the upload ran outside graph capture (`!capture_mode`)",
@@ -1847,12 +1858,13 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_batch_chunk_impl",
-        occurrences: 7,
+        occurrences: 10,
         decisions: &[
             "q8-multirow-verify-attention",
             "captured-batch-attention-physical-cap",
             "captured-verify-attention-physical-cap",
             "gdn-chunk-scan",
+            "vl-batched-prefill-capture-refusal",
         ],
     },
     Site {
@@ -1897,6 +1909,24 @@ pub const SITES: &[Site] = &[
         function: "lane_fa_plan_ok",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "vl_batched_prefill_admitted",
+        occurrences: 2,
+        decisions: &["vl-batched-prefill-capture-refusal"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/arch.rs",
