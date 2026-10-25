@@ -621,6 +621,94 @@ TEST(a_complete_tool_call_is_reported_as_tool_calls) {
     CHECK(c["message"]["content"].is_null());
 }
 
+TEST(hyv3_native_markup_flows_through_openai_tools_api) {
+    const json tools = json::parse(R"([{
+      "type":"function","function":{"name":"lookup_weather","parameters":{"type":"object",
+      "properties":{"city":{"type":"string"}},"required":["city"]}}},
+      {"type":"function","function":{"name":"add","parameters":{"type":"object",
+      "properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}])");
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "Check Toronto weather and add 20 and 22."}},
+        {{"role", "assistant"}, {"content", nullptr},
+         {"tool_calls", json::array({
+             {{"id", "call-weather"}, {"type", "function"},
+              {"function", {{"name", "lookup_weather"},
+                             {"arguments", "{\"city\":\"Toronto\"}"}}}},
+             {{"id", "call-add"}, {"type", "function"},
+              {"function", {{"name", "add"}, {"arguments", "{\"a\":20,\"b\":22}"}}}}
+         })}},
+        {{"role", "tool"}, {"tool_call_id", "call-weather"}, {"content", "Cloudy, 12 C."}},
+        {{"role", "tool"}, {"tool_call_id", "call-add"}, {"content", "42"}},
+        {{"role", "user"}, {"content", "Summarize the results."}}
+    });
+    const std::string reply =
+        "The weather is cloudy, and the sum is 42.\n<tool_calls>\n"
+        "<tool_call>lookup_weather<tool_sep>\n"
+        "<arg_key>city</arg_key>\n<arg_value>Toronto</arg_value>\n</tool_call>\n"
+        "<tool_call>add<tool_sep>\n"
+        "<arg_key>a</arg_key>\n<arg_value>20</arg_value>\n"
+        "<arg_key>b</arg_key>\n<arg_value>22</arg_value>\n</tool_call>\n</tool_calls>";
+    Fixture f;
+    f.tmpl.real_parser = hyv3_reply_parser(tools);
+    REQUIRE(f.tmpl.real_parser != nullptr);
+    f.sched.reply = reply;
+    const std::string body = json({{"messages", messages}, {"tools", tools},
+                                   {"parallel_tool_calls", true}, {"max_tokens", 512}}).dump();
+
+    HttpResponse buffered = f.post("/v1/chat/completions", body);
+    CHECK_EQ(buffered.status, 200);
+    const json c = json::parse(buffered.body)["choices"][0];
+    CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("tool_calls"));
+    CHECK_EQ(c["message"]["content"].get<std::string>(),
+             std::string("The weather is cloudy, and the sum is 42."));
+    REQUIRE(c["message"]["tool_calls"].size() == 2);
+    CHECK_EQ(c["message"]["tool_calls"][0]["function"]["name"].get<std::string>(),
+             std::string("lookup_weather"));
+    CHECK_EQ(c["message"]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+             std::string("{\"city\":\"Toronto\"}"));
+    CHECK_EQ(c["message"]["tool_calls"][1]["function"]["name"].get<std::string>(),
+             std::string("add"));
+    CHECK_EQ(c["message"]["tool_calls"][1]["function"]["arguments"].get<std::string>(),
+             std::string("{\"a\":20,\"b\":22}"));
+    CHECK_EQ(f.tmpl.last_tool_msgs, 2);
+    CHECK(has(f.tmpl.last_prompt, "Summarize the results."));
+
+    HttpResponse streamed = f.post("/v1/chat/completions",
+                                   json({{"messages", messages}, {"tools", tools},
+                                         {"stream", true}, {"max_tokens", 512}}).dump());
+    CHECK_EQ(streamed.status, 200);
+    int bad = 0;
+    std::string finish, content;
+    std::vector<std::string> names, arguments;
+    for (const std::string& payload : sse_payloads(drain(streamed), &bad)) {
+        if (payload == "[DONE]") continue;
+        const json event = json::parse(payload);
+        if (event["choices"].empty()) continue;
+        const json& choice = event["choices"][0];
+        if (!choice["finish_reason"].is_null())
+            finish = choice["finish_reason"].get<std::string>();
+        const json& delta = choice["delta"];
+        if (delta.contains("content")) content += delta["content"].get<std::string>();
+        if (!delta.contains("tool_calls")) continue;
+        for (const json& call : delta["tool_calls"]) {
+            const size_t i = call["index"].get<size_t>();
+            if (i >= names.size()) { names.resize(i + 1); arguments.resize(i + 1); }
+            if (call.contains("function") && call["function"].contains("name"))
+                names[i] = call["function"]["name"].get<std::string>();
+            if (call.contains("function") && call["function"].contains("arguments"))
+                arguments[i] += call["function"]["arguments"].get<std::string>();
+        }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(finish, std::string("tool_calls"));
+    CHECK_EQ(content, std::string("The weather is cloudy, and the sum is 42."));
+    REQUIRE(names.size() == 2);
+    CHECK_EQ(names[0], std::string("lookup_weather"));
+    CHECK_EQ(arguments[0], std::string("{\"city\":\"Toronto\"}"));
+    CHECK_EQ(names[1], std::string("add"));
+    CHECK_EQ(arguments[1], std::string("{\"a\":20,\"b\":22}"));
+}
+
 /* The three spellings of "do not think" must all reach the template, and the kwarg must reach
  * both places: the lift overwrites the context key `enable_thinking` with its own field
  * (chat-auto-parser-helpers.cpp), so a kwarg not also lifted into the field would be discarded

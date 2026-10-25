@@ -87,6 +87,12 @@ static const TemplateFixture& qwen() {
     return f;
 }
 
+static const TemplateFixture& hyv3() {
+    static const TemplateFixture f("RAD_TEST_HYV3_JINJA", "hyv3/chat_template.jinja",
+                                   "<｜hy_begin▁of▁sentence｜>", "<eos:6124c78e>");
+    return f;
+}
+
 static json tools_json() {
     return json::parse(R"([{
       "type": "function",
@@ -104,6 +110,58 @@ static json tools_json() {
                        "properties":{"path":{"type":"string"},"old_string":{"type":"string"},
                                      "new_string":{"type":"string"}},
                        "required":["path","old_string","new_string"]}}}])");
+}
+
+static json hyv3_tools_json() {
+    return json::parse(R"([{
+      "type":"function","function":{"name":"lookup_weather","description":"Look up weather.",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},
+      {"type":"function","function":{"name":"add","description":"Add two integers.",
+      "parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},
+      "required":["a","b"]}}}])");
+}
+
+TEST(hyv3_template_renders_openai_tool_schemas_and_replayed_history) {
+    if (!hyv3().need()) return;
+    REQUIRE(hyv3().t->caps().tools && hyv3().t->caps().tool_calls);
+    const json tools = hyv3_tools_json();
+    json messages = json::array({
+        {{"role", "system"}, {"content", "Use tools when useful."}},
+        {{"role", "user"}, {"content", "Check Toronto weather and add 20 and 22."}}
+    });
+    ChatOptions opt;
+    opt.add_generation_prompt = true;
+    ChatPrompt prompt;
+    CHECK_OK(hyv3().t->apply(messages, tools, opt, &prompt));
+    if (!prompt.error.empty()) return;
+    CHECK(prompt.prompt.find("<tools>") != std::string::npos);
+    CHECK(prompt.prompt.find("<tool_calls>") != std::string::npos);
+    CHECK(prompt.prompt.find("<tool_call>{function-name}<tool_sep>") != std::string::npos);
+    CHECK(prompt.generation_prompt.find("<｜hy_Assistant｜>") != std::string::npos);
+
+    messages.push_back({{"role", "assistant"}, {"content", ""},
+        {"tool_calls", json::array({
+            {{"id", "call-weather"}, {"type", "function"},
+             {"function", {{"name", "lookup_weather"},
+                            {"arguments", "{\"city\":\"Toronto\"}"}}}},
+            {{"id", "call-add"}, {"type", "function"},
+             {"function", {{"name", "add"}, {"arguments", "{\"a\":20,\"b\":22}"}}}}
+        })}});
+    messages.push_back({{"role", "tool"}, {"tool_call_id", "call-weather"},
+                        {"content", "Cloudy, 12 C."}});
+    messages.push_back({{"role", "tool"}, {"tool_call_id", "call-add"}, {"content", "42"}});
+    messages.push_back({{"role", "user"}, {"content", "Summarize the results."}});
+    prompt = ChatPrompt{};
+    CHECK_OK(hyv3().t->apply(messages, tools, opt, &prompt));
+    if (!prompt.error.empty()) return;
+    CHECK(prompt.prompt.find("<tool_calls>") != std::string::npos);
+    CHECK(prompt.prompt.find("<tool_call>lookup_weather<tool_sep>") != std::string::npos);
+    CHECK(prompt.prompt.find("<arg_key>city</arg_key>") != std::string::npos);
+    CHECK(prompt.prompt.find("Toronto") != std::string::npos);
+    CHECK(prompt.prompt.find("<tool_responses>") != std::string::npos);
+    CHECK(prompt.prompt.find("Cloudy, 12 C.") != std::string::npos);
+    CHECK(prompt.prompt.find("<tool_response>\n42\n</tool_response>") != std::string::npos);
+    CHECK(prompt.prompt.find("Summarize the results.") != std::string::npos);
 }
 
 /* Render one turn, passing `effort` as the template's reasoning_effort when set. */

@@ -94,6 +94,11 @@ license text is in the file named beside each.
   nlohmann/json   Copyright (c) 2013-2025 Niels Lohmann             vendor/nlohmann/LICENSE.MIT
   cpp-httplib     Copyright (c) 2017 yhirose                        vendor/cpp-httplib/LICENSE
 
+tests/data/chat/hyv3/chat_template.jinja is Tencent's Hy-Memory-30B-A3B chat template,
+copied unchanged from tencent/Hy-Memory-30B-A3B on Hugging Face.
+Copyright (C) 2026 Tencent. All rights reserved. Licensed under Apache-2.0 (LICENSE).
+Its source and content checksum are recorded in tests/data/chat/hyv3/README.md.
+
 core/server/systemone.cpp carries text from Liquid AI's d1 (prompt.py and api.py in the
 LiquidAI/d1-3B repository): the prompt it renders, its question blocks, the option codes and their
 fallback codebook and the answer spellings, unchanged, in code rewritten in C++. That text is Liquid
