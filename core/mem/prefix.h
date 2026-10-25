@@ -205,6 +205,11 @@ public:
     int64_t block_size() const { return block_size_; }
     int64_t checkpoint_interval() const { return interval_; }
     const std::vector<int32_t>& cached_groups() const { return groups_; }
+    /* Whether the host tier can hold this cache's entries. False when any cached group streams: a
+     * streamed group's rows are addressed by the block id the sequence used, so they cannot be
+     * copied into a slot and their ids cannot be given up. With it false the cache is a VRAM cache
+     * and evicts whole entries, exactly as with no host tier (docs/KV-STREAMING.md §4.1). */
+    bool demotable() const { return demotable_; }
     std::string report() const;
 
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
@@ -461,6 +466,12 @@ private:
     int64_t     block_size_ = 0;
     int64_t     interval_ = 0;
     std::vector<int32_t> groups_;         /* paged groups this cache indexes */
+    /* groups_ less the streamed ones, in the same order, and where each sits in groups_. A tier
+     * job's block ids and a host slot are in this order; an entry that is not demotable_ never
+     * reaches the tiers at all. */
+    std::vector<int32_t> tier_groups_;
+    std::vector<size_t>  tier_at_;
+    bool demotable_ = false;              /* the host tier can hold every group in an entry */
     bool        has_linear_ = false;
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;

@@ -1,6 +1,7 @@
 /* prefix.cpp -- see prefix.h. */
 #include "mem/prefix.h"
 
+#include "kvstream/plan.h"
 #include "mem/kvtier.h"
 
 #include <algorithm>
@@ -186,6 +187,25 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
                             p.name.c_str(), (long long)p.block_size, (long long)block_size_);
     }
 
+    /* An entry is only demotable when the host tier can hold every group in it. A streamed group
+     * cannot be gathered: its VRAM pool is one layer of its context, so a copy per layer would move
+     * the last staged layer N times, and its pinned host mirror is already its cold tier
+     * (docs/KV-STREAMING.md §4.1). Its rows are addressed by the block id the sequence used, so the
+     * entry cannot hand the mirror to a slot and drop its ids either: the ids are the bytes. Such an
+     * entry stays a VRAM entry and is evicted whole, exactly as with no host tier.
+     *
+     * The subset is also the block-id order of a tier job and of TierExec's slot, which is what
+     * rebind() takes; see "the host tier cannot hold a streamed group" in prefix.h. */
+    tier_groups_.clear();
+    tier_at_.clear();
+    for (size_t g = 0; g < groups_.size(); ++g) {
+        const KVGroupPlan* p = kv->plan(groups_[g]);
+        if (p && !kv_tier_cached(*p)) continue;
+        tier_at_.push_back(g);
+        tier_groups_.push_back(groups_[g]);
+    }
+    demotable_ = tier_at_.size() == groups_.size();
+
     interval_ = checkpoint_interval;
     /* A window snapshot is state too: a hit is reusable only at a checkpoint, whose slot carries
      * the window behind it (KVManager::has_window_snapshot). */
@@ -217,6 +237,12 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
                   (long long)kv->checkpoint_slots(), humanb(kv->checkpoint_bytes()).c_str(),
                   policy_->name());
     report_ += skipped;
+    if (!demotable_) {
+        /* A fact about the model, not about the tiers, so it is stated here whether or not a host
+         * tier is configured: with one, these entries are still never demoted. */
+        report_ += "  a streamed group is cached, so no entry can be demoted to the host tier: a "
+                   "streamed group's rows are its pinned mirror, addressed by block id\n";
+    }
     return RAD_OK;
 }
 
@@ -431,14 +457,16 @@ int PrefixCache::insert(uint64_t session,
      * The ids come from the map, not from `blocks`. For an entry that already existed the loop
      * above kept the cache's blocks, and `blocks` belongs to a sequence about to be freed; the
      * tiers would copy from blocks reassigned to another sequence. */
-    if (tiers_) {
+    if (tiers_ && demotable_) {
         for (int64_t b = 0; b < n_full; ++b) {
             auto it = map_.find(hs[(size_t)b]);
             if (it == map_.end()) continue;
             tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
         }
-        tiers_->note_session(session, hs, n_tokens, now, label);
     }
+    /* The session index names no blocks: it is what /v1/sessions release cuts, and it stays useful
+     * with or without a host copy. */
+    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label);
 
     take_over(session, hs, n_full * block_size_);
     return RAD_OK;
@@ -635,11 +663,13 @@ int64_t PrefixCache::trim_sparing(int64_t n_blocks,
             it = next;
             continue;
         }
-        if (keep && !tiers_->droppable(h)) { ++it; continue; }
+        /* Skip a copy still in flight, but never an entry this tier cannot hold: that one never
+         * gets a copy, so waiting for one would keep it out of reach of the trim forever. */
+        if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
         it = lru_.erase(it);
         e.in_lru = false;
         release_blocks(e);
-        if (keep) {
+        if (keep && demotable_) {
             tiers_->drop_commit(h);
             ++stats_.drops;
         } else {

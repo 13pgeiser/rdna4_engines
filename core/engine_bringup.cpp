@@ -1613,6 +1613,19 @@ int Engine::plan() {
                  * It prices the ring raised to a decode step's selection, before any weight is
                  * loaded. */
                 RAD_TRY(kvstream_cap_probe(probe, cfg_, r->program, ctx));
+                /* A streamed group's rows are addressed by block id, so the prefix cache cannot
+                 * demote an entry that contains one (PrefixCache::demotable): its mirror is the only
+                 * cold copy that group has. The host tier would only be pinned and never used, so it
+                 * is turned off here -- once, before the tables and the checkpoint store are sized,
+                 * so its memory is not reserved either. Only when streaming is really on: the flag
+                 * asks, the architecture serves it and the ring is under the context (kv_streams).
+                 */
+                if (const int64_t off = kvstream_prefix_host_off(cfg_)) {
+                    RAD_INFO("a streamed KV group has no host cache: --prefix-cache-mib %lld would "
+                             "hold nothing (its entries could never be demoted), so it is off; the "
+                             "%lld MiB go to the host pool and the page cache instead",
+                             (long long)off, (long long)off);
+                }
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
                 /* One --max-model-len sequence's pool, as the inverse of the real plan: its
