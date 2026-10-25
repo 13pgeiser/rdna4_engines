@@ -88,7 +88,7 @@ struct Fixture {
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
-               int64_t max_ctx = 4096, bool windowed = false) {
+               int64_t max_ctx = 4096, bool windowed = false, bool linear = true) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -109,17 +109,21 @@ struct Fixture {
         attn.block_size = 16;
         prog.kv_groups.push_back(attn);
 
-        KVGroupInfo lin;
-        lin.name = "gdn";
-        lin.decl.kind = RAD_KV_LINEAR;
-        lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
-        prog.kv_groups.push_back(lin);
+        /* `linear` false: a full-attention trunk, as Gemma 4's (with `windowed`, its sliding
+         * layers), and no GDN op or state buffers below. */
+        if (linear) {
+            KVGroupInfo lin;
+            lin.name = "gdn";
+            lin.decl.kind = RAD_KV_LINEAR;
+            lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
+            prog.kv_groups.push_back(lin);
 
-        KVGroupInfo conv;
-        conv.name = "conv";
-        conv.decl.kind = RAD_KV_CONV;
-        conv.decl.conv_width = 4;
-        prog.kv_groups.push_back(conv);
+            KVGroupInfo conv;
+            conv.name = "conv";
+            conv.decl.kind = RAD_KV_CONV;
+            conv.decl.conv_width = 4;
+            prog.kv_groups.push_back(conv);
+        }
 
         /* A windowed paged group, as sliding-window checkpoints pair with a full group. Not
          * prefix-cached: prefix.cpp indexes only groups whose blocks below the window stay put.
@@ -138,22 +142,24 @@ struct Fixture {
                                         * stays unbound, and unbound is not trunk-owned */
         }
 
-        OpInfo op;
-        op.op = "gdn_chunk_scan";
-        op.schema = &g_gdn_schema;
-        Band b;
-        b.hi = 4096;
-        b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
-        /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's spelling,
-         * the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's constraint
-         * contribute. */
-        b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
-        op.bands.push_back(b);
-        prog.ops.push_back(op);
+        if (linear) {
+            OpInfo op;
+            op.op = "gdn_chunk_scan";
+            op.schema = &g_gdn_schema;
+            Band b;
+            b.hi = 4096;
+            b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
+            /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's
+             * spelling, the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's
+             * constraint contribute. */
+            b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
+            op.bands.push_back(b);
+            prog.ops.push_back(op);
 
-        add_derived("seq_start", "seq_start_index", 257);
-        add_derived("chunk_bounds", "state_chunk_bounds", 4097);
-        add_derived("conv_idx", "conv_state_index", 256);
+            add_derived("seq_start", "seq_start_index", 257);
+            add_derived("chunk_bounds", "state_chunk_bounds", 4097);
+            add_derived("conv_idx", "conv_state_index", 256);
+        }
 
         cfg.max_tok = max_tok;
         cfg.max_seqs = 32;
@@ -1573,6 +1579,49 @@ TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
     CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
     CHECK_EQ(r.rows, 0);
+}
+
+/* z-lab's DFlash on the Gemma 4 31B: a full-attention block drafter (no window), whose own group the
+ * prefix cache indexes like the trunk's full layers. A hit resumes the trunk's window from the
+ * window snapshot, so no paged group is left with a hole and the drafter drafts from the first
+ * decode. Counting the trunk's window as a hole, as before the snapshot was counted, put the
+ * drafter's floor at the hit, and a drafter with no window to slide never drafted again that turn. */
+TEST(a_full_attention_drafter_drafts_at_once_after_a_hit_the_window_snapshot_resumes) {
+    for (int counted = 0; counted < 2; ++counted) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192,
+                /*windowed=*/true, /*linear=*/false);
+        f.cfg.n_spec = 7;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.window = 0;
+        KVGroupInfo d;
+        d.name = "draft";
+        d.decl.kind = RAD_KV_FULL;
+        d.block_size = 16;
+        f.prog.kv_groups.push_back(d);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        const int32_t swa = 1, draft = 2;
+        f.kv.snap = { swa };
+        f.kv.snap_reported = counted != 0;
+        f.pc.groups = { 0, draft };
+        f.pc.ckpt_lo = 2048;
+        CHECK_OK(f.start());
+        CHECK(f.sch.geometry().window_ckpt);
+        f.pc.seed(2048); f.pc.lin = 2048; f.pc.src = 3;
+        const uint64_t a = f.submit(2200, 64);
+        Scheduler::BlockRow rows[4];
+        int n_rows = -1;
+        for (int st = 0; st < 40; ++st) {
+            CHECK(f.sch.step() != nullptr);
+            if (st == 0) CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)2048);
+            f.commit_plain(11);
+            const int n = f.sch.block_begin(8, 7, 0, 99, rows, 4);
+            f.sch.block_end();
+            if (!f.sch.find(a)->output.empty()) { n_rows = n; break; }
+        }
+        CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
+        CHECK_EQ(n_rows, counted ? 1 : 0);
+    }
 }
 
 TEST(no_prefix_hit_gives_nothing_back) {

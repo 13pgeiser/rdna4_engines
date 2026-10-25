@@ -339,6 +339,17 @@ struct FakeKV : IKVManager {
         const KVGeom::G& gg = geom.g[(size_t)g];
         return gg.paged ? gg.block_size : 0;
     }
+    /* Groups a test says the window snapshot carries (KVGroupPlan::win_snap): a checkpoint slot
+     * then holds their window, and a hit at a snapshot seeds them (nothing to copy here). */
+    std::vector<int32_t> snap;
+    /* False: the snapshot is taken but its groups are not reported, as before
+     * IKVManager::window_snapshot existed. */
+    bool snap_reported = true;
+    bool window_snapshot(int32_t g) const override {
+        return snap_reported && std::find(snap.begin(), snap.end(), g) != snap.end();
+    }
+    bool has_window_snapshot() const override { return !snap.empty(); }
+    int  seed_window(uint64_t, int64_t) override { return snap.empty() ? -1 : 0; }
 };
 
 struct FakePC : IPrefixCache {

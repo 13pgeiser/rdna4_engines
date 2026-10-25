@@ -471,11 +471,13 @@ private:
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group
-     * is not prefix-cached. prefix.cpp skips windowed groups, so a windowed drafter has K and V
-     * only from the hit position and must wait for its window to slide past it. A full-attention
-     * drafter's group is cached like the trunk's and its floor is 0; treating it as windowed
-     * would stop drafting for good, since it has no window to slide. Read off
-     * IPrefixCache::cached_groups() so prefix.cpp's rule lives in one place. */
+     * is neither prefix-cached nor restored from the window snapshot. prefix.cpp skips windowed
+     * groups, so a windowed drafter the snapshot does not carry has K and V only from the hit
+     * position and must wait for its window to slide past it. A full-attention drafter's group is
+     * cached like the trunk's and its floor is 0; treating it as windowed would stop drafting for
+     * good, since it has no window to slide. Read off IPrefixCache::cached_groups() and
+     * IKVManager::window_snapshot() so prefix.cpp's and the KV manager's rules live in one
+     * place. */
     bool          hit_holes_draft_ = true;
     /* Does a hit leave a hole in the trunk: a paged group with a trunk layer (bound below
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?

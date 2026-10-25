@@ -84,19 +84,28 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "the prefix cache, checkpoints and speculation",
                  rswa_windows_.size(), (long long)rswa_windows_[0].tokens);
 
-    /* A hit can leave a drafter's own cache short only where a paged group is not prefix-cached
-     * (scheduler.h, hit_holes_draft_). With the cache off cached_groups() is empty and this is
-     * true, which costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
+    /* A hit can leave a drafter's own cache short only where a paged group is neither
+     * prefix-cached nor carried by the window snapshot a hit resumes from (scheduler.h,
+     * hit_holes_draft_). With the cache off cached_groups() is empty and this is true, which
+     * costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
     {
         /* Paged as the cache counts it (KVGroupPlan::paged(), via block_tokens()), not kvgeom_'s
          * `paged` flag, which is also true for an empty placeholder group and would pin this
          * predicate true. */
-        size_t n_paged = 0;
-        for (size_t i = 0; i < kvgeom_.g.size(); ++i)
-            if (kv->block_tokens((int32_t)i) > 0) ++n_paged;
-        hit_holes_draft_ = pc->cached_groups().size() < n_paged;
-        RAD_INFO("draft floor: %zu paged group(s), %zu prefix-cached -> a hit %s",
-                 n_paged, pc->cached_groups().size(),
+        size_t n_paged = 0, n_snap = 0;
+        for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
+            if (kv->block_tokens((int32_t)i) <= 0) continue;
+            ++n_paged;
+            const auto& cg = pc->cached_groups();
+            /* Snapshots are taken only where the trunk has a window to snapshot too
+             * (ChunkGeometry::window_ckpt); without them no drafter window rides in one. */
+            if (cfg.prefix_cache && geo_.window_ckpt && kv->window_snapshot((int32_t)i) &&
+                std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end())
+                ++n_snap;
+        }
+        hit_holes_draft_ = pc->cached_groups().size() + n_snap < n_paged;
+        RAD_INFO("draft floor: %zu paged group(s), %zu prefix-cached, %zu in the window snapshot "
+                 "-> a hit %s", n_paged, pc->cached_groups().size(), n_snap,
                  hit_holes_draft_ ? "leaves a hole in a drafter's own KV" : "leaves no hole");
     }
     /* The trunk's share: a paged group a trunk layer reads (a bound layer below the trunk's layer
