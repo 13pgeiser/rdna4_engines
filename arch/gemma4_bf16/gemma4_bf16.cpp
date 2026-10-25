@@ -1,4 +1,5 @@
-/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h).
+/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h) and,
+ * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h).
  *
  * Two attention classes over one residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
@@ -15,6 +16,7 @@
  * RedHatAI's gemma-4-31B-it-speculator.dflash2 (arch/common/rad_block_dflash2.h; 7 a pass).
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_audio.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -1765,9 +1767,11 @@ struct Model {
     Gemma4Head head{};
     bool       have_head = false;
 
-    /* The vision tower (rad_block_gemma4_vision.h), declared when the container carries one and
-     * the deployment serves media; `op_mm` writes its rows over the placeholders' embeddings. */
+    /* The vision tower and the audio encoder, each declared when the container carries it and
+     * the deployment serves that medium; `op_mm` writes their rows over the placeholders'
+     * embeddings. */
     Gemma4Vision vis{};
+    Gemma4Audio  aud{};
     rad_op       op_mm = 0;
 
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
@@ -2221,11 +2225,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
-    /* An image's rows overwrite its placeholders' embeddings after the lookup and before its
-     * all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other rank zeros). The
-     * reference scales token embeddings by sqrt(n_embd) and scatters the image features in
-     * unscaled. */
-    if (Gemma4Vision::present(meta) && ctx->max_enc_patches > 0)
+    /* Media rows (an image's or an audio clip's) overwrite their placeholders' embeddings after
+     * the lookup and before its all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other
+     * rank zeros). The reference scales token embeddings by sqrt(n_embd) and scatters the media
+     * features in unscaled. */
+    if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
+        (Gemma4Audio::present(meta) && ctx->max_audio_frames > 0))
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                           RAD_STR("dtype", "bf16")),
@@ -2607,7 +2612,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the vision tower, its weight groups past the trunk's and the draft model's: the
      * assistant's layers and its exit, or the DFlash drafter's layers. They are counted even when
-     * the draft model is not declared, so the groups do not move with max_spec. */
+     * the draft model is not declared, so the groups do not move with max_spec. The audio
+     * encoder's groups follow the tower's. */
     {
         int64_t head_groups = 0;
         if (has_assistant(meta))
@@ -2621,6 +2627,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
                                    "model.", "gemma4_bf16"));
+        RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, g.n_embd,
+                                   (int)(m.n_main + head_groups) + (int)m.vis.L.size(), "model.",
+                                   "gemma4_bf16"));
     }
 
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
@@ -2846,9 +2855,10 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
-    /* An encoder pass runs only the tower. */
+    /* An encoder pass runs only its encoder. */
     if (batch->enc) {
-        m.vis.step(c, batch);
+        if (batch->enc == RAD_MM_AUDIO) m.aud.step(c, batch);
+        else                            m.vis.step(c, batch);
         return;
     }
     /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
@@ -2988,12 +2998,13 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
         if (k > 0) out->enc_merge = k * k;
     }
+    if (Gemma4Audio::present(meta)) out->audio_frames = Gemma4Audio::frames_for(meta);
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "Gemma 4 dense (text, images and E2B/E4B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
                 "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")

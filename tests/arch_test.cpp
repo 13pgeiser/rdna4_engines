@@ -8683,6 +8683,57 @@ TEST(embgemma2_text_and_media_passes_lint_clean_and_feed_gemms_whole_rows) {
     }
 }
 
+/* Gemma 4 E4B with its audio encoder: the conformer EmbeddingGemma 2 declares
+ * (rad_block_gemma4_audio.h), read under the conditional-generation checkpoint's `model.` prefix,
+ * its mel bins from processor_config.json's feature_extractor. Its rows go through the same media
+ * scatter as an image's, the pass lints clean, and the probe states 30 s of frames. */
+TEST(gemma4_e4b_declares_its_audio_encoder) {
+    std::vector<const char*> keys(std::begin(k_gem4e_keys), std::end(k_gem4e_keys));
+    std::vector<const char*> vals(std::begin(k_gem4e_vals), std::end(k_gem4e_vals));
+    const char* ak[] = { "audio_config.model_type", "audio_config.hidden_size",
+                         "audio_config.num_attention_heads", "audio_config.output_proj_dims",
+                         "audio_config.attention_chunk_size", "audio_config.attention_context_left",
+                         "audio_config.attention_context_right", "audio_config.attention_logit_cap",
+                         "audio_config.num_hidden_layers", "audio_config.conv_kernel_size",
+                         "audio_config.residual_weight", "audio_config.hidden_act",
+                         "audio_config.subsampling_conv_channels",
+                         "processor.feature_extractor.feature_size" };
+    const char* av[] = { "gemma4_audio", "1024", "8", "1536", "12", "13", "0", "50", "2", "5", "0.5",
+                         "silu", "128 32", "128" };
+    keys.insert(keys.end(), std::begin(ak), std::end(ak));
+    vals.insert(vals.end(), std::begin(av), std::end(av));
+    RadModelMeta meta = gemma4_e4b_meta();
+    meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_audio_frames = 400;
+    REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK_EQ(b.audio_encoder_name, std::string("audio"));
+    CHECK_EQ(b.audio_encoder.max_patches, 400);
+    CHECK_EQ(b.audio_encoder.merge, 4);
+    CHECK_EQ(b.audio_encoder.n_embd, meta.n_embd);
+    const RecMap* emb = find_map(b, "a.embed");
+    REQUIRE(emb != nullptr);
+    CHECK(emb->src == std::vector<std::string>{ "model.embed_audio.embedding_projection.weight" });
+    const RecMap* c0 = find_map(b, "a.sscp.c0");
+    REQUIRE(c0 != nullptr);
+    CHECK(c0->src == std::vector<std::string>{
+                         "model.audio_tower.subsample_conv_projection.layer0.conv.weight" });
+    /* the media scatter, and the per-layer inputs' pad rows over the same positions */
+    CHECK_EQ(count_op(b, "scatter_rows"), 2);
+
+    const auto aud = enc_pass(RAD_MM_AUDIO, 400, 128);
+    RadCtx c{ .b = &b, .batch = &aud->b };
+    gemma4_bf16::step(&c, &aud->b);
+    CHECK(c.step_fail.empty());
+    CHECK(!c.issues.empty());
+    CHECK_LINT(b, &c);
+
+    RadArchProbe pr{};
+    REQUIRE_EQ(gemma4_bf16::probe(&meta, &pr), RAD_OK);
+    CHECK_EQ(pr.audio_frames, 3000);
+}
+
 /* ==================================================================== qwenimage21 */
 
 namespace {
