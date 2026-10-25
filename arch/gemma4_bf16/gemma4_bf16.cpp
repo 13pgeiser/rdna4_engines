@@ -2180,9 +2180,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
-    /* An image's rows overwrite its placeholders' embeddings after the (all-reduced) lookup and
-     * before the first block: the reference scales token embeddings by sqrt(n_embd) and scatters
-     * the image features in unscaled. */
+    /* An image's rows overwrite its placeholders' embeddings after the lookup and before its
+     * all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other rank zeros). The
+     * reference scales token embeddings by sqrt(n_embd) and scatters the image features in
+     * unscaled. */
     if (Gemma4Vision::present(meta) && ctx->max_enc_patches > 0)
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -2833,13 +2834,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
-    if (m.op_embed_ar)
-        RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
-                    brows(m.b_x, batch->n_tok), RAD_NONE);
+    /* Before the all-reduce: after it, every rank past 0 would write zeros over its image rows. */
     if (m.op_mm && batch->n_mm_rows > 0)
         RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
                     praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, m.g.n_embd),
                     praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
+    if (m.op_embed_ar)
+        RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
+                    brows(m.b_x, batch->n_tok), RAD_NONE);
 
     const int64_t T = batch->n_tok;
     if (m.n_ple > 0) {

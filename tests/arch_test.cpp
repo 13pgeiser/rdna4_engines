@@ -3791,6 +3791,47 @@ TEST(gemma4_declares_two_kv_groups_and_binds_the_schedule) {
     }
 }
 
+/* A step with an image: the rows go into the token lookup before its all-reduce, since
+ * RadBatch::mm_embd holds them at rank 0 and zeros at every other rank. */
+TEST(gemma4_scatters_image_rows_into_the_lookup_before_its_all_reduce) {
+    std::vector<const char*> keys(std::begin(k_gem4_keys), std::end(k_gem4_keys));
+    std::vector<const char*> vals(std::begin(k_gem4_vals), std::end(k_gem4_vals));
+    const char* vk[] = { "vision_config.model_type", "vision_config.hidden_size",
+                         "vision_config.num_attention_heads", "vision_config.head_dim",
+                         "vision_config.intermediate_size", "vision_config.pooling_kernel_size",
+                         "vision_config.position_embedding_size", "vision_config.num_hidden_layers",
+                         "vision_config.patch_size", "vision_config.rope_parameters.rope_theta",
+                         "vision_config.rope_parameters.rope_type", "vision_config.hidden_activation" };
+    const char* vv[] = { "gemma4_vision", "768", "12", "64", "3072", "3", "10240", "2", "16", "100",
+                         "default", "gelu_pytorch_tanh" };
+    keys.insert(keys.end(), std::begin(vk), std::end(vk));
+    vals.insert(vals.end(), std::begin(vv), std::end(vv));
+    static const int32_t rows[] = { 4, 5, 6, 7, 8, 9, 10, 11 };
+    static uint16_t embd[8 * 5376];
+    for (int world : { 1, 2 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadModelMeta meta = gemma4_meta();
+            meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_enc_patches = 9 * 64;
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            RadBatch batch = prefill_batch();
+            batch.n_mm_rows = 8; batch.mm_rows = rows; batch.mm_embd = embd;
+            RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK_LINT(b, &c);
+            CHECK(c.step_fail.empty());
+            const std::vector<std::string> ops = issued_ops(b, c);
+            REQUIRE(ops.size() > 3);
+            CHECK_EQ(ops[0], std::string("embed_lookup"));
+            CHECK_EQ(ops[1], std::string("scatter_rows"));
+            CHECK(c.issues[1].opd[0].raw == embd);
+            if (world == 2) CHECK_EQ(ops[2], std::string("all_reduce"));
+        }
+    }
+}
+
 /* The E2B/E4B form on the same twelve layers: the last four share KV (no cache of their own),
  * per-layer embeddings 64 wide, a global class with its own v (attention_k_eq_v 0) and no
  * num_global_key_value_heads, so the global layers take num_key_value_heads. */
