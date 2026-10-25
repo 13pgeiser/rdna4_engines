@@ -1,0 +1,42 @@
+# q38-27b-m2xfp4-df2.recipe -- a bf16 Qwen3.8-27B (or a finetune of it) at M2XFP4 with the DFlash2
+# drafter.
+#
+#   rad-convert <bf16 Qwen3.8-27B checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-m2xfp4-df2.recipe \
+#       --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+#       -o q38-27b-m2xfp4-df2.rad
+#
+# The --set keys give the container the family's fp8 descriptor, so qwen35_fp8 serves it as it
+# serves the Quark, ParoQuant and NVFP4 releases; without them a bf16 checkpoint selects
+# qwen35_bf16, which has no 4-bit GEMM.
+#
+# q38-27b-mxfp4-df2.recipe with its 4-bit rules at M2XFP4 (`m2xfp4`, docs/TOOLS.md): the MXFP4
+# codes and e8m0 exponent per 32 of K plus one metadata byte a group, whose four 2-bit extra
+# mantissas refine the exponent per 8 columns, chosen by least squared error from the bf16 source,
+# once. The delta net's a/b projections, the norms, the embedding and the vision tower stay bf16;
+# the head goes block fp8 as in the other 27B recipes. The checkpoint's MTP head is not read: the
+# DFlash2 drafter displaces it.
+#
+# The drafter's linears go to M2XFP4 as well, beside the same 2-bit copy of the target's head (u2
+# with a u8 zero, least-squares clip search) whose top 32 the engine rescores against the target's
+# fp8 head.
+
+blk.*.ffn_gate_up.weight                 m2xfp4
+blk.*.ffn_down.weight                    m2xfp4
+blk.*.attn_qg.weight                     m2xfp4
+blk.*.attn_k.weight                      m2xfp4
+blk.*.attn_v.weight                      m2xfp4
+blk.*.attn_output.weight                 m2xfp4
+blk.*.ssm_inz.weight                     m2xfp4
+blk.*.ssm_out.weight                     m2xfp4
+
+output.weight                            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight                 rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                         m2xfp4
+dflash.blk.*.attn_q.weight               m2xfp4
+dflash.blk.*.attn_k.weight               m2xfp4
+dflash.blk.*.attn_v.weight               m2xfp4
+dflash.blk.*.attn_output.weight          m2xfp4
+dflash.blk.*.ffn_gate_up.weight          m2xfp4
+dflash.blk.*.ffn_down.weight             m2xfp4

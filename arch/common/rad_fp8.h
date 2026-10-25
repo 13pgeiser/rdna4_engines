@@ -1641,6 +1641,11 @@ struct DenseFP8 {
      * works against the same E4M3 activation pair. */
     rad_weight ref = 0;
     bool       mx = false;
+    /* Or M2XFP4 (libquant `m2xfp4`): the MXFP4 weight plus one metadata byte a group, read by
+     * `gemm_nt_q` at dtype m2xfp4 with the same views and the same `b_ref`. The meta plane rides
+     * the weight operand's stored blob (libr4d's m2xfp4 layout), so the declared weight takes the
+     * codes and meta planes together. */
+    bool       m2x = false;
 
     /* `mapped`: the caller made the name map already, to ask the encoding before choosing this
      * struct over another grid's -- a COPY map declared twice is refused (rad_builder.cpp). */
@@ -1659,6 +1664,7 @@ struct DenseFP8 {
         if (lo < 0 || hi <= lo || lo % RAD_FP8_BLOCK || hi % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK)
             return RAD_E_INVAL;
         mx  = false;
+        m2x = false;
         ref = 0;
         const char* wn = nm.f("%s.weight", base);
         const char* sn = nm.f("%s.scale", base);
@@ -1671,11 +1677,18 @@ struct DenseFP8 {
         RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
         return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
     }
-    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi.
-     * `split_n`, when set, is the stored width a row slice takes its K split from (docs/OPS.md). */
+    /* `gemm_nt_q` over this weight, `fp8a8`, `mxfp4a8` or `m2xfp4` as it was declared, ranged
+     * M 1..hi. `split_n`, when set, is the stored width a row slice takes its K split from
+     * (docs/OPS.md). */
     rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
                 std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes,
                 int64_t split_n = 0) const {
+        if (m2x)
+            return rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "m2xfp4")),
+                          RAD_WEIGHTS(w, s, ref)),
+                      reads, writes);
         if (mx)
             return rw(b, RAD_OP(b, "gemm_nt_q",
                           RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
@@ -1695,8 +1708,9 @@ struct DenseFP8 {
                       RAD_WEIGHTS(w, s)),
                   reads, writes);
     }
-    /* The op's trailing `b_ref` operand: the reference view for MXFP4, absent for fp8. */
-    RadOperand bref() const { return mx ? RAD_W(ref) : RAD_NONE; }
+    /* The op's trailing `b_ref` operand: the reference view for MXFP4 and M2XFP4, absent for
+     * fp8. */
+    RadOperand bref() const { return mx || m2x ? RAD_W(ref) : RAD_NONE; }
 };
 
 inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
@@ -1712,6 +1726,7 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
         if (!mapped) RAD_ARCH_TRY(map_linear(b, wn, src));
         RadEncoding enc{};
         mx = weight_enc(b, wn, &enc) && linear_is_mxfp4(enc);
+        m2x = !mx && linear_is_m2xfp4(enc);     /* enc stays zero when there is no encoding */
         if (mx) {
             if (N % 16 || K % RAD_FP8_BLOCK) {
                 fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an MXFP4 weight takes rows "
@@ -1722,6 +1737,25 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
             RowParts rp;
             RAD_ARCH_TRY(rp.set(row_parts, 16, 1, base, "MXFP4 tiles"));
             w   = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, access, shard, grp,
+                            rp.w, rp.n);
+            s   = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                            access, shard, grp, rp.w, rp.n);
+            ref = decl_view(b, nm.f("%s.ref", base), wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                            access, shard, grp, rp.w, rp.n);
+            return w && s && ref ? RAD_OK : RAD_E_INVAL;
+        }
+        /* ---- M2XFP4: the MXFP4 views with the metadata plane riding the weight operand, the
+         * same bounds. */
+        if (m2x) {
+            if (N % 16 || K % RAD_FP8_BLOCK) {
+                fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an M2XFP4 weight takes rows "
+                                "in 16s and K in whole %d-column activation scale blocks\n",
+                        base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+                return RAD_E_INVAL;
+            }
+            RowParts rp;
+            RAD_ARCH_TRY(rp.set(row_parts, 16, 1, base, "M2XFP4 tiles"));
+            w   = decl_view(b, wn, nullptr, "codes,meta", RAD_FP4E2M1, { N, K }, access, shard, grp,
                             rp.w, rp.n);
             s   = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
                             access, shard, grp, rp.w, rp.n);

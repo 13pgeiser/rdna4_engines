@@ -673,8 +673,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                         {w.h}, {w.coef});
         op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.h2q, w.h2s}, {w.gate_up});
         /* The fold saves two launches and the bf16 round trip of the [T, n_ff] product; it is an
-         * fp8a8 tile, so an MXFP4 gate_up takes the pair. */
-        if (!w_gu[i].mx)
+         * fp8a8 tile, so an MXFP4 or M2XFP4 gate_up takes the pair. */
+        if (!w_gu[i].mx && !w_gu[i].m2x)
             op_gug[i] = decl_gated_fold(b, qrows, 2 * g.n_ff, g.n_embd, w_gu[i].w, w_gu[i].s,
                                         {w.h2q, w.h2s}, {w.ffq, w.ffs}, &gated_rows);
         op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffq, w.ffs}, {w.h});
