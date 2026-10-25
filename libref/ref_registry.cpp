@@ -2061,6 +2061,24 @@ static int ref_check_gemm_q(const char* op, const RadArgs* a) {
       },                                                                                         \
       nullptr, lay, ref::ref_relayout_planes<lay>, fn##_shape, ref::ref_unrelayout_planes<lay> }
 
+/* gemm_nt_q's row: the hooks above with dtype m2xfp4 answered first (ref_m2xfp4.cpp). */
+int ref_gemm_nt_q_m2(const RadArgs*, RadStream);
+REF_SHAPE_FN(ref_gemm_nt_q_m2);
+int ref_layout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, const int*,
+                         const RadTensor*, int, RadLayout*);
+int ref_relayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, const int*,
+                           const RadTensor*, int, void*, int64_t);
+int ref_unrelayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, const int*,
+                             const void*, int64_t, const RadTensor*, int);
+#define ROWL_GQ(nm, opname, fam, what, dts, check, fn, lay, rel, unrel)                           \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                 \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr,                                         \
+      [](const RadArgs* a, RadStream s) -> int {                                                 \
+          const int rc = check(opname, a);                                                       \
+          return rc < 0 ? rc : fn(a, s);                                                         \
+      },                                                                                         \
+      nullptr, lay, rel, fn##_shape, unrel }
+
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
 #define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
@@ -2236,10 +2254,11 @@ SIMPLE("ref_dequant", "dequant", "quant", "group-scaled dequantisation", DT_ANY,
 SIMPLE("ref_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate", DT_FLOAT, ref_gemm_nt),
 SIMPLE("ref_gemm_nt_bias", "gemm_nt_bias", "gemm", "C = A B^T + bias", DT_FLOAT,
        ref_gemm_nt_bias),
-ROWL("ref_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
-     "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; u2 / u4 / u5 codes with an f16 scale "
-     "and integer zero per group, joined; f32 accumulate",
-     ref_check_gemm_q, ref_gemm_nt_q, ref::ref_layout_gemm_q),
+ROWL_GQ("ref_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
+     "i8 / fp8 / float A; w4, w2, mxfp4, m2xfp4, i8 or float B; u2 / u4 / u5 codes with an f16 "
+     "scale and integer zero per group, joined; f32 accumulate",
+     ref_check_gemm_q, ref_gemm_nt_q_m2, ref_layout_gemm_q_m2, ref_relayout_gemm_q_m2,
+     ref_unrelayout_gemm_q_m2),
 SIMPLE("ref_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", ref_gemm_nt_q_bias),
 SIMPLE("ref_lora_shrink", "lora_shrink", "gemm", "t = x A[slot]^T per row, base rows untouched",

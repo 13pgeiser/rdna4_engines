@@ -41,8 +41,9 @@ here is such a choice.
 - Where an op takes `dtype`, it is a string naming the operand combination, so a weight format and
   an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`, `u8`, `fp8_e4m3`,
   `fp8a8`, `fp8a8f32`, `fp8a16`, `i8a8`, `i8a8h`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`,
-  `w4a16`, `w8a16`, `w2a8`, `mxfp4a8`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`, and the
-  codebook expert forms `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` (`docs/MOE-W4.md`).
+  `w4a16`, `w8a16`, `w2a8`, `mxfp4a8`, `m2xfp4`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`,
+  and the codebook expert forms `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`
+  (`docs/MOE-W4.md`).
   - `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the stored weight
     (`docs/MOE-W4.md`).
   - `i8a8` is an i8 weight with a bf16 scale per (row, 128 of K) against an int8 activation on
@@ -719,6 +720,13 @@ contributing nothing (libr4d's MXFP4 GEMMs carry their accumulators in the last 
 At `i8a8` they are `quant_act_i8g`'s row-major codes and per-(row, 128 of K) scales against an int8
 weight with a bf16 scale per (row, 128 of K); at `mxfp4a8`, `quant_act_fp8`'s pair against e2m1
 codes with an E8M0 exponent per (row, 32 of K).
+
+At `m2xfp4` -- the `m2xfp4` quantiser's own scheme, not an affine grid -- `b` is that scheme's
+codes and meta planes concatenated as stored (the codes rows, then the meta rows; the form the
+core's selection reader hands out, core/format/encoding.cpp) and `b_scale` the E8M0 plane as at
+`mxfp4a8`. The exact element is `e2m1(code) . 2^(e-127) . (1 + k_s/4)`, `k_s` the meta byte's
+two-bit field over subgroups of eight columns (libquant's `lq_m2xfp.cpp`). `b_ref` is the same
+reference exponent plane as at `mxfp4a8`.
 
 `a_sum` removes an asymmetric grid's zero point and `b_ref` is the per-row reference exponent an
 MXFP4 kernel folds its block exponents against. `b_ref` is derived from `b_scale` and does not

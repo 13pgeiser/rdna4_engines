@@ -10,12 +10,15 @@
  * scheme refines: the search's candidate set contains that quantiser's choice for every group,
  * so it can only tie or win, and the wins are where the format earns its half bit. The wide case
  * holds the same property one bias wider: wide=1 sweeps b in {-2, ..., 2} and can only tie or
- * beat adaptive, its planes decoding bit for bit as the equation does.
+ * beat adaptive, its planes decoding bit for bit as the equation does. The last case hands the
+ * planes to libref's gemm_nt_q row at m2xfp4 (ref_m2xfp4.cpp) and holds its product to the same
+ * hand decode.
  */
 #include "quant_fixture.h"
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -331,6 +334,94 @@ TEST(m2xfp4_wide_bias_sweep_contains_the_narrow_one_and_round_trips_bit_exact) {
     REQUIRE_EQ(off.status, RAD_OK);
     REQUIRE_EQ(both.status, RAD_OK);
     CHECK(same_planes(off, both));
+}
+
+/* libref's gemm_nt_q row at m2xfp4 over the quantiser's own planes: its layout hook takes codes and
+ * meta for the weight and the exponent plane as stored, its relayout concatenates the two, and
+ * the product is the hand decode's against an exact e4m3 activation and its per-128 scales,
+ * summed in double. N = 40 and M = 13 are not multiples of anything; K = 384 is three activation
+ * scale blocks. */
+TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
+    NEED_LIBQUANT();
+    const std::string lib = home() + "/kernels/libref.so";
+    void* so = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!so) ARTIFACT_MISSING(lib + " (does not load: " + dlerror() + ")");
+    const auto count = (int (*)(void))dlsym(so, "rad_kernel_count");
+    const auto at = (const RadKernelInfo* (*)(int))dlsym(so, "rad_kernel_at");
+    REQUIRE(count && at);
+    const RadKernelInfo* k = nullptr;
+    for (int i = 0; i < count(); ++i)
+        if (std::strcmp(at(i)->name, "ref_gemm_nt_q") == 0) k = at(i);
+    REQUIRE(k && k->layout && k->relayout && k->launch);
+
+    const int64_t M = 13, N = 40, K = 384, kb = K / 32, akb = K / 128;
+    const RadQuantizerInfo* q = quantizer("m2xfp4");
+    REQUIRE(q);
+    Opts o;
+    m2xfp_opts(o, 1);
+    Quantised w = quantise(q, o, kName, N, K, draw(N * K, 61, 8.0f));
+    REQUIRE_EQ(w.status, RAD_OK);
+    const std::vector<float> wd = ref_decode(w, N, K);
+
+    auto tensor = [](void* d, uint32_t dt, std::initializer_list<int64_t> s) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        for (int64_t e : s) t.shape[t.rank++] = e;
+        int64_t st = 1;
+        for (int i = (int)t.rank - 1; i >= 0; --i) {
+            t.stride[i] = st;
+            st *= t.shape[i];
+        }
+        return t;
+    };
+    Opts g;
+    g.i("M", M).i("N", N).i("K", K).i("group", 32).s("dtype", "m2xfp4");
+    const RadTensor pl[2] = { tensor(w.planes[0].data(), RAD_FP4E2M1, { N, K }),
+                              tensor(w.planes[2].data(), RAD_U8, { N, kb }) };
+    const RadTensor sp = tensor(w.planes[1].data(), RAD_E8M0, { N, kb });
+    const int sel[2] = { 0, 2 }, ssel[1] = { 1 };
+    RadLayout lay{};
+    CHECK_EQ(k->layout(g.data(), g.n(), 3, &w.enc, ssel, &sp, 1, &lay), (int)RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(k->layout(g.data(), g.n(), 2, &w.enc, sel, pl, 2, &lay), (int)RAD_OK);
+    REQUIRE_EQ(lay.bytes, N * (K / 2 + kb));
+    std::vector<uint8_t> b((size_t)lay.bytes);
+    REQUIRE_EQ(k->relayout(g.data(), g.n(), 2, &w.enc, sel, pl, 2, b.data(), lay.bytes),
+               (int)RAD_OK);
+
+    /* integer codes in [-13, 13], which e4m3 holds exactly */
+    std::vector<uint8_t> a((size_t)(M * K));
+    std::vector<float> as((size_t)(M * akb)), y((size_t)(M * N), NAN);
+    for (int64_t i = 0; i < M * K; ++i)
+        rad_store_f32(a.data(), RAD_F8E4M3, i, (float)((i * 7) % 27 - 13));
+    for (int64_t i = 0; i < M * akb; ++i) as[(size_t)i] = 0.003f * (float)(1 + i % 5);
+    RadTensor t[7] = { tensor(a.data(), RAD_F8E4M3, { M, K }),
+                       tensor(as.data(), RAD_F32, { M, akb }),
+                       tensor(b.data(), RAD_U8, { lay.bytes }),
+                       sp,
+                       tensor(y.data(), RAD_F32, { M, N }),
+                       RadTensor{},
+                       sp };
+    RadArgs args{};
+    args.t = t;
+    args.n_t = 7;
+    args.p = g.data();
+    args.n_p = g.n();
+    REQUIRE_EQ(k->launch(&args, nullptr), (int)RAD_OK);
+
+    double err = 0, mag = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            double r = 0;
+            for (int64_t c = 0; c < K; ++c)
+                r += (double)rad_load_f32(a.data(), RAD_F8E4M3, m * K + c) *
+                     (double)as[(size_t)(m * akb + c / 128)] * (double)wd[(size_t)(n * K + c)];
+            err = std::max(err, std::fabs((double)y[(size_t)(m * N + n)] - r));
+            mag = std::max(mag, std::fabs(r));
+        }
+    CHECK(mag > 0);
+    CHECK(err <= 1e-5 * mag);
+    dlclose(so);
 }
 
 RAD_TEST_MAIN()

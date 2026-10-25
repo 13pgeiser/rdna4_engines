@@ -163,6 +163,8 @@ static inline int avx_layout_mtp(const RadParam*, int, int operand, const RadEnc
 static inline int avx_layout_gemm_q(const RadParam* p, int n_p, int operand,
                                     const RadEncoding* enc, const int* sel,
                                     const RadTensor* planes, int n, RadLayout* out) {
+    /* libref serves M2XFP4 (ref_m2xfp4.cpp); refusing it here passes the op on to it. */
+    if (enc && rad_enc_is(enc, "m2xfp4")) return RAD_E_DTYPE;
     if (n < 2 || operand != 3) return RAD_E_UNSUPPORTED;
     const ZpGrid* zg = zp_grid(rad_param_gets(p, n_p, "dtype", nullptr));
     const long long group = rad_param_geti(p, n_p, "group", 0);
