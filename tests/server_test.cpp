@@ -5143,8 +5143,8 @@ TEST(embeddings_are_truncated_then_normalised_and_failures_named) {
     }
     {
         f.sched.embedding = std::vector<float>(8, 0.0f);
-        for (const json& x : vectors(R"({"input":"a"})")["data"][0]["embedding"])
-            CHECK_EQ(x.get<float>(), 0.0f);
+        const json embedding = vectors(R"({"input":"a"})")["data"][0]["embedding"];
+        for (const json& x : embedding) CHECK_EQ(x.get<float>(), 0.0f);
     }
     f.sched.embedding = { 3, 4, 0, 12, 0, 0, 0, 0 };
     {

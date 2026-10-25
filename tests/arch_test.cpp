@@ -9520,7 +9520,7 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
             ctx.max_mixed_tok = 2048;
             REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }),
                        RAD_OK);
-            const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+            qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
             CHECK(m.span_on);
             CHECK_EQ(m.pipe_on, world > 2);
             CHECK_EQ(m.qsacfg.plane_rows, 2048);
@@ -9556,6 +9556,10 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
             CHECK(score > 0);
             CHECK_EQ(wide_score, 0);
             CHECK(conv > 0);
+            /* This fake runtime has no engine teardown between model redeclarations. */
+            rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+            m.pipe_cu_h = nullptr;
+            m.pipe_cu_tried = false;
             if (world < 4) {
                 CHECK_EQ(ar, world > 1 ? 1 : 0);
                 CHECK_EQ(ar_lane0, ar);

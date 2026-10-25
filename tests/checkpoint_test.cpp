@@ -60,7 +60,8 @@ void write_shard(const std::string& path, const std::vector<T>& ts) {
     const uint64_t n = hdr.size();
     std::fwrite(&n, 8, 1, f);
     std::fwrite(hdr.data(), 1, hdr.size(), f);
-    for (const T& t : ts) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
+    for (const T& t : ts)
+        if (!t.bytes.empty()) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
     std::fclose(f);
 }
 
