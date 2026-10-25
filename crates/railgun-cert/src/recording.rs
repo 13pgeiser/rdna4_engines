@@ -1313,6 +1313,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-flash-next-gfx1151-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS)",
+        effect: KernelSelection,
+        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; recorded/captured: the incumbent unfused launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracle on Halo (gfx1151) of every output byte against the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal): halo-prefill-044/a-down/ORACLE.md",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-shared-int8-prefill",
         predicates: &[IsRecording, CaptureMode],
         condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
@@ -3577,13 +3588,19 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/gemm.rs",
         function: "hc_down_fused_selected",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_hc_down_fused_applies",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",

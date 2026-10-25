@@ -516,11 +516,17 @@ pub(crate) fn hc_down_tile_selected(
         }
 }
 
-/// Smallest route-row count the fused HC-down + activation kernel takes; below it the
+/// Smallest route-row count the gfx1201 fused HC-down + activation kernel takes; below it the
 /// three-launch chain wins.
 pub const HC_DOWN_FUSED_MIN_ROWS: usize = 1536;
 
-/// gfx1201 HC-down (320 x 10240) + activation fused into one launch
+/// Smallest route-row count the gfx1151 fused HC-down + activation kernel takes. Measured on
+/// Halo (fused vs the chain's GEMM + activation, us per call, 3 runs agree to 1 %): 512 rows
+/// 209 vs 178, 1024 rows 272 vs 309, 1536 rows 508 vs 557, 2048 rows 527 vs 862; the chain
+/// (64 x 64 tile below 2048 rows, 160 x 64 from there) stays below 1024.
+pub const HC_DOWN_FUSED_GFX1151_MIN_ROWS: usize = 1024;
+
+/// gfx1201 / gfx1151 HC-down (320 x 10240) + activation fused into one launch
 /// (`HIPFIRE_QWEN4_HC_DOWN_FUSED`, default on, `0` keeps the chain).
 pub(crate) fn hc_down_fused_selected(
     arch: &str,
@@ -531,11 +537,15 @@ pub(crate) fn hc_down_fused_selected(
     recording: bool,
     capturing: bool,
 ) -> bool {
+    let min_rows = match arch {
+        "gfx1201" => HC_DOWN_FUSED_MIN_ROWS,
+        "gfx1151" => HC_DOWN_FUSED_GFX1151_MIN_ROWS,
+        _ => return false,
+    };
     enabled
-        && arch == "gfx1201"
         && m == 320
         && k == 10240
-        && rows >= HC_DOWN_FUSED_MIN_ROWS
+        && rows >= min_rows
         && rows.checked_mul(k * 2).is_some_and(|b| b < (1usize << 32))
         && !recording
         && !capturing
@@ -551,7 +561,7 @@ pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
 /// of the 64 x 128 / k64 split-K tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true));
-/// Fused HC-down + activation (gfx1201), default on, `0` restores the three-launch chain.
+/// Fused HC-down + activation (gfx1201, gfx1151), default on, `0` restores the chain.
 static QWEN4_HC_DOWN_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_FUSED", true)
 });
@@ -29791,10 +29801,10 @@ impl Gpu {
         )
     }
 
-    /// gfx1201 HC-down (BF16 `weight` [m, k] on its F16 shadow, F16 `x_f16` [rows, k]) fused with
-    /// `hc_activation_fused_f32`: writes only the packed BF16 activation `low_bf16` [rows, m],
-    /// byte-identical to `gemm_bf16_xf16_f16_wmma` + `hc_activation_fused_f32(bf16_out)`.
-    /// Callers gate on [`Gpu::qwen4_hc_down_fused_applies`].
+    /// gfx1201 / gfx1151 HC-down (BF16 `weight` [m, k] on its F16 shadow, F16 `x_f16` [rows, k])
+    /// fused with `hc_activation_fused_f32`: writes only the packed BF16 activation `low_bf16`
+    /// [rows, m], byte-identical to `gemm_bf16_xf16_f16_wmma` + `hc_activation_fused_f32(bf16_out)`
+    /// on the same arch. Callers gate on [`Gpu::qwen4_hc_down_fused_applies`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf16_hc_down_fused(
         &mut self,
@@ -29808,8 +29818,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            self.arch == "gfx1201" && m == 320 && k == 10240,
-            "gemm_bf16_xf16_hc_down_fused: gfx1201 M=320 K=10240 only (arch {}, m {m}, k {k})",
+            matches!(self.arch.as_str(), "gfx1201" | "gfx1151") && m == 320 && k == 10240,
+            "gemm_bf16_xf16_hc_down_fused: gfx1201/gfx1151 M=320 K=10240 only (arch {}, m {m}, k {k})",
             self.arch
         );
         assert!(
@@ -29835,9 +29845,27 @@ impl Gpu {
             (w16 as usize) % 16 == 0 && (xp as usize) % 16 == 0 && (op as usize) % 16 == 0,
             "gemm_bf16_xf16_hc_down_fused: operands must be 16-byte aligned"
         );
-        const MODULE: &str = "qwen4_hc_down_fused";
-        const ENTRY: &str = "qwen4_hc_down_fused_b64_k32";
-        self.ensure_kernel(MODULE, kernels::QWEN4_HC_DOWN_FUSED_SRC, ENTRY)?;
+        // (module, source, entry, tokens per workgroup, threads per workgroup): gfx1151 runs
+        // five 64-row M waves over 32 tokens, gfx1201 four 80-row waves over 64.
+        let (module, src, entry, tile_rows, threads): (&str, &str, &str, usize, u32) =
+            if self.arch == "gfx1151" {
+                (
+                    "qwen4_hc_down_fused_gfx1151",
+                    kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
+                    "qwen4_hc_down_fused_gfx1151",
+                    32,
+                    160,
+                )
+            } else {
+                (
+                    "qwen4_hc_down_fused",
+                    kernels::QWEN4_HC_DOWN_FUSED_SRC,
+                    "qwen4_hc_down_fused_b64_k32",
+                    64,
+                    256,
+                )
+            };
+        self.ensure_kernel(module, src, entry)?;
         let ap = w16;
         let ki = k as i32;
         let bi = batch_size as i32;
@@ -29850,9 +29878,9 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            ENTRY,
-            [batch_size.div_ceil(64) as u32, 1, 1],
-            [256, 1, 1],
+            entry,
+            [batch_size.div_ceil(tile_rows) as u32, 1, 1],
+            [threads, 1, 1],
             0,
             &mut params,
             || {
@@ -52325,9 +52353,25 @@ mod tests {
         assert!(!ok("gfx1201", true, 321, 10240, 4096, false, false));
         assert!(!ok("gfx1201", true, 320, 10239, 4096, false, false));
         assert!(!ok("gfx1201", true, 320, 10496, 4096, false, false));
-        for arch in ["gfx1151", "gfx1200", "gfx1100", "gfx1030", "gfx1201x", ""] {
+        for arch in ["gfx1200", "gfx1100", "gfx1030", "gfx1201x", "gfx1151x", ""] {
             assert!(!ok(arch, true, 320, 10240, 4096, false, false), "{arch}");
         }
+        // gfx1151: the measured 1024-row crossover, same shape / flag / size rules.
+        let min1151 = HC_DOWN_FUSED_GFX1151_MIN_ROWS;
+        assert_eq!(min1151, 1024);
+        assert!(ok("gfx1151", true, 320, 10240, min1151, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, HC_DOWN_FUSED_MIN_ROWS, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, 8192, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, 16384, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, min1151 - 1, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 512, false, false));
+        assert!(!ok("gfx1151", false, 320, 10240, 8192, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 8192, true, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 8192, false, true));
+        assert!(!ok("gfx1151", true, 319, 10240, 8192, false, false));
+        assert!(!ok("gfx1151", true, 320, 10496, 8192, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, 209_715, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 209_716, false, false));
         // rows * k * 2 < 2^32: 209715 rows * 20480 B = 4_294_963_200 (< 2^32), 209716 is over.
         assert!(ok("gfx1201", true, 320, 10240, 209_715, false, false));
         assert!(!ok("gfx1201", true, 320, 10240, 209_716, false, false));
@@ -53939,18 +53983,24 @@ mod tests {
     }
 
     /// The fused HC-down + activation launch (`HIPFIRE_QWEN4_HC_DOWN_FUSED`) must write the
-    /// chain's packed BF16 bytes: the production split-K GEMM + reducer followed by
-    /// `hc_activation_fused_f32` with `bf16_out`, on the real 320 x 10240 shape, with a ragged
-    /// last 64-row block, NaN/inf/zero/subnormal-F16 operands and a guard region past the output.
+    /// chain's packed BF16 bytes: the production GEMM (gfx1201: split-K + reducer; gfx1151: the
+    /// ascending-K 160 x 64 tile) followed by `hc_activation_fused_f32` with `bf16_out`, on the
+    /// real 320 x 10240 shape, with a ragged last tile, NaN/inf/zero/subnormal-F16 operands and
+    /// a guard region past the output.
     #[test]
-    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    #[ignore = "requires a gfx1201 or gfx1151 GPU and working HIP toolchain"]
     fn hc_down_fused_matches_chain_bytes() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            Ok(gpu) if matches!(gpu.arch.as_str(), "gfx1201" | "gfx1151") => gpu,
             _ => {
-                eprintln!("skip: needs exact gfx1201");
+                eprintln!("skip: needs exact gfx1201 or gfx1151");
                 return;
             }
+        };
+        let min_rows = if gpu.arch.as_str() == "gfx1151" {
+            HC_DOWN_FUSED_GFX1151_MIN_ROWS
+        } else {
+            HC_DOWN_FUSED_MIN_ROWS
         };
         let (m, k) = (320usize, 10240usize);
         let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
@@ -53964,7 +54014,7 @@ mod tests {
             .expect("weight upload");
         weight.dtype = DType::BF16;
         let specials = [0x7e00u16, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x83ff];
-        for rows in [HC_DOWN_FUSED_MIN_ROWS, 4099usize] {
+        for rows in [min_rows, 4099usize] {
             let x_bits: Vec<u16> = (0..rows * k)
                 .map(|i| {
                     let row = i / k;

@@ -10720,6 +10720,13 @@ pub const GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC: &str =
 pub const QWEN4_HC_DOWN_FUSED_SRC: &str =
     include_str!("../../../kernels/src/qwen4_hc_down_fused.hip");
 
+/// gfx1151 sibling of `QWEN4_HC_DOWN_FUSED_SRC`: the incumbent gfx1151 chain's single
+/// ascending-K 160 x 64 / k64 pipelined WMMA tile (`gemm_wmma_lds_160_64_32_64_k64_p`) over the
+/// whole M = 320 per workgroup (X read from DRAM once) plus the BF16-bit activation, byte-identical
+/// to that chain (`Gpu::gemm_bf16_xf16_hc_down_fused`). Exact-arch gfx1151.
+pub const QWEN4_HC_DOWN_FUSED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_hc_down_fused.gfx1151.hip");
+
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from
 /// 8 to 64 FLOP/byte for the dense FLUX MMDiT linears. Requires K % 64 == 0.

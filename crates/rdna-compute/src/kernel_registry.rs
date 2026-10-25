@@ -1789,6 +1789,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1151" {
+        // Qwen4 HC input_mix_down (320 x 10240) + activation, one launch
+        // (HIPFIRE_QWEN4_HC_DOWN_FUSED; gemm.rs gemm_bf16_xf16_hc_down_fused).
+        add!(
+            "qwen4_hc_down_fused_gfx1151",
+            kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
+            ["qwen4_hc_down_fused_gfx1151"]
+        );
         // QSA gathered F16 WMMA attention (`tensor_ops::qsa_gathered_wmma_launch_with`
         // and the QSA F16 arena producer): the route is gfx1151-only for F32/Q8
         // K/V (`qsa_gathered_wmma_enabled`); the Q8 converter stays HIP even when
