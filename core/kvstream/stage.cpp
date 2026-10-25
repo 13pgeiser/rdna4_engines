@@ -63,7 +63,43 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
         KVPoolBinding* kb = c->kv_binding(b->kv[i].group);
         if (!kb || !kb->has_stage) continue;
         /* A pass selects by phase and row shape (bind.h). */
+        const bool was_stage = kb->depth == 1;
         kv_binding_enter(*kb, kv_pass_view(b->phase, b->n_tok, b->n_seq, b->n_spec));
+        /* Coming back to the ring from a staged pass: the ring's bytes are not what the residency
+         * map says. A staged pass copies whole layers to the pool at block-id identity (offset
+         * block * block_bytes), and that range overlaps the slots the ring uses for its layers --
+         * the stage row of layer N writes over the ring row of layer 0, and so on. The map is not
+         * touched by that copy, so every block it still calls resident names bytes some later
+         * layer has overwritten. On a ring smaller than its id space the ids are not addresses, so
+         * the map cannot even notice: a decode that trusts it reads another layer's (or another
+         * request's) KV, fluently and without a fault.
+         *
+         * Drop the map when the view returns to the ring. The first ring pass then resolves every
+         * live block out of the mirror -- exactly the cold-map behaviour the first request gets --
+         * and the ring is self-consistent again for the decode steps that follow. A stream whose
+         * ring covers its id space is the identity case and is left alone: there the staged bytes
+         * and the ring's bytes are the same bytes at the same offsets.
+         *
+         * The alternative -- capping the stage copy so it cannot reach a resident slot -- cannot
+         * work: the stage must hold the whole history one layer reads (stage.h, VOLUME), and the
+         * ring is a window of that same layer. */
+        if (was_stage && kb->depth == 0) {
+            const RadKVStream* st = b->kv[i].stream;
+            const int64_t bb     = st->block_bytes;
+            const int64_t blocks = bb > 0 ? st->host_layer_stride / bb : 0;
+            const int64_t layers = st->host_layer_stride > 0
+                                       ? st->host_bytes / st->host_layer_stride : 0;
+            if (blocks > 0 && layers > 0 && st->slots > 0 && st->slots < blocks) {
+                (void)rad_memset_async(st->res, 0xff,
+                                       layers * blocks * (int64_t)sizeof(int32_t), c->stream());
+                (void)rad_memset_async(st->slot_block, 0xff,
+                                       layers * st->slots * (int64_t)sizeof(int32_t),
+                                       c->stream());
+                (void)rad_memset_async(st->slot_state, 0,
+                                       layers * st->slots * 2 * (int64_t)sizeof(int32_t),
+                                       c->stream());
+            }
+        }
         /* The history one layer of this pass can read: every block up to the longest sequence's
          * end, at the same block size the resolve uses. That is the useful part of the stage row
          * the draw below copies in full. */
