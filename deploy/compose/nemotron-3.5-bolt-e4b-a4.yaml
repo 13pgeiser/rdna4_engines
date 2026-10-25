@@ -1,8 +1,8 @@
-# NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B, post-trained by NVIDIA) at 4 bits on one card: the
+# NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B, post-trained by NVIDIA) at 4 bits on two cards: the
 # feed-forward as asymmetric int4 (GPTQ; w4a8i8_asym, w4a16_asym at decode heights), attention and
-# layers 19-23 at i8a8, NVIDIA's DFlash drafter (7 tokens a pass) and the bf16 vision tower in pinned
-# host memory. bf16 KV. Thinking is off, as in NVIDIA's template; switch it per request
-# (chat_template_kwargs). Sampling as NVIDIA states it (temperature 1.0, top_p 0.95) and the
+# layers 19-23 at i8a8, NVIDIA's DFlash drafter (7 tokens a pass) and the bf16 vision tower and audio
+# encoder in pinned host memory. bf16 KV. Thinking is off, as in NVIDIA's template; switch it per
+# request (chat_template_kwargs). Sampling as NVIDIA states it (temperature 1.0, top_p 0.95) and the
 # checkpoint's top_k 64.
 name: radiance-nemotron-3.5-bolt-e4b-a4
 services:
@@ -12,6 +12,6 @@ services:
     command: >
       --model /models/nemotron-3.5-bolt-e4b-a4.rad
       --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
-      --tp 1 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype bf16
+      --tp 2 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype bf16
       --num-speculative-tokens 7 --mm-max-patches 2520 --vision-tower-placement ram
       --temp 1.0 --top-p 0.95 --top-k 64 --chat-template-kwargs '{"enable_thinking":false}'
