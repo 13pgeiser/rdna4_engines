@@ -273,6 +273,9 @@ and runs.
 | `qwen35_fp8` | the same, block-scaled fp8 |
 | `qwen35_w8a8` | the same, an int8 trunk rotated by a 128-wide Hadamard |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
+| `hyv3_bf16` | Tencent Hy-Memory-30B-A3B BF16 checkpoint; BF16, W4, W8A8, block-FP8 and MXFP4 recipes, TP1/2 |
+| `hyv3_fp8` | Tencent Hy-Memory-30B-A3B FP8 checkpoint: imported FP8 weights, dense-first MoE, TP1/2, BF16 or static-scaled E4M3 KV |
+| `hyv3_gguf` | llama.cpp Hy-Memory Q4_K_M input converted via `hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`; requires `--tokenizer <BF16-checkpoint>/tokenizer.json` |
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
 | `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
