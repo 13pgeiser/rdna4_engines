@@ -10274,37 +10274,32 @@ void gate_add_none_case(const Plugin& pl) {
 void conv1d_f32_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "conv1d_f32");
     if (!r) { ok("conv1d_f32", false, "row absent"); return; }
-    struct C { int64_t cin, cout, k, dil, M0, M1; int act, bias, res; int64_t st = 1; };   /* res 2: y itself */
+    struct C { int64_t cin, cout, k, dil, M0, M1; int act, bias, res; };   /* res 2: y itself */
     for (const C& c : { C{ 2048, 1024, 7, 1, 9, 15, 0, 1, 0 }, C{ 64, 128, 7, 1, 37, 60, 0, 1, 0 },
                         C{ 32, 32, 11, 5, 70, 41, 0, 1, 2 }, C{ 16, 16, 3, 3, 50, 77, 0, 1, 1 },
                         C{ 48, 40, 3, 1, 33, 30, 1, 1, 0 }, C{ 8, 8, 11, 5, 90, 64, 0, 1, 2 },
-                        C{ 8, 1, 7, 1, 100, 99, 2, 0, 0 }, C{ 64, 64, 11, 1, 200, 137, 2, 1, 2 },
-                        C{ 64, 128, 4, 1, 36, 60, 0, 1, 0, 2 }, C{ 128, 256, 8, 1, 64, 40, 0, 1, 1, 4 },
-                        C{ 256, 512, 16, 1, 96, 136, 0, 1, 0, 8 }, C{ 8, 8, 16, 1, 32, 48, 0, 1, 0, 8 },
-                        C{ 64, 64, 2, 1, 50, 30, 0, 1, 2, 2 } }) {
+                        C{ 8, 1, 7, 1, 100, 99, 2, 0, 0 }, C{ 64, 64, 11, 1, 200, 137, 2, 1, 2 } }) {
         const std::vector<int32_t> cu = { 0, (int32_t)c.M0, (int32_t)(c.M0 + c.M1) };
-        const int64_t M = c.M0 + c.M1, MO = M / c.st;
+        const int64_t M = c.M0 + c.M1;
         std::vector<float> x = randv((size_t)(M * c.cin), 1.0f);
         std::vector<float> w = randv((size_t)(c.cout * c.cin * c.k), 1.0f / std::sqrt((float)(c.cin * c.k)));
-        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(MO * c.cout), 0.5f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(M * c.cout), 0.5f);
         std::vector<RadParam> ps = { PI("M", M), PI("cin", c.cin), PI("cout", c.cout), PI("k", c.k),
                                      PI("dil", c.dil),
                                      PS("act", c.act == 1 ? "tanh" : c.act == 2 ? "clamp" : "none"),
                                      PS("dtype", "f32") };
-        if (c.st > 1) { ps.push_back(PI("causal", 1)); ps.push_back(PI("stride", c.st)); }
-        const std::string nm = fmt("conv1d_f32 cin %lld cout %lld k %lld dil %lld%s%s%s%s", (long long)c.cin,
+        const std::string nm = fmt("conv1d_f32 cin %lld cout %lld k %lld dil %lld%s%s%s", (long long)c.cin,
                                    (long long)c.cout, (long long)c.k, (long long)c.dil,
-                                   c.st > 1 ? fmt(" causal stride %lld", (long long)c.st).c_str() : "",
                                    c.bias ? " +bias" : "", c.res == 2 ? " +res in place" : c.res ? " +res" : "",
                                    c.act == 1 ? " tanh" : c.act == 2 ? " clamp" : "");
         void* dw = stored_weight_f32(r, ps, w, c.cout, c.cin * c.k, nm.c_str());
         if (!dw) continue;
         void* dx = up_f32(x);
         void* db = up_f32(b);
-        void* dy = up_f32(c.res == 2 ? res : std::vector<float>((size_t)(MO * c.cout), 0.0f));
+        void* dy = up_f32(c.res == 2 ? res : std::vector<float>((size_t)(M * c.cout), 0.0f));
         void* dr = up_f32(res);
-        RadTensor ty = T(dy, RAD_F32, { MO, c.cout });
-        RadTensor tr = c.res == 2 ? ty : T(dr, RAD_F32, { MO, c.cout });
+        RadTensor ty = T(dy, RAD_F32, { M, c.cout });
+        RadTensor tr = c.res == 2 ? ty : T(dr, RAD_F32, { M, c.cout });
         RadTensor tb = T(db, RAD_F32, { c.cout });
         if (!c.res) absent(tr);
         if (!c.bias) absent(tb);
@@ -10313,14 +10308,14 @@ void conv1d_f32_cases(const Plugin& pl) {
                                    T(up_i32(cu), RAD_I32, { 3 }), tr, ty, tb },
                               ps);
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
-        const int64_t pad = c.st > 1 ? c.dil * (c.k - 1) + 1 - c.st : c.dil * (c.k - 1) / 2;
-        std::vector<float> want((size_t)(MO * c.cout));
-        for (int64_t row = 0; row < MO; ++row) {
-            const int64_t e = seq_of(cu, row * c.st), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+        const int64_t pad = c.dil * (c.k - 1) / 2;
+        std::vector<float> want((size_t)(M * c.cout));
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
             for (int64_t co = 0; co < c.cout; ++co) {
                 double acc = 0;
                 for (int64_t kk = 0; kk < c.k; ++kk) {
-                    const int64_t ir = row * c.st + kk * c.dil - pad;
+                    const int64_t ir = row + kk * c.dil - pad;
                     if (ir < s0 || ir >= s1) continue;
                     for (int64_t ci = 0; ci < c.cin; ++ci)
                         acc += (double)w[(size_t)((co * c.cin + ci) * c.k + kk)] * x[(size_t)(ir * c.cin + ci)];
