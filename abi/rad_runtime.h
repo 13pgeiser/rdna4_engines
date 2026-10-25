@@ -189,9 +189,9 @@ typedef struct RadBatch {
     /* The longest query in each half. max_q_len over a mixed step is the prefill chunk's, and
      * banding the decode half with it would give eight rows a thousand-row GEMM's band.
      *
-     * Only the decode value is currently read (by the GDN blocks). The prefill value is for a
-     * block whose prefill path bands on a per-sequence query length; the GDN prefill ops band on
-     * the step's total tokens, taken from their operands. */
+     * The decode value is read by the GDN blocks and the fp8 gated attention's per-band issue
+     * (rad_block_attn_gated_fp8.h), which also bands its prefill half on the prefill value; the
+     * GDN prefill ops band on the step's total tokens, taken from their operands. */
     int32_t max_q_len_decode;
     int32_t max_q_len_prefill;
 

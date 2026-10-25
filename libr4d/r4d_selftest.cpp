@@ -1489,6 +1489,164 @@ static void attn_split_case(const Plugin& pl, const char* name, const char* kv_d
     dfree_all();
 }
 
+/* A mixed step's attention as the engine issues it (AttnGatedFP8::step's per-band issue) at
+ * Qwen3.8-27B's per-rank production geometry: `nd` decode sequences of 8-10 query rows (verify
+ * blocks) beside one prefill chunk of `pq` rows, max_seqs 16, max_ctx 200000, the band bounds 10
+ * (decode) and 2048. Each band's row gets the scratch its hook sized at declare, from the band's
+ * frozen geometry and no tensors, and nothing more, as the core binds it (rad_builder.cpp,
+ * ctx.cpp): the decode half (prefix rows, its own cu) at the decode band; the prefill half (q and
+ * out whole, cu and the per-sequence arrays past the decode sequences) at band `pband`, which
+ * picks the row as the core would (at most 10: the decode row). Both launches must succeed, and
+ * every sequence's rows match the oracle afterwards: the prefill half must not write the decode
+ * rows. 1.10-next6u issued the prefill half at its own query length, so a chunk of 10 rows or
+ * fewer reached the decode row with the whole step's rows and refused for scratch. */
+static void attn_mixed_step_case(const Plugin& pl, const char* dec_name, const char* pre_name,
+                                 const char* kv_dtype, int nd, int64_t pq, int64_t pband) {
+    if (!sel(pre_name) && !sel("attn_mixed_step")) return;
+    const RadKernelInfo* rd = find(pl, dec_name);
+    const RadKernelInfo* rp = find(pl, pre_name);
+    const std::string tag = fmt("%s mixed step: %d decode rows of 8-10 + a %lld-row chunk, "
+                                "prefill half at band %lld", pre_name, nd, (long long)pq,
+                                (long long)pband);
+    if (!rd || !rp || !rd->scratch) { ok(tag.c_str(), false, "row or scratch hook absent"); return; }
+    const int64_t head_dim = 256, gqa = 6, kv_heads = 2, bs = 16, q_heads = kv_heads * gqa;
+    const int64_t dband = 10, max_seqs = 16, max_ctx = 200000, top = 2048;
+    const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
+    const int64_t rowe = kvq == 2 ? 22 * head_dim / 16 : kvq == 1 ? 25 * head_dim / 16 : head_dim * 2;
+    const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
+    const int64_t vsoff = kvq == 2 ? head_dim * 21 / 16 : head_dim * 3 / 2;
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+
+    /* decode-first, as the scheduler sorts a step; contexts differ per sequence */
+    const int64_t ns = nd + 1;
+    std::vector<int64_t> ql, cx;
+    for (int s = 0; s < nd; ++s) { ql.push_back(8 + s % 3); cx.push_back(3000 + 397 * s); }
+    ql.push_back(pq); cx.push_back(pq + 2500);
+    int64_t mb = 0;
+    std::vector<int32_t> cu(1, 0), used;
+    for (int64_t s = 0; s < ns; ++s) {
+        cu.push_back(cu.back() + (int32_t)ql[(size_t)s]);
+        used.push_back((int32_t)cx[(size_t)s]);
+        mb = std::max(mb, (cx[(size_t)s] + bs - 1) / bs);
+    }
+    const int64_t nt = cu.back(), DT = cu[(size_t)nd];
+    const std::vector<int32_t> bt = iota_i32(ns * mb);
+
+    std::vector<uint16_t> qh((size_t)(nt * q_heads * head_dim));
+    for (size_t i = 0; i < qh.size(); ++i) qh[i] = st_rand_bf16(i);
+    const int64_t nelem = ns * mb * kv_heads * bs * rowe;
+    std::vector<uint8_t> kv((size_t)nelem);
+    for (int64_t e = 0; e < nelem; ++e) kv[(size_t)e] = st_rand_e4m3(e);
+    if (kvq)
+        for (int64_t r0 = 0; r0 < nelem; r0 += rowe) {
+            uint8_t* row = &kv[(size_t)r0];
+            for (int64_t b = 0; b < head_dim / 2; ++b)
+                row[voff + b] = (uint8_t)(st_rand_e4m3(r0 * 7 + b) * 37u + (uint32_t)b);
+            for (int64_t g = 0; g < head_dim / 32; ++g) {
+                const _Float16 s = (_Float16)(0.015625f * (float)(1 + (st_rand_e4m3(r0 + g) & 15)));
+                std::memcpy(row + vsoff + g * 2, &s, 2);
+            }
+            if (kvq == 2) {
+                for (int64_t b = 0; b < head_dim * 3 / 4; ++b)
+                    row[b] = (uint8_t)(st_rand_e4m3(r0 * 5 + b + 11) * 29u + (uint32_t)(3 * b));
+                for (int64_t g = 0; g < head_dim / 32; ++g) {
+                    const _Float16 s = (_Float16)(0.00390625f * (float)(1 + (st_rand_e4m3(r0 + g + 7) & 15)));
+                    std::memcpy(row + head_dim * 5 / 4 + g * 2, &s, 2);
+                }
+            }
+        }
+    const size_t on = (size_t)(nt * q_heads * head_dim);
+    void* d_q = dalloc(on * 2);
+    void* d_kv = dalloc(kv.size());
+    void* d_o = dalloc(on * 2);
+    if (!d_q || !d_kv || !d_o) { ok(tag.c_str(), false, "hipMalloc failed"); dfree_all(); return; }
+    st_memcpy(d_q, qh.data(), on * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kv, kv.data(), kv.size(), hipMemcpyHostToDevice);
+    st_memset(d_o, 0xff, on * 2);
+
+    /* A band's frozen geometry: the op's parameters with q_len at the band's bound. */
+    auto geom = [&](int64_t band) {
+        return std::vector<RadParam>{
+            PI("q_len", band), PI("head_dim", head_dim), PI("gqa", gqa), PI("causal", 1),
+            PI("window", 0), PI("n_head", q_heads), PI("block_size", bs),
+            PI("max_seqs", max_seqs), PI("max_ctx", max_ctx), PS("q_dtype", "bf16"),
+            PS("kv_dtype", kv_dtype) };
+    };
+    /* the core's sizing: the hook at the band's geometry, no tensors */
+    auto declared = [&](const RadKernelInfo* r, int64_t band) -> int64_t {
+        if (!r->scratch) return 0;
+        std::vector<RadParam> ps = geom(band);
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        return r->scratch(&a);
+    };
+    /* one issue: rows [r0 .. r0 + rows) of q/out are the tensors' extent from row 0 (prefix) or
+     * the whole step; sequences [s0, s0 + n) */
+    std::string why;
+    auto issue = [&](int64_t band, int64_t rows, int64_t s0, int64_t n) {
+        const RadKernelInfo* r = band <= dband ? rd : rp;
+        const int64_t sb = declared(r, band <= dband ? dband : top);
+        void* scr = sb > 0 ? dalloc((size_t)sb) : nullptr;
+        if (scr) st_memset(scr, 0x7f, (size_t)sb);
+        const std::vector<int32_t> bth(bt.begin() + s0 * mb, bt.begin() + (s0 + n) * mb);
+        const std::vector<int32_t> uh(used.begin() + s0, used.begin() + s0 + n);
+        const std::vector<int32_t> ch(cu.begin() + s0, cu.begin() + s0 + n + 1);
+        std::vector<RadTensor> ts = {
+            T(d_q,  RAD_BF16, { rows, q_heads, head_dim }),
+            T(d_kv, RAD_F8E4M3, { ns * mb, kv_heads, bs, rowe }),
+            TI32({ n, mb }, bth), TI32({ n }, uh),
+            TF32({ n, kv_heads }, 1.0f), TF32({ n, kv_heads }, 1.0f),
+            TI32({ n + 1 }, ch),
+            T(d_o,  RAD_BF16, { rows, q_heads, head_dim }),
+        };
+        std::vector<RadParam> ps = geom(band <= dband ? dband : top);
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        a.scratch = scr; a.scratch_bytes = sb;
+        const int rc = r->launch(&a, nullptr);
+        const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+        if (rc != RAD_OK || he != hipSuccess)
+            why += fmt("%s%s at band %lld (%lld rows, %lld sequences, scratch %lld) rc=%d hip=%d",
+                       why.empty() ? "" : "; ", r->name, (long long)band, (long long)rows,
+                       (long long)n, (long long)sb, rc, (int)he);
+    };
+    int dq = 0;
+    for (int s = 0; s < nd; ++s) dq = std::max<int>(dq, (int)ql[(size_t)s]);
+    issue(dq, DT, 0, nd);                 /* the decode half, at its band (<= 10) */
+    issue(pband, nt, nd, 1);              /* the prefill half */
+
+    std::vector<uint16_t> oh(on);
+    st_memcpy(oh.data(), d_o, on * 2, hipMemcpyDeviceToHost);
+    const float abs_tol = 1e-3f, rel_tol = 2e-2f;
+    float max_err = 0.0f;
+    int bad = 0, nchk = 0;
+    for (int64_t s = 0; s < ns; ++s) {
+        const int64_t q = ql[(size_t)s];
+        for (const int64_t i : { (int64_t)0, q / 2, q - 1 }) {
+            const int64_t tok = cu[(size_t)s] + i;
+            for (int64_t h = 0; h < q_heads; ++h) {
+                float ref[256];
+                attn_oracle_one(&qh[(size_t)((tok * q_heads + h) * head_dim)], kv.data(), 1,
+                                head_dim, kv_heads, bs, h / gqa, &bt[(size_t)(s * mb)], mb,
+                                (int)cx[(size_t)s], 1.0f, 1.0f, 1, 0, scale, q, i, ref, kvq);
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    const float got = h_bf16(oh[(size_t)((tok * q_heads + h) * head_dim + d)]);
+                    const float diff = std::fabs(got - ref[d]);
+                    if (!(diff <= abs_tol + rel_tol * std::fabs(ref[d]))) ++bad;
+                    if (diff > max_err) max_err = diff;
+                    ++nchk;
+                }
+            }
+        }
+    }
+    ok(tag.c_str(), why.empty() && bad == 0,
+       why.empty() ? fmt("max_err=%.5g bad=%d/%d", max_err, bad, nchk) : why);
+    dfree_all();
+}
+
 /* The split's scratch at declare (the band's bound 2048, Qwen3.8-27B's per-rank 12 heads over 2,
  * the model's context, no tensors): the hook must cover the largest launch the law can split in the
  * band, over every sequence count up to max_seqs, and stay near the 25.4 MB bound its comment
@@ -26398,6 +26556,16 @@ static void device_phase(const Plugin& pl) {
         attn_split_case(pl, n, kv, { { 53, 12000 } }, 16, true, 8, 0);
         attn_split_case(pl, n, kv, { { 64, 9000 }, { 11, 8192 } }, 6, true, 3, 0);
         attn_split_scratch_case(pl, n, kv);
+    }
+    /* A mixed step's two halves at the production geometry, each with only its band's declared
+     * scratch: up to 15 verify blocks beside chunks of 1 to 640 rows. */
+    for (const auto& sr : { std::make_pair("attn_prefill_h256_gqa6_k6v4", "k6_v4"),
+                            std::make_pair("attn_prefill_h256_gqa6_fp8v4", "fp8_v4") }) {
+        const std::string dec = std::string("attn_decode_h256_gqa6_") + (sr.second[0] == 'k' ? "k6v4" : "fp8v4");
+        for (const auto& c : { std::make_pair(15, 5), std::make_pair(15, 10), std::make_pair(3, 1),
+                               std::make_pair(8, 53), std::make_pair(1, 300),
+                               std::make_pair(15, 640) })
+            attn_mixed_step_case(pl, dec.c_str(), sr.first, sr.second, c.first, c.second, 2048);
     }
     /* Flash-Next's QSA layers: twelve queries per KV head over 4-token pages, and six at
      * four ranks, each layout's prefill (a long history and a ragged last tile), decode, and the

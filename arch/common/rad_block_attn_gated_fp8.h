@@ -21,10 +21,22 @@
 
 #include "rad_fp8.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace rad {
 namespace arch {
+
+/* RADIANCE_ATTN_BAND_SPLIT=0 issues a mixed step's dense attention as one launch at the step's
+ * widest band, as before the per-band issue in AttnGatedFP8::step; unset or anything else splits.
+ * An A/B and debugging knob, not configuration. Read once. */
+inline bool attn_band_split() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_ATTN_BAND_SPLIT");
+        return !(e && !std::strcmp(e, "0"));
+    }();
+    return on;
+}
 
 struct AttnGatedFP8 {
     struct Wire {
@@ -653,15 +665,57 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.x, off, rows, qw));
         }
     } else {
-        RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                    brows(w.q, T), kv_cache(kv, layer),
-                    praw2(table, RAD_I32, batch->n_seq,
-                          kvb ? kvb->block_table_pitch : 0),
-                    praw(used, RAD_I32, batch->n_seq),
-                    RAD_NONE, RAD_NONE,
-                    /* cu_seqlens: the batch may be ragged (a prefill chunk beside decode rows). */
-                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                    brows(w.attn.x, T));
+        /* A mixed step once per band, as the GDN blocks issue theirs (rad_block_gdn_fp8.h): one
+         * launch at the chunk's band would serve the decode rows by the query-tiled prefill kernel,
+         * one workgroup a kv head walking each decode sequence's whole context, the step's tail
+         * beside a chunk of thousands of rows (one sequence decoding at 188k beside a 25k prompt's
+         * 2048-row chunks: 512 ms a mixed step against 218 ms at 0.7k of context, the prompt's
+         * prefill 5.1 -> 11.3 s). The decode half, sequences [0, D) and rows [0, DT), is the prefix:
+         * its own band (the split-KV decode row) over its rows, tables and cu. The prefill half
+         * takes its per-sequence arrays past the decode sequences and keeps q, out and cu at their
+         * absolute rows (the kernels index q and out by cu, and the merge of a split launch keeps
+         * to cu's span).
+         *
+         * The prefill half is issued at the op's top band (max_tok), not at its own query length:
+         * a launch over part of the step (q and out whole, cu past row 0, as ArPieces issues its
+         * pieces) is served by the query-tiled row, while the band of a short chunk (10 rows or
+         * fewer at gqa 6) is the split-KV decode row's, whose partials are laid out by the step's
+         * rows and sized at declare for its own band: 1.10-next6u issued it there and stopped
+         * under load on RAD_E_SCRATCH. Kernels read exact lengths from cu, so the loose band costs
+         * nothing. A chunk no longer than the verify blocks beside it keeps the one launch at
+         * their band, as before the split: the whole step is decode-shaped then.
+         *
+         * Pure steps issue one launch, as before. */
+        int64_t D = 0, DT = 0;
+        batch_split(batch, &D, &DT);
+        const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
+        const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill
+                                                        : batch->max_q_len;
+        if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
+            batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode && attn_band_split()) {
+            const int64_t P = batch->n_seq - D;
+            RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,
+                        brows(w.q, DT), kv_cache(kv, layer),
+                        praw2(table, RAD_I32, D, pitch), praw(used, RAD_I32, D),
+                        RAD_NONE, RAD_NONE, praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        brows(w.attn.x, DT));
+            RAD_ISSUE_N(c, op_attn, g.max_tok,
+                        brows(w.q, T), kv_cache(kv, layer),
+                        praw2(table ? table + D * pitch : nullptr, RAD_I32, P, pitch),
+                        praw(used ? used + D : nullptr, RAD_I32, P),
+                        RAD_NONE, RAD_NONE, praw(batch->cu_seqlens + D, RAD_I32, P + 1),
+                        brows(w.attn.x, T));
+        } else {
+            RAD_ISSUE_N(c, op_attn, batch->max_q_len,
+                        brows(w.q, T), kv_cache(kv, layer),
+                        praw2(table, RAD_I32, batch->n_seq, pitch),
+                        praw(used, RAD_I32, batch->n_seq),
+                        RAD_NONE, RAD_NONE,
+                        /* cu_seqlens: the batch may be ragged (verify rows of different
+                         * lengths; a chunk beside decode rows at RADIANCE_ATTN_BAND_SPLIT=0). */
+                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                        brows(w.attn.x, T));
+        }
     }
 
     if (gated) {

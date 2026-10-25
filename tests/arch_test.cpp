@@ -7015,6 +7015,88 @@ TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
 }
 
+/* The dense attention of a mixed step is issued once per band (AttnGatedFP8::step): the decode
+ * sequences at their own band (the split-KV decode row), then the prefill chunks at theirs, so a
+ * long decode sequence riding a prefill chunk is not walked by one query-tiled workgroup. The
+ * decode half is the prefix (its rows, its tables, cu to its end); the prefill half has its
+ * per-sequence arrays past the decode sequences and q, out and cu at their absolute rows, as the
+ * GDN blocks issue their prefill half, at the op's top band so a row written for such a launch
+ * serves it. A pure step issues one attention per layer, as before
+ * (and with RADIANCE_ATTN_BAND_SPLIT=0, under which every pinned_steps pin of the families on this
+ * block holds unchanged, so a mixed step is the only one the split touches). */
+TEST(qwen35_fp8_issues_a_mixed_steps_attention_once_per_band) {
+    MetaKV mk = q35fp8_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    /* A verify of 4 and a plain decode beside a 6-row chunk over 20 tokens of history. */
+    const auto mixed = kit(b, { 4, 1 }, { 6 }, 20);
+    const auto dec   = kit(b, { 4, 1 }, {});
+    const auto pre   = kit(b, {}, { 6 }, 20);
+    auto attn = [&](const Kit& k) {
+        const auto v = run_passes(b, qwen35_fp8::step, { &k });
+        CHECK(steps_ok(v));
+        CHECK_LINT(b, v[0].get());
+        std::vector<RecIssue> out;
+        for (const auto& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (o && o->op == "attn_paged") out.push_back(i);
+        }
+        return out;
+    };
+    /* two attention layers in the fixture */
+    CHECK_EQ(attn(*dec).size(), (size_t)2);
+    CHECK_EQ(attn(*pre).size(), (size_t)2);
+    const auto m = attn(*mixed);
+    if (!rad::arch::attn_band_split()) {               /* RADIANCE_ATTN_BAND_SPLIT=0: one launch */
+        CHECK_EQ(m.size(), (size_t)2);
+        return;
+    }
+    REQUIRE_EQ(m.size(), (size_t)4);
+    const int32_t* table = mixed->table.data();
+    const int32_t* used  = mixed->used.data();
+    const int32_t* cu    = mixed->cu.data();
+    for (size_t l = 0; l < 2; ++l) {
+        const RecIssue& d = m[2 * l];
+        const RecIssue& p = m[2 * l + 1];
+        REQUIRE(d.opd.size() == 8 && p.opd.size() == 8);
+        CHECK_EQ(d.n, (int64_t)4);                       /* the decode band: the verify's 4 */
+        CHECK_EQ(d.opd[0].rows, (int64_t)5);             /* q: the 5 decode rows */
+        CHECK(d.opd[2].raw == (void*)table);  CHECK_EQ(d.opd[2].rows, (int64_t)2);
+        CHECK(d.opd[3].raw == (void*)used);   CHECK_EQ(d.opd[3].rows, (int64_t)2);
+        CHECK(d.opd[6].raw == (void*)cu);     CHECK_EQ(d.opd[6].rows, (int64_t)3);
+        CHECK_EQ(d.opd[7].rows, (int64_t)5);
+        CHECK_EQ(p.n, (int64_t)256);                     /* the top band, whatever the chunk */
+        CHECK_EQ(p.opd[0].rows, (int64_t)11);            /* q and out whole: cu is absolute */
+        CHECK(p.opd[2].raw == (void*)(table + 2 * 16));  CHECK_EQ(p.opd[2].rows, (int64_t)1);
+        CHECK(p.opd[3].raw == (void*)(used + 2));        CHECK_EQ(p.opd[3].rows, (int64_t)1);
+        CHECK(p.opd[6].raw == (void*)(cu + 2));          CHECK_EQ(p.opd[6].rows, (int64_t)2);
+        CHECK_EQ(p.opd[7].rows, (int64_t)11);
+        CHECK_EQ(d.opd[1].handle, p.opd[1].handle);      /* the same layer's cache */
+        CHECK_EQ(d.opd[1].offset, p.opd[1].offset);
+    }
+    /* A chunk no longer than the decode band's bound (1.10-next6u issued it at its own 10 and
+     * the decode row took the whole step's rows: RAD_E_SCRATCH under load) still goes to the top
+     * band; a chunk no longer than the verify blocks beside it keeps the one launch at their
+     * band, as before the split (r4d_selftest attn_mixed_step checks both halves' scratch). */
+    const auto shortc = kit(b, { 3, 2 }, { 4 }, 20);
+    const auto m2 = attn(*shortc);
+    REQUIRE_EQ(m2.size(), (size_t)4);
+    for (size_t l = 0; l < 2; ++l) {
+        CHECK_EQ(m2[2 * l].n, (int64_t)3);
+        CHECK_EQ(m2[2 * l + 1].n, (int64_t)256);
+        CHECK_EQ(m2[2 * l + 1].opd[0].rows, (int64_t)9);
+    }
+    const auto tiny = kit(b, { 4, 3 }, { 2 }, 20);
+    const auto m3 = attn(*tiny);
+    REQUIRE_EQ(m3.size(), (size_t)2);
+    for (const RecIssue& i : m3) {
+        CHECK_EQ(i.n, (int64_t)4);
+        CHECK_EQ(i.opd[0].rows, (int64_t)9);
+        CHECK_EQ(i.opd[6].rows, (int64_t)4);
+    }
+}
+
 namespace {
 
 /* Every trunk and MTP linear of a qwen35 container in the 4-bit form an int4 W4A16 release
