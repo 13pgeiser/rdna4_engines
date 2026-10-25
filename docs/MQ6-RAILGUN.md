@@ -81,7 +81,55 @@ controls must be detected. Raw per-case program/plan/ABI identities and a
 summary are written to the requested directory. This is component correctness
 and retained-replay evidence; it does not measure model quality or speed.
 
-## Recorded validation (2026-10-25)
+## Review follow-up: order the poison producer (2026-10-25)
+
+The reported `x4_empty_first B=1 part=3: unwritten active word c=0 r=0`
+failure was reproduced after integrating beta
+`6c53fbf0f9104864d750a90e0d56ba445f631416`. The unfixed build at
+`41bd815b3b814213d00026134fd5b66bbd9e2c66` failed in the first of three
+fresh processes; its next two processes passed. Its frozen binary SHA-256 is
+`afd84bea03d2e11f81048c35aa2922c9f8d3fcd6e4737ce55413cadfa197568e`.
+The older frozen PR binary had also passed three new processes. A passing
+single process was insufficient to expose this ordering error.
+
+`Output::reset` submitted `hipMemset` to the default stream. A base device
+allocation's memset may complete asynchronously (see the
+[ROCm implementation](https://github.com/ROCm/clr/blob/develop/hipamd/src/hip_memory.cpp),
+`ihipMemset` / `hipMemset_common`). Replay joins the current active HIP stream
+before submitting its independent ROCr PM4 IB. With no new active-stream
+operation joining that default-stream fill, the earlier device sync in
+`Fixture::reset` only drained work submitted before the poison write. The
+later poison could race with and overwrite the PM4 result.
+
+The oracle now queues `hipMemsetAsync` on the same active producer stream that
+replay waits for; the no-active-stream branch keeps the matching default
+stream path. Comparison errors also identify the HIP reference versus replay
+output. The MQ6 kernel objects, shapes, grid, kernarg ABI, receipt, runtime
+handoff and Redline defaults were not changed by this fix.
+
+Verified source: `8352551d32f68b5fa776bcbe49d6774fd9eac4d1`. Five fresh
+processes each passed all 40 shape/batch cases and 120 exact changing-input
+replays: **200 cases / 600 replays**, including empty-first B1..8, both RAW
+chains, guards and every existing negative control. No mandatory case was
+skipped. Frozen fixed binary SHA-256:
+`17bbe71339546005d260fd41d0e6920d89db18c13cae6788e191e51aab78d0d3`.
+
+On that source the affected CPU suites passed: railgun 23; rdna-compute
+1,125 (29 existing ignored); railgun-cert 6, including the inventory test
+whose prior beta omissions have since been fixed upstream. The six required
+static checks and env-docs/lifecycle passed. Named-file rustfmt and diff
+whitespace checks passed. No full model or performance claim is added.
+
+Raw evidence under the same Nahida output root:
+
+- `review-reproduction-v1/`: the older frozen PR binary, three new processes.
+- `review-latest-beta-unfixed-v1/`: the reproduced failure, source/binary pins
+  and all three fresh-process logs.
+- `review-fixed-stream-v2/`: the fixed source/binary, five full oracle reports
+  and process-retirement records; both GPU locks held.
+- `review-cpu-v1/`: affected CPU suites and required checks.
+
+## Initial validation (before the poison-ordering fix)
 
 Tested implementation: `3e5f176d71d19e803f7a0a1a7b7cf82906faf689`, based on
 beta `6d81107a55c6a8e7748635edd9d5e0a0529eda8d`. The checkout was clean when
