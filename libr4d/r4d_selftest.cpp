@@ -13094,7 +13094,8 @@ static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
  * (512, 16 over 2, the proportional `head` ladder over 128, k == v), at batch heights reaching
  * every width r4d_act_threads answers, including 256 at head_dim 512 (two channels per thread).
  * Gemma 3's class (head_dim 128, 16 q over 8 kv heads at one rank of two) has no value norm
- * (v_norm 0), so its chain is four ops and v must come back untouched. */
+ * (v_norm 0), so its chain is four ops and v must come back untouched. HYV3 adds 32 q / 4 kv
+ * heads, F32 norm gains widened from BF16 and positions near the 65K serving bound. */
 static void qkv_norm_rope_numeric(const Plugin& pl) {
     const RadKernelInfo* np  = find(pl, "rmsnorm_p_bf16");
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
@@ -13105,10 +13106,12 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
      * drafter's), q and k normed and v not, so the chain is four ops and v must come out as it went
      * in; nq 0 as well: that layer's keys alone (the drafter's context pass), the chain a k norm and
      * a k rope, q passed as k's buffer */
-    struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk, vn; };
+    struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk, vn;
+                 bool w32 = false; };
     for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false, true },
                            Cls{ 512, 16, 2, 128, "head", 1000000.0, true, true },
                            Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false },
+                           Cls{ 128, 32, 4, 128, "rotary", 11158840.0, false, false, true },
                            Cls{ 256, 8, 4, 256, "rotary", 10000.0, false, false },
                            Cls{ 256, 0, 4, 256, "rotary", 10000.0, false, false } }) {
         /* 8 rows of the head-256 class are 8 x 32 workgroups of 8 wavefronts, a full card: the
@@ -13125,14 +13128,22 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 hqw[(size_t)c] = h_to_bf16(0.6f + 0.004f * (float)((c * 19) % 51));
                 hkw[(size_t)c] = h_to_bf16(0.5f + 0.005f * (float)((c * 11) % 47));
             }
-            for (int64_t m = 0; m < M; ++m) hp[(size_t)m] = (int32_t)(1000 + 7 * m);
+            std::vector<float> hqwf((size_t)cl.hd), hkwf((size_t)cl.hd);
+            for (int64_t c = 0; c < cl.hd; ++c) {
+                hqwf[(size_t)c] = h_bf16(hqw[(size_t)c]);
+                hkwf[(size_t)c] = h_bf16(hkw[(size_t)c]);
+            }
+            const uint32_t wdt = cl.w32 ? RAD_F32 : RAD_BF16;
+            const size_t wb = (size_t)cl.hd * (cl.w32 ? 4 : 2);
+            for (int64_t m = 0; m < M; ++m)
+                hp[(size_t)m] = (int32_t)((cl.w32 ? 65000 : 1000) + 7 * m);
             void* dq[2] = { nullptr, nullptr };
             void* dk[2] = { dalloc(hk.size() * 2), dalloc(hk.size() * 2) };
             void* dv[2] = { dalloc(hv.size() * 2), dalloc(hv.size() * 2) };
             for (int j = 0; j < 2; ++j) dq[j] = cl.nq ? dalloc(hq.size() * 2) : dk[j];
             const int64_t QW = cl.nq ? QD : KD;   /* q's width as passed (k's buffer at nq 0) */
-            void* dqw = dalloc(hqw.size() * 2);
-            void* dkw = dalloc(hkw.size() * 2);
+            void* dqw = dalloc(wb);
+            void* dkw = dalloc(wb);
             void* dp  = dalloc(hp.size() * 4);
             if (!dq[1] || !dk[1] || !dv[1] || !dqw || !dkw || !dp) { ok("qkv_norm_rope alloc", false, "hipMalloc failed"); return; }
             for (int j = 0; j < 2; ++j) {
@@ -13140,8 +13151,10 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 st_memcpy(dk[j], hk.data(), hk.size() * 2, hipMemcpyHostToDevice);
                 st_memcpy(dv[j], hv.data(), hv.size() * 2, hipMemcpyHostToDevice);
             }
-            st_memcpy(dqw, hqw.data(), hqw.size() * 2, hipMemcpyHostToDevice);
-            st_memcpy(dkw, hkw.data(), hkw.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dqw, cl.w32 ? (const void*)hqwf.data() : (const void*)hqw.data(), wb,
+                      hipMemcpyHostToDevice);
+            st_memcpy(dkw, cl.w32 ? (const void*)hkwf.data() : (const void*)hkw.data(), wb,
+                      hipMemcpyHostToDevice);
             st_memcpy(dp, hp.data(), hp.size() * 4, hipMemcpyHostToDevice);
             const double eps = 1e-6, wadd = 0.0;
             /* --- the five, in the order the unfused block issues them --- */
@@ -13149,10 +13162,10 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                    : launch_row(np, { T(cl.vk ? dk[0] : dv[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dv[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16") });
             if (rc == RAD_OK && cl.nq)
-                rc = launch_row(nrm, { T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }), T(dqw, RAD_BF16, { cl.hd }), T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }) },
+                rc = launch_row(nrm, { T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }), T(dqw, wdt, { cl.hd }), T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }) },
                                 { PI("M", M * cl.nq), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
             if (rc == RAD_OK)
-                rc = launch_row(nrm, { T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dkw, RAD_BF16, { cl.hd }), T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
+                rc = launch_row(nrm, { T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dkw, wdt, { cl.hd }), T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
             for (int j = cl.nq ? 0 : 1; j < 2 && rc == RAD_OK; ++j)
                 rc = launch_row(rp, { T(j ? dk[0] : dq[0], RAD_BF16, { M, (j ? cl.nkv : cl.nq) * cl.hd }), T(dp, RAD_I32, { M }) },
@@ -13162,14 +13175,14 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
             /* --- the one --- */
             if (rc == RAD_OK)
                 rc = launch_row(fz, { T(dq[1], RAD_BF16, { M, QW }), T(dk[1], RAD_BF16, { M, KD }), T(dv[1], RAD_BF16, { M, KD }),
-                                      T(dp, RAD_I32, { M }), T(dqw, RAD_BF16, { cl.hd }), T(dkw, RAD_BF16, { cl.hd }) },
+                                      T(dp, RAD_I32, { M }), T(dqw, wdt, { cl.hd }), T(dkw, wdt, { cl.hd }) },
                                 { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq), PI("n_head_kv", cl.nkv),
                                   PF("theta", cl.theta), PF("eps", eps), PF("scale", 1.0), PS("mode", "neox"),
                                   PI("rotary_dim", cl.rot), PS("ladder", cl.ladder), PF("wadd", wadd),
                                   PI("v_from_k", cl.vk ? 1 : 0), PI("v_norm", cl.vn ? 1 : 0), PS("dtype", "bf16") });
             const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) +
                                      (cl.nq ? "" : " n_head=0") + (cl.vn ? "" : " v_norm=0") +
-                                     " M=" + std::to_string(M);
+                                     (cl.w32 ? " f32 gains" : "") + " M=" + std::to_string(M);
             if (rc != RAD_OK) { ok((what + " vs its five").c_str(), false, "rc=" + std::to_string(rc)); continue; }
             int nd = 0, moved = 0;
             for (int t = 0; t < 3; ++t) {
@@ -13193,7 +13206,8 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
             for (const bool f8 : { true, false }) {
                 const RadKernelInfo* ks = find(pl, f8 ? "kv_store_fp8" : "kv_store_bf16");
                 const RadKernelInfo* fk = find(pl, f8 ? "qkv_norm_rope_kv_store_fp8"
-                                                      : "qkv_norm_rope_kv_store_bf16");
+                                                      : cl.hd == 128 ? "qkv_norm_rope_kv_store_h128_bf16"
+                                                                     : "qkv_norm_rope_kv_store_bf16");
                 const std::string w2 = what + (f8 ? " + kv_store_fp8" : " + kv_store_bf16");
                 if (!ks || !fk) { ok(w2.c_str(), false, "rows absent"); continue; }
                 const int64_t bs = 16, nb = (M + bs - 1) / bs + 2, esz = f8 ? 1 : 2;
@@ -13225,7 +13239,7 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 if (r2 == RAD_OK)
                     r2 = launch_row(fk, { T(d3[0], RAD_BF16, { M, QW }), T(d3[1], RAD_BF16, { M, KD }),
                                           T(d3[2], RAD_BF16, { M, KD }), T(dp, RAD_I32, { M }),
-                                          T(dqw, RAD_BF16, { cl.hd }), T(dkw, RAD_BF16, { cl.hd }),
+                                          T(dqw, wdt, { cl.hd }), T(dkw, wdt, { cl.hd }),
                                           T(dsl, RAD_I32, { M }),
                                           T(dc[1], kvdt, { nb, cl.nkv, bs, 2 * cl.hd }) },
                                     { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq),
@@ -30589,7 +30603,7 @@ static void device_phase(const Plugin& pl) {
         gelu_mul_quant_i8_numeric(pl);
     }
     if (sel("qkv_norm_rope_bf16") || sel("qkv_norm_rope_kv_store_fp8") ||
-        sel("qkv_norm_rope_kv_store_bf16")) {
+        sel("qkv_norm_rope_kv_store_bf16") || sel("qkv_norm_rope_kv_store_h128_bf16")) {
         if (!g_case) std::printf("\nqkv_norm_rope, and with kv_store folded in, against the ops it "
                                  "replaces\n");
         qkv_norm_rope_numeric(pl);

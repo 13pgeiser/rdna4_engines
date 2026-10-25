@@ -4951,6 +4951,10 @@ static const RadConstraint cQkvNormRopeKvBf16[] = {
     C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
     C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
 };
+static const RadConstraint cQkvNormRopeKvH128Bf16[] = {
+    C_EQ("head_dim", 128), C_IN("dtype", "bf16"),
+    C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
+};
 static const RadConstraint cGeluMulQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
@@ -8626,6 +8630,18 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "kv_store_bf16",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkvNormRopeKvBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
+
+/* HYV3's 128-channel heads use the same instantiated body and BF16 cache store. */
+{ "qkv_norm_rope_kv_store_h128_bf16", "qkv_norm_rope_kv_store", "attn",
+  "per-head q/k RMS norms, NeoX rotary and BF16 paged KV store in one dispatch",
+  "head_dim 128; separate bf16 q/k/v, v_norm 0 or 1, one position component, no YaRN; "
+  "cache [n_blocks, n_head_kv, block_size, 256]",
+  "bf16 activations and cache, bf16 or f32 gains, i32 positions and slots; byte-identical to "
+  "qkv_norm_rope + kv_store_bf16, with each norm rounded before rotary",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRopeKvH128Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
   r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
 
