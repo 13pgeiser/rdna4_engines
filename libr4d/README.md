@@ -115,6 +115,27 @@ diverge by about 1 ULP.
 6. Add a case to `libr4d/r4d_selftest.cpp` so the row is called at least once; a row without one
    reports `no smoke case`.
 
+## Measuring asymmetric W4 GEMMs
+
+`r4d_selftest <libr4d.so> --perfw4 N K M [iters]` sweeps configurations of the asymmetric
+W4-weight/F16-activation kernel used by HYV3's attention and dense MLP at decode. For example,
+`--perfw4 4096 2048 1` measures its TP1 query projection. Activations are initialized and weights
+rotate through more than 256 MiB, including at small shapes. This is a timing diagnostic, not a
+correctness check or whole-model throughput result; validate candidate settings separately before
+changing deployment defaults. It does not measure the routed-expert `moe_gemm_q` kernel.
+
+`r4d_selftest <libr4d.so> --perfhyv3moe M [iters]` measures HYV3's actual TP1
+signed-I4 expert projections (gate/up 1536x2048, down 2048x768, top-8 of 128).
+It rotates the actively addressed expert codes **and** scales through more than 256 MiB,
+using identical copies behind pointer tables, and checks all output bytes against the
+original decode form. Missing rows, failed launches and mismatching outputs fail the command.
+This is a kernel timing/parity diagnostic, not a whole-model benchmark or an independent
+numerical oracle; the `moe_gemm_w4a8` selftest supplies host-decoded numerical checks.
+
+The older `--perfmoe` retains Flash-Next's asymmetric TP2 projection geometry even if a
+different expert count/top-k is given. It repeatedly addresses the same experts; a large
+allocation alone does not make its single-token measurements cold-weight measurements.
+
 ## The OCP-MXFP4 GEMM by row count
 
 `gemm_nt_q` at `mxfp4a8` has six rows over one stored weight (the skinny kernel's fragment-order
@@ -261,15 +282,6 @@ per-rank head (124160 × 5120) at 128 rows 3059 → 1984 µs, TranslateGemma's (
 2036; 65..128 rows -33..-39 %, 160..256 -26..-37 %, 64 and fewer unchanged; about 1 ms a step at 16
 streams with speculation. Same scale blocks, WMMAs and K order per output: the same bytes (the
 numeric cases at 65..150 rows for the fp8 head, 100 for the int8 head).
-
-## Measuring asymmetric W4 GEMMs
-
-`r4d_selftest <libr4d.so> --perfw4 N K M [iters]` sweeps configurations of the asymmetric
-W4-weight/F16-activation kernel used by HYV3's attention and dense MLP at decode. For example,
-`--perfw4 4096 2048 1` measures its TP1 query projection. Activations are initialized and weights
-rotate through more than 256 MiB, including at small shapes. This is a timing diagnostic, not a
-correctness check or whole-model throughput result; validate candidate settings separately before
-changing deployment defaults. It does not measure the routed-expert `moe_gemm_q` kernel.
 
 ## Notes on the kernels
 

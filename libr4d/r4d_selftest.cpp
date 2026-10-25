@@ -15191,6 +15191,137 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     }
 }
 
+/* HYV3's actual TP1 signed-I4 geometry. Replicate only live experts, behind rotating pointer
+ * tables, so the *addressed* code+scale working set exceeds 256 MiB even at a single token.
+ * Copies have identical bytes: timing a different bank must not change the cross-form answer.
+ * This checks byte parity with the original kernels; moe_w4_gemm supplies the independent oracle. */
+static void hyv3_moe_perf(const Plugin& pl, int64_t Mtok, int iters) {
+    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
+    if (!r || !pl.pin_moe) { ok("HYV3 MoE timing", false, "row or form pin absent"); return; }
+    constexpr int64_t E = 128, top_k = 8, group = 128;
+    const int64_t Tr = Mtok * top_k;
+    uint64_t seed = 0x9e3779b97f4a7c15ull;
+    auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    auto unif = [&]() { return ((double)(rnd() >> 11) + 0.5) / 9007199254740992.0; };
+    std::vector<double> popularity(E);
+    for (double& v : popularity)
+        v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
+    std::vector<std::vector<int32_t>> routes(E);
+    std::vector<std::pair<double, int>> score(E);
+    for (int64_t t = 0; t < Mtok; ++t) {
+        for (int e = 0; e < E; ++e) score[e] = { popularity[e] - std::log(-std::log(unif())), e };
+        std::partial_sort(score.begin(), score.begin() + top_k, score.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (int j = 0; j < top_k; ++j) routes[score[j].second].push_back((int32_t)(t * top_k + j));
+    }
+    std::vector<int32_t> off(E + 1), sorted;
+    std::vector<int64_t> active[2];
+    for (int64_t e = 0; e < E; ++e) {
+        sorted.insert(sorted.end(), routes[e].begin(), routes[e].end());
+        off[e + 1] = (int32_t)sorted.size();
+        if (!routes[e].empty()) active[e & 1].push_back(e / 2);
+    }
+    void* ds = dalloc(sorted.size() * 4), *doo = dalloc(off.size() * 4);
+    if (!ds || !doo) { ok("HYV3 MoE timing", false, "routing allocation failed"); return; }
+    st_memcpy(ds, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(doo, off.data(), off.size() * 4, hipMemcpyHostToDevice);
+    struct Proj { const char* name; int64_t n, k, parts; bool sorted; };
+    for (const Proj& p : { Proj{ "gate_up", 1536, 2048, 2, false },
+                           Proj{ "down", 2048, 768, 1, true } }) {
+        const int64_t Ma = p.sorted ? Tr : Mtok, kb = p.k / group;
+        const size_t wb = (size_t)(p.n * p.k / 2), sb = (size_t)(p.n * kb * 2);
+        const size_t live = active[0].size() + active[1].size();
+        const size_t copies = std::max<size_t>(2, (256u << 20) / (live * (wb + sb)) + 1);
+        const int count = (int)std::max<size_t>((size_t)iters, 4 * copies);
+        std::vector<uint8_t> aq((size_t)(Ma * p.k));
+        for (auto& b : aq) b = (uint8_t)((8 + rnd() % 111) | ((rnd() & 1) << 7));
+        std::vector<float> as((size_t)(Ma * kb), 0.013f);
+        void* da = dalloc(aq.size()), *das = dalloc(as.size() * 4);
+        void* dy = dalloc((size_t)(Tr * p.n * 2));
+        void* wt[2]{}, *st[2]{};
+        if (!da || !das || !dy) { ok(p.name, false, "activation allocation failed"); return; }
+        st_memcpy(da, aq.data(), aq.size(), hipMemcpyHostToDevice);
+        st_memcpy(das, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+        for (int c = 0; c < 2; ++c) {
+            const size_t slots = std::max<size_t>(1, active[c].size());
+            std::vector<uint8_t> w(slots * wb);
+            for (auto& b : w) b = (uint8_t)rnd();
+            std::vector<uint16_t> s(slots * sb / 2, h_to_bf16(0.02f));
+            void* dw = dalloc(w.size() * copies), *dsc = dalloc(s.size() * 2 * copies);
+            if (!dw || !dsc) { ok(p.name, false, "cold plane allocation failed"); return; }
+            std::vector<const void*> wp(copies * (E / 2)), sp(wp.size());
+            for (size_t b = 0; b < copies; ++b) {
+                auto* wbase = (uint8_t*)dw + b * w.size();
+                auto* sbase = (uint8_t*)dsc + b * s.size() * 2;
+                st_memcpy(wbase, w.data(), w.size(), hipMemcpyHostToDevice);
+                st_memcpy(sbase, s.data(), s.size() * 2, hipMemcpyHostToDevice);
+                for (int64_t e = 0; e < E / 2; ++e) {
+                    wp[b * (E / 2) + e] = wbase;
+                    sp[b * (E / 2) + e] = sbase;
+                }
+                for (size_t j = 0; j < active[c].size(); ++j) {
+                    wp[b * (E / 2) + active[c][j]] = wbase + j * wb;
+                    sp[b * (E / 2) + active[c][j]] = sbase + j * sb;
+                }
+            }
+            wt[c] = dalloc(wp.size() * sizeof(void*));
+            st[c] = dalloc(sp.size() * sizeof(void*));
+            if (!wt[c] || !st[c]) { ok(p.name, false, "pointer table allocation failed"); return; }
+            st_memcpy(wt[c], wp.data(), wp.size() * sizeof(void*), hipMemcpyHostToDevice);
+            st_memcpy(st[c], sp.data(), sp.size() * sizeof(void*), hipMemcpyHostToDevice);
+        }
+        std::vector<RadTensor> ts = {
+            T(da, RAD_F8E4M3, { Ma, p.k }), T(das, RAD_F32, { Ma, kb }),
+            T(wt[0], R4D_DT_MOEW4, { E / 2, p.n, p.k }),
+            T(st[0], RAD_BF16, { E / 2, p.n, kb }),
+            T(ds, RAD_I32, { Tr }), T(doo, RAD_I32, { E + 1 }),
+            T(wt[1], R4D_DT_MOEW4, { E / 2, p.n, p.k }),
+            T(st[1], RAD_BF16, { E / 2, p.n, kb }), T(dy, RAD_BF16, { Tr, p.n }) };
+        for (int i : { 2, 3, 6, 7 }) ts[i].stride[0] = 0;
+        std::vector<RadParam> ps = { PI("M", Mtok), PI("N", p.n), PI("K", p.k),
+            PI("parts", p.parts), PI("n_expert", E), PI("top_k", top_k), PI("group", group),
+            PS("a_order", p.sorted ? "sorted" : "token"), PS("dtype", "w4a8") };
+        RadArgs a{};
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        a.scratch_bytes = (1 + 2 * (E + Tr / 16 + 2)) * 4;
+        a.scratch = dalloc((size_t)a.scratch_bytes);
+        if (!a.scratch) { ok(p.name, false, "map allocation failed"); return; }
+        std::vector<uint16_t> reference((size_t)(Tr * p.n)), got(reference.size());
+        bool ran = true;
+        auto launch = [&](int i) {
+            if (!ran) return;
+            const size_t bank = (size_t)i % copies;
+            for (int c = 0; c < 2; ++c) {
+                ts[2 + 4 * c].data = (uint8_t*)wt[c] + bank * (E / 2) * sizeof(void*);
+                ts[3 + 4 * c].data = (uint8_t*)st[c] + bank * (E / 2) * sizeof(void*);
+            }
+            ran = r->launch(&a, nullptr) == RAD_OK;
+        };
+        std::printf("HYV3 %s M=%lld Tr=%lld E=128 top_k=8 N=%lld K=%lld: %zu live experts, "
+                    "%zu cold banks (%.1f MiB addressed), %d iterations\n", p.name,
+                    (long long)Mtok, (long long)Tr, (long long)p.n, (long long)p.k,
+                    live, copies, copies * live * (wb + sb) / 1048576.0, count);
+        // The original decode form is the baseline. Every subsequent form must match all bytes.
+        for (int form : { 2, 0, 1, 3 }) {
+            pl.pin_moe(form);
+            if (pl.pin_fk) pl.pin_fk(0);
+            for (size_t i = 0; i < 2 * copies; ++i) launch((int)i);
+            if (!ran || st_stream_sync(nullptr) != hipSuccess) {
+                pl.pin_moe(0);
+                ok(p.name, false, "warmup launch/sync failed"); return;
+            }
+            const double us = st_time_us(launch, count, nullptr);
+            st_memcpy(got.data(), dy, got.size() * 2, hipMemcpyDeviceToHost);
+            if (form == 2) reference = got;
+            ok((std::string("HYV3 ") + p.name + " form=" + std::to_string(form)).c_str(),
+               ran && got == reference, "cold-bank output bytes vs original decode form");
+            std::printf("  form=%d %.3f us\n", form, us);
+        }
+        pl.pin_moe(0);
+    }
+}
+
 /* The launcher's kPf2MinRows: from this band the rule takes the PF2 form and the scratch hook
  * sizes `u` for its weight planes; below it the pin to PF2 is refused. */
 static constexpr int64_t kHcPf2MinRows = 512;
@@ -20397,7 +20528,7 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
  * whose stored row is its nibbles then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the
  * same experts and holds it to the two-class op's bytes. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
-                        bool w5 = false, bool four = false) {
+                        bool w5 = false, bool four = false, int64_t top_k = 2) {
     const bool g64 = sub > 1;
     const float* tab = w5 ? kW5nlTable : kW4nlTable;
     static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
@@ -20413,7 +20544,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                               : g64 ? ", w4nl64a8h" : "") + ")";
     const char* dt = w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
 
-    const int64_t ne = sh.ne, group = 128, top_k = 2;
+    const int64_t ne = sh.ne, group = 128;
     const int64_t Nc[2] = { sh.N0, sh.N1 }, Kc[2] = { sh.K0, sh.K1 };
     const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
     const int64_t N = std::max(sh.N0, sh.N1), K = std::max(sh.K0, sh.K1);
@@ -20580,7 +20711,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         }
     }
 
-    const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    const bool small_i4 = Tr <= top_k && Tr <= 32 && !g64 && !w5;
+    const int f_lo = pl.pin_moe && !small_i4 ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
     std::vector<uint16_t> two_cls[4];      /* each form's bytes, for the four-class pass below */
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what + " " + kForm[form];
@@ -20623,6 +20755,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                     " elements off, worst " + std::to_string(worst) + first);
         two_cls[form] = got;
     }
+    if (!two_cls[0].empty() && !two_cls[2].empty())
+        ok((what + " rule, byte for byte with the pinned decode form").c_str(),
+           two_cls[0] == two_cls[2]);
     /* The decode form against the uniform prefill grid, byte for byte (every form keeps each
      * element's accumulation order). The decode form finds runs by a one-round-trip search up to
      * 512 experts and a chunked search above; the grid uses a binary search, a third way. */
@@ -30084,6 +30219,16 @@ static void device_phase(const Plugin& pl) {
      * name, so a case nested in another row's block would never run. */
     if (sel("moe_gemm_w4a8")) {
         if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM, against a host decode\n");
+        // Exact HYV3 shapes and one-token routing; the rule also runs beside all pinned forms.
+        moe_w4_gemm(pl, 8, { "HYV3 gate/up", 1536, 2048, 1536, 2048, 2, 128 },
+                    0, false, true, 8);
+        moe_w4_gemm(pl, 8, { "HYV3 down", 2048, 768, 2048, 768, 1, 128, true },
+                    0, false, true, 8);
+        // Repeated runs, mixed class widths/K and padding, including sorted activation rows.
+        moe_w4_gemm(pl, 8, { "small mixed gate/up", 256, 256, 128, 128, 2, 5 },
+                    0, false, true, 8);
+        moe_w4_gemm(pl, 8, { "small mixed down", 256, 256, 128, 128, 1, 3, true },
+                    0, false, false, 8);
         /* One geometry; a gate/up pair whose odd experts are half as wide; a down projection whose
          * odd experts are half as long; and a decode-shaped routing (a few runs over hundreds of
          * mostly empty experts) for the decode grid's run search. */
@@ -30903,6 +31048,9 @@ static void usage(void) {
                 "             time each launch alone, the median reported. Warm, a weight under\n"
                 "             64 MiB is read from cache after the first launch; the engine reads\n"
                 "             its weights cold.\n"
+                "  --perfhyv3moe M [iters]: HYV3 TP1 signed-I4 gate/up and down (top-8/128),\n"
+                "             rotating live expert codes/scales past 256 MiB, byte parity vs\n"
+                "             the original forms. M 1..256 token rows; default 100 iterations.\n"
                 "  --perfmoe M [iters] [experts] [top_k] [pooled%%]:  the routed-expert w4 GEMM,\n"
                 "             both projections at rank 0's tp2 width split, over a skewed routing of\n"
                 "             an M-token chunk (512 experts, top 10 by default); every form, each\n"
@@ -31014,7 +31162,8 @@ int main(int argc, char** argv) {
     int qsa_it = 200;
     long long hc_m = 0;
     int hc_it = 20;
-    long long moe_m = 0, moe_e = 512, moe_k = 10;
+    long long moe_m = 0, moe_e = 512, moe_k = 10, hy_m = 0;
+    int hy_it = 100;
     int moe_pool = 0;
     int moe_it = 20;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
@@ -31158,6 +31307,13 @@ int main(int argc, char** argv) {
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
         } else if (!std::strcmp(argv[i], "--timeline")) {
             g_timeline = true;
+        } else if (!std::strcmp(argv[i], "--perfhyv3moe")) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            hy_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') hy_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (hy_m < 1 || hy_m > 256 || hy_it < 1) {
+                std::fprintf(stderr, "--perfhyv3moe: M 1..256, iters > 0\n"); return 2;
+            }
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -31370,6 +31526,16 @@ int main(int argc, char** argv) {
         skip("runtime LoRA timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (hy_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hyv3_moe_perf(pl, hy_m, hy_it);
+        dfree_all();
+#else
+        skip("HYV3 expert GEMM timing", "built without HIP");
+#endif
+        return g_fail || g_skip ? 1 : 0;
     }
     if (moe_m) {
         if (!load(&pl, path)) return 1;
