@@ -8770,22 +8770,33 @@ pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
 /// VerifyAttn Stage 0 (gfx1201): `attention_verify_gqa_{q8,fp8}_gfx1201`, the
 /// GQA-shared split-K twins of the batched Q8_0 / fp8 flash tiles (one KV scan
 /// per kv head for 8 query rows x 6 q heads, fixed context-independent grid),
-/// `attention_verify_gqa_fp8_gqa8_gfx1201` (fp8 only, H16/KV2 GQA group 8: 6
-/// query rows x 8 q heads per workgroup), and `attention_verify_reduce_gfx1201`,
-/// the parallel twin of
+/// `attention_verify_gqa_fwht{4,3}_gfx1201` (twins of the fwht4 / fwht3 K tiles
+/// with Q8_0 V; they take the K rotation's sign tables as two extra kernel
+/// arguments), `attention_verify_gqa_fp8_gqa8_gfx1201` (fp8 only, H16/KV2 GQA
+/// group 8: 6 query rows x 8 q heads per workgroup), and
+/// `attention_verify_reduce_gfx1201`, the parallel twin of
 /// [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]. Partials and output are
 /// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6
 /// (and GQA 8 for the group-8 entry).
 pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_gqa.gfx1201.hip");
-/// VerifyAttn Stage 0 (gfx1100, Q8 only): `attention_verify_gqa_q8_gfx1100`
+/// VerifyAttn Stage 0 (gfx1100): `attention_verify_gqa_q8_gfx1100`
 /// (twin of `attention_flash_q8_0_tile_batched`),
+/// `attention_verify_gqa_fwht{4,3}_gfx1100` (twins of the fwht4 / fwht3 K tiles
+/// with Q8_0 V, sign tables as two extra kernel arguments),
 /// `attention_verify_gqa_q8_rows_gfx1100` (twin of the multi-row
 /// `attention_flash_q8_0_rows{8,4}_d8`) and `attention_verify_reduce_gfx1100`
 /// (twin of [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]); byte-identical
-/// partials and output at head_dim 256, GQA 6.
-pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip");
+/// partials and output at head_dim 256, GQA 6. The fwht entries use the
+/// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
+/// `kernels/src`, so the header is prepended and the source's guarded
+/// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
+    "#define VA_TURBO_COMMON_INLINED 1\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    "\n",
+    include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip")
+);
 /// VerifyAttn (gfx1151): `attention_verify_wmma_qk_gfx1151` (context-parallel
 /// S = Q.K^T tiles, one K dequant per kv head, f16 S to scratch) and
 /// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online

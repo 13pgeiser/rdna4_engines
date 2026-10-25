@@ -657,6 +657,14 @@ fn replay_stable_tile_count(
 pub enum VerifyKv {
     Q8,
     Fp8,
+    /// `attention_flash_fwht4_tile_batched` with Q8_0 V (`v_mode` 8): fwht4 K
+    /// records (f32 cnorm + 128 B of 4-bit codes per kv head, per-128-half
+    /// signed-FWHT-rotated). The launch takes the rotation's sign tables.
+    Fwht4,
+    /// `attention_flash_fwht3_tile_batched` with Q8_0 V (`v_mode` 8): fwht3 K
+    /// records (f32 cnorm + 96 B of 3-bit codes per kv head, 256-wide
+    /// signed-FWHT-rotated). The launch takes the rotation's sign tables.
+    Fwht3,
 }
 
 /// VerifyAttn Stage-0 kernel set of one arch: GQA-shared split-K twins of
@@ -674,6 +682,11 @@ struct VerifyGqaKernels {
     src: &'static str,
     tile_q8: Option<&'static str>,
     tile_fp8: Option<&'static str>,
+    /// fwht4 / fwht3 K twins (Q8_0 V): the 10-argument ABI of `tile_q8` plus
+    /// the signed-FWHT sign tables (`signs1`, `signs2`) as two trailing pointer
+    /// kernel arguments; same grid, block and split policy.
+    tile_fwht4: Option<&'static str>,
+    tile_fwht3: Option<&'static str>,
     /// Group-8 (H16/KV2) fp8 twin of `tile_fp8`: same ABI and partials, 6 rows
     /// per workgroup ([`VERIFY_GQA8_ROWS`]); `reduce` is shared.
     tile_fp8_gqa8: Option<&'static str>,
@@ -701,6 +714,8 @@ const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
     src: kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC,
     tile_q8: Some("attention_verify_gqa_q8_gfx1201"),
     tile_fp8: Some("attention_verify_gqa_fp8_gfx1201"),
+    tile_fwht4: Some("attention_verify_gqa_fwht4_gfx1201"),
+    tile_fwht3: Some("attention_verify_gqa_fwht3_gfx1201"),
     tile_fp8_gqa8: Some("attention_verify_gqa_fp8_gqa8_gfx1201"),
     rows_q8: None,
     reduce: "attention_verify_reduce_gfx1201",
@@ -712,6 +727,8 @@ const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
     src: kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
     tile_q8: Some("attention_verify_gqa_q8_gfx1100"),
     tile_fp8: None,
+    tile_fwht4: Some("attention_verify_gqa_fwht4_gfx1100"),
+    tile_fwht3: Some("attention_verify_gqa_fwht3_gfx1100"),
     tile_fp8_gqa8: None,
     rows_q8: Some("attention_verify_gqa_q8_rows_gfx1100"),
     reduce: "attention_verify_reduce_gfx1100",
@@ -10248,7 +10265,10 @@ impl Gpu {
     /// head_dim 256, GQA group 6, tile 128, non-tree full causal legacy-slot
     /// KV, not recording a Redline tape, partials fit one row. The grid is
     /// `[ceil(rows/8) * n_kv_heads, splits]` with the tile range derived from
-    /// `positions` on the device, so it is graph-capture-stable.
+    /// `positions` on the device, so it is graph-capture-stable. The fwht
+    /// kinds ([`VerifyKv::Fwht4`] / [`VerifyKv::Fwht3`], Q8_0 V) require
+    /// `signs = Some((signs1, signs2))`, the sign tables of the reference
+    /// tile's Q rotation (`Ok(false)` without them); Q8 / fp8 ignore it.
     #[allow(clippy::too_many_arguments)]
     pub fn try_attention_verify_gqa(
         &mut self,
@@ -10266,6 +10286,7 @@ impl Gpu {
         partials: &GpuTensor,
         tree_bias: Option<&GpuTensor>,
         block_cols: usize,
+        signs: Option<(&GpuTensor, &GpuTensor)>,
     ) -> HipResult<bool> {
         if tree_bias.is_some() || block_cols != 0 {
             return Ok(false);
@@ -10283,6 +10304,7 @@ impl Gpu {
             max_ctx_len,
             batch_size,
             partials,
+            signs,
         )
     }
 
@@ -10323,6 +10345,7 @@ impl Gpu {
             max_ctx_len,
             batch_size,
             partials,
+            None,
         )
     }
 
@@ -10341,6 +10364,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        signs: Option<(&GpuTensor, &GpuTensor)>,
     ) -> HipResult<bool> {
         if !self.flags.verify_attn || self.replay.is_recording() {
             return Ok(false);
@@ -10351,7 +10375,18 @@ impl Gpu {
         let (tile_func, group_rows) = match reference {
             VerifyGqaRef::Tile(VerifyKv::Q8) => (set.tile_q8, None),
             VerifyGqaRef::Tile(VerifyKv::Fp8) => (set.tile_fp8, None),
+            VerifyGqaRef::Tile(VerifyKv::Fwht4) => (set.tile_fwht4, None),
+            VerifyGqaRef::Tile(VerifyKv::Fwht3) => (set.tile_fwht3, None),
             VerifyGqaRef::Rows(rows) => (set.rows_q8, Some(rows as i32)),
+        };
+        // The fwht twins take the rotation's sign tables as two trailing
+        // pointer kernel arguments; without them the launch is not admitted.
+        let signs_ptrs: Option<(*mut c_void, *mut c_void)> = match (reference, signs) {
+            (VerifyGqaRef::Tile(VerifyKv::Fwht4 | VerifyKv::Fwht3), Some((s1, s2))) => {
+                Some((s1.buf.as_ptr(), s2.buf.as_ptr()))
+            }
+            (VerifyGqaRef::Tile(VerifyKv::Fwht4 | VerifyKv::Fwht3), None) => return Ok(false),
+            _ => None,
         };
         let Some(tile_func) = tile_func else {
             return Ok(false);
@@ -10412,6 +10447,8 @@ impl Gpu {
                 let bo = offset as i32;
                 let sc = scale;
                 let gr = group_rows.unwrap_or(0);
+                let (s1_ptr, s2_ptr) =
+                    signs_ptrs.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -10426,6 +10463,10 @@ impl Gpu {
                 ];
                 if group_rows.is_some() {
                     params.push(&gr as *const _ as *mut c_void);
+                }
+                if signs_ptrs.is_some() {
+                    params.push(&s1_ptr as *const _ as *mut c_void);
+                    params.push(&s2_ptr as *const _ as *mut c_void);
                 }
                 self.launch_maybe_blob(
                     tile_func,
@@ -10447,6 +10488,10 @@ impl Gpu {
                         b.push_f32(sc);
                         if group_rows.is_some() {
                             b.push_i32(gr);
+                        }
+                        if signs_ptrs.is_some() {
+                            b.push_ptr(s1_ptr);
+                            b.push_ptr(s2_ptr);
                         }
                         b
                     },
@@ -10739,6 +10784,7 @@ impl Gpu {
             partials,
             tree_bias,
             block_cols,
+            None,
         )? {
             return Ok(());
         }
@@ -10823,6 +10869,7 @@ impl Gpu {
             partials,
             tree_bias,
             block_cols,
+            None,
         )? {
             return Ok(());
         }
@@ -14902,6 +14949,30 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // VerifyAttn twin (Q8_0 V only): byte-identical partials and output,
+        // GQA-shared. No slot descriptors exist on this entry, so the legacy
+        // single-slot layout the twin reads is the one the reference reads.
+        if v_mode_bits == V_MODE_Q8
+            && self.try_attention_verify_gqa(
+                VerifyKv::Fwht4,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_cols,
+                Some((signs1, signs2)),
+            )?
+        {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fwht4_tile_batched",
             kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,
@@ -15540,6 +15611,30 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // VerifyAttn twin (Q8_0 V only): byte-identical partials and output,
+        // GQA-shared. No slot descriptors exist on this entry, so the legacy
+        // single-slot layout the twin reads is the one the reference reads.
+        if v_mode_bits == V_MODE_Q8
+            && self.try_attention_verify_gqa(
+                VerifyKv::Fwht3,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_cols,
+                Some((signs1, signs2)),
+            )?
+        {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fwht3_tile_batched",
             kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
