@@ -1339,18 +1339,18 @@ TEST(the_prefix_cache_host_tier_is_off_only_when_streaming_is_really_on) {
     };
     const Case cases[] = {
         { "the flag absent",           0,          false, 2048 },
-        { "a ring covering the ctx",   2 * 1024,   false, 2048 },
+        { "a ring covering the ctx",   2 * 65536,  false, 2048 },
         { "a ring under the ctx",      256,        true,  0    },
     };
     for (const Case& c : cases) {
         Fixture f;
         f.cfg.checkpoint_slots = 0;
-        f.cfg.max_ctx = 1024;
+        f.cfg.max_ctx = 65536;                             /* clears the 32 768-token floor */
         f.cfg.max_seqs = 2;
         f.cfg.kv_resident = c.resident;
         f.cfg.prefix_cache_mib = 2048;
         CHECK_OK(f.kv.plan_groups(groups, f.cfg));
-        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, c.streams ? narrow : wide, 1024));
+        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, c.streams ? narrow : wide, f.cfg.max_ctx));
         CHECK_EQ(f.cfg.kv_streams, c.streams);
         const int64_t off = kvstream_prefix_host_off(f.cfg);
         CHECK_EQ(f.cfg.prefix_cache_mib, c.tier_after);
@@ -1392,35 +1392,39 @@ TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {
      * the ceiling, which is what the carve must take. */
     Fixture f;
     f.cfg.checkpoint_slots = 0;
-    f.cfg.max_ctx = 1024;
+    /* The context must clear the shipped floor (kStreamFloorTokens, 32 768 tokens) for the step
+     * ceiling to be the binding bound: 2 x 65 536 tokens = 8192 blocks of 16. */
+    f.cfg.max_ctx = 65536;
     f.cfg.max_seqs = 2;
     f.cfg.n_spec = 0;
+    f.cfg.vram_kv_mib = 64;
     std::vector<KVGroupInfo> groups = hybrid_groups();
     groups[G_FULL].decl.dtype = RAD_F8E4M3;               /* the streamed store's one row */
     groups[G_FULL].bytes_per_block = 2048;                 /* as declare sets it */
-    const int64_t sel_pitch = 8;                           /* a synthetic indexer's topk + 1 */
-    const int64_t ctx_blocks = 2 * (1024 / 16);            /* 128 blocks of 16 tokens */
+    const int64_t sel_pitch = 2048;                        /* a synthetic indexer's topk + 1 */
+    const int64_t ctx_blocks = 2 * (65536 / 16);           /* 8192 blocks of 16 tokens */
     const Program prog = stream_program(groups[G_FULL], sel_pitch);
     CHECK_OK(configure_pools(f.pools, f.cfg));
     CHECK_OK(f.kv.plan_groups(groups, f.cfg));
-    /* The ceiling is 2 sequences x 1 row x sel_pitch = 16 blocks = 256 tokens. */
-    f.cfg.kv_resident = 128;                               /* 8 blocks: half of it */
+    /* The ceiling is 2 sequences x 1 row x sel_pitch = 4096 blocks = 65 536 tokens, above the
+     * shipped floor of 2048 blocks (32 768 tokens) and under the 8192-block context. */
+    f.cfg.kv_resident = 128;                               /* 8 blocks: far under it */
     KVStreamSetup s;
     const std::string log = stderr_of([&] {
         /* The budget probe prices the ring the carve will take, both of them raised. */
-        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, prog, 1024));
-        CHECK_OK(kvstream_configure(f.cfg, 1024, groups, prog, &s));
+        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, prog, 65536));
+        CHECK_OK(kvstream_configure(f.cfg, 65536, groups, prog, &s));
     });
-    CHECK(has(log, "--kv-resident 128 raised to 256 tokens"));
-    CHECK(has(log, "a decode step can name 16 blocks of 16 blocks each"));
-    CHECK(has(log, "(--max-num-seqs 2 x 1 for speculation x 8)"));
+    CHECK(has(log, "--kv-resident 128 raised to 65536 tokens"));
+    CHECK(has(log, "a decode step can name 4096 blocks of 16 blocks each"));
+    CHECK(has(log, "(--max-num-seqs 2 x 1 for speculation x 2048)"));
     /* Raised, not refused: the flag is as the operator left it and the plan is the ceiling. */
     CHECK_EQ(f.cfg.kv_resident, (int64_t)128);
     CHECK_EQ(s.group, (int32_t)G_FULL);
     CHECK_EQ(s.asked_tokens, (int64_t)128);
-    CHECK_EQ(s.raised_tokens, (int64_t)256);
-    CHECK_EQ(s.ring_blocks, (int64_t)16);
-    CHECK_EQ(s.ring_tokens, (int64_t)256);
+    CHECK_EQ(s.raised_tokens, (int64_t)65536);
+    CHECK_EQ(s.ring_blocks, (int64_t)4096);
+    CHECK_EQ(s.ring_tokens, (int64_t)65536);
     CHECK_EQ(s.ctx_blocks, ctx_blocks);
     CHECK_EQ(s.stage_blocks, ctx_blocks);                  /* one layer, the whole context */
 
@@ -1431,56 +1435,57 @@ TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {
     const KVGroupPlan* p = f.kv.plan(G_FULL);
     CHECK(p->streamed());
     CHECK_EQ(p->n_blocks, ctx_blocks);
-    CHECK_EQ(p->n_slots, (int64_t)16);                     /* the ceiling */
+    CHECK_EQ(p->n_slots, (int64_t)4096);                   /* the ceiling */
     CHECK_EQ(p->n_slots, s.ring_blocks);
-    CHECK_EQ(f.kv.stream_map(G_FULL)->slots, (int64_t)16);
-    CHECK_EQ(f.kv.stream_stats().resident_blocks, (int64_t)16);
+    CHECK_EQ(f.kv.stream_map(G_FULL)->slots, (int64_t)4096);
+    CHECK_EQ(f.kv.stream_stats().resident_blocks, (int64_t)4096);
 
     /* And the startup report says so in the ring's own line, not only in the warning: the ring is
      * no longer what the operator typed, and the report is what people read afterwards. */
     KVStreamHostUse use;
     kvstream_host_add(&use, f.kv);
     const std::string rep = stderr_of([&] { kvstream_report(s, use, 1); });
-    CHECK(has(rep, "--kv-resident 128 became 256 tokens"));
-    CHECK(has(rep, "(8 -> 16 blocks of 16 tokens each)"));
-    CHECK(has(rep, "ring 16 blocks"));                     /* the staging line quotes the ring */
+    CHECK(has(rep, "--kv-resident 128 became 65536 tokens"));
+    CHECK(has(rep, "(8 -> 4096 blocks of 16 tokens each)"));
+    CHECK(has(rep, "ring 4096 blocks"));                     /* the staging line quotes the ring */
     f.kv.free_stream(rad_malloc_allocator());
 
     /* Under speculation a verify step runs the drafts beside the accepted position, so the rows --
-     * and the ceiling -- scale by 1 + n_spec: 2 x 4 x 8 = 64 blocks = 1024 tokens. */
+     * and the ceiling -- scale by 1 + n_spec: 2 x 4 x 512 = 4096 blocks = 65 536 tokens. */
     {
+        const Program spec = stream_program(groups[G_FULL], 512);
         Fixture g;
         g.cfg.checkpoint_slots = 0;
-        g.cfg.max_ctx = 1024;
+        g.cfg.max_ctx = 65536;
         g.cfg.max_seqs = 2;
         g.cfg.n_spec = 3;
-        g.cfg.kv_resident = 512;                           /* 32 blocks: enough without speculation */
+        g.cfg.vram_kv_mib = 64;
+        g.cfg.kv_resident = 512;                           /* 32 blocks: far under the ceiling */
         KVStreamSetup o;
         const std::string l = stderr_of([&] {
-            CHECK_OK(kvstream_configure(g.cfg, 1024, groups, prog, &o));
+            CHECK_OK(kvstream_configure(g.cfg, 65536, groups, spec, &o));
         });
-        CHECK(has(l, "--kv-resident 512 raised to 1024 tokens"));
-        CHECK(has(l, "(--max-num-seqs 2 x 4 for speculation x 8)"));
+        CHECK(has(l, "(--max-num-seqs 2 x 4 for speculation x 512)"));
         CHECK_EQ(o.group, (int32_t)G_FULL);
-        CHECK_EQ(o.ring_blocks, (int64_t)64);
-        CHECK_EQ(o.raised_tokens, (int64_t)1024);
+        CHECK_EQ(o.ring_blocks, (int64_t)4096);
+        CHECK_EQ(o.raised_tokens, (int64_t)65536);
     }
-    /* At the ceiling nothing is raised and the ring is the flag's own number. */
+    /* At or above the ceiling nothing is raised and the ring is the flag's own number. */
     {
         Fixture g;
         g.cfg.checkpoint_slots = 0;
-        g.cfg.max_ctx = 1024;
+        g.cfg.max_ctx = 65536;
         g.cfg.max_seqs = 2;
-        g.cfg.n_spec = 3;
-        g.cfg.kv_resident = 1024;                          /* exactly 2 x 4 x 8 blocks of 16 */
+        g.cfg.n_spec = 0;
+        g.cfg.kv_resident = 65536;                         /* exactly 2 x 1 x 2048 blocks of 16 */
         KVStreamSetup o;
         const std::string l = stderr_of([&] {
-            CHECK_OK(kvstream_configure(g.cfg, 1024, groups, prog, &o));
+            CHECK_OK(kvstream_configure(g.cfg, 65536, groups, prog, &o));
         });
         CHECK(!has(l, "raised"));
         CHECK_EQ(o.raised_tokens, (int64_t)0);
-        CHECK_EQ(o.ring_blocks, (int64_t)64);
-        CHECK_EQ(o.ring_tokens, (int64_t)1024);
+        CHECK_EQ(o.ring_blocks, (int64_t)4096);
+        CHECK_EQ(o.ring_tokens, (int64_t)65536);
     }
 }
 
@@ -1494,16 +1499,16 @@ TEST(a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag) {
      * ignored with one line, and the server runs exactly as if it had not been given. */
     Fixture f;
     f.cfg.checkpoint_slots = 0;
-    f.cfg.max_ctx = 1024;
+    f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
     f.cfg.max_seqs = 2;
-    f.cfg.kv_resident = 256;                             /* 16 blocks against a 128-block context */
+    f.cfg.kv_resident = 256;                             /* under the ring floor, so it is raised */
     std::vector<KVGroupInfo> groups = hybrid_groups();
     groups[G_FULL].bytes_per_block = 2048;               /* 16 tokens x 2 kv heads x 8 x 2 B x 2 layers */
     const Program none =
         stream_program(groups[G_FULL], 8, /*with_resolve=*/false, /*with_store=*/false);
     KVStreamSetup s;
     int st = RAD_OK;
-    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, none, &s); });
+    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 65536, groups, none, &s); });
     CHECK_OK(st);                                        /* ignored, not refused */
     CHECK_EQ(s.group, -1);
     CHECK_EQ(s.asked_tokens, (int64_t)0);                /* nothing is claimed, so nothing is reported */
@@ -1518,7 +1523,7 @@ TEST(a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag) {
      * and the miss list meaningless, so the warning names that op instead. */
     KVStreamSetup half;
     const std::string log2 = stderr_of([&] {
-        CHECK_OK(kvstream_configure(f.cfg, 1024, groups,
+        CHECK_OK(kvstream_configure(f.cfg, 65536, groups,
                                     stream_program(groups[G_FULL], 8, true, false), &half));
     });
     CHECK_EQ(half.group, -1);
@@ -1527,9 +1532,9 @@ TEST(a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag) {
     /* And the fail-safe never turns a working architecture off: the same configuration with both
      * ops declared streams the ring it was sized for. */
     KVStreamSetup ok;
-    CHECK_OK(kvstream_configure(f.cfg, 1024, groups, stream_program(groups[G_FULL], 8), &ok));
+    CHECK_OK(kvstream_configure(f.cfg, 65536, groups, stream_program(groups[G_FULL], 8), &ok));
     CHECK_EQ(ok.group, (int32_t)G_FULL);
-    CHECK_EQ(ok.ring_blocks, (int64_t)16);
+    CHECK_EQ(ok.ring_blocks, (int64_t)2048);   /* raised to the 32 768-token floor */
     CHECK_EQ(ok.stage_blocks, ok.ctx_blocks);
 }
 
@@ -1542,9 +1547,9 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
      * copies zeros out of it. Modelled the way the builder produces it: one band, no domain bound. */
     Fixture f;
     f.cfg.checkpoint_slots = 0;
-    f.cfg.max_ctx = 1024;
+    f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
     f.cfg.max_seqs = 2;
-    f.cfg.kv_resident = 256;                             /* 16 blocks against a 128-block context */
+    f.cfg.kv_resident = 256;                             /* under the ring floor, so it is raised */
     std::vector<KVGroupInfo> groups = hybrid_groups();
     groups[G_FULL].decl.dtype = RAD_F8E4M3;
     groups[G_FULL].bytes_per_block = 2048;
@@ -1563,7 +1568,7 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
     KVStreamSetup s;
     int st = RAD_OK;
     const std::string log =
-        stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, unresolved, &s); });
+        stderr_of([&] { st = kvstream_configure(f.cfg, 65536, groups, unresolved, &s); });
     CHECK_OK(st);                                        /* ignored, not carved */
     CHECK_EQ(s.group, -1);
     CHECK_EQ(s.asked_tokens, (int64_t)0);
@@ -1586,9 +1591,9 @@ TEST(a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed)
     for (const char* dtype : { "fp8_v4", "k6_v4" }) {
         Fixture f;
         f.cfg.checkpoint_slots = 0;
-        f.cfg.max_ctx = 1024;
+        f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
         f.cfg.max_seqs = 2;
-        f.cfg.kv_resident = 256;                         /* 16 blocks against a 128-block context */
+        f.cfg.kv_resident = 256;                         /* under the ring floor, so it is raised */
         f.cfg.kv_cache_dtype = dtype;
         std::vector<KVGroupInfo> groups = hybrid_groups();
         groups[G_FULL].decl.dtype = RAD_F8E4M3;          /* what declare gives the core, packed or not */
@@ -1598,7 +1603,7 @@ TEST(a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed)
         KVStreamSetup s;
         int st = RAD_OK;
         const std::string log = stderr_of([&] {
-            st = kvstream_configure(f.cfg, 1024, groups, packed, &s);
+            st = kvstream_configure(f.cfg, 65536, groups, packed, &s);
         });
         CHECK_OK(st);                                    /* started, not refused */
         CHECK_EQ(s.group, -1);
@@ -1620,7 +1625,7 @@ TEST(a_resolve_declared_for_another_group_does_not_enable_streaming) {
      * "the group the plan streams resolves", and only the second is safe. */
     Fixture f;
     f.cfg.checkpoint_slots = 0;
-    f.cfg.max_ctx = 1024;
+    f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
     f.cfg.max_seqs = 2;
     f.cfg.kv_resident = 256;
     std::vector<KVGroupInfo> groups = hybrid_groups();
@@ -1629,7 +1634,7 @@ TEST(a_resolve_declared_for_another_group_does_not_enable_streaming) {
     other.ops[0].base.set_i("block_bytes", 4096);         /* a wider group's pitch, not this one's */
     KVStreamSetup s;
     int st = RAD_OK;
-    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, other, &s); });
+    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 65536, groups, other, &s); });
     CHECK_OK(st);
     CHECK_EQ(s.group, -1);
     CHECK(has(log, "kv_resolve"));
