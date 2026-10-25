@@ -753,8 +753,7 @@ struct LinearFP8 {
      * (`a8q`, `a8s`) for the w4a8i8_asym GEMM `op2`. */
     bool       w4 = false;
     int64_t    w4_split = 0;
-    rad_buf    a16 = 0, a8q = 0, a8s = 0;
-    rad_op     op_a16 = 0;
+    rad_buf    a8q = 0, a8s = 0;
     /* Prefill band for z-lab's int4 and the int5: above `rot_split` rows the f16 skinny kernel is
      * bound by the slow f16 matrix instruction, so a second chain runs: the same rotation to int8
      * with a scale per (row, 128) into `rot_q2`/`rot_s2`, then the int8 tiled GEMM (`w4a8i8_asym` /
@@ -955,8 +954,8 @@ inline bool linear_is_paro_m2xfp4(const RadEncoding& e) {
 
 /* A 4-bit weight with a zero point and no transform: u4 codes, an f16 scale and a u4 or u8 zero
  * point per 128 of K (libquant `codes=u4 zero=u4 group=128 scale=f16`, or rad-convert's import rule
- * over an int4 release). Read by gemm_nt_q at w4a16_asym over an f16 activation, or w4a8i8_asym
- * over an int8 one, the rotated int4's GEMMs with no rotation. */
+ * over an int4 release). At decode w4a16_asym narrows the BF16 input to F16 on load; larger
+ * batches use w4a8i8_asym over an int8 activation, the rotated int4's GEMMs with no rotation. */
 inline bool linear_is_w4(const RadEncoding& e) {
     if (!rad_enc_is(&e, "affine") || e.n_planes != 3 || e.transform[0]) return false;
     const RadEncPlane *sc = rad_enc_plane(&e, "scale"), *zp = rad_enc_plane(&e, "zero");
@@ -1288,9 +1287,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     }
 
     /* ---- 4-bit weight with a zero point and no rotation: the rotated int4's two GEMMs over this
-     * linear's own copies of the input's bf16 plane. At or below kSplit rows (the skinny f16
-     * kernel's ceiling) the GEMM reads the bf16 plane and narrows it on load; above it, where that kernel is
-     * bound by the f16 matrix instruction, it is quantised to int8 with an f32 scale per
+     * linear's BF16 input. At or below kSplit rows (the skinny F16 kernel's ceiling) the GEMM
+     * narrows that input on load; above it, where that kernel is bound by the F16 matrix
+     * instruction, the input is quantised to int8 with an F32 scale per
      * (row, 128) for w4a8i8_asym. Two views: codes, and (scale, zero) as `b_scale`, both at the
      * logical extents, so row parts and spans apply to both as they are; a column slice must be
      * whole 128s, the scale group. */

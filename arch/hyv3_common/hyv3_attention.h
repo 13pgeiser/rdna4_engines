@@ -59,12 +59,13 @@ struct AttnQKFP8 {
     rad_op op_ar = 0, op_add = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
-                const Wire& wire, const Src& src);
+                const Wire& wire, const Src& src, bool fold = false, bool add_out = true);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
-                              rad_kvgroup group, const Wire& wire, const Src& src) {
+                              rad_kvgroup group, const Wire& wire, const Src& src,
+                              bool fold, bool add_out) {
     g = geom;
     w = wire;
     layer = l;
@@ -96,7 +97,10 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     if (!w_norm || !w_q_norm || !w_k_norm) return RAD_E_INVAL;
 
-    RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, w.x, w.h, g.n_embd));
+    // As in the other pre-norm blocks, absorb a preceding delta into the residual stream.
+    // The fused kernel normalises the BF16-rounded sum, not an unrounded FP32 substitute.
+    RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
+                              fold ? w.x : 0));
     RAD_ARCH_TRY(q.declare(b, nm, g, nm.f("blk.%d.attn_q", l), q_dim, g.n_embd,
                            RAD_SHARD_ROW, grp_layer(l), {src.q}, w.h, w.q));
     RAD_ARCH_TRY(k.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
@@ -186,12 +190,12 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   RAD_INT("min_bytes", g.wire_min_bytes)),
                        RAD_NOWEIGHTS),
                    {w.h.x}, {w.h.x});
-    op_add = rw(b, RAD_OP(b, "add",
+    if (add_out) op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.x, w.h.x}, {w.x});
-    return op_attn && op_kv_store && op_add &&
+    return op_attn && op_kv_store && (!add_out || op_add) &&
            (!fp8_cache || (k_descale && v_descale && op_k_descale && op_v_descale))
                ? RAD_OK : RAD_E_INVAL;
 }
@@ -237,7 +241,7 @@ inline void AttnQKFP8::step(RadCtx* c, const RadBatch* batch) const {
     q_attn.step(c, T);
     o.step(c, w.attn, w.h.x, T);
     if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
-    RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+    if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
 }
 
 }  // namespace arch

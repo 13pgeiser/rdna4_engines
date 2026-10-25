@@ -348,7 +348,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
 #endif
         RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
-        status = lay.attn.declare(b, nm, g, (int)l, m.kv_full, aw, as);
+        // Each norm folds its predecessor's residual add. The first attention reads the
+        // embedding directly; the final feed-forward keeps its add for the plain output norm.
+        // Keep the collectives in the same places and the routed/shared FP32 combine separate.
+        status = lay.attn.declare(b, nm, g, (int)l, m.kv_full, aw, as, l > 0, false);
         if (status < 0) {
             fprintf(stderr, "radiance: hyv3: attention layer %lld declaration failed (%d)\n",
                     (long long)l, status);
@@ -369,7 +372,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ds.up = nm.ckpt("%s.up_proj.weight", mlp);
             ds.down = nm.ckpt("%s.down_proj.weight", mlp);
 #endif
-            status = lay.dense_mlp.declare(b, nm, g, (int)l, dw, ds);
+            status = lay.dense_mlp.declare(b, nm, g, (int)l, dw, ds, true,
+                                           l + 1 == g.n_layer);
             if (status < 0) {
                 fprintf(stderr, "radiance: hyv3: dense MLP declaration failed (%d)\n", status);
                 return status;
@@ -403,7 +407,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 return status;
             }
 #endif
-            status = lay.moe.declare(b, nm, g, (int)l, m.mw, ms);
+            status = lay.moe.declare(b, nm, g, (int)l, m.mw, ms, true, l + 1 == g.n_layer);
             if (status < 0) {
                 fprintf(stderr, "radiance: hyv3: MoE layer %lld declaration failed (%d)\n",
                         (long long)l, status);

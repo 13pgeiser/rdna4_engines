@@ -692,6 +692,64 @@ TEST(hyv3_bf16_selects_block_fp8_and_mxfp4_expert_formats) {
     }
 }
 
+TEST(hyv3_folds_residual_adds_into_the_next_norm_but_materializes_the_final_output) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    meta.n_layers = 3; // dense, a non-final MoE, and the final MoE
+    std::vector<const char*> vals(meta.kv_val, meta.kv_val + meta.n_kv);
+    for (int i = 0; i < meta.n_kv; ++i)
+        if (std::string(meta.kv_key[i]) == "mlp_layer_types") vals[(size_t)i] = "dense sparse sparse";
+    meta.kv_val = vals.data();
+    RadEncoding w4a = rad_enc_affine(RAD_U4, RAD_F16, 1, 128);
+    rad_enc_add_plane(&w4a, "zero", RAD_U8, 1, 128);
+    const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    for (int world : { 1, 2 }) for (int rank = 0; rank < world; ++rank) {
+        RadBuilder b;
+        b.encs = {
+            { "attn_q.weight", w4a }, { "attn_k.weight", w4a },
+            { "attn_v.weight", w4a }, { "attn_output.weight", w4a },
+            { "ffn_gate_up.weight", w4a }, { "ffn_down.weight", w4a },
+            { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 },
+            { "ffn_gate_up_shexp.weight", plain }, { "ffn_down_shexp.weight", plain },
+            { "output.weight", plain },
+        };
+        RadBuildCtx ctx = build_ctx(rank, world);
+        ctx.max_tok = 4096;
+        REQUIRE_EQ(hyv3_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const auto& m = hyv3_bf16::models[rank];
+        CHECK_EQ(m.layers[0].attn.nq_h.res, (rad_buf)0);
+        CHECK_EQ(m.layers[0].attn.nq_h.src, m.x);
+        CHECK_EQ(m.layers[0].dense_mlp.nq_h.res, m.x);
+        CHECK_EQ(m.layers[0].dense_mlp.op_add, (rad_op)0);
+        for (size_t l = 0; l < m.layers.size(); ++l) {
+            CHECK_EQ(m.layers[l].attn.op_add, (rad_op)0);
+            if (l == 0) continue;
+            CHECK_EQ(m.layers[l].attn.nq_h.src, m.h.x);
+            CHECK_EQ(m.layers[l].attn.nq_h.res, m.x);
+            CHECK_EQ(m.layers[l].moe.nq_h.src, m.h.x);
+            CHECK_EQ(m.layers[l].moe.nq_h.res, m.x);
+            CHECK_EQ(m.layers[l].moe.op_add != 0, l + 1 == m.layers.size());
+            CHECK(m.layers[l].moe.op_combine != 0); // retain the separate BF16-rounded arms
+            const RecOp* norm = b.op_of(m.layers[l].moe.nq_h.op);
+            REQUIRE(norm);
+            CHECK(std::find(norm->reads.begin(), norm->reads.end(), m.x) != norm->reads.end());
+            CHECK(std::find(norm->writes.begin(), norm->writes.end(), m.x) != norm->writes.end());
+        }
+        CHECK_EQ(count_op(b, "add"), 3); // two routed/shared combines, one final residual
+        for (int rows : { 1, 8, 65, 2049, 4096 }) {
+            RadBatch batch = decode_batch(); batch.n_tok = rows; batch.max_q_len = rows;
+            RadCtx run{}; run.b = &b; run.batch = &batch; run.rank = rank;
+            hyv3_bf16::step(&run, &batch);
+            CHECK(lint_step(b, {&run}).empty());
+            int final_adds = 0;
+            for (const auto& issue : run.issues)
+                if (issue.op == m.layers.back().moe.op_add) ++final_adds;
+            CHECK_EQ(final_adds, (rows + 2047) / 2048);
+        }
+    }
+}
+
 TEST(hyv3_decode_fuses_qk_norm_rope_and_store_with_unfused_fallbacks) {
     for (int form = 0; form < 3; ++form) {
         RadModelMeta meta = hyv3_fp8_test_meta();
