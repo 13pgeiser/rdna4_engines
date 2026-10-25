@@ -982,6 +982,10 @@ name = "vit_qtiled_parity_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "vit_attention_hd72_probe"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_vit_attention_shapes"
 required-features = ["lab"]
 

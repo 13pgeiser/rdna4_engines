@@ -1042,11 +1042,56 @@ pub struct VisionTowerJob {
     grid_w: usize,
     /// Next tower layer to run (`0..num_layers`).
     next_layer: usize,
-    /// Naive per-(head, query) attention fallback (HIPFIRE_VIT_ATTN=naive or
-    /// head shapes outside the Q-tiled kernel's contract).
-    attn_naive: bool,
+    /// Self-attention kernel for this image (HIPFIRE_VIT_ATTN / arch / head_dim).
+    attn: VitAttn,
     dump_dir: Option<std::path::PathBuf>,
     t0: std::time::Instant,
+}
+
+/// ViT self-attention kernel choice, made once per image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VitAttn {
+    /// WMMA flash kernel, head_dim <= 80 (zero-padded to 80), gfx11/gfx12.
+    Wmma,
+    /// Scalar Q-tiled flash kernel, any head_dim <= 128.
+    QTiled,
+    /// Per-(head, query) fallback, any head_dim.
+    Naive,
+}
+
+/// Resolve `HIPFIRE_VIT_ATTN` (`auto|wmma|qtiled|naive`, default auto).
+/// auto: Wmma when the arch has wave32 WMMA and head_dim <= 80, else QTiled
+/// when head_dim <= 128, else Naive. Explicit `wmma` errors if the arch lacks
+/// WMMA or head_dim > 80; explicit `qtiled` with head_dim > 128 falls back to
+/// naive inside the dispatcher.
+fn select_vit_attn(gpu: &Gpu, head_dim: usize) -> HipResult<VitAttn> {
+    let has_wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
+    let var = hipfire_config::developer_var("HIPFIRE_VIT_ATTN");
+    match var.as_deref() {
+        Ok("naive") => Ok(VitAttn::Naive),
+        Ok("qtiled") => Ok(VitAttn::QTiled),
+        Ok("wmma") => {
+            if has_wmma && head_dim <= 80 {
+                Ok(VitAttn::Wmma)
+            } else {
+                Err(HipError::new(
+                    0,
+                    &format!(
+                        "HIPFIRE_VIT_ATTN=wmma needs wave32 WMMA and head_dim <= 80 \
+                         (arch={}, head_dim={head_dim})",
+                        gpu.arch
+                    ),
+                ))
+            }
+        }
+        _ => Ok(if has_wmma && head_dim <= 80 {
+            VitAttn::Wmma
+        } else if head_dim <= 128 {
+            VitAttn::QTiled
+        } else {
+            VitAttn::Naive
+        }),
+    }
 }
 
 impl VisionTowerJob {
@@ -1152,16 +1197,13 @@ impl VisionTowerJob {
         let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
         let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
 
-        // Attention dispatch: the Q-tiled kernel is the production path (the
-        // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
-        // — the whole 25 s image-request stall). HIPFIRE_VIT_ATTN=naive forces
-        // the old kernel for rollback/A-B; head shapes outside the Q-tiled
-        // kernel's contract fall back to naive instead of asserting.
-        let attn_naive = matches!(
-            hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
-            Ok("naive")
-        ) || config.head_dim % 16 != 0
-            || config.head_dim > 128;
+        // Attention dispatch (see `select_vit_attn`): the WMMA flash kernel
+        // (head_dim <= 80, padded to 80 for head_dim 72) is the production
+        // path on wave32-WMMA parts — the scalar Q-tiled kernel and the
+        // per-(head, query) naive kernel (1.02 s/layer at a 68x68 grid on
+        // gfx1101; naive = 92% of tower time at N=4096 on gfx1201) remain as
+        // fallbacks / A-B switches via HIPFIRE_VIT_ATTN=auto|wmma|qtiled|naive.
+        let attn = select_vit_attn(gpu, config.head_dim)?;
 
         Ok(Self {
             x,
@@ -1171,7 +1213,7 @@ impl VisionTowerJob {
             grid_h,
             grid_w,
             next_layer: 0,
-            attn_naive,
+            attn,
             dump_dir,
             t0,
         })
@@ -1285,11 +1327,7 @@ impl VisionTowerJob {
         let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
         let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
 
-        let attn_naive = matches!(
-            hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
-            Ok("naive")
-        ) || config.head_dim % 16 != 0
-            || config.head_dim > 128;
+        let attn = select_vit_attn(gpu, config.head_dim)?;
 
         Ok(Self {
             x,
@@ -1299,7 +1337,7 @@ impl VisionTowerJob {
             grid_h,
             grid_w,
             next_layer: 0,
-            attn_naive,
+            attn,
             dump_dir,
             t0,
         })
@@ -1353,10 +1391,26 @@ impl VisionTowerJob {
 
         // Self-attention
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        if self.attn_naive {
-            gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
-        } else {
-            gpu.vit_attention_qtiled_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+        match self.attn {
+            VitAttn::Naive => {
+                gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?
+            }
+            VitAttn::QTiled => gpu.vit_attention_qtiled_f32(
+                &qkv,
+                &attn_out,
+                n,
+                h,
+                config.num_heads,
+                config.head_dim,
+            )?,
+            VitAttn::Wmma => gpu.vit_attention_wmma_f32(
+                &qkv,
+                &attn_out,
+                n,
+                h,
+                config.num_heads,
+                config.head_dim,
+            )?,
         }
         gpu.free_tensor(qkv)?;
 
