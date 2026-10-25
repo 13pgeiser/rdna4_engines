@@ -1,0 +1,216 @@
+/* HYV3 full GQA attention with block-scaled FP8 projections and per-head
+ * Q/K RMSNorm before NeoX RoPE (the HYV3 attention path).
+ *
+ *   rmsnorm -> q/k/v gemm_nt_q -> per-head q/k RMSNorm -> rope -> kv_store -> attn_paged
+ *   -> quant_act_fp8 -> o gemm_nt_q -> [all_reduce] -> residual add
+ *
+ * Unlike AttnFP8, the projections stay separate so Q and K can be normalized independently before
+ * rotation. The weights and all non-attention activations use the same contracts as the other FP8
+ * blocks in rad_fp8.h.
+ */
+#ifndef HYV3_ATTENTION_H
+#define HYV3_ATTENTION_H
+
+#include <arch/rad_fp8.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace rad {
+namespace arch {
+
+struct AttnQKFP8 {
+    struct Wire {
+        rad_buf x = 0;       /* [max_tok, n_embd] residual stream */
+        ActFP8 h{};          /* [max_tok, n_embd] normed input, then o output */
+        rad_buf q = 0;       /* [max_tok, q_dim], projected, normed and rotated */
+        rad_buf k = 0;       /* [max_tok, kv_dim], projected, normed and rotated */
+        rad_buf v = 0;       /* [max_tok, kv_dim], projected */
+        ActFP8 attn{};       /* [max_tok, q_dim] attention output */
+    };
+
+    struct Src {
+        const char* norm = nullptr;
+        const char* q = nullptr;
+        const char* k = nullptr;
+        const char* v = nullptr;
+        const char* q_norm = nullptr;
+        const char* k_norm = nullptr;
+        const char* o = nullptr;
+        double k_scale = 1.0, v_scale = 1.0;  /* static FP8-cache descales; 1 for BF16 cache */
+    };
+
+    Geom g{};
+    Wire w{};
+    int layer = 0;
+    rad_kvgroup kv = 0;
+
+    rad_weight w_norm = 0, w_q_norm = 0, w_k_norm = 0;
+    LinearFP8 q{}, k{}, v{}, o{};
+    rad_buf k_descale = 0, v_descale = 0;
+    NormQuantFP8 nq_h{};
+    QuantFP8 q_attn{};
+    rad_op op_q_norm = 0, op_k_norm = 0;
+    rad_op op_k_descale = 0, op_v_descale = 0;
+    rad_op op_rope_q = 0, op_rope_k = 0, op_attn = 0, op_kv_store = 0;
+    rad_op op_ar = 0, op_add = 0;
+
+    int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
+                const Wire& wire, const Src& src);
+    void step(RadCtx* c, const RadBatch* batch) const;
+};
+
+inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                              rad_kvgroup group, const Wire& wire, const Src& src) {
+    g = geom;
+    w = wire;
+    layer = l;
+    kv = group;
+    const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
+
+    if (g.world > g.n_head_kv_all) {
+        fprintf(stderr, "radiance: %s declares no KV row span and cannot serve world_size = %d "
+                        "with n_head_kv = %lld\n", __func__, g.world,
+                (long long)g.n_head_kv_all);
+        return RAD_E_UNSUPPORTED;
+    }
+    const bool fp8_cache = std::strcmp(g.kv_dtype, "fp8_e4m3") == 0;
+    if (fp8_cache && (!std::isfinite(src.k_scale) || src.k_scale <= 0.0 ||
+                      !std::isfinite(src.v_scale) || src.v_scale <= 0.0)) {
+        fprintf(stderr, "radiance: HYV3 layer %d needs positive finite static K/V descales for "
+                        "its FP8 KV cache\n", l);
+        return RAD_E_INVAL;
+    }
+
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l), src.norm));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l), src.q_norm));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k_norm.weight", l), src.k_norm));
+    w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_F32, {g.n_embd},
+                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_q_norm = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_F32, {g.head_dim},
+                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_k_norm = decl_w(b, nm.f("blk.%d.attn_k_norm.weight", l), RAD_F32, {g.head_dim},
+                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    if (!w_norm || !w_q_norm || !w_k_norm) return RAD_E_INVAL;
+
+    RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, w.x, w.h, g.n_embd));
+    RAD_ARCH_TRY(q.declare(b, nm, g, nm.f("blk.%d.attn_q", l), q_dim, g.n_embd,
+                           RAD_SHARD_ROW, grp_layer(l), {src.q}, w.h, w.q));
+    RAD_ARCH_TRY(k.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
+                           RAD_SHARD_ROW, grp_layer(l), {src.k}, w.h, w.k));
+    RAD_ARCH_TRY(v.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
+                           RAD_SHARD_ROW, grp_layer(l), {src.v}, w.h, w.v));
+
+    auto head_norm = [&](int64_t heads, rad_weight wt) {
+        return RAD_OP(b, "rmsnorm",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * heads), RAD_INT("n", g.head_dim),
+                                 RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd_qk),
+                                 RAD_STR("dtype", g.dtype)),
+                      RAD_WEIGHTS(wt));
+    };
+    op_q_norm = rw(b, head_norm(g.n_head, w_q_norm), {w.q}, {w.q});
+    op_k_norm = rw(b, head_norm(g.n_head_kv, w_k_norm), {w.k}, {w.k});
+    op_rope_q = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head, 0, g.head_dim, "neox"),
+                   {w.q}, {w.q});
+    op_rope_k = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head_kv, 0, g.head_dim, "neox"),
+                   {w.k}, {w.k});
+
+    if (fp8_cache) {
+        k_descale = decl_b(b, nm.f("blk.%d.attn_k_descale", l), RAD_F32,
+                           {g.max_seqs, g.n_head_kv});
+        v_descale = decl_b(b, nm.f("blk.%d.attn_v_descale", l), RAD_F32,
+                           {g.max_seqs, g.n_head_kv});
+        op_k_descale = rw(b, RAD_OP(b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", g.n_head_kv),
+                                        RAD_STR("dtype", "f32"), RAD_F64("value", src.k_scale)),
+                             RAD_NOWEIGHTS),
+                         {}, {k_descale});
+        op_v_descale = rw(b, RAD_OP(b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", g.n_head_kv),
+                                        RAD_STR("dtype", "f32"), RAD_F64("value", src.v_scale)),
+                             RAD_NOWEIGHTS),
+                         {}, {v_descale});
+    }
+    const rad_op attn = decl_attn(b, g, "attn_paged",
+                         RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                    RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                    RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                    RAD_INT("block_size", RAD_KV_BLOCK),
+                                    RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                    RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                         RAD_NOWEIGHTS);
+    op_attn = fp8_cache ? rw(b, attn, {w.q, k_descale, v_descale}, {w.attn.x})
+                        : rw(b, attn, {w.q}, {w.attn.x});
+    op_kv_store = rw(b, RAD_OP(b, "kv_store",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                    RAD_INT("n_head_kv", g.n_head_kv),
+                                    RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                    RAD_STR("kv_dtype", g.kv_dtype),
+                                    RAD_F64("k_scale", src.k_scale), RAD_F64("v_scale", src.v_scale)),
+                         RAD_NOWEIGHTS),
+                     {w.k, w.v}, {});
+
+    RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
+    RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
+                           RAD_SHARD_COL, grp_layer(l), {src.o}, w.attn, w.h.x));
+    if (g.world > 1)
+        op_ar = rw(b, RAD_OP(b, "all_reduce",
+                       RAD_PARAMS(RAD_INT("world_size", g.world),
+                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                  RAD_INT("min_bytes", g.wire_min_bytes)),
+                       RAD_NOWEIGHTS),
+                   {w.h.x}, {w.h.x});
+    op_add = rw(b, RAD_OP(b, "add",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                               RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS),
+                {w.x, w.h.x}, {w.x});
+    return op_attn && op_kv_store && op_add &&
+           (!fp8_cache || (k_descale && v_descale && op_k_descale && op_v_descale))
+               ? RAD_OK : RAD_E_INVAL;
+}
+
+inline void AttnQKFP8::step(RadCtx* c, const RadBatch* batch) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot = kvb ? kvb->slot_mapping : nullptr;
+    const int32_t* table = kvb ? kvb->block_table : nullptr;
+    const int32_t* used = kvb ? kvb->seqused : nullptr;
+    const int64_t T = batch->n_tok;
+
+    nq_h.step(c, T);
+    q.step(c, w.h, w.q, T);
+    k.step(c, w.h, w.k, T);
+    v.step(c, w.h, w.v, T);
+    RAD_ISSUE_N(c, op_q_norm, T * g.n_head, brows(w.q, T), RAD_W(w_q_norm), brows(w.q, T));
+    RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
+    RAD_ISSUE(c, op_rope_q, brows(w.q, T), rope_posmc(g, batch, T));
+    RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
+    RAD_ISSUE(c, op_kv_store, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
+              kv_cache(kv, layer));
+    if (op_k_descale) {
+        RAD_ISSUE_N(c, op_k_descale, batch->n_seq, brows(k_descale, batch->n_seq));
+        RAD_ISSUE_N(c, op_v_descale, batch->n_seq, brows(v_descale, batch->n_seq));
+    }
+    if (k_descale && v_descale)
+        RAD_ISSUE_N(c, op_attn, batch->max_q_len, brows(w.q, T), kv_cache(kv, layer),
+                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, batch->n_seq), brows(k_descale, batch->n_seq),
+                    brows(v_descale, batch->n_seq),
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(w.attn.x, T));
+    else
+        RAD_ISSUE_N(c, op_attn, batch->max_q_len, brows(w.q, T), kv_cache(kv, layer),
+                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, batch->n_seq), RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(w.attn.x, T));
+    q_attn.step(c, T);
+    o.step(c, w.attn, w.h.x, T);
+    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
+    RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+}
+
+}  // namespace arch
+}  // namespace rad
+
+#endif /* HYV3_ATTENTION_H */

@@ -50,6 +50,11 @@
 #undef QWEN35_NS
 #undef QWEN35_ARCH_ID
 #include "../arch/qwen35_w8a8/qwen35_w8a8.cpp"
+/* Tencent Hy-Memory: FP8 full attention with Q/K norm and sigmoid-correction MoE. */
+#include "../arch/hyv3_fp8/hyv3_fp8.cpp"
+#include "../arch/hyv3_bf16/hyv3_bf16.cpp"
+#include "../arch/hyv3_gguf/hyv3_gguf.cpp"
+#include "hyv3_bf16_fixture.h"
 /* The LLaMA family from a dense checkpoint: llama_fp8 under its other descriptor. */
 #undef LLAMA_DENSE_SRC
 #undef LLAMA_NS
@@ -346,6 +351,484 @@ TEST(llama_reads_its_rotary_scaling_by_type) {
             CHECK(!param(&op, "yarn_factor"));
         }
     }
+}
+
+TEST(fp8_qk_attention_normalizes_before_neox_rope) {
+    using namespace rad::arch;
+    RadModelMeta meta{};
+    meta.arch_id = "hyv3"; meta.name = "test-hyv3"; meta.quant = "fp8";
+    meta.n_layers = 1; meta.n_embd = 2048; meta.n_head = 32; meta.n_head_kv = 4;
+    meta.head_dim = 128; meta.n_ff = 6912; meta.n_vocab = 120832;
+    meta.n_ctx_train = 262144; meta.rms_eps = 1e-5f; meta.rope_theta = 11158840.0f;
+    RadBuildCtx ctx = build_ctx();
+    Geom g{};
+    CHECK_OK(geom_from(g, &meta, &ctx, "bf16", RAD_BF16));
+
+    RadBuilder b;
+    Names nm("");
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL; kd.dtype = RAD_BF16; kd.n_head_kv = g.n_head_kv;
+    kd.head_dim = g.head_dim;
+    const rad_kvgroup kv = rad_decl_kv_group(&b, "kv_attn", &kd);
+    CHECK_OK(rad_bind_layer_kv(&b, 0, kv));
+
+    AttnQKFP8::Wire w{};
+    w.x = decl_b(&b, nm.f("x"), RAD_BF16, {g.max_tok, g.n_embd});
+    w.h.x = decl_b(&b, nm.f("h"), RAD_BF16, {g.max_tok, g.n_embd});
+    CHECK_OK(w.h.declare_qs(&b, nm, g, "h", g.n_embd));
+    w.q = decl_b(&b, nm.f("q"), RAD_BF16, {g.max_tok, g.q_dim()});
+    w.k = decl_b(&b, nm.f("k"), RAD_BF16, {g.max_tok, g.kv_dim()});
+    w.v = decl_b(&b, nm.f("v"), RAD_BF16, {g.max_tok, g.kv_dim()});
+    w.attn.x = decl_b(&b, nm.f("attn"), RAD_BF16, {g.max_tok, g.q_dim()});
+    CHECK_OK(w.attn.declare_qs(&b, nm, g, "attn", g.q_dim()));
+    const rad_op init = rw(&b, RAD_OP(&b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("value", 0.0)),
+                             RAD_NOWEIGHTS),
+                         {}, {w.x});
+
+    AttnQKFP8::Src src{};
+    src.norm = nm.ckpt("model.layers.0.input_layernorm.weight");
+    src.q = nm.ckpt("model.layers.0.self_attn.q_proj.weight");
+    src.k = nm.ckpt("model.layers.0.self_attn.k_proj.weight");
+    src.v = nm.ckpt("model.layers.0.self_attn.v_proj.weight");
+    src.q_norm = nm.ckpt("model.layers.0.self_attn.q_norm.weight");
+    src.k_norm = nm.ckpt("model.layers.0.self_attn.k_norm.weight");
+    src.o = nm.ckpt("model.layers.0.self_attn.o_proj.weight");
+    AttnQKFP8 attn;
+    CHECK_OK(attn.declare(&b, nm, g, 0, kv, w, src));
+
+    const RecWeight* qw = find_w(b, "blk.0.attn_q.weight");
+    const RecWeight* kw = find_w(b, "blk.0.attn_k.weight");
+    const RecWeight* qn = find_w(b, "blk.0.attn_q_norm.weight");
+    CHECK(qw && kw && qn);
+    CHECK_EQ(qw->d.shape[0], 4096); CHECK_EQ(qw->d.shape[1], 2048);
+    CHECK_EQ(kw->d.shape[0], 512); CHECK_EQ(kw->d.shape[1], 2048);
+    CHECK_EQ(qn->d.shape[0], 128); CHECK_EQ(qn->d.dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(qn->d.shard, RAD_SHARD_NONE);
+    int q_norms = 0, k_norms = 0;
+    for (const auto& op : b.ops) if (op.op == "rmsnorm" && pint(&op, "n") == 128) {
+        if (op.w.size() == 1 && op.w[0] == attn.w_q_norm) ++q_norms;
+        if (op.w.size() == 1 && op.w[0] == attn.w_k_norm) ++k_norms;
+    }
+    CHECK_EQ(q_norms, 1); CHECK_EQ(k_norms, 1);
+
+    RadBatch batch = decode_batch();
+    RadCtx run{}; run.b = &b; run.batch = &batch;
+    RAD_ISSUE(&run, init, brows(w.x, batch.n_tok));
+    attn.step(&run, &batch);
+    auto issue_of = [&](rad_op h) {
+        for (size_t i = 0; i < run.issues.size(); ++i)
+            if (run.issues[i].op == h) return (int)i;
+        return -1;
+    };
+    const int q_norm_issue = issue_of(attn.op_q_norm), k_norm_issue = issue_of(attn.op_k_norm);
+    const int q_rope_issue = issue_of(attn.op_rope_q), k_rope_issue = issue_of(attn.op_rope_k);
+    const int attn_issue = issue_of(attn.op_attn);
+    CHECK(q_norm_issue >= 0); CHECK(k_norm_issue >= 0); CHECK(attn_issue >= 0);
+    CHECK(q_rope_issue >= 0); CHECK(k_rope_issue >= 0);
+    CHECK(q_norm_issue < q_rope_issue); CHECK(k_norm_issue < k_rope_issue);
+    CHECK(q_rope_issue < attn_issue); CHECK(k_rope_issue < attn_issue);
+    const auto lint = lint_step(b, {&run});
+    CHECK(lint.empty());
+}
+
+static RadModelMeta hyv3_fp8_test_meta() {
+    static const char* keys[] = {
+        "qk_norm", "moe_router_use_sigmoid", "moe_router_enable_expert_bias", "route_norm",
+        "enable_moe_fp32_combine", "attention_bias", "mlp_bias", "first_k_dense_replace",
+        "num_experts", "num_experts_per_tok", "num_shared_experts", "expert_hidden_dim",
+        "moe_intermediate_size", "router_scaling_factor", "mlp_layer_types",
+        "hyv3.kv_cache.0.k_scale", "hyv3.kv_cache.0.v_scale",
+        "hyv3.kv_cache.1.k_scale", "hyv3.kv_cache.1.v_scale",
+    };
+    static const char* vals[] = {
+        "1", "1", "1", "1", "1", "0", "0", "1", "128", "8", "1", "768", "1536",
+        "2.826", "dense sparse", "0.0376674123", "0.0004359654",
+        "0.0224609375", "0.0005318778",
+    };
+    RadModelMeta meta{};
+    meta.arch_id = "hyv3"; meta.name = "test-hyv3"; meta.quant = "fp8";
+    meta.n_layers = 2; meta.n_embd = 2048; meta.n_head = 32; meta.n_head_kv = 4;
+    meta.head_dim = 128; meta.n_ff = 6912; meta.n_vocab = 120832;
+    meta.n_ctx_train = 262144; meta.rms_eps = 1e-5f; meta.rope_theta = 11158840.0f;
+    meta.n_expert = 128; meta.n_expert_used = 8;
+    meta.n_kv = (int)(sizeof(keys) / sizeof(keys[0])); meta.kv_key = keys; meta.kv_val = vals;
+    return meta;
+}
+
+TEST(hyv3_bf16_declares_checkpoint_geometry_and_plain_moe) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_bf16::probe(&meta, &probe));
+    RadBuilder b;
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    b.encs = {
+        { "attn_q.weight", plain }, { "attn_k.weight", plain },
+        { "attn_v.weight", plain }, { "attn_output.weight", plain },
+        { "ffn_gate_up.weight", plain }, { "ffn_down.weight", plain },
+        { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain },
+        { "ffn_gate_up_shexp.weight", plain }, { "ffn_down_shexp.weight", plain },
+        { "output.weight", plain },
+    };
+    RadBuildCtx ctx = build_ctx();
+    const int rc = hyv3_bf16::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    const RecWeight* q_norm = find_w(b, "blk.0.attn_q_norm.weight");
+    const RecWeight* k_norm = find_w(b, "blk.0.attn_k_norm.weight");
+    const RecWeight* q = find_w(b, "blk.0.attn_q.weight");
+    const RecWeight* k = find_w(b, "blk.0.attn_k.weight");
+    const RecWeight* v = find_w(b, "blk.0.attn_v.weight");
+    const RecWeight* o = find_w(b, "blk.0.attn_output.weight");
+    const RecWeight* dense = find_w(b, "blk.0.ffn_gate_up.weight");
+    const RecWeight* dense_down = find_w(b, "blk.0.ffn_down.weight");
+    const RecWeight* expert = find_w(b, "blk.1.ffn_gate_up_exps.0.weight");
+    const RecWeight* expert_down = find_w(b, "blk.1.ffn_down_exps.0.weight");
+    const RecWeight* shared = find_w(b, "blk.1.ffn_gate_up_shexp.weight");
+    const RecWeight* shared_down = find_w(b, "blk.1.ffn_down_shexp.weight");
+    const RecWeight* router = find_w(b, "blk.1.glm_router.weight");
+    const RecWeight* correction = find_w(b, "blk.1.glm_router.correction");
+    REQUIRE(q_norm && k_norm && q && k && v && o && dense && dense_down && expert &&
+            expert_down && shared && shared_down && router && correction);
+    CHECK_EQ(q_norm->d.shape[0], hyv3_bf16_fixture::q_norm[0]);
+    CHECK_EQ(k_norm->d.shape[0], hyv3_bf16_fixture::k_norm[0]);
+    CHECK_EQ(router->d.shape[0], hyv3_bf16_fixture::router[0]);
+    CHECK_EQ(router->d.shape[1], hyv3_bf16_fixture::router[1]);
+    CHECK_EQ(correction->d.shape[0], hyv3_bf16_fixture::correction[0]);
+    CHECK_EQ(q->d.shape[0], hyv3_bf16_fixture::q_proj[0]);
+    CHECK_EQ(q->d.shape[1], hyv3_bf16_fixture::q_proj[1]);
+    CHECK_EQ(k->d.shape[0], hyv3_bf16_fixture::k_proj[0]);
+    CHECK_EQ(k->d.shape[1], hyv3_bf16_fixture::k_proj[1]);
+    CHECK_EQ(v->d.shape[0], hyv3_bf16_fixture::v_proj[0]);
+    CHECK_EQ(v->d.shape[1], hyv3_bf16_fixture::v_proj[1]);
+    CHECK_EQ(o->d.shape[0], hyv3_bf16_fixture::o_proj[0]);
+    CHECK_EQ(o->d.shape[1], hyv3_bf16_fixture::o_proj[1]);
+    CHECK_EQ(dense->d.shape[0], hyv3_bf16_fixture::dense_gate[0] +
+                                  hyv3_bf16_fixture::dense_up[0]);
+    CHECK_EQ(dense->d.shape[1], hyv3_bf16_fixture::dense_gate[1]);
+    CHECK_EQ(dense_down->d.shape[0], hyv3_bf16_fixture::dense_down[0]);
+    CHECK_EQ(dense_down->d.shape[1], hyv3_bf16_fixture::dense_down[1]);
+    CHECK_EQ(expert->d.shape[0], hyv3_bf16_fixture::expert_gate[0] +
+                                  hyv3_bf16_fixture::expert_up[0]);
+    CHECK_EQ(expert->d.shape[1], hyv3_bf16_fixture::expert_gate[1]);
+    CHECK_EQ(expert_down->d.shape[0], hyv3_bf16_fixture::expert_down[0]);
+    CHECK_EQ(expert_down->d.shape[1], hyv3_bf16_fixture::expert_down[1]);
+    CHECK_EQ(shared->d.shape[0], hyv3_bf16_fixture::shared_gate[0] +
+                                  hyv3_bf16_fixture::shared_up[0]);
+    CHECK_EQ(shared->d.shape[1], hyv3_bf16_fixture::shared_gate[1]);
+    CHECK_EQ(shared_down->d.shape[0], hyv3_bf16_fixture::shared_down[0]);
+    CHECK_EQ(shared_down->d.shape[1], hyv3_bf16_fixture::shared_down[1]);
+    const auto& moe = hyv3_bf16::models[0].layers[1].moe;
+    CHECK_EQ(moe.c.n_ff_exp, 768);
+    CHECK_EQ(moe.c.n_ff_shared, 768);
+    CHECK_EQ(moe.c.expert_bf16, 1);
+    RadBatch batch = decode_batch();
+    RadCtx run{}; run.b = &b; run.batch = &batch;
+    hyv3_bf16::step(&run, &batch);
+    CHECK(lint_step(b, {&run}).empty());
+}
+
+TEST(hyv3_gguf_maps_llamacpp_moe_tensors_and_lints_tp2) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "gguf_ftype_15";
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_gguf::probe(&meta, &probe));
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = {
+            { "attn_q.weight", plain }, { "attn_k.weight", plain },
+            { "attn_v.weight", plain }, { "attn_output.weight", plain },
+            { "ffn_gate_up.weight", plain }, { "ffn_down.weight", plain },
+            { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain },
+            { "ffn_gate_up_shexp.weight", plain }, { "ffn_down_shexp.weight", plain },
+            { "output.weight", plain },
+        };
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        const int rc = hyv3_gguf::declare(&b, &meta, &ctx);
+        CHECK_EQ(rc, RAD_OK);
+        if (rc < 0) continue;
+        auto mapped = [&](const char* target, const char* source) {
+            for (const RecMap& m : b.maps)
+                if (m.declared == target && m.src.size() == 1 && m.src[0] == source) return true;
+            return false;
+        };
+        CHECK(mapped("blk.0.attn_q.weight", "blk.0.attn_q.weight"));
+        CHECK(mapped("blk.1.glm_router.weight", "blk.1.ffn_gate_inp.weight"));
+        CHECK(mapped("blk.1.glm_router.correction", "blk.1.exp_probs_b"));
+        CHECK(mapped("token_embd.weight", "token_embd.weight"));
+        const std::string expert_name =
+            "blk.1.ffn_gate_up_exps." + std::to_string(rank * 64) + ".weight";
+        const std::string down_name =
+            "blk.1.ffn_down_exps." + std::to_string(rank * 64) + ".weight";
+        bool expert_gate_up = false, expert_down = false, shared_gate_up = false;
+        for (const RecMap& m : b.maps) {
+            if (m.declared == expert_name && m.src.size() == 2 &&
+                m.src[0] == "blk.1.ffn_gate_exps.weight" &&
+                m.src[1] == "blk.1.ffn_up_exps.weight") expert_gate_up = true;
+            if (m.declared == down_name && m.src.size() == 1 &&
+                m.src[0] == "blk.1.ffn_down_exps.weight") expert_down = true;
+            if (m.declared == "blk.1.ffn_gate_up_shexp.weight" && m.src.size() == 2 &&
+                m.src[0] == "blk.1.ffn_gate_shexp.weight" &&
+                m.src[1] == "blk.1.ffn_up_shexp.weight") shared_gate_up = true;
+        }
+        CHECK(expert_gate_up); CHECK(expert_down); CHECK(shared_gate_up);
+        const auto& moe = hyv3_gguf::models[rank].layers[1].moe;
+        CHECK_EQ(moe.c.expert_bf16, 1);
+        RadBatch batch = decode_batch();
+        RadCtx run{}; run.b = &b; run.batch = &batch;
+        hyv3_gguf::step(&run, &batch);
+        CHECK(lint_step(b, {&run}).empty());
+    }
+}
+
+TEST(hyv3_bf16_selects_native_int4_expert_kernels_from_recipe_encodings) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+    RadEncoding w4a = rad_enc_affine(RAD_U4, RAD_F16, 1, 128);
+    rad_enc_add_plane(&w4a, "zero", RAD_U8, 1, 128);
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = {
+            { "attn_q.weight", w4a }, { "attn_k.weight", w4a },
+            { "attn_v.weight", w4a }, { "attn_output.weight", w4a },
+            { "ffn_gate_up.weight", w4a }, { "ffn_down.weight", w4a },
+            { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 },
+            { "ffn_gate_up_shexp.weight", plain }, { "ffn_down_shexp.weight", plain },
+            { "output.weight", plain },
+        };
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        const int rc = hyv3_bf16::declare(&b, &meta, &ctx);
+        CHECK_EQ(rc, RAD_OK);
+        if (rc < 0) continue;
+        const auto& moe = hyv3_bf16::models[rank].layers[1].moe;
+        CHECK_EQ(moe.c.expert_w4, 1);
+        CHECK_EQ(moe.c.expert_bf16, 0);
+        CHECK_EQ(moe.c.n_ff_exp, 768);
+        CHECK_EQ(moe.c.expert_base, rank * 64);
+        int asym_w4_gemms = 0;
+        for (const RecOp& op : b.ops) {
+            const RecParam* dtype = op.op == "gemm_nt_q" ? param(&op, "dtype") : nullptr;
+            if (dtype && dtype->sval == "w4a8i8_asym") ++asym_w4_gemms;
+        }
+        CHECK(asym_w4_gemms > 0);
+        RadBatch batch = decode_batch();
+        RadCtx run{}; run.b = &b; run.batch = &batch;
+        hyv3_bf16::step(&run, &batch);
+        CHECK(lint_step(b, {&run}).empty());
+    }
+}
+
+TEST(hyv3_bf16_supports_int8_linear_recipes_at_tp2) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const RadEncoding w8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = {
+            { "attn_q.weight", w8 }, { "attn_k.weight", w8 },
+            { "attn_v.weight", w8 }, { "attn_output.weight", w8 },
+            { "ffn_gate_up.weight", w8 }, { "ffn_down.weight", w8 },
+            { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain },
+            { "ffn_gate_up_shexp.weight", w8 }, { "ffn_down_shexp.weight", w8 },
+            { "output.weight", w8 },
+        };
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        const int rc = hyv3_bf16::declare(&b, &meta, &ctx);
+        CHECK_EQ(rc, RAD_OK);
+        if (rc < 0) continue;
+        int i8_gemms = 0;
+        for (const RecOp& op : b.ops) {
+            const RecParam* dtype = op.op == "gemm_nt_q" ? param(&op, "dtype") : nullptr;
+            if (dtype && dtype->sval == "i8a8") ++i8_gemms;
+        }
+        CHECK(i8_gemms > 0);
+        CHECK_EQ(find_w(b, "output.weight")->d.dtype, (uint32_t)RAD_I8);
+        const auto& moe = hyv3_bf16::models[rank].layers[1].moe;
+        CHECK_EQ(moe.c.expert_bf16, 1);
+        RadBatch batch = decode_batch();
+        RadCtx run{}; run.b = &b; run.batch = &batch;
+        hyv3_bf16::step(&run, &batch);
+        CHECK(lint_step(b, {&run}).empty());
+    }
+}
+
+TEST(hyv3_bf16_selects_block_fp8_and_mxfp4_expert_formats) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    meta.quant = "";
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    for (int format = 0; format < 2; ++format) {
+        const RadEncoding encoded = format == 0 ? fp8 : mx;
+        for (int rank = 0; rank < 2; ++rank) {
+            RadBuilder b;
+            b.encs = {
+                { "attn_q.weight", encoded }, { "attn_k.weight", encoded },
+                { "attn_v.weight", encoded }, { "attn_output.weight", encoded },
+                { "ffn_gate_up.weight", encoded }, { "ffn_down.weight", encoded },
+                { "ffn_gate_up_exps", encoded }, { "ffn_down_exps", encoded },
+                { "ffn_gate_up_shexp.weight", encoded }, { "ffn_down_shexp.weight", encoded },
+                { "output.weight", plain },
+            };
+            RadBuildCtx ctx = build_ctx(rank, 2);
+            const int rc = hyv3_bf16::declare(&b, &meta, &ctx);
+            CHECK_EQ(rc, RAD_OK);
+            if (rc < 0) continue;
+            const auto& moe = hyv3_bf16::models[rank].layers[1].moe;
+            CHECK_EQ(moe.c.expert_f32_scale, format == 0 ? 1 : 0);
+            CHECK_EQ(moe.c.expert_mx, format == 0 ? 0 : 1);
+            RadBatch batch = decode_batch();
+            RadCtx run{}; run.b = &b; run.batch = &batch;
+            hyv3_bf16::step(&run, &batch);
+            CHECK(lint_step(b, {&run}).empty());
+        }
+    }
+}
+
+TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder b;
+    RadArchProbe probe{};
+    CHECK_OK(hyv3_fp8::probe(&meta, &probe));
+    const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+
+    const RecWeight* q_norm = find_w(b, "blk.0.attn_q_norm.weight");
+    const RecWeight* dense = find_w(b, "blk.0.ffn_gate_up.weight");
+    const RecWeight* expert = find_w(b, "blk.1.ffn_gate_up_exps.0.weight");
+    const RecMap* expert_map = find_map(b, "blk.1.ffn_gate_up_exps.0.weight");
+    const RecWeight* shared = find_w(b, "blk.1.ffn_gate_up_shexp.weight");
+    const RecWeight* router = find_w(b, "blk.1.glm_router.weight");
+    const RecWeight* bias = find_w(b, "blk.1.glm_router.correction");
+    CHECK(q_norm && dense && expert && expert_map && shared && router && bias);
+    CHECK_EQ(expert_map->src.size(), 2u);
+    CHECK_EQ(expert_map->src[0], std::string("model.layers.1.mlp.experts.0.gate_proj.weight"));
+    CHECK_EQ(expert_map->src[1], std::string("model.layers.1.mlp.experts.0.up_proj.weight"));
+    CHECK_EQ(q_norm->d.shape[0], 128);
+    CHECK_EQ(dense->d.shape[0], 13824); CHECK_EQ(dense->d.shape[1], 2048);
+    CHECK_EQ(expert->d.shape[0], 1536); CHECK_EQ(expert->d.shape[1], 2048);
+    CHECK_EQ(shared->d.shape[0], 1536); CHECK_EQ(shared->d.shape[1], 2048);
+    CHECK_EQ(router->d.shape[0], 128); CHECK_EQ(router->d.shape[1], 2048);
+    CHECK_EQ(bias->d.shape[0], 128); CHECK_EQ(bias->d.dtype, (uint32_t)RAD_F32);
+
+    auto& model = hyv3_fp8::models[0];
+    auto& moe = model.layers[1].moe;
+    CHECK_EQ(moe.c.n_ff_exp, 768); CHECK_EQ(moe.c.n_ff_shared, 768);
+    CHECK_EQ(moe.c.expert_f32_scale, 1);
+    CHECK_EQ(moe.c.route_scale, 2.826); CHECK_EQ(moe.c.sigmoid_router, 1);
+    CHECK_EQ(moe.c.shared_fp32_combine, 1); CHECK_EQ(moe.gfold, false);
+    const RecOp* gather = b.op_of(moe.op_gather);
+    CHECK(gather != nullptr);
+    CHECK_EQ(gather->writes.size(), 1u);
+    CHECK_EQ(gather->writes[0], moe.w.moe);
+    CHECK(moe.op_moe_to_f32 && moe.op_shared_to_f32 && moe.op_combine_f32 &&
+          moe.op_combined_to_bf16);
+
+    RadBatch batch = decode_batch();
+    RadCtx run{}; run.b = &b; run.batch = &batch;
+    hyv3_fp8::step(&run, &batch);
+    auto issue_of = [&](rad_op h) {
+        for (size_t i = 0; i < run.issues.size(); ++i)
+            if (run.issues[i].op == h) return (int)i;
+        return -1;
+    };
+    const int gather_i = issue_of(moe.op_gather), routed_i = issue_of(moe.op_moe_to_f32);
+    const int shared_i = issue_of(moe.op_shared_to_f32), add_i = issue_of(moe.op_combine_f32);
+    const int cast_i = issue_of(moe.op_combined_to_bf16);
+    CHECK(gather_i >= 0 && routed_i >= 0 && shared_i >= 0 && add_i >= 0 && cast_i >= 0);
+    CHECK(gather_i < routed_i && routed_i < add_i && shared_i < add_i && add_i < cast_i);
+    const auto lint = lint_step(b, {&run});
+    CHECK(lint.empty());
+}
+
+TEST(hyv3_fp8_tensor_parallel_partitions_experts_and_shared_width) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        ctx.kv_dtype = RAD_F8E4M3;
+        RadBuilder b;
+        const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+        CHECK_EQ(rc, RAD_OK);
+        if (rc < 0) continue;
+        auto& model = hyv3_fp8::models[rank];
+        const auto& moe = model.layers[1].moe;
+        CHECK_EQ(moe.c.n_expert, 64);
+        CHECK_EQ(moe.c.expert_base, rank * 64);
+        CHECK_EQ(moe.c.n_ff_shared, 384);
+        CHECK_EQ(moe.c.shared_lo, rank * 384);
+        CHECK_EQ(moe.c.shared_hi, (rank + 1) * 384);
+        CHECK(moe.op_moe_ar && moe.op_shared_ar && !moe.op_ar);
+        CHECK(find_w(b, rank == 0 ? "blk.1.ffn_gate_up_exps.0.weight"
+                                   : "blk.1.ffn_gate_up_exps.64.weight") != nullptr);
+        CHECK_EQ(model.g.n_ff, 3456);
+        RadBatch batch = decode_batch();
+        RadCtx run{}; run.b = &b; run.batch = &batch; run.rank = rank;
+        hyv3_fp8::step(&run, &batch);
+        auto issue_of = [&](rad_op h) {
+            for (size_t i = 0; i < run.issues.size(); ++i)
+                if (run.issues[i].op == h) return (int)i;
+            return -1;
+        };
+        CHECK(issue_of(moe.op_gather) < issue_of(moe.op_moe_ar));
+        CHECK(issue_of(moe.op_moe_ar) < issue_of(moe.op_moe_to_f32));
+        CHECK(issue_of(moe.op_shared_ar) < issue_of(moe.op_shared_to_f32));
+        CHECK(issue_of(moe.op_combine_f32) < issue_of(moe.op_combined_to_bf16));
+        CHECK(lint_step(b, {&run}).empty());
+    }
+}
+
+TEST(hyv3_fp8_uses_static_layerwise_fp8_kv_descales) {
+    RadModelMeta meta = hyv3_fp8_test_meta();
+    RadBuildCtx ctx = build_ctx();
+    ctx.kv_dtype = RAD_F8E4M3;
+    RadBuilder b;
+    const int rc = hyv3_fp8::declare(&b, &meta, &ctx);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_F8E4M3);
+    auto& attn = hyv3_fp8::models[0].layers[0].attn;
+    CHECK(attn.op_k_descale && attn.op_v_descale);
+    CHECK(attn.k_descale && attn.v_descale);
+    const RecWeight* q = find_w(b, "blk.0.attn_q.weight");
+    CHECK(q != nullptr);
+    if (q) CHECK_EQ(q->d.shape[0], 4096);
+    const RecOp* k_fill = b.op_of(attn.op_k_descale);
+    const RecOp* v_fill = b.op_of(attn.op_v_descale);
+    CHECK(k_fill != nullptr && v_fill != nullptr);
+    if (k_fill) CHECK(std::fabs(pflt(k_fill, "value") - 0.0376674123) < 1e-9);
+    if (v_fill) CHECK(std::fabs(pflt(v_fill, "value") - 0.0004359654) < 1e-10);
+    const RecOp* store = b.op_of(attn.op_kv_store);
+    CHECK(store != nullptr);
+    if (store) {
+        CHECK(std::fabs(pflt(store, "k_scale") - 0.0376674123) < 1e-9);
+        CHECK(std::fabs(pflt(store, "v_scale") - 0.0004359654) < 1e-10);
+    }
+    const auto& attn1 = hyv3_fp8::models[0].layers[1].attn;
+    const RecOp* store1 = b.op_of(attn1.op_kv_store);
+    CHECK(store1 != nullptr);
+    if (store1) {
+        CHECK(std::fabs(pflt(store1, "k_scale") - 0.0224609375) < 1e-10);
+        CHECK(std::fabs(pflt(store1, "v_scale") - 0.0005318778) < 1e-10);
+    }
+    RadBatch batch = decode_batch();
+    RadCtx run{}; run.b = &b; run.batch = &batch;
+    hyv3_fp8::step(&run, &batch);
+    auto issue_of = [&](rad_op h) {
+        for (size_t i = 0; i < run.issues.size(); ++i)
+            if (run.issues[i].op == h) return (int)i;
+        return -1;
+    };
+    CHECK(issue_of(attn.op_k_descale) < issue_of(attn.op_attn));
+    CHECK(issue_of(attn.op_v_descale) < issue_of(attn.op_attn));
+    CHECK(lint_step(b, {&run}).empty());
 }
 
 TEST(the_alternation_puts_full_attention_at_3_and_7) {
