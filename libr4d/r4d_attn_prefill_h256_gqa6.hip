@@ -69,8 +69,8 @@
 // O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
 #define O_V4    33554432
 #define O_K6    67108864
-// O_PSPLIT: a KV split for launches with too few workgroups to fill the card (prefill_splits in
-// r4d_attn_paged_h256_gqa6.hip). blockIdx.x is qtile * a.splits + split, and the workgroup walks
+// O_PSPLIT: a KV split for launches with too few workgroups to fill the card (r4d_prefill_splits
+// in r4d_attn_prefill_split.h). blockIdx.x is qtile * a.splits + split, and the workgroup walks
 // only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
 // split-KV merge recomputes from ctx), clipped at its causal end. Instead of bf16 out it stores the
 // unnormalised f32 O, m_ref and l in the decode kernel's partial layout (r4d_attn_decode_body,

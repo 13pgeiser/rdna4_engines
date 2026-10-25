@@ -132,6 +132,7 @@ int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs*);
  * windowed prefill (the gqa6 leg's r4d_attn_prefill_kernel with WIN on). */
 int     r4d_rad_attn_prefill_h256_gqa2_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_gqa2_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa2_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa2_fp8   (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa2_bf16  (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa2_scratch(const RadArgs*);
@@ -299,6 +300,7 @@ int64_t r4d_rad_quant_cols_fp8_scratch(const RadArgs*);
  * row's constraint value) is 8, against the gqa6 leg's 10. */
 int     r4d_rad_attn_prefill_h256_gqa8_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_gqa8_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa8_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa8_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa8_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa8_scratch(const RadArgs*);
@@ -318,6 +320,7 @@ int64_t r4d_rad_attn_decode_h128_gqa1_scratch(const RadArgs*);
  * (r4d_attn_paged_h256_gqa4.hip). */
 int     r4d_rad_attn_prefill_h256_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_gqa4_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa4_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa4_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa4_scratch(const RadArgs*);
@@ -335,6 +338,7 @@ int64_t r4d_rad_attn_decode_h128_gqa2_scratch(const RadArgs*);
  * another instantiation (r4d_attn_paged_h256_gqa12.hip). */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_gqa12_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa12_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa12_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa12_fp8(const RadArgs*, RadStream);
@@ -345,6 +349,7 @@ int64_t r4d_rad_attn_decode_h256_gqa12_scratch(const RadArgs*);
  * the decode rows' constraint value. */
 int     r4d_rad_attn_prefill_h256_gqa6_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_gqa6_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa6_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_scratch(const RadArgs*);
@@ -356,18 +361,22 @@ int     r4d_rad_attn_decode_gq_h256_gqa6_bf16(const RadArgs*, RadStream);
 /* The fp8_v4 and k6_v4 caches on both: prefill, decode, and decode with the gate and quantiser in
  * the merge (R4D_ATTN_V4 in r4d_attn_paged_gqa8.hip). */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_fp8v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa12_fp8v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa12_fp8v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa12_fp8v4_scratch(const RadArgs*);
 int     r4d_rad_attn_prefill_h256_gqa12_k6v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k6v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa12_k6v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa12_k6v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa12_k6v4_scratch(const RadArgs*);
 int     r4d_rad_attn_prefill_h256_gqa6_fp8v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_fp8v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_fp8v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_fp8v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_fp8v4_scratch(const RadArgs*);
 int     r4d_rad_attn_prefill_h256_gqa6_k6v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k6v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_k6v4_scratch(const RadArgs*);

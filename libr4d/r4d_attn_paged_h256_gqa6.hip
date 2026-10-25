@@ -25,6 +25,7 @@
 using std::max;
 #include "r4d_attn_prefill_h256_gqa6.hip"
 #include "r4d_attn_decode_h256_gqa6.hip"
+#include "r4d_attn_prefill_split.h"
 
 #define CHK() do { hipError_t e_ = hipGetLastError(); if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
@@ -51,66 +52,18 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 // (36-48 bytes per lane, ~4% of the prefill). At 2 the spill is 20 bytes, outside the WMMA groups.
 #define P_OPT    3954187
 
-// ---- the prefill KV split ----------------------------------------------------------------------
-// The query-tiled grid is ceil(q_len / 64) x kv_heads x num_seqs, one 768-thread workgroup a WGP,
-// and each workgroup walks its whole causal range serially. So below one workgroup per WGP a launch
-// costs one full walk of the context whatever its row count: Qwen3.8-27B at TP2 (kv_heads 2) runs a
-// 53-row tail over 188k keys as 2 workgroups on 32 WGPs, ~17.7 ms a layer, against ~21 ms a
-// workgroup for a 1024-row piece filling all 32 (audits 9a/9b; profiled tails, attention: 63 ms
-// at 41k / 80 rows, 152 at 97k / 345, 283 at 188k / 53). Such launches split the KV (O_PSPLIT)
-// and finish in the split-KV merge.
-//
-// Workgroups the card runs at once: one a WGP. HIP's multiProcessorCount counts WGPs on RDNA (32 on
-// the R9700, see want_wg in r4d_hc_bf16.hip); 32 if it cannot be read.
-static int prefill_wgps() {
-    static const int v = [] {
-        int dev = 0;
-        hipDeviceProp_t pr{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&pr, dev) != hipSuccess)
-            return 32;
-        return pr.multiProcessorCount > 0 ? pr.multiProcessorCount : 32;
-    }();
-    return v;
-}
+// ---- the prefill KV split (r4d_attn_prefill_split.h) -------------------------------------------
+// Query positions a workgroup: 64.
+#define P_BQ ((P_NWARPS * 16) / A_GQA)
 
-// The split law. `units` counts the workgroups that do work: a ragged batch's grid is sized from
-// its longest sequence (q_len), but a shorter sequence's query tiles past its end exit at once, so
-// the count is bounded by sum ceil(q_s / 64) <= (total_q + 63 n) / 64 as well (exact for one
-// sequence), so a ragged launch's longest sequence does not make its others look like full tiles.
-// One S applies to every sequence of the launch; a mixed step's decode rows reach the split-KV
-// decode row instead, by the arch's per-band issue (AttnGatedFP8::step). A launch over part of a
-// step (q and out whole, cu past row 0) counts the step's rows in total_q, so the bound is loose
-// there and may keep it unsplit.
-// At `wgps` units or more the card is full: no split. Otherwise S rounds of equal workgroups cost
-// rounds / S walks, so take one round (S1 = wgps / units) or two (S2 = 2 wgps / units), whichever
-// is faster, the smaller S on a tie (fewer partials): 53 rows (2 units) -> 16 splits, 80 -> 8,
-// 345 (12 units) -> 5 (60 workgroups, 0.4 walks against 0.5 at 2), 576 -> 3, 1024 and up -> 1.
-// Each split keeps at least 8 tiles of max_ctx, the only context the host sees (the engine passes
-// the model's bound, so in serving this caps nothing; a short context's splits past its tiles exit
-// at once). At most 64, the vectorised merge's limit.
-static inline int r4d_prefill_splits_law(int q_len, int total_q, int num_seqs, int kv_heads,
-                                         int max_ctx, int wgps) {
-    constexpr int BQ = (P_NWARPS * 16) / A_GQA;
-    const long n  = std::max(1, num_seqs);
-    const long qt = std::min(n * ((std::max(1, q_len) + BQ - 1) / BQ),
-                             (std::max(1, total_q) + (BQ - 1) * n) / BQ);
-    const long units = (long)std::max(1, kv_heads) * std::max(1L, qt);
-    if (units >= wgps) return 1;
-    const int s1 = (int)(wgps / units), s2 = (int)(2L * wgps / units);
-    int sp = s2 > 2 * s1 ? s2 : s1;
-    const int cap = ((max_ctx > 0 ? max_ctx : (1 << 30) - 1) + P_TILE - 1) / P_TILE / 8;
-    sp = std::min(sp, std::max(1, cap));
-    return std::max(1, std::min(sp, 64));
-}
-
-// The law at this card's WGP count. A test hook (r4d_selftest), not a plugin entry.
+// The law at this unit's geometry and this card's WGP count. A test hook (r4d_selftest), not a
+// plugin entry.
 extern "C" int r4d_attn_prefill_h256_gqa6_splits(int q_len, int total_q, int num_seqs,
                                                  int kv_heads, int max_ctx) {
-    return r4d_prefill_splits_law(q_len, total_q, num_seqs, kv_heads, max_ctx, prefill_wgps());
+    return r4d_prefill_splits_law(P_BQ, P_TILE, q_len, total_q, num_seqs, kv_heads, max_ctx,
+                                  r4d_prefill_wgps());
 }
-// The split count the last prefill launch in this process used, 1 unsplit. A test hook: lets
-// r4d_selftest tell a split launch from an unsplit one whose bytes happen to agree. Not atomic.
-static int g_prefill_last_splits = 0;
+// The split count this unit's last prefill launch used, 1 unsplit. A test hook (r4d_selftest).
 extern "C" int r4d_attn_prefill_h256_gqa6_last_splits(void) { return g_prefill_last_splits; }
 
 static int prefill_combine(const R4DArgs* a, int splits, hipStream_t s);
@@ -182,21 +135,9 @@ static int prefill_legs_launch(const R4DArgs* a, hipStream_t s, int legs) {
 // 288 it wins by 1.2-20%. The cut is four rows per CU.
 #define D_VECMIN 256
 
-// The prefill split's merge: the decode merge over f32 partials (PF16 0), at the prefill tile, so
-// it recomputes the kernel's partition; vectorised on the decode launcher's terms. SPAN: the launch
-// may cover part of a step's rows (ArPieces' pieces, a band-split step's prefill half: cu_q starts
-// past row 0, or ends before total_q), and the rest are another launch's.
+// The prefill split's merge (r4d_prefill_combine), vectorised on the decode launcher's terms.
 static int prefill_combine(const R4DArgs* a, int splits, hipStream_t s) {
-    const int jobs3 = r4d_q_total(*a) * a->q_heads;
-    if (splits <= 64 && jobs3 >= D_VECMIN)
-        hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<A_HEAD_DIM, 4, 0, D_JPB, 0, 1>),
-                           dim3((jobs3 + D_JPB - 1) / D_JPB), dim3(32 * D_JPB), 0, s, *a, splits,
-                           P_TILE);
-    else
-        hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<A_HEAD_DIM, 4, 0, 0, 1>), dim3(jobs3),
-                           dim3(256), splits * sizeof(float), s, *a, splits, P_TILE);
-    CHK();
-    return 0;
+    return r4d_prefill_combine<A_HEAD_DIM, D_JPB, D_VECMIN>(a, splits, P_TILE, s);
 }
 
 // Split law: r4d_decode_splits (r4d_attn_decode_h256_gqa6.hip).
@@ -268,80 +209,17 @@ extern "C" int r4d_attn_decode_h256_gqa6_k6v4kv(const R4DArgs* a, hipStream_t s)
 // the .so carries an undefined symbol that only r4d_selftest catches.
 /* ------------------------------------------------------------------ paged prefill */
 
-/* The KV split's count before the scratch bound: the case's `splits` parameter when it names one
- * (r4d_selftest; the prefill rows declare no such axis, so the engine passes none), else
- * R4D_PREFILL_SPLITS, else the law. R4D_PREFILL_SPLITS is a tuning and A/B knob, not
- * configuration: 0 or unset = the law, 1 = never split, N = N splits for every launch (at most 64,
- * and at most what the scratch holds, see prefill_splits). Read once. */
-static int prefill_splits_want(const RadArgs* a, const R4DArgs* r) {
-    const int sp = split_of(a);
-    if (sp > 0) return std::min(sp, 64);
-    static const int env = [] {
-        const char* e = getenv("R4D_PREFILL_SPLITS");
-        return e && *e ? atoi(e) : 0;
-    }();
-    if (env > 0) return std::min(env, 64);
-    return r4d_prefill_splits_law(r->q_len, r4d_q_total(*r), r->num_seqs, r->kv_heads, r->max_ctx,
-                                  prefill_wgps());
-}
-
-/* The launch's split count, 1 for the plain form: what prefill_splits_want asks, cut to the
- * segments the caller's scratch holds, so a forced count past the declared worst case runs with as
- * many as fit rather than writing past the region. No scratch (a row without the hook, a direct
- * caller of the r4d_attn_prefill_* entry points) is the plain form. */
+/* The launch's KV split count (r4d_prefill_splits) at this unit's geometry, 1 for the plain form. */
 static int prefill_splits(const RadArgs* a, const R4DArgs* r) {
-    if (!a->scratch || a->scratch_bytes <= 0) return 1;
-    int sp = prefill_splits_want(a, r);
-    const long per = r4d_decode_scratch(r, 1, 0);          /* one segment of every row, f32 */
-    if (sp > 1 && per > 0 && a->scratch_bytes / per < sp) sp = (int)(a->scratch_bytes / per);
-    return std::max(1, sp);
+    return r4d_prefill_splits(a, r, P_BQ, P_TILE);
 }
 
-/* Bytes of the split's f32 partials, at declare the most any launch in the band can take.
- *
- * Declare passes the band's upper bound as q_len and no tensors, so the worst case is swept over
- * every sequence count up to max_seqs and every row count up to the band, in both the uniform form
- * (q_len = rows / n) and the ragged one (q_len = min(band, rows), as fill_paged takes it). Only
- * launches with fewer than one workgroup a WGP split, and the units of a launch of `t` rows are at
- * least kv_heads * ceil(t / 64), so the sweep stops there. The law keeps units * S <= 2 wgps, so
- * rows * S <= 64 * gqa * 2 wgps: 24576 rows of 1032 bytes, 25.4 MB, for any kv_heads (23.8 MB is
- * reached, at 384 rows x 5 and 640 x 3). Not monotone in the rows, hence the sweep. A launch over
- * part of a step's rows counts the whole step's in its partial layout (total_q), more than this
- * covers when it is long; prefill_splits then cuts S to what fits, down to the plain form.
- *
- * Never an error: a refusal would unseat the prefill row, which ran without scratch before the
- * split. A shape it cannot read gets none, and its launches run the plain form. */
+/* The split's f32 partials at declare (r4d_prefill_scratch: 23.8 MB is reached at this geometry,
+ * at 384 rows x 5 and 640 x 3), by the cache's token row: fp8 and bf16 (2 * head_dim), fp8_v4 (400
+ * bytes), k6_v4 (352). */
 static int64_t prefill_scratch(const RadArgs* a, long long row) {
-    R4DArgs r;
-    const long long n_head   = r4d_geti_or(a, "n_head", 0);
-    const long long max_seqs = r4d_geti_or(a, "max_seqs", 0);
-    if (n_head > 0 && max_seqs > 0) {
-        const long long gqa = r4d_geti_or(a, "gqa", 1);
-        const int kv   = (int)std::max(1LL, gqa > 0 ? n_head / gqa : n_head);
-        const int band = (int)std::max(1LL, r4d_geti_or(a, "q_len", 1));
-        const int mctx = (int)r4d_geti_or(a, "max_ctx", 0);
-        const int w    = prefill_wgps();
-        constexpr int BQ = (P_NWARPS * 16) / A_GQA;
-        const int64_t per_row = (int64_t)n_head * (A_HEAD_DIM + 2) * 4;
-        int64_t worst = 0;
-        for (long long n = 1; n <= max_seqs; ++n)
-            for (long long t = n; t <= band; ++t) {
-                if ((long long)kv * ((t + BQ - 1) / BQ) >= w) break;
-                int sp = r4d_prefill_splits_law((int)std::min<long long>(band, t), (int)t, (int)n,
-                                                kv, mctx, w);
-                if (t % n == 0)
-                    sp = std::max(sp, r4d_prefill_splits_law((int)(t / n), (int)t, (int)n, kv,
-                                                              mctx, w));
-                if (sp > 1) worst = std::max(worst, (int64_t)t * sp * per_row);
-            }
-        return worst;
-    }
-    if (fill_paged_row(a, &r, 256, row) != RAD_OK) return 0;
-    const int sp = prefill_splits_want(a, &r);
-    return sp > 1 ? (int64_t)r4d_decode_scratch(&r, sp, 0) : 0;
+    return r4d_prefill_scratch(a, A_HEAD_DIM, row, P_BQ, P_TILE);
 }
-
-/* By the cache's token row: fp8 and bf16 (2 * head_dim), fp8_v4 (400 bytes), k6_v4 (352). */
 extern "C" int64_t r4d_rad_attn_prefill_h256_scratch(const RadArgs* a) {
     return prefill_scratch(a, 512);
 }

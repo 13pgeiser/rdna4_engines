@@ -1281,13 +1281,20 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
        fmt("corrupted ref must fail: max_err=%.5g bad=%d", nmax, nbadc));
 }
 
-/* The prefill kernel's KV split (prefill_splits, r4d_attn_paged_h256_gqa6.hip): a launch with too
- * few query tiles to fill the card walks the KV in segments, each into f32 partials, and finishes in
- * the split-KV merge. `seqs` are {q_len, ctx} each, ragged (cu_seqlens, q_len at the band's bound
+/* A head-256 prefill geometry the KV split serves: queries per KV head, KV heads (a rank's), page
+ * size, and the unit's test hooks' prefix (`<hook>_splits`, the law; `<hook>_last_splits`, the
+ * count the unit's last launch used). The workgroup holds 384 / gqa query positions. */
+struct SplitGeo { int64_t gqa, kv_heads, bs; const char* hook; };
+static const SplitGeo kSplitG6 = { 6, 2, 16, "r4d_attn_prefill_h256_gqa6" };
+
+/* The prefill kernel's KV split (r4d_attn_prefill_split.h): a launch with too few query tiles to
+ * fill the card walks the KV in segments, each into f32 partials, and finishes in the split-KV
+ * merge, at geometry `g`. `seqs` are {q_len, ctx} each, ragged (cu_seqlens, q_len at the band's bound
  * 2048 as the engine issues it) when there are two or more. The row runs three times on the same
  * operands: unsplit (`splits` 1), at `force` segments, and at the law's own count, which must be
  * what the law hook says (and above one when `law_splits`). Both split runs are checked against the
- * oracle on sampled rows (every head of each sequence's rows 0, 62, 63, 64, middle and last) at
+ * oracle on sampled rows (every head of each sequence's rows 0, bq - 2, bq - 1, bq, middle and
+ * last, bq = 384 / gqa the workgroup's query positions, so both sides of a query tile's edge) at
  * attn_numeric_case's tolerance, and against the unsplit run on every element; the largest
  * difference is in the case's name. A chunk long against its context (345 of 345 or 1000 keys)
  * gives its early query tiles segments past their causal end, which must be written empty.
@@ -1296,23 +1303,24 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
  * launch over part of a step (ArPieces' two pieces, the prefill half of a band-split mixed step):
  * cu_seqlens starts at `lead` and q/out are the whole step. Those rows must come out untouched. */
 struct SplitSeq { int64_t q, ctx; };
-static void attn_split_case(const Plugin& pl, const char* name, const char* kv_dtype,
-                            const std::vector<SplitSeq>& seqs, int force, bool law_splits,
-                            int64_t lead = 0, int64_t tail = 0) {
+static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* name,
+                            const char* kv_dtype, const std::vector<SplitSeq>& seqs, int force,
+                            bool law_splits, int64_t lead = 0, int64_t tail = 0) {
     if (!sel(name) && !sel("attn_prefill_split")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
-    std::string tag = std::string(name) + " split";
+    std::string tag = std::string(name) + fmt(" kv%lld split", (long long)g.kv_heads);
     for (const SplitSeq& s : seqs) tag += fmt(" %lld/%lld", (long long)s.q, (long long)s.ctx);
     tag += fmt(" x%d", force);
     if (lead || tail) tag += fmt(" rows %lld+..+%lld", (long long)lead, (long long)tail);
     using LawFn  = int (*)(int, int, int, int, int);
     using LastFn = int (*)(void);
-    const LawFn  law  = (LawFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_splits");
-    const LastFn last = (LastFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_last_splits");
+    const LawFn  law  = (LawFn)dlsym(pl.h, (std::string(g.hook) + "_splits").c_str());
+    const LastFn last = (LastFn)dlsym(pl.h, (std::string(g.hook) + "_last_splits").c_str());
     if (!law || !last) { ok(tag.c_str(), false, "libr4d lacks the split's test hooks"); return; }
 
-    const int64_t head_dim = 256, gqa = 6, kv_heads = 2, bs = 16, q_heads = kv_heads * gqa;
+    const int64_t head_dim = 256, gqa = g.gqa, kv_heads = g.kv_heads, bs = g.bs;
+    const int64_t q_heads = kv_heads * gqa, bq = 384 / gqa;
     const int64_t ns = (int64_t)seqs.size();
     const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
     const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
@@ -1461,7 +1469,7 @@ static void attn_split_case(const Plugin& pl, const char* name, const char* kv_d
     int obad = 0, nchk = 0;
     for (int64_t s = 0; s < ns; ++s) {
         const int64_t q = seqs[(size_t)s].q;
-        std::vector<int64_t> rows = { 0, 62, 63, 64, q / 2, q - 1 };
+        std::vector<int64_t> rows = { 0, bq - 2, bq - 1, bq, q / 2, q - 1 };
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         for (const int64_t i : rows) {
@@ -1490,27 +1498,31 @@ static void attn_split_case(const Plugin& pl, const char* name, const char* kv_d
 }
 
 /* A mixed step's attention as the engine issues it (AttnGatedFP8::step's per-band issue) at
- * Qwen3.8-27B's per-rank production geometry: `nd` decode sequences of 8-10 query rows (verify
- * blocks) beside one prefill chunk of `pq` rows, max_seqs 16, max_ctx 200000, the band bounds 10
- * (decode) and 2048. Each band's row gets the scratch its hook sized at declare, from the band's
+ * geometry `g` (Qwen3.8-27B's per-rank production geometry for kSplitG6): `nd` decode sequences of
+ * the widest verify blocks the decode row holds (64 / gqa query rows and the two below: 8-10 at
+ * gqa 6, 3-5 at gqa 12) beside one prefill chunk of `pq` rows, max_seqs 16, max_ctx 200000, the
+ * band bounds 64 / gqa (decode) and 2048. Each band's row gets the scratch its hook sized at declare, from the band's
  * frozen geometry and no tensors, and nothing more, as the core binds it (rad_builder.cpp,
  * ctx.cpp): the decode half (prefix rows, its own cu) at the decode band; the prefill half (q and
  * out whole, cu and the per-sequence arrays past the decode sequences) at band `pband`, which
- * picks the row as the core would (at most 10: the decode row). Both launches must succeed, and
+ * picks the row as the core would (at most the decode band: the decode row). Both launches must succeed, and
  * every sequence's rows match the oracle afterwards: the prefill half must not write the decode
  * rows. 1.10-next6u issued the prefill half at its own query length, so a chunk of 10 rows or
  * fewer reached the decode row with the whole step's rows and refused for scratch. */
-static void attn_mixed_step_case(const Plugin& pl, const char* dec_name, const char* pre_name,
-                                 const char* kv_dtype, int nd, int64_t pq, int64_t pband) {
+static void attn_mixed_step_case(const Plugin& pl, const SplitGeo& g, const char* dec_name,
+                                 const char* pre_name, const char* kv_dtype, int nd, int64_t pq,
+                                 int64_t pband) {
     if (!sel(pre_name) && !sel("attn_mixed_step")) return;
     const RadKernelInfo* rd = find(pl, dec_name);
     const RadKernelInfo* rp = find(pl, pre_name);
-    const std::string tag = fmt("%s mixed step: %d decode rows of 8-10 + a %lld-row chunk, "
-                                "prefill half at band %lld", pre_name, nd, (long long)pq,
+    const int64_t head_dim = 256, gqa = g.gqa, kv_heads = g.kv_heads, bs = g.bs;
+    const int64_t q_heads = kv_heads * gqa;
+    const int64_t dband = 64 / gqa, max_seqs = 16, max_ctx = 200000, top = 2048;
+    const std::string tag = fmt("%s kv%lld mixed step: %d decode rows of %lld-%lld + a %lld-row "
+                                "chunk, prefill half at band %lld", pre_name, (long long)kv_heads,
+                                nd, (long long)(dband - 2), (long long)dband, (long long)pq,
                                 (long long)pband);
     if (!rd || !rp || !rd->scratch) { ok(tag.c_str(), false, "row or scratch hook absent"); return; }
-    const int64_t head_dim = 256, gqa = 6, kv_heads = 2, bs = 16, q_heads = kv_heads * gqa;
-    const int64_t dband = 10, max_seqs = 16, max_ctx = 200000, top = 2048;
     const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
     const int64_t rowe = kvq == 2 ? 22 * head_dim / 16 : kvq == 1 ? 25 * head_dim / 16 : head_dim * 2;
     const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
@@ -1520,7 +1532,7 @@ static void attn_mixed_step_case(const Plugin& pl, const char* dec_name, const c
     /* decode-first, as the scheduler sorts a step; contexts differ per sequence */
     const int64_t ns = nd + 1;
     std::vector<int64_t> ql, cx;
-    for (int s = 0; s < nd; ++s) { ql.push_back(8 + s % 3); cx.push_back(3000 + 397 * s); }
+    for (int s = 0; s < nd; ++s) { ql.push_back(dband - 2 + s % 3); cx.push_back(3000 + 397 * s); }
     ql.push_back(pq); cx.push_back(pq + 2500);
     int64_t mb = 0;
     std::vector<int32_t> cu(1, 0), used;
@@ -1615,7 +1627,7 @@ static void attn_mixed_step_case(const Plugin& pl, const char* dec_name, const c
     };
     int dq = 0;
     for (int s = 0; s < nd; ++s) dq = std::max<int>(dq, (int)ql[(size_t)s]);
-    issue(dq, DT, 0, nd);                 /* the decode half, at its band (<= 10) */
+    issue(dq, DT, 0, nd);                 /* the decode half, at its band (<= 64 / gqa) */
     issue(pband, nt, nd, 1);              /* the prefill half */
 
     std::vector<uint16_t> oh(on);
@@ -1647,26 +1659,27 @@ static void attn_mixed_step_case(const Plugin& pl, const char* dec_name, const c
     dfree_all();
 }
 
-/* The split's scratch at declare (the band's bound 2048, Qwen3.8-27B's per-rank 12 heads over 2,
- * the model's context, no tensors): the hook must cover the largest launch the law can split in the
- * band, over every sequence count up to max_seqs, and stay near the 25.4 MB bound its comment
- * derives. Sizes it in the name. */
-static void attn_split_scratch_case(const Plugin& pl, const char* name, const char* kv_dtype) {
+/* The split's scratch at declare (the band's bound 2048, geometry `g`'s per-rank heads -- 12 over 2
+ * for Qwen3.8-27B --, the model's context, no tensors): the hook must cover the largest launch the
+ * law can split in the band, over every sequence count up to max_seqs, and stay within the 25.4 MB
+ * bound its comment derives for every ratio. Sizes it in the name. */
+static void attn_split_scratch_case(const Plugin& pl, const SplitGeo& g, const char* name,
+                                    const char* kv_dtype) {
     if (!sel(name) && !sel("attn_prefill_split")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
     using LawFn = int (*)(int, int, int, int, int);
-    const LawFn law = (LawFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_splits");
+    const LawFn law = (LawFn)dlsym(pl.h, (std::string(g.hook) + "_splits").c_str());
     if (!r->scratch || !law) {
         ok((std::string(name) + ": split scratch at declare").c_str(), false,
            !r->scratch ? "the row has no scratch hook" : "libr4d lacks the law's test hook");
         return;
     }
-    const int band = 2048, n_head = 12, kv = 2, mctx = 262144;
+    const int band = 2048, kv = (int)g.kv_heads, n_head = (int)(g.kv_heads * g.gqa), mctx = 262144;
     for (const int ms : { 1, 16, 64 }) {
         std::vector<RadParam> ps = {
-            PI("q_len", band), PI("head_dim", 256), PI("gqa", 6), PI("n_head", n_head),
-            PI("max_seqs", ms), PI("max_ctx", mctx), PI("block_size", 16), PI("causal", 1),
+            PI("q_len", band), PI("head_dim", 256), PI("gqa", g.gqa), PI("n_head", n_head),
+            PI("max_seqs", ms), PI("max_ctx", mctx), PI("block_size", g.bs), PI("causal", 1),
             PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", kv_dtype),
         };
         RadArgs a;
@@ -1681,8 +1694,8 @@ static void attn_split_scratch_case(const Plugin& pl, const char* name, const ch
                 if (t % n == 0) sp = std::max(sp, law(t / n, t, n, kv, mctx));
                 if (sp > 1) worst = std::max(worst, (int64_t)t * sp * n_head * (256 + 2) * 4);
             }
-        ok(fmt("%s: split scratch at declare, %d sequences: %.2f MB (the law's worst %.2f MB)", name,
-               ms, need / 1e6, worst / 1e6).c_str(),
+        ok(fmt("%s kv%d: split scratch at declare, %d sequences: %.2f MB (the law's worst %.2f MB)",
+               name, kv, ms, need / 1e6, worst / 1e6).c_str(),
            worst > 0 && need >= worst && need <= 24576LL * 1032,
            fmt("need %lld worst %lld bound %lld", (long long)need, (long long)worst,
                24576LL * 1032));
@@ -26659,49 +26672,87 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 4,   "k6_v4",  0, 2048);
-    /* The prefill KV split at Qwen3.8-27B's per-rank geometry, every cache layout: the tails the
-     * audits measured (11 to 345 rows over 8k to 20k keys, where the law splits), one row through
-     * the prefill kernel, chunks long against their context (early query tiles own empty
-     * segments), and ragged batches of a chunk beside decode rows of other contexts. Then the
-     * declare-time scratch. */
-    static const struct { const char* row; const char* kv; } split_rows[] = {
-        { "attn_prefill_h256_gqa6_k6v4", "k6_v4" },     { "attn_prefill_h256_gqa6_fp8v4", "fp8_v4" },
-        { "attn_prefill_h256_gqa6_fp8kv", "fp8_e4m3" }, { "attn_prefill_h256_gqa6_bf16kv", "bf16" },
+    /* The prefill KV split on every head-256 prefill row, each at a rank's production geometry
+     * and every cache layout it has: Qwen3.8-27B (gqa 6, 2 KV heads at TP2), Flash-Next's QSA
+     * layers (gqa 12 over 4-token pages, 1 KV head at TP2; gqa 6 over 4-token pages, 1 at TP4),
+     * Qwen3.6-35B-A3B (gqa 8, 1 at TP2), Qwen3.5-0.8B (gqa 4, 2 at TP1) and the gqa 2 rows'
+     * full-attention form (4 KV heads). The tails the audits measured (11 to 345 rows over
+     * 8k to 20k keys, where the law splits), one row through the prefill kernel, chunks long
+     * against their context (early query tiles own empty segments), and ragged batches of a chunk
+     * beside decode rows of other contexts. Then the declare-time scratch. */
+    static const SplitGeo kSplitG12 = { 12, 1, 4, "r4d_attn_prefill_h256_gqa12_bs4" };
+    static const SplitGeo kSplitG6Bs4 = { 6, 1, 4, "r4d_attn_prefill_h256_gqa6_bs4" };
+    static const SplitGeo kSplitG8 = { 8, 1, 16, "r4d_attn_prefill_h256_gqa8_bs16" };
+    static const SplitGeo kSplitG4 = { 4, 2, 16, "r4d_attn_prefill_h256_gqa4_bs16" };
+    static const SplitGeo kSplitG2 = { 2, 4, 16, "r4d_attn_prefill_h256_gqa2" };
+    /* The mixed step at gqa 2 with 2 KV heads: 15 decoders of 32-row blocks at 4 heads make a
+     * 280 MB cache, and beside a production server the card has less than that free (the launch
+     * then fails for its scratch, split or not). */
+    static const SplitGeo kSplitG2Kv2 = { 2, 2, 16, "r4d_attn_prefill_h256_gqa2" };
+    static const struct { const SplitGeo* g; const char* row; const char* kv; } split_rows[] = {
+        { &kSplitG6, "attn_prefill_h256_gqa6_k6v4", "k6_v4" },
+        { &kSplitG6, "attn_prefill_h256_gqa6_fp8v4", "fp8_v4" },
+        { &kSplitG6, "attn_prefill_h256_gqa6_fp8kv", "fp8_e4m3" },
+        { &kSplitG6, "attn_prefill_h256_gqa6_bf16kv", "bf16" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_k6v4", "k6_v4" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_fp8v4", "fp8_v4" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_fp8kv", "fp8_e4m3" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_bf16kv", "bf16" },
+        { &kSplitG6Bs4, "attn_prefill_h256_gqa6_bs4_k6v4", "k6_v4" },
+        { &kSplitG6Bs4, "attn_prefill_h256_gqa6_bs4_fp8v4", "fp8_v4" },
+        { &kSplitG6Bs4, "attn_prefill_h256_gqa6_bs4_fp8kv", "fp8_e4m3" },
+        { &kSplitG6Bs4, "attn_prefill_h256_gqa6_bs4_bf16kv", "bf16" },
+        { &kSplitG8, "attn_prefill_h256_gqa8_fp8kv", "fp8_e4m3" },
+        { &kSplitG8, "attn_prefill_h256_gqa8_bf16kv", "bf16" },
+        { &kSplitG4, "attn_prefill_h256_gqa4_fp8kv", "fp8_e4m3" },
+        { &kSplitG4, "attn_prefill_h256_gqa4_bf16kv", "bf16" },
+        { &kSplitG2, "attn_prefill_h256_gqa2_fp8kv", "fp8_e4m3" },
+        { &kSplitG2, "attn_prefill_h256_gqa2_bf16kv", "bf16" },
     };
     for (const auto& sr : split_rows) {
+        const SplitGeo& g = *sr.g;
         const char* n = sr.row;
         const char* kv = sr.kv;
-        attn_split_case(pl, n, kv, { { 1, 20000 } }, 16, true);
-        attn_split_case(pl, n, kv, { { 11, 8192 } }, 7, true);
-        attn_split_case(pl, n, kv, { { 53, 18000 } }, 16, true);
-        attn_split_case(pl, n, kv, { { 64, 12000 } }, 13, true);
-        attn_split_case(pl, n, kv, { { 65, 9000 } }, 8, true);
-        attn_split_case(pl, n, kv, { { 345, 16000 } }, 16, true);
-        attn_split_case(pl, n, kv, { { 345, 345 } }, 16, false);
-        attn_split_case(pl, n, kv, { { 345, 1000 } }, 16, true);
-        attn_split_case(pl, n, kv, { { 640, 2000 } }, 5, true);
-        attn_split_case(pl, n, kv, { { 53, 12000 }, { 1, 20000 } }, 16, true);
-        attn_split_case(pl, n, kv, { { 11, 8192 }, { 64, 9000 }, { 1, 12000 } }, 6, true);
-        attn_split_case(pl, n, kv, { { 300, 600 }, { 1, 10000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 1, 20000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 11, 8192 } }, 7, true);
+        attn_split_case(pl, g, n, kv, { { 53, 18000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 64, 12000 } }, 13, true);
+        attn_split_case(pl, g, n, kv, { { 65, 9000 } }, 8, true);
+        attn_split_case(pl, g, n, kv, { { 345, 16000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 345, 345 } }, 16, false);
+        attn_split_case(pl, g, n, kv, { { 345, 1000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 640, 2000 } }, 5, true);
+        attn_split_case(pl, g, n, kv, { { 53, 12000 }, { 1, 20000 } }, 16, true);
+        attn_split_case(pl, g, n, kv, { { 11, 8192 }, { 64, 9000 }, { 1, 12000 } }, 6, true);
+        attn_split_case(pl, g, n, kv, { { 300, 600 }, { 1, 10000 } }, 16, true);
         /* Launches over part of a step: ArPieces' first piece (rows after it) and second (rows
          * before it), and a band-split mixed step's prefill half behind its decode rows. The law
          * sees the step's rows (total_q), so it leaves the 512-row pieces unsplit. */
-        attn_split_case(pl, n, kv, { { 512, 12000 } }, 4, false, 0, 512);
-        attn_split_case(pl, n, kv, { { 512, 12512 } }, 4, false, 512, 0);
-        attn_split_case(pl, n, kv, { { 53, 12000 } }, 16, true, 8, 0);
-        attn_split_case(pl, n, kv, { { 64, 9000 }, { 11, 8192 } }, 6, true, 3, 0);
-        attn_split_scratch_case(pl, n, kv);
+        attn_split_case(pl, g, n, kv, { { 512, 12000 } }, 4, false, 0, 512);
+        attn_split_case(pl, g, n, kv, { { 512, 12512 } }, 4, false, 512, 0);
+        attn_split_case(pl, g, n, kv, { { 53, 12000 } }, 16, true, 8, 0);
+        attn_split_case(pl, g, n, kv, { { 64, 9000 }, { 11, 8192 } }, 6, true, 3, 0);
+        attn_split_scratch_case(pl, g, n, kv);
     }
-    /* A mixed step's two halves at the production geometry, each with only its band's declared
-     * scratch: up to 15 verify blocks beside chunks of 1 to 640 rows. */
-    for (const auto& sr : { std::make_pair("attn_prefill_h256_gqa6_k6v4", "k6_v4"),
-                            std::make_pair("attn_prefill_h256_gqa6_fp8v4", "fp8_v4") }) {
-        const std::string dec = std::string("attn_decode_h256_gqa6_") + (sr.second[0] == 'k' ? "k6v4" : "fp8v4");
+    /* A mixed step's two halves at each geometry's production shape, each with only its band's
+     * declared scratch: up to 15 verify blocks beside chunks of 1 to 640 rows. */
+    static const struct { const SplitGeo* g; const char* pre; const char* dec; const char* kv; }
+        mixed_rows[] = {
+        { &kSplitG6, "attn_prefill_h256_gqa6_k6v4", "attn_decode_h256_gqa6_k6v4", "k6_v4" },
+        { &kSplitG6, "attn_prefill_h256_gqa6_fp8v4", "attn_decode_h256_gqa6_fp8v4", "fp8_v4" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_k6v4", "attn_decode_h256_gqa12_k6v4", "k6_v4" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_fp8v4", "attn_decode_h256_gqa12_fp8v4", "fp8_v4" },
+        { &kSplitG12, "attn_prefill_h256_gqa12_fp8kv", "attn_decode_h256_gqa12_fp8kv", "fp8_e4m3" },
+        { &kSplitG6Bs4, "attn_prefill_h256_gqa6_bs4_k6v4", "attn_decode_h256_gqa6_bs4_k6v4", "k6_v4" },
+        { &kSplitG8, "attn_prefill_h256_gqa8_fp8kv", "attn_decode_h256_gqa8_fp8kv", "fp8_e4m3" },
+        { &kSplitG4, "attn_prefill_h256_gqa4_fp8kv", "attn_decode_h256_gqa4_fp8kv", "fp8_e4m3" },
+        { &kSplitG2Kv2, "attn_prefill_h256_gqa2_fp8kv", "attn_decode_h256_gqa2_fp8kv", "fp8_e4m3" },
+    };
+    for (const auto& mr : mixed_rows)
         for (const auto& c : { std::make_pair(15, 5), std::make_pair(15, 10), std::make_pair(3, 1),
                                std::make_pair(8, 53), std::make_pair(1, 300),
                                std::make_pair(15, 640) })
-            attn_mixed_step_case(pl, dec.c_str(), sr.first, sr.second, c.first, c.second, 2048);
-    }
+            attn_mixed_step_case(pl, *mr.g, mr.dec, mr.pre, mr.kv, c.first, c.second, 2048);
     /* Flash-Next's QSA layers: twelve queries per KV head over 4-token pages, and six at
      * four ranks, each layout's prefill (a long history and a ragged last tile), decode, and the
      * widest verify (q_len 5 at gqa 12, 10 at gqa 6). */

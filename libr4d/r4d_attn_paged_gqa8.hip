@@ -28,6 +28,7 @@ using std::max;
 // The decode kernel uses helpers defined in the prefill unit, so prefill is included first.
 #include "r4d_attn_prefill_h256_gqa6.hip"
 #include "r4d_attn_decode_h256_gqa6.hip"
+#include "r4d_attn_prefill_split.h"
 
 #define CHK8() do { hipError_t e_ = hipGetLastError(); if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
@@ -86,12 +87,30 @@ using std::max;
 #define G8_D_VECMIN 256
 
 // ---- prefill -----------------------------------------------------------------------------------
+// Query positions a workgroup: 384 / gqa.
+#define G8_P_BQ ((G8_P_NWARPS * 16) / G8_GQA)
+
+// a->splits > 1 with a->scratch set is the KV split (r4d_attn_prefill_split.h): segments in the
+// scratch, then the merge. Only the head_dim 256 entries set it (their rows declare the scratch);
+// the 128 and 64 legs have no split instance and always run the plain form, unchanged.
 template <int HEAD_DIM, int OPT, int KVP>
 static int g8_prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != HEAD_DIM || a->block_size != G8_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != G8_GQA) return -2;
-    constexpr int BQ = (G8_P_NWARPS * 16) / G8_GQA;
-    dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
+    constexpr int BQ = G8_P_BQ;
+    constexpr bool CAN_SPLIT = HEAD_DIM == 256;
+    const int splits = (CAN_SPLIT && a->scratch && a->splits > 1) ? a->splits : 1;
+    g_prefill_last_splits = splits;
+    dim3 grid((a->q_len + BQ - 1) / BQ * splits, a->kv_heads, a->num_seqs);
+    if constexpr (CAN_SPLIT) {
+        if (splits > 1) {
+            hipLaunchKernelGGL((r4d_attn_prefill_kernel<G8_P_NWARPS, G8_P_TILE, HEAD_DIM, G8_GQA,
+                                                        G8_BLOCK_SIZE, KVP, OPT | O_PSPLIT>),
+                               grid, dim3(G8_P_NWARPS * 32), 0, s, *a);
+            CHK8();
+            return r4d_prefill_combine<HEAD_DIM, G8_D_JPB, G8_D_VECMIN>(a, splits, G8_P_TILE, s);
+        }
+    }
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<G8_P_NWARPS, G8_P_TILE, HEAD_DIM, G8_GQA,
                                                 G8_BLOCK_SIZE, KVP, OPT>),
                        grid, dim3(G8_P_NWARPS * 32), 0, s, *a);
@@ -189,10 +208,36 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
 // ============================================================== the plugin ABI entry points
 
 #if R4D_ATTN_H256
+/* The head_dim 256 prefill's KV split at this ratio's workgroup height (r4d_attn_prefill_split.h).
+ * Test hooks (r4d_selftest), not plugin entries, named by ratio and page since gqa 6 exists at 16-
+ * and 4-token pages in different units: the law at this card's WGP count, and the split count this
+ * unit's last prefill launch used. */
+#define G8_HOOK_(g, b, suf) r4d_attn_prefill_h256_gqa##g##_bs##b##suf
+#define G8_HOOK(g, b, suf)  G8_HOOK_(g, b, suf)
+extern "C" int G8_HOOK(R4D_ATTN_GQA, G8_BLOCK_SIZE, _splits)(int q_len, int total_q, int num_seqs,
+                                                             int kv_heads, int max_ctx) {
+    return r4d_prefill_splits_law(G8_P_BQ, G8_P_TILE, q_len, total_q, num_seqs, kv_heads, max_ctx,
+                                  r4d_prefill_wgps());
+}
+extern "C" int G8_HOOK(R4D_ATTN_GQA, G8_BLOCK_SIZE, _last_splits)(void) {
+    return g_prefill_last_splits;
+}
+#undef G8_HOOK
+#undef G8_HOOK_
+
+/* The split's f32 partials at declare, by the cache's token row (r4d_prefill_scratch). */
+static int64_t g8_prefill_scratch(const RadArgs* a, long long row) {
+    return r4d_prefill_scratch(a, 256, row, G8_P_BQ, G8_P_TILE);
+}
+extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _scratch)(const RadArgs* a) {
+    return g8_prefill_scratch(a, 512);
+}
+
 extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _fp8)(const RadArgs* a, RadStream s) {
     R4DArgs r;
     const int rc = fill_paged(a, &r, 256);
     if (rc != RAD_OK) return rc;
+    r.splits = r4d_prefill_splits(a, &r, G8_P_BQ, G8_P_TILE);
     /* Absent descales mean 1.0, as on the gqa6 leg. */
     return g8_prefill_launch<256, G8_P_OPT_256, 0>(&r, (hipStream_t)s);
 }
@@ -200,6 +245,7 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _bf16)(const RadArgs* a, Ra
     R4DArgs r;
     const int rc = fill_paged(a, &r, 256);
     if (rc != RAD_OK) return rc;
+    r.splits = r4d_prefill_splits(a, &r, G8_P_BQ, G8_P_TILE);
     return g8_prefill_launch<256, G8_P_OPT_256, 1>(&r, (hipStream_t)s);
 }
 #endif
@@ -397,10 +443,14 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
  * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
  * quantiser in the merge. */
 #define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
+extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
+    return g8_prefill_scratch(a, ROWB);                                                        \
+}                                                                                              \
 extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
     R4DArgs r;                                                                                 \
     const int rc = fill_paged_row(a, &r, 256, ROWB);                                           \
     if (rc != RAD_OK) return rc;                                                               \
+    r.splits = r4d_prefill_splits(a, &r, G8_P_BQ, G8_P_TILE);                                  \
     return g8_prefill_launch<256, G8_P_OPT_256 | (XOPT), 0>(&r, (hipStream_t)s);               \
 }                                                                                              \
 extern "C" int64_t GQ_SYM(r4d_rad_attn_decode_h256_gqa, _##TAG##_scratch)(const RadArgs* a) {  \
