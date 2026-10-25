@@ -32,10 +32,6 @@
 #ifndef HRU3_WAVES
 #define HRU3_WAVES 8
 #endif
-// Token tiles per pass (shared W fragment reads): 1 is fastest on Halo, 2 spills.
-#ifndef HRU3_TP
-#define HRU3_TP 1
-#endif
 #define HRU3_K 320
 #define HRU3_KSTEPS (HRU3_K / 16)
 #define HRU3_LUT_LO 0x3b80u
@@ -98,63 +94,6 @@ static __device__ __forceinline__ hru3_bf16x16_t hru3_pack(uint4 a, uint4 b) {
     return __builtin_bit_cast(hru3_bf16x16_t, xp);
 }
 
-static __device__ __forceinline__ void hru3_epilogue(
-    hru3_f8_t* acc, const uint4* nvv, const unsigned* tab, int token, int N, int hidden, int jb,
-    float* mixed, int half) {
-    // acc[br][i] holds j = j0 + 2 * i + half; exchange so lane half h holds j = j0 + 8 * h + m
-    // in acc[br][m] (pure data movement, as `_swap`).
-#pragma unroll
-    for (int br = 0; br < 4; br++) {
-        float q[8];
-#pragma unroll
-        for (int m = 0; m < 4; m++) {
-            const float send = half ? acc[br][m] : acc[br][4 + m];
-            const float recv = __shfl_xor(send, 16);
-            q[2 * m] = half ? recv : acc[br][m];
-            q[2 * m + 1] = half ? acc[br][4 + m] : recv;
-        }
-#pragma unroll
-        for (int m = 0; m < 8; m++) acc[br][m] = q[m];
-    }
-    float out[8];
-    bool bad = false;
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        float value = 0.0f;
-#pragma unroll
-        for (int br = 0; br < 4; br++) {
-            const float a = acc[br][i];
-            bad |= (a != a);
-            const unsigned u = __float_as_uint(a);
-            const unsigned r = u + 0x7fffu + ((u >> 16) & 1u);
-            const unsigned mag = min(max((r >> 16) & 0x7fffu, HRU3_LUT_LO), HRU3_LUT_HI);
-            const float gate = __uint_as_float(tab[(r >> 31) * HRU3_LUT_SPAN + (mag - HRU3_LUT_LO)]);
-            const unsigned int w32 = ((const unsigned int*)&nvv[br])[i >> 1];
-            const unsigned short hb = (i & 1) ? (w32 >> 16) : (w32 & 0xffff);
-            const float normed = (float)__builtin_bit_cast(_Float16, hb);
-            value += hru3_bf16r_fin(gate * normed);
-        }
-        out[i] = hru3_bf16r_fin(value * 0.25f);
-    }
-    {
-        // inf / NaN anywhere in the 16 normalized words survives a packed F16 sum.
-        hru3_h2_t s = __builtin_bit_cast(hru3_h2_t, ((const unsigned int*)&nvv[0])[0]);
-#pragma unroll
-        for (int br = 0; br < 4; br++)
-#pragma unroll
-            for (int w = 0; w < 4; w++)
-                if (br | w) s += __builtin_bit_cast(hru3_h2_t, ((const unsigned int*)&nvv[br])[w]);
-        bad |= !((float)s[0] >= -1e30f) | !((float)s[1] >= -1e30f) | ((float)s[0] > 1e30f) |
-               ((float)s[1] > 1e30f);
-    }
-    if (bad) hru3_baseline_epilogue(acc, nvv, out);
-    if (token < N) {
-        float4* mp = (float4*)(mixed + (size_t)token * hidden + jb);
-        mp[0] = float4{out[0], out[1], out[2], out[3]};
-        mp[1] = float4{out[4], out[5], out[6], out[7]};
-    }
-}
-
 extern "C" __global__ __launch_bounds__(HRU3_WAVES * 32) void hyper_read_up_wmma_bf16_gfx1151_v2(
     const unsigned short* __restrict__ W,
     const unsigned short* __restrict__ X,
@@ -188,46 +127,36 @@ extern "C" __global__ __launch_bounds__(HRU3_WAVES * 32) void hyper_read_up_wmma
     const int tend = min(ntiles, tbeg + tpg);
     const int jb = j0 + 8 * half;
     const unsigned short* const wb = hru3_w + l16 * LDW;
-    for (int tile0 = tbeg + wave; tile0 < tend; tile0 += HRU3_WAVES * HRU3_TP) {
-        // HRU3_TP token tiles per pass share each W fragment's LDS read.
-        int token[HRU3_TP];
-        uint4 nvv[HRU3_TP][4];
-        const unsigned short* xr[HRU3_TP];
-        hru3_f8_t acc[HRU3_TP][4];
+    for (int tile = tbeg + wave; tile < tend; tile += HRU3_WAVES) {
+        const int token = tile * 16 + l16;
+        const int tokc = min(token, N - 1);
+        uint4 nvv[4];
 #pragma unroll
-        for (int tp = 0; tp < HRU3_TP; tp++) {
-            token[tp] = (tile0 + tp * HRU3_WAVES) * 16 + l16;
-            const int tokc = min(token[tp], N - 1);
+        for (int br = 0; br < 4; br++)
+            nvv[br] = *(const uint4*)(normalized + (size_t)tokc * wide + br * hidden + jb);
+        const unsigned short* const xr = X + (size_t)tokc * HRU3_K;
+        hru3_f8_t acc[4];
 #pragma unroll
-            for (int br = 0; br < 4; br++)
-                nvv[tp][br] = *(const uint4*)(normalized + (size_t)tokc * wide + br * hidden + jb);
-            xr[tp] = X + (size_t)tokc * HRU3_K;
+        for (int br = 0; br < 4; br++) acc[br] = hru3_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        uint4 xcur[HRU3_XB][2];
 #pragma unroll
-            for (int br = 0; br < 4; br++) acc[tp][br] = hru3_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int s = 0; s < HRU3_XB; s++) {
+            xcur[s][0] = *(const uint4*)(xr + 16 * s);
+            xcur[s][1] = *(const uint4*)(xr + 16 * s + 8);
         }
-        uint4 xcur[HRU3_TP][HRU3_XB][2];
-#pragma unroll
-        for (int tp = 0; tp < HRU3_TP; tp++)
-#pragma unroll
-            for (int s = 0; s < HRU3_XB; s++) {
-                xcur[tp][s][0] = *(const uint4*)(xr[tp] + 16 * s);
-                xcur[tp][s][1] = *(const uint4*)(xr[tp] + 16 * s + 8);
-            }
         hru3_bf16x16_t acur[4];
 #pragma unroll
         for (int br = 0; br < 4; br++) acur[br] = *(const hru3_bf16x16_t*)(wb + br * 16 * LDW);
 #pragma unroll
         for (int g = 0; g < HRU3_KSTEPS / HRU3_XB; g++) {
             __builtin_amdgcn_sched_barrier(0);
-            uint4 xnext[HRU3_TP][HRU3_XB][2];
+            uint4 xnext[HRU3_XB][2];
             if (g + 1 < HRU3_KSTEPS / HRU3_XB) {
 #pragma unroll
-                for (int tp = 0; tp < HRU3_TP; tp++)
-#pragma unroll
-                    for (int s = 0; s < HRU3_XB; s++) {
-                        xnext[tp][s][0] = *(const uint4*)(xr[tp] + 16 * ((g + 1) * HRU3_XB + s));
-                        xnext[tp][s][1] = *(const uint4*)(xr[tp] + 16 * ((g + 1) * HRU3_XB + s) + 8);
-                    }
+                for (int s = 0; s < HRU3_XB; s++) {
+                    xnext[s][0] = *(const uint4*)(xr + 16 * ((g + 1) * HRU3_XB + s));
+                    xnext[s][1] = *(const uint4*)(xr + 16 * ((g + 1) * HRU3_XB + s) + 8);
+                }
             }
             __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
@@ -240,14 +169,10 @@ extern "C" __global__ __launch_bounds__(HRU3_WAVES * 32) void hyper_read_up_wmma
                         anext[br] = *(const hru3_bf16x16_t*)(wb + br * 16 * LDW + 16 * (ks + 1));
                 }
                 __builtin_amdgcn_sched_barrier(0);
+                const hru3_bf16x16_t b = hru3_pack(xcur[s][0], xcur[s][1]);
 #pragma unroll
-                for (int tp = 0; tp < HRU3_TP; tp++) {
-                    const hru3_bf16x16_t b = hru3_pack(xcur[tp][s][0], xcur[tp][s][1]);
-#pragma unroll
-                    for (int br = 0; br < 4; br++)
-                        acc[tp][br] =
-                            __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(acur[br], b, acc[tp][br]);
-                }
+                for (int br = 0; br < 4; br++)
+                    acc[br] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(acur[br], b, acc[br]);
                 if (ks + 1 < HRU3_KSTEPS) {
 #pragma unroll
                     for (int br = 0; br < 4; br++) acur[br] = anext[br];
@@ -255,17 +180,63 @@ extern "C" __global__ __launch_bounds__(HRU3_WAVES * 32) void hyper_read_up_wmma
             }
             if (g + 1 < HRU3_KSTEPS / HRU3_XB) {
 #pragma unroll
-                for (int tp = 0; tp < HRU3_TP; tp++)
-#pragma unroll
-                    for (int s = 0; s < HRU3_XB; s++) {
-                        xcur[tp][s][0] = xnext[tp][s][0];
-                        xcur[tp][s][1] = xnext[tp][s][1];
-                    }
+                for (int s = 0; s < HRU3_XB; s++) {
+                    xcur[s][0] = xnext[s][0];
+                    xcur[s][1] = xnext[s][1];
+                }
             }
         }
+        // acc[br][i] holds j = j0 + 2 * i + half; exchange so lane half h holds j = j0 + 8 * h + m
+        // in acc[br][m] (pure data movement, as `_swap`).
 #pragma unroll
-        for (int tp = 0; tp < HRU3_TP; tp++) {
-            hru3_epilogue(acc[tp], nvv[tp], tab, token[tp], N, hidden, jb, mixed, half);
+        for (int br = 0; br < 4; br++) {
+            float q[8];
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                const float send = half ? acc[br][m] : acc[br][4 + m];
+                const float recv = __shfl_xor(send, 16);
+                q[2 * m] = half ? recv : acc[br][m];
+                q[2 * m + 1] = half ? acc[br][4 + m] : recv;
+            }
+#pragma unroll
+            for (int m = 0; m < 8; m++) acc[br][m] = q[m];
+        }
+        float out[8];
+        bool bad = false;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float value = 0.0f;
+#pragma unroll
+            for (int br = 0; br < 4; br++) {
+                const float a = acc[br][i];
+                bad |= (a != a);
+                const unsigned u = __float_as_uint(a);
+                const unsigned r = u + 0x7fffu + ((u >> 16) & 1u);
+                const unsigned mag = min(max((r >> 16) & 0x7fffu, HRU3_LUT_LO), HRU3_LUT_HI);
+                const float gate = __uint_as_float(tab[(r >> 31) * HRU3_LUT_SPAN + (mag - HRU3_LUT_LO)]);
+                const unsigned int w32 = ((const unsigned int*)&nvv[br])[i >> 1];
+                const unsigned short hb = (i & 1) ? (w32 >> 16) : (w32 & 0xffff);
+                const float normed = (float)__builtin_bit_cast(_Float16, hb);
+                value += hru3_bf16r_fin(gate * normed);
+            }
+            out[i] = hru3_bf16r_fin(value * 0.25f);
+        }
+        {
+            // inf / NaN anywhere in the 16 normalized words survives a packed F16 sum.
+            hru3_h2_t s = __builtin_bit_cast(hru3_h2_t, ((const unsigned int*)&nvv[0])[0]);
+#pragma unroll
+            for (int br = 0; br < 4; br++)
+#pragma unroll
+                for (int w = 0; w < 4; w++)
+                    if (br | w) s += __builtin_bit_cast(hru3_h2_t, ((const unsigned int*)&nvv[br])[w]);
+            bad |= !((float)s[0] >= -1e30f) | !((float)s[1] >= -1e30f) | ((float)s[0] > 1e30f) |
+                   ((float)s[1] > 1e30f);
+        }
+        if (bad) hru3_baseline_epilogue(acc, nvv, out);
+        if (token < N) {
+            float4* mp = (float4*)(mixed + (size_t)token * hidden + jb);
+            mp[0] = float4{out[0], out[1], out[2], out[3]};
+            mp[1] = float4{out[4], out[5], out[6], out[7]};
         }
     }
 }
