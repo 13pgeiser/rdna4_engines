@@ -139,12 +139,17 @@ the `input/` folder.
 
 While a job runs the node polls every 3 s, drives ComfyUI's node progress bar,
 **and prints a live line to the ComfyUI console** —
-`[RadianceMiniMax] job_x: 45%, step 12/26, eta ~1m 07s, elapsed 55s` — so a
-waiting user sees pace and progress, not a silent spinner. Real step counts
-come from a radiance server built after Oct 2026 (it added `steps_done`/
-`steps_total` to the job object); an older server shows `~step` derived from
-the job's `progress` field, which is the steps' share of 0..90 by design. That
-same new server also prints one `RAD_INFO` line per step, so `docker logs -f`
-shows the identical pace on the server box. `timeout` (advanced, default
-1800 s) bounds the wait. A refusal, a failed job or an unreachable server all
+`[RadianceMiniMax] job_x: 45%, step 12/26, 5.2 s/step, eta ~1m 07s (+decode),
+elapsed 55s` — so a waiting user sees pace and progress, not a silent spinner.
+The `s/step` is **measured between polls** from the step counter and lightly
+smoothed, so it tracks the live pace — including the step-price jump when a
+latent-upscaled job switches from draft to refine grid — and the eta is
+remaining steps × that pace (the `+decode` tail is extra, as on the server's
+own log). Real step counts come from a radiance server built after Oct 2026
+(it added `steps_done`/`steps_total` to the job object); an older server shows
+`~step` derived from the job's `progress` field, which is the steps' share of
+0..90 by design, and extrapolates its eta from that progress. That same new
+server also prints one `RAD_INFO` line per step, so `docker logs -f` shows the
+identical pace on the server box. `timeout` (advanced, default 1800 s) bounds
+the wait. A refusal, a failed job or an unreachable server all
 raise with the server's own error text.

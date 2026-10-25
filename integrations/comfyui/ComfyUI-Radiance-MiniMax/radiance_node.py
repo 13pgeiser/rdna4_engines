@@ -145,11 +145,14 @@ OUTPUTS: clip saved to the output folder under radiance/ AND returned
 as VIDEO (preview/chain) + file path + server job id. Progress bar
 tracks the job; `timeout` bounds the wait. The node prints a
 PROGRESS LINE to the ComfyUI console every poll (~3s):
-"job_x: 45%, step 12/26, eta ~1m 07s, elapsed 55s" -- real
-step counts come from a server built after Oct 2026; older
-servers show ~step derived from the job progress, which is
-the steps' share of 0..90 by design. On the SERVER itself, a
-new-enough build logs one RAD_INFO line per step, so
+"job_x: 45%, step 12/26, 5.2 s/step, eta ~1m 07s (+decode),
+elapsed 55s" -- the s/step is MEASURED from the step counter
+(smoothed, so it tracks a latent-upscale's draft->refine pace
+change), and the eta is remaining-steps x that pace. Real step
+counts come from a server built after Oct 2026; older servers
+show ~step derived from the job progress (the steps' share of
+0..90 by design) and extrapolate the eta from it. On the SERVER
+itself, a new-enough build logs one RAD_INFO line per step, so
 `docker logs -f` shows the same pace live."""
 
 
@@ -429,9 +432,11 @@ class RadianceMiniMax(io.ComfyNode):
                 "The clip is **saved to the output folder** under `radiance/` AND returned as "
                 "a `VIDEO` (preview/chain), plus the saved `file` path and server `job id`. "
                 "The node polls the job, drives its progress bar, and prints a live line to "
-                "the ComfyUI console every ~3 s (`45%, step 12/26, eta ~1m 07s` — real steps "
-                "on a server built after Oct 2026, `~step` derived from progress otherwise); "
-                "`timeout` (advanced) bounds the wait."),
+                "the ComfyUI console every ~3 s (`45%, step 12/26, 5.2 s/step, eta ~1m 07s "
+                "(+decode)` — the pace is measured from the step counter and the eta is "
+                "remaining steps × that pace; real steps on a server built after Oct 2026, "
+                "`~step` derived from progress otherwise); `timeout` (advanced) bounds the "
+                "wait."),
             inputs=[
                 io.String.Input("server_url", default="http://127.0.0.1:8133",
                                 tooltip="the radiance server: http://<host>:8133 -- point it "
@@ -714,6 +719,7 @@ class RadianceMiniMax(io.ComfyNode):
         bar = _progress_bar(cls)
         deadline = time.time() + timeout
         t0 = time.time()
+        pace = _PaceTracker()
         logging.info(f"[{LOG}] job {job_id} submitted -- progress lines every "
                      f"{POLL_SECONDS:.0f}s below; `docker logs -f` on the server shows them "
                      "per STEP too (a server built after Oct 2026)")
@@ -732,8 +738,9 @@ class RadianceMiniMax(io.ComfyNode):
                 bar.update_absolute(min(max(float(p), 0.0), 100.0))
             # the heartbeat: ComfyUI's console gets a live line per poll, so a
             # waiting user sees pace and eta instead of a silent spinner
-            logging.info(f"[{LOG}] {job_id}: {_progress_line(j, num_inference_steps, time.time() - t0)}")
-            if time.time() > deadline:
+            now = time.time()
+            logging.info(f"[{LOG}] {job_id}: {_progress_line(j, num_inference_steps, now - t0, pace.update(j, now))}")
+            if now > deadline:
                 raise RuntimeError(f"job {job_id} still {status} after {timeout}s")
             time.sleep(POLL_SECONDS)
 
@@ -764,12 +771,42 @@ def _fmt_secs(s):
     return f"{s:.0f}s" if s < 90 else f"{s / 60:.0f}m {s % 60:02.0f}s"
 
 
-def _progress_line(job, steps_requested, elapsed):
+class _PaceTracker:
+    """Measured sec/step for the console heartbeat -- the client-side mirror of
+    the server's per-step RAD_INFO log. Polls are ~3 s apart, so each poll pair
+    contributes the average over the steps completed in between, and a light
+    EMA (~40% new) lets the number FOLLOW the pace instead of averaging the
+    job's whole life into it -- important when a latent-upscaled job switches
+    grids mid-run (draft steps are cheaper than refine steps). Needs a
+    post-Oct-2026 server (the `steps_done` counter); reports None otherwise."""
+
+    def __init__(self):
+        self.prev_t = None
+        self.prev_done = None
+        self.sps = None
+
+    def update(self, job, now):
+        done = job.get("steps_done")
+        if not isinstance(done, int):
+            return self.sps
+        if self.prev_done is not None and done > self.prev_done and self.prev_t is not None:
+            inst = (now - self.prev_t) / (done - self.prev_done)
+            if inst > 0:
+                self.sps = inst if self.sps is None else 0.4 * inst + 0.6 * self.sps
+        self.prev_t, self.prev_done = now, done
+        return self.sps
+
+
+def _progress_line(job, steps_requested, elapsed, sps=None):
     """One console line per poll -- the waiting client's heartbeat. A server
     built after Oct 2026 reports real `steps_done`/`steps_total` in the job
     JSON; every server's `progress` is the steps' share of 0..90 by design
     (videos.cpp), so an older one shows the derived estimate marked `~`. The
-    eta extrapolates the observed progress, which also covers the decode tail."""
+    eta rides the MEASURED s/step while steps remain (it tracks the live pace
+    through phase changes and ignores the encode warm-up that skews a
+    whole-job extrapolation), falling back to extrapolating `progress` on
+    older servers -- that also covers the decode tail, which the step-based
+    eta flags as extra."""
     status = job.get("status", "?")
     if status == "queued":
         return f"queued (waiting for the server's slot), elapsed {_fmt_secs(elapsed)}"
@@ -777,14 +814,19 @@ def _progress_line(job, steps_requested, elapsed):
     p = float(p) if isinstance(p, (int, float)) else 0.0
     parts = [f"{p:.0f}%"]
     done, total = job.get("steps_done"), job.get("steps_total")
-    if isinstance(done, int) and isinstance(total, int) and total > 0:
+    have_steps = isinstance(done, int) and isinstance(total, int) and total > 0
+    if have_steps:
         parts.append(f"step {done}/{total}")
     elif p > 0 and steps_requested:
         est = min(int(round(p / 90.0 * steps_requested)), int(steps_requested))
         parts.append(f"~step {est}/{steps_requested}")
+    if sps:
+        parts.append(f"{sps:.1f} s/step")
     if p >= 90:
         parts.append("decoding/muxing")
-    if 0 < p < 100 and elapsed > 0:
+    if have_steps and sps and 0 < done < total:
+        parts.append(f"eta ~{_fmt_secs((total - done) * sps)} (+decode)")
+    elif not have_steps and 0 < p < 100 and elapsed > 0:
         parts.append(f"eta ~{_fmt_secs(elapsed * (100.0 - p) / p)}")
     parts.append(f"elapsed {_fmt_secs(elapsed)}")
     return ", ".join(parts)
