@@ -1313,6 +1313,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-flash-next-gfx1151-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS)",
+        effect: KernelSelection,
+        switches: "eager: the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; recorded/captured: the _swap launch",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracle of every mixed output byte against hyper_read_up_wmma_bf16_swap on gfx1151 (halo-prefill-044/a-up/ORACLE.md): random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-shared-int8-prefill",
         predicates: &[IsRecording, CaptureMode],
         condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
@@ -3601,13 +3612,19 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hc_up_v2_selected",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hyper_read_up_wmma_launch",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/shared_i8.rs",
