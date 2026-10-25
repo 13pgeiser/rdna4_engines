@@ -3552,9 +3552,16 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let qwen4_native_mtp = is_qwen4 && spec_name == "mtp";
-    // Qwen4's shared history planner only renders; its native MTP route plans
-    // reuse separately through the session cache. Other Qwen4 speculators are cold.
+    // Qwen4's shared history planner only renders; its speculators plan reuse
+    // separately through the session cache: native MTP on its own route,
+    // DFlash2 (no device head state) on the target-only AR route.
+    let qwen4_session_route = if is_qwen4 && spec_name == "mtp" {
+        Some(SessionRoute::Mtp)
+    } else if is_qwen4 && spec_name == "dflash2" {
+        Some(SessionRoute::Ar)
+    } else {
+        None
+    };
     let cache_disabled = spec_cache_disabled_for(
         is_qwen4,
         !is_qwen4
@@ -3727,19 +3734,19 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
-    // Native Qwen4 MTP plans against the full canonical prompt. A hit is the
+    // Qwen4 speculators plan against the full canonical prompt. A hit is the
     // longest of the live state (this conversation's previous turn) and a
     // cold-exact session snapshot.
-    if qwen4_native_mtp {
+    if let Some(route) = qwen4_session_route {
         // Native MTP never reuses a session under pipeline parallelism (its
         // sessions are not distributed); `plan_qwen4_session` returns 0 for a
-        // mesh on the MTP route.
-        let start = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Mtp);
+        // mesh on the MTP route. DFlash2 never runs on a mesh.
+        let start = plan_qwen4_session(m, &prompt_tokens, route);
         let start_is_live = m
             .qwen4()
-            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, SessionRoute::Mtp, start));
+            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, route, start));
         trace_qwen4_session_plan(
-            SessionRoute::Mtp,
+            route,
             &m.conversation_tokens,
             &prompt_tokens,
             start,
@@ -11135,6 +11142,32 @@ fn spec_prefill(
     abort: &dyn Fn() -> bool,
 ) -> Result<PrefillOutcome, String> {
     let Some(gpus) = pp else {
+        // Qwen4 DFlash2 prefills inside an AR-route session turn: the begin
+        // restores the planned prefix (or cold-starts) and arms the snapshot
+        // boundaries `spec_advance` publishes, so the speculator continues
+        // the target in place rather than resetting it (which would drop the
+        // turn).
+        if spec.name() == "dflash2" {
+            if let Some(bundle) = slot
+                .as_any_mut()
+                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            {
+                let start = if cache_hit { prefill_start } else { 0 };
+                bundle
+                    .session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)
+                    .map_err(|e| e.to_string())?;
+                return spec.prefill(
+                    gpu,
+                    slot,
+                    prompt_tokens,
+                    &prompt_tokens[start..],
+                    start,
+                    true,
+                    None,
+                    abort,
+                );
+            }
+        }
         return spec.prefill(
             gpu,
             slot,

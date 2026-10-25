@@ -53,6 +53,9 @@ pub struct Dflash2Speculator {
     /// ([`trim_feature_rows`]); otherwise `host_base` stays 0.
     target_hidden_host: Vec<f32>,
     host_base: usize,
+    /// Token of every committed position `0..host_end()`: tells a session
+    /// reuse whether the rows below its restart belong to that prompt.
+    host_tokens: Vec<u32>,
     /// Rows the draft reads (its declared sliding window); `None` keeps every
     /// row.
     feature_window: Option<usize>,
@@ -135,6 +138,29 @@ impl Dflash2Speculator {
         self.target_hidden_host.clear();
         self.target_hidden_host.shrink_to_fit();
         self.host_base = 0;
+        self.host_tokens.clear();
+        self.scratch.reset_upload_tracking();
+    }
+
+    /// The target continues `prompt` at `start` (a session restore or a live
+    /// continuation): keep the rows below `start` when they were committed
+    /// for this prompt's tokens, else restart the draft context empty at
+    /// `start` (fewer context rows only lower acceptance).
+    fn reuse_host(&mut self, prompt: &[u32], start: usize) {
+        let covered = self.host_base <= start
+            && start <= self.host_end()
+            && self.host_tokens.get(..start) == prompt.get(..start);
+        if covered {
+            self.target_hidden_host
+                .truncate((start - self.host_base) * self.row_elems());
+            self.host_tokens.truncate(start);
+        } else {
+            self.target_hidden_host.clear();
+            self.host_base = start;
+            self.host_tokens.clear();
+            self.host_tokens.extend_from_slice(&prompt[..start]);
+        }
+        // Device copies of rows at or past `start` are stale now.
         self.scratch.reset_upload_tracking();
     }
 
@@ -180,12 +206,13 @@ impl Dflash2Speculator {
             target.verify_block(gpu, &block, position, vs.as_mut(), Some(&mut rows))?[0]
         };
         target.commit_prefix(gpu, &block, 0, position, self.verify_scratch()?.as_mut())?;
-        self.append_rows(&rows, 1)?;
+        self.append_rows(&rows, &block)?;
         Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
     }
 
-    fn append_rows(&mut self, rows: &[f32], count: usize) -> Result<(), String> {
-        let elems = count * self.row_elems();
+    /// Append the feature rows of the committed `tokens`.
+    fn append_rows(&mut self, rows: &[f32], tokens: &[u32]) -> Result<(), String> {
+        let elems = tokens.len() * self.row_elems();
         if rows.len() < elems {
             return Err(format!(
                 "Dflash2Speculator: target captured {} feature floats, need {elems}",
@@ -193,6 +220,7 @@ impl Dflash2Speculator {
             ));
         }
         self.target_hidden_host.extend_from_slice(&rows[..elems]);
+        self.host_tokens.extend_from_slice(tokens);
         self.trim_host();
         Ok(())
     }
@@ -214,14 +242,16 @@ impl Speculator for Dflash2Speculator {
         _resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // A cold prefill resets the target and a hit restores or continues
+        // it: either way no verify ticket is outstanding.
+        if let Some(vs) = self.verify_scratch.as_mut() {
+            vs.clear();
+        }
         let (fill, start) = if cache_hit {
+            self.reuse_host(prompt_tokens, prefill_start);
             (prefill_tokens, prefill_start)
         } else {
-            // A cold prefill resets the target: any verify ticket is gone.
             self.clear_host();
-            if let Some(vs) = self.verify_scratch.as_mut() {
-                vs.clear();
-            }
             (prompt_tokens, 0)
         };
         self.check_host_rows(start)?;
@@ -241,6 +271,7 @@ impl Speculator for Dflash2Speculator {
             } => (last_argmax, last_logits),
         };
         self.rebase_host(start + fill.len())?;
+        self.host_tokens.extend_from_slice(fill);
         self.check_host_rows(start + fill.len())?;
         let first_token = if self.sampled() {
             let logits = last_logits.ok_or(
@@ -377,6 +408,7 @@ impl Speculator for Dflash2Speculator {
             Some(&mut self.target_hidden_host),
         )? {
             self.rebase_host(start_pos + tokens.len())?;
+            self.host_tokens.extend_from_slice(tokens);
             self.check_host_rows(start_pos + tokens.len())?;
         }
         Ok(true)
@@ -480,7 +512,7 @@ impl Dflash2Speculator {
             position,
             self.verify_scratch()?.as_mut(),
         )?;
-        self.append_rows(&rows, accepted + 1)?;
+        self.append_rows(&rows, &block[..=accepted])?;
         let emit = drafts[..accepted]
             .iter()
             .copied()
@@ -637,6 +669,7 @@ pub fn build_dflash2_speculator(
         config,
         target_hidden_host: Vec::new(),
         host_base: 0,
+        host_tokens: Vec::new(),
         feature_window,
         verify_scratch: Some(verify_scratch),
         block_size: block,
