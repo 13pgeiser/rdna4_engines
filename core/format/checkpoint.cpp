@@ -1221,6 +1221,18 @@ void Checkpoint::detect_import() {
         else
             import_why_ = "ParoQuant's MXFP4 here is not format mxfp4 with 32-element blocks and "
                           "rotation groups of 128, which is the one this reads";
+    } else if (qm == "paroquant_m2xfp4") {
+        /* The same rotated planes on libquant's `m2xfp4` grid: e2m1 codes, an e8m0 exponent per 32
+         * of K, and one metadata byte a group whose four 2-bit subgroup multipliers refine that
+         * exponent to (1 + k/4) . 2^E. `mx_block` states the group the planes are cut in and
+         * `subgroup` the columns one multiplier covers. */
+        if (qc("format") == "m2xfp4" && qc("mx_block") == "32" && qc("subgroup") == "8" &&
+            qc("group_size") == "128")
+            import_ = Import::ParoM2;
+        else
+            import_why_ = "ParoQuant's M2XFP4 here is not format m2xfp4 with 32-element groups, "
+                          "8-element subgroups and rotation groups of 128, which is the one this "
+                          "reads";
     }
     /* Rename the tool's quantization_config: plugins read that key as the served format
      * (qwen35_fp8 checks quant_method is "fp8"), while an imported checkpoint states each weight's
@@ -1285,10 +1297,13 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::QuarkMx || import_ == Import::ParoMx) {
+    if (import_ == Import::QuarkMx || import_ == Import::ParoMx || import_ == Import::ParoM2) {
         /* Quark's MXFP4 is `fp4_e2m1*e8m0[1x32]` as stored: two codes per byte (element 2j in the
          * low nibble), one biased exponent per 32 of K. The view only renames dtypes and the
-         * logical width. Excluded layers are plain tensors. */
+         * logical width. Excluded layers are plain tensors. ParoQuant's M2XFP4 grid carries one
+         * more plane (`weight_meta`, [N, K/32] u8) that is handed to the weight through
+         * import_meta: its bytes are the encoding's third plane as they ship. */
+        const bool m2 = import_ == Import::ParoM2;
         const SrcTensor* w = find(name);
         const SrcTensor* e = w ? find(name + "_scale") : nullptr;
         if (!w || !e || w->rad_dtype != RAD_U8) return RAD_E_NOTFOUND;
@@ -1296,6 +1311,11 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
             e->shape[0] != w->shape[0] || e->shape[1] * 32 != w->shape[1] * 2)
             return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the [N, K/32] exponent plane of '" +
                                        w->name + "'");
+        const SrcTensor* mt = m2 ? find(name + "_meta") : nullptr;
+        if (m2 && (!mt || mt->rad_dtype != RAD_U8 || mt->shape != e->shape))
+            return refuse(RAD_E_FORMAT, "'" + w->name + "' has no [N, K/32] u8 '" + name +
+                                        "_meta' beside its exponent plane, which the checkpoint's "
+                                        "m2xfp4 grid stores the subgroup multipliers in");
         SrcTensor c = *w;
         c.rad_dtype = RAD_FP4E2M1;
         c.shape = { w->shape[0], w->shape[1] * 2 };
@@ -1306,6 +1326,7 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         sliced_.push_back(std::move(x));
         *scale = &sliced_.back();
         imported_[name] = { *codes, *scale };
+        if (mt) imported_meta_[name] = mt;
         return RAD_OK;
     }
 
@@ -1582,6 +1603,11 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
     return RAD_OK;
 }
 
+const SrcTensor* Checkpoint::import_meta(const std::string& name) const {
+    auto it = imported_meta_.find(name);
+    return it == imported_meta_.end() ? nullptr : it->second;
+}
+
 int Checkpoint::open(const std::string& path) {
     path_ = path;
     const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
@@ -1704,7 +1730,8 @@ std::string ckpt_tensor_of(const SrcTensor& t) {
 bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
                     std::unordered_set<std::string>* hit) {
     bool any = false;
-    for (const auto* list : { &w.pieces, &w.scales, &w.pq_pairs, &w.pq_theta, &w.pq_scale })
+    for (const auto* list : { &w.pieces, &w.scales, &w.pq_pairs, &w.pq_theta, &w.pq_scale,
+                              &w.pq_meta })
         for (const SrcTensor* t : *list) {
             if (!t) continue;
             const std::string n = ckpt_tensor_of(*t);
@@ -1777,7 +1804,7 @@ int paro_attach(Checkpoint& ck, CkptWeight* out, std::string* why) {
         const SrcTensor* th = ck.find(base + ".theta");
         const SrcTensor* cs = ck.find(base + ".channel_scales");
         if (!pr || !th || !cs)
-            return refuse("'" + piece->name + "' is a ParoQuant MXFP4 weight and '" + base +
+            return refuse("'" + piece->name + "' is a ParoQuant weight and '" + base +
                           "' lacks its pairs, theta or channel_scales");
         if (pr->rad_dtype != RAD_I16 || th->rad_dtype != RAD_F16 || cs->rad_dtype != RAD_F16 ||
             pr->shape.size() != 2 || th->shape.size() != 2 || cs->shape.size() != 2 ||
@@ -2224,6 +2251,34 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", RAD_F32, 1, 16);
+        }
+    } else if (dt == RAD_FP4E2M1 && scaled && ck.imports() == Checkpoint::Import::ParoM2) {
+        /* ParoQuant's M2XFP4: the MXFP4 planes byte for byte -- e2m1 codes, an e8m0 exponent per
+         * 32 of K -- plus the scheme's metadata byte a group (one per 32, four 2-bit subgroup
+         * multipliers), in the rotated basis the checkpoint trained, with the rotation beside them
+         * (paro_attach). Joined only along rows: every plane follows the pieces row by row. */
+        bool fits = d == 0 || out->pieces.size() == 1;
+        for (size_t k = 0; k < out->pieces.size() && fits; ++k) {
+            const SrcTensor* mt = ck.import_meta(out->pieces[k]->name);
+            fits = mt && out->scales[k] && out->scales[k]->rad_dtype == RAD_E8M0;
+            if (fits) out->pq_meta.push_back(mt);
+        }
+        if (!fits) {
+            out->pq_meta.clear();
+            out->why = "its M2XFP4 pieces are joined along a column, or a piece has no metadata "
+                       "plane beside its exponents";
+        } else {
+            out->imported = true;
+            out->trivial = false;
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "m2xfp4");
+            rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+            rad_enc_add_plane(&out->enc, "meta", RAD_U8, 1, 32);
+            const int rc = paro_attach(ck, out, why);
+            if (rc != RAD_OK) return rc;
+            out->why = "it is ParoQuant M2XFP4, which rad-convert imports with its rotation tables "
+                       "-- serve the container it writes";
         }
     } else if (dt == RAD_FP4E2M1 && scaled) {
         /* Quark's MXFP4 byte for byte: codes and exponents are the planes of
@@ -2885,6 +2940,31 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
                         *o++ = (uint8_t)(lo | (h << 4));
                     }
                 }
+            }
+            base += Np;
+        }
+        return RAD_OK;
+    }
+    if (w.paro && std::strncmp(w.enc.plane[k].role, "meta", RAD_ENC_STR) == 0) {
+        /* The M2XFP4 grid's metadata byte a group, as stored: [N][K/32], one byte a group, the
+         * subgroup multipliers packed in it (subgroup s in bits [2s, 2s+2)). The checkpoint packs
+         * along N the way the plane does, so a row is a memcpy. */
+        int64_t base = 0;
+        for (size_t p = 0; p < w.pieces.size() && p < w.pq_meta.size(); ++p) {
+            const SrcTensor& m = *w.pq_meta[p];
+            const int64_t Np = w.pieces[p]->shape[0];
+            /* The pieces view is the logical [N, K] codes; one metadata byte covers 32 of K. */
+            const int64_t ng = w.pieces[p]->shape[1] / 32;
+            if (m.shape.size() != 2 || m.shape[0] != Np || m.shape[1] != ng)
+                return refuse(RAD_E_SHAPE, "'" + m.name + "' is not the [" + std::to_string(Np) +
+                                           ", " + std::to_string(ng) + "] metadata plane of '" +
+                                           w.pieces[p]->name + "'; a stacked form it cannot be "
+                                           "sliced out of is refused rather than packed");
+            const int64_t lo = std::max(r0, base), hi = std::min(r0 + nr, base + Np);
+            if (hi > lo) {
+                std::memcpy(o, (const uint8_t*)m.data + (lo - base) * ng,
+                            (size_t)((hi - lo) * ng));
+                o += (hi - lo) * ng;
             }
             base += Np;
         }

@@ -16,6 +16,7 @@
  * end of this file: each answers dtype m2xfp4 here and hands every other dtype, unchanged, to the
  * hook the row had (ref_gemm.cpp, ref_shapes.cpp, ref_planes.h).
  */
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include "ref_common.h"
@@ -27,43 +28,59 @@ using namespace ref;
 
 namespace {
 
-/* The plain scheme as libquant writes it: no transform; codes [1 x 1], scale and meta [1 x 32]. */
+/* The scheme as libquant writes it: codes [1 x 1], scale and meta [1 x 32]. A rotated weight
+ * (ParoQuant) carries the same three planes in the basis its "givens" transform names, with the
+ * rotation's tables beside them; the rotation is the activation's, so the planes are read as they
+ * are. */
 bool m2_enc_planes(const RadEncoding* enc) {
-    if (!enc || !rad_enc_is(enc, "m2xfp4") || enc->transform[0] || enc->n_planes != 3)
-        return false;
+    if (!enc || !rad_enc_is(enc, "m2xfp4")) return false;
+    if (enc->transform[0] && std::strncmp(enc->transform, "givens", RAD_ENC_STR) != 0) return false;
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     const RadEncPlane* mt = rad_enc_plane(enc, "meta");
-    return enc->plane[0].kind == RAD_PLANE_TILED && enc->plane[0].dtype == RAD_FP4E2M1 &&
-           enc->plane[0].block[0] == 1 && enc->plane[0].block[1] == 1 && sc && mt &&
-           sc->kind == RAD_PLANE_TILED && sc->dtype == RAD_E8M0 && sc->block[0] == 1 &&
-           sc->block[1] == 32 && mt->kind == RAD_PLANE_TILED && mt->dtype == RAD_U8 &&
-           mt->block[0] == 1 && mt->block[1] == 32;
+    const bool planes = enc->plane[0].kind == RAD_PLANE_TILED &&
+                        enc->plane[0].dtype == RAD_FP4E2M1 && enc->plane[0].block[0] == 1 &&
+                        enc->plane[0].block[1] == 1 && sc && mt && sc->kind == RAD_PLANE_TILED &&
+                        sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == 32 &&
+                        mt->kind == RAD_PLANE_TILED && mt->dtype == RAD_U8 &&
+                        mt->block[0] == 1 && mt->block[1] == 32;
+    if (!planes) return false;
+    if (!enc->transform[0]) return enc->n_planes == 3;
+    return enc->n_planes >= 6 && rad_enc_plane(enc, "t.pairs") && rad_enc_plane(enc, "t.angle") &&
+           rad_enc_plane(enc, "t.scale");
 }
 
 /* Each product is one f32 multiply and each output one f32 accumulation in k order: the exact
  * decode's own arithmetic, since the multipliers take the codes off the integer grid an mxfp4
- * group sub-sum would use. */
+ * group sub-sum would use.
+ *
+ * Parts (`pb1`, `pb2`), a rotated (ParoQuant) fused projection's pieces, as gemm_ntq_impl's mxfp4
+ * arm reads them (ref_gemm.cpp): weight rows [0, pb1), [pb1, pb2) and [pb2, N) each meet their own
+ * copy of the activation, side by side in a row of `a` ([M, parts * K]) and of its scale
+ * ([M, parts * K / 128]). 0 omits a bound. */
 int m2_gemm(const RadArgs* a) {
     if (a->n_t < 5) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[2], *Y = &a->t[4];
     const RadTensor *as_ = t_in(a, 1), *bs_ = t_in(a, 3);
     if (!A->data || !B->data || !Y->data) return RAD_E_INVAL;
     if (t_in(a, 5)) return RAD_E_UNSUPPORTED;            /* a_sum belongs to the asym grids */
-    /* Parts (pb1/pb2) are the rotated grids'; a plain m2xfp4 linear has none, and a case carrying
-     * them is declined rather than answered unsplit. */
-    if (p_int(a, "pb1", 0) > 0 || p_int(a, "pb2", 0) > 0) return RAD_E_UNSUPPORTED;
     if (A->dtype != RAD_F8E4M3 || B->dtype != RAD_U8 || B->rank != 1) return RAD_E_DTYPE;
     if (!as_ || !bs_ || bs_->dtype != RAD_E8M0 || bs_->rank < 2) return RAD_E_DTYPE;
     const int64_t K = p_int(a, "K", 0), N = p_int(a, "N", 0);
     if (K <= 0 || K % 32 || N <= 0) return RAD_E_SHAPE;
     const int64_t M = numel(Y) / N;
     if (M <= 0) return RAD_E_SHAPE;
-    const int64_t kb = K / 32, akb = (K + 127) / 128;
-    if (numel(A) < M * K || numel(B) != N * (K / 2 + kb) || numel(bs_) < N * kb ||
-        numel(as_) < M * akb)
+    const int64_t pb1 = p_int(a, "pb1", 0), pb2 = p_int(a, "pb2", 0);
+    const int64_t e1 = pb1 > 0 ? std::min<int64_t>(pb1, N) : N;
+    const int64_t e2 = pb2 > 0 ? std::max<int64_t>(e1, std::min<int64_t>(pb2, N)) : N;
+    const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    if (parts > 1 && (e1 % 16 || e2 % 16 || A->rank < 2 || A->shape[A->rank - 1] != parts * K))
         return RAD_E_SHAPE;
-    const int64_t ars = row_stride(A, K), acs = laststride(A);
-    const int64_t srs = row_stride(as_, akb), scs = laststride(as_);
+    const int64_t kb = K / 32, akb = (K + 127) / 128;
+    if (numel(A) < M * parts * K || numel(B) != N * (K / 2 + kb) || numel(bs_) < N * kb ||
+        numel(as_) < M * parts * akb)
+        return RAD_E_SHAPE;
+    const int64_t ars = row_stride(A, parts * K), acs = laststride(A);
+    const int64_t srs = row_stride(as_, parts * akb), scs = laststride(as_);
     const int64_t brs = row_stride(bs_, kb);
     const int64_t ys_r = row_stride(Y, N), ys_c = laststride(Y);
     const uint8_t* meta0 = (const uint8_t*)B->data + N * (K / 2);
@@ -72,6 +89,8 @@ int m2_gemm(const RadArgs* a) {
         const uint8_t* codes = (const uint8_t*)B->data + n * (K / 2);
         const uint8_t* meta  = meta0 + n * kb;
         const uint8_t* expe  = (const uint8_t*)bs_->data + n * brs;
+        const int64_t  part  = n < e1 ? 0 : (n < e2 ? 1 : 2);
+        const int64_t  ak0   = part * K, sk0 = part * akb;   /* this part's copy of `a` */
         /* The weight row decoded once, so the meta and exponent reads are not repeated per
          * activation row. */
         std::vector<float> w((size_t)K);
@@ -86,7 +105,8 @@ int m2_gemm(const RadArgs* a) {
             const int64_t ab = m * ars;
             float acc = 0.0f;
             for (int64_t k = 0; k < K; ++k)
-                acc += ldt(A, ab + k * acs) * ldt(as_, m * srs + (k >> 7) * scs) * w[(size_t)k];
+                acc += ldt(A, ab + (ak0 + k) * acs) * ldt(as_, m * srs + (sk0 + (k >> 7)) * scs) *
+                       w[(size_t)k];
             stt(Y, m * ys_r + n * ys_c, acc);
         }
     }
@@ -111,7 +131,8 @@ int m2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 }
 
 /* The weight operand is codes and meta, concatenated; the scale and reference operands are the
- * exponent plane, stored as it is. Any other encoding is refused, a transform included. */
+ * exponent plane, stored as it is. Any other encoding is refused, a transform other than
+ * "givens" included. */
 int m2_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
               const RadTensor* planes, int n, RadLayout* out) {
     const long long group = rad_param_geti(p, n_p, "group", 0);

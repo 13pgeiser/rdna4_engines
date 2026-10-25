@@ -929,6 +929,24 @@ inline bool linear_is_paro_mxfp4(const RadEncoding& e) {
            sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == RAD_MX_GROUP;
 }
 
+/* A rotated weight with M2XFP4 planes (ParoQuant's `m2xfp4` grid): the scheme's three planes in
+ * the basis of a "givens" transform, whose tables are views of the weight's planes. Read like the
+ * plain M2XFP4 weight -- the meta plane rides the weight operand's stored blob -- over an
+ * activation the rotation makes, as linear_is_paro_mxfp4's is. */
+inline bool linear_is_paro_m2xfp4(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "m2xfp4") || std::strncmp(e.transform, "givens", RAD_ENC_STR) != 0 ||
+        !rad_enc_valid(&e) || e.n_planes < 6)
+        return false;
+    const RadEncPlane *sc = rad_enc_plane(&e, "scale"), *mt = rad_enc_plane(&e, "meta"),
+                      *pr = rad_enc_plane(&e, "t.pairs"), *an = rad_enc_plane(&e, "t.angle"),
+                      *rs = rad_enc_plane(&e, "t.scale");
+    return pr && an && rs && pr->dtype == RAD_I32 && an->dtype == RAD_F32 && rs->dtype == RAD_F32 &&
+           e.plane[0].dtype == RAD_FP4E2M1 && e.plane[0].block[0] == 1 &&
+           e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_E8M0 && sc->block[0] == 1 &&
+           sc->block[1] == RAD_MX_GROUP && mt && mt->dtype == RAD_U8 && mt->block[0] == 1 &&
+           mt->block[1] == RAD_MX_GROUP;
+}
+
 /* A 4-bit weight with a zero point and no transform: u4 codes, an f16 scale and a u4 or u8 zero
  * point per 128 of K (libquant `codes=u4 zero=u4 group=128 scale=f16`, or rad-convert's import rule
  * over an int4 release). Read by gemm_nt_q at w4a16_asym over an f16 activation, or w4a8i8_asym
@@ -965,7 +983,8 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc));
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
-    const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
+    const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
+                                   linear_is_paro_m2xfp4(enc));
     reads_x = g.w_bf16 || plain || probed_i8 || rotated || (known && linear_is_w4(enc));
     return RAD_OK;
 }
@@ -1425,15 +1444,34 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * which rides the weight operand -- the declared view takes codes and meta together, and the
      * stored blob carries the meta in its tail (libr4d's m2xfp4 layout). The exponent plane is
      * `b_scale` and `b_ref` as MXFP4's is; the row parts, the shape bounds and the column-shard
-     * rule are the MXFP4 ones. */
-    m2x = known && linear_is_m2xfp4(enc);
+     * rule are the MXFP4 ones.
+     *
+     * A rotated weight (ParoQuant) carries the same planes in the basis its "givens" tables name
+     * and is declared like the rotated MXFP4 one: `givens_dense_quant` makes the E4M3 pair from
+     * the input's bf16 plane, once per rotated part, and the GEMM meets copy p with part p's rows
+     * (`pb1`/`pb2`). `paro` makes step() issue that rotation first. */
+    const bool m2rot = known && linear_is_paro_m2xfp4(enc);
+    m2x = known && (linear_is_m2xfp4(enc) || m2rot);
     if (m2x) {
+        paro = m2rot;
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
                             "may\n", wn, stored);
             return RAD_E_INVAL;
         }
-        if (!a.q || !a.s) {
+        if (m2rot) {
+            if (!a.x) {
+                fprintf(stderr, "radiance: '%s' is a rotated M2XFP4 weight, rotated and quantised "
+                                "from its input's bf16 plane, and its input has none\n", wn);
+                return RAD_E_DTYPE;
+            }
+            if (g.world > 1 || span_hi > 0) {
+                fprintf(stderr, "radiance: '%s' is a rotated M2XFP4 weight; its rotation is per "
+                                "projection and is not cut by a tensor-parallel shard (world %d)\n",
+                        wn, g.world);
+                return RAD_E_UNSUPPORTED;
+            }
+        } else if (!a.q || !a.s) {
             fprintf(stderr, "radiance: '%s' is an M2XFP4 weight read against its input's E4M3 "
                             "pair, and its input has none\n", wn);
             return RAD_E_DTYPE;
@@ -1446,6 +1484,22 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 16, 1, base, "M2XFP4 tiles"));
+        int64_t pb1 = 0, pb2 = 0;
+        if (m2rot) {
+            std::vector<int64_t> cut;
+            for (int64_t p : rot_part_rows) cut.push_back(p);
+            if (cut.empty()) for (int64_t p : row_parts) cut.push_back(p);
+            RAD_ARCH_TRY(declare_rotation(b, nm, base, wn, enc, N, K, grp, cut, &pb1, &pb2));
+            const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+            rot_q = decl_b(b, nm.f("%s.rot_q", base), RAD_F8E4M3, { rows, rot_parts * K });
+            rot_s = decl_b(b, nm.f("%s.rot_s", base), RAD_F32,
+                           { rows, rot_parts * (K / RAD_FP8_BLOCK) });
+            if (!rot_q || !rot_s) return RAD_E_INVAL;
+            rot_dense = decl_dense(b, nm, base, wn, enc, K, grp);
+            if (!rot_dense) return RAD_E_INVAL;
+            op_rot = decl_dense_op(b, g, a, "fp8", 1, rows, { rot_q, rot_s });
+            if (!op_rot) return RAD_E_INVAL;
+        }
         const char* sn = nm.f("%s.scale", base);
         const char* rn = nm.f("%s.ref", base);
         w    = decl_view(b, wn, nullptr, "codes,meta", RAD_FP4E2M1, { N, K }, access, shard, grp,
@@ -1469,8 +1523,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             RAD_ARCH_TRY(rad_weight_shard_span(b, ws, lo, hi));
             RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
         }
-        op = decl_gemm_q(b, 1, max_rows > 0 ? max_rows : g.max_tok, RAD_MX_GROUP, "m2xfp4", 0, 0,
-                         { w, ws, wref }, { a.q, a.s }, y);
+        /* One GEMM: a rotated weight reads its own rotated pair, a plain one the producer's. */
+        op = decl_gemm_q(b, 1, max_rows > 0 ? max_rows : g.max_tok, RAD_MX_GROUP, "m2xfp4", pb1,
+                         pb2, { w, ws, wref }, { m2rot ? rot_q : a.q, m2rot ? rot_s : a.s }, y);
         return op ? RAD_OK : RAD_E_INVAL;
     }
 
@@ -1597,16 +1652,17 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                     RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
-    if (m2x) {
+    if (m2x && !paro) {
         /* The MXFP4 operands over the producer's pair; the meta rides the weight's stored blob. */
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q, r0, rows, K),
                     brow_slice(a.s, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_W(wref));
         return;
     }
-    if (mx) {
+    if (mx || m2x) {
         /* A rotated weight first rotates its input into its own codes, `rot_parts` copies side by
-         * side; a plain weight reads the producer's. */
+         * side; a plain weight reads the producer's. A rotated M2XFP4 weight is issued here as the
+         * rotated MXFP4 one is, its meta riding the weight operand's stored blob. */
         const rad_buf aq = paro ? rot_q : a.q, as = paro ? rot_s : a.s;
         const int64_t ak = rot_parts * K;
         if (paro)

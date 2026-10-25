@@ -977,12 +977,17 @@ extern "C" int r4d_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int oper
  * bounds the fold: d >= 0 for every block, so the largest e4m3 a table cell holds is the x1.75
  * magnitude 10.5 scaled by 2^-d, a normal at every d >= 0.
  *
- * Anything else is refused, a transform included: this kernel library decodes one scheme, and a
- * weight whose meta plane said something else would decode to other numbers. */
+ * Anything else is refused: this kernel library decodes one scheme, and a weight whose meta plane
+ * said something else would decode to other numbers.
+ *
+ * A rotated weight (ParoQuant's M2XFP4) carries the same three planes in the basis its "givens"
+ * transform names, with the rotation's tables beside them -- the rotated MXFP4 weight's shape plus
+ * the meta plane. The GEMM reads the planes as for an unrotated weight; the rotation is applied to
+ * the activation (givens_dense_quant), whose tables are separate weight operands. */
 namespace {
+/* The scheme's three planes, whichever kind of weight carries them. */
 bool m2_planes(const RadEncoding* enc) {
     if (!enc || !rad_enc_is(enc, "m2xfp4")) return false;
-    if (enc->transform[0] || enc->n_planes != 3) return false;
     if (enc->plane[0].dtype != RAD_FP4E2M1 || enc->plane[0].block[0] != 1 ||
         enc->plane[0].block[1] != 1)
         return false;
@@ -997,6 +1002,23 @@ bool m2_planes(const RadEncoding* enc) {
     return true;
 }
 
+/* A rotated one: the three planes in the basis of a "givens" transform, whose tables are views of
+ * the weight's planes. Only the presence and the dtype of the tables is checked here (the arch
+ * declares them as operands the rotation op reads); any other transform would decode to other
+ * numbers, so it is refused. */
+bool m2_paro_enc(const RadEncoding* enc, long long K) {
+    if (!enc || std::strncmp(enc->transform, "givens", RAD_ENC_STR) != 0) return false;
+    if (enc->n_planes < 6 || !rad_enc_valid(enc) || !m2_planes(enc)) return false;
+    const int p = rad_enc_find(enc, "t.pairs"), an = rad_enc_find(enc, "t.angle"),
+              sc = rad_enc_find(enc, "t.scale");
+    if (p < 0 || an < 0 || sc < 0) return false;
+    if (enc->plane[p].dtype != RAD_I32 || enc->plane[an].dtype != RAD_F32 ||
+        enc->plane[sc].dtype != RAD_F32)
+        return false;
+    /* The quantiser rotates whole groups of 128 columns, one scale per group. */
+    return K % 128 == 0 && enc->plane[p].extent[1] == K;
+}
+
 int m2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
     if (!out || !pl) return RAD_E_INVAL;
@@ -1005,6 +1027,8 @@ int m2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     if (rc != RAD_OK) return rc;
     if (g.group != R4D_MXFP4_GROUP || g.K % 16) return RAD_E_SHAPE;
     if (!m2_planes(enc)) return RAD_E_DTYPE;
+    const bool plain = !enc->transform[0] && enc->n_planes == 3;
+    if (!plain && !m2_paro_enc(enc, g.K)) return RAD_E_DTYPE;
     if (gout) *gout = g;
     const long long nblk = g.K / R4D_MXFP4_GROUP;
     if (operand == Q_BSCALE || operand == Q_BREF) {

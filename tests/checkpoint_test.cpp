@@ -1476,6 +1476,115 @@ TEST(a_paroquant_mxfp4_weight_carries_its_rotations_as_parts) {
     }
 }
 
+/* ParoQuant M2XFP4 is the MXFP4 form plus one metadata byte a group (`weight_meta`, [N, K/32] u8):
+ * the three planes of the `m2xfp4` scheme byte for byte, joined row by row, with the rotations
+ * beside them as for ParoMx. A piece without its metadata plane is refused, and so is a grid the
+ * import does not read. */
+TEST(a_paroquant_m2xfp4_weight_carries_its_meta_plane_and_rotations) {
+    const int64_t K = 128, S = 2, N = 16;
+    uint32_t rng = 777;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto u8s = [&](const std::string& n, int64_t cols, uint32_t lo, uint32_t span) {
+        T t{ n, "U8", { N, cols }, {} };
+        for (int64_t i = 0; i < N * cols; ++i) t.bytes.push_back((uint8_t)(lo + next() % span));
+        return t;
+    };
+    auto pairs = [&](const std::string& n) {
+        T t{ n, "I16", { S, K }, {} };
+        for (int64_t st = 0; st < S; ++st) {
+            std::vector<int16_t> perm((size_t)K);
+            for (int64_t i = 0; i < K; ++i) perm[(size_t)i] = (int16_t)i;
+            for (int64_t i = K - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[next() % (i + 1)]);
+            for (int64_t i = 0; i < K; ++i) {
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] & 0xff));
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] >> 8));
+            }
+        }
+        return t;
+    };
+    auto f16s = [&](const std::string& n, std::vector<int64_t> shape, float lo, float hi) {
+        T t{ n, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        for (int64_t i = 0; i < cnt; ++i) {
+            const uint16_t h = rad_f32_to_f16(lo + (hi - lo) * (float)(next() % 1000) / 1000.0f);
+            t.bytes.push_back((uint8_t)(h & 0xff));
+            t.bytes.push_back((uint8_t)(h >> 8));
+        }
+        return t;
+    };
+    std::vector<T> ts;
+    for (const char* b : { "g", "u" }) {
+        const std::string n = b;
+        ts.push_back(u8s(n + ".weight", K / 2, 0, 256));
+        ts.push_back(u8s(n + ".weight_scale", K / 32, 122, 5));
+        ts.push_back(u8s(n + ".weight_meta", K / 32, 0, 256));
+        ts.push_back(pairs(n + ".pairs"));
+        ts.push_back(f16s(n + ".theta", { S, K / 2 }, -3.0f, 3.0f));
+        ts.push_back(f16s(n + ".channel_scales", { 1, K }, 0.5f, 2.0f));
+    }
+    const std::string cfg = "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":"
+                            "\"paroquant_m2xfp4\",\"format\":\"m2xfp4\",\"bits\":4,\"group_size\":128,"
+                            "\"mx_block\":32,\"subgroup\":8,\"krot\":2}}";
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(write_checkpoint(ts, cfg)), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoM2);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro);
+    CHECK(w.imported && !w.trivial);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK(rad_enc_is(&w.enc, "m2xfp4"));
+    CHECK_EQ(std::string(w.enc.transform), std::string("givens"));
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    CHECK_EQ(w.rows, (int64_t)2 * N);
+    REQUIRE_EQ(w.enc.n_planes, 8);
+    CHECK_EQ(std::string(w.enc.plane[2].role), std::string("meta"));
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_U8);
+    CHECK_EQ(w.enc.plane[2].block[1], (int64_t)32);
+    CHECK(ckpt_reads_any(w, { "u.weight_meta" }));
+
+    // codes, exponents and metadata are the checkpoint's bytes, gate's rows then up's
+    const std::vector<std::vector<uint8_t>> pl = read_planes(w);
+    REQUIRE(!pl.empty());
+    for (int k = 0; k < 3; ++k) {
+        const T& g = ts[(size_t)k];
+        const T& u = ts[(size_t)(6 + k)];
+        CHECK_EQ(std::memcmp(pl[(size_t)k].data(), g.bytes.data(), g.bytes.size()), 0);
+        CHECK_EQ(std::memcmp(pl[(size_t)k].data() + g.bytes.size(), u.bytes.data(), u.bytes.size()), 0);
+    }
+    // the rotation tables follow, as ParoMx's: part 1's stage 0 pairs in whole-row columns
+    REQUIRE_EQ(std::string(w.enc.plane[3].role), std::string("t.pairs"));
+    const int32_t* tp = (const int32_t*)pl[3].data();
+    for (int64_t c = 0; c < K; ++c)
+        CHECK_EQ(tp[S * K + c], (int32_t)(*(const int16_t*)(ts[9].bytes.data() + 2 * c)));
+
+    // a piece without its metadata plane is refused by name
+    {
+        std::vector<T> no_meta;
+        for (const T& t : ts)
+            if (t.name != "u.weight_meta") no_meta.push_back(t);
+        Checkpoint c2;
+        REQUIRE_EQ(c2.open(write_checkpoint(no_meta, cfg)), RAD_OK);
+        CkptWeight w2;
+        why.clear();
+        CHECK(ckpt_resolve(c2, prog, "gu", false, &w2, &why) != RAD_OK);
+        CHECK(why.find("u.weight_meta") != std::string::npos);
+    }
+    // another subgroup width is not the grid this reads
+    {
+        std::string other = cfg;
+        other.replace(other.find("\"subgroup\":8"), 12, "\"subgroup\":4");
+        Checkpoint c3;
+        REQUIRE_EQ(c3.open(write_checkpoint(ts, other)), RAD_OK);
+        CHECK(c3.imports() == Checkpoint::Import::None);
+        CHECK(c3.import_refusal().find("M2XFP4") != std::string::npos);
+    }
+}
+
 /* ParoQuant int5-bitplane: low nibbles AWQ-packed along N (qweight [K, N/8], eight columns per
  * word in the order 0,2,4,6,1,3,5,7), a fifth-bit plane (qweight_hi [K, N/32], bit n % 32), and the
  * same two packings for the zero points. The logical [N, K] weight becomes u5 codes (a bit stream

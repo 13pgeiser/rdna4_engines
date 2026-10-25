@@ -4867,13 +4867,19 @@ static void mxfp4a8_m_invariant(const Plugin& pl, const char* row, int64_t N, in
  * mxfp4 row's plus the table's accepted k = 3 rounding: a quarter of the weights at up to 2^-4.4
  * each is about 1.2% of a whole dot, so 4e-2 holds the same margin the 1e-2 does there. The
  * relayout is exercised for real: the weight operand takes codes and meta, and the stored blob the
- * launch reads is this hook's output. The output starts as NaN, as there. */
+ * launch reads is this hook's output. The output starts as NaN, as there. Parts (ParoQuant's
+ * rotated M2XFP4): weight rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy of the
+ * activation, as at mxfp4a8. */
 static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
-                             int tn, bool ablk = false, std::vector<RadParam> extra = {}) {
+                             int tn, bool ablk = false, std::vector<RadParam> extra = {},
+                             int64_t pb1 = 0, int64_t pb2 = 0) {
     if (!sel(row)) return;
+    const PartCut cut(N, pb1, pb2);
+    const int parts = cut.parts;
     char nm[160];
     std::string ex;
     for (const RadParam& p : extra) ex += std::string(" ") + p.key + "=" + std::to_string(p.ival);
+    if (parts > 1) ex += " parts=" + std::to_string(parts);
     std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld tn=%d%s%s", row, (long long)M,
                   (long long)N, (long long)K, tn, ablk ? " ascale=row x 128" : "", ex.c_str());
     const RadKernelInfo* r = find(pl, row);
@@ -4906,20 +4912,21 @@ static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64
     }
 
     const int64_t nkb = (K + 127) / 128, asc = ablk ? nkb : 1;
-    std::vector<uint8_t> ha((size_t)(M * K));
-    std::vector<float> av((size_t)(M * K)), as((size_t)(M * asc));
+    const int64_t PK = parts * K, PA = parts * asc;           /* a row of `a`, and of its scale */
+    std::vector<uint8_t> ha((size_t)(M * PK));
+    std::vector<float> av((size_t)(M * PK)), as((size_t)(M * PA));
     for (int64_t i = 0; i < M; ++i) {
-        for (int64_t c = 0; c < asc; ++c) {
-            const uint32_t h = st_mix32((uint32_t)(i * asc + c) ^ 0xa5u);
-            as[(size_t)(i * asc + c)] =
+        for (int64_t c = 0; c < PA; ++c) {
+            const uint32_t h = st_mix32((uint32_t)(i * PA + c) ^ 0xa5u);
+            as[(size_t)(i * PA + c)] =
                 ablk ? ((i + c) % 11 == 5 ? 0.0f : 0.002f * (float)(1 + h % 97))
                      : 0.0125f * (float)(1 + h % 5);
         }
-        for (int64_t k = 0; k < K; ++k) {
-            const bool zero = ablk && as[(size_t)(i * asc + k / 128)] == 0.0f;
+        for (int64_t k = 0; k < PK; ++k) {
+            const bool zero = ablk && as[(size_t)(i * PA + (k / K) * asc + (k % K) / 128)] == 0.0f;
             const float v = zero ? 0.0f : mxfp4_act(i, k, 0x3cu);
-            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, v);
-            av[(size_t)(i * K + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * K + k);
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * PK + k, v);
+            av[(size_t)(i * PK + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * PK + k);
         }
     }
     std::vector<uint16_t> hy((size_t)(M * N), 0x7fc0);    /* bf16 NaN */
@@ -4937,8 +4944,8 @@ static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64
     st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
     st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
-        T(d_a, RAD_F8E4M3, { M, K }),
-        ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+        T(d_a, RAD_F8E4M3, { M, PK }),
+        ablk ? T(d_s, RAD_F32, { M, PA }) : T(d_s, RAD_F32, { M }),
         T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
         T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
     };
@@ -4946,6 +4953,8 @@ static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64
     std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
                                  PS("dtype", "m2xfp4") };
     if (tn) ps.push_back(PI("tn", tn));
+    if (pb1) ps.push_back(PI("pb1", pb1));
+    if (pb2) ps.push_back(PI("pb2", pb2));
     for (const RadParam& p : extra) ps.push_back(p);
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
@@ -4974,6 +4983,7 @@ static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; ++i)
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
+            const int pt = cut.part_of(n);
             double acc = 0;
             for (int64_t k = 0; k < K; ++k) {
                 const uint8_t meta = p.data[(size_t)im][(size_t)(n * nblk + k / 32)];
@@ -4982,8 +4992,8 @@ static void m2xfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64
                     (double)rad_load_f32(p.data[(size_t)ic].data(), RAD_FP4E2M1, n * K + k) *
                     (1.0 + kk / 4.0) *
                     (double)rad_load_f32(p.data[(size_t)is].data(), RAD_E8M0, n * nblk + k / 32);
-                acc += (double)av[(size_t)(i * K + k)] * w *
-                       (ablk ? (double)as[(size_t)(i * asc + k / 128)] : 1.0);
+                acc += (double)av[(size_t)(i * PK + pt * K + k)] * w *
+                       (ablk ? (double)as[(size_t)(i * PA + pt * asc + k / 128)] : 1.0);
             }
             if (!ablk) acc *= (double)as[(size_t)i];
             const double d = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
@@ -28215,17 +28225,22 @@ static void device_phase(const Plugin& pl) {
                                     { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
                 }
         /* The M2XFP4 rows: the decode band's rule and band edges, the tiled row at both widths and
-         * past the tn crossover, and both activation grids, at the three-plane encoding. */
+         * past the tn crossover, both activation grids, and parts (ParoQuant's rotated M2XFP4) --
+         * the same spread the OCP rows get, at the three-plane encoding. */
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 8, 272, 640, 0, false);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 8, 272, 640, 0, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 40, 400, 2560, 0, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 128, 512, 2560, 0, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 5, 1040, 576, 0, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 96, 14336, 640, 0, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 8, 400, 2560, 0, true, {}, 128);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_decode", 40, 512, 2560, 0, true, {}, 128, 384);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 40, 272, 640, 2, false);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 400, 640, 4, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 2100, 512, 2560, 0, true);
         m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 272, 576, 2, true);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 400, 640, 2, true, {}, 192);
+        m2xfp4a8_numeric(pl, "gemm_m2xfp4a8_tiled", 300, 34816, 5120, 0, true, {}, 17408);
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);

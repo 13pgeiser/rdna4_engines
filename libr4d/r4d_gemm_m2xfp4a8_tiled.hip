@@ -325,37 +325,49 @@ extern "C" void r4d_gemm_m2xfp4a8_tiled(long at, long ascale, long wq, long ws, 
 }
 
 // ============================================================== the plugin ABI entry point
-// The row-major activation is re-tiled into the op's scratch and the GEMM reads it there.
+// The row-major activation is re-tiled into the op's scratch and the GEMM reads it there. For a
+// partitioned weight (mx_parts), each part's activation copy is re-tiled and multiplied in turn.
 extern "C" int r4d_rad_gemm_m2xfp4a8_tiled(const RadArgs* a, RadStream s) {
     GemmOps g;
-    /* No parts: the m2xfp4 declare makes none, so gemm_ops refuses pb1/pb2, as libref does. */
-    int rc = gemm_ops(a, &g, 1);
+    int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale) return R4D_NO(RAD_E_INVAL);
     /* The per-row reference exponent is required, as in r4d_rad_gemm_mxfp4a8_m64. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
+    MxParts mp;
+    rc = mx_parts(a, &g, &mp);
+    if (rc != RAD_OK) return rc;
     if (g.K % R4D_M2T_KUNIT) return R4D_NO(RAD_E_SHAPE);
     int as_group = 0, as_rs = 1;
-    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     const long long slab = r4d_m2xfp4a8_tile_a_bytes((int)g.M, (int)g.K);
     if (!a->scratch || a->scratch_bytes < slab) return R4D_NO(RAD_E_INVAL);
     R4dMxTileCfg t;
     r4d_cfg_mxfp4_tiled(a, &t);
+    const long kb = (long)((g.K + 127) / 128);
     const long at = (long)(uintptr_t)a->scratch;
-    // The meta plane rides the weight blob's tail, in the scale plane's [K/32][N] order.
-    const long meta = r4d_addr(g.b) + (long)g.N * g.K / 2;
-    R4D_TRY("gemm_m2xfp4a8_tiled",
-        r4d_m2xfp4a8_tile_a(r4d_addr(g.a), at, (int)g.M, (int)g.K, (long)(uintptr_t)s, (int)g.K);
-        r4d_gemm_m2xfp4a8_tiled(at, r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), meta,
-                                r4d_addr(g.bref), r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N,
-                                t.tn, as_group, as_rs, (long)(uintptr_t)s, (int)g.N, (int)g.N));
+    // The meta plane rides the weight blob's tail, in the scale plane's [K/32][N] order; a part
+    // windows it at n0, as it does the exponent plane.
+    const long meta0 = (long)g.N * g.K / 2;
+    for (int p = 0; p < mp.n; ++p) {
+        const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
+        R4D_TRY("gemm_m2xfp4a8_tiled",
+            r4d_m2xfp4a8_tile_a(r4d_addr(g.a) + p * g.K, at, (int)g.M, (int)g.K,
+                                (long)(uintptr_t)s, (int)(mp.lda ? mp.lda : g.K));
+            r4d_gemm_m2xfp4a8_tiled(at, r4d_addr(g.ascale) + p * kb * 4,
+                                    r4d_addr(g.b) + n0 * g.K / 2, r4d_addr(g.bscale) + n0,
+                                    r4d_addr(g.b) + meta0 + n0, r4d_addr(g.bref) + n0,
+                                    r4d_addr(g.y) + n0 * 2, (int)g.M, (int)g.K, (int)np, t.tn,
+                                    as_group, as_rs, (long)(uintptr_t)s, (int)g.N, (int)g.N));
+    }
     return RAD_OK;
 }
 
 /* The op's scratch, sized at the band's widest M: the fragment-tiled activation in whole 16-row
- * fragments. */
+ * fragments. One copy serves every part: parts run in order on the op's stream, so a re-tile
+ * cannot overtake the previous part's GEMM. */
 extern "C" int64_t r4d_rad_gemm_m2xfp4a8_tiled_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), K = r4d_geti_or(a, "K", 0);
     return (int64_t)r4d_m2xfp4a8_tile_a_bytes((int)M, (int)K);

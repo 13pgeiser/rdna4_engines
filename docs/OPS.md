@@ -635,7 +635,8 @@ so the activation takes the same rotation once a token.
   of `a' = a cos t + b sin t, b' = b cos t - a sin t`. Each pair lies inside one scale group, so the
   matrices belong to the weight: rad-convert composes them once in f64 and stores them as the
   weight's `t.dense` table, which the layout hook (`r4d_rad_layout_gdense`) only moves. Consumers
-  are `gemm_nt_q` at `mxfp4a8` (`out` fp8) and at `w4a8i8_asym` / `w5a8i8` (`out` i8).
+  are `gemm_nt_q` at `mxfp4a8` and `m2xfp4` (`out` fp8) and at `w4a8i8_asym` / `w5a8i8` (`out`
+  i8).
 - **`givens_rotate`** is the same rotation stage by stage with no quantiser, `y` in its own dtype
   (f16), for the 16-bit-activation weights `w5a16` and `w4a16_asym`, whose GEMM serves any `M`
   (rows past 64 run as chunks of 64).
@@ -645,9 +646,9 @@ A fused projection (gate|up, qkv|z) was rotated per checkpoint tensor, so the ac
 `pairs` and `angle` stack each part's `stages` rows and `rscale` has one row per part. `gemm_nt_q`'s
 `pb1` and `pb2` are the row bounds of the weight's parts: rows `[0, pb1)`, `[pb1, pb2)` and
 `[pb2, N)` meet copies 0, 1 and 2 of the wide `a`/`a_scale`. `pb1` absent is one part; `pb2` absent
-ends the second part at `N`. The `mxfp4a8` rows and the asymmetric 4- and 5-bit rows read them;
-host rows that do not (libavx) refuse a call that names one rather than contract against the wrong
-copy.
+ends the second part at `N`. The `mxfp4a8` and `m2xfp4` rows and the asymmetric 4- and 5-bit rows
+read them; host rows that do not (libavx) refuse a call that names one rather than contract against
+the wrong copy.
 
 ### Int8 and gated fp8 fusions (device-only)
 

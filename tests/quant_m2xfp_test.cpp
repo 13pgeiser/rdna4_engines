@@ -10,9 +10,9 @@
  * scheme refines: the search's candidate set contains that quantiser's choice for every group,
  * so it can only tie or win, and the wins are where the format earns its half bit. The wide case
  * holds the same property one bias wider: wide=1 sweeps b in {-2, ..., 2} and can only tie or
- * beat adaptive, its planes decoding bit for bit as the equation does. The last case hands the
- * planes to libref's gemm_nt_q row at m2xfp4 (ref_m2xfp4.cpp) and holds its product to the same
- * hand decode.
+ * beat adaptive, its planes decoding bit for bit as the equation does. The last two cases hand the
+ * planes to libref's gemm_nt_q row at m2xfp4 (ref_m2xfp4.cpp) and hold its product to the same
+ * hand decode, the second over a fused projection's parts.
  */
 #include "quant_fixture.h"
 
@@ -339,9 +339,9 @@ TEST(m2xfp4_wide_bias_sweep_contains_the_narrow_one_and_round_trips_bit_exact) {
 /* libref's gemm_nt_q row at m2xfp4 over the quantiser's own planes: its layout hook takes codes and
  * meta for the weight and the exponent plane as stored, its relayout concatenates the two, and
  * the product is the hand decode's against an exact e4m3 activation and its per-128 scales,
- * summed in double. N = 40 and M = 13 are not multiples of anything; K = 384 is three activation
- * scale blocks. */
-TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
+ * summed in double. With parts (pb1/pb2), weight rows [0, pb1), [pb1, pb2) and [pb2, N) each read
+ * their own copy of the activation, side by side in a row of `a`. */
+static void libref_m2xfp4_gemm(int64_t M, int64_t N, int64_t K, int64_t pb1, int64_t pb2) {
     NEED_LIBQUANT();
     const std::string lib = home() + "/kernels/libref.so";
     void* so = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -354,7 +354,10 @@ TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
         if (std::strcmp(at(i)->name, "ref_gemm_nt_q") == 0) k = at(i);
     REQUIRE(k && k->layout && k->relayout && k->launch);
 
-    const int64_t M = 13, N = 40, K = 384, kb = K / 32, akb = K / 128;
+    const int64_t kb = K / 32, akb = K / 128;
+    const int64_t e1 = pb1 > 0 ? pb1 : N, e2 = pb2 > 0 ? pb2 : N;
+    const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    const int64_t PK = parts * K, PA = parts * akb;      /* a row of `a`, and of its scale */
     const RadQuantizerInfo* q = quantizer("m2xfp4");
     REQUIRE(q);
     Opts o;
@@ -377,6 +380,8 @@ TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
     };
     Opts g;
     g.i("M", M).i("N", N).i("K", K).i("group", 32).s("dtype", "m2xfp4");
+    if (pb1 > 0) g.i("pb1", pb1);
+    if (pb2 > 0) g.i("pb2", pb2);
     const RadTensor pl[2] = { tensor(w.planes[0].data(), RAD_FP4E2M1, { N, K }),
                               tensor(w.planes[2].data(), RAD_U8, { N, kb }) };
     const RadTensor sp = tensor(w.planes[1].data(), RAD_E8M0, { N, kb });
@@ -390,13 +395,13 @@ TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
                (int)RAD_OK);
 
     /* integer codes in [-13, 13], which e4m3 holds exactly */
-    std::vector<uint8_t> a((size_t)(M * K));
-    std::vector<float> as((size_t)(M * akb)), y((size_t)(M * N), NAN);
-    for (int64_t i = 0; i < M * K; ++i)
+    std::vector<uint8_t> a((size_t)(M * PK));
+    std::vector<float> as((size_t)(M * PA)), y((size_t)(M * N), NAN);
+    for (int64_t i = 0; i < M * PK; ++i)
         rad_store_f32(a.data(), RAD_F8E4M3, i, (float)((i * 7) % 27 - 13));
-    for (int64_t i = 0; i < M * akb; ++i) as[(size_t)i] = 0.003f * (float)(1 + i % 5);
-    RadTensor t[7] = { tensor(a.data(), RAD_F8E4M3, { M, K }),
-                       tensor(as.data(), RAD_F32, { M, akb }),
+    for (int64_t i = 0; i < M * PA; ++i) as[(size_t)i] = 0.003f * (float)(1 + i % 5);
+    RadTensor t[7] = { tensor(a.data(), RAD_F8E4M3, { M, PK }),
+                       tensor(as.data(), RAD_F32, { M, PA }),
                        tensor(b.data(), RAD_U8, { lay.bytes }),
                        sp,
                        tensor(y.data(), RAD_F32, { M, N }),
@@ -412,16 +417,29 @@ TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
     double err = 0, mag = 0;
     for (int64_t m = 0; m < M; ++m)
         for (int64_t n = 0; n < N; ++n) {
+            const int64_t pt = n < e1 ? 0 : (n < e2 ? 1 : 2);
             double r = 0;
             for (int64_t c = 0; c < K; ++c)
-                r += (double)rad_load_f32(a.data(), RAD_F8E4M3, m * K + c) *
-                     (double)as[(size_t)(m * akb + c / 128)] * (double)wd[(size_t)(n * K + c)];
+                r += (double)rad_load_f32(a.data(), RAD_F8E4M3, m * PK + pt * K + c) *
+                     (double)as[(size_t)(m * PA + pt * akb + c / 128)] *
+                     (double)wd[(size_t)(n * K + c)];
             err = std::max(err, std::fabs((double)y[(size_t)(m * N + n)] - r));
             mag = std::max(mag, std::fabs(r));
         }
     CHECK(mag > 0);
     CHECK(err <= 1e-5 * mag);
     dlclose(so);
+}
+
+/* N = 40 and M = 13 are not multiples of anything; K = 384 is three activation scale blocks. */
+TEST(m2xfp4_libref_gemm_reads_the_planes_as_the_decode_does) {
+    libref_m2xfp4_gemm(13, 40, 384, 0, 0);
+}
+
+/* A rotated fused projection's parts, two and three of them, at 16-row bounds. */
+TEST(m2xfp4_libref_gemm_gives_each_part_its_own_activation) {
+    libref_m2xfp4_gemm(13, 48, 384, 16, 0);
+    libref_m2xfp4_gemm(13, 48, 384, 16, 32);
 }
 
 RAD_TEST_MAIN()

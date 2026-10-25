@@ -608,40 +608,62 @@ extern "C" void r4d_gemm_m2xfp4a8_decode(long a, long ascale, long wq, long ws, 
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_m2xfp4a8_decode(const RadArgs* a, RadStream s) {
     GemmOps g;
-    /* No parts: the m2xfp4 declare makes none, so gemm_ops refuses pb1/pb2, as libref does. */
-    int rc = gemm_ops(a, &g, 1);
+    int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale || !g.bref) return R4D_NO(RAD_E_INVAL);
+    MxParts mp;
+    rc = mx_parts(a, &g, &mp);
+    if (rc != RAD_OK) return rc;
     if (g.K % 64) return R4D_NO(RAD_E_SHAPE);
     if (g.M > r4d_gemm_m2xfp4a8_decode_max_m() || g.N > R4D_M2D_MAX_N) return R4D_NO(RAD_E_SHAPE);
     int as_group = 0, as_rs = 1;
-    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
-    // The meta plane rides the weight blob's tail, in the scale plane's [K/32][N] order.
-    const long meta = r4d_addr(g.b) + (long)g.N * g.K / 2;
-    R4D_TRY("gemm_m2xfp4a8_decode",
-        m2d_launch(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), meta,
-                   r4d_addr(g.bref), r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N, t.ks, t.bk, t.nt,
-                   as_group, as_rs, (long)(uintptr_t)s, (long)(uintptr_t)a->scratch,
-                   (long)a->scratch_bytes, (int)g.K, (int)g.N, (int)g.N));
+    const long long kb = (g.K + 127) / 128;
+    // The meta plane rides the weight blob's tail, in the scale plane's [K/32][N] order: a part of
+    // a partitioned weight (mx_parts) windows it at n0 as it does the exponent plane, and the codes
+    // at n0 * K / 2.
+    const long meta0 = (long)g.N * g.K / 2;
+    for (int p = 0; p < mp.n; ++p) {
+        const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
+        R4D_TRY("gemm_m2xfp4a8_decode",
+            m2d_launch(r4d_addr(g.a) + p * g.K, r4d_addr(g.ascale) + (long)(p * kb * 4),
+                       r4d_addr(g.b) + n0 * g.K / 2, r4d_addr(g.bscale) + n0,
+                       r4d_addr(g.b) + meta0 + n0, r4d_addr(g.bref) + n0,
+                       r4d_addr(g.y) + n0 * 2,
+                       (int)g.M, (int)g.K, (int)np, t.ks, t.bk, t.nt, as_group, as_rs,
+                       (long)(uintptr_t)s, (long)(uintptr_t)a->scratch, (long)a->scratch_bytes,
+                       (int)(mp.lda ? mp.lda : g.K), (int)g.N, (int)g.N));
+    }
     return RAD_OK;
 }
 
 /* The op's scratch size. A narrower M can split wider than the band's widest M, so the size is the
- * widest split over the band times the widest M, an upper bound for every launch. */
+ * widest split over the band times the widest M, an upper bound for every launch. Parts of a
+ * partitioned weight split at their own N and run in turn sharing the scratch, so the bound is the
+ * largest part's. */
 extern "C" int64_t r4d_rad_gemm_m2xfp4a8_decode_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
     const long long K = r4d_geti_or(a, "K", 0);
     if (M < 1 || N < 16 || K < 64 || M > r4d_gemm_m2xfp4a8_decode_max_m()) return 0;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
-    int ks = 1;
-    for (int m = 1; m <= (int)M; ++m) {
-        const int k = m2d_plan(m, (int)K, (int)N, t.ks, t.bk, t.nt).ks;
-        if (k > ks) ks = k;
+    long long bound[4];
+    mx_part_bounds(N, r4d_geti_or(a, "pb1", 0), r4d_geti_or(a, "pb2", 0), bound);
+    int64_t worst = 0;
+    for (int i = 0; i < 3; ++i) {
+        const long long np = bound[i + 1] - bound[i];
+        if (np < 16) continue;
+        int ks = 1;
+        for (int m = 1; m <= (int)M; ++m) {
+            const int k = m2d_plan(m, (int)K, (int)np, t.ks, t.bk, t.nt).ks;
+            if (k > ks) ks = k;
+        }
+        const int64_t b = (int64_t)m2d_partial_bytes((int)M, (int)np, ks);
+        if (b > worst) worst = b;
     }
-    return (int64_t)m2d_partial_bytes((int)M, (int)N, ks);
+    return worst;
 }

@@ -157,7 +157,8 @@ public:
      * quantization_config at open. Gptq: AutoRound's `auto_round:auto_gptq` export and GPTQ v1
      * (zero point stored less one). QuarkMx: Quark's MXFP4 (fp4 weights, per_group 32, e8m0
      * scales, no per-layer overrides). ParoMx: ParoQuant's `paroquant_mxfp4` (Quark's codes and
-     * exponents in a rotated basis, rotations beside them). CtInt4, Nvfp4, CtFp8:
+     * exponents in a rotated basis, rotations beside them). ParoM2: ParoQuant's
+     * `paroquant_m2xfp4` (the same plus the m2xfp4 metadata byte a group). CtInt4, Nvfp4, CtFp8:
      * compressed-tensors' pack-quantized int4 (symmetric, or asymmetric with a zero point), a
      * release with an nvfp4-pack-quantized group, and one whose groups are all float-quantized FP8
      * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
@@ -166,7 +167,7 @@ public:
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
-    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4, Nvfp4, CtFp8,
+    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
                         ModelOpt };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
@@ -178,6 +179,10 @@ public:
      * tensor or absent; another error, with `why`, for an unreadable imported form. */
     int import_piece(const std::string& name, const SrcTensor** codes, const SrcTensor** scale,
                      std::string* why);
+
+    /* The metadata plane an imported `name` carries, when its form has one (ParoM2): [N, K/32] u8,
+     * one byte a group, as `weight_meta` ships it. Null for every other form. */
+    const SrcTensor* import_meta(const std::string& name) const;
 
 private:
     /* `owner` is the index's weight_map, if any: a tensor it places in another shard is skipped
@@ -212,6 +217,8 @@ private:
     bool        ct_asym_  = false;   /* CtInt4: the config states asymmetric weights */
     /* import_piece's answers by name, so a weight resolved twice reuses its views. */
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
+    /* The metadata plane of an imported form that has one (ParoM2), by name. */
+    std::unordered_map<std::string, const SrcTensor*> imported_meta_;
 };
 
 /* ================================================================== logical weights */
@@ -253,9 +260,11 @@ struct CkptWeight {
     /* ParoQuant MXFP4 (Import::ParoMx), also `imported`: written plane by plane through
      * ckpt_plane_rows. Planes 0 and 1 are Quark's codes and exponents byte for byte; the rest are
      * the "givens" transform's tables, built from `pq_pairs`/`pq_theta`/`pq_scale`, one set per
-     * piece (a row part: gate and up, or q, k and v, each rotated separately). */
+     * piece (a row part: gate and up, or q, k and v, each rotated separately). Import::ParoM2 is
+     * the same with a third plane before the tables, the m2xfp4 scheme's metadata byte a group,
+     * from `pq_meta`. */
     bool        paro = false;
-    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
+    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale, pq_meta;
     /* A weight-normalised tensor (RAD_MAP_WNORM): `pieces` is its direction v alone, and every
      * element of v with first index i reads times wnorm_scale[i] = g_i / ||v_i||. Not trivial
      * (the values change), so a recipe rule stores it. */
