@@ -74,10 +74,13 @@ int32_t kv_stream_group(const std::vector<KVGroupInfo>& groups, const Program* p
  * numbers the engine already has, so the budget probe and the carve decision cannot disagree. */
 struct KVStreamRing {
     int64_t ring_blocks = 0;   /* --kv-resident, rounded up to whole blocks and raised to the
-                                * ceiling below when the flag asks for less */
-    int64_t raised_blocks = 0; /* the depth the flag was raised to (kvstream_ceiling_blocks), or 0
-                                * when it already asked for that much: the ring is not the
-                                * operator's number when this is set */
+                                * floor below when the flag asks for less */
+    int64_t raised_blocks = 0; /* the depth the flag was raised to (the larger of
+                                * kvstream_ceiling_blocks and the shipped floor), or 0 when it
+                                * already asked for that much: the ring is not the operator's
+                                * number when this is set */
+    int64_t floor_blocks = 0;  /* the shipped floor (kStreamFloorTokens) in blocks, or 0 when the
+                                * context is smaller than it: which of the two bound the raise */
     int64_t ctx_blocks  = 0;   /* max_seqs x ceil(ctx / block_size): the group's whole context */
     /* A ring that covers the context is not a streamed group. The pool then holds every block
      * with its own id, so the group keeps the base engine's path exactly: no mirror, no residency
@@ -127,6 +130,12 @@ struct KVStreamOps {
     }
 };
 KVStreamOps kvstream_ops(const Program& prog, const KVGroupInfo* group);
+
+/* The depth a ring is never carved below, in tokens: any --kv-resident under it is raised to it
+ * (never past the group's context). Below this the misses a decode step takes cost more than the
+ * VRAM the ring gives back -- the measured point is 24 576 tokens and the shipped value is 32 768
+ * (docs/KV-STREAMING.md §3.9, §5.1). A floor, not a default: --kv-resident 0 still means off. */
+constexpr int64_t kStreamFloorTokens = 32768;
 
 /* The ring's depth and the group's id space with nothing else decided: whether a ring covers the
  * context, so that the caller can tell "this model has no streamed path" (a warning) from "this
