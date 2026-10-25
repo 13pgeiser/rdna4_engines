@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <unordered_map>
+#include <vector>
 
 using namespace ref;
 
@@ -230,6 +231,109 @@ int ref_sample_dry(const RadArgs* a, RadStream) {
         for (const auto& e : longest) {
             const int64_t off = lb + (e.first - voff) * ls;
             stt(lg, off, ldt(lg, off) - dry_penalty(sp.dry_multiplier, base, e.second - allowed));
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ sample_ngram_ban */
+/* The windowed no-repeat-ngram ban: Unlimited-OCR's `SlidingWindowNoRepeatNgramProcessor`
+ * (modeling_unlimitedocr.py:353-383), which SGLang ships as
+ * DeepseekOCRNoRepeatNGramLogitProcessor. With the row's history `s[0, hl)` (oldest first, `hl`
+ * committed tokens including the one just emitted), `n` and `w` from the `ngram` plane (an i32
+ * pair a row, {n-gram length, window}):
+ *
+ *     search_start = max(0, hl - w)          (w <= 0: the whole span)
+ *     search_end   = hl - n + 1
+ *     prefix       = s[hl - n + 1, hl)        (empty at n == 1)
+ *     for idx in [search_start, search_end):
+ *         if s[idx, idx + n - 1) == prefix:   ban s[idx + n - 1]
+ *
+ * A banned token's logit becomes -infinity, exactly as the reference writes it, so the argmax and
+ * every later stage see the same distribution. The n-gram that spans the window boundary is one
+ * of the searched ones, as in the reference: the window is applied to the START index, not to the
+ * n-gram's end.
+ *
+ * Ids are global and columns are global less `vocab_off`; a banned token on another rank's shard
+ * is that rank's to mask. Rows whose n is 0 (the default) are untouched, so a request without the
+ * ban leaves the logits bit for bit as they were. The scan is O(w * n) a row and compares
+ * integers, so every implementation (this one, libavx, libr4d) agrees by construction.
+ *
+ * The optional `whitelist` bitmask is the reference's whitelist: a token whose column bit is set
+ * in the row's own plane row is removed from the banned set before the -inf writes
+ * (`banned.difference_update(self.whitelist)`, modeling_unlimitedocr.py:379), so it is never
+ * banned. Absent, nothing is exempt -- the default serving form, bit-identical to the ban
+ * without the operand. */
+int ref_sample_ngram_ban(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *lg = &a->t[0], *pr = &a->t[1], *hist = &a->t[2], *ng = &a->t[3];
+    const RadTensor* wl = a->n_t > 4 && a->t[4].data ? &a->t[4] : nullptr;
+    const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
+    if (n_vocab <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(lg) / n_vocab;
+    if (M <= 0) return RAD_E_SHAPE;
+    Rows R;
+    RAD_REF_TRY(param_rows(pr, M, &R));
+    const int64_t hmax = numel(hist) / M;
+    if (hmax <= 0) return RAD_E_SHAPE;
+    /* One {n, window} pair a row. At least M pairs, so a plane shared by sparser row sets is not
+     * read past its end. */
+    if (numel(ng) < 2 * M) return RAD_E_SHAPE;
+    const int64_t voff = p_int(a, "vocab_off", 0);
+    const int64_t wwords = (n_vocab + 31) / 32;
+    if (wl && wl->dtype != RAD_I32 && wl->dtype != RAD_U32) return RAD_E_DTYPE;
+    if (wl && numel(wl) < M * wwords) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(M * hmax)
+    for (int64_t m = 0; m < M; ++m) {
+        const RadSampleParams& sp = R.p[m];
+        const int64_t nb = rowoff(ng, m, 2), ns = laststride(ng);
+        const int64_t n = ld_int(ng->dtype, ng->data, nb);
+        const int64_t win_req = ld_int(ng->dtype, ng->data, nb + ns);
+        if (n <= 0) continue;
+
+        /* The whole staged span; the window below keeps its tail. last_n -1 is hist_window's
+         * "the whole span". */
+        int64_t ho = 0, hl = 0;
+        if (!hist_window(sp, -1, hmax, &ho, &hl)) continue;
+        if (hl < n) continue;
+        const int64_t win = win_req > 0 && win_req < hl ? win_req : hl;
+        const int64_t search_start = hl - win;
+        const int64_t search_end   = hl - n + 1;
+        if (search_end <= search_start) continue;
+
+        const int64_t hb = rowoff(hist, m, hmax) + ho * laststride(hist);
+        const int64_t hs = laststride(hist);
+        const int64_t lb = rowoff(lg, m, n_vocab), ls = laststride(lg);
+        const int64_t wb = wl ? rowoff(wl, m, wwords) : 0, ws = wl ? laststride(wl) : 0;
+        auto tok_at = [&](int64_t i) {
+            return ld_int(hist->dtype, hist->data, hb + i * hs);
+        };
+        /* The reference removes the whitelist from the banned set before it writes; a column
+         * whose bit is set in the row's whitelist words is therefore never written. */
+        auto exempt = [&](int64_t col) {
+            if (!wl) return false;
+            const uint32_t word = (uint32_t)ld_int(wl->dtype, wl->data, wb + (col / 32) * ws);
+            return ((word >> (uint32_t)(col % 32)) & 1u) != 0u;
+        };
+        /* n == 1 bans every token in the window: the prefix is empty, as in the reference.
+         * The prefix is read once, not per search position: it is the same n-1 tokens
+         * compared at every idx, and the row's history is short (the staged span). */
+        const int64_t plen = n - 1, p0 = hl - plen;
+        std::vector<int64_t> pref((size_t)plen);
+        for (int64_t j = 0; j < plen; ++j) pref[(size_t)j] = tok_at(p0 + j);
+
+        for (int64_t idx = search_start; idx < search_end; ++idx) {
+            bool match = true;
+            for (int64_t j = 0; j < plen; ++j) {
+                if (tok_at(idx + j) != pref[(size_t)j]) { match = false; break; }
+            }
+            if (!match) continue;
+            const int64_t tok = tok_at(idx + plen);
+            const int64_t col = tok - voff;
+            if (tok < 0 || col < 0 || col >= n_vocab) continue;
+            if (exempt(col)) continue;
+            stt(lg, lb + col * ls, -INFINITY);
         }
     }
     return RAD_OK;

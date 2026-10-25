@@ -279,7 +279,7 @@ AVX_KERNEL(s2d3d) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ pix_patch / patch_pix8 */
+/* ------------------------------------------------------------------ pix_patch */
 static inline int64_t patch_col(int64_t c, int64_t ph, int64_t pw, int64_t p, bool wh) {
     return c * p * p + (wh ? pw * p + ph : ph * p + pw);
 }
@@ -302,33 +302,6 @@ AVX_KERNEL(pix_patch) {
                 st_elem(Y->data, Y->dtype,
                         (y / p) * yr + (x / p) * C * p * p + patch_col(c, y % p, x % p, p, wh),
                         ldt(X, y * xr + x * C + c));
-    return RAD_OK;
-}
-
-AVX_KERNEL(patch_pix8) {
-    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
-    const RadTensor *X = &a->t[0], *Y = &a->t[1];
-    const int64_t p = p_int(a, "p", 0), C = p_int(a, "C", 0);
-    const bool wh = std::strcmp(p_str(a, "order", "wh"), "hw") != 0;
-    if (p <= 0 || C <= 0 || X->rank != 2 || Y->rank != 2 || Y->dtype != RAD_U8 ||
-        X->shape[1] % (C * p * p))
-        return RAD_E_SHAPE;
-    const int64_t R = X->shape[0], w = X->shape[1] / (C * p * p);
-    if (R <= 0 || w <= 0 || Y->shape[0] != R * p || Y->shape[1] != w * p * C) return RAD_E_SHAPE;
-    const int64_t xr = X->stride[0], yr = Y->stride[0];
-    const uint32_t dt = X->dtype;
-    uint8_t* yb = (uint8_t*)Y->data;
-    AVX_PARALLEL_FOR_IF(R * p * w * p * C >= AVX_PAR_MIN)
-    for (int64_t y = 0; y < R * p; ++y)
-        for (int64_t x = 0; x < w * p; ++x)
-            for (int64_t c = 0; c < C; ++c) {
-                const float v = ldt(X, (y / p) * xr + (x / p) * C * p * p +
-                                           patch_col(c, y % p, x % p, p, wh));
-                const float cl = std::min(std::max(v, -1.0f), 1.0f);
-                float u = narrow1(dt, narrow1(dt, cl / 2.0f) + 0.5f);
-                u = std::min(std::max(u, 0.0f), 1.0f);
-                yb[y * yr + x * C + c] = (uint8_t)std::nearbyint(u * 255.0f);
-            }
     return RAD_OK;
 }
 

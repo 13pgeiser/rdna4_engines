@@ -136,7 +136,6 @@ const OpdTol g_opd_tol[] = {
 
 }  /* namespace */
 
-const std::vector<TolRow>& tolerance_table() { return g_tol; }
 
 const char* activation_dtype(const Geometry& g) {
     for (const char* k : { "dtype", "q_dtype", "kv_dtype" })

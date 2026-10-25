@@ -3406,8 +3406,9 @@ extern "C" int r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, 
         const size_t bytes = (size_t)kRgCtrSlots * kRgCtrStride * sizeof(unsigned int);
         void* p = nullptr;
         if (hipMalloc(&p, bytes) != hipSuccess) return RAD_E_NOMEM;
-        /* Zero before any launch reads it: the memset is on the null stream, which the engine's
-         * streams need not wait for, so wait here. */
+        /* Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has
+         * finished when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it
+         * runs on the null stream, which a non-blocking stream does not wait for, so wait here. */
         if (hipMemset(p, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
             (void)hipFree(p);
             return RAD_E_DEVICE;

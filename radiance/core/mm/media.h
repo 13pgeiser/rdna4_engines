@@ -46,7 +46,12 @@ int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRG
 /* Encodes `px`, [h, w, ch] 8-bit with ch 3 (RGB) or 4 (RGBA), as an image file; `format` is png,
  * jpeg or webp. `quality` 0..100 applies to jpeg and lossy webp (0 or above 100 picks the
  * format's default); png is lossless and webp is lossless at 100. jpeg refuses alpha. Returns
- * RAD_E_UNSUPPORTED, with the reason, for a format this build cannot encode. */
+ * RAD_E_UNSUPPORTED, with the reason, for a format this build cannot encode.
+ *
+ * Lossless webp is written by libwebp; FFmpeg's native VP8L decoder refuses some valid
+ * libwebp streams ("Invalid data", reproducible with ffmpeg 8.0.1 on a low-colour picture),
+ * so an FFmpeg-based consumer may not read every lossless file this writes. libwebp and
+ * browsers do. */
 int encode_image(const uint8_t* px, int32_t w, int32_t h, int32_t ch, const std::string& format,
                  int32_t quality, std::vector<uint8_t>* out, std::string* why);
 

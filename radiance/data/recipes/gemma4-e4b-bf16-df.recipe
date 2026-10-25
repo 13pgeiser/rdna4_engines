@@ -1,0 +1,18 @@
+# gemma4-e4b-bf16-df.recipe -- Gemma 4 E4B (NVIDIA-Nemotron-3.5-Bolt-E4B-BF16) as the checkpoint holds it,
+# text and vision, with NVIDIA's DFlash drafter on block FP8. Wikitext-2 KL against the HF bf16 reference
+# 0.0015 (bf16 against fp32 0.0012).
+#
+#   rad-convert <checkpoint> --recipe data/recipes/gemma4-e4b-bf16-df.recipe --draft-model <dflash-bf16> \
+#       --set quantization_config.quant_method=compressed-tensors -o nemotron-3.5-bolt-e4b-bf16.rad
+#
+# The drafter ships as a GGUF only (nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash); --draft-model reads
+# it as safetensors in the z-lab layout. DFlash1 declares its linears block FP8, so bf16 codes are refused.
+
+dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16

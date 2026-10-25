@@ -38,11 +38,9 @@ extern "C" int rad_event_create_as(RadEvent* out, unsigned flags);
 extern "C" void rad_dev_host_wrote(void);
 /* Chained launches: chainable rows run their chained forms (RadKernelChainFn), and the backend
  * lets a chained kernel (named r4dchain*) wait in its prologue instead of behind the barrier bit.
- * Only on the AQL backend, whose queues keep the completion counter. On by default where the
- * model's plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays: the
- * Gemma 4 31B and 26B) and that drafter decodes speculatively (rad_dev_chain_infer, from the
- * engine before any row resolves). RADIANCE_CHAIN=0 turns them off and =1 on wherever the backend
- * chains; `auto` is the default. */
+ * Only on the AQL backend, whose queues keep the completion counter, and only where the model's
+ * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
+ * decodes speculatively (rad_dev_chain_infer, from the engine before any row resolves). */
 extern "C" int  rad_dev_chain_enabled(void);
 extern "C" void rad_dev_chain_infer(int pays);
 
@@ -472,6 +470,10 @@ const DeviceBackend* hip_backend_if_present(void);
 /* The HIP backend with streams, events, copies and fills replaced by AQL packets the engine writes
  * itself (aql.cpp). Aborts with the reason on a machine it cannot run on. */
 const DeviceBackend* aql_backend_if_present(void);
+/* For tests: every card keeps its kernel argument rings and recorded-pass argument blocks in pinned
+ * host memory, the placement a card whose PCI BAR is smaller than its VRAM gets, so that path runs
+ * on any card. Takes effect only before the backend starts; RAD_E_STATE after. */
+int     aql_force_host_kargs(void);
 /* Bytes copied to or from pageable host memory so far; each such copy is a host wait. */
 int64_t aql_pageable_bytes(void);
 /* Fat binaries registered so far, counted whichever backend runs: the registration hooks are this

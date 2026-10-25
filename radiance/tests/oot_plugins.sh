@@ -3,7 +3,7 @@
 #
 # THE PLUGINS RADIANCE SHIPS, BUILT THE WAY A THIRD PARTY BUILDS THEIRS. The tree's build is
 # installed into a prefix; then every plugin directory -- the kernel libraries, the quantisers,
-# every architecture -- is configured ON ITS OWN against that prefix with find_package(radiance),
+# every architecture, the plugins under plugin/ -- is configured ON ITS OWN against that prefix with find_package(radiance),
 # built, and installed into a home of its own. Nothing in the tree's build is reused: what is
 # tested is the installed package a stranger would have.
 #
@@ -47,8 +47,8 @@ run "$W/logs/install.log" cmake --install "$B" --prefix "$P"
 
 dirs="libref libquant"
 [ -d "$S/libavx" ] && [ -f "$B/radiance_home/kernels/libavx.so" ] && dirs="$dirs libavx"
-for d in "$S"/arch/*/; do
-  [ -f "$d/CMakeLists.txt" ] && dirs="$dirs arch/$(basename "$d")"
+for d in "$S"/arch/*/ "$S"/plugin/*/; do
+  [ -f "$d/CMakeLists.txt" ] && dirs="$dirs $(basename "$(dirname "$d")")/$(basename "$d")"
 done
 # The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
 # comparison below without it.
@@ -59,15 +59,20 @@ done
 [ -n "$HIPC" ] && dirs="$dirs $devlibs"
 is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
 
+# Each plugin installs its plugin file under $H and anything else it ships (libr4d's r4d_selftest)
+# under the package's prefix, as a third party installing into that radiance would.
 for d in $dirs; do
   n=$(basename "$d")
   say "building $d against the installed package"
   extra=""
   is_dev "$n" && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT
                         -DRAD_HIP_VOPD_REPEATABLE=$VOPD"
+  # A bundled plugin under plugin/ may carry device rows beside its host ones; it gets the tree's
+  # HIP compiler as a third party would pass theirs.
+  case "$d" in plugin/*) [ -n "$HIPC" ] && extra="-DCMAKE_HIP_COMPILER=$HIPC" ;; esac
   # shellcheck disable=SC2086
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
-      -DCMAKE_PREFIX_PATH="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
+      -DCMAKE_PREFIX_PATH="$P" -DCMAKE_INSTALL_PREFIX="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
   run "$W/logs/$n.build.log" cmake --build "$W/b/$n" -j "$J"
   run "$W/logs/$n.install.log" cmake --install "$W/b/$n"
 done

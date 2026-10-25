@@ -124,9 +124,9 @@ TEST(repaired_links_give_four_and_one) {
     CHECK_EQ(weights(r, s), std::string("4,1,4,4,1,1,4,4"));
 }
 
-/* The duplex model on the board after the repair: x16 holds 2/9 of the message and x8 1/36, so
- * each direction of every link carries the same time's bytes; on the earlier board the Gen4 x8
- * cards hold nothing (they would need T B > N) and Gen5 x8 one seventh of x16. */
+/* The duplex model with four Gen5 x16 and four Gen5 x8 links: x16 holds 2/9 of the message and
+ * x8 1/36, so each direction of every link carries the same time's bytes. With two of the x8
+ * links at Gen4 those two hold nothing (they would need T B > N) and Gen5 x8 one seventh of x16. */
 TEST(the_duplex_model_balances_both_directions_of_every_link) {
     Root r;
     const Slot fixed[8] = { { G5, 16 }, { G5, 8 }, { G5, 8 }, { G5, 16 },

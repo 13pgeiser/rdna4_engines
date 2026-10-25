@@ -8,11 +8,11 @@
  * norm on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
  * cap * tanh(x / cap).
  *
- * Two draft models, whichever the container carries under `draft.`: Google's assistant head (a
- * serial head over the trunk's own cache, the Gemma4Head below) or z-lab's DFlash drafter (a
+ * Three draft models, whichever the container carries under `draft.`: Google's assistant head (a
+ * serial head over the trunk's own cache, the Gemma4Head below), z-lab's DFlash drafter (a
  * five-layer block drafter with its own cache, reading the trunk's residual stream at six layers,
- * arch/common/rad_gemma4_dflash.h) -- the 31B's z-lab/gemma-4-31B-it-DFlash proposes 15 tokens a
- * pass where the assistant proposes one a round.
+ * arch/common/rad_gemma4_dflash.h; 15 tokens a pass on the 31B), or a DFlash2 drafter such as
+ * RedHatAI's gemma-4-31B-it-speculator.dflash2 (arch/common/rad_block_dflash2.h; 7 a pass).
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_vision.h>
@@ -104,7 +104,25 @@ struct G4Linear {
     rad_op     op = 0, op_q = 0;   /* the quantised GEMM and, for w4a8, its activation quantiser */
     rad_buf    q8 = 0, s8 = 0;     /* the int8 pair (i8 codes + f32 row scale) the quantiser writes */
     int64_t    N = 0, K = 0;
-    bool       quant = false;   /* true: w4a8 */
+    bool       quant = false;   /* true: w4a8 / w8a8 over a per-row int8 activation */
+    /* true: i8a8 as arch/gemma3's G3Linear: int8 codes with a bf16 scale per [1 x 128] (libquant
+     * `codes=i8 group=128 scale=bf16`) over quant_act_i8g, an activation scale per (row, 128).
+     * Gemma 4 E4B's activations carry a few channels 40-200 times the row's median (the down
+     * projection's input most), and one int8 scale a row spends its codes on them. There is no
+     * fused norm/quantiser at this grid, so the junctions stay off for a model that uses it. */
+    bool       i8g = false;
+    /* true: asymmetric int4 as arch/gemma3's G3Linear: u4 codes, a u8 zero point and an f16 scale
+     * per [1 x 128] (libquant `codes=u4 zero=u8 group=128 scale=f16`), gemm_nt_q at w4a8i8_asym
+     * over the same per-(row, 128) int8 activation as i8g. */
+    bool       a4 = false;
+    bool       grouped() const { return i8g || a4; }
+    /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
+     * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
+     * which at one row does 16 times the matrix work and reads its weight a quarter as fast. */
+    static constexpr int64_t kA4Split = 64;
+    int64_t    a4_split = 0;      /* rows up to which op_dec serves; 0: no decode band */
+    rad_buf    a16 = 0;
+    rad_op     op_a16 = 0, op_dec = 0;
     /* Reads another linear's int8 pair. q, k and v quantise the same norm output on the same
      * per-row grid, so with `in_from` set at declare this linear reads that linear's pair and
      * declares no quantiser of its own: one dispatch instead of three. */
@@ -175,6 +193,73 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
      * at w8a8 reads the same int8 activation and per-row scale as w4a8, so the quantiser is
      * shared. A recipe uses it for linears int4 hurts (attention, down_proj). */
     const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
+    i8g = known && linear_is_w8(enc);
+    {
+        const RadEncPlane* sp = rad_enc_plane(&enc, "scale");
+        const RadEncPlane* zp = rad_enc_plane(&enc, "zero");
+        a4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 3 && !enc.transform[0] &&
+             cdt == RAD_U4 && enc.plane[0].block[1] == 1 && sp && sp->dtype == RAD_F16 &&
+             sp->block[0] == 1 && sp->block[1] == RAD_FP8_BLOCK && zp && zp->dtype == RAD_U8 &&
+             zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK;
+    }
+    if (i8g || a4) {
+        if (N % 16 || K % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; it takes rows in 16s and K in "
+                            "whole %d-column activation scale groups\n", base, (long long)N,
+                    (long long)K, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        if (a4) {
+            w  = decl_view(b, wn, nullptr, "codes", RAD_U4, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
+                           RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        } else {
+            w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK },
+                           RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        }
+        if (!w || !ws) return RAD_E_INVAL;
+        /* not an a4 linear's pair: below its decode band it writes none */
+        if (in_from && in_from->grouped() && !in_from->a4 && in_from->q8 && in_from->K == K) {
+            q8 = in_from->q8;
+            s8 = in_from->s8;
+            shared_in = true;
+        } else {
+            q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8,  { g.max_tok, K });
+            s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, K / RAD_FP8_BLOCK });
+            if (!q8 || !s8) return RAD_E_INVAL;
+            op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
+                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
+                        RAD_NOWEIGHTS),
+                    { a }, { q8, s8 });
+            if (!op_q) return RAD_E_INVAL;
+        }
+        op = rw(b, RAD_OP(b, "gemm_nt_q",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
+                               RAD_INT("group", RAD_FP8_BLOCK),
+                               RAD_STR("dtype", a4 ? "w4a8i8_asym" : "i8a8")),
+                    RAD_WEIGHTS(w, ws)),
+                { q8, s8 }, { y });
+        if (!op) return RAD_E_INVAL;
+        if (a4) {
+            a4_split = std::min<int64_t>(kA4Split, g.max_tok);
+            a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { a4_split, K });
+            if (!a16) return RAD_E_INVAL;
+            op_a16 = rw(b, RAD_OP(b, "cast",
+                           RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("n", K),
+                                      RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
+                           RAD_NOWEIGHTS),
+                        { a }, { a16 });
+            op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
+                            RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
+                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a16_asym")),
+                            RAD_WEIGHTS(w, ws)),
+                        { a16 }, { y });
+            if (!op_a16 || !op_dec) return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     if (known && g4_grid_w4(enc)) {
         if (N % 16 || K % 128) {
             fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a w4 weight takes rows in "
@@ -216,8 +301,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
     char en[256];
     rad_enc_format(&enc, en, sizeof en);
-    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8 or w8a8 -- "
-                    "neither matches\n", wn, en);
+    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8, w8a8, "
+                    "int8 a 128 (i8a8) or asymmetric int4 a 128 -- none matches\n", wn, en);
     return RAD_E_DTYPE;
 }
 
@@ -229,6 +314,16 @@ inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
+    } else if (a4 && T <= a4_split) {
+        /* the decode band: f16 copy of the input, the skinny kernel; operands as LinearFP8's w4 */
+        RAD_ISSUE_N(c, op_a16, T, brows(a, T), brows(a16, T));
+        RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
+                    RAD_NONE, RAD_NONE);
+    } else if (grouped()) {
+        /* quant_act_i8g takes x, q, scale: no optional `asum`. */
+        if (!shared_in)
+            RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T));
+        gemm(c, y, T);
     } else
         RAD_ISSUE(c, op, brows(a, T), RAD_W(w), brows(y, T));
 }
@@ -239,18 +334,29 @@ inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
 }
 
 inline void G4Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const {
-    if (!quant) {
+    if (a4 && n <= a4_split) {
+        RAD_ISSUE_N(c, op_a16, n, brow_slice(a, r0, n, K), brows(a16, n));
+        RAD_ISSUE_N(c, op_dec, n, brows(a16, n), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (!quant && !grouped()) {
         RAD_ISSUE_N(c, op, n, brow_slice(a, r0, n, K), RAD_W(w), brow_slice(y, r0, n, N));
         return;
     }
-    if (!shared_in)
+    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;   /* the scale plane's row width */
+    if (!shared_in && grouped())
+        RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
+                    brow_slice(s8, r0, n, sw));
+    else if (!shared_in)
         RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
                     brow_slice(s8, r0, n, 1), RAD_NONE);
     gemm_rows(c, y, r0, n);
 }
 
 inline void G4Linear::gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const {
-    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, 1), RAD_W(w), RAD_W(ws),
+    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;
+    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, sw), RAD_W(w), RAD_W(ws),
                 brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
 }
 
@@ -265,6 +371,11 @@ struct Gemma4Attn {
     ClassGeom cls{};
     int         layer = 0;
     rad_kvgroup kv    = 0;
+    /* KV sharing (num_kv_shared_layers, Gemma 4 E2B/E4B): a shared layer has no k or v of its own
+     * and attends over the cache of `kv_layer`, the last earlier layer of its class that keeps
+     * one. A layer with its own cache has kv_layer == layer. */
+    bool        shared   = false;
+    int         kv_layer = 0;
 
     rad_weight w_norm = 0, w_qn = 0, w_kn = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_q{}, ln_k{}, ln_v{}, ln_o{};              /* the GEMM weights (bf16 or w4a8) */
@@ -297,12 +408,16 @@ struct Gemma4Attn {
     /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
     const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
     bool reads_pair() const {
+        if (shared) return ln_q.quant;
         return fused ? ln_qkv.quant
                      : ln_q.quant && ln_k.shared_in && (!cls.has_v || ln_v.shared_in);
     }
 
+    /* `kv_src` < 0: the layer keeps its own cache; else the layer whose cache it reads. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                 rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot);
+                 rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot,
+                 int kv_src = -1);
+    int  declare_shared(RadBuilder* b, Names& nm, const char* pre);
     /* `entry_done`: a junction op already wrote this block's quantised input (ln_q's pair).
      * `tail_fused`: the caller issues the post-norm and the add as a junction op. */
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
@@ -323,8 +438,12 @@ struct Gemma4Attn {
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                        rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot) {
+                        rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot,
+                        int kv_src) {
     g = geom; cls = cgeo; layer = l; kv = group; w = wire;
+    shared = kv_src >= 0;
+    kv_layer = shared ? kv_src : l;
+    if (shared) return declare_shared(b, nm, pre);
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
     const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
 
@@ -363,13 +482,18 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     if (cls.has_v) RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src, v_src }));
     else           RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src }));
     {
+        /* one q|k|v GEMM wherever the weight is on a quantised grid: w4a8 / w8a8, i8a8 or a4 */
         RadEncoding e{};
-        fused = weight_enc(b, qkv_wn, &e) && g4_grid_w4(e);
+        fused = weight_enc(b, qkv_wn, &e) && (g4_grid_w4(e) || linear_is_w8(e) ||
+                                              (rad_enc_is(&e, "affine") && e.n_planes == 3 &&
+                                               e.plane[0].dtype == RAD_U4));
     }
     if (fused) {
         if (!qkv_slot) return RAD_E_INVAL;
         if (!*qkv_slot)
-            *qkv_slot = decl_b(b, nm.f(cls.has_v ? "attn_qkvs" : "attn_qkvg"), g.act_dtype,
+            /* named by class, not by the value path: a global class with its own v (E2B/E4B,
+             * attention_k_eq_v false) has one too, and the two rows differ in width */
+            *qkv_slot = decl_b(b, nm.f(cls.head_ladder ? "attn_qkvg" : "attn_qkvs"), g.act_dtype,
                                {g.max_tok, qkvd});
         w.qkv = *qkv_slot;
         if (cls.has_v)
@@ -589,6 +713,78 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     return RAD_OK;
 }
 
+/* A KV-shared layer (transformers' Gemma4TextAttention with is_kv_shared_layer): q_proj, the per-head
+ * q norm and the class's rotary, attention over the source layer's cache, o_proj and the two norms.
+ * No k or v projection, no k or v norm and no cache store: the source layer, earlier in the same
+ * step, wrote the keys and values these queries read. The checkpoint's k_proj / v_proj / k_norm of
+ * these layers (the "frozen shared kv" file) are unused, as in the reference. */
+int Gemma4Attn::declare_shared(RadBuilder* b, Names& nm, const char* pre) {
+    const int l = layer;
+    const int64_t qd = cls.q_dim();
+    fused = false;
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),      nm.ckpt("%s.%lld.input_layernorm.weight",   pre, (long long)l)));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l),    nm.ckpt("%s.%lld.self_attn.q_norm.weight",   pre, (long long)l)));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_post_norm.weight", l), nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l)));
+    w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_BF16, {g.n_embd},
+                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_qn = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_BF16, {cls.head_dim},
+                 RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_post = decl_w(b, nm.f("blk.%d.attn_post_norm.weight", l), RAD_BF16, {g.n_embd},
+                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
+                              { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
+                              qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
+    RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
+                              { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
+                              g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
+    op_norm = rw(b, RAD_OP(b, "rmsnorm",
+                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                             RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+                  RAD_WEIGHTS(w_norm)),
+                 {w.x}, {w.h});
+    op_qn = rw(b, RAD_OP(b, "rmsnorm",
+               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * cls.n_head), RAD_INT("n", cls.head_dim),
+                          RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype)),
+               RAD_WEIGHTS(w_qn)),
+             {w.q}, {w.q});
+    op_rq = rw(b, RAD_OP(b, "rope",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                            RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", 0),
+                            RAD_F64("theta", cls.theta), RAD_F64("scale", cls.scale),
+                            RAD_STR("mode", "neox"), RAD_INT("rotary_dim", cls.n_rot),
+                            RAD_STR("ladder", cls.head_ladder ? "head" : "rotary")),
+                 RAD_NOWEIGHTS),
+                {w.q}, {w.q});
+    op_attn = rw(b, RAD_OP(b, "attn_paged",
+                     RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
+                                RAD_INT("head_dim", cls.head_dim),
+                                RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1),
+                                RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
+                                RAD_INT("block_size", RAD_KV_BLOCK),
+                                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                RAD_F64("scale", 1.0),
+                                RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                     RAD_NOWEIGHTS),
+                  {w.q}, {w.attn});
+    if (g.world > 1)
+        op_ar = rw(b, RAD_OP(b, "all_reduce",
+                   RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                              RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                              RAD_INT("min_bytes", g.wire_min_bytes)),
+                   RAD_NOWEIGHTS),
+                  {w.h}, {w.h});
+    op_post = rw(b, RAD_OP(b, "rmsnorm",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                            RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+                 RAD_WEIGHTS(w_post)),
+                {w.h}, {w.h});
+    op_add = rw(b, RAD_OP(b, "add",
+               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
+               RAD_NOWEIGHTS),
+              {w.x, w.h}, {w.x});
+    return (op_norm && op_qn && op_rq && op_attn && op_post && op_add) ? RAD_OK : RAD_E_INVAL;
+}
+
 /* ---- Prefetch beside the reductions (prefetch_beside, rad_arch.h). The all-reduce in front of
  * each GEMM leaves the card's memory idle for its round trip (~20 us at a DFlash2 verify's rows on
  * 4x R9700), so the trunk reads the next GEMM's leading bytes in that window -- gate_up's after
@@ -609,7 +805,13 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
                       bool ar_fused) const {
     const int64_t T = batch->n_tok;
 
-    if (fused) {
+    if (shared) {
+        if (entry_done) ln_q.gemm(c, w.q, T);
+        else {
+            RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+            ln_q.step(c, w.h, w.q, T);
+        }
+    } else if (fused) {
         if (!entry_done) RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
         if (entry_done) ln_qkv.gemm(c, w.qkv, T);
         else            ln_qkv.step(c, w.h, w.qkv, T);
@@ -637,6 +839,10 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
 }
 
 void Gemma4Attn::project(RadCtx* c, int64_t r0, int64_t n) const {
+    if (shared) {
+        ln_q.gemm_rows(c, w.q, r0, n);
+        return;
+    }
     if (fused) {
         ln_qkv.gemm_rows(c, w.qkv, r0, n);
         return;
@@ -657,6 +863,19 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
     const int64_t T = batch->n_tok;
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    if (shared) {
+        /* q only: its norm and rotary, then attention over the source layer's cache. */
+        RAD_ISSUE_N(c, op_qn, T * cls.n_head, brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
+        RAD_ISSUE(c, op_rq, brows(w.q, T), rope_posmc(g, batch, T));
+        RAD_ISSUE_N(c, op_attn, batch->max_q_len,
+                    brows(w.q, T), kv_cache(kv, kv_layer),
+                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, batch->n_seq),
+                    RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                    brows(w.attn, T));
+        return;
+    }
     /* q, k and v where the prologue works on them: their own buffers, or on a fused layer with the
      * one-op prologue the row's column slices (a k_eq_v class's v is its own buffer either way). */
     const bool row = fused && op_qnr;
@@ -869,43 +1088,24 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
  * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
  * `res` null it is the plain norm of `x`, the first block's entry. */
-/* The four-rank fold's band. libr4d's exact all-reduce is a one-shot up to this many elements
- * (R4D_AR_WIDE_ONESHOT_MAX_ELEMS) and a two-shot above, and the fused junction at four ranks is
- * that one-shot with the junction as its epilogue: three times the message per rank on the link,
- * which pays at decode heights and not at a prefill's. So at four ranks op_ar serves the rows a
- * one-shot would, 97 at 5376, and a taller step issues the all-reduce and the junction apart.
- *
- * Within that band the fold pays only at the bottom. On 4x R9700 (2026-10-17, same image) a plain
- * decode step (1 row) ran 5.6% slower without it (89 against 94 tok/s), and a DFlash verify
- * (16 rows) 9% faster (300 against 276): at 16 rows the standalone all-reduce is the exact
- * two-shot, while the fold's one block a row each takes a fenced handshake. The per-row costs
- * cross near 4-5 rows. From 5 rows libr4d's four-rank row takes its tail form instead (axis
- * `tail`): the standalone two-shot with the junction run after it in the same launch, behind a
- * card-local count, so the junction costs neither a handshake nor a launch. With it a DFlash2
- * verify (8 rows) folds and gains ~1% (348 / 258 / 187 / 516 against 345 / 255 / 185 / 511 tok/s,
- * code / prose / story / long, 4x R9700; replies identical), where the one-shot fold there lost
- * 6%. So the fold serves up to kAr4FoldRows rows, a z-lab DFlash verify's 16 included, and a
- * taller step issues the pair. */
-static constexpr int64_t kArOneShotElems = 524288;
+/* The four-rank fold's band. libr4d's four-rank row serves it in three forms, all byte-identical
+ * to all_reduce + rmsnorm_quant_i8. Up to 4 rows it is the exact one-shot with the junction as its
+ * epilogue: three times the message per rank and one fenced handshake a row, which wins at one row
+ * (plain decode about 5% faster on 4x R9700) and loses to the standalone two-shot by 16. From 5
+ * rows it is that two-shot with the junction as its tail (axis `tail`), behind a card-local count,
+ * so the junction costs neither a handshake nor a launch. Above kAr4FoldRows a step issues the
+ * pair. */
 static constexpr int64_t kAr4FoldRows = 16;
-/* From kArSpMinRows rows to the same band's top, libr4d's four-rank row takes `sp` instead: the
- * all-reduce split around the junction. Each rank reduces only the rows it owns (a quarter, in
- * rank order), runs the junction on them and gathers the int8 codes the next GEMM reads, so the
- * second hop carries a byte a column instead of two and the junction a quarter of the rows. The
- * fold and the sums are the whole form's, so q and the scales are byte for byte the same; the
- * residual stream then holds this rank's rows only, which is all the next junction reads. A
- * junction whose stream anything else reads next asks for the residual on every row too (sp 2):
+/* From kArSpMinRows rows to kArSpMaxRows, libr4d's four-rank row takes `sp`: the all-reduce split
+ * around the junction. Each rank reduces only the rows it owns (a quarter, in rank order), runs the
+ * junction on them and gathers the int8 codes the next GEMM reads, so the second hop carries a byte
+ * a column instead of two and the junction runs on a quarter of the rows. q and the scales are
+ * the whole form's bytes; the residual stream then holds this rank's rows only, which is all the
+ * next junction reads. A junction whose stream anything else reads next asks for every row (sp 2):
  * the layers the drafter taps, and the last layer's attention junction, since that layer's
- * feed-forward closes with its own all-reduce, post-norm and add over every row. One launch at a
- * time on 4x R9700 (2026-10-19): 19.8 against 21.9 us at 4 rows of 5376 (the one-shot fold), 22.9
- * against 24.5 at 8 and 30.8 against 34.9 at 16 (the tail), 72.3 against 89.2 at 64. Below 4 rows
- * a rank would idle (31.7 against 18.7 us at one).
- *
- * In the engine it pays only where it replaces the fold: a DFlash2 verify (8 rows) ran 402 / 297 /
- * 216 / 603 tok/s code / prose / story / long against 392 / 290 / 210 / 585, replies identical,
- * but steps of 24-64 rows, where the pair runs instead, lost ~10% under load (4 users 588 against
- * 698 aggregate, 8 users 781 against 867; 12 users even; 4x R9700, 2026-10-19). So it serves to
- * kArSpMaxRows, the fold's band, within the one-shot's. */
+ * feed-forward closes with its own all-reduce, post-norm and add over every row. Below 4 rows a
+ * rank would idle (on 4x R9700, 31.7 against 18.7 us at one row); at 24-64 rows, where the pair
+ * runs, the split form lost about 10% of aggregate throughput under load. */
 static constexpr int64_t kArSpMinRows = 4;
 static constexpr int64_t kArSpMaxRows = 16;
 
@@ -941,11 +1141,10 @@ struct G4Junction {
         rad_op_writes(b, op, wr, res ? 3 : 2);
         /* With the all-reduce in front, at two or four ranks on the exact wire: `x` is then a
          * rank's partial sum of a column-sharded linear. With the lossy wire allowed, the
-         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold is
-         * the one-shot's and serves only its band (kArOneShotElems, kAr4FoldRows). */
+         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold
+         * serves steps of up to kAr4FoldRows rows. */
         const bool four = g.world == 4;
-        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd))
-                                : g.max_tok;
+        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, g.max_tok) : g.max_tok;
         if (res && g.wire_exact && (g.world == 2 || four) && hi >= 1 &&
             rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
             const RadParam pa[] = { RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
@@ -960,8 +1159,7 @@ struct G4Junction {
             }
             /* The split form from kArSpMinRows to kArSpMaxRows rows. It needs the post-norm, as
              * every trunk junction past the first has; `x` is declared written, as the fold's. */
-            const int64_t top = std::min<int64_t>(
-                std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd), kArSpMaxRows);
+            const int64_t top = std::min<int64_t>(g.max_tok, kArSpMaxRows);
             if (op_ar && four && wp && top >= kArSpMinRows) {
                 const RadParam ps[] = { RAD_RANGE("M", 1, top), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
@@ -1468,6 +1666,11 @@ struct Layer {
     Gemma4Mlp  mlp{};
     rad_weight w_scalar = 0;   /* the per-layer [1] residual scalar, `cur = cur * scalar` */
     rad_op     op_scale = 0;
+    /* Per-layer embeddings (Gemma 4 E2B/E4B), after the feed-forward's residual add and before the
+     * scalar: x += norm(proj(gelu(gate(x)) * pli[l])). `ple_post` is the norm's gain. */
+    G4Linear   ln_pg{}, ln_pp{};
+    rad_weight w_ple_post = 0;
+    rad_op     op_ple_act = 0, op_ple_post = 0, op_ple_add = 0;
     /* The fused junctions (see "Residual junctions" above): attention -> this layer's
      * feed-forward, and this layer's feed-forward -> the next layer's attention, scalar included.
      * The last layer has no j_ma: its stream goes to the final norm, which feeds the lm_head, not
@@ -1505,6 +1708,22 @@ struct Model {
 
     rad_weight w_tok = 0, w_out = 0, w_lm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final = 0, op_gather = 0, op_logits = 0, op_cap = 0;
+
+    /* Per-layer embeddings (hidden_size_per_layer_input > 0): the token-identity table
+     * (embed_tokens_per_layer, n_layer x n_ple wide), the context projection of the scaled
+     * embedding and its per-(token, layer) norm, combined into `b_ple` [max_tok, n_layer * n_ple]
+     * that every layer reads its slice of. */
+    int64_t    n_ple = 0;
+    rad_weight w_ple_tok = 0, w_ple_norm = 0;
+    G4Linear   ln_ple_proj{};
+    rad_buf    b_ple = 0, b_ple_tok = 0, b_pg = 0;
+    rad_op     op_ple_tok = 0, op_ple_norm = 0, op_ple_add = 0;
+    /* An image's placeholder positions take the token-identity row of pad_token_id, as the
+     * reference looks them up (Gemma4Model.forward: llm_input_ids = pad where multimodal): that row
+     * times sqrt(n_ple), made as fill(sqrt(n_ple)) * the row, scattered over the image rows. */
+    rad_weight w_ple_pad = 0;
+    rad_buf    b_ple_pad = 0;
+    rad_op     op_ple_pfill = 0, op_ple_pmul = 0, op_ple_pscat = 0;
 
     std::vector<Layer> layers;
 
@@ -1768,7 +1987,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Names& nm = m.nm;
 
     /* ---- geometry RadModelMeta does not name. */
-    const int64_t kv_g_all    = meta_text_geti(meta, "num_global_key_value_heads", 0);
+    /* num_global_key_value_heads may be null (Gemma 4 E2B/E4B): the global layers then take the
+     * model's num_key_value_heads, as transformers' per-layer config does. */
+    const int64_t kv_g_all    = meta_text_geti(meta, "num_global_key_value_heads",
+                                               meta_text_geti(meta, "num_key_value_heads", 0));
     const int64_t head_g      = meta_text_geti(meta, "global_head_dim", 0);
     const int64_t sliding_win = meta_text_geti(meta, "sliding_window", 0);
     const int64_t kv_shared   = meta_text_geti(meta, "num_kv_shared_layers", 0);
@@ -1798,12 +2020,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     if (!(softcap > 0.0)) { fprintf(stderr, "radiance: gemma4: final_logit_softcapping is required\n"); return RAD_E_INVAL; }
     if (kv_shared < 0) { fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld is negative\n", (long long)kv_shared); return RAD_E_INVAL; }
-    if (kv_shared > 0) {
-        fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld needs a shared-KV reuse path; refusing\n",
-                (long long)kv_shared);
-        return RAD_E_UNSUPPORTED;
+    if (kv_shared >= g.n_layer) {
+        fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld leaves no layer with a cache of "
+                        "its own (%lld layers)\n", (long long)kv_shared, (long long)g.n_layer);
+        return RAD_E_INVAL;
     }
     if (sliding_win <= 0) { fprintf(stderr, "radiance: gemma4: sliding_window %lld is required\n", (long long)sliding_win); return RAD_E_INVAL; }
+    m.n_ple = meta_text_geti(meta, "hidden_size_per_layer_input", 0);
+    if (m.n_ple < 0) { fprintf(stderr, "radiance: gemma4: hidden_size_per_layer_input %lld is negative\n", (long long)m.n_ple); return RAD_E_INVAL; }
+    if (m.n_ple > 0) {
+        const int64_t v_ple = meta_text_geti(meta, "vocab_size_per_layer_input", g.n_vocab_all);
+        if (g.world > 1) {
+            fprintf(stderr, "radiance: gemma4: per-layer embeddings (hidden_size_per_layer_input %lld) "
+                            "are served at one rank only; this model is small enough for one card\n",
+                    (long long)m.n_ple);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (v_ple != g.n_vocab_all) {
+            fprintf(stderr, "radiance: gemma4: vocab_size_per_layer_input %lld differs from the "
+                            "vocabulary (%lld)\n", (long long)v_ple, (long long)g.n_vocab_all);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     if (!(prf > 0.0)) prf = 1.0;
     const int64_t n_rot_g = (int64_t)(head_g * prf + 0.5);
     if (n_rot_g <= 0 || n_rot_g > head_g || (n_rot_g & 1)) {
@@ -1827,6 +2065,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(g4_schedule(meta, g.n_layer, interval, is_global));
     int n_global = 0;
     for (int v : is_global) n_global += v;
+
+    /* KV sharing: from layer n_layer - num_kv_shared_layers on, a layer keeps no cache and reads the
+     * last earlier non-shared layer of its own class (transformers' store_full_length_kv; E4B:
+     * sliding layers read 22, full layers 23). kv_src[l] is that layer, or -1 for an own cache. */
+    const int64_t first_shared = g.n_layer - kv_shared;
+    std::vector<int> kv_src((size_t)g.n_layer, -1);
+    if (kv_shared > 0) {
+        int last_s = -1, last_f = -1;
+        for (int64_t l = 0; l < first_shared; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        for (int64_t l = first_shared; l < g.n_layer; ++l) {
+            const int src = is_global[(size_t)l] ? last_f : last_s;
+            if (src < 0) {
+                fprintf(stderr, "radiance: gemma4: KV-shared layer %lld is %s and no earlier layer of "
+                                "that class keeps a cache\n", (long long)l,
+                        is_global[(size_t)l] ? "full" : "sliding");
+                return RAD_E_INVAL;
+            }
+            kv_src[(size_t)l] = src;
+        }
+    }
 
     /* The sliding class comes from geom_from (head_dim 256, 16 kv heads, full rotation, theta_s);
      * the global class is built from the container header. */
@@ -1929,6 +2187,78 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                      {m.b_x}, {m.b_x});
 
+    /* ---- per-layer embeddings (transformers' get_per_layer_inputs / project_per_layer_inputs):
+     *   tok = embed_tokens_per_layer[id] * sqrt(n_ple)                      (bf16, sqrt(256) = 16)
+     *   ctx = rmsnorm( (e @ W_proj^T) * n_embd^-0.5 ) per (token, layer)   over n_ple, gain w_norm
+     *   pli = (ctx + tok) * 2^-0.5
+     * `e` is the scaled embedding (after any image rows are scattered in). The projection's scale
+     * is folded into the norm's eps, as embgemma2 does: rmsnorm(s x, eps) = rmsnorm(x, eps / s^2),
+     * so no bf16 rounding of s x. The table is read a row a token, so the placement puts it in the
+     * pinned host pool by default (--embedding-placement ram), off the card. */
+    if (m.n_ple > 0) {
+        const int64_t P = g.n_layer * m.n_ple;
+        RAD_ARCH_TRY(map_copy(b, nm.f("ple_token_embd.weight"),
+                              nm.ckpt("model.language_model.embed_tokens_per_layer.weight")));
+        RAD_ARCH_TRY(map_copy(b, nm.f("ple_proj_norm.weight"),
+                              nm.ckpt("model.language_model.per_layer_projection_norm.weight")));
+        m.w_ple_tok = decl_w(b, nm.f("ple_token_embd.weight"), RAD_BF16, {g.n_vocab, P},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        m.w_ple_norm = decl_w(b, nm.f("ple_proj_norm.weight"), RAD_BF16, {m.n_ple},
+                              RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        m.b_ple     = decl_b(b, nm.f("ple_in"),  g.act_dtype, {g.max_tok, P});
+        m.b_ple_tok = decl_b(b, nm.f("ple_tok"), g.act_dtype, {g.max_tok, P});
+        m.b_pg      = decl_b(b, nm.f("ple_gate"), g.act_dtype, {g.max_tok, m.n_ple});
+        if (!m.w_ple_tok || !m.w_ple_norm || !m.b_ple || !m.b_ple_tok || !m.b_pg) return RAD_E_INVAL;
+        m.op_ple_tok = rw(b, RAD_OP(b, "embed_lookup",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", P),
+                                     RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                     RAD_INT("vocab_offset", g.vocab_off),
+                                     RAD_F64("mult", std::sqrt((double)m.n_ple))),
+                          RAD_WEIGHTS(m.w_ple_tok)),
+                         {}, {m.b_ple_tok});
+        RAD_ARCH_TRY(m.ln_ple_proj.declare(b, nm, g, nm.f("ple_model_proj"),
+                                           { nm.ckpt("model.language_model.per_layer_model_projection.weight") },
+                                           P, g.n_embd, RAD_SHARD_NONE, grp_model(), m.b_x, m.b_ple));
+        m.op_ple_norm = rw(b, RAD_OP(b, "rmsnorm",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * g.n_layer), RAD_INT("n", m.n_ple),
+                                      RAD_F64("eps", (double)g.eps * (double)g.n_embd),
+                                      RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                           RAD_WEIGHTS(m.w_ple_norm)),
+                          {m.b_ple}, {m.b_ple});
+        m.op_ple_add = rw(b, RAD_OP(b, "add",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                     RAD_STR("dtype", g.dtype), RAD_F64("div", std::sqrt(2.0))),
+                          RAD_NOWEIGHTS),
+                         {m.b_ple, m.b_ple_tok}, {m.b_ple});
+        if (!m.op_ple_tok || !m.op_ple_norm || !m.op_ple_add) return RAD_E_INVAL;
+        if (m.op_mm) {
+            const int pad = (int)meta_text_geti(meta, "pad_token_id", 0);
+            RAD_ARCH_TRY(map_slice(b, nm.f("ple_pad_row.weight"),
+                                   nm.ckpt("model.language_model.embed_tokens_per_layer.weight"), pad));
+            m.w_ple_pad = decl_w(b, nm.f("ple_pad_row.weight"), RAD_BF16, {P}, RAD_ACCESS_PER_TOKEN,
+                                 RAD_SHARD_NONE, grp_model());
+            m.b_ple_pad = decl_b(b, nm.f("ple_pad"), g.act_dtype, {g.max_tok, P});
+            if (!m.w_ple_pad || !m.b_ple_pad) return RAD_E_INVAL;
+            m.op_ple_pfill = rw(b, RAD_OP(b, "fill",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_F64("value", std::sqrt((double)m.n_ple))),
+                                    RAD_NOWEIGHTS),
+                                {}, {m.b_ple_pad});
+            m.op_ple_pmul = rw(b, RAD_OP(b, "mul_weight",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                              RAD_STR("dtype", g.dtype), RAD_INT("scalar", 0)),
+                                   RAD_WEIGHTS(m.w_ple_pad)),
+                               {m.b_ple_pad}, {m.b_ple_pad});
+            m.op_ple_pscat = rw(b, RAD_OP(b, "scatter_rows",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_NOWEIGHTS),
+                                {m.b_ple_pad, m.b_ple_tok}, {m.b_ple_tok});
+            if (!m.op_ple_pfill || !m.op_ple_pmul || !m.op_ple_pscat) return RAD_E_INVAL;
+        }
+    }
+
     /* ---- the layers. */
     Gemma4Attn::Wire sw{}; sw.x = m.b_x; sw.h = m.b_h; sw.q = m.b_qs; sw.k = m.b_ks; sw.v = m.b_vs;        sw.attn = m.b_attns;
     Gemma4Attn::Wire gw{}; gw.x = m.b_x; gw.h = m.b_h; gw.q = m.b_qg; gw.k = m.b_kg; gw.v = m.b_vg;        gw.attn = m.b_atting;
@@ -1941,9 +2271,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const ClassGeom&        cgeo = lay.global ? m.cg : m.cs;
         const rad_kvgroup       kg   = lay.global ? m.kv_g : m.kv_s;
         const Gemma4Attn::Wire& aw   = lay.global ? gw : sw;
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
+        /* A KV-shared layer is not bound: the group's pages hold only the layers that write. */
+        if (kv_src[(size_t)l] < 0) RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
-                                      lay.global ? &m.b_qkvg : &m.b_qkvs));
+                                      lay.global ? &m.b_qkvg : &m.b_qkvs, kv_src[(size_t)l]));
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
 
         /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
@@ -1957,11 +2288,48 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             RAD_WEIGHTS(lay.w_scalar)),
                            {mw.x}, {mw.x});
 
+        /* The per-layer embedding branch (transformers' Gemma4TextDecoderLayer, after the
+         * feed-forward's residual add): gate n_embd -> n_ple, gelu_tanh times this layer's slice of
+         * `ple_in`, projection back to n_embd into `h`, its norm, the residual add. The scalar
+         * follows it. */
+        if (m.n_ple > 0) {
+            RAD_ARCH_TRY(lay.ln_pg.declare(b, nm, g, nm.f("blk.%d.ple_gate", (int)l),
+                                           { nm.ckpt("%s.%lld.per_layer_input_gate.weight", pre, (long long)l) },
+                                           m.n_ple, g.n_embd, RAD_SHARD_NONE, grp_layer((int)l),
+                                           m.b_x, m.b_pg));
+            RAD_ARCH_TRY(lay.ln_pp.declare(b, nm, g, nm.f("blk.%d.ple_proj", (int)l),
+                                           { nm.ckpt("%s.%lld.per_layer_projection.weight", pre, (long long)l) },
+                                           g.n_embd, m.n_ple, RAD_SHARD_NONE, grp_layer((int)l),
+                                           m.b_pg, m.b_h));
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_post_norm.weight", (int)l),
+                                  nm.ckpt("%s.%lld.post_per_layer_input_norm.weight", pre, (long long)l)));
+            lay.w_ple_post = decl_w(b, nm.f("blk.%d.ple_post_norm.weight", (int)l), RAD_BF16, {g.n_embd},
+                                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer((int)l));
+            lay.op_ple_act = rw(b, RAD_OP(b, "act_mul",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", m.n_ple),
+                                               RAD_STR("act", "gelu_tanh"), RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_pg, m.b_ple}, {m.b_pg});
+            lay.op_ple_post = rw(b, RAD_OP(b, "rmsnorm",
+                                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                                RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
+                                                RAD_STR("dtype", g.dtype)),
+                                     RAD_WEIGHTS(lay.w_ple_post)),
+                                 {m.b_h}, {m.b_h});
+            lay.op_ple_add = rw(b, RAD_OP(b, "add",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_x, m.b_h}, {m.b_x});
+            if (!lay.w_ple_post || !lay.op_ple_act || !lay.op_ple_post || !lay.op_ple_add)
+                return RAD_E_INVAL;
+        }
+
         /* The tap: a row copy of the layer's output (after the scalar, HF's hidden_states[l + 1])
          * into the column slice the tap owns. It is declared here, in the layer it is issued
-         * after, because the buffer planner's liveness is declaration order. A tap declared once
-         * after the trunk made `dflash_src` look born at its end and free to share with what every
-         * layer writes, which on arch/gemma4 cost 98% of the drafts with the reply still fluent. */
+         * after, because the buffer planner's liveness is declaration order. Declared after the
+         * trunk, `dflash_src` would look born at its end and free to share with what every layer
+         * writes: the drafts would fail while the reply stays fluent. */
         for (int t = 0; t < m.n_taps; ++t)
             if (m.tap_layer[t] == (int)l && !lay.op_tap)
                 lay.op_tap = rw(b, RAD_OP(b, "cast",
@@ -1996,7 +2364,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
-                    RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm, lay.mlp.w_post,
+                    /* With per-layer embeddings the junction closes the PLE branch instead of the
+                     * feed-forward (whose post-norm and add then run apart): the branch's norm,
+                     * its add, the scalar, the next norm and quantiser, in the reference's order. */
+                    RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm,
+                                                  m.n_ple > 0 ? lay.w_ple_post : lay.mlp.w_post,
                                                   lay.w_scalar, nx.attn.ln_in(), tapped));
                     ok = lay.j_ma.op != 0;
                 }
@@ -2019,8 +2391,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
      * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
      * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
-     * where there are reductions to sit beside. RADIANCE_PREFETCH=0 declares none
-     * (decl_prefetch). */
+     * where there are reductions to sit beside. */
     if (g.world > 1 && rad_op_declared(b, "prefetch")) {
         for (size_t l = 0; l < m.layers.size(); ++l) {
             Layer& lay = m.layers[l];
@@ -2046,9 +2417,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
      * arena's sharing, which the runtime asks of every buffer a second lane touches; it lives
      * across the whole trunk already. */
-    const char* ov = std::getenv("RADIANCE_GEMMA4_OVERLAP");   /* 0: every step whole */
-    const bool ov_off = ov && !std::strcmp(ov, "0");
-    m.overlap = !ov_off && g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
+    m.overlap = g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
     for (const Layer& lay : m.layers)
         m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
@@ -2081,11 +2450,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * feed-forward reduction only slice A's junction and q|k|v. Per slice (A's projection,
      * prologue, attention and o_proj, then B's), each of the four reductions sits beside a whole
      * block: on 4x R9700 the exact two-shot of a 1024-row slice takes ~1.05 ms alone and ~1.4x
-     * that beside any card-filling compute (a four-card microbenchmark, 2026-10-18). Slice A's
-     * attention reads its context end from kv_len_trim, one a KV group. A one-sequence step only
-     * (the slices' rows are then one sequence's), with the one-launch prologue and no
-     * multi-component rotary. Byte-identical: every greedy reply matches the whole attention's
-     * (4x R9700, two rounds, and 16 of 16 fresh starts on a 5310-token prompt); prefill +5%. */
+     * that beside card-filling compute, so the reductions want whole blocks to hide behind. Slice
+     * A's attention reads its context end from kv_len_trim, one a KV group. A one-sequence step
+     * only (the slices' rows are then one sequence's), with the one-launch prologue and no
+     * multi-component rotary. A slice's attention rows see exactly the keys they see in the whole
+     * step, so the output is the whole attention's byte for byte. */
     if (m.overlap) {
         bool ok = !g.rope_mc && rad_op_declared(b, "kv_len_trim");
         for (const Layer& lay : m.layers) ok = ok && lay.attn.slicable();
@@ -2136,7 +2505,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the deployment speculates; otherwise its ~0.5 GB of weights stay off the card. */
     if (ctx->max_spec > 0 && has_assistant(meta)) {
         int last_s = -1, last_f = -1;
-        for (int64_t l = 0; l < m.n_main; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        /* the last layer of each class that keeps a cache (a KV-shared layer reads another's) */
+        for (int64_t l = 0; l < m.n_main; ++l)
+            if (kv_src[(size_t)l] < 0) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
         RAD_ARCH_TRY(m.head.declare(b, nm, meta, g, m.cs, m.cg, m.kv_s, m.kv_g, last_s, last_f,
                                     m.n_main, m.w_tok, m.b_h, m.b_logits));
         m.have_head = true;
@@ -2196,6 +2567,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
              (long long)(g.n_layer - n_global), (long long)sliding_win,
               (long long)g.n_head, (long long)g.head_dim, (long long)g.n_head, (long long)head_g);
+    if (kv_shared > 0) {
+        int src_s = -1, src_f = -1;
+        for (int64_t l = first_shared; l < g.n_layer; ++l)
+            (is_global[(size_t)l] ? src_f : src_s) = kv_src[(size_t)l];
+        rad_note(b, "KV sharing: layers %lld..%lld keep no cache and read the last earlier layer of "
+                    "their class (sliding %d, full %d); %lld of %lld layers hold KV",
+                 (long long)first_shared, (long long)(g.n_layer - 1), src_s, src_f,
+                 (long long)first_shared, (long long)g.n_layer);
+    }
     {
         int64_t n_fused = 0, n_row = 0, n_dec = 0, dec_hi = 0;
         for (const Layer& lay : m.layers) {
@@ -2220,8 +2600,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      (long long)(2 * kOverlapRows));
         else
             rad_note(b, "prefill overlap: off (%s)",
-                     ov_off        ? "RADIANCE_GEMMA4_OVERLAP=0"
-                     : !g.wire_exact ? "the lossy all-reduce wire"
+                     !g.wire_exact ? "the lossy all-reduce wire"
                      : !m.fuse     ? "the residual junctions are not fused"
                                    : "a step holds fewer than two slices");
     }
@@ -2445,6 +2824,23 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
 
     const int64_t T = batch->n_tok;
+    if (m.n_ple > 0) {
+        RAD_ISSUE(c, m.op_ple_tok, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_ple_tok),
+                  brows(m.b_ple_tok, T));
+        if (m.op_ple_pscat && batch->n_mm_rows > 0) {
+            const int64_t nm_rows = batch->n_mm_rows;
+            RAD_ISSUE_N(c, m.op_ple_pfill, nm_rows, brows(m.b_ple_pad, nm_rows));
+            RAD_ISSUE_N(c, m.op_ple_pmul, nm_rows, brows(m.b_ple_pad, nm_rows), RAD_W(m.w_ple_pad),
+                        brows(m.b_ple_pad, nm_rows));
+            RAD_ISSUE_N(c, m.op_ple_pscat, nm_rows, brows(m.b_ple_pad, nm_rows),
+                        praw(batch->mm_rows, RAD_I32, nm_rows), brows(m.b_ple_tok, T));
+        }
+        m.ln_ple_proj.step(c, m.b_x, m.b_ple, T);
+        /* [T, n_layer * n_ple] read as [T * n_layer, n_ple]: one norm row per (token, layer). */
+        RAD_ISSUE_N(c, m.op_ple_norm, T * m.g.n_layer, brows(m.b_ple, T), RAD_W(m.w_ple_norm),
+                    brows(m.b_ple, T));
+        RAD_ISSUE(c, m.op_ple_add, brows(m.b_ple, T), brows(m.b_ple_tok, T), brows(m.b_ple, T));
+    }
     const int64_t cut = split_at(m, T);
     if (cut > 0) trunk_overlap(c, m, batch, cut);
     else if (m.fuse) m.j0.step(c, T);
@@ -2455,7 +2851,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const bool last = li + 1 == m.layers.size();
         l.attn.step(c, batch, m.fuse, m.fuse, far);
         if (m.fuse) l.j_am.step(c, T, far);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, far);
+        const bool ple = m.n_ple > 0;
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last && !ple, far);
+        if (ple) {
+            l.ln_pg.step(c, m.b_x, m.b_pg, T);
+            RAD_ISSUE(c, l.op_ple_act, brows(m.b_pg, T),
+                      bcol(m.b_ple, (int64_t)li * m.n_ple, m.n_ple, T), brows(m.b_pg, T));
+            l.ln_pp.step(c, m.b_pg, m.b_h, T);
+            if (!(m.fuse && !last)) {
+                RAD_ISSUE(c, l.op_ple_post, brows(m.b_h, T), RAD_W(l.w_ple_post), brows(m.b_h, T));
+                RAD_ISSUE(c, l.op_ple_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
+            }
+        }
         if (m.fuse && !last) {
             /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
             l.j_ma.step(c, T, far);
@@ -2521,7 +2928,7 @@ RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
-                "logits; Google's assistant head or z-lab's DFlash drafter")
+                "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 RAD_ARCH_PROBE(gemma4_bf16)
 #endif

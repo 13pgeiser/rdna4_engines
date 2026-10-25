@@ -606,6 +606,51 @@ void IdleTiers::drop_session(uint64_t id) {
     sessions_.erase(it);
 }
 
+void IdleTiers::find_sessions(const std::string& label, uint64_t id,
+                              std::vector<SessionChain>* out) const {
+    out->clear();
+    std::lock_guard lk(mu_);
+    for (const auto& kv : sessions_) {
+        const bool hit = id != 0 ? kv.first == id : (!label.empty() && kv.second.label == label);
+        if (!hit) continue;
+        SessionChain c;
+        c.id = kv.first;
+        c.label = kv.second.label;
+        c.chain = kv.second.chain;
+        out->push_back(std::move(c));
+    }
+}
+
+int64_t IdleTiers::shared_prefix_blocks(const std::vector<BlockHash>& chain,
+                                        const std::vector<uint64_t>& except) const {
+    if (chain.empty()) return 0;
+    std::lock_guard lk(mu_);
+    auto ro = roots_.find(chain[0]);
+    if (ro == roots_.end()) return 0;
+    int64_t most = 0;
+    for (uint64_t sid : ro->second) {
+        if (std::find(except.begin(), except.end(), sid) != except.end()) continue;
+        auto it = sessions_.find(sid);
+        if (it == sessions_.end()) continue;
+        const std::vector<BlockHash>& other = it->second.chain;
+        size_t n = 0;
+        while (n < chain.size() && n < other.size() && chain[n] == other[n]) ++n;
+        if ((int64_t)n > most) most = (int64_t)n;
+    }
+    return most;
+}
+
+void IdleTiers::cut_session(uint64_t id, int64_t keep_blocks, int64_t keep_tokens) {
+    std::lock_guard lk(mu_);
+    if (keep_blocks <= 0) { drop_session(id); return; }
+    auto it = sessions_.find(id);
+    if (it == sessions_.end()) return;
+    Session& s = it->second;
+    if ((int64_t)s.chain.size() <= keep_blocks) return;
+    s.chain.resize((size_t)keep_blocks);
+    s.n_tokens = keep_tokens;
+}
+
 std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
     /* One slice's hold on the lock (YieldingMutex). */
     struct Slice {

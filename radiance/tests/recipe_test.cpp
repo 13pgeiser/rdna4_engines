@@ -228,4 +228,71 @@ TEST(the_sage_recipe_decides_the_model_it_was_written_for) {
         CHECK(r.match(n) == nullptr);
 }
 
+/* The two Sage-A1.5 containers with the DFlash2 drafter in place of the MTP head: the trunk's
+ * rules unchanged in form (block fp8, or MXFP4 for the 4-bit sibling, whose lm_head stays block
+ * fp8), the drafter's linears in the trunk's form, its draft head the 2-bit copy, and no rule for
+ * an MTP head the container does not carry. The trunk's `blk.*` patterns do not reach the
+ * drafter's `dflash.blk.*` names, and the drafter's norms, selector and convolution stay as the
+ * checkpoint holds them. */
+TEST(the_sage_dflash2_recipes_decide_the_trunk_and_the_drafter) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    struct Case { const char* file; const char* codes; const char* grid_key; const char* grid; };
+    const Case cases[] = { { "sage-a1.5-fp8-df2.recipe", "fp8_e4m3", "block", "128x128" },
+                           { "sage-a1.5-mxfp4-df2.recipe", "fp4_e2m1", "group", "32" } };
+    for (const Case& c : cases) {
+        std::ifstream in(dir + "/" + c.file);
+        REQUIRE(in.good());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        Recipe r;
+        std::string why;
+        REQUIRE_EQ(r.add_text(text, c.file, &why), RAD_OK);
+        CHECK_EQ(r.rules().size(), (size_t)19);
+
+        const char* linears[] = { "blk.0.attn_qg.weight", "blk.39.attn_k.weight",
+                                  "blk.3.attn_v.weight", "blk.39.attn_output.weight",
+                                  "blk.0.ssm_inz.weight", "blk.39.ssm_out.weight",
+                                  "blk.0.ffn_gate_up_exps.0.weight",
+                                  "blk.39.ffn_down_exps.255.weight",
+                                  "blk.0.ffn_gate_up_shexp.weight", "blk.39.ffn_down_shexp.weight",
+                                  "dflash.fc.weight", "dflash.blk.0.attn_q.weight",
+                                  "dflash.blk.5.attn_k.weight", "dflash.blk.5.attn_v.weight",
+                                  "dflash.blk.5.attn_output.weight",
+                                  "dflash.blk.0.ffn_gate_up.weight",
+                                  "dflash.blk.5.ffn_down.weight" };
+        for (const char* n : linears) {
+            const RecipeRule* m = r.match(n);
+            REQUIRE(m != nullptr);
+            CHECK_EQ(m->quantizer, std::string("rtn"));
+            CHECK(has_opt(m, "codes", c.codes));
+            CHECK(has_opt(m, c.grid_key, c.grid));
+        }
+        /* A drafter linear is decided by its own rule, not a trunk pattern. */
+        CHECK_EQ(r.match("dflash.blk.0.attn_k.weight")->pattern,
+                 std::string("dflash.blk.*.attn_k.weight"));
+
+        const RecipeRule* head = r.match("output.weight");
+        REQUIRE(head != nullptr);
+        CHECK(has_opt(head, "codes", "fp8_e4m3"));
+        CHECK(has_opt(head, "block", "128x128"));
+        const RecipeRule* dh = r.match("dflash.draft_head.weight");
+        REQUIRE(dh != nullptr);
+        CHECK(has_opt(dh, "codes", "u2"));
+        CHECK(has_opt(dh, "zero", "u8"));
+        CHECK(has_opt(dh, "group", "128"));
+        CHECK(has_opt(dh, "scale", "f16"));
+
+        const char* kept[] = { "blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_shexp.weight",
+                               "blk.0.ssm_ab.weight", "blk.0.attn_norm.weight",
+                               "token_embd.weight", "output_norm.weight",
+                               "dflash.blk.0.attn_norm.weight", "dflash.norm.weight",
+                               "dflash.hidden_norm.weight", "dflash.sel_proj.weight",
+                               "dflash.blk.0.attn_conv_proj.weight",
+                               "dflash.blk.0.ffn_conv_proj.weight", "mtp.draft_head.weight",
+                               "v.blk.0.qkv.weight" };
+        for (const char* n : kept)
+            CHECK(r.match(n) == nullptr);
+    }
+}
+
 RAD_TEST_MAIN()

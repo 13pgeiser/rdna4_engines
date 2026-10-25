@@ -2,7 +2,7 @@
 
 The story behind `step_ns_decode_best`, `step_ns_decode_recent`, and why the
 dashboard shows them without a verdict. Written 2026-10-18, the day all of it
-happened. The user-facing explanation is §6.1 of the guide; this is the log of
+happened. The user-facing explanation is [GUIDE.md §6.1](GUIDE.md#61-the-dashboard); this is the log of
 how we got there, including the parts that failed.
 
 ## What shipped

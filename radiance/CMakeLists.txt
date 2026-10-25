@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 1.10.0 LANGUAGES C CXX)
+project(radiance VERSION 1.12.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -305,6 +305,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_subdirectory(libavx)
 endif()
 add_subdirectory(arch)
+# spechub: the linear-MTP coupling kernels (--draft-coupling). Built by default; without the flag
+# no op resolves to its rows.
+add_subdirectory(plugin/spechub)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()

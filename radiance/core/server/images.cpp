@@ -397,12 +397,15 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         r.seed = (uint64_t)body["seed"].get<int64_t>();
         r.seed_given = body["seed"].is_number_unsigned() || body["seed"].get<int64_t>() != -1;
     }
-    /* Krea 2's fixed tap gains (ConditioningKrea2Rebalance's defaults, arch/krea2); other models
-     * ignore it. */
+    /* The conditioning at the plugin's fixed rebalance gains (Krea 2: its text taps at
+     * ConditioningKrea2Rebalance's defaults). `false` is accepted everywhere. */
     if (body.contains("rebalance") && !body["rebalance"].is_null()) {
         if (!body["rebalance"].is_boolean())
             return error_response(err_bad("rebalance", "expected true or false"), req.peer);
         r.rebalance = body["rebalance"].get<bool>();
+        if (r.rebalance && !(info.cond_opts & RAD_GEN_COND_REBALANCE))
+            return error_response(err_unsupported("rebalance", "this model has no rebalance"),
+                                  req.peer);
     }
     if (str("negative_prompt", &r.negative) < 0)
         return error_response(err_bad("negative_prompt", "expected a string"), req.peer);

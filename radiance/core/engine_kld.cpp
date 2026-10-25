@@ -124,6 +124,8 @@ int Engine::run_kld() {
         r->ignore_eos = true;
         r->sp.temp    = 0.0f;
         r->score      = true;
+        /* A loaded control vector scores at the deployment's default (--control-vector on|off). */
+        r->sp.use_control_vector = cvec_default_on();
         /* --kld-lora-sources: the other documents run as the base, in the same steps. */
         const bool via = cfg_.kld_lora_sources.empty() ||
                          kld_->source(d).rfind(cfg_.kld_lora_sources, 0) == 0;

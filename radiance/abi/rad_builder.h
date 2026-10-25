@@ -80,6 +80,13 @@ enum {
     RAD_KVQ_K6V4 = 2
 };
 
+/* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
+ * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
+enum {
+    RAD_ATTN_FP8_QK = 1,   /* Q.K^T, the query rounded to e4m3 after the softmax scale */
+    RAD_ATTN_FP8_PV = 2    /* P.V, the probabilities rounded to e4m3 */
+};
+
 typedef struct RadBuildCtx {
     int      rank;            /* declare runs once per rank; the plugin declares dimensions */
     int      world_size;      /* already divided -- the core inserts no collectives (spec §9) */
@@ -174,6 +181,17 @@ typedef struct RadBuildCtx {
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
 
+    /* ---- appended in ABI 26 (fp8 prefill attention) */
+    /* RAD_ATTN_FP8_* bits from --attn-prefill-fp8: the attention products the deployment accepts
+     * in e4m3 rather than exactly. 0 (the zero-initialised default) is exact. A plugin passes a
+     * nonzero value on as `attn_paged`'s `prefill_fp8` (docs/OPS.md) and omits the parameter at
+     * 0, so an exact declare is unchanged. The engine refuses to start when no resolved kernel
+     * takes it, so a plugin that ignores the field is refused rather than silently exact.
+     *
+     * Zero-defaulted and in the padding after kv_quant, so no other field moves and a plugin built
+     * against the older struct is unchanged. */
+    int      attn_prefill_fp8;
+
     /* ---- appended in ABI 26 (control vectors) */
     /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
      *
@@ -190,6 +208,38 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     const struct RadControlVector* cvec;
+
+    /* ---- appended in ABI 27 (row-split prefill attention) */
+    /* 1 from --tp-attn-split rows: from the plugin's split threshold, a prefill-sized step under
+     * tensor parallelism runs attention by rows, each rank all heads of its run of the step's
+     * rows and an all_gather of the runs, instead of by heads. It is faster where the attention
+     * dominates, costs the full-width projections on every rank, and is not bit-identical to the
+     * head split. 0 (the zero-initialised default) is the head split. The engine sets it only
+     * above one rank and only for a plugin whose probe sets RadArchProbe::tp_attn_rows_ok, and
+     * refuses the flag otherwise.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      tp_attn_rows;
+
+    /* ---- appended in ABI 27 (recurrent state at f16) */
+    /* RAD_F16 from --state-cache-dtype f16: the recurrent state caches (RAD_KV_LINEAR groups) are
+     * stored at f16 instead of the plugin's f32, which halves the state pool, its checkpoints and
+     * its traffic and changes the generated text. 0 (the zero-initialised default) is the
+     * plugin's own width. The engine sets it only for a plugin whose probe has
+     * RadArchProbe::state_f16_ok and refuses the flag otherwise.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    uint32_t state_dtype;
+
+    /* ---- appended in ABI 27 (draft coupling) */
+    /* Nonzero from --draft-coupling on: a linear serial drafter samples each round's proposal from
+     * its own shortlist law and declares the planes and ops the coupled verify reads
+     * (abi/rad_spechub.h, docs/OPS.md `mtp_couple_propose`). 0, the zero-initialised default,
+     * declares the greedy drafter. A plugin that cannot couple returns RAD_E_UNSUPPORTED from
+     * declare when it is set; the engine refuses a model whose program carries no coupled planes.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      draft_coupling;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -351,13 +401,20 @@ enum {
     RAD_KV_FULL    = 0,   /* paged, per-token, growing -- full attention */
     RAD_KV_WINDOW  = 1,   /* paged, per-token, bounded by the window */
     RAD_KV_LINEAR  = 2,   /* per-sequence, fixed size -- GDN recurrent state */
-    RAD_KV_CONV    = 3    /* per-sequence, a rolling window of width-1 + num_spec entries */
+    RAD_KV_CONV    = 3,   /* per-sequence, a rolling window of width-1 + num_spec entries */
+    /* Paged exactly like RAD_KV_WINDOW, but the window's floor is per sequence and set at
+     * runtime (R-SWA, spec §7.2): `window` is the ring's W, and a sequence keeps everything from
+     * position 0 up to its own prompt (prefill and image rows) plus a ring of W slots after it,
+     * rewritten in place. So the group is sized for the whole context plus one ring a sequence,
+     * never checkpointed, and never reused from the prefix cache. A model that serves a fixed
+     * sliding window declares RAD_KV_WINDOW instead. */
+    RAD_KV_RING    = 4
 };
 
 typedef struct RadKVGroupDecl {
     int      kind;            /* RAD_KV_* */
     uint32_t dtype;
-    int64_t  window;          /* RAD_KV_WINDOW: the window; 0 otherwise */
+    int64_t  window;          /* RAD_KV_WINDOW: the window; RAD_KV_RING: the ring's W; 0 otherwise */
     int64_t  n_head_kv;
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
@@ -420,6 +477,17 @@ int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
  *
  * A no-op for a PERSIST or DERIVED buffer, which is live everywhere already. */
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
+
+/* ---- appended in ABI 27 (the second lane's window) */
+/* The second lane's window: every op the architecture issues on lane 1 is declared between
+ * rad_lane1_window_begin and rad_lane1_window_end. With a window a rad_buf_concurrent buffer is live
+ * over the window and its own declared uses instead of the whole program, so buffers used only
+ * outside the window (a drafter's, the heads') can share its bytes. The runtime holds the
+ * architecture to it: an op issued on lane 1 outside the window fails the step by name, and an op
+ * issued on lane 0 outside the window joins lane 1 first when lane 1 has work pending. Optional, one
+ * window a program; call both at declare, in order. */
+int rad_lane1_window_begin(RadBuilder* b);
+int rad_lane1_window_end(RadBuilder* b);
 
 /* An uneven shard: this rank's slice of a RAD_SHARD_ROW or RAD_SHARD_COL weight's split dimension
  * is [lo, hi) rather than an even 1/tp. Rows of each stacked row part for ROW, columns for COL, in
@@ -601,7 +669,8 @@ typedef struct RadDrafterDecl {
 
     /* Where a pass leaves its proposal. 0 = the sampler's token buffer. */
     rad_buf     proposal;
-    int64_t     proposal_pitch;  /* elements a row in `proposal`; 0 means 1 */
+    int64_t     proposal_pitch;  /* elements a row in `proposal`; 0 means 1, and for a BLOCK
+                                      * drafter `depth` (less is refused) */
 
     /* BLOCK only. `mask_token` is the id every unfilled block position embeds; a block drafter
      * without one cannot run. `window` is the drafter's own sliding window over its own cache, 0
@@ -654,13 +723,23 @@ int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
 int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
 
 /* Whether this engine's launches chain (RadKernelChainFn, abi/rad_abi.h): the core's decision, on
- * the AQL backend only, which keeps a completion counter per queue -- by default where the model's
- * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
- * decodes speculatively, or as RADIANCE_CHAIN says. A plugin that places work by whether a kernel
- * waits in its prologue behind the one before it -- a weight read issued on lane 0 right after its
- * GEMM -- asks this instead of reading the environment, so it follows that decision. Additive
- * export; RAD_ABI_VERSION does not move. */
+ * the AQL backend only, which keeps a completion counter per queue, where the model's plugin
+ * measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
+ * speculatively. A plugin that places work by whether a kernel waits in its prologue behind the
+ * one before it -- a weight read issued on lane 0 right after its GEMM -- asks this, so it follows
+ * that decision. Additive export; RAD_ABI_VERSION does not move. */
 int rad_chain_on(void);
+
+/* A block drafter that also serves a shorter block: the plugin declared its query pass at `block`
+ * rows a sequence as well as at RadDrafterDecl::block, with the same anchor convention, so the
+ * core may stage a step's block at either. The short block proposes
+ * `block - (RadDrafterDecl::block - depth)` tokens. Called once, after rad_declare_drafter.
+ *
+ * The block is proposed whole, so its length is paid for by every drafting sequence whatever each
+ * verifies: at one sequence a long block's extra drafts pay, at many its rows and its weaker first
+ * positions cost more than they bring. The core picks per step (--draft-short-from). */
+/* ---- appended in ABI 27 (a block drafter's short block) */
+int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
@@ -692,6 +771,12 @@ typedef struct RadEncoderDecl {
      * the pass and before any other pass runs, so the planner may share its bytes with buffers
      * no encoder pass touches. */
     rad_buf     out;
+
+    /* ---- appended in ABI 26 (one grid a pass) */
+    /* 1: every segment of a pass has one grid (Item segment height), for an encoder whose
+     * position tables or kernels are per geometry; the core ends a pass where the grid changes.
+     * 0 packs segments of any grid into a pass. */
+    int32_t     one_grid;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
@@ -866,6 +951,11 @@ typedef struct RadGeneratorDecl {
      * `cond_rows` a whole number of windows. */
     int32_t     chunk_tokens;
     int32_t     chunk_bos, chunk_eos;
+
+    /* ---- appended in ABI 26 (Krea 2's rebalance) */
+    /* The RAD_GEN_COND_* options (rad_runtime.h) the plugin's COND pass serves, as a mask; a
+     * request asking for another is refused. 0: none. */
+    uint32_t    cond_opts;
 } RadGeneratorDecl;
 
 /* RadGeneratorDecl::beta_schedule: betas linear in sqrt(beta) (Stable Diffusion's
@@ -962,7 +1052,8 @@ typedef struct RadAudioGenDecl {
     /* The prompt, as text the core tokenises: `{instructions}` is replaced by the request's
      * instructions (a piece's description, a voice's) and `{input}` by its input text (lyrics, the
      * words to speak), each first rewritten by the plugin's rad_arch_text_prepare when it exports
-     * one. Special tokens are spelled as text. */
+     * one. Special tokens are spelled as text. NULL for a model that takes no instructions, which
+     * then declares `tmpl_plain` and has a request's instructions refused. */
     const char* tmpl;
     /* The unconditional branch is the conditional prompt with every token but the first
      * `neg_keep_head` and the last `neg_keep_tail` replaced by `neg_token`, so the two branches
@@ -1023,6 +1114,36 @@ typedef struct RadAudioGenDecl {
      * latent: `lat_num` = `lat_den` = 1, `samples_per_latent` samples a frame. */
     int64_t     voc_chunk;
     int64_t     voc_context;
+
+    /* ---- appended in ABI 27 (one-branch speech over a hybrid model, references) */
+    /* Sequences a request runs: 0 or 2, the conditional and unconditional branches above; 1, the
+     * conditional one alone, for a model without guidance (no unconditional prompt is rendered,
+     * a request's guidance must be 1, and every per-entry array of a PROMPT or FRAME pass has one
+     * entry a lane, its `slot` the lane itself). The KV, the prompt's rows and a frame's rows then
+     * cost half. */
+    int32_t     branches;
+    /* Nonzero: the `{input}` slot is tokenised with its special tokens, which the template's own
+     * text always is, so a caller can write the model's speaker tags. The plugin's
+     * rad_arch_text_prepare then refuses the control tokens a caller must not write. */
+    int32_t     input_special;
+    /* References (voice cloning): with `tmpl_ref`, a request may carry up to `ref_max` of them,
+     * each a transcript and a clip of the voice saying it, which the plugin encodes into frames
+     * in the request's PROMPT pass (whole prompts only: `prompt_whole`). `tmpl_ref` is the prompt
+     * of a request with references, `{references}` each of them rendered from `ref_item` in turn
+     * and `{input}` as in `tmpl_plain`. `ref_item` is one reference: `{index}` its number from 1,
+     * `{text}` its transcript (rewritten by rad_arch_text_prepare as RAD_TEXT_REFERENCE) and
+     * `{audio}` its frames, one prompt row each (RadAudioGenBatch::ref_frame); the text before
+     * `{audio}` is tokenised as one segment with its special tokens (the transcript's own, which
+     * prepare() has limited to those a caller may write), and so is the text after it. A clip is
+     * mono f32 in [-1, 1] at `ref_rate`, right-padded with zeros to a whole number of `ref_hop`
+     * samples, each `ref_hop` samples one frame; a request's clips hold at most `ref_max_samples`
+     * samples together. NULL `tmpl_ref`: references are refused. */
+    const char* tmpl_ref;
+    const char* ref_item;
+    int64_t     ref_rate;
+    int64_t     ref_hop;
+    int64_t     ref_max_samples;
+    int32_t     ref_max;
 } RadAudioGenDecl;
 
 int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
@@ -1300,12 +1421,28 @@ typedef struct RadArchProbe {
      * libr4d has their rows for its attention geometry. A layout whose bit is clear is refused at
      * startup with the plugin named. */
     int32_t kv_quant_ok;
+
+    /* ---- appended in ABI 26 (chained launches, control vectors) */
     /* Nonzero when this plugin measured its speculative step faster with chained launches
      * (RadKernelChainFn: a dependent kernel waits in its own prologue rather than behind the
      * queue's barrier bit). With a drafter decoding speculatively on the AQL backend, the core
-     * then takes them by default; RADIANCE_CHAIN overrides either way. Zero keeps them off: plain
-     * decode measured slower chained, and a plugin that never measured them asks for nothing. */
+     * then takes them. Zero keeps them off: plain decode measured slower chained, and a plugin
+     * that never measured them asks for nothing. */
     int32_t chain_pays;
+    /* Nonzero when the plugin applies RadBuildCtx::cvec for this model. --control-vector is
+     * refused at startup with the plugin named when this is 0. */
+    int32_t control_vector_ok;
+
+    /* ---- appended in ABI 27 (row-split prefill attention) */
+    /* Nonzero when the plugin serves RadBuildCtx::tp_attn_rows for this model. --tp-attn-split
+     * rows is refused at startup with the plugin named when this is 0. */
+    int32_t tp_attn_rows_ok;
+
+    /* ---- appended in ABI 27 (recurrent state at f16) */
+    /* Nonzero when the plugin declares its recurrent state at f16 under RadBuildCtx::state_dtype
+     * and its kernels read that width. --state-cache-dtype f16 is refused at startup with the
+     * plugin named when this is 0. */
+    int32_t state_f16_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
@@ -1484,11 +1621,13 @@ const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* meta);
  * as given. Training data has conventions a client does not know -- section tags on lines of
  * their own and lower case, no markdown in a description -- and only the plugin knows them.
  *
- * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8. Writes at most `cap` bytes, the NUL included,
- * and returns the length the whole result needs without its NUL (call again with more room when
- * it is >= cap), or a negative status for text the model cannot take. Called on HTTP threads, so
- * it keeps no state. */
-enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2 };
+ * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8: the instructions, the input, or a
+ * reference's transcript (RadAudioGenDecl::ref_item's `{text}`). Writes at most `cap` bytes, the
+ * NUL included, and returns the length the whole result needs without its NUL (call again with
+ * more room when it is >= cap), or a negative status for text the model cannot take, with the
+ * reason in `out` (NUL-terminated within `cap`) when it has one to give the caller. Called on
+ * HTTP threads, so it keeps no state. */
+enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2, RAD_TEXT_REFERENCE = 3 };
 int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap);
 
 /* The layout of a video generator's passes (rad_declare_video_generator), which only the model

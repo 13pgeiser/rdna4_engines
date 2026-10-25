@@ -103,10 +103,12 @@ int         avx_par_force(int threads);
     X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
+    X(sam_attn)             \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \
-    X(moe_gemm_q_mod4)      X(pair_argmax)                                                        \
+    X(moe_gemm_q_mod4)      X(pair_argmax)          \
+    X(router_topk_scatter)  X(router_gemm_topk_scatter)                                          \
     /* ---- gated delta net */                                                                    \
     X(gdn_conv_prep)        X(gdn_conv_update)      X(gdn_kkt_solve)        X(gdn_chunk_scan)     \
     X(gdn_recurrent_update) X(gdn_conv_recurrent_update)                X(gdn_gated_rmsnorm)  \
@@ -126,7 +128,7 @@ int         avx_par_force(int threads);
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)                               \
     /* ---- LTX-2 */                                                                              \
     X(rope_split)           X(head_gate)            X(ltx_guide)            X(pixel_norm)         \
-    X(d2s3d)                X(s2d3d)                X(pix_patch)            X(patch_pix8)         \
+    X(d2s3d)                X(s2d3d)                X(pix_patch)                                  \
     X(stft_logmel)          X(bwe_up)               X(tile_grid)            X(tile_crop)          \
     X(tile_stitch)          X(vol_index)                                                          \
     /* ---- audio generation */                                                                   \
@@ -134,12 +136,13 @@ int         avx_par_force(int threads);
     X(rvq_embed)            X(frame_mix_store)      X(end_status)           X(frame_store)        \
     X(resample_nearest)     X(fourier_embed)        X(win_input)            X(win_prep)           \
     X(win_finish)           X(chan_split)           X(interleave2)          X(iota)               \
-    X(cu_repeat)            X(snake_aa)             X(int_affine)                                 \
+    X(cu_repeat)            X(snake_aa)             X(int_affine)           X(sub_i32)            \
+    X(ras_pick)             X(vq_encode)                                                          \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
+    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
  * error from that level's avx_table.cpp object. */

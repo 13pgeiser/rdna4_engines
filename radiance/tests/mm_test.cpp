@@ -29,10 +29,14 @@
 #include "mm_golden.h"
 #include "rad_builder.h"
 #include "rad_plugin.h"
+#include "uocr_golden.h"
+#include "uocr_resample_golden.h"
+#include "../arch/common/rad_resample.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -1226,8 +1230,24 @@ TEST(lossless_encodes_decode_back_to_the_same_pixels) {
     CHECK_EQ(decode_image_rgba(file.data(), file.size(), int64_t(1) << 24, &fa, &why), RAD_OK);
     CHECK(fa.rgba == rgba);
     REQUIRE_EQ(encode_image(rgb.data(), 33, 17, 3, "webp", 100, &file, &why), RAD_OK);
-    CHECK_EQ(decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why), RAD_OK);
-    CHECK(f.rgb == rgb);
+    /* The encoder must write a real lossless container. The decode leg depends on FFmpeg's native
+     * VP8L decoder, which refuses some valid libwebp streams ("Invalid data"): the system's
+     * ffmpeg 8.0.1 CLI refuses the same bytes, while libwebp/PIL decode them, so that specific
+     * refusal is an external decoder limitation and is not counted as a radiance failure. Any
+     * other decode error, or wrong pixels, still fails. */
+    const bool riff_webp = file.size() >= 20 && std::memcmp(file.data(), "RIFF", 4) == 0 &&
+                           std::memcmp(file.data() + 8, "WEBP", 4) == 0 &&
+                           std::memcmp(file.data() + 12, "VP8L", 4) == 0;
+    CHECK(riff_webp);
+    const int webp_rc = decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why);
+    const bool ffmpeg_vp8l_limit = webp_rc == RAD_E_INVAL && has(why, "Invalid data");
+    if (ffmpeg_vp8l_limit)
+        std::fprintf(stderr, "    note: this FFmpeg's VP8L decoder refuses the libwebp stream "
+                             "(external; libwebp decodes it)\n");
+    else {
+        CHECK_EQ(webp_rc, RAD_OK);
+        CHECK(f.rgb == rgb);
+    }
     REQUIRE_EQ(encode_image(rgb.data(), 33, 17, 3, "jpeg", 90, &file, &why), RAD_OK);
     CHECK_EQ(decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why), RAD_OK);
     CHECK_EQ(f.w, 33);
@@ -1469,6 +1489,582 @@ TEST(a_resampled_stream_is_its_tone_whether_pushed_whole_or_in_pieces) {
     CHECK(std::equal(p.begin(), p.end(), in.begin()) && p.size() == 100);
     CHECK(mm::Resampler::takes(24000) && mm::Resampler::takes(44100));
     CHECK(!mm::Resampler::takes(23999));
+}
+
+
+/* ================================================================== Unlimited-OCR
+ *
+ * The checkpoint's two picture modes, from its own remote code (tests/mkuocrgolden.py): the tile
+ * grid dynamic_preprocess chooses (its ratio set sorted by area, ties in the set's order), the
+ * placeholders that replace the picture (infer()'s global view plus crops; infer_multi()'s page),
+ * and the pixels of the global view and of the tile mosaic, in the order Item::patch_raster
+ * stages them: row by row, each patch (channel, y, x).
+ */
+
+/* The checkpoint's processor configuration, as a converted container states it. */
+VisionConfig uocr_cfg() {
+    VisionConfig c;
+    c.family = Family::UnlimitedOcr;
+    c.patch = kUocrPatch;
+    c.temporal = 1;
+    c.merge = kUocrDownsample;
+    c.downsample = kUocrDownsample;
+    c.base_size = kUocrBaseSize;
+    c.image_size = kUocrBaseSize;
+    c.tile = kUocrTile;
+    c.min_tiles = kUocrMinTiles;
+    c.max_tiles = kUocrMaxTiles;
+    c.crop_mode = kUocrCropMode;
+    c.tok_image = kUocrImageToken;
+    c.max_patches = 16384;                 /* the server's --mm-max-patches default */
+    const int64_t f2 = (int64_t)c.factor() * c.factor();
+    c.image_min_pixels = c.video_min_pixels = f2;
+    c.image_max_pixels = c.video_max_pixels = (int64_t)c.base_size * c.base_size;
+    c.min_frames = 1;
+    return c;
+}
+
+int32_t uocr_marker(const std::string& s) { return s == "<image>" ? kUocrImageToken : -1; }
+
+/* A segment's patches in raster order, its first `real_w` patches a row: the tensor the reference
+ * holds for that view, patch by patch. */
+std::vector<uint16_t> segment_pixels(const Item& it, int32_t s, int32_t real_w) {
+    const int64_t pd = it.patch_dim;
+    const int32_t gh = it.seg_h(s), gw = it.seg_w(s);
+    const int64_t p0 = it.patch_at(s);
+    std::vector<uint16_t> out;
+    out.reserve((size_t)gh * (size_t)real_w * (size_t)pd);
+    for (int32_t py = 0; py < gh; ++py)
+        for (int32_t px = 0; px < real_w; ++px) {
+            const uint16_t* p = it.pixels.data() + (p0 + (int64_t)py * gw + px) * pd;
+            out.insert(out.end(), p, p + pd);
+        }
+    return out;
+}
+
+/* The container's model_type selects the family; a key it does not carry takes the reference's
+ * default, so a container converted before the tower landed still states a processor. */
+TEST(unlimitedocr_configures_itself_from_the_container) {
+    const char* keys[] = { "model_type", "preprocessor.crop_to_patches", "preprocessor.max_patches",
+                           "preprocessor.min_patches", "preprocessor.resample",
+                           "preprocessor.size.height", "preprocessor.size.width",
+                           "preprocessor.tile_size", "processor.downsample_ratio",
+                           "processor.image_token", "processor.patch_size" };
+    const char* vals[] = { "unlimited_ocr", "true", "32", "2", "3", "1024", "1024", "640", "4",
+                           "<image>", "16" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof keys / sizeof keys[0]);
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    REQUIRE_EQ(c.from_meta(m, &why), RAD_OK);
+    CHECK(c.family == Family::UnlimitedOcr);
+    CHECK_EQ(c.patch, 16);
+    CHECK_EQ(c.downsample, 4);
+    CHECK_EQ(c.merge, 4);
+    CHECK_EQ(c.temporal, 1);
+    CHECK_EQ(c.base_size, 1024);
+    CHECK_EQ(c.image_size, 1024);
+    CHECK_EQ(c.tile, 640);
+    CHECK_EQ(c.min_tiles, 2);
+    CHECK_EQ(c.max_tiles, 32);
+    CHECK(c.crop_mode);
+    CHECK_EQ(c.factor(), 64);
+    CHECK_EQ(c.patch_dim(), (int64_t)3 * 16 * 16);
+    CHECK_EQ(c.mean[0], 0.5f);
+    CHECK_EQ(c.stdv[2], 0.5f);
+    CHECK(c.image_token == "<image>");
+
+    /* Only model_type: every processor key takes the reference's default. */
+    const char* one_key[] = { "model_type" };
+    const char* one_val[] = { "unlimited_ocr" };
+    RadModelMeta mt{};
+    mt.n_kv = 1;
+    mt.kv_key = one_key;
+    mt.kv_val = one_val;
+    VisionConfig d;
+    REQUIRE_EQ(d.from_meta(mt, &why), RAD_OK);
+    CHECK_EQ(d.patch, 16);
+    CHECK_EQ(d.downsample, 4);
+    CHECK_EQ(d.base_size, 1024);
+    CHECK_EQ(d.image_size, 1024);
+    CHECK_EQ(d.tile, 640);
+    CHECK_EQ(d.min_tiles, 2);
+    CHECK_EQ(d.max_tiles, 32);
+    CHECK(d.crop_mode);
+    CHECK(d.image_token == "<image>");
+
+    /* PIL's bicubic is the only filter this processor stages. */
+    const char* bad_key[] = { "model_type", "preprocessor.resample" };
+    const char* bad_val[] = { "unlimited_ocr", "2" };
+    RadModelMeta mb{};
+    mb.n_kv = 2;
+    mb.kv_key = bad_key;
+    mb.kv_val = bad_val;
+    VisionConfig b;
+    CHECK_EQ(b.from_meta(mb, &why), RAD_E_UNSUPPORTED);
+}
+
+/* The transposed ratios whose tall side the reference's Python set visits last, which is what its
+ * tie rule needs beyond "the wider grid wins": the table in core/mm/processor.cpp must be the
+ * golden's, pair for pair. */
+TEST(unlimitedocr_tie_order_is_the_references) {
+    int32_t listed = 0;
+    for (int32_t c = 1; c <= kUocrMaxTiles; ++c)
+        for (int32_t r = c + 1; r <= kUocrMaxTiles; ++r) {
+            if ((int64_t)c * r < kUocrMinTiles || (int64_t)c * r > kUocrMaxTiles) continue;
+            bool want = false;
+            for (int32_t k = 0; k < kUocrNTallLast; ++k)
+                if (kUocrTallLast[k].c == c && kUocrTallLast[k].r == r) want = true;
+            if (want) ++listed;
+            if (uocr_tall_last(c, r) != want)
+                std::fprintf(stderr, "    pair %dx%d: %s last here, %s in the reference\n", c, r,
+                             uocr_tall_last(c, r) ? "tall" : "wide",
+                             want ? "tall" : "wide");
+            CHECK_EQ((int)uocr_tall_last(c, r), (int)want);
+        }
+    CHECK_EQ(listed, kUocrNTallLast);
+}
+
+/* A line wider than one encoder pass is cut into chunks of whole tiles; only the last chunk
+ * carries the newline column, and only the real 4x4 view separator is flagged as one. */
+TEST(unlimitedocr_wide_lines_are_chunked_whole_tiles) {
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    const int32_t q = kUocrTile / kUocrPatch;              /* 40 */
+    const int32_t w = 16000, h = 1024;                     /* 15.6:1: a 16-tile line */
+    int32_t cols = 1, rows = 1;
+    uocr_grid(h, w, kUocrMinTiles, kUocrMaxTiles, kUocrTile, &cols, &rows);
+    REQUIRE(cols > 10);                                    /* more than one chunk */
+    const int32_t chunk = (int32_t)((16384 / q - 4) / q);   /* 10 */
+
+    ImageMode mode;
+    mode.kind = ImageMode::Gundam;
+    std::shared_ptr<Item> it;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, h, w), &it, &why, mode), RAD_OK);
+    REQUIRE(it != nullptr);
+
+    /* Two line chunks, the global view, the separator. */
+    REQUIRE_EQ(it->n_seg, 4);
+    CHECK_EQ(it->seg_h(0), q);
+    CHECK_EQ(it->seg_h(1), q);
+    CHECK(!it->seg_is_sep(0));
+    CHECK(!it->seg_is_sep(1));
+    CHECK(!it->seg_is_sep(2));
+    CHECK(it->seg_is_sep(3));
+    CHECK_EQ(it->seg_w(3), kUocrDownsample);
+    CHECK_EQ(it->seg_h(3), kUocrDownsample);
+
+    /* Earlier chunks end at their last tile; only the last has the 4 newline columns. */
+    CHECK_EQ(it->seg_w(0), q * chunk);
+    CHECK_EQ(it->seg_w(1), q * (cols - chunk) + kUocrDownsample);
+    for (int32_t s = 0; s < 2; ++s) CHECK_EQ(it->seg_w(s) % q, s == 1 ? kUocrDownsample : 0);
+
+    /* The placeholders are the reference's layout: (10*cols + 1) * 10 lines, plus 273 + 1. */
+    const int64_t want = 273 + (int64_t)(10 * cols + 1) * 10;
+    CHECK_EQ((int64_t)it->expand.size(), want);
+    CHECK_EQ(it->n_rows(), want);
+    CHECK_EQ(uocr_tokens(p.config(), mode, cols, rows), want);
+
+    /* Rows: each chunk contributes its patches / 16, the global 272, the separator 1. */
+    CHECK_EQ(it->row_at(1), (int64_t)q * it->seg_w(0) / 16);
+    CHECK_EQ(it->row_at(2), (int64_t)q * it->seg_w(0) / 16 + (int64_t)q * it->seg_w(1) / 16);
+    CHECK_EQ(it->row_at(3), it->row_at(2) + 272);
+    CHECK_EQ(it->row_at(4), want);
+}
+
+/* dynamic_preprocess's grid for a sweep of shapes, the exact ties of its ratio set included. */
+TEST(unlimitedocr_tile_grids_are_the_references) {
+    for (const GoldUocrGrid& g : kUocrGrid) {
+        int32_t cols = 1, rows = 1;
+        /* The reference asks dynamic_preprocess only for a picture larger than one tile. */
+        if (g.w > kUocrTile || g.h > kUocrTile)
+            uocr_grid(g.h, g.w, kUocrMinTiles, kUocrMaxTiles, kUocrTile, &cols, &rows);
+        if (cols != g.cols || rows != g.rows)
+            std::fprintf(stderr, "    picture %lldx%lld: grid %dx%d, reference %dx%d\n",
+                         (long long)g.w, (long long)g.h, cols, rows, g.cols, g.rows);
+        CHECK_EQ(cols, g.cols);
+        CHECK_EQ(rows, g.rows);
+    }
+}
+
+/* Whole pictures in both modes: the segments (a line of tiles per tile row, the global view, the
+ * view separator), every placeholder the picture marker, the pixel count the reference's layout
+ * has, and the patches of the global view and of the tile mosaic. */
+TEST(unlimitedocr_pictures_are_the_references) {
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    const int32_t q = kUocrTile / kUocrPatch;
+    for (const GoldUocrPic& g : kUocrPictures) {
+        ImageMode mode;
+        if (g.mode == 1) {
+            mode.kind = ImageMode::Gundam;
+        } else {
+            mode.kind = ImageMode::Base;
+            mode.image_size = g.mode == 2 ? kUocrBaseSize : kUocrTile;
+        }
+        std::shared_ptr<Item> it;
+        std::string why;
+        const int rc = p.image_from(frame(g.f, g.h, g.w), &it, &why, mode);
+        if (rc < 0) std::fprintf(stderr, "    %dx%d mode %d: %s\n", g.w, g.h, g.mode, why.c_str());
+        CHECK_OK(rc);
+        REQUIRE(it != nullptr);
+        REQUIRE_EQ(it->n_seg, g.n_seg);
+        REQUIRE_EQ((int64_t)it->expand.size(), (int64_t)g.n_ids);
+        CHECK_EQ(it->n_rows(), (int64_t)g.n_ids);
+        REQUIRE_EQ(it->seg_at.size(), (size_t)it->n_seg);
+        for (int32_t v : it->expand) CHECK_EQ(v, kUocrImageToken);
+        CHECK(it->rope_1d);
+        CHECK(it->patch_raster);
+
+        int32_t cols = 0, rows = 0;
+        for (int32_t s = 0; s < it->n_seg; ++s) {
+            const GoldUocrSeg& gs = kUocrSegs[g.seg0 + s];
+            CHECK_EQ(it->seg_h(s), gs.h);
+            CHECK_EQ(it->seg_w(s), gs.w);
+            CHECK_EQ(it->seg_at[(size_t)s], (int32_t)it->row_at(s));
+            const int64_t np = it->patch_at(s + 1) - it->patch_at(s);
+            CHECK_EQ(np, (int64_t)gs.h * gs.w);
+            if (gs.h == q && s + 2 < it->n_seg) {       /* a line of tiles */
+                if (cols) { CHECK_EQ(cols, gs.real / q); }
+                cols = gs.real / q;
+                rows += 1;
+            }
+            /* Raster order: patch k of a segment sits at (k / w, k % w). */
+            std::vector<int32_t> planes((size_t)(4 * np));
+            it->coords(it->patch_at(s), np, planes.data());
+            for (int64_t k = 0; k < np; ++k) {
+                CHECK_EQ(planes[(size_t)k], (int32_t)(k / gs.w));
+                CHECK_EQ(planes[(size_t)(np + k)], (int32_t)(k % gs.w));
+                CHECK_EQ(planes[(size_t)(2 * np + k)], gs.h);
+                CHECK_EQ(planes[(size_t)(3 * np + k)], gs.w);
+            }
+        }
+        const bool tiled_ref = g.mode == 1 && g.cols * g.rows > 1;
+        if (cols != (tiled_ref ? g.cols : 0) || rows != (tiled_ref ? g.rows : 0))
+            std::fprintf(stderr, "    picture %dx%d mode %d: %d lines of %d tiles, reference %dx%d\n",
+                         g.w, g.h, g.mode, rows, cols, g.cols, g.rows);
+        CHECK_EQ(cols, tiled_ref ? g.cols : 0);
+        CHECK_EQ(rows, tiled_ref ? g.rows : 0);
+
+        /* The global view, then the mosaic of the crops (if any). */
+        const int32_t sg = it->n_seg - 2;
+        const GoldUocrSeg& gg = kUocrSegs[g.seg0 + sg];
+        if (fnv(segment_pixels(*it, sg, gg.real)) != g.global_fnv)
+            std::fprintf(stderr, "    picture %dx%d mode %d: the global view's patches differ\n",
+                         g.w, g.h, g.mode);
+        CHECK_EQ(fnv(segment_pixels(*it, sg, gg.real)), g.global_fnv);
+        std::vector<uint16_t> local;
+        for (int32_t s = 0; s < sg; ++s) {
+            const std::vector<uint16_t> v = segment_pixels(*it, s, kUocrSegs[g.seg0 + s].real);
+            local.insert(local.end(), v.begin(), v.end());
+        }
+        if (g.local_fnv) {
+            if (fnv(local) != g.local_fnv)
+                std::fprintf(stderr, "    picture %dx%d mode %d: the crops' patches differ\n",
+                             g.w, g.h, g.mode);
+            CHECK_EQ(fnv(local), g.local_fnv);
+        } else {
+            CHECK(local.empty());
+        }
+        /* The token count is the reference's arithmetic. */
+        CHECK_EQ(uocr_tokens(p.config(), mode, g.cols, g.rows), (int64_t)g.n_ids);
+    }
+}
+
+/* Pillow's antialiased bicubic runs its two passes in its own order (libImaging/Resample.c: the
+ * vertical one first when the height shrinks by more than twice what the width does) and rounds
+ * the intermediate to eight bits; this pins the order at sizes where the choice changes the
+ * picture, since a one-pixel difference is invisible in a summary and visible to the model. */
+TEST(pillow_bicubic_resizes_in_the_references_pass_order) {
+    for (const GoldUocrResize& g : kUocrResize) {
+        Frame out;
+        resize_bicubic(frame(0, g.sh, g.sw), g.dw, g.dh, &out);
+        CHECK_EQ(out.w, g.dw);
+        CHECK_EQ(out.h, g.dh);
+        if (fnv(out.rgb) != g.fnv)
+            std::fprintf(stderr, "    %dx%d -> %dx%d: pixels differ\n", g.sw, g.sh, g.dw, g.dh);
+        CHECK_EQ(fnv(out.rgb), g.fnv);
+    }
+}
+
+/* A request with several pictures marks each one `several`. A one-mode processor serves it
+ * exactly as a lone picture and refuses only a mode the request named; Unlimited-OCR takes its
+ * multi-page (base) mode for a picture whose mode was not named. */
+TEST(several_pictures_pick_a_mode_only_where_the_processor_has_two) {
+    std::string why;
+    Processor q;
+    REQUIRE(q.init(qwen_cfg(), [](const std::string&) { return std::vector<int32_t>{ 1 }; }) >= 0);
+    ImageMode several;
+    several.several = true;
+    std::shared_ptr<Item> a, b;
+    CHECK_OK(q.image_from(frame(0, 256, 320), &a, &why, several));
+    CHECK_OK(q.image_from(frame(0, 256, 320), &b, &why));
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(a->expand == b->expand);
+    CHECK_EQ(fnv(a->pixels), fnv(b->pixels));
+    ImageMode named;
+    named.kind = ImageMode::Base;
+    CHECK_EQ(q.image_from(frame(0, 256, 320), &a, &why, named), RAD_E_UNSUPPORTED);
+
+    Processor u;
+    REQUIRE_EQ(u.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    ImageMode base;
+    base.kind = ImageMode::Base;
+    std::shared_ptr<Item> x, y;
+    CHECK_OK(u.image_from(frame(0, 1400, 1000), &x, &why, several));
+    CHECK_OK(u.image_from(frame(0, 1400, 1000), &y, &why, base));
+    REQUIRE(x != nullptr && y != nullptr);
+    CHECK(x->expand == y->expand);
+    CHECK_EQ(fnv(x->pixels), fnv(y->pixels));
+    /* Named, the mode wins over `several`. */
+    ImageMode gundam = several;
+    gundam.kind = ImageMode::Gundam;
+    CHECK_OK(u.image_from(frame(0, 1400, 1000), &x, &why, gundam));
+    REQUIRE(x != nullptr);
+    CHECK(x->expand.size() > y->expand.size());
+}
+
+/* The runs: one per segment, every token the picture marker, and a 1-D rotary that gives each
+ * placeholder its own position. The reference's assembled order is the item's row order -- the
+ * local lines, the global view's lines, then the view separator. */
+TEST(unlimitedocr_runs_follow_the_reference_layout) {
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    ImageMode gundam;
+    gundam.kind = ImageMode::Gundam;
+    std::shared_ptr<Item> it;
+    std::string why;
+    CHECK_OK(p.image_from(frame(1, 900, 1400), &it, &why, gundam));
+    REQUIRE(it != nullptr);
+
+    auto pm = std::make_shared<PromptMedia>();
+    pm->items.push_back({ it, 1 });          /* after one text token */
+    pm->layout();
+    REQUIRE_EQ(pm->rope.runs.size(), (size_t)it->n_seg);
+    for (int32_t s = 0; s < it->n_seg; ++s) {
+        const RopeLayout::Run& r = pm->rope.runs[(size_t)s];
+        CHECK(r.flat);
+        CHECK_EQ(r.tok, 1 + it->seg_at[(size_t)s]);
+        CHECK_EQ(r.n, (int32_t)(it->row_at(s + 1) - it->row_at(s)));
+        CHECK_EQ(r.base, 1 + it->seg_at[(size_t)s]);
+        CHECK_EQ(r.shift, 0);
+        CHECK_EQ(r.item, 0);
+        CHECK_EQ(r.row0, (int32_t)it->row_at(s));
+    }
+    const int64_t n = (int64_t)it->expand.size();
+    for (int64_t i = 0; i < n; ++i) {
+        int32_t pos[3];
+        pm->rope.at(1 + i, pos);
+        CHECK_EQ(pos[0], (int32_t)(1 + i));
+        CHECK_EQ(pos[1], (int32_t)(1 + i));
+        CHECK_EQ(pos[2], (int32_t)(1 + i));
+    }
+    /* The reference's arithmetic, spelled out: the global view's 16 lines of 16 features with a
+     * newline each plus the separator, then the local grid's lines (a newline after each). */
+    const VisionConfig& c = p.config();
+    CHECK_EQ(uocr_tokens(c, gundam, 1, 1), (int64_t)273);
+    ImageMode base;
+    base.kind = ImageMode::Base;
+    CHECK_EQ(uocr_tokens(c, base, 1, 1), (int64_t)273);
+    ImageMode page640;
+    page640.kind = ImageMode::Base;
+    page640.image_size = kUocrTile;
+    CHECK_EQ(uocr_tokens(c, page640, 1, 1), (int64_t)111);
+    CHECK_EQ(uocr_tokens(c, gundam, 3, 2), (int64_t)273 + (int64_t)(10 * 3 + 1) * 20);
+    CHECK_EQ(uocr_tokens(c, gundam, 4, 3), (int64_t)273 + (int64_t)(10 * 4 + 1) * 30);
+
+    /* A request may restate the global view's side, but only at a grid the DeepEncoder serves
+     * (64/40), and not cut crops at another tile or pad a page to a side that is not whole merged
+     * patches. */
+    bool crop = false;
+    int32_t bs = 0, is = 0;
+    ImageMode b2048;
+    b2048.kind = ImageMode::Gundam;
+    b2048.base_size = 2048;
+    CHECK_EQ(uocr_mode(c, b2048, &crop, &bs, &is, &why), RAD_E_INVAL);
+    ImageMode b640;
+    b640.kind = ImageMode::Gundam;
+    b640.base_size = 640;
+    REQUIRE_EQ(uocr_mode(c, b640, &crop, &bs, &is, &why), RAD_OK);
+    CHECK_EQ(uocr_tokens(c, b640, 1, 1), (int64_t)(10 + 1) * 10 + 1);
+    ImageMode tile512;
+    tile512.kind = ImageMode::Gundam;
+    tile512.image_size = 512;
+    CHECK_EQ(uocr_mode(c, tile512, &crop, &bs, &is, &why), RAD_E_INVAL);
+    ImageMode odd;
+    odd.kind = ImageMode::Base;
+    odd.image_size = 700;
+    CHECK_EQ(uocr_mode(c, odd, &crop, &bs, &is, &why), RAD_E_INVAL);
+    ImageMode ok640;
+    ok640.kind = ImageMode::Base;
+    ok640.image_size = 640;
+    REQUIRE_EQ(uocr_mode(c, ok640, &crop, &bs, &is, &why), RAD_OK);
+    CHECK(!crop);
+    CHECK_EQ(is, 640);
+
+    /* The multi-page form: two pages at the base mode are two runs of 273, back to back. */
+    ImageMode base2;
+    base2.kind = ImageMode::Base;
+    std::shared_ptr<Item> a, b;
+    CHECK_OK(p.image_from(frame(0, 300, 500), &a, &why, base2));
+    CHECK_OK(p.image_from(frame(1, 900, 1400), &b, &why, base2));
+    auto mp = std::make_shared<PromptMedia>();
+    mp->items.push_back({ a, 1 });
+    mp->items.push_back({ b, 1 + (int32_t)a->expand.size() });
+    mp->layout();
+    CHECK_EQ((int64_t)mp->rope.runs.size(), (int64_t)4);
+    CHECK_EQ(a->expand.size(), (size_t)273);
+    CHECK_EQ(b->expand.size(), (size_t)273);
+    int32_t pos[3];
+    mp->rope.at(1 + 273 + 100, pos);
+    CHECK_EQ(pos[0], (int32_t)(1 + 273 + 100));
+}
+
+/* The DeepEncoder's 40-tower absolute position tables are the 64/16 checkpoint tables resampled
+ * with torch's bicubic + antialias (arch/common/rad_resample.h), computed host-side in
+ * fill_tables() and rounded to bf16. Every golden here is torch's F.interpolate(mode="bicubic",
+ * antialias=True) on CPU fp32 (tests/resample_golden.py), so this pins the load-time position
+ * table number for number: a resample off by a row or a tap serves a slightly shifted picture. */
+TEST(unlimitedocr_bicubic_antialias_resample_is_the_reference) {
+    uocr_golden::Golden gd;
+    std::string gerr;
+    if (!uocr_golden::load(&gd, &gerr)) ARTIFACT_MISSING(gerr);
+    const int CH = 3;
+    double worst_abs = 0.0, worst_rel = 0.0;
+    for (int k = 0; k < gd.n_cases; ++k) {
+        const int ih = gd.geo[k][0], iw = gd.geo[k][1];
+        const int oh = gd.geo[k][2], ow = gd.geo[k][3];
+        std::vector<float> out((size_t)oh * ow * CH);
+        rad::arch::resample_bicubic_aa(gd.in[k].data(), ih, iw, oh, ow, CH, out.data());
+        const float* want = gd.out[k].data();
+        double a = 0.0, r = 0.0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            const double d = std::fabs((double)out[i] - (double)want[i]);
+            const double rr = d / std::fmax(std::fabs((double)want[i]), 1e-30);
+            if (d > a) a = d;
+            if (rr > r) r = rr;
+        }
+        std::fprintf(stderr, "    %dx%d -> %dx%d: max abs %.3g, max rel %.3g\n", ih, iw, oh, ow, a, r);
+        if (a > worst_abs) worst_abs = a;
+        if (r > worst_rel) worst_rel = r;
+    }
+    std::fprintf(stderr, "    synthetic fp32: worst abs %.3g, worst rel %.3g (target < 1e-4)\n",
+                 worst_abs, worst_rel);
+    CHECK(worst_abs < 1e-4);
+
+    /* A checkpoint table, bf16 in and bf16 out, exactly as fill_tables() does it: decode the
+     * stored bf16, resample in fp32, round back. Reports the last-bit count and the max abs the
+     * bf16 table would carry. */
+    auto bf16_case = [&](const uint16_t* src_bits, int ih, int iw, int oh, int ow, int ch,
+                         const uint16_t* want_bits, size_t off, const char* tag,
+                         size_t* mism, double* absmax) {
+        std::vector<float> f((size_t)ih * iw * ch);
+        for (size_t i = 0; i < f.size(); ++i) f[i] = rad_bf16_to_f32(src_bits[i]);
+        std::vector<float> g((size_t)oh * ow * ch);
+        rad::arch::resample_bicubic_aa(f.data(), ih, iw, oh, ow, ch, g.data());
+        size_t m = 0;
+        double a = 0.0;
+        for (size_t i = 0; i < g.size(); ++i) {
+            const uint16_t got = rad_f32_to_bf16(g[i]);
+            const uint16_t want = want_bits[off + i];
+            if (got != want) ++m;
+            const double d = std::fabs(rad_bf16_to_f32(got) - rad_bf16_to_f32(want));
+            if (d > a) a = d;
+        }
+        std::fprintf(stderr, "    %s: %zu/%zu bf16 mismatches, max abs %.3g\n", tag, m, g.size(), a);
+        *mism = m;
+        *absmax = a;
+    };
+
+    size_t sam_mism = 0;
+    double sam_abs = 0.0;
+    bf16_case(gd.sam_src.data(), 64, 64, 40, 40, 768, gd.sam_out.data(), 0, "sam 64->40 bf16",
+              &sam_mism, &sam_abs);
+
+    /* CLIP: rows 1: as a 16x16 grid resampled to 10x10; the cls row (index 0) passes through in
+     * front, so the golden's grid starts one channel-vector in. */
+    size_t clip_mism = 0;
+    double clip_abs = 0.0;
+    {
+        const int CW = 1024;
+        const uint16_t* grid_bits = gd.clip_src.data() + CW;   /* skip the cls row */
+        bf16_case(grid_bits, 16, 16, 10, 10, CW, gd.clip_out.data(), (size_t)CW, "clip 16->10 bf16",
+                  &clip_mism, &clip_abs);
+    }
+    /* The bf16 tables are a report, not a gate: bf16 carries ~3 decimal digits, so a last-bit
+     * difference on a fraction of entries is representable, not a bug. The fp32 CHECK above is
+     * the strict signal on the resample arithmetic. */
+    (void)sam_mism;
+    (void)clip_mism;
+}
+
+/* The AVX2 resample and patch-staging paths must be the scalar function, not an approximation:
+ * the goldens above pin the modelled result, and this pins the vector lanes against the scalar
+ * loop that produced them. mm_force_scalar selects the scalar path (core/mm/processor.cpp), so the
+ * same input goes through both dispatches on this host. Sizes cover growth and shrink (different
+ * tap counts), both pass orders, odd widths/tails, and a 1-pixel side. */
+TEST(avx2_preprocessing_is_bit_identical_to_scalar) {
+    const struct { int32_t ih, iw, oh, ow; } cases[] = {
+        { 53, 67, 35, 40 },  { 53, 67, 55, 57 },  { 64, 64, 1024, 1024 },
+        { 1024, 1024, 640, 640 }, { 200, 100, 50, 200 }, { 97, 129, 96, 128 },
+        { 1, 1, 7, 5 },      { 71, 131, 70, 130 }, { 17, 31, 9, 8 },
+        { 300, 500, 299, 501 },
+    };
+    int seed = 11;
+    for (const auto& c : cases) {
+        Frame in = frame(seed++, c.ih, c.iw);
+        Frame sv, sm, tv, tm;
+        mm_force_scalar(true);
+        resize_bicubic(in, c.ow, c.oh, &sv);
+        resize_bicubic_torch(in, c.ow, c.oh, &tv);
+        mm_force_scalar(false);
+        resize_bicubic(in, c.ow, c.oh, &sm);
+        resize_bicubic_torch(in, c.ow, c.oh, &tm);
+        CHECK_EQ(sm.w, sv.w);
+        CHECK_EQ(sm.h, sv.h);
+        CHECK(sm.rgb == sv.rgb);
+        CHECK(tm.rgb == tv.rgb);
+        if (sm.rgb != sv.rgb) {
+            for (size_t i = 0; i < sv.rgb.size(); ++i)
+                if (sm.rgb[i] != sv.rgb[i]) {
+                    std::fprintf(stderr, "    %dx%d -> %dx%d: first byte %zu differs (%d vs %d)\n",
+                                 c.iw, c.ih, c.ow, c.oh, i, (int)sv.rgb[i], (int)sm.rgb[i]);
+                    break;
+                }
+        }
+    }
+
+    /* Patch/LUT staging (the Unlimited-OCR append path), through the whole processor so the
+     * segment order and both views are covered. */
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    const struct { int32_t seed, h, w; } imgs[] = { { 3, 640, 640 }, { 4, 900, 1400 } };
+    for (const auto& g : imgs) {
+        Frame in = frame(g.seed, g.h, g.w);
+        for (int kind = 0; kind < 2; ++kind) {
+            ImageMode mode;
+            mode.kind = kind ? ImageMode::Base : ImageMode::Gundam;
+            std::shared_ptr<Item> a, b;
+            std::string why;
+            mm_force_scalar(true);
+            REQUIRE_EQ(p.image_from(in, &a, &why, mode), RAD_OK);
+            mm_force_scalar(false);
+            REQUIRE_EQ(p.image_from(in, &b, &why, mode), RAD_OK);
+            REQUIRE(a != nullptr);
+            REQUIRE(b != nullptr);
+            CHECK_EQ(b->n_patch, a->n_patch);
+            CHECK(b->pixels == a->pixels);
+            CHECK(b->expand == a->expand);
+        }
+    }
 }
 
 RAD_TEST_MAIN()

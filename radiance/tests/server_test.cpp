@@ -947,8 +947,8 @@ TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
     CHECK_EQ(set[1], std::string("medium"));
     CHECK_EQ(set[2], std::string("xhigh"));
     CHECK(f.srv->template_default_effort().empty());   /* no level renders as no level */
-    /* A template that writes one level when a request names none, as Qwen3.8's writes xhigh
-     * (#113): the probe names it. */
+    /* A template that writes one level when a request names none, as Qwen3.8's writes xhigh:
+     * the probe names it. */
     f.tmpl.default_effort = "\"xhigh\"";
     f.srv->probe_reasoning_efforts();
     CHECK_EQ(f.srv->template_default_effort(), std::string("xhigh"));
@@ -2284,9 +2284,8 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_NEAR(find_one("radiance:draft_acceptance_ratio{"), 0.61, 1e-9);
     CHECK_NEAR(find_one("vllm:generation_tokens_total{"), 5.0, 1e-9);
 
-    /* An unmeasured decode floor is ABSENT, not 0: a floor of 0 seconds per token is an
-     * infinitely fast one, and a scrape would plot it as a record. This fixture never completes a
-     * window of 32 single-stream steps, so neither series may appear. */
+    /* An unmeasured decode floor is absent, not 0, which a scrape would plot as the fastest step
+     * ever. This fixture completes no single-stream window, so neither series appears. */
     CHECK(r.body.find("radiance:decode_step_seconds_best") == std::string::npos);
     CHECK(r.body.find("radiance:decode_step_seconds_recent") == std::string::npos);
 
@@ -2312,13 +2311,11 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK(r.body.find("le=\"2560\"") != std::string::npos);
 }
 
-/* The decode floor reaches /metrics, in seconds. The scheduler keeps nanoseconds and the page
- * divides for display; the wire uses the base unit Prometheus expects, the same choice
- * radiance:engine_step_seconds_* already makes. */
+/* The decode floor reaches /metrics in seconds; the scheduler keeps nanoseconds. */
 TEST(metrics_carries_the_decode_floor_in_seconds) {
     Fixture f;
-    f.sched.m.step_ns_decode_best   = 14708911;   /* 14.71 ms/token: a measured floor */
-    f.sched.m.step_ns_decode_recent = 16428860;   /* 16.43 ms/token: the recent window */
+    f.sched.m.step_ns_decode_best   = 14708911;   /* 14.71 ms a step */
+    f.sched.m.step_ns_decode_recent = 16428860;   /* 16.43 ms a step */
 
     HttpResponse r = f.get("/metrics");
     CHECK_EQ(r.status, 200);
@@ -2335,15 +2332,13 @@ TEST(metrics_carries_the_decode_floor_in_seconds) {
     CHECK_NEAR(find_one("radiance:decode_step_seconds_best{"), 0.014708911, 1e-12);
     CHECK_NEAR(find_one("radiance:decode_step_seconds_recent{"), 0.016428860, 1e-12);
 
-    /* A floor is a duration, so it must survive the number formatter: 0.0147 s rendered as an
-     * integer would read as infinitely fast. Checked on a prefix rather than the whole literal
-     * because num() prints 17 significant digits and the last ones are the double's own noise. */
+    /* The value keeps its fraction through the number formatter. A prefix, because num() prints
+     * 17 significant digits. */
     CHECK(r.body.find("radiance:decode_step_seconds_best{model_name=\"test-model\",engine=\"0\"} 0.01470891")
           != std::string::npos);
 }
 
-/* Half a window: a floor exists but the recent window has not completed since. Each series is
- * gated on its own value, so one may appear while the other is absent. */
+/* Each series is gated on its own value, so one may appear while the other is absent. */
 TEST(metrics_omits_only_the_floor_half_that_is_unmeasured) {
     Fixture f;
     f.sched.m.step_ns_decode_best   = 15000000;
@@ -4077,7 +4072,7 @@ TEST(a_responses_request_becomes_the_chat_request_it_means) {
 
 /* A namespace groups function tools (Codex sends every MCP server's tools that way). They reach
  * the model flattened to <namespace>__<name>, the reply's function_call item reports the two apart,
- * streamed and not, and the next turn's call and tool_choice come back joined (#119). */
+ * streamed and not, and the next turn's call and tool_choice come back joined. */
 TEST(a_namespaces_tools_are_offered_flat_and_answered_apart) {
     OaiLimits lim;
     std::string chat, echo;
@@ -4625,12 +4620,10 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         CHECK_EQ(r2.status, 200);
         CHECK(f.sched.last_sp.use_control_vector);
 
-        /* Both spellings in one body: the field's own name wins over Strata's alias, whichever
-         * order the parser happens to read them in. */
+        /* An explicit false wins over the default (on, here). */
         HttpResponse r3 = f.post("/v1/chat/completions",
                                  R"({"messages":[{"role":"user","content":"hi"}],
                                      "max_tokens":4,
-                                     "experimental_speed_projection":true,
                                      "control_vector":false})");
         if (r3.streaming()) drain(r3);
         f.sched.join_all();
@@ -4655,6 +4648,21 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         CHECK(!def);
         /* Refuses a body that names no boolean rather than guessing. */
         CHECK_EQ(f.post("/admin/control-vector", R"({"enabled":"yes"})").status, 400);
+        /* Without --api-key a change comes from loopback only; reading it is not restricted. */
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/admin/control-vector";
+        q.body = R"({"enabled":true})";
+        q.peer = "192.168.1.20:50122";
+        CHECK_EQ(f.srv->router().dispatch(q).status, 403);
+        CHECK(!def);
+        q.peer = "127.0.0.1:50122";
+        CHECK_EQ(f.srv->router().dispatch(q).status, 200);
+        CHECK(def);
+        HttpRequest g2;
+        g2.path = "/admin/control-vector";
+        g2.peer = "192.168.1.20:50122";
+        CHECK_EQ(f.srv->router().dispatch(g2).status, 200);
     }
 }
 
@@ -4760,6 +4768,11 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "timings_per_token", { true, json::parse(R"({"stream":true})") } },
         { "return_progress", { true, json::parse(R"({"stream":true})") } },
         { "session_id", { "s", none } }, { "n_probs", { 2, none } },
+        /* The windowed no-repeat-ngram ban and Unlimited-OCR's picture mode. */
+        { "ngram_ban_n", { 35, none } }, { "ngram_window", { 128, none } },
+        { "ngram_whitelist", { json::parse(R"([4,5])"), none } },
+        { "no_repeat_ngram_whitelist", { json::parse(R"([4,5])"), none } },
+        { "images_config", { "gundam", none } },
         { "messages", { json::parse(R"([{"role":"user","content":"yo"}])"), none } },
         { "tools", { json::parse(R"([{"type":"function","function":{"name":"f"}}])"), none } },
         { "tool_choice", { "auto", none } },
@@ -4780,11 +4793,9 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "input", { "yo", none } }, { "encoding_format", { "base64", none } },
         { "dimensions", { 2, none } }, { "image_tokens", { 70, none } },
         { "prompt_name", { "query", none } },
-        /* The control vector is accepted by every text endpoint under its own name and under
-         * Strata's spelling; its semantic refusal (a deployment with no vector) happens at
+        /* Accepted by every text endpoint; the refusal on a deployment with no vector happens at
          * submission, not parsing, so a parse test sees 200 here. */
         { "control_vector", { true, none } },
-        { "experimental_speed_projection", { true, none } },
     };
     /* logprobs is spelled per endpoint: true on chat, a count on completions. */
     auto value_for = [&](const std::string& key, const std::string& ep) -> Valid {
@@ -4914,6 +4925,46 @@ TEST(a_media_part_reaches_the_prompt_where_the_template_put_it) {
     CHECK(mm.got[0].second == std::vector<uint8_t>(one.begin(), one.end()));
     CHECK(mm.got[1].first == MediaKind::Audio);
     CHECK(mm.got[1].second == std::vector<uint8_t>(two.begin(), two.end()));
+}
+
+/* Several pictures in one request reach the processor as several, with no mode the request did
+ * not name: a processor with one picture mode serves them as it serves one. A named mode is passed
+ * on as named. */
+TEST(several_pictures_are_marked_several_and_keep_the_mode_the_request_named) {
+    Fixture f;
+    FakeMultimodal mm;
+    OaiDeps d = f.odeps();
+    d.mm = &mm;
+    OaiLimits lim = f.limits();
+    lim.allow_image = true;
+    auto pic = [](const std::string& b) {
+        return json{ { "type", "image_url" }, { "image_url", { { "url", data_url("image/png", b) } } } };
+    };
+    auto body = [&](int n, const char* mode) {
+        json parts = json::array();
+        for (int i = 0; i < n; ++i) parts.push_back(pic("\x89PNG " + std::to_string(i)));
+        json b = { { "messages", json::array({ json{ { "role", "user" }, { "content", parts } } }) } };
+        if (mode) b["images_config"] = mode;
+        return b.dump();
+    };
+    OaiRequest r;
+    ApiError e;
+    REQUIRE(parse_chat_request(body(2, nullptr), d, lim, &r, &e) == RAD_OK);
+    REQUIRE_EQ(mm.got_opts.size(), (size_t)2);
+    for (const MediaOpts& o : mm.got_opts) {
+        CHECK_EQ(o.image_mode, 0);
+        CHECK(o.several_pictures);
+    }
+    mm.got_opts.clear();
+    OaiRequest r1;
+    REQUIRE(parse_chat_request(body(1, nullptr), d, lim, &r1, &e) == RAD_OK);
+    REQUIRE_EQ(mm.got_opts.size(), (size_t)1);
+    CHECK(!mm.got_opts[0].several_pictures);
+    mm.got_opts.clear();
+    OaiRequest r2;
+    REQUIRE(parse_chat_request(body(2, "gundam"), d, lim, &r2, &e) == RAD_OK);
+    REQUIRE_EQ(mm.got_opts.size(), (size_t)2);
+    for (const MediaOpts& o : mm.got_opts) CHECK_EQ(o.image_mode, 1);
 }
 
 /* A media part that cannot be served is refused by name: a remote URL (the server fetches nothing
@@ -5136,6 +5187,43 @@ TEST(an_embedding_inputs_bos_moves_its_media_by_one) {
     CHECK(r.prompts[0].tokens == std::vector<int32_t>({ 1, 'a', 'b', 9001, 9002 }));
     REQUIRE(r.prompts[0].media->items.size() == 1);
     CHECK_EQ(r.prompts[0].media->items[0].tok, 3);
+}
+
+/* A chat prompt gets the BOS its tokenizer states, once, in front of the render, and a picture's
+ * placeholders move by one with it; a tokenizer that adds none gets none. */
+TEST(a_chat_prompt_gets_the_tokenizers_bos_once) {
+    Fixture f;
+    f.tok.add_bos = true;
+    FakeMultimodal mm;
+    mm.expand = { 9001 };
+    OaiDeps d = f.odeps();
+    d.mm = &mm;
+    OaiLimits lim = f.limits();
+    lim.allow_image = true;
+    OaiRequest r;
+    ApiError e;
+    REQUIRE(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})", d, lim, &r,
+                               &e) == RAD_OK);
+    std::vector<int32_t> want = { 1 };
+    const std::vector<int32_t> text = byte_ids("<user>hi<assistant>");
+    want.insert(want.end(), text.begin(), text.end());
+    CHECK(r.prompts[0].tokens == want);
+
+    OaiRequest m;
+    REQUIRE(parse_chat_request(R"({"messages":[{"role":"user","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]})", d, lim, &m,
+                               &e) == RAD_OK);
+    REQUIRE(m.prompts[0].media && m.prompts[0].media->items.size() == 1);
+    CHECK_EQ(m.prompts[0].tokens[0], 1);
+    CHECK_EQ(m.prompts[0].tokens[1], '<');
+    CHECK_EQ(m.prompts[0].media->items[0].tok, 1 + (int32_t)byte_ids("<user>").size());
+    CHECK_EQ(m.prompts[0].tokens[(size_t)m.prompts[0].media->items[0].tok], 9001);
+
+    f.tok.add_bos = false;
+    OaiRequest n;
+    REQUIRE(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})", d, lim, &n,
+                               &e) == RAD_OK);
+    CHECK(n.prompts[0].tokens == text);
 }
 
 /* ================================================================== infill's layout */

@@ -131,7 +131,7 @@ private:
     int64_t   next_id_ = 0;
     std::map<int64_t, Timing> results_;
 
-    bool set_up_ = false, setup_failed_ = false;
+    bool set_up_ = false;
     std::string withheld_;
     std::vector<std::string> header_;
     int64_t   footprint_ = 0;        /* 0 in warm timing */

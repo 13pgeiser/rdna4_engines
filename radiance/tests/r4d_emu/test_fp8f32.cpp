@@ -270,6 +270,51 @@ int main() {
         }
     }
     fails += grouped_cases(cases);
+    {
+        /* A run of rows and a slice of columns give the bytes the whole product has there: GLM's
+         * MLA split by rows computes q_b and o over a rank's rows at full width, the head form
+         * over every row at a slice of the columns (or of K, as eight rank partials). */
+        const int M = 130, N = 1024, K = 512, kb = K / 128, r0 = 37, mr = 33, c0 = 256, nc = 256;
+        std::vector<uint8_t> a((size_t)M * K), w((size_t)N * K);
+        for (auto& v : a) v = rad_f32_to_fp8e4m3(nd(rng));
+        for (auto& v : w) v = rad_f32_to_fp8e4m3(nd(rng) * 0.5f);
+        std::vector<float> as((size_t)M * kb), ws((size_t)(N / 128) * kb);
+        std::uniform_real_distribution<float> oct(-6.f, 6.f);
+        for (auto& v : as) v = std::exp2(oct(rng));
+        for (auto& v : ws) v = std::exp2(oct(rng)) * 0.01f;
+        auto gemm = [&](int rows, int cols, int row0, int col0, std::vector<uint16_t>& y) {
+            y.assign((size_t)rows * cols, 0x7777);
+            RadTensor t[7] = { mat(a.data() + (size_t)row0 * K, RAD_F8E4M3, rows, K, K),
+                               mat(as.data() + (size_t)row0 * kb, RAD_F32, rows, kb, kb),
+                               mat(w.data() + (size_t)col0 * K, RAD_F8E4M3, cols, K, K),
+                               mat(ws.data() + (size_t)(col0 / 128) * kb, RAD_F32, cols / 128, kb,
+                                   kb),
+                               mat(y.data(), RAD_BF16, rows, cols, cols), RadTensor{}, RadTensor{} };
+            RadParam p[5]{};
+            p[0] = { "M", RAD_P_INT, rows };
+            p[1] = { "N", RAD_P_INT, cols };
+            p[2] = { "K", RAD_P_INT, K };
+            p[3] = { "group", RAD_P_INT, 128 };
+            p[4].key = "dtype";
+            p[4].kind = RAD_P_STR;
+            p[4].sval = "fp8a8f32";
+            RadArgs ar{};
+            ar.t = t;
+            ar.n_t = 7;
+            ar.p = p;
+            ar.n_p = 5;
+            return r4d_rad_fp8_f32scale(&ar, nullptr);
+        };
+        std::vector<uint16_t> whole, part;
+        ++cases;
+        bool same = gemm(M, N, 0, 0, whole) == RAD_OK && gemm(mr, nc, r0, c0, part) == RAD_OK;
+        for (int r = 0; same && r < mr; ++r)
+            for (int c = 0; c < nc; ++c)
+                same = same && part[(size_t)r * nc + c] == whole[(size_t)(r0 + r) * N + c0 + c];
+        std::printf("%s rows %d..%d x columns %d..%d alone against the %dx%d product\n",
+                    same ? "ok  " : "FAIL", r0, r0 + mr, c0, c0 + nc, M, N);
+        fails += !same;
+    }
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

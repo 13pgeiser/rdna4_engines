@@ -364,12 +364,6 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     return s;
 }
 
-void dump_graph(const Program& p, FILE* out, const std::vector<std::string>* errors) {
-    std::string s = dump_graph_str(p, errors);
-    fwrite(s.data(), 1, s.size(), out ? out : stderr);
-    fflush(out ? out : stderr);
-}
-
 /* ================================================================== the graph, as JSON
  *
  * dump_graph_str's content and more, for the server's Model view. It walks the same Program with

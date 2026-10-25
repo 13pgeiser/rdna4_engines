@@ -24,12 +24,23 @@
 // 2^(Wref[n]-127) is applied in the epilogue (see r4d_gemm_mxfp4a8_nt_m64.hip).
 //
 // Tile: 8 waves as 4 (M) x 2 (N), each owning TM=4 x TN fragments, so a block covers BMF = 256
-// rows and BNF = 2*TN*16 columns. TN=4 halves the column-block count and only wins on long prompts
-// (crossover near M=2048 on a 17408x5120 weight), so tn=0 picks TN=4 from M >= 2048. The K slab is
-// 128 at TN=2 (64 if K % 128 != 0) and 64 at TN=4, which holds twice the accumulators.
+// rows and BNF = 2*TN*16 columns. TN=4 halves the column-block count and wins from M = 1024 on
+// (on gfx1201 at a 27B's per-rank weights, mixed below), so tn=0 picks TN=4 from M >= 1024. The K
+// slab is 128 at TN=2 (64 if K % 128 != 0) and 64 at TN=4, which holds twice the accumulators.
+// TN does not change an output's bits: each fragment runs the same WMMAs in the same K order.
 //
 // Barriers fence LDS only: __syncthreads() also drains the global load counter, and nothing in
 // global memory is shared between the waves, so the next slab's A loads stay in flight.
+//
+// The weight words and exponents a thread stages are loaded a slab ahead, into registers, right
+// after the staging barrier, so their DRAM round trip runs under the slab's WMMAs instead of in
+// front of the next unpack (+1 VGPR at TN=4). Loading the A fragments a slab ahead too (+38 VGPRs)
+// is slower.
+//
+// A thin last row of blocks (1..160 rows, under 1024 rows in all) runs a second kernel whose
+// blocks of that row skip the WMMAs of their padding fragments past M. Every other M runs the
+// plain kernel, whose body declares its own LDS: a guard inside the one kernel, or the body
+// taking the LDS by pointer, slows the full blocks.
 //
 // Staging is clamped, never predicated: a predicated load gets its own exec-mask region and the
 // compiler cannot carry a counted s_wait_loadcnt across the merge. Clamped loads (tile past M ->
@@ -63,7 +74,7 @@
 #define R4D_MXT_NTHR  (R4D_MXT_WM * R4D_MXT_WN * 32)
 #define R4D_MXT_BMF   (R4D_MXT_WM * R4D_MXT_TM * 16)
 #define R4D_MXT_KUNIT 64        // the narrowest K slab, so K must be a multiple of it
-#define R4D_MXT_TN4_MIN_M 2048  // tn=0's crossover, see above
+#define R4D_MXT_TN4_MIN_M 1024  // tn=0's crossover, see above
 
 typedef int      mxt_v2i  __attribute__((ext_vector_type(2)));
 typedef unsigned mxt_u2   __attribute__((ext_vector_type(2)));
@@ -85,12 +96,16 @@ __global__ __launch_bounds__(256) void r4d_mxfp4a8_tile_a_kernel(
   *(mxt_u2*)(AT + o * 8) = v;
 }
 
-template <int TN, int LBK, bool ABLK>
-__global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
+// The kernel's body. OWN: it declares its LDS arrays itself (the plain kernel); otherwise it takes
+// the caller's (the two-body kernel, one set for both bodies). PART: a block the M edge cuts,
+// which skips the WMMAs of its padding fragments past M.
+template <int TN, int LBK, bool ABLK, bool PART, bool OWN>
+__device__ __forceinline__ void r4d_gemm_mxfp4a8_tiled_body(
     const unsigned char* __restrict__ AT, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int as_rs, int ldws, int ldc) {
+    int M, int K, int N, int as_rs, int ldws, int ldc, unsigned char* __restrict__ sW_in,
+    unsigned int* __restrict__ sMag_in, float* __restrict__ sR_in) {
   constexpr int TM = R4D_MXT_TM, WN = R4D_MXT_WN, NTHR = R4D_MXT_NTHR, BMF = R4D_MXT_BMF;
   constexpr int NS = LBK / 16, STR = LBK + R4D_MXT_PAD, BNF = WN * TN * 16;
   constexpr int NTILES_T = BNF / 16, TOT_SLOTS = NTILES_T * NS * 32;
@@ -98,15 +113,23 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
   constexpr int WSLOTS = (TOT_SLOTS >= NTHR * 4) ? 4 : (TOT_SLOTS >= NTHR * 2 ? 2 : 1);
   constexpr int NW = TOT_SLOTS / (NTHR * WSLOTS);
   static_assert(NW * NTHR * WSLOTS == TOT_SLOTS, "the W tile must split evenly over the block");
-  __shared__ unsigned char sW[BNF * STR];
-  __shared__ unsigned int sMag[32];
-  __shared__ float sR[ABLK ? BMF : 1];   // ABLK: a boundary's ratio a row, then each row's final scale
+  __shared__ unsigned char sW_own[OWN ? BNF * STR : 1];
+  __shared__ unsigned int sMag_own[OWN ? 32 : 1];
+  __shared__ float sR_own[OWN && ABLK ? BMF : 1];   // ABLK: a boundary's ratio a row, then each row's final scale
+  unsigned char* __restrict__ sW = OWN ? sW_own : sW_in;
+  unsigned int* __restrict__ sMag = OWN ? sMag_own : sMag_in;
+  float* __restrict__ sR = OWN ? sR_own : sR_in;
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF;
   const int ksteps = K / 16, Mt = (M + 15) >> 4;
+  // PART: this wave's M fragments that hold a row below M, 0..TM and wave-uniform; the rest are
+  // padding whose WMMAs are skipped (their rows are dropped at the store). Their A loads stay,
+  // clamped, in the slab's one clause.
+  const int live = PART ? __builtin_amdgcn_readfirstlane(min(TM, max(0, Mt - ((m0 >> 4) + wm * TM))))
+                        : TM;
 
   if (tid < 32) sMag[tid] = (&kMxfp4Mag[0][0])[tid];
 
@@ -155,6 +178,31 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
   lds_barrier();   // sMag
 
+  // The slab's weight words and exponents, loaded a slab ahead (the first one here).
+  unsigned int wqn[NW][WSLOTS], wswn[NW];
+  auto wload = [&](int k0) {
+    const int kstep0 = k0 / 16;
+#pragma unroll
+    for (int it = 0; it < NW; ++it) {
+      const unsigned int* src =
+          &Wp[((size_t)(wrc[it] >> 4) * ksteps + kstep0 + wkst[it]) * 32 + wlanec[it]];
+      const int blk = (k0 + wkst[it] * 16) / R4D_MXFP4_GROUP;
+      if constexpr (WSLOTS == 4) {
+        const mxt_u4 v = *(const mxt_u4*)src;
+        wqn[it][0] = v[0]; wqn[it][1] = v[1]; wqn[it][2] = v[2]; wqn[it][3] = v[3];
+        wswn[it] = *(const unsigned int*)(Ws + (size_t)blk * ldws + wrc[it]);
+      } else if constexpr (WSLOTS == 2) {
+        const mxt_u2 v = *(const mxt_u2*)src;
+        wqn[it][0] = v[0]; wqn[it][1] = v[1];
+        wswn[it] = *(const unsigned short*)(Ws + (size_t)blk * ldws + wrc[it]);
+      } else {
+        wqn[it][0] = *src;
+        wswn[it] = Ws[(size_t)blk * ldws + wrc[it]];
+      }
+    }
+  };
+  wload(0);
+
   for (int k0 = 0; k0 < K; k0 += LBK) {
     // ABLK: at a 128 boundary each row's ratio goes to LDS, published by the staging barrier below
     // (sR's previous readers finished before the last slab's closing barrier). A zero block keeps
@@ -172,36 +220,20 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
       for (int st = 0; st < NS; ++st)
         af[i][st] = *(const mxt_v2i*)(abase[i] +
                                       (aoff + (unsigned int)(k0 * 16) + (unsigned int)(st * 256)));
-    // W slab -> LDS, folded to e4m3.
-    const int kstep0 = k0 / 16;
+    // W slab -> LDS, folded to e4m3, from the words loaded a slab ago.
 #pragma unroll
     for (int it = 0; it < NW; ++it) {
-      const unsigned int* src =
-          &Wp[((size_t)(wrc[it] >> 4) * ksteps + kstep0 + wkst[it]) * 32 + wlanec[it]];
-      const int blk = (k0 + wkst[it] * 16) / R4D_MXFP4_GROUP;
-      unsigned int wq[WSLOTS], wsw;
-      if constexpr (WSLOTS == 4) {
-        const mxt_u4 v = *(const mxt_u4*)src;
-        wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
-        wsw = *(const unsigned int*)(Ws + (size_t)blk * ldws + wrc[it]);
-      } else if constexpr (WSLOTS == 2) {
-        const mxt_u2 v = *(const mxt_u2*)src;
-        wq[0] = v[0]; wq[1] = v[1];
-        wsw = *(const unsigned short*)(Ws + (size_t)blk * ldws + wrc[it]);
-      } else {
-        wq[0] = *src;
-        wsw = Ws[(size_t)blk * ldws + wrc[it]];
-      }
 #pragma unroll
       for (int q = 0; q < WSLOTS; ++q) {
         const int d = r4d_mxfp4_fold_d((int)((wref[it] >> (8 * q)) & 0xFF),
-                                       (int)((wsw >> (8 * q)) & 0xFF));
+                                       (int)((wswn[it] >> (8 * q)) & 0xFF));
         unsigned int lo, hi;
-        r4d_mxfp4_unpack8_t(wq[q], sMag[d * 2], sMag[d * 2 + 1], &lo, &hi);
+        r4d_mxfp4_unpack8_t(wqn[it][q], sMag[d * 2], sMag[d * 2 + 1], &lo, &hi);
         *(mxt_u2*)(&sW[(wrow[it] + q) * STR + wkloc[it]]) = mxt_u2{lo, hi};
       }
     }
     lds_barrier();
+    if (k0 + LBK < K) wload(k0 + LBK);   // the next slab's weight flies across this slab's WMMAs
 
     if constexpr (ABLK) {
       // Re-express each row's partial sum in the new block's scale: one ratio a lane a row.
@@ -235,11 +267,13 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
       // loads above the first WMMA.
       __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-      for (int i = 0; i < TM; ++i)
+      for (int i = 0; i < TM; ++i) {
+        if (PART && i >= live) break;   // wave-uniform: padding fragments past M
 #pragma unroll
         for (int j = 0; j < TN; ++j)
           acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[j], af[i][step],
                                                                           acc[i][j]);
+      }
     }
     lds_barrier();
   }
@@ -287,6 +321,37 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
   }
 }
 
+// The plain kernel: every block the unguarded body, over the body's own LDS.
+template <int TN, int LBK, bool ABLK>
+__global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
+    const unsigned char* __restrict__ AT, const float* __restrict__ As,
+    const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
+    const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
+    int M, int K, int N, int as_rs, int ldws, int ldc) {
+  r4d_gemm_mxfp4a8_tiled_body<TN, LBK, ABLK, false, true>(AT, As, W, Ws, Wref, C, M, K, N, as_rs, ldws,
+                                                          ldc, nullptr, nullptr, nullptr);
+}
+
+// The two-body kernel, for a thin last row of blocks: a block of that row takes the guarded body,
+// every other block the unguarded one, uniform over the block, over one set of LDS arrays.
+template <int TN, int LBK, bool ABLK>
+__global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_part_kernel(
+    const unsigned char* __restrict__ AT, const float* __restrict__ As,
+    const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
+    const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
+    int M, int K, int N, int as_rs, int ldws, int ldc) {
+  constexpr int BNF = R4D_MXT_WN * TN * 16, STR = LBK + R4D_MXT_PAD;
+  __shared__ unsigned char sW[BNF * STR];
+  __shared__ unsigned int sMag[32];
+  __shared__ float sR[ABLK ? R4D_MXT_BMF : 1];
+  if ((int)(blockIdx.y + 1) * R4D_MXT_BMF > M)
+    r4d_gemm_mxfp4a8_tiled_body<TN, LBK, ABLK, true, false>(AT, As, W, Ws, Wref, C, M, K, N, as_rs,
+                                                            ldws, ldc, sW, sMag, sR);
+  else
+    r4d_gemm_mxfp4a8_tiled_body<TN, LBK, ABLK, false, false>(AT, As, W, Ws, Wref, C, M, K, N, as_rs,
+                                                             ldws, ldc, sW, sMag, sR);
+}
+
 extern "C" int r4d_gemm_mxfp4a8_tiled_group(void) { return R4D_MXFP4_GROUP; }
 
 extern "C" long r4d_mxfp4a8_tile_a_bytes(int M, int K) {
@@ -332,9 +397,18 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
   auto Rp = (const unsigned char*)wref;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define MXT_LAUNCH(TNv, LBKv, ABv)                                                              \
-  hipLaunchKernelGGL((r4d_gemm_mxfp4a8_tiled_kernel<TNv, LBKv, ABv>), grid, block, 0, st, Ap, Sp, \
-                     Wp, Zp, Rp, Cp, M, K, N, as_rs, ldws, ldc)
+  // The two-body kernel only for a thin last row of blocks (1..160 rows) under 1024 rows; see the
+  // header.
+  const int rem = M % R4D_MXT_BMF;
+  const bool part = rem > 0 && rem <= 160 && M < 1024;
+#define MXT_LAUNCH(TNv, LBKv, ABv) do {                                                          \
+    if (part)                                                                                     \
+      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_tiled_part_kernel<TNv, LBKv, ABv>), grid, block, 0, st, \
+                         Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, as_rs, ldws, ldc);                      \
+    else                                                                                          \
+      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_tiled_kernel<TNv, LBKv, ABv>), grid, block, 0, st, Ap,  \
+                         Sp, Wp, Zp, Rp, Cp, M, K, N, as_rs, ldws, ldc);                          \
+  } while (0)
   if (TN == 4)        { if (ablk) MXT_LAUNCH(4, 64, true);  else MXT_LAUNCH(4, 64, false); }
   else if (wide_slab) { if (ablk) MXT_LAUNCH(2, 128, true); else MXT_LAUNCH(2, 128, false); }
   else                { if (ablk) MXT_LAUNCH(2, 64, true);  else MXT_LAUNCH(2, 64, false); }

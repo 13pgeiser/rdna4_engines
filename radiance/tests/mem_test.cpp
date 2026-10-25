@@ -1104,6 +1104,29 @@ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
     }
 }
 
+TEST(window_prefix_tail_edit_resumes_at_an_earlier_interval_snapshot) {
+    Fixture f;
+    f.cfg.checkpoint_interval = 256;
+    f.cfg.checkpoint_slots = 8;
+    auto groups = hybrid_groups(/*with_linear=*/false);
+    groups.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 2 }, 64));
+    REQUIRE_EQ(f.build_groups(groups), RAD_OK);
+    CHECK(f.kv.has_window_snapshot());
+    auto tokens = tok_run(1000, 1100);
+    publish(f, 1, tokens, 1100);
+    const auto hashes = chain_of(tokens);
+    for (int64_t p : { 256, 512, 768, 1024, 1072 }) ckpt_at(f, 1, hashes, p);
+    f.pc.retain(1);
+
+    /* Replacing the final 123 tokens invalidates both the tail and 1024 snapshot,
+     * but the unchanged prefix still reaches the snapshot at 768. */
+    for (size_t i = 977; i < tokens.size(); ++i) tokens[i] += 10000;
+    const CacheHit hit = f.pc.lookup(tokens, {});
+    CHECK_EQ(hit.n_attn_tokens, 976);
+    CHECK_EQ(hit.n_linear_tokens, 768);
+    CHECK(hit.checkpoint_slot >= 0);
+}
+
 TEST(kv_window_group_recycles_below_the_window) {
     std::vector<KVGroupInfo> g;
     g.push_back(null_group());
@@ -3234,6 +3257,188 @@ TEST(the_tiers_are_told_the_cache_s_block_ids_and_not_the_requests) {
     }
 }
 
+/* ================================================================== release on request
+ *
+ * A client that deleted a conversation, or kept a prefix of it and replaced the rest, forgets it
+ * through the session table: by label, from the tip inwards, host copy and snapshots with it.
+ * What another conversation also walks stays, as does what a live sequence holds.
+ */
+
+/* Publishes `tokens` under `id` with a session label, as the scheduler does at a turn's close,
+ * and frees the sequence, as it does right after. */
+static void publish_turn(Fixture& f, uint64_t id, const std::vector<int32_t>& tokens,
+                         const std::string& label) {
+    CHECK_OK(f.kv.add_sequence(id));
+    CHECK_OK(f.kv.ensure(id, (int64_t)tokens.size()));
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(id, g));
+    CHECK_OK(f.pc.insert(id, tokens, {}, bt, (int64_t)tokens.size(), label));
+    f.kv.free_sequence(id);
+}
+
+/* The label's rows in the session table. */
+static std::vector<IdleTiers::SessionInfo> rows_of(IdleTiers& t, const std::string& label) {
+    std::vector<IdleTiers::SessionInfo> out;
+    for (const IdleTiers::SessionInfo& s : t.sessions())
+        if (s.label == label) out.push_back(s);
+    return out;
+}
+
+TEST(a_released_conversation_goes_from_the_tip_down_to_what_another_one_shares) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(1 << 20, 1024)));
+    f.pc.set_tiers(&t);
+
+    /* Conversation A over three turns under three request ids: each turn extends the last. The
+     * first two blocks are a system prompt conversation B opens with too. */
+    const auto a1 = tok_run(100, 64);                      /* 4 blocks */
+    auto a2 = a1; for (int i = 0; i < 32; ++i) a2.push_back(700 + i);    /* 6 */
+    auto a3 = a2; for (int i = 0; i < 32; ++i) a3.push_back(800 + i);    /* 8 */
+    publish_turn(f, 1, a1, "chat-a");
+    publish_turn(f, 2, a2, "chat-a");
+    publish_turn(f, 3, a3, "chat-a");
+    auto b = tok_run(100, 32); for (int i = 0; i < 64; ++i) b.push_back(900 + i);   /* 6 */
+    publish_turn(f, 4, b, "chat-b");
+    CHECK_EQ(f.pc.size(), 12ll);                            /* 8 + 4 own blocks of B */
+    REQUIRE_EQ(rows_of(t, "chat-a").size(), 1u);            /* one row per conversation */
+    CHECK_EQ(rows_of(t, "chat-a")[0].n_tokens, 128ll);
+    /* Every entry has its host copy. */
+    copy_now(t);
+    CHECK_EQ(t.arena().used_slots(), 12);
+    const int64_t pool_before = f.kv.free_blocks(G_FULL);
+
+    SessionRelease r;
+    CHECK_EQ(f.pc.release_session("chat-c", 0, 0, &r), RAD_E_NOTFOUND);
+    CHECK_EQ(f.pc.release_session("", 0, 0, &r), RAD_E_INVAL);
+
+    CHECK_OK(f.pc.release_session("chat-a", 0, 0, &r));
+    CHECK_EQ(r.sessions, 1ll);
+    CHECK_EQ(r.entries, 6ll);                               /* 8 less the 2 B walks too */
+    CHECK_EQ(r.tokens, 96ll);
+    CHECK_EQ(r.kept_shared, 2ll);
+    CHECK_EQ(r.kept_live, 0ll);
+    CHECK_EQ(r.kept_tokens, 0ll);
+    CHECK(r.device_bytes > 0);
+    CHECK_EQ(r.host_bytes, 6 * 1024ll);
+    /* Pool and arena got the six back; the index holds B's chain and the shared start. */
+    CHECK_EQ(f.kv.free_blocks(G_FULL), pool_before + 6);
+    CHECK_EQ(t.arena().used_slots(), 6);
+    CHECK_EQ(f.pc.size(), 6ll);
+    CHECK_EQ(f.pc.stats().released, 6ll);
+    /* A's next turn hits the shared system prompt and nothing more; B is whole. */
+    CHECK_EQ(f.pc.lookup(a3, {}).n_attn_tokens, 32);
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 80);
+    CHECK_EQ(rows_of(t, "chat-a").size(), 0u);
+    REQUIRE_EQ(rows_of(t, "chat-b").size(), 1u);
+    CHECK_EQ(rows_of(t, "chat-b")[0].n_tokens, 96ll);
+
+    /* Released twice is not found the second time. */
+    CHECK_EQ(f.pc.release_session("chat-a", 0, 0, &r), RAD_E_NOTFOUND);
+}
+
+TEST(keep_tokens_leaves_the_chains_start_standing_in_whole_blocks) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(1 << 20, 1024)));
+    f.pc.set_tiers(&t);
+
+    auto b = tok_run(100, 32); for (int i = 0; i < 64; ++i) b.push_back(900 + i);   /* 6 blocks */
+    publish_turn(f, 4, b, "chat-b");
+
+    /* 40 tokens keep three blocks: the one holding token 40 goes with them. */
+    SessionRelease r;
+    CHECK_OK(f.pc.release_session("chat-b", 0, 40, &r));
+    CHECK_EQ(r.entries, 3ll);
+    CHECK_EQ(r.kept_tokens, 48ll);
+    CHECK_EQ(r.kept_shared, 0ll);
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 48);
+    /* The row stays, cut to the kept prefix: the client extends it again. */
+    REQUIRE_EQ(rows_of(t, "chat-b").size(), 1u);
+    CHECK_EQ(rows_of(t, "chat-b")[0].n_tokens, 48ll);
+    const uint64_t id = rows_of(t, "chat-b")[0].id;
+
+    /* The same by engine id, keeping more than is left: nothing goes, nothing breaks. */
+    CHECK_OK(f.pc.release_session("", id, 200, &r));
+    CHECK_EQ(r.entries, 0ll);
+    CHECK_EQ(r.kept_tokens, 48ll);
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 48);
+
+    /* A later turn extends the stub into a full row again. */
+    publish_turn(f, 5, b, "chat-b");
+    REQUIRE_EQ(rows_of(t, "chat-b").size(), 1u);
+    CHECK_EQ(rows_of(t, "chat-b")[0].n_tokens, 96ll);
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 80);
+}
+
+TEST(a_release_takes_the_sessions_snapshots_past_the_kept_prefix_and_leaves_live_blocks) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    IdleTiers t;
+    IdleTiers::Config tc = tier_config(1 << 20, 1024);
+    tc.ckpt_bytes = f.kv.checkpoint_bytes();
+    tc.ckpt_slots = 4;
+    CHECK_OK(t.configure(tc));
+    f.pc.set_tiers(&t);
+
+    const auto a = tok_run(100, 128);                      /* 8 blocks, checkpoints at 64, 128 */
+    const std::vector<BlockHash> hs = chain_of(a);
+    CHECK_OK(f.kv.add_sequence(3));
+    CHECK_OK(f.kv.ensure(3, 128));
+    ckpt_at(f, 3, hs, 64);
+    ckpt_at(f, 3, hs, 128);
+    f.pc.begin_step();
+    {
+        std::vector<std::vector<int32_t>> bt;
+        for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(3, g));
+        CHECK_OK(f.pc.insert(3, a, {}, bt, 128, "chat-a"));
+    }
+    f.kv.free_sequence(3);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 2ll);
+    CHECK_EQ(rows_of(t, "chat-a")[0].snapshots, 2ll);
+
+    /* A waiting request restored the chain and holds it; a running one adopted the first
+     * five blocks. Both keep their blocks through a release. */
+    std::vector<std::vector<int32_t>> found;
+    const CacheHit h = f.pc.lookup(a, {}, &found);
+    CHECK_EQ(h.n_attn_tokens, 112);
+    CHECK_OK(f.kv.add_sequence(9));
+    std::vector<int32_t> five(found[0].begin(), found[0].begin() + 5);
+    CHECK_OK(f.kv.adopt(9, f.pc.cached_groups()[0], five, 80));
+    f.pc.begin_step();
+
+    SessionRelease r;
+    CHECK_OK(f.pc.release_session("chat-a", 0, 64, &r));
+    /* Blocks 4..7 are past the kept 64 tokens; block 4 is live, 5..7 go. */
+    CHECK_EQ(r.entries, 3ll);
+    CHECK_EQ(r.kept_live, 1ll);
+    CHECK_EQ(r.kept_tokens, 64ll);
+    /* The snapshot at 128 sat on block 7 and went with it; the one at 64 is on the kept prefix. */
+    CHECK_EQ(r.snapshots, 1ll);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 3ll);
+    const std::vector<int64_t> left = f.pc.checkpoints(3);
+    REQUIRE_EQ(left.size(), 1u);
+    CHECK_EQ(left[0], 64ll);
+    CHECK_EQ(f.pc.stats().ckpt_released, 1ll);
+    /* The live block is still indexed and the sequence still reads it; the row reaches it. */
+    CHECK_EQ(f.kv.block_refcount(G_FULL, five[4]), 2);
+    REQUIRE_EQ(rows_of(t, "chat-a").size(), 1u);
+    CHECK_EQ(rows_of(t, "chat-a")[0].n_tokens, 80ll);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 80);
+    CHECK_EQ(f.pc.lookup(a, {}).n_linear_tokens, 64);
+
+    /* The sequence is gone: the block it held goes on the next release. */
+    f.kv.free_sequence(9);
+    CHECK_OK(f.pc.release_session("chat-a", 0, 64, &r));
+    CHECK_EQ(r.entries, 1ll);
+    CHECK_EQ(r.kept_live, 0ll);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 64);
+    CHECK_EQ(f.pc.lookup(a, {}).n_linear_tokens, 64);
+    CHECK_EQ(rows_of(t, "chat-a")[0].n_tokens, 64ll);
+}
+
 /* ================================================================== the pool in bytes
  *
  * Blocks and tokens cannot be summed across KV groups: a recurrent group has no token axis and
@@ -3333,6 +3538,48 @@ TEST(dropping_a_clean_entry_gives_its_vram_back_and_keeps_it_restorable) {
     CHECK_EQ(x.f.pc.lookup(prompt, {}).n_attn_tokens, 0);
     CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 20u);
     CHECK_EQ(x.f.pc.drop_clean(), 0);               /* nothing left to drop */
+}
+
+TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {
+    /* A short request shares less than one checkpoint with an off-device conversation, so it
+     * recomputes instead of adopting that prefix. Its different prefill shape can round the KV
+     * differently. Publishing it must not replace the original bytes underneath the longer
+     * conversation's still-valid recurrent snapshot. Device-resident entries already keep the
+     * first copy; host-resident entries must obey the same rule. */
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+    publish(x.f, 1, prompt, 320);
+    const int32_t snapshot = ckpt_at(x.f, 1, keys, 320);
+    x.f.kv.free_sequence(1);
+
+    const auto copied = copy_now(x.t);
+    REQUIRE_EQ(copied.size(), 20u);
+    const int32_t host_slot = copied[0].host_slot;
+    REQUIRE(host_slot >= 0);
+    std::memset(x.t.arena().at(host_slot), 0x5a, 1024);
+    CHECK_EQ(x.f.pc.drop_clean(), 20);
+    CHECK_EQ(x.t.arena().used_slots(), 20ll);
+
+    std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    short_prompt.insert(short_prompt.end(), tail.begin(), tail.end());
+    CHECK_EQ(x.f.pc.lookup(short_prompt, {}).n_linear_tokens, 0);
+    publish(x.f, 2, short_prompt, 64);
+    x.f.kv.free_sequence(2);
+
+    CHECK(x.t.resident_off_device(keys[0]));
+    CHECK(x.t.resident_off_device(keys[1]));
+    CHECK_EQ(x.t.arena().used_slots(), 20ll);
+    CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 20u);
+    CHECK(x.f.kv.checkpoint_held(snapshot));
+    const auto* bytes = static_cast<const unsigned char*>(x.t.arena().at(host_slot));
+    for (int i = 0; i < 1024; ++i) CHECK_EQ(bytes[i], 0x5a);
+    TierJob restore;
+    CHECK(x.t.plan_promote(keys[0], &restore));
+    CHECK_EQ(restore.host_slot, host_slot);
+    x.t.report(restore, false);                  /* leave the unstarted restore in host memory */
 }
 
 TEST(an_entry_a_running_sequence_reads_is_dropped_once_the_sequence_lets_go) {
@@ -6198,9 +6445,11 @@ TEST(the_cache_tiers_and_pool_agree_over_random_interleavings) {
  */
 
 /* The engine's restore (the binding's restore_fn) without the transfer: which entries come back,
- * into which blocks, and what the tiers and the cache are told. Returns how many came back. */
-static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r) {
-    const std::vector<BlockHash> want = b.restore_plan(r, 0);
+ * into which blocks, and what the tiers and the cache are told. Returns how many came back;
+ * `res`, when given, is whether the plan was cut. */
+static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r,
+                              RestoreResult* res = nullptr) {
+    const std::vector<BlockHash> want = b.restore_plan(r, 0, /*whole_only=*/false, res);
     std::vector<TierJob> jobs;
     for (const BlockHash& h : want) {
         TierJob j;
@@ -6275,18 +6524,19 @@ TEST(a_restore_gives_up_other_clean_copies_to_bring_the_whole_chain_back) {
     PCBinding<PrefixCache> b(&x.f.pc);
     int flushes = 0;
     b.flush_fn = [&]() { ++flushes; return !copy_now(x.t).empty(); };
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), off);
+    RestoreResult res = RestoreResult::Cut;
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), off);
+    CHECK(res == RestoreResult::Whole);
     CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
     /* B had no host copy yet: its copies were landed first, then its VRAM went. Nothing lost. */
     CHECK_EQ(flushes, 1);
     CHECK_EQ(x.f.pc.stats().evictions, evictions);
     CHECK_EQ(x.f.pc.size(), 2 * s.n);
     CHECK_EQ((int64_t)x.f.pc.restorable_from(s.b, {}).size(), 2 * s.n - x.f.pc.resident());
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
-/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches. Cut
- * at the free list, that is somewhere down the retention ladder, far below the tip. */
+/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches; with
+ * the whole chain back, that is the tip, not a snapshot down the retention ladder. */
 TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
     TierFixture x;
     CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
@@ -6296,11 +6546,12 @@ TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
 
     PCBinding<PrefixCache> b(&x.f.pc);
     b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
-    (void)engine_restore(x, b, turn(3, s.a, {}));
+    RestoreResult res = RestoreResult::Cut;
+    (void)engine_restore(x, b, turn(3, s.a, {}), &res);
+    CHECK(res == RestoreResult::Whole);
     const CacheHit hit = x.f.pc.lookup(s.a, {});
     CHECK_EQ(hit.n_attn_tokens, (int32_t)(s.n * 16));
     CHECK_EQ(hit.n_linear_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
 /* When the pool cannot be made to hold the chain, what comes back ends at a snapshot: blocks past
@@ -6326,14 +6577,15 @@ TEST(a_restore_the_pool_cannot_hold_stops_at_a_snapshot_and_spares_its_own_chain
 
     PCBinding<PrefixCache> b(&x.f.pc);
     b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
-    const int64_t back = engine_restore(x, b, turn(3, s.a, {}));
+    RestoreResult res = RestoreResult::Whole;
+    const int64_t back = engine_restore(x, b, turn(3, s.a, {}), &res);
+    CHECK(res == RestoreResult::Cut);
     CHECK_EQ(back, std::max<int64_t>(0, snap / 16 - resident));
     CHECK_EQ(x.f.pc.stats().drops, drops);          /* no VRAM copy given up: A's own, or B's */
     const CacheHit hit = x.f.pc.lookup(s.a, {});
     CHECK_EQ(hit.n_linear_tokens, (int32_t)snap);
     CHECK_EQ(hit.n_attn_tokens, (int32_t)std::max<int64_t>(snap, resident * 16));
     CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
 }
 
 /* A chain another waiting request holds is kept too: that request restored it and was refused,
@@ -6348,15 +6600,59 @@ TEST(a_restore_does_not_take_a_chain_a_waiting_request_holds) {
     const int64_t drops = x.f.pc.stats().drops;
 
     PCBinding<PrefixCache> b(&x.f.pc);
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), room);
+    RestoreResult res = RestoreResult::Whole;
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), room);
+    CHECK(res == RestoreResult::Cut);
     CHECK_EQ(x.f.pc.stats().drops, drops);
     CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
 
     x.f.pc.release(9);
     const int64_t rest = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), rest);
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), rest);
+    CHECK(res == RestoreResult::Whole);
     CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
+}
+
+/* A restore asked to come back whole either does, or brings back nothing and is declined: the
+ * admission waits a step and asks again (Scheduler::admit_one). */
+TEST(a_whole_only_restore_comes_back_whole_or_not_at_all) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/true, /*a_snapshots=*/true);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    RestoreResult res = RestoreResult::Whole;
+    CHECK(b.restore_plan(turn(3, s.a, {}), 0, /*whole_only=*/true, &res).empty());
+    CHECK(res == RestoreResult::Declined);
+    CHECK_EQ((int64_t)x.f.pc.restorable_from(s.a, {}).size(), off);   /* nothing moved */
+
+    x.f.kv.free_sequence(2);                         /* B's sequence ends: its VRAM can go */
+    CHECK_EQ((int64_t)b.restore_plan(turn(3, s.a, {}), 0, true, &res).size(), off);
+    CHECK(res == RestoreResult::Whole);
+}
+
+/* Making room for a restore never erases an entry. Without a host tier, or with one attached but
+ * off, a trim would erase, since no copy will ever land; so it takes nothing. */
+TEST(making_room_for_a_restore_without_a_host_tier_takes_nothing) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    publish(f, 1, tok_run(7600, 336), 320);         /* twenty 16-token blocks */
+    f.kv.free_sequence(1);                          /* finished: only the cache holds them */
+    const auto other = tok_run(900000, 336);
+    CHECK_EQ(f.pc.trim_for(other, {}, 20), 0ll);
+    CHECK_EQ(f.pc.size(), 20ll);
+    CHECK_EQ(f.pc.resident(), 20ll);
+
+    IdleTiers off;
+    CHECK_OK(off.configure(tier_config(0, 1024)));
+    REQUIRE(!off.host_on());
+    f.pc.set_tiers(&off);
+    CHECK_EQ(f.pc.trim_for(other, {}, 20), 0ll);
+    CHECK_EQ(f.pc.size(), 20ll);
+    CHECK_EQ(f.pc.stats().evictions, 0ll);
+    f.pc.set_tiers(nullptr);
 }
 
 /* Tools and tests build and tear down the tier executors and pools repeatedly, and on a card every

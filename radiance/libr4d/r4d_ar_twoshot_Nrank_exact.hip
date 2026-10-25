@@ -11,21 +11,21 @@
 //
 // The shard table (r4d_ar_shards.h) comes in as a kernel argument. By default it is the even
 // split (the first n16 % ws shards one word longer); at 3 ranks engine residuals rarely divide (a
-// 2048-wide bf16 row is 256 words). At 8 ranks it may be weighted per link
-// (RADIANCE_AR8_SHARD_WEIGHTS); a rank with weight 0 owns nothing and only pushes, gathers and
+// 2048-wide bf16 row is 256 words). At 8 ranks it is weighted per link (r4d_ar_links.h); a rank with weight 0 owns nothing and only pushes, gathers and
 // handshakes. Over both phases a rank moves N + (ws-2)*len_r each way, but phase 1 only sends
 // N - len_r (receiving (ws-1)*len_r) and phase 2 the reverse, so a short shard on a slow link pays
 // only as far as the phases overlap on that link (docs/GUIDE.md, 4.7). Each word is the same fp32
 // fold in ascending rank order whoever owns it, so the bits match the one-shot's.
 //
-// At 8 ranks the message may also run in pieces (RADIANCE_AR8_PIECES, by default a count from
-// the message size, r4d_ar_shards.h): each block's words split into `pieces` runs pipelined so
+// At 8 ranks the message may also run in pieces (a count from the message size, r4d_ar_shards.h): each block's words split into `pieces` runs pipelined so
 // piece j+1's phase 1 shares the link with piece j's phase 2. A rank with a short shard then
 // sends and receives at once instead of one direction per phase.
 //
-// Also at 8 ranks, two more forms of the same work (RADIANCE_AR8_FORM, the `form` parameter):
+// Also at 8 ranks, two more forms of the same work, chosen by the `form` launch parameter to time
+// a board (the engine runs lockstep, r4d_ar_entry.hip):
 //  * ring sends the first hop to the peers in ring order from rank + 1 instead of ascending, so
-//    at any moment each card receives from one peer rather than all seven from the same one;
+//    no card receives from all seven at once, as the lowest rank does when every sender starts
+//    at its lowest peer;
 //  * split also replaces the one handshake a step, which waits for every peer to finish the whole
 //    step, by a flag after each half (the first hop of the next piece, the reduce of this one),
 //    each awaited only before its data is read: before reducing piece j the peers' first hop of

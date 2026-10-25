@@ -422,11 +422,13 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
+        { "--tp-attn-split", { "rows" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
@@ -434,7 +436,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
-        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
+        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
+        { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -639,6 +642,39 @@ TEST(the_wire_mode_is_one_of_two_names) {
     CHECK_EQ(parse({ "--tp-wire", "EXACT" }, &c), RAD_E_INVAL);
 }
 
+/* The row split of a prefill's attention is not bit-identical to the head split, so heads is
+ * the default and anything but the two names stops the server. */
+TEST(the_attention_split_is_one_of_two_names) {
+    Config c;
+    CHECK_EQ(c.tp_attn_rows, 0);
+    CHECK_EQ(parse({ "--tp-attn-split", "rows" }, &c), RAD_OK);
+    CHECK_EQ(c.tp_attn_rows, 1);
+    CHECK_EQ(parse({ "--tp-attn-split", "heads" }, &c), RAD_OK);
+    CHECK_EQ(c.tp_attn_rows, 0);
+    CHECK_EQ(parse({ "--tp-attn-split", "1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--tp-attn-split", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--tp-attn-split", "ROWS" }, &c), RAD_E_INVAL);
+}
+
+/* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
+ * names stops the server. */
+TEST(the_attention_fp8_mode_is_one_of_four_names) {
+    Config c;
+    CHECK_EQ(c.attn_prefill_fp8, 0);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "qk" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_QK);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "pv" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_PV);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "both" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)(RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV));
+    CHECK_EQ(std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)), std::string("both"));
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "off" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, 0);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "3" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "QK" }, &c), RAD_E_INVAL);
+}
+
 TEST(the_p2p_mode_is_one_of_three_names) {
     Config c;
     CHECK_EQ(c.p2p, RAD_P2P_AUTO);
@@ -653,6 +689,20 @@ TEST(the_p2p_mode_is_one_of_three_names) {
     CHECK_EQ(parse({ "--p2p", "yes" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
+}
+
+TEST(the_state_cache_dtype_is_f32_or_f16) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.state_cache_dtype, std::string("f32"));
+    Config c;
+    CHECK_EQ(parse({ "--state-cache-dtype", "f16" }, &c), RAD_OK);
+    CHECK_EQ(c.state_cache_dtype, std::string("f16"));
+    CHECK_EQ(parse({ "--state-cache-dtype", "f32" }, &c), RAD_OK);
+    CHECK_EQ(c.state_cache_dtype, std::string("f32"));
+    CHECK_EQ(parse({ "--state-cache-dtype", "bf16" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--state-cache-dtype", "1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--state-cache-dtype" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_kv_cache_dtype_is_one_of_four_names) {
@@ -728,6 +778,22 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not
+ * start a server on the other path. */
+TEST(the_draft_coupling_is_off_or_on) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_coupling);
+    Config c;
+    CHECK_EQ(parse({ "--draft-coupling", "on" }, &c), RAD_OK);
+    CHECK(c.draft_coupling);
+    CHECK_EQ(parse({ "--draft-coupling", "off" }, &c), RAD_OK);
+    CHECK(!c.draft_coupling);
+    for (const char* bad : { "On", "1", "yes", "true", "" })
+        CHECK_EQ(parse({ "--draft-coupling", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-coupling" }, &c), RAD_E_INVAL);
 }
 
 /* An unknown policy name is refused; falling through to the default would make a comparison
@@ -1224,10 +1290,11 @@ TEST(usage_names_every_flag_it_documents) {
      * for, so a flag added without a help line is caught. */
     const std::string text = stderr_of([] { config_usage("radiance"); });
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
-                           "--num-speculative-tokens", "--draft-window", "--checkpoint-policy",
+                           "--num-speculative-tokens", "--draft-window", "--draft-coupling",
+                           "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
-                           "--embedding-placement", "--ngram-placement", "--kld-record",
-                           "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
+                           "--attn-prefill-fp8", "--embedding-placement", "--ngram-placement",
+                           "--kld-record", "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
                            "--presence-penalty", "--dry-sequence-breakers",
                            "--chat-template-kwargs", "--reasoning-format", "--max-n",
                            "--max-queued-requests", "--max-stop-strings", "--http-threads",

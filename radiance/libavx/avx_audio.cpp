@@ -227,7 +227,10 @@ inline float sin_sq1(float v) {
  * k input rows' channel runs back to back, zeros outside its own sequence (padded on both sides,
  * or with `causal` on the left only). A band's patches are one gemm_nt_into call into f32 rows (the
  * bias added there); `res` and the tanh or the clamp to [-1, 1] are applied to the f32 rows, which
- * are rounded once into y. A 1-wide kernel over a dense x reads x itself as the patches. */
+ * are rounded once into y. A 1-wide kernel over a dense x reads x itself as the patches. With a
+ * `stride` (causal only) output row o's patch starts at input row o stride - pad, the pad the
+ * reach less the stride, and a sequence of L rows makes L / stride. `cu_div`: the bounds in units
+ * that many input rows apart, as libref reads them. */
 AVX_KERNEL(conv1d) {
     if (!rad_args_have(a, 3) || a->n_t < 5) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *W = &a->t[1], *cu = &a->t[2];
@@ -235,20 +238,26 @@ AVX_KERNEL(conv1d) {
     if (!Y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
+    const int64_t st = p_int(a, "stride", 1), cd = p_int(a, "cu_div", 1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
     if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1)
+        causal < 0 || causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) ||
+        cd < 1)
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
-    const int64_t r0 = cu_at(cu, 0), r1 = cu_at(cu, n_seq);
-    if (r0 < 0 || r1 <= r0 || rows_of(Y, cout) < r1 || rows_of(X, cin) < r1) return RAD_E_SHAPE;
+    for (int64_t e = 0; e <= n_seq; ++e)
+        if (cu_at(cu, e) % (cd * st)) return RAD_E_SHAPE;
+    /* r0, r1: the output rows, the input's over the stride. */
+    const int64_t r0 = cu_at(cu, 0) / (cd * st), r1 = cu_at(cu, n_seq) / (cd * st);
+    if (r0 < 0 || r1 <= r0 || rows_of(Y, cout) < r1 || rows_of(X, cin) < r1 * st)
+        return RAD_E_SHAPE;
     if (numel(W) < cout * cin * k || (B && numel(B) < cout)) return RAD_E_SHAPE;
     if (res && rows_of(res, cout) < r1) return RAD_E_SHAPE;
-    const int64_t pad = causal ? dil * (k - 1) : dil * (k - 1) / 2, KK = k * cin;
+    const int64_t pad = causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2, KK = k * cin;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
     static thread_local std::vector<float> ybuf;
 
@@ -264,8 +273,8 @@ AVX_KERNEL(conv1d) {
     const uint32_t adt = b16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32;
     const size_t ael = b16 ? 2 : 4;
     /* A 1-wide kernel's patch row is x's own row. */
-    const bool direct = k == 1 && X->rank == 2 && X->shape[1] == cin && X->stride[1] == 1 &&
-                        (X->dtype == RAD_BF16 || X->dtype == RAD_F32);
+    const bool direct = k == 1 && st == 1 && X->rank == 2 && X->shape[1] == cin &&
+                        X->stride[1] == 1 && (X->dtype == RAD_BF16 || X->dtype == RAD_F32);
     const int64_t band = band_rows(KK, cout, r1 - r0);
     if (!direct) pbuf.resize((size_t)(band * KK) * ael + 64);
     ybuf.resize((size_t)(band * cout) + 16);
@@ -282,10 +291,10 @@ AVX_KERNEL(conv1d) {
             pt = mat_view(pp, adt, nb, KK);
             AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
             for (int64_t p = 0; p < nb; ++p) {
-                const int64_t r = b0 + p, e = seq_of(cu, n_seq, r);
-                const int64_t s0 = cu_at(cu, e), s1 = cu_at(cu, e + 1);
+                const int64_t r = b0 + p, e = seq_of(cu, n_seq, r * st * cd);
+                const int64_t s0 = cu_at(cu, e) / cd, s1 = cu_at(cu, e + 1) / cd;
                 for (int64_t t = 0; t < k; ++t) {
-                    const int64_t ir = r + t * dil - pad;
+                    const int64_t ir = r * st + t * dil - pad;
                     patch_slot(X, ir, cin, ir >= s0 && ir < s1, b16,
                                pp + (size_t)(p * KK + t * cin) * ael);
                 }
@@ -590,8 +599,10 @@ AVX_KERNEL(cfg_topk_sample) {
     const int64_t sup_lo = p_int(a, "sup_lo", 0), sup_hi = p_int(a, "sup_hi", 0);
     const float cfg = p_f32(a, "cfg", 1.0f), temp = p_f32(a, "temp", 1.0f);
     const float pen = p_f32(a, "penalty", 1.0f);
+    const double top_p = (double)p_f32(a, "top_p", 1.0f);
     if (V <= 0 || K <= 0 || K > V || rep < 1 || rep > 2 || ck < 0 || ck > V || !(temp > 0) ||
-        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane))
+        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane) ||
+        !(top_p >= 0))
         return RAD_E_SHAPE;
     const int64_t n = numel(ids) / rep;
     if (n <= 0 || rows_of(lg, V) < rep * n || numel(fr) < n || numel(seed) < 2 * n ||
@@ -650,11 +661,29 @@ AVX_KERNEL(cfg_topk_sample) {
         } else {
             for (int64_t j = 0; j < V; ++j) if (open(j)) idx[nc++] = j;
         }
-        const int64_t kk = std::min(K, nc);
+        /* top_p's normaliser over every candidate in index order (idx still is), as libref. */
+        double z = 0;
+        if (top_p < 1.0) {
+            float gm = g[idx[0]];
+            for (int64_t t = 1; t < nc; ++t) gm = std::max(gm, g[idx[t]]);
+            const float m0 = gm / temp;
+            for (int64_t t = 0; t < nc; ++t) z += std::exp((double)(g[idx[t]] / temp - m0));
+        }
+        int64_t kk = std::min(K, nc);
         std::partial_sort(idx, idx + kk, idx + nc, [g](int64_t p, int64_t q) {
             return g[p] > g[q] || (g[p] == g[q] && p < q);
         });
         const float m = g[idx[0]] / temp;
+        if (top_p < 1.0) {
+            double cum = 0;
+            int64_t keep = 1;
+            for (int64_t t = 0; t < kk; ++t) {
+                cum += std::exp((double)(g[idx[t]] / temp - m)) / z;
+                if (t > 0 && cum > top_p) break;
+                keep = t + 1;
+            }
+            kk = keep;
+        }
         double tot = 0;
         for (int64_t t = 0; t < kk; ++t) {
             e[t] = std::exp((double)(g[idx[t]] / temp - m));
@@ -693,17 +722,18 @@ AVX_KERNEL(rvq_embed) {
     const int64_t D = p_int(a, "n_embd", 0), K = p_int(a, "n_codes", 0);
     const int64_t voc = p_int(a, "vocab", 0), off0 = p_int(a, "off0", 0);
     const float scale = p_f32(a, "scale", 1.0f);
-    const int64_t round1 = p_int(a, "round", 0);
-    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1) return RAD_E_SHAPE;
+    const int64_t round1 = p_int(a, "round", 0), clamp = p_int(a, "clamp", 0);
+    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1 || clamp < 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, D);
     if (rows <= 0 || numel(codes) < K * rows) return RAD_E_SHAPE;
     const int64_t n0 = rows_of(t0, D), n1 = rows_of(t1, D);
+    auto cl = [clamp](int64_t c) { return clamp > 0 && c > clamp - 1 ? clamp - 1 : c; };
     /* Code (k, r): a codebook's row at the plane's own pitch, a frame's code at its own stride. */
     const int64_t kp = codes->rank >= 2 ? codes->stride[codes->rank - 2] : rows;
     const int64_t rp = codes->rank >= 1 ? codes->stride[codes->rank - 1] : 1;
     AVX_PARALLEL_FOR_IF(rows * D * K >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
-        const int64_t c0 = ld_int_dt(codes->dtype, codes->data, r * rp) + off0;
+        const int64_t c0 = cl(ld_int_dt(codes->dtype, codes->data, r * rp)) + off0;
         if (c0 < 0 || c0 >= n0) continue;
         float* acc = scratch_f32((size_t)D + 16);
         float* buf = scratch_f32_b((size_t)D + 16);
@@ -716,7 +746,7 @@ AVX_KERNEL(rvq_embed) {
         }
         for (int64_t k = 1; k < K; ++k) {
             const int64_t cb =
-                ld_int_dt(codes->dtype, codes->data, k * kp + r * rp) + (k - 1) * voc;
+                cl(ld_int_dt(codes->dtype, codes->data, k * kp + r * rp)) + (k - 1) * voc;
             if (cb < 0 || cb >= n1) continue;
             const float* tr = in_row(t1, rowoff(t1, cb, D), D, buf);
             for (int64_t d = 0; d < D; ++d) acc[d] += tr[d];
@@ -732,6 +762,70 @@ AVX_KERNEL(rvq_embed) {
         narrow_row(RAD_BF16, acc, D, tmp);
         for (int64_t d = 0; d < D; ++d) acc[d] *= scale;
         out_row(Y, rowoff(Y, r, D), D, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vq_encode */
+/* libref's step a row at a time: e as dim dot products over x's row, the codebook normalised once
+ * a launch (F.normalize's division) and scored against e normalised, ties to the lower index, the
+ * chosen raw row's out-projection subtracted and the row rounded once into x. */
+AVX_KERNEL(vq_encode) {
+    if (!rad_args_have(a, 7)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *iw = &a->t[1], *ib = &a->t[2], *cb = &a->t[3];
+    const RadTensor *ow = &a->t[4], *ob = &a->t[5], *codes = &a->t[6];
+    const int64_t n = p_int(a, "n", 0), dim = p_int(a, "dim", 0), bins = p_int(a, "bins", 0);
+    if (n <= 0 || dim <= 0 || bins <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0 || numel(codes) < rows || numel(iw) < dim * n || numel(ib) < dim ||
+        numel(cb) < bins * dim || numel(ow) < n * dim || numel(ob) < n)
+        return RAD_E_SHAPE;
+    /* The weights dense in f32, held by this thread for the launch's parallel region. */
+    auto dense = [](const RadTensor* t, int64_t m) {
+        std::vector<float> v((size_t)m);
+        for (int64_t i = 0; i < m; ++i) v[(size_t)i] = ldt(t, i);
+        return v;
+    };
+    const std::vector<float> wi = dense(iw, dim * n), bi = dense(ib, dim);
+    const std::vector<float> raw = dense(cb, bins * dim), wo = dense(ow, n * dim), bo = dense(ob, n);
+    std::vector<float> cn((size_t)(bins * dim));
+    for (int64_t c = 0; c < bins; ++c) {
+        const float* cr = raw.data() + c * dim;
+        float ss = 0.0f;
+        for (int64_t j = 0; j < dim; ++j) ss += cr[j] * cr[j];
+        const float nrm = std::max(std::sqrt(ss), 1e-12f);
+        for (int64_t j = 0; j < dim; ++j) cn[(size_t)(c * dim + j)] = cr[j] / nrm;
+    }
+    const float *Wi = wi.data(), *Bi = bi.data(), *Raw = raw.data(), *Cn = cn.data();
+    const float *Wo = wo.data(), *Bo = bo.data();
+    AVX_PARALLEL_FOR_IF(rows * (2 * n + bins) * dim >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n);
+        const float* xv = in_row(X, xb, n, scratch_f32((size_t)n + 16));
+        float* e = scratch_f32_c((size_t)dim + 16);
+        float ss = 0.0f;
+        for (int64_t j = 0; j < dim; ++j) {
+            e[j] = dotf(Wi + j * n, xv, n) + Bi[j];
+            ss += e[j] * e[j];
+        }
+        const float nrm = std::max(std::sqrt(ss), 1e-12f);
+        for (int64_t j = 0; j < dim; ++j) e[j] /= nrm;
+        int64_t best = 0;
+        float bs = -INFINITY;
+        for (int64_t c = 0; c < bins; ++c) {
+            float s = 0.0f;
+            for (int64_t j = 0; j < dim; ++j) s += e[j] * Cn[c * dim + j];
+            if (s > bs) { bs = s; best = c; }
+        }
+        st_int_dt(codes->dtype, codes->data, offlin(codes, r), best);
+        float* y = scratch_f32_b((size_t)n + 16);
+        const float* row = Raw + best * dim;
+        for (int64_t d = 0; d < n; ++d) {
+            float q = 0.0f;
+            for (int64_t j = 0; j < dim; ++j) q += Wo[d * dim + j] * row[j];
+            y[d] = xv[d] - (q + Bo[d]);
+        }
+        out_row(X, xb, n, y);
     }
     return RAD_OK;
 }
@@ -785,6 +879,42 @@ AVX_KERNEL(frame_mix_store) {
         narrow_row(RAD_BF16, acc, D, tmp);
         for (int64_t d = 0; d < D; ++d) acc[d] *= scale;
         out_row(dst, rowoff(dst, row, D), D, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ ras_pick */
+/* libref's rule: the first draw unless it lies in [lo, hi) and the lane's window of its last `win`
+ * picks holds it, then the alternative; the pick enters the window. Lanes are checked before
+ * anything is written and run in order, as two entries may share a lane's window. */
+AVX_KERNEL(ras_pick) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *first = &a->t[0], *alt = &a->t[1], *lane = &a->t[2], *hist = &a->t[3];
+    const RadTensor* ids = &a->t[4];
+    const int64_t W = p_int(a, "win", 0), lo = p_int(a, "lo", 0), hi = p_int(a, "hi", 0);
+    const int64_t rep = p_int(a, "rep", 1), clear = p_int(a, "clear", 0);
+    const int64_t n = numel(lane);
+    if (W <= 0 || lo < 0 || hi < lo || rep < 1 || clear < 0 || clear > 1 || n <= 0 ||
+        numel(first) < rep * n || numel(alt) < rep * n || numel(ids) < rep * n)
+        return RAD_E_SHAPE;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t L = at(lane, i);
+        if (L < 0 || (L + 1) * W > numel(hist)) return RAD_E_SHAPE;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t hb = at(lane, i) * W;
+        if (clear)
+            for (int64_t w = 0; w < W; ++w) st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), -1);
+        const int64_t f = at(first, rep * i);
+        int64_t pick = f;
+        if (f >= lo && f < hi)
+            for (int64_t w = 0; w < W; ++w)
+                if (at(hist, hb + w) == f) { pick = at(alt, rep * i); break; }
+        for (int64_t r = 0; r < rep; ++r)
+            st_int_dt(ids->dtype, ids->data, offlin(ids, rep * i + r), pick);
+        for (int64_t w = 0; w + 1 < W; ++w)
+            st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), at(hist, hb + w + 1));
+        st_int_dt(hist->dtype, hist->data, offlin(hist, hb + W - 1), pick);
     }
     return RAD_OK;
 }
@@ -1122,6 +1252,19 @@ AVX_KERNEL(int_affine) {
         const int64_t v = src[j] < 0 ? 0 : at(X, src[j]);
         st_int_dt(Y->dtype, Y->data, offlin(Y, j), v * mul[j] + add[j]);
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ sub_i32 */
+/* y[i] = x[i] - s[0], int32. */
+AVX_KERNEL(sub_i32) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *S = &a->t[1], *Y = &a->t[2];
+    const int64_t n = numel(Y);
+    if (n <= 0 || numel(X) < n || numel(S) < 1) return RAD_E_SHAPE;
+    const int64_t s0 = at(S, 0);
+    for (int64_t i = 0; i < n; ++i)
+        st_int_dt(Y->dtype, Y->data, offlin(Y, i), (int64_t)(int32_t)(at(X, i) - s0));
     return RAD_OK;
 }
 

@@ -24,6 +24,7 @@
 #include "../rad_internal.h"
 #include "../rad_core.h"
 #include "safetensors.h"
+#include "torch_zip.h"
 #include "../text/gguf.h"
 
 #include <deque>
@@ -187,6 +188,7 @@ private:
     int open_diffusers();
     int open_sgm();
     int add_companions();
+    int add_torch_files();
     int open_gguf(const std::string& path);
     void detect_import();
 
@@ -195,6 +197,7 @@ private:
     GgufFile    gguf_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
+    std::vector<std::unique_ptr<TorchZipFile>>    torch_;
     std::vector<SrcTensor> tensors_;
     std::unordered_map<std::string, size_t> index_;
     std::unordered_map<std::string, size_t> index_shard_;   /* name -> shards_ position */
@@ -262,10 +265,9 @@ struct CkptWeight {
      * values in the logical shape, which ckpt_rows_f32 serves. Not trivial, so a recipe rule
      * stores it. */
     std::vector<float> derived;
-    /* An `import` rule's form, applied by ckpt_plane_rows (also `imported`). `rounded` counts the
-     * shipped scales `form.scale` does not hold exactly and `max_rel` is their largest relative
-     * change, both found by ckpt_import_form. */
-    bool        reform = false;
+    /* An `import` rule's form, applied by ckpt_plane_rows (the weight is then `imported`).
+     * `rounded` counts the shipped scales `form.scale` does not hold exactly and `max_rel` is their
+     * largest relative change, both found by ckpt_import_form. */
     ImportForm  form{};
     int64_t     rounded = 0;
     double      max_rel = 0;

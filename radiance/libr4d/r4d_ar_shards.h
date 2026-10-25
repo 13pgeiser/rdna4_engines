@@ -11,27 +11,36 @@
 // crosses, not its fold (fp32, ascending rank), so every table gives the same bits.
 #include <cstdlib>
 
-#define R4D_AR8_SHARD_WEIGHTS_ENV "RADIANCE_AR8_SHARD_WEIGHTS"
-#define R4D_AR8_PIECES_ENV "RADIANCE_AR8_PIECES"
-// The eight-rank two-shot's form (r4d_ar_twoshot_Nrank_exact.hip): lockstep (unset, the one
-// handshake a step), ring (the first hop sent to the ranks in ring order from the next one) or
-// split (ring, and a flag after each half of a step, each awaited only where its data is read).
-// Every form folds the same words in the same order, so all give the same bits.
-#define R4D_AR8_FORM_ENV "RADIANCE_AR8_FORM"
-// Below these message sizes (elements) the weights and the pieces do not apply: a decode-sized
-// message pays more for the extra handshakes and the uneven split than its link time saves
-// (measured on the eight R9700: 196608 elements run fastest even and in one piece, 524288 already
-// gain from weights and two pieces).
-#define R4D_AR8_SHARD_WEIGHTS_MIN_ENV "RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS"
-#define R4D_AR8_PIECES_MIN_ENV "RADIANCE_AR8_PIECES_MIN_ELEMS"
+// Below R4D_AR8_MIN_ELEMS_DEFAULT elements the weights and the pieces do not apply: a
+// decode-sized message pays more for the extra handshakes and the uneven split than its link time
+// saves (measured on the eight R9700: 196608 elements run fastest even and in one piece, 524288
+// already gain from weights and two pieces).
+// The eight-rank two-shot's form, its launch parameter `form` (r4d_ar_twoshot_Nrank_exact.hip):
+// lockstep (one handshake a step), ring (the first hop sent to the ranks in ring order from the
+// next one) or split (ring, and a flag after each half of a step, each awaited only where its data
+// is read). Every form folds the same words in the same order, so all give the same bits. The
+// engine runs lockstep; the other two exist to time a board (r4d_selftest --perfar8).
 enum { R4D_AR8_FORM_LOCKSTEP = 0, R4D_AR8_FORM_RING = 1, R4D_AR8_FORM_SPLIT = 2 };
 enum {
   R4D_AR_SHARD_WEIGHT_MAX = 65535,
   R4D_AR8_MIN_ELEMS_DEFAULT = 262144,
-  R4D_AR8_MIN_ELEMS_MAX = 268435456,  // the two-shot band's top (r4d.h)
 };
 
-// The piece count when RADIANCE_AR8_PIECES is unset, by message size in elements: more pieces
+// The eight-rank two-shot's settings. The engine runs the defaults: weights from each card's
+// slowest PCIe hop (r4d_ar_weights_from_rates, r4d_ar_links.h), the piece count from the message
+// size (r4d_ar8_auto_pieces), both from R4D_AR8_MIN_ELEMS_DEFAULT elements. r4d_selftest sets
+// others through r4d_ar8_test_settings (r4d.h) to check unequal and empty shards, fixed piece
+// counts and the floors, and to time another board's weights.
+enum { R4D_AR8_WEIGHTS_AUTO = 0, R4D_AR8_WEIGHTS_EVEN = 1, R4D_AR8_WEIGHTS_SET = 2 };
+struct R4DAr8Settings {
+  int weights = R4D_AR8_WEIGHTS_AUTO;
+  int w[8] = { 0 };       // R4D_AR8_WEIGHTS_SET: the eight weights
+  int pieces = 0;         // 0: r4d_ar8_auto_pieces
+  long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
+  long long pieces_min = R4D_AR8_MIN_ELEMS_DEFAULT;
+};
+
+// The piece count when none is set, by message size in elements: more pieces
 // shorten the one-way first and last steps ((K+1)/K of the link time) but add a handshake each,
 // which only a large message amortises (measured at 4,1,0,4,0,1,4,4: K2 best at 524288, K4 at
 // 2097152, K8 at 8388608).
@@ -53,19 +62,6 @@ inline int r4d_ar8_form_parse(const char* s) {
     if (!*a && !*b) return f;
   }
   return -1;
-}
-
-// A non-negative decimal integer of at most `max`, nothing else.
-inline bool r4d_ar_parse_count(const char* s, long long max, long long* out) {
-  if (!s || *s < '0' || *s > '9') return false;
-  long long v = 0;
-  while (*s >= '0' && *s <= '9') {
-    v = v * 10 + (*s++ - '0');
-    if (v > max) return false;
-  }
-  if (*s) return false;
-  *out = v;
-  return true;
 }
 
 // `ws` non-negative integers separated by commas, each at most R4D_AR_SHARD_WEIGHT_MAX, summing

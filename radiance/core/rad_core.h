@@ -129,6 +129,8 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
+/* --attn-prefill-fp8's spelling of RAD_ATTN_FP8_* bits: off, qk, pv or both. */
+const char* attn_prefill_fp8_name(int bits);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
@@ -390,6 +392,8 @@ public:
      * for drafters that did not ask. */
     bool           drafter_shared_kv = false;
     int32_t        drafter_pos_offset = 0;
+    /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
+    int64_t        drafter_short_block = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -414,7 +418,8 @@ public:
      * strings point at `agen_str`, as the image generator's do at `gen_str`. */
     RadAudioGenDecl audio_gen{};
     struct AudioGenStrings {
-        std::string name, tmpl, tmpl_plain, neg_tmpl;   /* "" for an absent template */
+        /* "" for an absent template; tmpl_ref and ref_item RadAudioGenDecl's references */
+        std::string name, tmpl, tmpl_plain, neg_tmpl, tmpl_ref, ref_item;
     } agen_str;
     bool is_audio_generator() const { return audio_gen.max_lanes != 0; }
     /* The declared video generator (rad_declare_video_generator); `max_lanes` 0 when none. */
@@ -456,6 +461,14 @@ public:
      * region safely through in-order launch; a second lane is a second stream and needs its own.
      * Two when the architecture declared a buffer rad_buf_concurrent. */
     int32_t scratch_regions = 1;
+    /* Region 1's size when there are two: the largest device scratch of an op the second lane may
+     * issue. By Ctx::lane1_'s rule 3 such an op touches only rad_buf_concurrent buffers, so an op
+     * with any other transient buffer never runs there; one naming no transient buffer counts.
+     * At most scratch_bytes; -1 (a program not built by the Builder) means scratch_bytes. */
+    int64_t scratch_bytes_lane1 = -1;
+    /* The second lane's window (rad_lane1_window_begin): the first and last op handle lane 1 may run;
+     * -1 when the architecture declared none (concurrent buffers then live for the whole program). */
+    int32_t lane1_w0 = -1, lane1_w1 = -1;
 
     /* Everything that resolved to nothing, reported whole rather than stopping at the first
      * failure (spec §3.1). Structured because the domains are reported differently: a device miss
@@ -620,11 +633,22 @@ struct SamplingParams {
 
     /* The control vector (core/cvec.h): whether this request's steps project the vector found for
      * this deployment out of the residual stream. The server sets it from the request's
-     * `control_vector` field (`experimental_speed_projection` is Strata's spelling of the same
-     * switch), or from the deployment's runtime default when the request names none; it needs no
-     * reload and leaves the graph untouched. A deployment with no vector refuses `true` at
-     * admission rather than serving the stock model. */
+     * `control_vector` field, or from the deployment's runtime default when the request names
+     * none. A deployment with no vector refuses `true` at admission. */
     bool   use_control_vector = false;
+    /* The windowed no-repeat-ngram ban (core/sample/sampler.h, `sample_ngram_ban`): a token that
+     * would complete an `ngram_ban_n`-gram already present in the last `ngram_window` tokens of
+     * the sequence is banned. `ngram_ban_n` 0 is off, the default; `ngram_window` <= 0 searches
+     * the whole staged history (the un-windowed processor). Unlimited-OCR's generation_config
+     * asks for 35 and 128 (the model card's document mode uses 1024). */
+    int    ngram_ban_n = 0;
+    int    ngram_window = 0;
+    /* The ids exempt from that ban: the reference processor's whitelist
+     * (SlidingWindowNoRepeatNgramProcessor's `whitelist_token_ids`, whose set is removed from
+     * the banned set after it is built -- modeling_unlimitedocr.py:359,379). Global token ids,
+     * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
+     * no-whitelist form. */
+    std::vector<int32_t> ngram_whitelist;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -741,6 +765,9 @@ struct Config {
      * element plus a bf16 scale per 64) instead of 16 bits per element, 2.4x fewer bytes over
      * PCIe. The received sum then differs undetectably, hence a named flag, not a heuristic. */
     int   tp_wire_exact = 1;          /* --tp-wire exact|wht6 */
+    /* --tp-attn-split heads|rows: 1 runs a prefill-sized step's attention by rows over the ranks
+     * (RadBuildCtx::tp_attn_rows). Not bit-identical to the head split, so heads is the default. */
+    int   tp_attn_rows = 0;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -787,6 +814,11 @@ struct Config {
      * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
      * another name. */
     std::string kv_cache_dtype = "bf16";
+    std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
+    /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
+     * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
+     * attn_prefill_fp8_name() spells it as the flag does. */
+    int attn_prefill_fp8 = 0;
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
@@ -881,6 +913,14 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
+     * the step just run; 0 never. Ignored without a drafter that declares one. */
+    int64_t draft_short_from = 0;       /* --draft-short-from */
+
+    /* --draft-coupling off|on: a linear serial drafter samples its proposals and the sampler
+     * applies the maximal coupling at the verify (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
+     * Off by default; on changes which tokens a fixed seed yields, not their law. */
+    bool        draft_coupling = false;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

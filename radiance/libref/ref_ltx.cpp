@@ -327,8 +327,8 @@ int ref_s2d3d(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ pix_patch / patch_pix8 */
-/* LTX-2's patchifier, both ways, over dense 2-D operands whose shapes give the sizes. A patch of
+/* ------------------------------------------------------------------ pix_patch */
+/* LTX-2's patchifier over dense 2-D operands whose shapes give the sizes. A patch of
  * p x p pixels of C channels is one row of C p p values, channel c's offset (ph, pw) at
  * c p p + pw p + ph with `order` wh (LTX-2's: the column offset outer) or c p p + ph p + pw with
  * hw.
@@ -355,36 +355,6 @@ int ref_pix_patch(const RadArgs* a, RadStream) {
             for (int64_t c = 0; c < C; ++c)
                 stt(Y, (y / p) * yr + (x / p) * C * p * p + patch_col(c, y % p, x % p, p, wh),
                     ldt(X, y * xr + x * C + c));
-    return RAD_OK;
-}
-
-/* patch_pix8: patch rows x [R, w C p p] (R a frame's patch rows times its frames) to RGB bytes
- * y [R p, w p C], each byte round(255 clamp(rd(rd(clamp(v, -1, 1) / 2) + 0.5), 0, 1)) with rd
- * x's dtype, to_rgba8's rule. */
-int ref_patch_pix8(const RadArgs* a, RadStream) {
-    if (!have(a, 2)) return RAD_E_INVAL;
-    const RadTensor *X = &a->t[0], *Y = &a->t[1];
-    const int64_t p = p_int(a, "p", 0), C = p_int(a, "C", 0);
-    const bool wh = std::strcmp(p_str(a, "order", "wh"), "hw") != 0;
-    if (p <= 0 || C <= 0 || X->rank != 2 || Y->rank != 2 || Y->dtype != RAD_U8 ||
-        X->shape[1] % (C * p * p))
-        return RAD_E_SHAPE;
-    const int64_t R = X->shape[0], w = X->shape[1] / (C * p * p);
-    if (R <= 0 || w <= 0 || Y->shape[0] != R * p || Y->shape[1] != w * p * C) return RAD_E_SHAPE;
-    const int64_t xr = X->stride[0], yr = Y->stride[0];
-    const uint32_t dt = X->dtype;
-    uint8_t* yb = (uint8_t*)Y->data;
-    REF_PAR_FOR(R * p * w * p * C)
-    for (int64_t y = 0; y < R * p; ++y)
-        for (int64_t x = 0; x < w * p; ++x)
-            for (int64_t c = 0; c < C; ++c) {
-                const float v = ldt(X, (y / p) * xr + (x / p) * C * p * p +
-                                           patch_col(c, y % p, x % p, p, wh));
-                const float cl = std::min(std::max(v, -1.0f), 1.0f);
-                float u = round_dt(dt, round_dt(dt, cl / 2.0f) + 0.5f);
-                u = std::min(std::max(u, 0.0f), 1.0f);
-                yb[y * yr + x * C + c] = (uint8_t)std::nearbyint(u * 255.0f);
-            }
     return RAD_OK;
 }
 
@@ -522,7 +492,7 @@ int ref_tile_crop(const RadArgs* a, RadStream) {
  *
  * and across time blend_t: frame f of band kt, f < et = min(F of band kt-1, F of band kt,
  * (tile_t - stride_t) scale_t), is mix(S_{kt-1}[F_{kt-1} - et + f], S_kt[f], f, et). The byte is
- * patch_pix8's, round(255 clamp(rd(rd(clamp(v, -1, 1) / 2) + 0.5), 0, 1)). y is u8
+ * to_rgba8's, round(255 clamp(rd(rd(clamp(v, -1, 1) / 2) + 0.5), 0, 1)). y is u8
  * [n (H scale p), (W scale p) C], frames first .. first + n - 1. A tile above, to the left or
  * before is never short enough for its own blends to reach the margin read here (a tile not last
  * on its axis spans more than `stride`), so these are the reference's values exactly. */

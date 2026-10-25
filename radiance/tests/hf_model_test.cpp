@@ -219,6 +219,41 @@ TEST(a_restart_serves_the_complete_copy_when_the_hub_cannot_be_reached) {
     }
 }
 
+/* A hub whose repo holds safetensors beside a torch copy of the same weights and a codec that only
+ * ships as a .pth: the copies (pytorch_model*.pth, a pickle .bin) are skipped, the codec is
+ * fetched, since the checkpoint reader reads it (core/format/torch_zip.h). */
+const char* kCodecRepo =
+    "#!/bin/sh\n"
+    "out=''; url=''; prev=''\n"
+    "for a in \"$@\"; do\n"
+    "  [ \"$prev\" = -o ] && out=\"$a\"\n"
+    "  case \"$a\" in https://*) url=\"$a\";; esac\n"
+    "  prev=\"$a\"\n"
+    "done\n"
+    "case \"$url\" in *api/models*)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"model.safetensors\",\"size\":3},"
+    "{\"type\":\"file\",\"path\":\"codec.pth\",\"size\":3},"
+    "{\"type\":\"file\",\"path\":\"pytorch_model.pth\",\"size\":3},"
+    "{\"type\":\"file\",\"path\":\"pytorch_model.bin\",\"size\":3}]'; exit 0;; esac\n"
+    "[ -n \"$out\" ] && printf abc > \"$out\"\n"
+    "exit 0\n";
+
+TEST(a_pth_that_is_not_the_weights_again_is_fetched_beside_the_safetensors) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    FakeCurl curl(kCodecRepo);
+    const std::string cmd = "sh '" + hfget_beside_this_binary() +
+                            "' radiance-test-owner/radiance-test-model '" + root.path +
+                            "' >/dev/null 2>&1";
+    CHECK_EQ(std::system(cmd.c_str()), 0);
+    CHECK(fs::exists(root.path + "/model.safetensors"));
+    CHECK(fs::exists(root.path + "/codec.pth"));
+    CHECK(!fs::exists(root.path + "/pytorch_model.pth"));
+    CHECK(!fs::exists(root.path + "/pytorch_model.bin"));
+}
+
 /* With no --download-dir and neither XDG_CACHE_HOME nor HOME there is nowhere to fetch to, which
  * is refused by name before anything runs. */
 TEST(a_repo_id_with_nowhere_to_fetch_to_is_refused) {

@@ -18,7 +18,8 @@ live in `scripts/`:
 | [`scripts/`](#the-shell-harnesses) | bring a model up, measure it, assert on what comes back |
 
 [`rad-avx-check`](#rad-avx-check), which checks a host kernel library against libref without a GPU,
-is built beside libavx rather than installed.
+is built beside libavx rather than installed, and [`r4d_selftest`](#r4d_selftest), libr4d's own
+check and kernel timer, into the build's `bin/`.
 
 `rad-convert`, `rad-kbench` and `rad-tune` run the engine's startup with a different last step:
 the same plugins, in the same hierarchy, through the same declare phase, so they resolve kernels
@@ -727,6 +728,28 @@ serves fails in either case: the selector would resolve to it and the step would
 
 ---
 
+## r4d_selftest
+
+```
+r4d_selftest <libr4d.so> [--case <row>]
+r4d_selftest <libr4d.so> --perf N K M [iters]      (and the other --perf* modes in its usage text)
+```
+
+With no mode it runs libr4d's catalogue and static checks, then each row's smoke and numeric cases
+in a child process of its own, the fusion claims compared byte for byte (ctest runs it as
+`r4d_selftest`, labels `slow`, `gpu`); `--case` runs one row in this process, as the reproducer.
+The `--perf*` modes time rows at one shape on a card. Two that cover the dense GEMMs:
+
+| | |
+|---|---|
+| `--perf N K M [iters]` | the fp8 decode GEMMs, and the fp8 head (`logits_gemm_fp8`) |
+| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches |
+
+`--perfmx` is the MXFP4 expert GEMM (`M`, experts, `top_k`, skew), not the dense rows. `--cold MIB`
+times each launch alone behind a cache flush instead of back to back.
+
+---
+
 ## rad-tokcheck
 
 ```
@@ -794,9 +817,8 @@ The mode changes these settings itself:
 Everything else comes from the command line: run every candidate with the same flags, and the
 reference with the exact wire and a bf16 KV cache.
 
-The control vector's switch is per request, and KLD mode serves none, so a deployment that has one
-loaded is scored with it **off**. `--control-vector on` starts the deployment default on, which is how
-the projection itself is scored (the switch still decides per request, and a request's false wins).
+A loaded control vector is applied at the deployment's default: `--control-vector on` scores every
+document with the projection, `--control-vector off` without it.
 
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be

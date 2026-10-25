@@ -134,7 +134,7 @@ static size_t json_depth(const ojson& root) {
 /* The conversation with every system message merged, in order, into one at its head, or false
  * when that is the conversation already (none, or one leading) or a system message carries more
  * than text. The Chat Completions API places no constraint on system messages, while many
- * templates raise unless there is exactly one, first (#137). */
+ * templates raise unless there is exactly one, first. */
 static bool lead_system(const ojson& messages, ojson* out) {
     if (!messages.is_array()) return false;
     std::string text;

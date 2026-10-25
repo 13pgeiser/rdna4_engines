@@ -124,7 +124,7 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
 
     /* Declared before kv_store, which reads back the resolved `block_size` (rad_block_attn_gated.h
      * explains declare vs issue order). */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
+    op_attn = rw(b, decl_attn(b, g, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0), RAD_INT("n_head", g.n_head),

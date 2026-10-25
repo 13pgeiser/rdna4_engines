@@ -46,6 +46,10 @@ struct Layer {
 struct Model {
     Names nm{};
     Geom g{};
+    /* The MLA's split of a prefill-sized step under TP (RadBuildCtx::tp_attn_rows). The head
+     * form declares none of the row form's full-width weights (1.29 GiB a card at eight ranks);
+     * the row form is opt-in because it is not bit-identical to it (docs/ARCHITECTURES.md). */
+    GlmMla::Form form = GlmMla::Form::heads;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
@@ -102,7 +106,11 @@ static int stream_buffers(RadBuilder* b, Model& m) {
     m.h0 = decl_b(b, nm.f("manifold"), RAD_BF16, { T, 16384 });
     m.h1 = decl_b(b, nm.f("manifold_mid"), RAD_BF16, { T, 16384 });
     m.x = decl_b(b, nm.f("collapsed"), RAD_BF16, { T, 4096 });
-    m.y = decl_b(b, nm.f("attn_delta"), RAD_BF16, { T, 4096 });
+    /* The MLA row form gathers every rank's run at full length, so its output is rounded up to
+     * whole runs; the head form keeps the step's rows. */
+    const bool rows = g.world > 1 && m.form == GlmMla::Form::rows;
+    m.y = decl_b(b, nm.f("attn_delta"), RAD_BF16,
+                 { rows ? g.world * GlmMla::rows_for(T, g.world) : T, 4096 });
     m.post = decl_b(b, nm.f("post"), RAD_F32, { T, 4 });
     m.comb = decl_b(b, nm.f("mix"), RAD_F32, { T, 16 });
     m.act.x = decl_b(b, nm.f("normalized"), RAD_BF16, { T, 4096 });
@@ -132,9 +140,9 @@ static int kda_buffers(RadBuilder* b, Model& m) {
     kw.core.out = bf("recurrent_out", W);
     return RAD_OK;
 }
-/* The head form's buffers, then the selection planes the indexer writes and the MLA reads. Under
- * TP the selection planes hold every rank's run of rows, which can reach past the step
- * (DsaCache::part_rows). */
+/* The head form's buffers, then the selection planes the indexer writes and the MLA reads, then
+ * the row form's (Model::form). Under TP the selection planes hold every rank's run of rows,
+ * which can reach past the step (DsaCache::part_rows). */
 static int mla_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -160,6 +168,16 @@ static int mla_buffers(RadBuilder* b, Model& m) {
     const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
     aw.core.selected = decl_b(b, nm.f("selected"), RAD_I32, { TQ, 513 });
     aw.core.length = decl_b(b, nm.f("length"), RAD_I32, { TQ });
+    if (g.world > 1 && m.form == GlmMla::Form::rows) {
+        auto& rows = aw.rows;
+        const int64_t R = GlmMla::rows_for(T, g.world);
+        rows.q = decl_b(b, nm.f("rows_query"), RAD_BF16, { R, 16384 });
+        rows.q_latent = decl_b(b, nm.f("rows_q_latent"), RAD_BF16, { R, 64, 512 });
+        rows.attn_latent = decl_b(b, nm.f("rows_attn_latent"), RAD_BF16, { R, 64, 512 });
+        rows.attn.x = decl_b(b, nm.f("rows_expanded"), RAD_BF16, { R, 16384 });
+        RAD_ARCH_TRY(rows.attn.declare_qs(b, nm, g, "rows_expanded", 16384, R));
+        rows.out = decl_b(b, nm.f("rows_out"), RAD_BF16, { R, 4096 });
+    }
     return RAD_OK;
 }
 static int indexer_buffers(RadBuilder* b, Model& m) {
@@ -292,7 +310,10 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         decl_w(b, nn, RAD_F32, { 4096 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     RAD_ARCH_TRY(lay.norm.declare(b, g, gain, input, m.act, 4096));
     if (lay.full) {
-        RAD_ARCH_TRY(lay.mla.declare(b, nm, g, l, m.aw, ap, m.latent, true, true));
+        // The MTP layer keeps the head form: its row form would cost another 126 MB a card.
+        auto aw = m.aw;
+        if (draft) aw.rows = {};
+        RAD_ARCH_TRY(lay.mla.declare(b, nm, g, l, aw, ap, m.latent, true, true));
         DsaCache::Config c;
         c.blocks = (g.max_ctx + 3) / 4 + 1;
         c.work = (g.max_tok + 3) / 4 + g.max_seqs;
@@ -386,18 +407,50 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
-    if (!GlmTp::world_ok(world) || meta->n_embd != 4096 || meta->n_layers != 45 ||
-        meta->n_vocab != 154880 || cfg(meta, "num_nextn_predict_layers", 0) != 1 ||
-        cfg(meta, "hc_mult", 0) != 4 || cfg(meta, "n_routed_experts", 0) != 288 ||
-        cfg(meta, "index_topk", 0) != 2048 || ctx->max_spec > 31 ||
-        (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16))
+    if (!GlmTp::world_ok(world)) {
+        fprintf(stderr, "radiance: glm5next: --tp %d; the head, KDA channel and expert splits of "
+                        "this plugin are built for 1, 2, 4 or 8 ranks\n", world);
         return RAD_E_UNSUPPORTED;
+    }
+    /* The graph is written for the released GLM-5.3-Flash and reads none of these from the
+     * checkpoint, so a checkpoint that differs in any of them is refused by name. */
+    const struct {
+        const char* what;
+        int64_t     got, want;
+    } shape[] = { { "hidden_size", meta->n_embd, 4096 },
+                  { "num_hidden_layers", meta->n_layers, 45 },
+                  { "vocab_size", meta->n_vocab, 154880 },
+                  { "num_nextn_predict_layers", cfg(meta, "num_nextn_predict_layers", 0), 1 },
+                  { "hc_mult", cfg(meta, "hc_mult", 0), 4 },
+                  { "n_routed_experts", cfg(meta, "n_routed_experts", 0), 288 },
+                  { "index_topk", cfg(meta, "index_topk", 0), 2048 } };
+    for (const auto& s : shape)
+        if (s.got != s.want) {
+            fprintf(stderr, "radiance: glm5next: the checkpoint's %s is %lld; this plugin serves "
+                            "the GLM-5.3-Flash geometry, where it is %lld\n",
+                    s.what, (long long)s.got, (long long)s.want);
+            return RAD_E_UNSUPPORTED;
+        }
+    if (ctx->max_spec > 31) {
+        fprintf(stderr, "radiance: glm5next: --num-speculative-tokens %d; the KDA verify pass "
+                        "takes at most 32 rows a sequence, so the MTP depth is at most 31\n",
+                ctx->max_spec);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
+        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin keeps its latent "
+                        "attention, index tail and KDA caches in bf16 and has no fp8 cache, so "
+                        "run it with --kv-cache-dtype bf16\n",
+                ctx->kv_dtype == RAD_F8E4M3 ? "fp8" : rad_dtype_name(ctx->kv_dtype));
+        return RAD_E_UNSUPPORTED;
+    }
     auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
     slot = std::make_unique<Model>();
     auto& m = *slot;
     auto& g = m.g;
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
+    m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
@@ -547,6 +600,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (k > 0) out->enc_merge = k * k;
     }
     out->shape_probe_ok = 1;
+    out->tp_attn_rows_ok = 1;
     return RAD_OK;
 }
 } // namespace glm5next

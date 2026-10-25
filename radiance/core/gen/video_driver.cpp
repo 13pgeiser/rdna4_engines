@@ -181,8 +181,6 @@ namespace {
 
 constexpr int64_t kAlign = 256;
 
-int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
-
 /* Region offsets and sizes, in the enum's order (video_driver.h), and the total; shared by the
  * allocation and the VRAM budget. */
 int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t (*bytes)[2], int n) {
@@ -210,7 +208,7 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t (*bytes)[2], in
     for (int r = 0; r < n; ++r) {
         bytes[r][0] = off;
         bytes[r][1] = want[r];
-        off = align_up(off + want[r]);
+        off = align_up(off + want[r], kAlign);
     }
     return off;
 }

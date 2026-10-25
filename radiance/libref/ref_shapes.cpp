@@ -1398,6 +1398,40 @@ int ref_chan_stats_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("chan_stats", operand, out);
 }
 
+/* The SAM tower's attention (ref_sam_attn.cpp): a row of `n_head * head_dim`, one raster
+ * grid_h x grid_w segment a cu entry, and the two rel_pos tables. Their length follows the contract
+ * in arch/common/rad_block_sam.h: 2*maxdist-1 rows with maxdist the window, or the longer grid axis
+ * for a global layer (which is the length a resampled table needs; the op resamples along dim 0
+ * either way). */
+int ref_sam_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t nh  = gi(p, n_p, "n_head", 0);
+    const int64_t gh  = gi(p, n_p, "grid_h", 0);
+    const int64_t gw  = gi(p, n_p, "grid_w", 0);
+    const int64_t win = gi(p, n_p, "window", 0);
+    if (M <= 0 || hd <= 0 || nh <= 0 || gh <= 0 || gw <= 0 || win < 0) return RAD_E_UNSUPPORTED;
+    /* A shape hook answers "describe this geometry", so an unbuildable one spells E_UNSUPPORTED
+     * (the harness convention); the kernels' own launch checks report E_SHAPE for the same
+     * inputs. */
+    const int64_t W = nh * hd;
+    const int64_t S = n_seq_of(p, n_p);
+    const int64_t maxd = win > 0 ? win : (gh > gw ? gh : gw);
+    const int64_t tab  = 2 * maxd - 1;
+    const uint32_t D = act_dt(p, n_p);
+
+    Opd o;
+    o.t(D, { M, W });                                /* q */
+    o.t(D, { M, W });                                /* k */
+    o.t(D, { M, W });                                /* v */
+    /* [0, ..., M], the batch's shape, not a draw. */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* cu_seqlens */
+    o.t(D, { M, W });                                /* out */
+    o.t(D, { tab, hd });                             /* rel_pos_h */
+    o.t(D, { tab, hd });                             /* rel_pos_w */
+    return o.finish("sam_attn", operand, out);
+}
+
 int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -1669,8 +1703,55 @@ int ref_moe_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("moe_scatter", operand, out);
 }
 
-/* `a_order` decides the activation's row count: one per token, or one per (token, slot) in
- * scatter order. */
+/* The two shape lists concatenated, with `expert_ids` named ONCE as an output -- it is what the
+ * selection writes and what the sort reads. The sort's three outputs are sized by THIS RANK'S
+ * SLICE (`n_local`, absent means the slice is the router), exactly as in libr4d's shape. */
+int ref_router_topk_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    const int64_t nl = gi(p, n_p, "n_local", ne);
+    if (M <= 0 || ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });                               /* logits */
+    o.t((uint32_t)RAD_I32, { M, k });                /* expert_ids */
+    o.t(D, { M, k });                                /* expert_w */
+    o.t((uint32_t)RAD_I32, { M * k });               /* sorted_tok */
+    o.t((uint32_t)RAD_I32, { nl + 1 });              /* expert_offset */
+    o.t((uint32_t)RAD_I32, { nl });                  /* expert_count */
+    return o.finish("router_topk_scatter", operand, out);
+}
+
+/* The router GEMM's list, the pair's list, and -- with the gate present -- the gate's one-column
+ * list, with `logits` named once as the GEMM's output. `gate_b`/`gate` come together or not: the
+ * operand count carries it, as in libr4d's shape. */
+int ref_router_gemm_topk_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t K  = gi(p, n_p, "K", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    const int64_t nl = gi(p, n_p, "n_local", ne);
+    if (M <= 0 || K <= 0 || ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, K });                                /* a */
+    o.t(D, { ne, K });                               /* b: the router */
+    o.t(D, { 1, K });                                /* gate_b: the shared expert's gate */
+    o.t(D, { M, ne });                               /* logits */
+    o.t((uint32_t)RAD_I32, { M, k });                /* expert_ids */
+    o.t(D, { M, k });                                /* expert_w */
+    o.t((uint32_t)RAD_I32, { M * k });               /* sorted_tok */
+    o.t((uint32_t)RAD_I32, { nl + 1 });              /* expert_offset */
+    o.t((uint32_t)RAD_I32, { nl });                  /* expert_count */
+    o.t(D, { M, 1 });                                /* gate */
+    return o.finish("router_gemm_topk_scatter", operand, out);
+}
+
+/* `a_order` decides the activation's row count: one per token, or one per (token, slot) already
+ * in the scatter's order. A described case that got this wrong would build the operand at the
+ * extent the WRONG reading wants, and the fault it names would go unseen. */
 static inline bool sorted_a_order(const RadParam* p, int n_p) {
     const char* s = gs(p, n_p, "a_order");
     return s && std::strcmp(s, "sorted") == 0;
@@ -2319,6 +2400,28 @@ int ref_sample_penalties_shape(const RadParam* p, int n_p, int operand, RadOpdDe
 }
 int ref_sample_dry_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return penalty_shape(p, n_p, operand, "sample_dry", true, out);
+}
+
+/* The n-gram ban reads the same history the two penalty stages do and writes the logits in place,
+ * and adds one small plane beside them: `ngram`, an i32 {n-gram length, window} pair a row. It is
+ * a plane of its own rather than fields in `params` because the params row is a fixed 24-word wire
+ * format shared by every sampler op (and recorded in the kbench fixtures). Drawn in 0..63 so both
+ * a length inside the 64-token history and the 0 (= off) and whole-window forms occur.
+ *
+ * The optional `whitelist` bitmask is sample_mask's plane shape (word w bit b covers column
+ * 32w + b, a SET bit marking an exempt token), addressed by the sampled row itself; a random draw
+ * fills it with random bits, so a sweep exercises exemptions as often as plain bans. */
+int ref_sample_ngram_ban_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    int64_t M = 0, nv = 0;
+    if (sample_vocab(p, n_p, &M, &nv) < 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, nv });                              /* logits, INOUT */
+    sample_params(o, M, REF_SAMPLE_HIST, 0);                        /* params */
+    o.t_idx({ M, (int64_t)REF_SAMPLE_HIST }, nv, -1,
+            (uint32_t)RAD_OPD_F_IDX_HISTORY);                       /* history */
+    o.t_idx({ M, 2 }, 64, -1, 0);                                   /* ngram: {n, window} */
+    o.t((uint32_t)RAD_I32, { M, (nv + 31) / 32 });                  /* whitelist, optional */
+    return o.finish("sample_ngram_ban", operand, out);
 }
 
 int ref_sample_temp_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -3124,16 +3227,20 @@ static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
 int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
-    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0))
+    const int64_t st = gi(p, n_p, "stride", 1), dil = gi(p, n_p, "dil", 1);
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || st < 1 ||
+        (st > 1 && (!causal || dil * (k - 1) + 1 < st || M % st)) || gi(p, n_p, "cu_div", 1) != 1)
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
-    const int64_t S = two_seqs(M);
+    /* A strided convolution is described over one sequence: two would each need a whole number
+     * of strides. Bounds in coarser units (cu_div) are not drawn; ref_test checks them. */
+    const int64_t S = st > 1 ? 1 : two_seqs(M);
     Opd o;
     o.t(D, { M, cin });                                       /* x */
     o.t(D, { cout, cin, k });                                 /* w */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
-    o.t(D, { M, cout });                                      /* res */
-    o.t(D, { M, cout });                                      /* y */
+    o.t(D, { M / st, cout });                                 /* res */
+    o.t(D, { M / st, cout });                                 /* y */
     o.t(D, { cout });                                         /* b */
     return o.finish("conv1d", operand, out);
 }
@@ -3211,6 +3318,22 @@ int ref_rvq_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("rvq_embed", operand, out);
 }
 
+int ref_vq_encode_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t dim = gi(p, n_p, "dim", 0), bins = gi(p, n_p, "bins", 0);
+    if (M <= 0 || n <= 0 || dim <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* x, INOUT */
+    o.t(F, { dim, n });                                       /* in_w */
+    o.t(F, { dim });                                          /* in_b */
+    o.t(F, { bins, dim });                                    /* cb */
+    o.t(F, { n, dim });                                       /* out_w */
+    o.t(F, { n });                                            /* out_b */
+    o.t_idx({ M }, bins, -1, 0);                              /* codes, OUT */
+    return o.finish("vq_encode", operand, out);
+}
+
 int ref_frame_mix_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "n_embd", 0), L = gi(p, n_p, "L", 0);
     const int64_t st = gi(p, n_p, "stride", 0);
@@ -3236,6 +3359,21 @@ int ref_end_status_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
     o.t_idx({ REF_LANES }, 8, -1, 0);                         /* status, INOUT */
     return o.finish("end_status", operand, out);
+}
+
+int ref_ras_pick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), rep = gi(p, n_p, "rep", 1), W = gi(p, n_p, "win", 0);
+    const int64_t hi = gi(p, n_p, "hi", 0);
+    if (M <= 0 || rep < 1 || W <= 0 || hi <= 0 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    Opd o;
+    /* Picks over a small band so the windows repeat them often enough to exercise the redraw. */
+    const int64_t band = std::min<int64_t>(hi + 2, 12);
+    o.t_idx({ rep * M }, band, -1, 0);                        /* first */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* alt */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ REF_LANES * W }, band, -1, 0);                  /* hist, INOUT */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* ids, OUT */
+    return o.finish("ras_pick", operand, out);
 }
 
 int ref_frame_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -3374,6 +3512,16 @@ int ref_int_affine_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t_idx({ 16 }, 1000, -1, 0);                             /* x */
     o.t_idx({ M }, 1, -1, 0);                                 /* y */
     return o.finish("int_affine", operand, out);
+}
+
+int ref_sub_i32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, 100000, -1, 0);                            /* x */
+    o.t_idx({ 1 }, 1000, -1, 0);                              /* s */
+    o.t_idx({ M }, 1, -1, 0);                                 /* y */
+    return o.finish("sub_i32", operand, out);
 }
 
 /* ================================================================== LTX-2 (ref_ltx.cpp) */
@@ -3532,16 +3680,6 @@ int ref_tile_stitch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     o.t_idx({ 1 }, 0, 0, 0);                                   /* first: frame 0 */
     o.t((uint32_t)RAD_U8, { c * c * sc * pp, c * sc * pp * C });  /* y: every frame */
     return o.finish("tile_stitch", operand, out);
-}
-
-int ref_patch_pix8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), pp = gi(p, n_p, "p", 0), C = gi(p, n_p, "C", 0);
-    const int64_t w = cols_for(M, 1), R = w ? M / w : 0;
-    if (!w || pp <= 0 || C <= 0) return RAD_E_UNSUPPORTED;
-    Opd o;
-    o.t(act_dt(p, n_p), { R, w * C * pp * pp });              /* x: patch rows */
-    o.t((uint32_t)RAD_U8, { R * pp, w * pp * C });            /* y: bytes */
-    return o.finish("patch_pix8", operand, out);
 }
 
 int ref_stft_logmel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

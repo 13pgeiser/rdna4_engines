@@ -129,9 +129,10 @@ Loaded load(const GgufWriter& w, int64_t n_embd, int64_t model_layers, const std
 }  // namespace
 
 TEST(the_published_shape_loads_and_is_normalised) {
-    /* 47 directions of 2560 for a 48-layer model, and no JSON beside it: the loader takes the
-     * published selection, 4..44. */
-    const Loaded f = load(make_vector(2560, 47), 2560, 48, "flash-next.gguf");
+    /* 47 directions of 2560 for a 48-layer model with the published package's JSON beside it:
+     * its range, 4..44, steers. */
+    const char* kPublished = R"({"mode":"project","scale":1.0,"layer_range":[4,44]})";
+    const Loaded f = load(make_vector(2560, 47), 2560, 48, "flash-next.gguf", kPublished);
     CHECK_OK(f.rc);
     CHECK_EQ(f.cv.n_embd, (int64_t) 2560);
     CHECK_EQ(f.cv.first, 4);
@@ -157,7 +158,7 @@ TEST(the_published_shape_loads_and_is_normalised) {
     CHECK_EQ(f.cv.covers(45), false);
 
     /* The cache partition: nonzero with a vector loaded, and stable across loads of one file. */
-    const Loaded again = load(make_vector(2560, 47), 2560, 48, "flash-next-2.gguf");
+    const Loaded again = load(make_vector(2560, 47), 2560, 48, "flash-next-2.gguf", kPublished);
     CHECK_OK(again.rc);
     CHECK(rad::control_vector_salt(f.cv) != 0);
     CHECK_EQ(rad::control_vector_salt(f.cv), rad::control_vector_salt(again.cv));
@@ -199,10 +200,9 @@ TEST(not_a_control_vector_is_refused) {
     CHECK(l.err.find("controlvector") != std::string::npos);
 }
 
-/* The operation's parameters come from the package's own JSON, not a command line: the published
- * Flash-Next vector ships {"mode":"project","scale":1.0,"layer_range":[4,44]}. A JSON that states a
- * different range or scale is honoured; one that says another mode, or is malformed, only means the
- * defaults (the vector itself is still valid). */
+/* The operation's parameters come from the package's own JSON, not a command line. A JSON that
+ * states a range or scale is honoured; without one every direction the file carries steers at
+ * scale 1; one that names another mode, or is not JSON, is refused by name. */
 TEST(the_packages_json_sets_the_range_and_scale) {
     const Loaded a = load(make_vector(2560, 47), 2560, 48, "json-range.gguf",
                           R"({"mode":"project","scale":0.5,"layer_range":[8,20]})");
@@ -215,18 +215,25 @@ TEST(the_packages_json_sets_the_range_and_scale) {
     CHECK_EQ(a.cv.scales[(size_t) 7], 0.0f);
     CHECK_EQ(a.cv.scales[(size_t) 21], 0.0f);
 
-    /* Another mode is not implemented: the file's directions still load, with the defaults. */
+    /* Another mode is not implemented. */
     const Loaded b = load(make_vector(2560, 47), 2560, 48, "json-add.gguf",
                           R"({"mode":"add","scale":0.1,"layer_range":[16,32]})");
-    CHECK_OK(b.rc);
-    CHECK_EQ(b.cv.first, 4);
-    CHECK_EQ(b.cv.last, 44);
-    CHECK_NEAR(b.cv.user_scale, 1.0f, 1e-6);
+    CHECK(b.rc < 0);
+    CHECK(b.err.find("'add'") != std::string::npos);
 
-    /* Malformed JSON is reported, not fatal. */
+    /* Not JSON. */
     const Loaded c = load(make_vector(2560, 47), 2560, 48, "json-broken.gguf", "{ not json");
-    CHECK_OK(c.rc);
-    CHECK_EQ(c.cv.first, 4);
+    CHECK(c.rc < 0);
+    CHECK(c.err.find("json-broken.json") != std::string::npos);
+
+    /* No JSON: every direction the file carries, 1..47, at scale 1. No model's layer count picks
+     * a range. */
+    const Loaded d = load(make_vector(2560, 47), 2560, 48, "json-none.gguf");
+    CHECK_OK(d.rc);
+    CHECK_EQ(d.cv.first, 1);
+    CHECK_EQ(d.cv.last, 47);
+    CHECK_NEAR(d.cv.scales[(size_t) 1], 1.0f, 1e-5);
+    CHECK_NEAR(d.cv.scales[(size_t) 47], 1.0f, 1e-5);
 }
 
 TEST(a_unit_vector_gives_scale_one_at_every_steered_layer) {

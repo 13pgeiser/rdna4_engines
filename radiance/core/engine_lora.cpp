@@ -275,7 +275,11 @@ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>
             char* da = (char*)P.buffers[lp.a].ptr;
             char* db = (char*)P.buffers[lp.b].ptr;
             char* ds = (char*)P.buffers[lp.scale].ptr;
-            if (!da || !db || !ds) { rc = RAD_E_STATE; *err = "a pool has no address"; break; }
+            if (!da || !db || !ds) {
+                rc = RAD_E_STATE;
+                *err = "the adapter pool of '" + lp.weight + "' has no buffer address";
+                break;
+            }
             da += (int64_t)slot * ab; db += (int64_t)slot * bb; ds += (int64_t)slot * sb;
             /* A pool this adapter does not touch is zeroed, not left as it was: the bytes are what
              * the slot's last adapter or the arena held, and a scale of 0 times a NaN is a NaN. */

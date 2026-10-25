@@ -93,7 +93,7 @@ const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& plugins, const
  * (rad_arch_text_prepare): RAD_OK with the result in `*out` (the text unchanged when the plugin
  * states no rewrite), or the plugin's negative status. */
 int rad_tools_text_prepare(const LoadedPlugins& plugins, int field, const std::string& in,
-                           std::string* out);
+                           std::string* out);   /* on a refusal, `out` is its reason or "" */
 
 /* The architecture plugin's video positions (rad_arch_video_positions), or null when it exports
  * none. */

@@ -243,6 +243,19 @@ typedef struct RadBatch {
     /* A video generator's pass (rad_declare_video_generator; `gen` is one of its
      * RAD_GEN_PASS_*): its payload. Null on every other step. */
     const struct RadVideoGenBatch* vgen_b;
+
+    /* ---- appended in ABI 26 (control vectors) */
+    /* Host-side: nonzero when some row of this pass takes the loaded control vector (its
+     * `projection_on_rows` entry is 1). A projection skips a zero row anyway, so a block issues
+     * no projection op when this is 0 and the pass is the one a deployment without a vector runs. */
+    int32_t control_vector;
+
+    /* ---- appended in ABI 26 (per-segment encoder grids) */
+    /* host: [enc_n_seg] each segment's grid in patches, the same values enc_coord planes 2 and 3
+     * carry. A plugin that has to pick a geometry before it issues ops (a tower with one set of
+     * position tables per grid) reads them here; they live as long as the pass. */
+    const int32_t* enc_seg_h;
+    const int32_t* enc_seg_w;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -379,13 +392,15 @@ typedef struct RadGenBatch {
      * where a window's end-of-text marker sits. */
     const int32_t* tokens_h;
     /* ---- appended in ABI 26 (Krea 2's rebalance) */
-    /* COND: the request's RAD_GEN_COND_* options, 0 for none. */
+    /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
+     * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
 enum {
-    RAD_GEN_COND_REBALANCE = 1   /* Krea 2: the text taps at the plugin's fixed rebalance gains */
+    RAD_GEN_COND_REBALANCE = 1   /* the conditioning at the plugin's fixed rebalance gains (the
+                                  * request field `rebalance`; Krea 2: its text taps) */
 };
 
 /* An entry's flags on a DENOISE pass. */
@@ -474,6 +489,30 @@ typedef struct RadAudioGenBatch {
     /* VOCODE with RadAudioGenDecl::voc_chunk: the lane's first frame the pass reads, counted
      * from the first kept frame. 64 bits so that it starts past the struct's ABI 18 end. */
     int64_t         voc_frame0;
+
+    /* ---- appended in ABI 27 (a frame head at the previous row, references) */
+    /* FRAME, one value per entry ([n_seq]): the row before the frame's own row -- the one whose
+     * hidden state the frame is sampled from -- as its KV slot, its position, and the context
+     * through it (position + 1). A model whose frame head attends at that row (Fish Audio
+     * drama-3's codebook tower, layers bound to the language model's full-attention group) issues
+     * those layers there, before the language model runs at the frame's own row. */
+    const int32_t*  prev_slot;
+    const int32_t*  prev_pos;
+    const int32_t*  prev_used;
+
+    /* PROMPT of a request with references (RadAudioGenDecl::tmpl_ref; n_ref 0 without): its
+     * clips' samples end to end (`ref_samples` f32 on the device), the clips' bounds in samples
+     * ([n_ref + 1], each a whole number of RadAudioGenDecl::ref_hop), and for every row of the
+     * pass the frame of the clips it is or -1 for a token row ([n_tok]), frames counted over the
+     * clips in order, frame f the samples [f ref_hop, (f + 1) ref_hop). A frame's row stages
+     * token 0; the plugin embeds the frame there instead. */
+    int64_t         n_ref;
+    int64_t         ref_samples;
+    const float*    ref_audio;
+    const int32_t*  ref_cu;
+    const int32_t*  ref_cu_h;
+    const int32_t*  ref_frame;
+    const int32_t*  ref_frame_h;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear
@@ -666,7 +705,8 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
  * the all-reduce numbers its scratch slots per launch and the ranks must agree; a kernel with a
  * device-wide arrival counter must key it on the stream (libr4d's split-K GEMM does), or it may
  * not run here; and every buffer the second lane touches must be named to rad_buf_concurrent,
- * because the planner packs transients from one linear order. */
+ * because the planner packs transients from one linear order (live for the whole program, or across
+ * the second lane's window where the architecture declares one, abi/rad_builder.h). */
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
 

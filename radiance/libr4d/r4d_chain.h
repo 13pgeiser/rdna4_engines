@@ -1,8 +1,8 @@
 // r4d_chain.h -- a chained launch's wait and completion (RadKernelChainFn, abi/rad_abi.h).
 //
 // Between two dependent kernels on one queue the packet processor waits for the first to finish
-// before it launches the second (the AQL barrier bit): ~1.3 ms of a 14 ms DFlash2 step on the 31B
-// (4x R9700, 2026-10-17). A chained launch drops the bit. The engine writes a record into the
+// before it launches the second (the AQL barrier bit): on 4x R9700, ~1.3 ms of a 14 ms DFlash2 step
+// on the 31B. A chained launch drops the bit. The engine writes a record into the
 // kernel's argument slot, and the kernel waits for its queue's completion counter to reach the
 // blocks issued before it, then adds its own blocks as they finish. A kernel's chained form
 // (`CHAIN` true) brackets its body with r4d_chain_wait / r4d_chain_done; the plain form never reads

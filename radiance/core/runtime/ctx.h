@@ -88,6 +88,9 @@ struct OpPlan {
     bool          billed = false;
     /* Runtime LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
     int32_t       lora_site = -1;
+    /* Its position in the declared order, or its anchor's for a core-appended op: what the second
+     * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
+    int32_t       order = 0;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -288,6 +291,8 @@ public:
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
     const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
+    /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
+    bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
@@ -546,6 +551,9 @@ public:
     /* Backs rad_step_fail(): stops the step like an operand rejection, with the caller's
      * message. */
     int  step_fail(const char* what);
+    /* The device kernel `h` resolved to on this rank ("?" if it resolved none). For log
+     * attribution only. */
+    const char* ip_kernel_name(rad_op h) const;
 private:
     [[noreturn]] void fatal_issue(rad_op h, int64_t n, const char* why) const;
 
@@ -572,7 +580,6 @@ private:
      * byte-compares the two results, finding kernels that are not a function of their inputs,
      * which a host-vs-device comparison cannot detect. */
     void  oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd);
-    const char* ip_kernel_name(rad_op h) const;
     /* The reference library's host plan for (op, band): the band's own host plan when a reference
      * library won it, else one resolved from `registry_` on first use. Null when none exists. */
     const IssuePlan* oracle_reference(rad_op h, int band);
@@ -619,7 +626,8 @@ private:
      * 3. The buffer planner packs from one linear order, so two lanes can alias arena bytes
      *    through buffers with disjoint declared lifetimes. The architecture passes every buffer
      *    its second lane touches to `rad_buf_concurrent`, which makes it live for the whole
-     *    program.
+     *    program, or, where the architecture declares the second lane's window
+     *    (rad_lane1_window_begin / _end), across the window and its own declared uses.
      *
      * 4. A slice must land in the same bucket-table band as the whole, or it picks a kernel with
      *    a different summation order and silently changes output. `--debug-graph` prints a model's
@@ -641,6 +649,9 @@ private:
     bool      own_lane1_  = false;
     int       lane_       = 0;
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before
+     * an op outside the second lane's window (Ctx::issue_body). */
+    bool      lane1_pending_ = false;
     /* The last device op on each lane that touched host-domain memory. A host op runs at issue on
      * this thread and must be ordered behind every earlier device op that touched the host arena;
      * on each lane those complete no later than the last one. So a device op with a host-domain

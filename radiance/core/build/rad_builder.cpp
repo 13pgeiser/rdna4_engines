@@ -87,6 +87,7 @@ const char* bld_kv_kind_name(int k) {
         case RAD_KV_WINDOW: return "window";
         case RAD_KV_LINEAR: return "linear";
         case RAD_KV_CONV:   return "conv";
+        case RAD_KV_RING:   return "ring";
         default:            return "?";
     }
 }
@@ -336,7 +337,7 @@ rad_buf Builder::decl_buffer(const char* name, const RadBufDecl* d) {
 rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     if (finished_) return err(RAD_E_STATE, "decl_kv_group('%s') after declare finished", name ? name : "");
     if (!name || !*name || !d) return err(RAD_E_INVAL, "decl_kv_group: null name or declaration");
-    if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_CONV)
+    if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_RING)
         return err(RAD_E_INVAL, "kv group '%s': unknown kind %d", name, d->kind);
 
     std::string n = scoped(name);
@@ -840,6 +841,26 @@ int Builder::buf_concurrent(rad_buf b) {
     return RAD_OK;
 }
 
+/* See rad_lane1_window_begin. The window is the ops declared between the two calls. */
+int Builder::lane1_window(bool end) {
+    if (finished_) { err(RAD_E_STATE, "rad_lane1_window after declare finished"); return RAD_E_STATE; }
+    const int32_t next = (int32_t)prog_.ops.size();   /* the next op's handle */
+    if (!end) {
+        if (lane1_w0_ >= 0) {
+            err(RAD_E_STATE, "rad_lane1_window_begin called twice: one window a program");
+            return RAD_E_STATE;
+        }
+        lane1_w0_ = next;
+    } else {
+        if (lane1_w0_ < 0 || lane1_w1_ >= 0 || next - 1 < lane1_w0_) {
+            err(RAD_E_STATE, "rad_lane1_window_end without a begin, twice, or around no op");
+            return RAD_E_STATE;
+        }
+        lane1_w1_ = next - 1;
+    }
+    return RAD_OK;
+}
+
 /* See rad_weight_shard_span. Checked against the declaration here, where the plugin can be named;
  * the loader checks it against the container. */
 int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
@@ -923,7 +944,7 @@ int Builder::kv_group_zero(rad_kvgroup h) {
      * state is saved and cleared on every rank, so a zero-sized one would mismatch those
      * copies. */
     const int kind = prog_.kv_groups[h].decl.kind;
-    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW && kind != RAD_KV_RING) {
         err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group that is not paged",
             prog_.kv_groups[h].name.c_str());
         return RAD_E_INVAL;
@@ -942,7 +963,10 @@ int Builder::kv_group_replicated(rad_kvgroup h) {
         err(RAD_E_STATE, "kv_group_replicated after declare finished");
         return RAD_E_STATE;
     }
-    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    if (h == 0 || h >= prog_.kv_groups.size()) {
+        err(RAD_E_INVAL, "kv_group_replicated: %u is not a declared KV group", (unsigned)h);
+        return RAD_E_INVAL;
+    }
     /* Paged groups only: the tiers move blocks. A linear or conv group's state travels in the
      * checkpoint store, which has no such window. */
     const int kind = prog_.kv_groups[h].decl.kind;
@@ -1204,6 +1228,11 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
             (long long)d->n_embd);
         return RAD_E_INVAL;
     }
+    if (d->one_grid != 0 && d->one_grid != 1) {
+        err(RAD_E_INVAL, "declare_encoder '%s': one_grid %d is neither 0 nor 1", nm,
+            (int)d->one_grid);
+        return RAD_E_INVAL;
+    }
     slot = *d;
     slot_name = nm;
     slot.name = nullptr;   /* the plugin's storage; the name is the copy */
@@ -1389,7 +1418,12 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                 : prog_.generator.layout != 0 ? "an image generator" : "a video generator");
         return RAD_E_STATE;
     }
-    if (!d->tmpl || !std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}")) {
+    if (!d->tmpl && !d->tmpl_plain) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': no prompt template (tmpl or tmpl_plain)",
+            nm);
+        return RAD_E_INVAL;
+    }
+    if (d->tmpl && (!std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}"))) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl needs {instructions} and {input}", nm);
         return RAD_E_INVAL;
     }
@@ -1397,6 +1431,45 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         (!std::strstr(d->tmpl_plain, "{input}") || std::strstr(d->tmpl_plain, "{instructions}"))) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_plain is the prompt without "
                          "instructions and needs {input} alone", nm);
+        return RAD_E_INVAL;
+    }
+    /* References: a template with both of its slots, an item with one transcript before its one
+     * clip, and the clips' geometry; read whole by one branch's prompt (an unconditional branch
+     * would need references of its own). */
+    if (d->tmpl_ref) {
+        auto once = [](const char* t, const char* k) {
+            const char* a = t ? std::strstr(t, k) : nullptr;
+            return a && !std::strstr(a + 1, k);
+        };
+        const char* au = d->ref_item ? std::strstr(d->ref_item, "{audio}") : nullptr;
+        const char* tx = d->ref_item ? std::strstr(d->ref_item, "{text}") : nullptr;
+        if (!once(d->tmpl_ref, "{references}") || !once(d->tmpl_ref, "{input}") ||
+            std::strstr(d->tmpl_ref, "{instructions}") || !once(d->ref_item, "{audio}") ||
+            !once(d->ref_item, "{text}") || !au || !tx || tx > au) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_ref needs {references} and "
+                             "{input} once each, and ref_item {text} before its one {audio}", nm);
+            return RAD_E_INVAL;
+        }
+        if (d->branches != 1 || !d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
+            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': references are read by a model of one "
+                             "branch from whole prompts, clips at a rate (%lld Hz) in frames of "
+                             "%lld samples, at most %d of them and %lld samples a request", nm,
+                (long long)d->ref_rate, (long long)d->ref_hop, (int)d->ref_max,
+                (long long)d->ref_max_samples);
+            return RAD_E_INVAL;
+        }
+    }
+    if (d->branches != 0 && d->branches != 1 && d->branches != 2) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': branches is %d; a request runs 1 sequence "
+                         "or 2 (0 means 2)", nm, (int)d->branches);
+        return RAD_E_INVAL;
+    }
+    /* One branch has no unconditional prompt to render and no guidance to apply. */
+    if (d->branches == 1 && (d->neg_tmpl || d->default_cfg != 1.0)) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': a model of one branch has no "
+                         "unconditional template and no guidance (default_cfg %g)", nm,
+            d->default_cfg);
         return RAD_E_INVAL;
     }
     if (d->neg_tmpl && !d->prompt_whole) {
@@ -1476,15 +1549,24 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         !buf_ok(d->audio_out, RAD_F32, win_samples * d->channels, "audio_out"))
         return RAD_E_INVAL;
     prog_.agen_str.name = nm;
-    prog_.agen_str.tmpl = d->tmpl;
+    prog_.agen_str.tmpl = d->tmpl ? d->tmpl : "";
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
+    prog_.agen_str.tmpl_ref = d->tmpl_ref ? d->tmpl_ref : "";
+    prog_.agen_str.ref_item = d->tmpl_ref && d->ref_item ? d->ref_item : "";
     prog_.audio_gen = *d;
     /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
     prog_.audio_gen.name = nullptr;
     prog_.audio_gen.tmpl = nullptr;
     prog_.audio_gen.tmpl_plain = nullptr;
     prog_.audio_gen.neg_tmpl = nullptr;
+    prog_.audio_gen.tmpl_ref = nullptr;
+    prog_.audio_gen.ref_item = nullptr;
+    /* Without references the clips' geometry is nothing: the driver stages none. */
+    if (!d->tmpl_ref) {
+        prog_.audio_gen.ref_rate = prog_.audio_gen.ref_hop = prog_.audio_gen.ref_max_samples = 0;
+        prog_.audio_gen.ref_max = 0;
+    }
     return RAD_OK;
 }
 
@@ -1771,6 +1853,13 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             (long long)d->proposal_pitch);
         return RAD_E_INVAL;
     }
+    if (d->kind == RAD_DRAFT_BLOCK && d->proposal_pitch > 0 && d->proposal_pitch < d->depth) {
+        err(RAD_E_INVAL, "declare_drafter '%s': proposal_pitch %lld under depth %d. A block pass "
+                         "writes each sequence's %d proposals into one row of the proposal buffer, "
+                         "so a row must hold them.", nm, (long long)d->proposal_pitch, d->depth,
+            d->depth);
+        return RAD_E_INVAL;
+    }
     /* A block pass embeds the mask id at every unfilled position, so it needs one. */
     if (d->kind == RAD_DRAFT_BLOCK && d->mask_token < 0) {
         err(RAD_E_INVAL, "declare_drafter '%s': RAD_DRAFT_BLOCK with no mask_token. Every "
@@ -1814,7 +1903,11 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     prog_.drafter_name = nm;
     prog_.drafter.name = nullptr;
     prog_.drafter.block = block;
-    if (prog_.drafter.proposal_pitch == 0) prog_.drafter.proposal_pitch = 1;
+    /* A block drafter's proposal row holds its whole block's tokens, and the engine reads row s
+     * at s * pitch (a short block fills only its front), so its pitch defaults to depth; a serial
+     * one writes a token a pass, at pitch 1 by default. */
+    if (prog_.drafter.proposal_pitch == 0)
+        prog_.drafter.proposal_pitch = prog_.drafter.kind == RAD_DRAFT_BLOCK ? prog_.drafter.depth : 1;
     return RAD_OK;
 }
 
@@ -1903,6 +1996,33 @@ int Builder::lora_alias(const char* native, const char* from, const char* to, in
     a.root = native; a.from = from; a.to = to;
     a.from_lo = from_lo; a.from_hi = from_hi; a.to_lo = to_lo;
     prog_.lora_aliases.push_back(std::move(a));
+    return RAD_OK;
+}
+
+/* A block drafter's shorter block (rad_builder.h). Validated at declare: the core stages the block
+ * from it, and a block the plugin did not declare its ops at would fail the step. */
+int Builder::drafter_short_block(int64_t block) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_short_block after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_STATE, "drafter_short_block: %s. Only a BLOCK drafter proposes a block; declare "
+                         "it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a SERIAL head");
+        return RAD_E_STATE;
+    }
+    const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
+    const int64_t lead = full - prog_.drafter.depth;     /* rows ahead of the proposing ones */
+    if (block >= full || block - lead < 1) {
+        err(RAD_E_INVAL, "drafter_short_block '%s': %lld rows. The short block must be shorter "
+                         "than the drafter's own (%lld) and still propose a token (more than %lld "
+                         "rows).", prog_.drafter_name.c_str(), (long long)block, (long long)full,
+            (long long)lead);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_short_block = block;
     return RAD_OK;
 }
 
@@ -2108,7 +2228,8 @@ void Builder::finish_kv_groups() {
         KVGroupInfo& gi = prog_.kv_groups[g];
         const RadKVGroupDecl& d = gi.decl;
 
-        if ((d.kind == RAD_KV_FULL || d.kind == RAD_KV_WINDOW) && gi.block_size == 0) {
+        if ((d.kind == RAD_KV_FULL || d.kind == RAD_KV_WINDOW || d.kind == RAD_KV_RING) &&
+            gi.block_size == 0) {
             /* The plugin may never have asked; the manifest still needs the answer. */
             kv_block_size((rad_kvgroup)g);
         }
@@ -2121,6 +2242,7 @@ void Builder::finish_kv_groups() {
         switch (d.kind) {
             case RAD_KV_FULL:
             case RAD_KV_WINDOW:
+            case RAD_KV_RING:
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
                     rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;
@@ -2167,6 +2289,10 @@ void Builder::finish_buffer_liveness() {
     /* A second lane, signalled by any concurrent buffer, gets a second scratch region
      * (Program::scratch_regions). */
     prog_.scratch_regions = concurrent_bufs_.empty() ? 1 : 2;
+    if (lane1_w0_ >= 0 && lane1_w1_ < 0)
+        err(RAD_E_STATE, "rad_lane1_window_begin without rad_lane1_window_end");
+    prog_.lane1_w0 = lane1_w1_ >= 0 ? lane1_w0_ : -1;
+    prog_.lane1_w1 = lane1_w1_;
 
     /* Each buffer's first and last declaring op, in one pass over the op lists. */
     const size_t nb = prog_.buffers.size();
@@ -2184,9 +2310,17 @@ void Builder::finish_buffer_liveness() {
          * rule); a buffer on the second lane, whose declared range does not bound when its bytes
          * are in use; and one with no declared use, since an op may issue any handle in any
          * order (--debug-graph reports the cost). */
-        if (b.decl.kind != RAD_BUF_TRANSIENT || concurrent_bufs_.count((rad_buf)i) || first[i] < 0) {
+        if (b.decl.kind != RAD_BUF_TRANSIENT || first[i] < 0 ||
+            (concurrent_bufs_.count((rad_buf)i) && lane1_w1_ < 0)) {
             b.first_def = 0;
             b.last_use  = last_op;
+            continue;
+        }
+        /* A concurrent buffer under a declared window (rad_lane1_window_begin): live across the
+         * window, when lane 1 may touch it, and over its own uses. */
+        if (concurrent_bufs_.count((rad_buf)i)) {
+            b.first_def = std::min(first[i], lane1_w0_);
+            b.last_use  = std::max(last[i], lane1_w1_);
             continue;
         }
         b.first_def = first[i];
@@ -2199,6 +2333,25 @@ void Builder::finish_buffer_liveness() {
          * output likewise: the engine reads it after the last op. */
         if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
     }
+
+    /* Region 1 holds what an op the second lane may issue asks for (Program::scratch_bytes_lane1):
+     * every transient buffer of such an op is concurrent (Ctx::lane1_ rule 3). Ctx::issue refuses a
+     * larger request on lane 1 by name, so an op that breaks the rule fails rather than overruns. */
+    prog_.scratch_bytes_lane1 = 0;
+    if (prog_.scratch_regions > 1)
+        for (size_t o = 1; o < prog_.ops.size() && o < op_bufs_.size(); ++o) {
+            bool lane1 = true;
+            for (const std::vector<rad_buf>* v : { &op_bufs_[o].reads, &op_bufs_[o].writes })
+                for (rad_buf h : *v)
+                    if (prog_.buffers[h].decl.kind == RAD_BUF_TRANSIENT && !concurrent_bufs_.count(h))
+                        lane1 = false;
+            if (!lane1) continue;
+            for (const Band& bd : prog_.ops[o].bands)
+                if (bd.dom[RAD_DOMAIN_DEVICE] &&
+                    bd.dom[RAD_DOMAIN_DEVICE].scratch_bytes > prog_.scratch_bytes_lane1)
+                    prog_.scratch_bytes_lane1 = bd.dom[RAD_DOMAIN_DEVICE].scratch_bytes;
+        }
+    if (prog_.scratch_bytes_lane1 > prog_.scratch_bytes) prog_.scratch_bytes_lane1 = prog_.scratch_bytes;
 }
 
 int Builder::finish() {
@@ -2331,6 +2484,16 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     return B(b)->buf_concurrent(buf);
 }
 
+int rad_lane1_window_begin(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lane1_window(false);
+}
+
+int rad_lane1_window_end(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lane1_window(true);
+}
+
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     if (!b) return RAD_E_INVAL;
     return B(b)->weight_shard_span(w, lo, hi);
@@ -2389,6 +2552,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }
+
+int rad_drafter_short_block(RadBuilder* b, int64_t block) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_short_block(block);
+}
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

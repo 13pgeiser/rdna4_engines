@@ -146,9 +146,9 @@ __device__ __forceinline__ bool volume_of(const int* geom, long long rows, int* 
 // once a tap.
 //
 // Measured on the R9700 at 300 W, warm, against gemm_nt_bias at bf16 at the same M, N and K = 27
-// cin: 512 -> 512 at 84 x 48 x 37 148 TFLOP/s (the GEMM 146), at 42 x 24 x 37 149 (145). The
-// select-and-pointer form of the gather this replaces ran 136 and 134: its loop issued twice the
-// GEMM's vector instructions. The weight through global loads at a uniform base is 0.2-1% slower;
+// cin: 512 -> 512 at 84 x 48 x 37 148 TFLOP/s (the GEMM 146), at 42 x 24 x 37 149 (145). A
+// select-and-pointer form of the gather runs 136 and 134: its loop issues twice the GEMM's vector
+// instructions. The weight through global loads at a uniform base is 0.2-1% slower;
 // raster groups of 4 or 16 bands are within noise of 8. 512 -> 24 (the output convolution) runs at
 // 30 with 13/16 of its 128-wide channel tile idle, a few milliseconds of a whole upscale.
 constexpr uint32_t kCTW = 2, kCTA = 4, kCWW = 4, kCWA = 2;

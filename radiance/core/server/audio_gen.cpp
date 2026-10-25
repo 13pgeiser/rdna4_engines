@@ -11,11 +11,18 @@
  * `guidance_scale` (the model's guidance: the denoiser's for a music model, the frame model's for
  * a speech one) and, for a model with a denoiser, `num_inference_steps`.
  *
+ * References, for a model that clones a voice (RadAudioGenDecl::tmpl_ref): `references` is an
+ * array of {"audio", "text"}, a clip of the voice (a data: URL or the base64 of an audio file,
+ * decoded to mono at the model's rate and padded to whole frames) and what it says; at most the
+ * model's count of them and seconds together. The prompt is then the references' template, each
+ * reference rendered from the model's item, its transcript and a row a frame of its clip.
+ *
  * Prompt: the plugin's template with its slots filled, each text first rewritten by the plugin
  * into the form the model was trained on (rad_arch_text_prepare). The template is tokenised with
  * its special tokens and the texts without, so a caller cannot write the model's control tokens
- * into a lyric. A model that declares the unconditional branch's own template gets that one
- * rendered from the same texts.
+ * into a lyric; a model that declares `input_special` has its input tokenised with them too (its
+ * speaker tags), its prepare() refusing the control tokens. A model that declares the
+ * unconditional branch's own template gets that one rendered from the same texts.
  *
  * Response: the whole piece, once it is finished, as `response_format` wav (16-bit PCM, the
  * model's rate and channels) or pcm (the same samples raw, little-endian). Streamed as the
@@ -29,6 +36,7 @@
 #include "oai.h"
 
 #include "gen/audio.h"
+#include "mm/media.h"
 #include "rad_internal.h"
 
 #include <nlohmann/json.hpp>
@@ -109,6 +117,9 @@ int Server::speech_request(const json& body, const std::string& text,
         return fail(err_bad("instructions", "this model needs instructions, as a non-empty "
                                             "string: for a song its genre, mood, vocals and "
                                             "instruments"));
+    if (!inst.empty() && info.tmpl.empty())
+        return fail(err_unsupported("instructions", "this model takes no instructions; its "
+                                                    "direction is written in the input"));
     if (body.contains("speed") && !body["speed"].is_null() &&
         !(body["speed"].is_number() && body["speed"].get<double>() == 1.0))
         return fail(err_unsupported("speed", "this model keeps its own tempo; the instructions "
@@ -156,6 +167,8 @@ int Server::speech_request(const json& body, const std::string& text,
         if (!body["guidance_scale"].is_number() || !(body["guidance_scale"].get<double>() >= 1.0) ||
             body["guidance_scale"].get<double>() > 30.0)
             return fail(err_bad("guidance_scale", "expected a number in [1, 30]"));
+        if (info.branches == 1 && body["guidance_scale"].get<double>() != 1.0)
+            return fail(err_unsupported("guidance_scale", "this model runs without guidance"));
         r->cfg = (float)body["guidance_scale"].get<double>();
     }
     bool seed_given = false;
@@ -170,33 +183,141 @@ int Server::speech_request(const json& body, const std::string& text,
         r->seed = (((uint64_t)rd() << 32) ^ rd()) & (((uint64_t)1 << 53) - 1);
     }
 
+    /* ---- the references: a clip of a voice and what it says, each */
+    struct Ref { std::string text; int64_t frames = 0; };
+    std::vector<Ref> refs;
+    if (body.contains("references") && !body["references"].is_null()) {
+        const json& rs = body["references"];
+        if (!rs.is_array())
+            return fail(err_bad("references", "expected an array of {\"audio\", \"text\"}"));
+        if (!rs.empty() && info.tmpl_ref.empty())
+            return fail(err_unsupported("references", "this model takes no reference audio; its "
+                                                      "voice is described in the input"));
+        if ((int64_t)rs.size() > info.ref_max)
+            return fail(err_bad("references", "at most " + std::to_string(info.ref_max) +
+                                                  " references a request"));
+        const int64_t hop = std::max<int64_t>(1, info.ref_hop);
+        r->ref_cu.assign(1, 0);
+        for (size_t i = 0; i < rs.size(); ++i) {
+            const std::string at = "references[" + std::to_string(i) + "]";
+            const json& e = rs[i];
+            if (!e.is_object())
+                return fail(err_bad(at, "expected an object {\"audio\", \"text\"}"));
+            for (auto it = e.begin(); it != e.end(); ++it)
+                if (it.key() != "audio" && it.key() != "text")
+                    return fail(err_bad(at + "." + it.key(), "a reference is its audio and its "
+                                                             "text"));
+            if (!e.contains("audio") || !e["audio"].is_string())
+                return fail(err_bad(at + ".audio", "the clip is required, as a data: URL or "
+                                                   "base64 of an audio file"));
+            if (!e.contains("text") || !e["text"].is_string() || blank(e["text"].get<std::string>()))
+                return fail(err_bad(at + ".text", "the clip's transcript is required, as a "
+                                                  "non-empty string"));
+            /* The file: a data: URL, or its base64 alone (as fish-speech's server takes it). */
+            const std::string& a = e["audio"].get_ref<const std::string&>();
+            std::vector<uint8_t> bytes;
+            if (a.rfind("data:", 0) == 0) {
+                ApiError ue;
+                if (decode_media_url(a, at + ".audio", &bytes, &ue) < 0) return fail(ue);
+            } else if (!base64_decode(a, &bytes)) {
+                return fail(err_bad(at + ".audio", "invalid base64"));
+            }
+            /* Mono at the model's rate; one sample past what is left of the budget is decoded,
+             * so a clip too long is refused rather than cut. */
+            const int64_t left = info.ref_max_samples - (int64_t)r->ref_audio.size();
+            std::vector<float> pcm;
+            std::string dwhy;
+            if (left < hop)
+                return fail(err_bad(at + ".audio", "the references are longer than this model "
+                                                   "takes"));
+            if (mm::decode_audio(bytes.data(), bytes.size(), (int32_t)info.ref_rate, left + 1,
+                                 &pcm, &dwhy) < 0)
+                return fail(err_bad(at + ".audio", "the clip could not be used: " + dwhy));
+            if (pcm.empty()) return fail(err_bad(at + ".audio", "the clip holds no audio"));
+            const int64_t padded = ((int64_t)pcm.size() + hop - 1) / hop * hop;
+            if (padded > left)
+                return fail(err_bad(at + ".audio", "the references hold more than " +
+                                                       rad::fmt("%g", (double)info.ref_max_samples /
+                                                                          (double)info.ref_rate) +
+                                                       " seconds together; this model takes no "
+                                                       "more"));
+            pcm.resize((size_t)padded, 0.0f);
+            r->ref_audio.insert(r->ref_audio.end(), pcm.begin(), pcm.end());
+            r->ref_cu.push_back((int32_t)r->ref_audio.size());
+            Ref ref;
+            std::string why;
+            if (deps_.audio->prepare(RAD_TEXT_REFERENCE, e["text"].get<std::string>(), &ref.text,
+                                     &why) < 0)
+                return fail(err_bad(at + ".text", why));
+            ref.frames = padded / hop;
+            refs.push_back(std::move(ref));
+        }
+        if (refs.empty()) r->ref_cu.clear();
+    }
+    if (!refs.empty() && !inst.empty())
+        return fail(err_unsupported("instructions", "a request with references takes no "
+                                                    "instructions; the clips set the voice"));
+
     /* ---- the prompt */
     std::string i2, t2, why;
     if (!inst.empty() && deps_.audio->prepare(RAD_TEXT_INSTRUCTIONS, inst, &i2, &why) < 0)
         return fail(err_bad("instructions", why));
     if (deps_.audio->prepare(RAD_TEXT_INPUT, text, &t2, &why) < 0)
         return fail(err_bad("input", why));
+    auto encode = [&](const std::string& t, bool special, std::vector<int32_t>* ids_out) {
+        if (t.empty()) return;
+        const auto ids = deps_.tok->encode(t, false, /*parse_special=*/special);
+        ids_out->insert(ids_out->end(), ids.begin(), ids.end());
+    };
+    auto subst = [](std::string t, const std::string& key, const std::string& v) {
+        for (size_t p = t.find(key); p != std::string::npos; p = t.find(key, p + v.size()))
+            t.replace(p, key.size(), v);
+        return t;
+    };
+    /* One reference (ref_item): its header, the transcript in it, tokenised as one segment with
+     * its special tokens (the speaker tags prepare() allows), a row a frame of its clip, and what
+     * follows the clip as another segment. */
+    int64_t frame0 = 0;
+    auto render_ref = [&](size_t i, std::vector<int32_t>* ids_out) {
+        static const std::string kAudio = "{audio}";
+        const std::string idx = std::to_string(i + 1);
+        const size_t a = info.ref_item.find(kAudio);
+        encode(subst(subst(info.ref_item.substr(0, a), "{index}", idx), "{text}", refs[i].text),
+               true, ids_out);
+        r->ref_frame.resize(ids_out->size(), -1);
+        for (int64_t f = 0; f < refs[i].frames; ++f) {
+            ids_out->push_back(0);
+            r->ref_frame.push_back((int32_t)(frame0 + f));
+        }
+        frame0 += refs[i].frames;
+        encode(subst(info.ref_item.substr(a + kAudio.size()), "{index}", idx), true, ids_out);
+    };
     /* A template a segment at a time: its own text with special tokens, each slot without. */
     auto render = [&](const std::string& t, std::vector<int32_t>* ids_out) {
-        static const std::string kInst = "{instructions}", kInput = "{input}";
+        static const std::string kInst = "{instructions}", kInput = "{input}",
+                                 kRefs = "{references}";
         size_t at = 0;
         while (at <= t.size()) {
-            const size_t a = t.find(kInst, at), b = t.find(kInput, at);
-            const size_t p = std::min(a, b);
-            const std::string lit =
-                t.substr(at, p == std::string::npos ? std::string::npos : p - at);
-            if (!lit.empty()) {
-                const auto ids = deps_.tok->encode(lit, false, /*parse_special=*/true);
-                ids_out->insert(ids_out->end(), ids.begin(), ids.end());
-            }
+            const size_t a = t.find(kInst, at), b = t.find(kInput, at), c = t.find(kRefs, at);
+            const size_t p = std::min(a, std::min(b, c));
+            encode(t.substr(at, p == std::string::npos ? std::string::npos : p - at), true,
+                   ids_out);
             if (p == std::string::npos) break;
+            if (p == c) {
+                for (size_t i = 0; i < refs.size(); ++i) render_ref(i, ids_out);
+                at = p + kRefs.size();
+                continue;
+            }
             const bool is_inst = p == a;
-            const auto ids = deps_.tok->encode(is_inst ? i2 : t2, false, /*parse_special=*/false);
-            ids_out->insert(ids_out->end(), ids.begin(), ids.end());
+            /* The input keeps its special tokens only for a model that asks (its speaker tags);
+             * the plugin's prepare() has refused the ones a caller may not write. */
+            encode(is_inst ? i2 : t2, !is_inst && info.input_special, ids_out);
             at = p + (is_inst ? kInst : kInput).size();
         }
     };
-    render(inst.empty() ? info.tmpl_plain : info.tmpl, &r->tokens);
+    render(!refs.empty() ? info.tmpl_ref : inst.empty() ? info.tmpl_plain : info.tmpl,
+           &r->tokens);
+    if (!refs.empty()) r->ref_frame.resize(r->tokens.size(), -1);
     if (!info.neg_tmpl.empty()) render(info.neg_tmpl, &r->neg_tokens);
     const size_t n_prompt = std::max(r->tokens.size(), r->neg_tokens.size());
     if ((int64_t)n_prompt > info.max_prompt)
@@ -225,7 +346,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     static const char* kKnown[] = {
         "model", "input", "instructions", "voice", "response_format", "speed", "stream",
         "stream_format", "seed", "max_new_tokens", "duration", "num_inference_steps",
-        "guidance_scale", "user",
+        "guidance_scale", "user", "references",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -339,9 +460,13 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     std::string pcm;
     for (const gen::AudioChunk& c : chunks) append_pcm16(c.samples, &pcm);
     const double secs = (double)pcm.size() / 2.0 / (double)(info.channels * info.sample_rate);
-    RAD_INFO("audio: %.1f s from %lld frames in %lld windows, %.1f s%s", secs,
-             (long long)ticket->frames, (long long)ticket->windows,
-             (double)(ticket->t_done_ns - ticket->t_submit_ns) * 1e-9,
+    auto sec = [](int64_t a, int64_t b) { return a > 0 && b >= a ? (double)(b - a) * 1e-9 : 0.0; };
+    RAD_INFO("audio: %.1f s from %lld frames in %lld windows, %.1f s: queue and prompt %.1f s, "
+             "first audio %.1f s, frames %.1f s%s", secs, (long long)ticket->frames,
+             (long long)ticket->windows, sec(ticket->t_submit_ns, ticket->t_done_ns),
+             sec(ticket->t_submit_ns, ticket->t_prompt_ns),
+             sec(ticket->t_submit_ns, ticket->t_first_audio_ns),
+             sec(ticket->t_prompt_ns, ticket->t_frames_ns),
              ticket->model_ended ? "" : " (the request's length)");
     HttpResponse res;
     res.status = 200;

@@ -1,18 +1,5 @@
-/* cvec.cpp -- loading and validating a GGUF control vector (core/cvec.h).
- *
- * The format is llama.cpp's `controlvector` package: one `direction.<l>` tensor of unit f32 per
- * layer, plus three metadata keys. The reader is core/text/gguf.cpp, which already mmaps a GGUF
- * and computes tensor byte sizes, so nothing here parses bytes by hand.
- *
- * The published package (hf.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection) is what the checks
- * below are written against, and its own JSON states the operation's parameters:
- *
- *     {"mode": "project", "dir": "per-layer", "scale": 1.0, "layer_range": [4, 44], ...}
- *
- * so a file is only accepted for a model whose hidden size equals the directions' width and whose
- * architecture the file names. Everything else is refused at startup, by name, rather than
- * steered along a direction from another residual basis.
- */
+/* cvec.cpp -- loading and validating a GGUF control vector (core/cvec.h). The reader is
+ * core/text/gguf.cpp, which maps the file and sizes its tensors. */
 #include "cvec.h"
 
 #include "text/gguf.h"
@@ -98,10 +85,10 @@ int control_vector_discover(const std::string& model_path, const std::string& ar
 }
 
 
-/* The package's own JSON, if it is beside the vector: `{"mode": "project", "scale": 1.0,
- * "layer_range": [4, 44]}` is what the published Flash-Next vector ships. It is the only place
- * the operation's parameters are stated, so they are read from there rather than configured; a
- * malformed or absent file only means the defaults below. */
+/* The package's own JSON beside the vector (`<stem>.json`), the only place the operation's
+ * parameters are stated: `{"mode": "project", "scale": 1.0, "layer_range": [4, 44]}` for the
+ * published Flash-Next vector. Absent, the defaults apply. A file that is not JSON or names a mode
+ * other than `project` is refused: the directions were tuned for that operation. */
 namespace {
 
 struct PackageJson {
@@ -109,8 +96,8 @@ struct PackageJson {
     float scale = 1.0f;
 };
 
-PackageJson read_package_json(const std::string& gguf_path) {
-    PackageJson out;
+int read_package_json(const std::string& gguf_path, PackageJson* out, std::string* why) {
+    *out = PackageJson{};
     std::string stem = gguf_path;
     const size_t dot = stem.find_last_of('.');
     const size_t slash = stem.find_last_of("/\\");
@@ -118,28 +105,28 @@ PackageJson read_package_json(const std::string& gguf_path) {
         stem = stem.substr(0, dot);
     const std::string path = stem + ".json";
     std::ifstream f(path);
-    if (!f) return out;
+    if (!f) return RAD_OK;
     try {
         const nlohmann::json j = nlohmann::json::parse(f);
         if (const auto m = j.find("mode"); m != j.end() && m->is_string() &&
                                           m->get<std::string>() != "project") {
-            RAD_WARN("control vector: %s says mode '%s'; only 'project' is implemented, so the "
-                     "defaults apply", path.c_str(), m->get<std::string>().c_str());
-            return out;
+            *why = "control vector " + path + ": mode '" + m->get<std::string>() +
+                   "'; only 'project' is implemented";
+            return RAD_E_UNSUPPORTED;
         }
         if (const auto r = j.find("layer_range"); r != j.end() && r->is_array() && r->size() == 2 &&
                                                   (*r)[0].is_number_integer() &&
                                                   (*r)[1].is_number_integer()) {
-            out.first = (*r)[0].get<int>();
-            out.last  = (*r)[1].get<int>();
+            out->first = (*r)[0].get<int>();
+            out->last  = (*r)[1].get<int>();
         }
         if (const auto s = j.find("scale"); s != j.end() && s->is_number())
-            out.scale = (float) s->get<double>();
+            out->scale = (float) s->get<double>();
     } catch (const std::exception& e) {
-        RAD_WARN("control vector: %s is not readable JSON (%s); the defaults apply", path.c_str(),
-                 e.what());
+        *why = "control vector " + path + ": not readable JSON (" + e.what() + ")";
+        return RAD_E_INVAL;
     }
-    return out;
+    return RAD_OK;
 }
 
 }  /* namespace */
@@ -206,16 +193,14 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     }
     if (n_dir == 0) return fail("control vector " + path + ": the file holds no directions");
 
-    /* The package's parameters: its JSON, else the published selection where the file covers it,
-     * else every direction the file carries. A deployment therefore has nothing to configure, and
-     * a file published with a different selection states it itself. */
-    const PackageJson pj = read_package_json(path);
+    /* The package's parameters: its JSON, else every direction the file carries at scale 1, as
+     * llama.cpp applies a control vector given no layer range. */
+    PackageJson pj;
+    std::string pj_why;
+    if (const int prc = read_package_json(path, &pj, &pj_why); prc != RAD_OK) return fail(pj_why);
     int first = pj.first, last = pj.last;
     float scale = pj.scale;
-    if (last < 0) {
-        if (n_model_layers >= 45 && dir_last >= 44) { first = 4; last = 44; }
-        else                                        { first = (int) dir_first; last = (int) dir_last; }
-    }
+    if (last < 0) { first = (int) dir_first; last = (int) dir_last; }
     if (first < 1 || last < first)
         return fail("control vector " + path + ": the layer range " + std::to_string(first) + ":" +
                     std::to_string(last) + " is empty");

@@ -226,8 +226,18 @@ int TierExec::device_init() {
     bool ev = rad_event_create(&ev_compute_) == RAD_OK && rad_event_create(&ev_copy_) == RAD_OK &&
               rad_event_create(&ev_restore_) == RAD_OK;
     for (int i = 0; i < kRing && ev; ++i) ev = rad_event_create(&ring_ev_[i]) == RAD_OK;
-    if (verify_rep_) vrep_ = (char*)rad_dev_alloc(copy_idx_ * rep_bytes_, RAD_MEM_HOST_PINNED);
-    if (!stage_ || !idx_dev_ || !idx_host_ || !ev || (verify_rep_ && !vrep_)) {
+    /* The verify scratch is a diagnostic's: without it the replicated groups go unchecked, and
+     * the tiers run as they would without RADIANCE_DEBUG_TIER_VERIFY. */
+    if (verify_rep_) {
+        vrep_ = (char*)rad_dev_alloc(copy_idx_ * rep_bytes_, RAD_MEM_HOST_PINNED);
+        if (!vrep_) {
+            RAD_WARN("kv tiers: RADIANCE_DEBUG_TIER_VERIFY: no pinned host memory (%s) for this "
+                     "rank's copy of the replicated groups, so they are not compared",
+                     humanb(copy_idx_ * rep_bytes_).c_str());
+            verify_rep_ = false;
+        }
+    }
+    if (!stage_ || !idx_dev_ || !idx_host_ || !ev) {
         release_device();
         return RAD_E_NOMEM;
     }

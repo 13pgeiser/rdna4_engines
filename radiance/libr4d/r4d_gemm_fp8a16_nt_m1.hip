@@ -481,13 +481,15 @@ constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
 }
 
 // The body; lm_wmma_kernel and its chained form (RadKernelChainFn) wrap it.
-template <uint32_t MT, uint32_t FKB, bool I8>
+template <uint32_t MT, uint32_t FKB, bool I8, uint32_t MH = 1>
 __device__ __forceinline__ void lm_wmma_body(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ A, uint32_t a_ld,
     float* __restrict__ C, uint32_t c_ld,
     uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t m_real) {
     constexpr uint32_t kFK    = FKB * kBlock;              /* K a staging round */
-    constexpr uint32_t kRows  = kDenseWaves * 16u;         /* weight rows a workgroup covers */
+    /* Weight rows a workgroup covers: 16 a wave, the waves split into MH halves along M that share
+     * the staged tile (MH = 2: 64 rows, each half four 16-row activation tiles). */
+    constexpr uint32_t kRows  = kDenseWaves * 16u / MH;
     constexpr uint32_t kPitch = lds_pitch<kFK>();          /* BYTES a staged weight row */
     constexpr uint32_t kWUnits = kRows * (kFK / 16u);      /* 16-byte staging units, weight */
     constexpr bool     kPre    = MT <= 3u;                  /* activation a K step ahead, below */
@@ -497,12 +499,14 @@ __device__ __forceinline__ void lm_wmma_body(
     const uint32_t tid  = (uint32_t)threadIdx.x;
     const uint32_t lane = tid & (kWave - 1u);
     const uint32_t wv   = tid / kWave;
+    const uint32_t wn   = wv % (kDenseWaves / MH);                /* this wave's 16 weight rows */
+    const uint32_t mo   = (wv / (kDenseWaves / MH)) * 16u * MT;   /* its M half's first row */
     const uint32_t c    = lane & 15u;          /* this lane's weight row inside its 16-row tile */
     const uint32_t h    = lane >> 4;           /* which half of the K step */
 
     for (uint32_t base = (uint32_t)blockIdx.x * kRows; base < rows; base += gridDim.x * kRows) {
         /* Clamped, not skipped: a tail workgroup recomputes the last row; the store drops it. */
-        const uint32_t n   = base + wv * 16u + c;
+        const uint32_t n   = base + wn * 16u + c;
         const uint32_t nc  = (n < rows) ? n : (rows - 1u);
         const uint16_t* scl = (const uint16_t*)(W + (size_t)nc * w_ld + cols);
 
@@ -519,7 +523,7 @@ __device__ __forceinline__ void lm_wmma_body(
             auto aload = [&](uint32_t kf) {
 #pragma unroll
                 for (uint32_t t = 0; t < MT; ++t) {
-                    const uint32_t m = t * 16u + c, mr = (m < m_real) ? m : (m_real - 1u);
+                    const uint32_t m = mo + t * 16u + c, mr = (m < m_real) ? m : (m_real - 1u);
                     an[t] = *(const lm_s8v*)(A + (size_t)mr * a_ld + kt + kf + h * 8u);
                 }
             };
@@ -563,7 +567,7 @@ __device__ __forceinline__ void lm_wmma_body(
                         for (uint32_t t = 0; t < MT; ++t) ac[t] = an[t];
                         aload(kf + 16u < kFK ? kf + 16u : kf);
                     }
-                    const i2v raw = frag<kFK>(s_w, wv * 16u, kf, lane);
+                    const i2v raw = frag<kFK>(s_w, wn * 16u, kf, lane);
                     const lm_s8v bf =
                         e4m3x8_to_bf16<I8>((uint32_t)raw[0], (uint32_t)raw[1]);
 /* The activation load is unconditional: a padding row re-reads the last real row and a select
@@ -571,7 +575,7 @@ __device__ __forceinline__ void lm_wmma_body(
  * per K step). */
 #pragma unroll
                     for (uint32_t t = 0; t < MT; ++t) {
-                        const uint32_t m = t * 16u + c;
+                        const uint32_t m = mo + t * 16u + c;
                         [[maybe_unused]] const uint32_t mr = (m < m_real) ? m : (m_real - 1u);
                         lm_s8v af;
                         if constexpr (kPre) af = ac[t];
@@ -594,7 +598,7 @@ __device__ __forceinline__ void lm_wmma_body(
         for (uint32_t t = 0; t < MT; ++t)
 #pragma unroll
             for (uint32_t j = 0; j < 8; ++j) {
-                const uint32_t m = t * 16u + h * 8u + j;
+                const uint32_t m = mo + t * 16u + h * 8u + j;
                 if (m < m_real) C[(size_t)m * c_ld + n] = acc[t][j];
             }
     }
@@ -603,16 +607,16 @@ __device__ __forceinline__ void lm_wmma_body(
 #define R4D_LMW_PARAMS const uint8_t* __restrict__ W, const uint16_t* __restrict__ A,           \
     uint32_t a_ld, float* __restrict__ C, uint32_t c_ld, uint32_t rows, uint32_t cols,          \
     uint32_t w_ld, uint32_t m_real
-template <uint32_t MT, uint32_t FKB, bool I8 = false>
+template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1>
 __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm_wmma_kernel(
     R4D_LMW_PARAMS) {
-    lm_wmma_body<MT, FKB, I8>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+    lm_wmma_body<MT, FKB, I8, MH>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
 }
-template <uint32_t MT, uint32_t FKB, bool I8 = false>
+template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1>
 __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void r4dchain_lm_wmma(
     R4D_LMW_PARAMS) {
     r4d_chain_wait();
-    lm_wmma_body<MT, FKB, I8>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+    lm_wmma_body<MT, FKB, I8, MH>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
     r4d_chain_done();
 }
 #undef R4D_LMW_PARAMS
@@ -688,8 +692,8 @@ extern "C" int r4d_gemm_fp8a16_nt_mt(long a, long wq, long ws, long c,
 //   wq   [N][lm_row_bytes(K)]  E4M3 codes, nkb bf16 scales, pad; `w_ld` BYTES a row (0 = that)
 //   c    [M][N]          f32,  `c_ld` elements a row (0 = N)
 //
-// The WMMA path takes M > 2 in chunks of 64 rows, each re-reading the weight; the matvec takes
-// M <= 2.
+// The WMMA path takes M > 2 in passes of up to 128 rows, each reading the weight once (past 64
+// rows in two M halves over one staged tile); the matvec takes M <= 2.
 //
 // This row must serve every M: all bands of one op read the same stored bytes, so a band falling
 // to another kernel (e.g. the bf16 projection) would misread the E4M3 codes.
@@ -730,9 +734,31 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
     /* WMMA from M = 3, the matvec at or below. The tile's rate is nearly flat in M; the matvec is
      * marginally ahead at M = 2 and clearly at M = 1. Both read the same stored bytes. */
     if (M > 2) {
-        /* Sixty-four rows per pass: four WMMA accumulator tiles (32 registers). */
-        for (int m0 = 0; m0 < M; m0 += 64) {
-            const int Mc = (M - m0) < 64 ? (M - m0) : 64;
+        /* Passes of up to 128 rows. Up to 64, one tile of four WMMA accumulator tiles (32
+         * registers) a wave; past 64, the same four a wave in two M halves over one staged weight
+         * tile (MH = 2), so the head is read once a pass. */
+        for (int m0 = 0; m0 < M; m0 += 128) {
+            const int Mc = (M - m0) < 128 ? (M - m0) : 128;
+            if (Mc > 64) {
+                uint32_t fkb = lm_fkb_rule(4u);
+                while (fkb > 1u && (cols % (fkb * kBlock)) != 0u) fkb >>= 1;
+                const uint32_t per = kDenseWaves * 16u / 2u;
+                const uint32_t blocks = std::min<uint32_t>(4096u, (rows + per - 1u) / per);
+                const uint16_t* ac = (const uint16_t*)a + (size_t)m0 * a_ld;
+                float* cc = (float*)c + (size_t)m0 * c_ld;
+                if (fkb == 2u)
+                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 2, I8, 2> : lm_wmma_kernel<4, 2, I8, 2>),
+                                       dim3(blocks), dim3(kDenseThreads), 0,
+                                       (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,
+                                       (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc);
+                else
+                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 1, I8, 2> : lm_wmma_kernel<4, 1, I8, 2>),
+                                       dim3(blocks), dim3(kDenseThreads), 0,
+                                       (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,
+                                       (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc);
+                if (hipGetLastError() != hipSuccess) return -6;
+                continue;
+            }
             const uint32_t mt = (uint32_t)((Mc + 15) / 16);
             /* FKB = 4 would need kRows * (512 + 8) = 66560 bytes of LDS, over the 64 KiB limit. */
             uint32_t fkb = lm_fkb_rule(mt);

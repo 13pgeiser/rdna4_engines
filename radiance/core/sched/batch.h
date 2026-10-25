@@ -199,6 +199,11 @@ private:
         int32_t  *h_rows = nullptr, *d_rows = nullptr;
         int32_t  *h_first = nullptr, *d_first = nullptr;
         AdvGroup *h_grp = nullptr, *d_grp = nullptr;
+        /* [max_seqs] per-sequence runtime-window data for the advance: the block-aligned first
+         * ring position and the block table's length in blocks, 0 when the sequence has no
+         * runtime window (advance.h). Per sequence because each prompt has its own floor. */
+        int32_t  *h_rpos = nullptr, *d_rpos = nullptr;
+        int32_t  *h_tlen = nullptr, *d_tlen = nullptr;
 
         char*      h_derived = nullptr;   /* derivation staging, byte-addressed */
         /* [3][n_tok] rotary positions and [n_tok] encoder-row targets (RadBatch::rope_pos,
@@ -328,6 +333,9 @@ private:
     int32_t*               enc_coord_host_ = nullptr;
     int32_t*               enc_cu_host_ = nullptr;
     std::vector<int32_t>   enc_coord_tmp_;   /* one item's coordinates; kept for its capacity */
+    /* The pass's per-segment grid, host side (RadBatch::enc_seg_h/w). Filled by build_encoder and
+     * valid until the next build, like the staged coordinates. */
+    std::vector<int32_t>   enc_seg_h_host_, enc_seg_w_host_;
     int64_t                last_n_tok_ = 0;
     struct MediaBytes { int64_t mm = 0, pix = 0, crd = 0, cu = 0; };
     MediaBytes media_bytes();   /* the four per-rank device regions alloc_media reserves */

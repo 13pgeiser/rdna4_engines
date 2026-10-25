@@ -18,7 +18,7 @@ using namespace rad;
 
 namespace {
 
-static_assert(sizeof(AdvGroup) == 48, "AdvGroup's layout is part of the card's slab");
+static_assert(sizeof(AdvGroup) == 72, "AdvGroup's layout is part of the card's slab");
 
 /* Word offsets of every array the advance reads or writes. Up to kSeq rows, kTok tokens and
  * kGroups KV groups, each group with a kPitch-entry block table per row. */
@@ -35,8 +35,8 @@ struct Slab {
         CU    = SID + kSeq,
         Q     = CU + kSeq + 8,
         ROPE  = Q + kSeq,                       /* [3][kTok] */
-        GRP   = ROPE + 3 * kTok,                /* [kGroups] AdvGroup, 12 words each */
-        SLOT  = GRP + 12 * kGroups,             /* [kGroups][kTok] */
+        GRP   = ROPE + 3 * kTok,                /* [kGroups] AdvGroup, sizeof/4 words each */
+        SLOT  = GRP + (int)(sizeof(AdvGroup) / 4) * kGroups,  /* [kGroups][kTok] */
         USED  = SLOT + kGroups * kTok,          /* [kGroups][kSeq] */
         BT    = USED + kGroups * kSeq,          /* [kGroups][kSeq][kPitch] */
         FIRST = BT + kGroups * kSeq * kPitch,   /* [kGroups][kSeq] */

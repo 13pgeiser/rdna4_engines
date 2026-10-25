@@ -592,6 +592,25 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               ? "has no host kernel for this band, and the placement planner put "
                                 "it on the host anyway"
                               : "has no device kernel for this band");
+    /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
+     * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
+     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. */
+    if (program_ && program_->lane1_w1 >= 0) {
+        const bool outside = p.order < program_->lane1_w0 || p.order > program_->lane1_w1;
+        if (lane_ == 1 && outside)
+            return abort_step_msg(h, RAD_E_STATE,
+                                  fmt("issued on the second lane outside its declared window (ops "
+                                      "%d..%d, this one %d): the buffers it may touch there are "
+                                      "live only across the window",
+                                      (int)program_->lane1_w0, (int)program_->lane1_w1, (int)p.order));
+        if (lane_ == 0 && lane1_pending_ && outside) {
+            const int js = lane_join(1, 0);
+            if (js < 0)
+                return abort_step_msg(h, js, "joining the second lane outside its window failed");
+        }
+    }
+    if (lane_ == 1) lane1_pending_ = true;
+
     /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
     if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
         return abort_step_msg(h, RAD_E_SHAPE,
@@ -874,7 +893,18 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * correctness. That also covers lane 0 before lane 1 exists, since a lane built later has
      * nothing ordering it behind lane 0's earlier work. */
     if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST && arena_.scratch_regions() > 1) {
-        /* Per-lane regions: nothing to order. */
+        /* Per-lane regions: nothing to order. Region 1 holds what an op the second lane may issue
+         * asked for at declare (Program::scratch_bytes_lane1); a larger request there comes from an
+         * op with a transient buffer outside rad_buf_concurrent, which breaks Ctx::lane1_'s rule 3
+         * in its buffers too, so it is refused by name rather than let overrun the region. */
+        if (ip.args.scratch_bytes > arena_.scratch_bytes(lane_)) {
+            return abort_step_msg(h, RAD_E_SCRATCH,
+                fmt("kernel %s at n=%lld asks for %lld bytes of scratch on lane %d, whose region "
+                    "holds %lld: an op on the second lane may touch only buffers named to "
+                    "rad_buf_concurrent (Ctx::lane1_ rule 3)",
+                    ip.row && ip.row->info ? ip.row->info->name : "?", (long long)n,
+                    (long long)ip.args.scratch_bytes, lane_, (long long)arena_.scratch_bytes(lane_)));
+        }
         ip.args.scratch = scratch_take(lane_, ip.args.scratch_bytes);
     } else if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST) {
         ip.args.scratch = scratch_take(0, ip.args.scratch_bytes);
@@ -1048,7 +1078,7 @@ void* Ctx::scratch_take(int region, int64_t bytes) {
     constexpr int64_t kAlign = 256;
     const int64_t need = (bytes + kAlign - 1) / kAlign * kAlign;
     int64_t off = scratch_cur_[region];
-    if (off + need > arena_.scratch_bytes()) off = 0;
+    if (off + need > arena_.scratch_bytes(region)) off = 0;
     scratch_cur_[region] = off + need;
     return (char*)arena_.scratch(region) + off;
 }

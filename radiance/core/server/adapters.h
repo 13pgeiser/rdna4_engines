@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <iterator>
 #include <memory>
 
@@ -107,6 +108,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.hit_cut_tokens = m.hit_cut_tokens;
     o.prefix_expired = m.prefix_expired;
     o.prefix_ckpt_expired = m.prefix_ckpt_expired;
+    o.prefix_released = m.prefix_released;
+    o.prefix_ckpt_released = m.prefix_ckpt_released;
 
     o.prefill_tps = m.prefill_tps;
     o.decode_tps = m.decode_tps;
@@ -201,6 +204,24 @@ public:
     void reap(uint64_t id) override { s_->reap(id); }
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
+
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionReleased* out) override {
+        SessionRelease r;
+        const int rc = s_->release_session(label, id, keep_tokens, &r);
+        if (out) {
+            out->sessions = r.sessions;
+            out->entries = r.entries;
+            out->tokens = r.tokens;
+            out->device_bytes = r.device_bytes;
+            out->host_bytes = r.host_bytes;
+            out->snapshots = r.snapshots;
+            out->kept_tokens = r.kept_tokens;
+            out->kept_shared = r.kept_shared;
+            out->kept_live = r.kept_live;
+        }
+        return rc;
+    }
 
     /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
      * to "seconds ago" here, so only the monotonic clock is authoritative. */
@@ -708,10 +729,21 @@ public:
                 std::shared_ptr<mm::Item>* out, std::string* why) override {
         if (!accepts(k)) { if (why) *why = "this kind of media is not served"; return RAD_E_UNSUPPORTED; }
         if (k == MediaKind::Audio) return p_->audio(bytes.data(), bytes.size(), out, why);
-        return k == MediaKind::Image
-                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
-                               opts.max_pixels)
-                   : p_->video(bytes.data(), bytes.size(), out, why);
+        if (k == MediaKind::Video) return p_->video(bytes.data(), bytes.size(), out, why);
+        mm::ImageMode mode;
+        mode.kind = (int32_t)opts.image_mode;
+        mode.base_size = opts.image_base_size;
+        mode.image_size = opts.image_size;
+        mode.several = opts.several_pictures;
+        /* The host share of a picture (decode, resample, patch staging), apart from the tower
+         * pass engine_mm.cpp times. */
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
+                                 opts.max_pixels, mode);
+        RAD_DEBUG("mm: host processor %lld bytes -> %.1f ms (rc %d)", (long long)bytes.size(),
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0).count(), rc);
+        return rc;
     }
 
     int32_t audio_rate() const override {

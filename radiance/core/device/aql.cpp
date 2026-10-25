@@ -241,6 +241,9 @@ Global& G() {
     return *g;
 }
 
+/* Set by aql_force_host_kargs before the backend starts. */
+std::atomic<bool> g_force_host_kargs{false};
+
 std::string agent_isa(hsa_agent_t a) {
     char name[64] = {0};
     hsa_agent_get_info(a, HSA_AGENT_INFO_NAME, name);
@@ -423,13 +426,10 @@ bool init_devices() {
                      "difference where the slot allows it",
                      i, bus);
         }
-        /* The fallback on a card that needs none, to measure what reading each dispatch's
-         * arguments across the link costs against the same card's VRAM rings. */
-        const char* force_host_kargs = std::getenv("RADIANCE_DEBUG_AQL_HOST_KARGS");
-        if (force_host_kargs && *force_host_kargs && *force_host_kargs != '0') {
+        if (g_force_host_kargs.load(std::memory_order_acquire) && !g.dev[(size_t)i].host_kargs) {
             g.dev[(size_t)i].host_kargs = true;
-            RAD_WARN("device: card %d (%s): RADIANCE_DEBUG_AQL_HOST_KARGS puts the kernel argument "
-                     "rings in host memory", i, bus);
+            RAD_INFO("device: card %d (%s) keeps kernel arguments in pinned host memory, as a "
+                     "test asked", i, bus);
         }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
@@ -829,7 +829,7 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
     /* The running kernel and its arguments. A queue's read index stays on a packet until it
      * completes, so the packet there is in flight. Every pointer-shaped argument word is located
      * like the address, which names the operand that got a stale or short buffer. Only card
-     * `card`'s queues; arguments are read back through the BAR. */
+     * `card`'s queues; the host reads the arguments at the packet's kernarg_address. */
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
         if (s->ord != card) continue;
@@ -3049,9 +3049,70 @@ int vres_ord(const void* addr) {
     return -1;
 }
 
+/* The DRM interface version of card `gpu_id`'s render node, false when it cannot be read. */
+bool drm_version(uint32_t gpu_id, int* major, int* minor, std::string* name) {
+    /* struct drm_version, a layout fixed since DRM's first release. */
+    struct DrmVersion {
+        int    major, minor, patch;
+        size_t name_len;
+        char*  name;
+        size_t date_len;
+        char*  date;
+        size_t desc_len;
+        char*  desc;
+    };
+    const int rm = render_minor(gpu_id);
+    if (rm < 0) return false;
+    char path[64];
+    std::snprintf(path, sizeof path, "/dev/dri/renderD%d", rm);
+    const int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    char nm[32] = {0};
+    DrmVersion v{};
+    v.name = nm;
+    v.name_len = sizeof nm - 1;
+    const bool ok = ioctl(fd, _IOWR('d', 0x00, DrmVersion), &v) == 0;
+    close(fd);
+    if (!ok) return false;
+    *major = v.major;
+    *minor = v.minor;
+    *name = std::string(nm, std::min(v.name_len, sizeof nm - 1));
+    return true;
+}
+
+/* Whether hsa_amd_vmem mappings on card `dev` return. From HIP 7.16 (ROCm 10.1) the runtime maps
+ * a vmem handle with DRM_AMDGPU_GEM_VA, asks the kernel to signal a VM timeline syncobj once the
+ * page tables are written, and waits on that point with no timeout. amdgpu reads the timeline
+ * fields of GEM_VA from interface 3.64 (Linux 6.16) on; an older kernel ignores them, never
+ * signals the point, and the first commit waits forever in drm_syncobj_array_wait_timeout. The
+ * ROCm 7.2 runtime maps through the KFD and has no such wait. A card that would hang this way
+ * gets no virtual memory management: its pools are carved whole, as on a driver without it. */
+bool vmem_maps_return(int dev) {
+    static std::once_flag once[kMaxDevices];
+    static bool ok[kMaxDevices];
+    std::call_once(once[dev], [dev] {
+        ok[dev] = true;
+        int hip = 0;
+        if (hipRuntimeGetVersion(&hip) != hipSuccess || hip < 71600000) return;
+        int major = 0, minor = 0;
+        std::string name;
+        if (!drm_version(G().dev[(size_t)dev].kfd_id, &major, &minor, &name) || name != "amdgpu")
+            return;
+        if (major > 3 || (major == 3 && minor >= 64)) return;
+        ok[dev] = false;
+        RAD_WARN("device %d: this kernel's amdgpu interface is %d.%d, and the HIP %d.%d runtime "
+                 "waits after every virtual-memory map for a page-table timeline that amdgpu "
+                 "signals only from 3.64 (Linux 6.16) on, so a map here would never return. The "
+                 "card runs without virtual memory management; a 6.16 or later kernel restores it",
+                 dev, major, minor, hip / 10000000, hip / 100000 % 100);
+    });
+    return ok[dev];
+}
+
 int64_t a_vmem_granularity(void) {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= (int)G().dev.size()) return 0;
+    if (!vmem_maps_return(dev)) return 0;
     size_t gran = 0;
     if (hsa_amd_memory_pool_get_info(G().dev[(size_t)dev].vram,
                                      HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_REC_GRANULE, &gran) !=
@@ -3549,6 +3610,12 @@ const DeviceBackend* aql_backend_if_present(void) {
 }
 
 int64_t aql_pageable_bytes(void) { return aql::g_pageable_bytes.load(std::memory_order_relaxed); }
+
+int aql_force_host_kargs(void) {
+    if (aql::G().ok) return RAD_E_STATE;
+    aql::g_force_host_kargs.store(true, std::memory_order_release);
+    return RAD_OK;
+}
 
 int aql_vmem_device_of(const void* addr, int* dev) {
     const int d = vres_ord(addr);

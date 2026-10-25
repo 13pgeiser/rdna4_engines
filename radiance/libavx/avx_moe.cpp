@@ -1218,10 +1218,14 @@ AVX_KERNEL(moe_gemm_q_mod4) { return moe_gemm_impl(a, true, 4); }
 /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)], summed in
  * ascending slot j (see the file header). The inverse permutation is built once per batch. */
 AVX_KERNEL(moe_gather) {
+    /* NOT `rad_args_have(a, 6)`: the required operands are not a prefix -- the shared pair at 3
+     * and 4 is a NULL SLOTS form for a layer whose shared arm runs beside the block, and the
+     * prefix test reads a legal unfolded call as a missing operand. */
     if (!a || !a->t || a->n_t < 6 || !rad_args_have(a, 3) || !rad_arg_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *ye = &a->t[0], *ew = &a->t[1], *sorted = &a->t[2], *Y = &a->t[5];
     /* Optional shared-expert fold: y = narrow(shared * act(gate)) + narrow(gathered). Both
      * operands or neither, as in libref. */
+    if (!ye->data || !ew->data || !sorted->data || !Y->data) return RAD_E_INVAL;
     const RadTensor *sh = rad_arg_in(a, 3), *sg = rad_arg_in(a, 4);
     if ((sh != nullptr) != (sg != nullptr)) return RAD_E_INVAL;
     const char* act = p_str(a, "act", "none");
@@ -1491,4 +1495,77 @@ AVX_KERNEL(pair_argmax) {
         if (val) stt(val, offlin(val, m), bv);
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ router_topk_scatter */
+/* The pair as one op: `router_topk` then `moe_scatter` over the ids it just wrote. The selection
+ * reads the whole router's `n_expert` logits; the sort runs over this rank's slice, which is the
+ * fused op's `n_local` standing where `moe_scatter`'s `n_expert` names the slice it owns.
+ *
+ * The operands line up with `router_topk`'s own first three slots (logits, ids, weights), so the
+ * selection is the sibling kernel called on this very RadArgs -- no copy, no re-derivation of the
+ * softmax -- and the sort is `moe_scatter` over the four operands it takes. */
+AVX_KERNEL(router_topk_scatter) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const int64_t ne = p_int(a, "n_expert", 0);
+    const int64_t nl = p_int(a, "n_local", ne);
+    const int64_t k  = p_int(a, "top_k", 1);
+    if (ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne) return RAD_E_SHAPE;
+
+    const int rc = AVX_FN(avx_router_topk)(a, stream);
+    if (rc != RAD_OK) return rc;
+
+    const RadTensor t2[] = { a->t[1], a->t[3], a->t[4], a->t[5] };
+    const RadParam sp[]   = { RAD_INT("n_expert", nl), RAD_INT("top_k", k),
+                              RAD_INT("expert_base", p_int(a, "expert_base", 0)),
+                              RAD_STR("protect", p_str(a, "protect", nullptr)) };
+    const RadArgs sa{ t2, 4, sp, 4, a->scratch, a->scratch_bytes, a->instance, a->rank,
+                      a->world_size };
+    return AVX_FN(avx_moe_scatter)(&sa, stream);
+}
+
+/* ------------------------------------------------------------------ router_gemm_topk_scatter */
+/* The router GEMM in front of the pair, and with `gate_b`/`gate` present the shared expert's
+ * one-column gate over the same input, at N = 1. `gate_b` and `gate` come together or not at all,
+ * and the operand count says which. */
+extern "C" int AVX_FN(avx_gemm_nt)(const RadArgs*, RadStream);
+
+AVX_KERNEL(router_gemm_topk_scatter) {
+    /* NOT `rad_args_have`: the required operands are not a prefix -- `gate_b` sits between the
+     * router's weight and the outputs, and it and `gate` are null slots in the gate-absent form. */
+    if (!a || !a->t || a->n_t < 9) return RAD_E_INVAL;
+    const bool gate_b = a->t[2].data != nullptr;
+    const bool gate   = a->n_t > 9 && a->t[9].data != nullptr;
+    if (gate_b != gate) return RAD_E_INVAL;
+    for (int i : {0, 1, 3, 4, 5, 6, 7, 8})
+        if (!a->t[i].data) return RAD_E_INVAL;
+    const int64_t ne = p_int(a, "n_expert", 0);
+    const int64_t nl = p_int(a, "n_local", ne);
+    const int64_t k  = p_int(a, "top_k", 1);
+    const int64_t K  = p_int(a, "K", 0);
+    if (ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne || K <= 0) return RAD_E_SHAPE;
+    const char* dt = p_str(a, "dtype", "bf16");
+
+    const RadTensor g3[] = { a->t[0], a->t[1], a->t[3] };
+    const RadParam  gp[] = { RAD_INT("N", ne), RAD_INT("K", K), RAD_STR("dtype", dt) };
+    const RadArgs   ga{ g3, 3, gp, 3, a->scratch, a->scratch_bytes, a->instance, a->rank,
+                        a->world_size };
+    const int gc = AVX_FN(avx_gemm_nt)(&ga, stream);
+    if (gc != RAD_OK) return gc;
+
+    if (gate) {
+        const RadTensor p3[] = { a->t[0], a->t[2], a->t[9] };
+        const RadParam  pp[] = { RAD_INT("N", 1), RAD_INT("K", K), RAD_STR("dtype", dt) };
+        const RadArgs   pa{ p3, 3, pp, 3, a->scratch, a->scratch_bytes, a->instance, a->rank,
+                            a->world_size };
+        const int pc = AVX_FN(avx_gemm_nt)(&pa, stream);
+        if (pc != RAD_OK) return pc;
+    }
+
+    /* The pair over the logits the GEMM just wrote. Every parameter the pair reads is a parameter
+     * of this op, under the same name -- the fused lists are unions. */
+    const RadTensor t6[] = { a->t[3], a->t[4], a->t[5], a->t[6], a->t[7], a->t[8] };
+    const RadArgs   fa{ t6, 6, a->p, a->n_p, a->scratch, a->scratch_bytes, a->instance, a->rank,
+                        a->world_size };
+    return AVX_FN(avx_router_topk_scatter)(&fa, stream);
 }

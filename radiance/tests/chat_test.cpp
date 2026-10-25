@@ -1016,6 +1016,16 @@ TEST(the_capability_probe_reads_what_the_template_actually_does) {
     CHECK(c.system_role);
 }
 
+/* The string-content probe hands a template an empty `tools` array. GLM-5.3's template iterates
+ * `tools` under `{% if tools %}` and tests `'function' in tool`, which throws on a null element,
+ * and the probe reads a throw as "cannot render string content". */
+TEST(the_string_content_probe_renders_glm53s_template) {
+    static const TemplateFixture f("RAD_TEST_GLM53_JINJA", "glm53/chat_template.jinja", "", "");
+    if (!f.need()) return;
+    CHECK(f.t->caps().string_content);
+    CHECK(f.t->caps().tools);
+}
+
 /* jinja2 reads `obj.0` as `obj[0]`, and GLM-5's template tests a tool result with
  * `m.content.0.type`. The engine threw on it, and the probe, which swallows a throw, reported a
  * template that renders tools as one that cannot: every request with `tools` was refused. */
@@ -1032,8 +1042,6 @@ TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
         "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
     CHECK(glm.caps().tools);
     CHECK(glm.caps().tool_calls);
-    /* The string-content probe hands the template an empty tools array, not [null]: this
-     * template iterates `tools`, threw on the null, and lost string content. */
     CHECK(glm.caps().string_content);
 
     ChatTemplate first;
@@ -1048,7 +1056,7 @@ TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
 
 /* A template that takes one system message, first, as many do, against conversations the Chat
  * Completions API allows: a system message after a user turn, and two at the head. They are
- * rendered with the system messages merged, in order, into one at the head (#137). Any other
+ * rendered with the system messages merged, in order, into one at the head. Any other
  * refusal comes back in the template's own words, without the parser-generation wrapper. */
 TEST(system_messages_a_template_takes_only_first_are_merged_at_the_head) {
     ChatTemplate t;

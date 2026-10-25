@@ -174,6 +174,142 @@ TEST(a_speech_model_takes_optional_instructions_and_renders_its_unconditional_pr
     CHECK(m.last().neg_tokens.empty());
 }
 
+/* A model that declares input_special (its speaker tags are special tokens) has its input
+ * tokenised with them, and one of one branch refuses any guidance but 1 under its field; other
+ * models' input stays plain text. */
+TEST(a_model_that_asks_has_its_input_read_with_special_tokens_and_one_branch_has_no_guidance) {
+    Speech s;
+    s.gen.inf.tmpl_plain = "<s>{input}";
+    s.gen.inf.default_steps = 0;
+    s.gen.inf.input_special = true;
+    s.gen.inf.branches = 1;
+    s.f->tok.last_parse_special = false;
+    CHECK_EQ(s.post({ { "input", "hi" } }).status, 200);
+    CHECK(s.f->tok.last_parse_special);
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "guidance_scale", 2.0 } }),
+             std::string("guidance_scale"));
+    CHECK_EQ(s.post({ { "input", "hi" }, { "guidance_scale", 1.0 } }).status, 200);
+    /* A model that declares no template with instructions refuses them by name. */
+    s.gen.inf.tmpl.clear();
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "instructions", "calm" } }),
+             std::string("instructions"));
+    CHECK_EQ(s.post({ { "input", "hi" } }).status, 200);
+    Speech m;
+    m.gen.inf.tmpl_plain = "<s>{input}";
+    m.gen.inf.default_steps = 0;
+    CHECK_EQ(m.post({ { "input", "hi" } }).status, 200);
+    CHECK(!m.f->tok.last_parse_special);
+}
+
+/* A 16-bit mono WAV of the given samples at `rate`. */
+static std::string wav_of(const std::vector<int16_t>& x, uint32_t rate) {
+    std::string d;
+    for (int16_t v : x) {
+        d.push_back((char)(v & 0xff));
+        d.push_back((char)((v >> 8) & 0xff));
+    }
+    auto u32 = [](uint32_t v) {
+        std::string b;
+        for (int i = 0; i < 4; ++i) b.push_back((char)((v >> (8 * i)) & 0xff));
+        return b;
+    };
+    auto u16 = [](uint16_t v) { return std::string{ (char)(v & 0xff), (char)(v >> 8) }; };
+    return "RIFF" + u32((uint32_t)(36 + d.size())) + "WAVEfmt " + u32(16) + u16(1) + u16(1) +
+           u32(rate) + u32(rate * 2) + u16(2) + u16(16) + "data" + u32((uint32_t)d.size()) + d;
+}
+
+/* A model that clones a voice takes references: each clip decoded at its rate and padded to
+ * whole frames, the prompt its references' template with each one's header, transcript and a row
+ * a frame (token 0, the clips' frames numbered in order), the rest of the rows -1. A data: URL and
+ * bare base64 both carry a clip. Refused by name: references on a model without them, too many,
+ * a reference without its text or clip or with an unknown field, a clip past the budget, and
+ * instructions beside them. */
+TEST(a_cloning_model_takes_references_as_clips_and_transcripts_in_its_prompt) {
+    if (!mm::decoder_available()) return;
+    Speech s;
+    s.gen.inf.tmpl_plain = "<s>{input}";
+    s.gen.inf.tmpl_ref = "<s>R{references}|{input}";
+    s.gen.inf.ref_item = "[{index}:{text}]{audio}.";
+    s.gen.inf.ref_rate = 8000;
+    s.gen.inf.ref_hop = 4;
+    s.gen.inf.ref_max_samples = 16;
+    s.gen.inf.ref_max = 2;
+    s.gen.inf.default_steps = 0;
+    s.gen.inf.branches = 1;
+    const std::string w1 = wav_of({ 1000, -2000, 3000, 4000, 5000 }, 8000);
+    const std::string w2 = wav_of({ -16384, 16384 }, 8000);
+    const std::string b1 = base64_encode((const uint8_t*)w1.data(), w1.size());
+    const std::string b2 = base64_encode((const uint8_t*)w2.data(), w2.size());
+    json refs = json::array({ json{ { "audio", b1 }, { "text", "one" } },
+                              json{ { "audio", "data:audio/wav;base64," + b2 },
+                                    { "text", "two" } } });
+    CHECK_EQ(s.post({ { "input", "hi" }, { "references", refs } }).status, 200);
+    const gen::AudioRequest& q = s.last();
+    /* "<s>R", "[1:one]", 2 frames, ".", "[2:two]", 1 frame, ".", "|hi". */
+    const std::string head = "<s>R[1:one]";
+    std::vector<int32_t> want_tok, want_frame;
+    auto text = [&](const std::string& t) {
+        for (unsigned char c : t) { want_tok.push_back(c); want_frame.push_back(-1); }
+    };
+    auto frames = [&](int32_t f0, int32_t n) {
+        for (int32_t f = 0; f < n; ++f) { want_tok.push_back(0); want_frame.push_back(f0 + f); }
+    };
+    text(head);
+    frames(0, 2);
+    text(".[2:two]");
+    frames(2, 1);
+    text(".|hi");
+    CHECK(q.tokens == want_tok);
+    CHECK(q.ref_frame == want_frame);
+    REQUIRE(q.ref_cu.size() == 3);
+    CHECK_EQ(q.ref_cu[1], 8);
+    CHECK_EQ(q.ref_cu[2], 12);
+    REQUIRE(q.ref_audio.size() == 12);
+    CHECK(std::fabs(q.ref_audio[0] - 1000.0f / 32768.0f) < 1e-6f);
+    CHECK(std::fabs(q.ref_audio[1] + 2000.0f / 32768.0f) < 1e-6f);
+    CHECK_EQ(q.ref_audio[5], 0.0f);
+    CHECK_EQ(q.ref_audio[7], 0.0f);
+    CHECK(std::fabs(q.ref_audio[8] + 0.5f) < 1e-6f);
+    CHECK_EQ(q.ref_audio[11], 0.0f);
+    /* Without references the plain prompt, and no clips. */
+    CHECK_EQ(s.post({ { "input", "hi" }, { "references", json::array() } }).status, 200);
+    CHECK(s.last().ref_cu.empty() && s.last().ref_frame.empty() && s.last().ref_audio.empty());
+
+    const json one = json{ { "audio", b1 }, { "text", "one" } };
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "references", json::array({ one, one, one }) } }),
+             std::string("references"));
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "references", one } }), std::string("references"));
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ json{ { "audio", b1 } } }) } }),
+             std::string("references[0].text"));
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ json{ { "text", "x" } } }) } }),
+             std::string("references[0].audio"));
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ json{ { "audio", b1 }, { "text", "x" },
+                                                             { "speaker", 1 } } }) } }),
+             std::string("references[0].speaker"));
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ json{ { "audio", "@@@" },
+                                                             { "text", "x" } } }) } }),
+             std::string("references[0].audio"));
+    /* 8 and 8 samples fit the 16; a third frame past them does not. */
+    const std::string w3 = wav_of(std::vector<int16_t>(9, 7), 8000);
+    const std::string b3 = base64_encode((const uint8_t*)w3.data(), w3.size());
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ one, json{ { "audio", b3 },
+                                                                  { "text", "x" } } }) } }),
+             std::string("references[1].audio"));
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "instructions", "calm" }, { "references", refs } }),
+             std::string("instructions"));
+    CHECK_EQ(s.refused({ { "input", "hi" },
+                         { "references", json::array({ json{ { "audio", b1 },
+                                                             { "text", "REFUSE" } } }) } }),
+             std::string("references[0].text"));
+    Speech m;
+    CHECK_EQ(m.refused(Speech::body({ { "references", refs } })), std::string("references"));
+}
+
 /* ================================================================== the response */
 
 /* The whole piece: the windows in order whatever order they were played in, as a WAV whose header

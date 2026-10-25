@@ -1,0 +1,64 @@
+{#- Unlimited-OCR is a single-shot document parser: it expects the picture marker(s) followed by
+    the reference instruction, e.g. "<__media__>document parsing." (the server replaces each
+    marker with a picture's token run). Chat clients send the picture plus arbitrary text, often
+    nothing, and resend earlier turns including their pictures. A parser without its start
+    instruction free-runs like a language model and first emits prose (the Chinese/Russian
+    preamble seen from LibreChat), and text from earlier turns or a system message would be
+    concatenated into the prompt. This template keeps every picture marker (the server requires
+    the rendered prompt to account for every picture in the request) and the final user turn's
+    text, drops other text, and supplies the reference instruction when the final turn carries
+    none, for any number of pictures: one is "document parsing.", several are "Multi page
+    parsing." -#}
+{%- set ns = namespace(last=none, at=-1, media=0, text=false) -%}
+{%- for message in messages -%}
+  {%- if message['role'] == 'user' -%}
+    {%- set ns.last = message -%}
+    {%- set ns.at = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.last is not none -%}
+  {%- if ns.last['content'] is string -%}
+    {%- for piece in ns.last['content'].split('<__media__>') -%}
+      {%- if not loop.last -%}{%- set ns.media = ns.media + 1 -%}{%- endif -%}
+      {%- if ((piece | replace('￼', '')) | trim) != '' -%}{%- set ns.text = true -%}{%- endif -%}
+    {%- endfor -%}
+  {%- else -%}
+    {#- The OpenAI parts form counts the same way: media from the marker parts, text from any
+        non-empty text part (a client's U+FFFC object placeholder is whitespace). -#}
+    {%- for part in ns.last['content'] -%}
+      {%- if part['type'] == 'media_marker' -%}
+        {%- set ns.media = ns.media + 1 -%}
+      {%- elif part['type'] == 'text' and ((part['text'] | default('', true) | replace('￼', '')) | trim) != '' -%}
+        {%- set ns.text = true -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- set mi = loop.index0 -%}
+  {%- if message['content'] is string -%}
+    {%- set c = message['content'] -%}
+    {%- if mi == ns.at -%}
+      {{- c | replace('￼', '') -}}
+    {%- else -%}
+      {%- for piece in c.split('<__media__>') -%}
+        {%- if not loop.last -%}<__media__>{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- for part in message['content'] -%}
+      {%- if part['type'] == 'media_marker' -%}<__media__>
+      {%- elif part['type'] == 'text' and mi == ns.at and ns.last is not none -%}{{- part['text'] -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endfor -%}
+{#- The instruction block serves both content forms: ns.media/ns.text above scanned the final
+    turn whichever it was. Output is whitespace-tight: every tag trims, the newline after
+    "Multi page parsing." is eaten by the next tag's `{%-`, and the rendered prompt ends with
+    the instruction verbatim -- keep the trims when reformatting this block. -#}
+{%- if ns.last is not none and not ns.text -%}
+  {%- if ns.media > 1 -%}Multi page parsing.
+  {%- elif ns.media == 1 -%}document parsing.
+  {%- endif -%}
+{%- endif -%}

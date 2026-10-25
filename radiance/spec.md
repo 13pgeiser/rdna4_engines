@@ -363,8 +363,9 @@ zero, so `auto` resolves to 0.
 divided, §9); the deployment's bounds `max_tok`, `max_seqs`, `max_ctx`, `max_spec`,
 `max_enc_patches` and `max_audio_frames`, so buffers are sized for the worst step; the
 tensor-parallel wire choice `tp_wire_lossy` and its `tp_wire_min_bytes` cutover (§9); `kv_dtype`;
-`shape_probe` (§3.1); and `is_draft` / `scope`, which say whether this builder scope is the model,
-a drafter or an encoder.
+`attn_prefill_fp8`, the attention products the deployment accepts in e4m3 (`attn_paged`'s
+`prefill_fp8`, docs/OPS.md); `shape_probe` (§3.1); and `is_draft` / `scope`, which say whether this
+builder scope is the model, a drafter or an encoder.
 
 ---
 
@@ -636,6 +637,14 @@ same path runs. Trivial means served as stored:
   throughout), where `X.weight` holds the codes and `X.weight_scale` the exponents: the encoding
   `fp4_e2m1*e8m0[1x32]`, byte for byte;
 - GGUF `F32`, `F16` and `BF16`.
+
+**A torch.save file beside the safetensors is read as data** (`core/format/torch_zip.h`), for a
+model part that ships only that way (Fish Audio drama-3's `codec.pth`): its tensors join the
+namespace under `<stem>.`. The zip's stored entries are mapped, and its pickle is read by a machine
+over the weights-only subset (the state dict's `OrderedDict`, `_rebuild_tensor_v2`,
+`_rebuild_parameter` and the typed storages), so nothing in the file runs; any other global or
+opcode is refused by name, and the file is then left out with a warning. A torch copy of the
+model's own weights (`pytorch_model*.pth`, `consolidated*.pth`) is passed over.
 
 **Nothing is quantised at load.** A served form that needs quantisation (Flash-Next's int4
 experts, an fp8 `lm_head` from a bf16 one) is converted ahead of time (§4.4). A direct load has no

@@ -58,7 +58,7 @@ std::vector<Case> build_cases() {
         add("scale",         { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
-        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid" })
+        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" })
             add("act_mul", { HI("M", 6), HI("n", 645), HS("act", act), HS("dtype", dt) },
                 EB(6, 645, w, 3));
         add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt) }, EB(9, 645, w, 2));
@@ -378,6 +378,31 @@ std::vector<Case> build_cases() {
         for (int kw : { 3, 4 })
             add("attn_na3d", { HI("M", 64), HI("head_dim", 64), HI("kt", 3), HI("kh", 3),
                                HI("kw", kw), HS("dtype", dt) });
+    /* Unlimited-OCR's SAM tower: window 14 on a 16x16 grid (padded to 2x2 windows of 14x14), the
+     * same over a 14x21 grid (a partial window in both directions, and the padded rows take part in
+     * the softmax), an exact 14x14 multiple, window 7 (21x21 after padding), the global form on a
+     * square grid, and the global form on a non-square grid whose rel_pos tables must be resampled
+     * along their row axis. Two segments where the case is multi-segment, so a wrong cu walk shows.
+     * `n_seq` is not a schema parameter: libref's shape hook sizes cu from it (the harness hint
+     * convention, avx_cases.cpp's gdn cases). */
+    add("sam_attn", { HI("M", 256), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 14), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 588), HI("head_dim", 32), HI("n_head", 2), HI("grid_h", 14),
+                      HI("grid_w", 21), HI("window", 14), HF("scale", 0.17677669529663687),
+                      HS("dtype", "bf16"), HI("n_seq", 2) });
+    add("sam_attn", { HI("M", 196), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 14),
+                      HI("grid_w", 14), HI("window", 14), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 256), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 7), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 256), HI("head_dim", 16), HI("n_head", 4), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 0), HF("scale", 0.25),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 240), HI("head_dim", 32), HI("n_head", 2), HI("grid_h", 12),
+                      HI("grid_w", 20), HI("window", 0), HF("scale", 0.17677669529663687),
+                      HS("dtype", "bf16") });
     for (const char* dt : { "f32", "bf16" })
         add("seg_sinusoid", { HI("M", 30), HI("n", 64), HI("period", 13), HS("dtype", dt) });
     /* Gemma 4's audio attention: left 12, over segments longer than the window. */
@@ -565,6 +590,18 @@ std::vector<Case> build_cases() {
                              HS("dtype", dt) });
         add("router_topk", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2), HI("norm", 0),
                              HS("dtype", dt) });
+        /* The pair and the pair behind the router GEMM: the whole-model form and a rank's slice
+         * with a nonzero expert base, since the sort's slicing is the part the fuse adds. */
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2),
+                                     HI("norm", 1), HS("dtype", dt) });
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("n_local", 4),
+                                     HI("top_k", 2), HI("norm", 0), HI("expert_base", 2),
+                                     HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("top_k", 2), HI("norm", 0), HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("n_local", 4), HI("top_k", 2), HI("norm", 1),
+                                          HI("expert_base", 2), HS("dtype", dt) });
         add("moe_gather",  { HI("M", 9), HI("n", 128), HI("top_k", 2), HS("dtype", dt) });
         /* The shared-expert fold: `shared`/`shared_gate` are always described, so always
          * present; this case uses sigmoid, the one above "none". */
@@ -657,8 +694,8 @@ std::vector<Case> build_cases() {
 
     /* Sampling. n_vocab 517 exceeds every vector width and is not a multiple of any; n_cand 12 is
      * a realistic candidate set after top-k. */
-    for (const char* op : { "sample_penalties", "sample_dry", "sample_temp", "sample_mask",
-                            "sample_argmax" })
+    for (const char* op : { "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp",
+                            "sample_mask", "sample_argmax" })
         add(op, { HI("M", 5), HI("n_vocab", 517) });
     add("sample_topk", { HI("M", 5), HI("n_vocab", 517), HI("vocab_off", 0) });
     /* k 7 and 20 (OpenAI's top_logprobs bound) against 517 columns; the offset case checks that
@@ -907,7 +944,6 @@ std::vector<Case> build_cases() {
         add("s2d3d", { HI("M", 64), HI("C", 6), HI("st", 2), HI("sh", 2), HI("sw", 2),
                        HI("group", 4), HS("mode", "mean"), HI("add", 1), HS("dtype", dt) });
         add("pix_patch", { HI("M", 12), HI("p", 4), HI("C", 3), HS("dtype", dt) });
-        add("patch_pix8", { HI("M", 12), HI("p", 4), HI("C", 3), HS("dtype", dt) });
         add("stft_logmel", { HI("M", 6), HI("hop", 80), HI("nfft", 512), HI("n_mel", 64),
                              HI("ch", 2), HS("dtype", dt) });
         add("bwe_up", { HI("M", 600), HI("ratio", 3), HI("ch", 2), HS("dtype", dt) });
@@ -961,6 +997,13 @@ std::vector<Case> build_cases() {
         for (int dil : { 1, 3 })
             add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 7),
                             HI("dil", dil), HI("causal", 1), HS("dtype", dt) });
+        /* Strided, causal: Fish Audio's codec encoder downsamples with kernels of two strides
+         * (2, 4, 8) and its quantiser with a kernel of one (k 2, stride 2). */
+        for (int s : { 2, 4, 8 })
+            add("conv1d", { HI("M", 64), HI("cin", 20), HI("cout", 13), HI("k", 2 * s),
+                            HI("dil", 1), HI("causal", 1), HI("stride", s), HS("dtype", dt) });
+        add("conv1d", { HI("M", 64), HI("cin", 24), HI("cout", 16), HI("k", 2), HI("dil", 1),
+                        HI("causal", 1), HI("stride", 2), HS("dtype", dt) });
         for (int s : { 2, 4, 8 })
             add("conv_t1d", { HI("M", 12), HI("cin", 20), HI("cout", 13), HI("stride", s),
                               HS("dtype", dt) });
@@ -1005,6 +1048,12 @@ std::vector<Case> build_cases() {
     add("cfg_topk_sample", { HI("M", 6), HI("n_vocab", 645), HI("k", 645), HI("rep", 2),
                              HF("cfg", 1.7), HF("temp", 0.8), HI("stream", 0),
                              HS("dtype", "f32") });
+    /* Fish Audio's draw: the nucleus over the whole candidate set's softmax, then the top-k cut;
+     * at a small top_p the head alone, and above 1 none. */
+    for (double tp : { 0.7, 0.05, 0.95 })
+        add("cfg_topk_sample", { HI("M", 4), HI("n_vocab", 645), HI("k", 30), HI("rep", 1),
+                                 HF("cfg", 1.0), HF("temp", 0.7), HI("stream", 2),
+                                 HF("top_p", tp), HS("dtype", "f32") });
     /* A speech model's backbone pick: reserved ids suppressed (the vocabulary's last class stays a
      * candidate), a temperature, the penalty idle without a history. */
     for (int rep : { 1, 2 })
@@ -1016,6 +1065,9 @@ std::vector<Case> build_cases() {
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 8), HI("vocab", 64),
                                HI("off0", 5), HF("scale", sc), HS("dtype", dt) });
+        /* Codes past a codebook smaller than its heads read its last row (Fish Audio's codec). */
+        add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 4), HI("vocab", 64),
+                           HI("off0", 0), HF("scale", 1.0), HI("clamp", 40), HS("dtype", dt) });
         /* One rounding of the whole sum: sixteen codebooks, as a speech model's frame embedding. */
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 16), HI("vocab", 64),
@@ -1045,6 +1097,19 @@ std::vector<Case> build_cases() {
     }
     add("end_status", { HI("M", 2), HI("end", 5), HI("rep", 2) });
     add("end_status", { HI("M", 4), HI("end", 3), HI("rep", 1) });
+    add("ras_pick", { HI("M", 4), HI("win", 16), HI("lo", 1), HI("hi", 9), HI("rep", 1) });
+    add("ras_pick", { HI("M", 2), HI("win", 4), HI("lo", 0), HI("hi", 12), HI("rep", 2),
+                      HI("clear", 1) });
+    /* A codec encoder's residual quantiser step: DAC's eight-wide codes over a semantic codebook
+     * and a residual one, both dtypes; a dimension that is no vector's width. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("vq_encode", { HI("M", 7), HI("n", 64), HI("dim", 8), HI("bins", 4096),
+                           HS("dtype", dt) });
+        add("vq_encode", { HI("M", 5), HI("n", 128), HI("dim", 8), HI("bins", 1024),
+                           HS("dtype", dt) });
+    }
+    add("vq_encode", { HI("M", 3), HI("n", 40), HI("dim", 5), HI("bins", 33),
+                       HS("dtype", "f32") });
     add("frame_store", { HI("M", 2), HI("n_codes", 16), HI("stride", 9), HI("rep", 2),
                          HI("skip", 0) });
     add("frame_store", { HI("M", 4), HI("n_codes", 3), HI("stride", 5), HI("rep", 1),
@@ -1057,6 +1122,8 @@ std::vector<Case> build_cases() {
     add("cu_repeat", { HI("M", 9), HI("mult", 1) });
     add("int_affine", { HI("M", 4), HS("src", "0 -1 2 1"), HS("mul", "2 0 8 4"),
                         HS("add", "-1 7 -7 -3") });
+    add("sub_i32", { HI("M", 1) });
+    add("sub_i32", { HI("M", 37) });
 
     /* ================================================================== speed-only, at model size
      *

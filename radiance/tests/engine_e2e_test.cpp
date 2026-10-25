@@ -727,6 +727,100 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* --attn-prefill-fp8 is a permission an exact kernel also satisfies. The host libraries have no
+ * e4m3 attention, so asked for it the start is refused by the flag's name instead of serving the
+ * exact form under it. */
+TEST(an_attention_fp8_mode_no_kernel_takes_is_refused_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
+                                       "--attn-prefill-fp8", "both" }, {}, 120);
+    const bool named = has(r.log, "not starting: --attn-prefill-fp8 both, but no attention kernel");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+}
+
+/* The row split of a prefill's attention is a graph only a plugin that declares it can build, so
+ * a plugin that does not (qwen35 here) is refused by the flag's name instead of serving the head
+ * split under it. */
+TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0", "--tp", "2",
+                                       "--tp-attn-split", "rows" },
+                           { "RADIANCE_HOST_DEVICES=2" }, 120);
+    const bool named = has(r.log, "--tp-attn-split rows: the '") &&
+                       has(r.log, "plugin does not split attention by rows");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+}
+
+/* --draft-coupling's answers before any request: a value other than off/on is refused by the flag
+ * parse, and a model whose drafter has no per-round draw to couple is refused at bringup. The same
+ * model with the flag off is the control: it starts, so the refusals are the flag's and not the
+ * fixture's. */
+TEST(the_coupling_flag_refuses_what_it_cannot_serve_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    /* qwen35's tiny checkpoint declares no draft head: no serial chain to couple. The spechub
+     * kernels are loaded beside libref, so the refusal is the drafter's shape and not a missing
+     * coupling kernel. */
+    const Ran on = radiance(w.qwen35, { "--kernels", "libref,spechub", "--draft-coupling", "on" },
+                            {}, 120);
+    const std::string want = "--draft-coupling on requires the linear serial draft chain "
+                             "(RAD_DRAFT_SERIAL with depth > 0)";
+    if (on.status == 0 || on.status == 124 || !has(on.log, want))
+        fprintf(stderr, "    --draft-coupling on exited %d:\n%s\n", on.status,
+                tail(on.log, 20).c_str());
+    CHECK(on.status != 0);
+    CHECK(on.status != 124);
+    CHECK(has(on.log, want));
+    CHECK(has(on.log, "declares drafter '(none)'"));
+
+    /* The reference gate is not relaxed: with a production library for the model's ops and the
+     * spechub library beside it on a machine with no card, the only coupled row left is the host
+     * oracle, and the start must be refused naming the coupled op. */
+    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+        std::string gate_log;
+        const int gate = tiny::run(serving_argv(w.qwen35, { "--kernels", "libavx,spechub",
+                                                            "--draft-coupling", "on" }),
+                                   engine_env({}), &gate_log, 120);
+        const std::string gate_ref = "1 declared op(s) resolve only to a reference implementation "
+                                     "(spechub)";
+        if (gate == 0 || gate == 124 || !has(gate_log, gate_ref) ||
+            !has(gate_log, "1 distinct op(s): mtp_couple_verify"))
+            fprintf(stderr, "    serving start exited %d:\n%s\n", gate,
+                    tail(gate_log, 20).c_str());
+        CHECK(gate != 0);
+        CHECK(gate != 124);
+        CHECK(has(gate_log, gate_ref));
+        CHECK(has(gate_log, "distinct op(s): mtp_couple_verify"));
+    }
+
+    const Ran typo = radiance(w.qwen35, { "--draft-coupling", "yes" }, {}, 120);
+    const std::string refused = "--draft-coupling takes off or on, not 'yes'";
+    if (typo.status == 0 || typo.status == 124 || !has(typo.log, refused))
+        fprintf(stderr, "    --draft-coupling yes exited %d:\n%s\n", typo.status,
+                tail(typo.log, 20).c_str());
+    CHECK(typo.status != 0);
+    CHECK(typo.status != 124);
+    CHECK(has(typo.log, refused));
+
+    /* --debug-graph runs declare and plan and exits, so it is a start, not a serve. */
+    const Ran off = radiance(w.qwen35, { "--debug-graph", "--draft-coupling", "off" }, {}, 120);
+    if (off.status != 0)
+        fprintf(stderr, "    --draft-coupling off exited %d:\n%s\n", off.status,
+                tail(off.log, 20).c_str());
+    CHECK_EQ(off.status, 0);
+    CHECK(!has(off.log, "MTP coupled LIVE"));
+}
+
 /* Two ranks split heads, the FFN and the vocabulary, and sum partial products in an all-reduce,
  * so the rounding differs from one rank's; anything more than rounding is a wrong column or row
  * (a rank's logits read at another rank's vocabulary offset score near chance). */

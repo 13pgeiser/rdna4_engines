@@ -517,11 +517,13 @@ static inline void h_sampler_rows(Prepared& pr, const Case& c) {
     if (std::strncmp(c.op, "sample_", 7) != 0) return;
     Opd* params = nullptr;
     Opd* hist = nullptr;
+    Opd* ngram = nullptr;
     for (size_t k = 0; k < pr.opd.size(); ++k) {
         const char* nm = pr.schema->operands[k].name;
         if (!nm || pr.opd[k].absent || pr.opd[k].d.rank != 2) continue;
         if (!std::strcmp(nm, "params")) params = &pr.opd[k];
         if (!std::strcmp(nm, "history") && pr.opd[k].d.dtype == RAD_I32) hist = &pr.opd[k];
+        if (!std::strcmp(nm, "ngram") && pr.opd[k].d.shape[1] == 2) ngram = &pr.opd[k];
     }
     const int64_t words = (int64_t)(sizeof(RadSampleParams) / 4);
     if (!params || rad_dtype_bits(params->d.dtype) != 32 || params->d.shape[1] != words) return;
@@ -549,6 +551,14 @@ static inline void h_sampler_rows(Prepared& pr, const Case& c) {
         sp.hist_off = 0;
         sp.hist_len = (int32_t)hw;
         sp.mask_row = r % 2 ? (int32_t)r : -1;
+        /* The n-gram ban's per-row pair: n 1 to 3 over windows short of the 64-token history, so
+         * the window boundary and the n == 1 form (an empty prefix) both run. Only the op whose
+         * schema has the `ngram` plane reads it. */
+        if (ngram) {
+            int32_t* v = (int32_t*)ngram->master.data();
+            v[2 * r]     = 1 + (int32_t)(r % 3);
+            v[2 * r + 1] = 12 + 8 * (int32_t)(r % 4);
+        }
         sp.flags = RAD_SP_PENALTY | RAD_SP_XTC | RAD_SP_DRY | RAD_SP_LOGPROBS |
                    (sp.mask_row >= 0 ? RAD_SP_MASK : 0);
         if (r == M - 1 && M > 1) sp.flags = RAD_SP_GREEDY;

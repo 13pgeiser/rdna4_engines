@@ -10,6 +10,7 @@
  * host blocks (rad_dev_host_blocks).
  */
 #include "rad_test.h"
+#include "host_kargs_main.h"
 
 #include "device/device.h"
 #include "runtime/arena.h"
@@ -489,6 +490,51 @@ TEST(pending_weight_waits_on_the_stream_not_the_host) {
     rad_event_destroy(moving);
 }
 
+/* A stream wait orders only the stream it is put on, so each lane that reads a weight in flight
+ * waits for it once: lane 0 reading a weight lane 1 already waited on must not run ahead of the
+ * copy. */
+TEST(a_pending_weight_is_waited_on_by_each_lane_that_reads_it) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.dense.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("gemm_nt", "M", { 8192 }, { k_pre }, { "prefill" }, &g_gemm_schema, { w });
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    rad::WeightSlot& slot = res.slot[(size_t)w];
+    RadEvent moving = nullptr;
+    CHECK_OK(rad_event_create(&moving));
+    slot.ptr        = g_moved_bytes;
+    slot.ready      = moving;
+    slot.generation = 1;
+
+    CHECK_OK(f.start(&res));
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));   /* lane 0 again: already ordered */
+    }));
+    CHECK_EQ(f.ctx.stream_waits(), (int64_t)2);
+
+    /* A new transfer re-arms the wait on both lanes. */
+    slot.generation = 2;
+    CHECK_OK(f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+    }));
+    CHECK_EQ(f.ctx.stream_waits(), (int64_t)4);
+
+    f.ctx.shutdown();
+    rad_event_destroy(moving);
+}
+
 /* With no residency table (all in VRAM: everything on tier 0, the mover never runs) the lookup
  * collapses to WeightInfo::ptr and there is nothing to wait on. The common case must not pay for
  * the dynamic one. */
@@ -865,6 +911,88 @@ TEST(a_declared_second_lane_has_its_own_scratch_region) {
     }
 }
 
+/* A request on the second lane larger than its region (an op whose buffers are not all
+ * rad_buf_concurrent, breaking Ctx::lane1_ rule 3) is refused by name; on lane 0 the same op runs. */
+TEST(a_second_lane_scratch_request_past_its_region_is_refused_by_name) {
+    Fixture f;
+    f.P.scratch_bytes       = kScrBytes;
+    f.P.scratch_bytes_lane1 = kScrBytes / 4;
+    f.P.scratch_regions     = 2;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    f.P.ops[a0].bands[0].dom[RAD_DOMAIN_DEVICE].scratch_bytes = kScrBytes;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.issue(a0, opd, 1, RAD_N_BATCH));
+    }));
+    const int s = f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.set_lane(1));
+        c.issue(a0, opd, 1, RAD_N_BATCH);
+        CHECK_OK(c.set_lane(0));
+    });
+    CHECK_EQ(s, RAD_E_SCRATCH);
+    CHECK(std::strstr(f.ctx.step_error(), "rad_buf_concurrent") != nullptr);
+}
+
+/* The second lane's window holds at issue: an op on lane 1 outside it fails the step by name; inside
+ * it runs. */
+TEST(an_op_on_the_second_lane_outside_its_window_is_refused_by_name) {
+    Fixture f;
+    f.P.scratch_regions = 2;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    rad_op a1 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" }, nullptr, {});
+    f.P.lane1_w0 = f.P.lane1_w1 = (int32_t)a0;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(a0, opd, 1, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+        CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));   /* past the window: joins lane 1 first */
+    }));
+    const int s = f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.set_lane(1));
+        c.issue(a1, opd, 1, RAD_N_BATCH);
+        CHECK_OK(c.set_lane(0));
+    });
+    CHECK_EQ(s, RAD_E_STATE);
+    CHECK(std::strstr(f.ctx.step_error(), "outside its declared window") != nullptr);
+}
+
+/* Lane 0 joins pending lane-1 work before an op outside the window on either side: a transient of an
+ * op declared before the window may share bytes with a concurrent buffer as much as one declared
+ * after it. Inside the window lane 0 runs beside lane 1. */
+TEST(an_op_outside_the_window_on_lane_0_joins_the_second_lane_first) {
+    Fixture f;
+    f.P.scratch_regions = 2;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    rad_op a1 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" }, nullptr, {});
+    rad_op a2 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    f.P.lane1_w0 = f.P.lane1_w1 = (int32_t)a1;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        for (rad_op before_or_after : { a0, a2 }) {
+            CHECK_OK(c.set_lane(1));
+            CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));
+            CHECK_OK(c.set_lane(0));
+            CHECK(c.lane1_pending());
+            CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));        /* inside: no join */
+            CHECK(c.lane1_pending());
+            CHECK_OK(c.issue(before_or_after, opd, 1, RAD_N_BATCH));
+            CHECK(!c.lane1_pending());
+        }
+    }));
+}
+
 /* Operands are positional (spec §2.3), so a miscount is silent numerical garbage at the kernel,
  * not a diagnosable failure. The runtime checks the given arity against the schema. */
 TEST(operand_arity_is_checked_against_the_schema) {
@@ -1205,6 +1333,30 @@ TEST(the_predicted_arena_counts_every_scratch_region) {
     CHECK_EQ(a.bytes(), total);
     CHECK_EQ(a.scratch_regions(), 2);
     CHECK_EQ((char*)a.scratch(1) - (char*)a.scratch(0), rad::align_up(300, RAD_ALIGN_UNIT));
+    CHECK((char*)a.scratch(1) + 300 <= a.base() + a.bytes());
+    a.release();
+}
+
+/* Region 1 sized apart (Program::scratch_bytes_lane1): the prediction and the allocation agree,
+ * region 1 starts right after region 0 and ends inside the arena. */
+TEST(the_second_lanes_scratch_region_takes_its_own_size) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 16, 16, 0);
+    f.P.arena_bytes         = 512;
+    f.P.scratch_bytes       = 3 * RAD_ALIGN_UNIT;
+    f.P.scratch_bytes_lane1 = 300;
+    f.P.scratch_regions     = 2;
+    int64_t dev = 0, total = 0;
+    rad::arena_plan_bytes(f.P, &dev, &total);
+    CHECK_EQ(total, rad::align_up(dev, RAD_ALIGN_UNIT) + 3 * RAD_ALIGN_UNIT +
+                        rad::align_up(300, RAD_ALIGN_UNIT));
+    rad::Arena a;
+    CHECK_OK(a.init(dev, f.P.scratch_bytes, RAD_MEM_DEVICE, f.P.scratch_regions,
+                    f.P.scratch_bytes_lane1));
+    CHECK_EQ(a.bytes(), total);
+    CHECK_EQ(a.scratch_bytes(0), 3 * RAD_ALIGN_UNIT);
+    CHECK_EQ(a.scratch_bytes(1), 300);
+    CHECK_EQ((char*)a.scratch(1) - (char*)a.scratch(0), 3 * RAD_ALIGN_UNIT);
     CHECK((char*)a.scratch(1) + 300 <= a.base() + a.bytes());
     a.release();
 }
@@ -1903,7 +2055,7 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
 }
 
 /* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
- * step; a played pass reissues the sum without calling step (#122). A program holding one records
+ * step; a played pass reissues the sum without calling step. A program holding one records
  * no passes; one without records them wherever the backend can. */
 TEST(a_program_with_a_calibration_tap_records_no_passes) {
     {
@@ -2225,4 +2377,4 @@ TEST(repeat_mode_flags_a_kernel_that_is_not_a_function_of_its_inputs) {
     CHECK(has(good.log, "1 issue(s) run twice, 0 of them answered differently"));
 }
 
-RAD_TEST_MAIN()
+RAD_TEST_MAIN_HOST_KARGS()

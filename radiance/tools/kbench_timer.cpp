@@ -305,7 +305,6 @@ void DeviceTimer::setup() {
                          rad_stream_sync(s_) < 0))
         fail = std::string("the keep-alive source could not be written: ") + rad_dev_last_error();
     if (!fail.empty()) {
-        setup_failed_ = true;
         withheld_ = fail;
         header_.push_back("timing: " + fail);
         return;

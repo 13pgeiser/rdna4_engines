@@ -156,6 +156,7 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.max_spec      = cfg_.n_spec;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
+    sc.draft_coupling = cfg_.draft_coupling;
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -354,7 +355,7 @@ int Engine::issue_ahead(const RadBatch** out) {
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, drafter_.depth);
+        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
@@ -405,13 +406,9 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. A block drafter pipelines only on the card
-     * (engine_draft.cpp); the host's driver stages from the committed sequence. */
-    block_card_ = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !cfg_.kld() &&
-                  !embedding_ && [] { const char* v = std::getenv("RADIANCE_DRAFT_BLOCK_HOST");
-                                      return !(v && *v && *v != '0'); }();
-    pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
-                  (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
+     * pass issued ahead would overwrite them. */
+    pipelining_ = !cfg_.kld() && !embedding_ &&
+                  (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -456,22 +453,7 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        /* Zero freshly assigned recurrent slots before the step that reads them. The manager
-         * records the grab but cannot write (StateClear in core/mem/kv.h); the list is empty except
-         * on a sequence's first step. Each rank clears by its own plan: the slot number is the
-         * scheduler's, but the state size depends on the heads this rank holds, which can differ
-         * per rank (rad_arch.h remainder_place). */
-        for (const StateClear& c : ranks_[0]->kv.state_clears()) {
-            for (auto& rk : ranks_) {
-                const KVGroupPlan* gp = rk->kv.plan(c.group);
-                if (!gp || !gp->stateful()) continue;
-                const int64_t bytes = gp->layer_bytes_per_state();
-                for (int64_t l = 0; l < gp->n_layers; ++l)
-                    if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
-                        rad_memset_async(p, 0, bytes, rk->ctx.stream());
-            }
-        }
-        ranks_[0]->kv.clear_state_clears();
+        clear_fresh_states();
 
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
@@ -530,7 +512,7 @@ int Engine::step_loop() {
             }
             if (t_on) phase_mark(PH_BEGIN);
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs);
+                const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
                 for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
@@ -705,7 +687,8 @@ int Engine::step_loop() {
         /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
          * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
          * step. */
-        st = block_card_ ? issue_block_drafter(b->step, so) : issue_serial_drafter(b->step, so);
+        st = block_drafting() ? issue_block_drafter(b->step, so)
+                              : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
@@ -717,6 +700,9 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* The step's sampler chain, verify op included, has returned: one line at the first
+         * coupled verify that actually completed. */
+        couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
             if (st < 0) return fail_loop(st);
@@ -769,13 +755,10 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* The drafter for the next step. The host's block driver runs here, since it stages from
-         * the committed sequence. A serial one, or a block one on the card, already ran; what
-         * remains is to check its acceptance against the host's and publish its proposals. Each
-         * driver returns immediately for a kind that is not its own. */
-        st = drafter_.kind != RAD_DRAFT_BLOCK ? finish_serial_drafter(so)
-           : block_card_                      ? finish_block_drafter(so)
-                                              : run_block_drafter(b->step);
+        /* The drafter for the next step already ran on the card; what remains is to check its
+         * acceptance against the host's and publish its proposals. Each driver returns
+         * immediately for a kind that is not its own. */
+        st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
@@ -1370,6 +1353,25 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+/* Zero freshly assigned recurrent slots before the step that reads them. The manager records the
+ * grab but cannot write (StateClear in core/mem/kv.h); the list is empty except on a sequence's
+ * first step. Each rank clears by its own plan: the slot number is the scheduler's, but the state
+ * size depends on the heads this rank holds, which can differ per rank (rad_arch.h
+ * remainder_place). */
+void Engine::clear_fresh_states() {
+    for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+        for (auto& rk : ranks_) {
+            const KVGroupPlan* gp = rk->kv.plan(c.group);
+            if (!gp || !gp->stateful()) continue;
+            const int64_t bytes = gp->layer_bytes_per_state();
+            for (int64_t l = 0; l < gp->n_layers; ++l)
+                if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
+                    rad_memset_async(p, 0, bytes, rk->ctx.stream());
+        }
+    }
+    ranks_[0]->kv.clear_state_clears();
+}
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -1491,15 +1493,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto* b = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
         /* Called inside Scheduler::step() under its lock, which makes touching the cache and rank
          * 0's manager safe; nothing here may call back into the scheduler. */
-        b->restore_fn = [this, b](const Request& req) {
+        b->restore_fn = [this, b](const Request& req, bool whole_only) -> RestoreResult {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
             /* Room is made before anything is planned (PCBinding::restore_plan): a chain the free
              * list cannot hold would otherwise come back only as far as it reaches. One block
              * table serves every rank, so what rank 0's cache gives up is room on every rank. */
-            const std::vector<BlockHash> want =
-                b->restore_plan(req, cvec_salt_for(req.sp.use_control_vector));
-            if (want.empty()) return;
+            RestoreResult res = RestoreResult::Whole;
+            const std::vector<BlockHash> want = b->restore_plan(
+                req, cvec_salt_for(req.sp.use_control_vector), whole_only, &res);
+            if (want.empty()) return res;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch
              * and one copy per run of arena slots instead of a round trip per entry. */
@@ -1510,7 +1513,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                 if (!ranks_[0]->tierx.plan_promote(h, &j)) break;
                 jobs.push_back(std::move(j));
             }
-            if (jobs.empty()) return;
+            /* A record still in flight ends the chain here, as a short reservation does below. */
+            if (jobs.size() < want.size()) res = RestoreResult::Cut;
+            if (jobs.empty()) return res;
             std::vector<char> ok(jobs.size(), 1);
             for (auto& r : ranks_) {
                 std::vector<char> mine;
@@ -1525,7 +1530,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             const std::vector<int32_t>& cg = pc.cached_groups();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 TierJob& j = jobs[i];
-                if (!ok[i]) continue;
+                if (!ok[i]) { res = RestoreResult::Cut; continue; }
                 const int rb = pc.rebind(j.key, j.blocks);
                 if (rb != RAD_OK) {
                     /* No entry to land in: release the reserved blocks and forget the tier record,
@@ -1537,6 +1542,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                 }
             }
             ranks_[0]->tiers.note_restore((int64_t)(rad_mono_ns() - t0));
+            return res;
         };
         /* An eviction that would lose an entry waits for its copy instead. Called by the prefix
          * cache binding under the scheduler's lock when dropping already-copied entries did not
@@ -1688,6 +1694,8 @@ std::string Engine::engine_info() const {
     e["tensor_parallel"]        = cfg_.tp;
     e["tp_wire"]                = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
+    e["attn_prefill_fp8"]       = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
+    e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
@@ -2538,6 +2546,7 @@ int Engine::run_server() {
         in.chunk_bos = gd.chunk_bos;
         in.chunk_eos = gd.chunk_eos;
         in.chunk_pad = gd.pad_token;
+        in.cond_opts = gd.cond_opts;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
@@ -2568,8 +2577,9 @@ int Engine::run_server() {
                     std::string* why) const override {
             const int s = rad_tools_text_prepare(*plugins, field, in, out);
             if (s < 0 && why)
-                *why = s == RAD_E_INVAL ? "the model cannot take this text"
-                                        : std::string(rad_strerror(s));
+                *why = !out->empty()       ? *out
+                       : s == RAD_E_INVAL ? "the model cannot take this text"
+                                          : std::string(rad_strerror(s));
             return s;
         }
         int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) override {
@@ -2595,6 +2605,14 @@ int Engine::run_server() {
         in.default_steps = ad.voc_chunk > 0 ? 0 : ad.default_steps;
         in.default_cfg = ad.default_cfg;
         in.max_lanes = ad.max_lanes;
+        in.branches = ad.branches == 1 ? 1 : 2;
+        in.input_special = ad.input_special != 0;
+        in.tmpl_ref = pg.agen_str.tmpl_ref;
+        in.ref_item = pg.agen_str.ref_item;
+        in.ref_rate = ad.ref_rate;
+        in.ref_hop = ad.ref_hop;
+        in.ref_max_samples = ad.ref_max_samples;
+        in.ref_max = ad.ref_max;
         audio_bridge.drv = aud_gen_;
         audio_bridge.plugins = &plugins_;
         d.audio = &audio_bridge;
@@ -2723,8 +2741,8 @@ int Engine::run_server() {
             RAD_INFO("chat: the template takes reasoning_effort %s, and none or minimal turn "
                      "thinking off%s%s", list.c_str(), mapped.empty() ? "" : "; mapped: ",
                      mapped.c_str());
-            /* What a request naming no effort gets, which a client cannot see: Qwen3.8's template
-             * renders xhigh into a system prompt (#113). */
+            /* What a request naming no effort gets, which a client cannot see: a template may
+             * render a level into a system prompt (Qwen3.8's renders xhigh). */
             const std::string& dflt = srv.template_default_effort();
             if (cfg_.reasoning_effort.empty() && !dflt.empty())
                 RAD_INFO("chat: a request naming no reasoning_effort renders as '%s', the "

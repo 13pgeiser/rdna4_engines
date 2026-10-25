@@ -210,6 +210,12 @@ void Server::register_routes() {
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     router_.post("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
+    /* Forget one stored conversation: by its client label in the path (or `?label=`, for a
+     * label the path cannot carry), or by engine id with `?id=`. */
+    router_.add ("DELETE", "/sessions/:label",
+                 [this](const HttpRequest& q) { return handle_session_release(q); });
+    router_.add ("DELETE", "/sessions",
+                 [this](const HttpRequest& q) { return handle_session_release(q); });
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
@@ -297,8 +303,8 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
         if (text == plain) same.push_back(w);
     }
     /* The level a request naming none gets: the one level whose render is the same. A template may
-     * spend it in a system prompt the client never sees (#113: Qwen3.8's is xhigh). Several, or
-     * none, say nothing. */
+     * spend it in a system prompt the client never sees (Qwen3.8's is xhigh). Several, or none,
+     * say nothing. */
     if (same.size() == 1) template_default_effort_ = same[0];
     lim_.reasoning_efforts = set;
     return set;
@@ -467,9 +473,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
     }
 
     /* The control vector: the request's own choice, else the deployment's runtime default. A
-     * deployment with no vector refuses the on state by name -- serving the stock model while the
-     * client believes it asked for the vector would be a silent lie about what produced the text.
-     * (Naming: `control_vector` is the field, `experimental_speed_projection` its alias.) */
+     * deployment with no vector refuses the on state by name rather than serve the stock model. */
     bool projection_on = false;
     {
         const bool named = r.control_vector >= 0;
