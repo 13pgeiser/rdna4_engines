@@ -1455,13 +1455,29 @@ pub fn f16_shadow_charge(
     }
 }
 
-/// Device bytes of the shared-expert INT8 shadows (`rdna_compute::shared_i8`) the long-prefill
-/// route builds lazily: for every trunk layer `0..num_layers` whose BF16, rank-2, resident,
-/// non-tied `mlp.shared_expert.{gate,up,down}_proj.weight` triple has the route's shape
-/// (`gate`/`up` `[I, K]`, `down` `[M, I]`), the planes of
-/// [`rdna_compute::shared_i8::shared_i8_shadow_layer_bytes`]. A conservative cold bound, like
-/// [`f16_shadow_bytes`]. Callers gate it with [`shared_i8_charge`].
-pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+/// One trunk layer whose shared-expert triple the INT8 route shadows: the
+/// route's shape and the byte sizes of its two planes
+/// ([`rdna_compute::shared_i8::shared_i8_shadow_plane_bytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedI8ShadowLayer {
+    pub layer: usize,
+    pub intermediate: usize,
+    pub hidden: usize,
+    pub down_rows: usize,
+    /// Bytes of the interleaved gate/up plane.
+    pub gate_up_bytes: u64,
+    /// Bytes of the down plane.
+    pub down_bytes: u64,
+}
+
+/// The layers [`shared_i8_shadow_bytes`] charges, in layer order: every trunk
+/// layer `0..num_layers` whose BF16, rank-2, resident, non-tied
+/// `mlp.shared_expert.{gate,up,down}_proj.weight` triple has the route's shape
+/// (`gate`/`up` `[I, K]`, `down` `[M, I]`).
+pub fn shared_i8_shadow_layers(
+    weights: &[WeightEntry],
+    num_layers: usize,
+) -> Result<Vec<SharedI8ShadowLayer>, String> {
     use rdna_compute::DType;
     let find = |layer: usize, proj: &str| {
         let name = format!("model.language_model.layers.{layer}.mlp.shared_expert.{proj}.weight");
@@ -1473,7 +1489,7 @@ pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Res
                 && !matches!(e.policy, ShardPolicy::Tied { .. })
         })
     };
-    let mut total = 0u64;
+    let mut layers = Vec::new();
     for layer in 0..num_layers {
         let (Some(gate), Some(up), Some(down)) = (
             find(layer, "gate_proj"),
@@ -1486,14 +1502,41 @@ pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Res
         if up.logical_shape != gate.logical_shape || down.logical_shape[1] != i {
             continue;
         }
-        let Some(bytes) =
-            rdna_compute::shared_i8::shared_i8_shadow_layer_bytes(i, k, down.logical_shape[0])
+        let Some((gate_up_bytes, down_bytes)) =
+            rdna_compute::shared_i8::shared_i8_shadow_plane_bytes(i, k, down.logical_shape[0])
         else {
             continue;
         };
+        layers.push(SharedI8ShadowLayer {
+            layer,
+            intermediate: i,
+            hidden: k,
+            down_rows: down.logical_shape[0],
+            gate_up_bytes,
+            down_bytes,
+        });
+    }
+    Ok(layers)
+}
+
+/// Device bytes of the shared-expert INT8 shadows (`rdna_compute::shared_i8`) the long-prefill
+/// route builds lazily: for every trunk layer `0..num_layers` whose BF16, rank-2, resident,
+/// non-tied `mlp.shared_expert.{gate,up,down}_proj.weight` triple has the route's shape
+/// (`gate`/`up` `[I, K]`, `down` `[M, I]`), the planes of
+/// [`rdna_compute::shared_i8::shared_i8_shadow_layer_bytes`]. A conservative cold bound, like
+/// [`f16_shadow_bytes`]. Callers gate it with [`shared_i8_charge`].
+pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+    let mut total = 0u64;
+    for layer in shared_i8_shadow_layers(weights, num_layers)? {
         total = total
-            .checked_add(bytes)
-            .ok_or_else(|| format!("shared-expert INT8 shadow bytes of layer {layer} overflow"))?;
+            .checked_add(layer.gate_up_bytes)
+            .and_then(|bytes| bytes.checked_add(layer.down_bytes))
+            .ok_or_else(|| {
+                format!(
+                    "shared-expert INT8 shadow bytes of layer {} overflow",
+                    layer.layer
+                )
+            })?;
     }
     Ok(total)
 }
@@ -1518,7 +1561,7 @@ pub fn shared_i8_charge(
 /// Whether `entry` is a lazily F16-shadowed BF16 owner of the trunk
 /// ([`f16_shadow_bytes`]'s one predicate, shared with the physical-granule
 /// census so the two can never name different owners).
-fn is_f16_shadow_owner(
+pub(crate) fn is_f16_shadow_owner(
     entry: &WeightEntry,
     num_layers: usize,
     owns_layer: &impl Fn(usize) -> bool,
@@ -1547,7 +1590,7 @@ fn is_f16_shadow_owner(
 }
 
 /// The F16 shadow allocation of one owner: `2 * rows * cols` bytes.
-fn f16_shadow_entry_bytes(entry: &WeightEntry) -> Result<u64, String> {
+pub(crate) fn f16_shadow_entry_bytes(entry: &WeightEntry) -> Result<u64, String> {
     entry.logical_shape[0]
         .checked_mul(entry.logical_shape[1])
         .and_then(|elements| elements.checked_mul(2))
@@ -2044,6 +2087,10 @@ pub struct AutoReserve {
     /// `S` bytes of prefill scratch are borrowed from the donor tail instead
     /// of reserved ([`DecodeShareForward`]).
     pub decode_share_borrowed: Option<u64>,
+    /// Bytes of F16 + INT8 weight shadows that live in the donor tail instead
+    /// of resident VRAM (their census terms are not charged); 0 when the
+    /// shadows stay resident ([`DecodeShareForward::shadows_borrowed`]).
+    pub decode_share_shadows: u64,
 }
 
 impl AutoReserve {
@@ -2054,6 +2101,7 @@ impl AutoReserve {
             census,
             census_total,
             decode_share_borrowed: None,
+            decode_share_shadows: 0,
         })
     }
 
@@ -2064,14 +2112,28 @@ impl AutoReserve {
         self
     }
 
+    /// Record `bytes` of F16 + INT8 weight shadows borrowed inside the donor
+    /// tail (the census `f16_shadows` / `shared_i8_shadows` terms are 0).
+    pub fn with_decode_share_shadows(mut self, bytes: u64) -> Self {
+        self.decode_share_shadows = bytes;
+        self
+    }
+
     /// The census with its `forward` term annotated when decode-share charged
     /// the dedicated forward.
     fn census_text(&self) -> String {
         match self.decode_share_borrowed {
-            Some(borrowed) => self.census.describe_with(Some(&format!(
-                "decode-share dedicated; {} MiB prefill scratch borrowed from the donor tail",
-                borrowed >> 20
-            ))),
+            Some(borrowed) => {
+                let shadows = if self.decode_share_shadows == 0 {
+                    String::new()
+                } else {
+                    format!(" + {} MiB weight shadows", self.decode_share_shadows >> 20)
+                };
+                self.census.describe_with(Some(&format!(
+                    "decode-share dedicated; {} MiB prefill scratch{shadows} borrowed from the donor tail",
+                    borrowed >> 20
+                )))
+            }
             None => self.census.describe(),
         }
     }
@@ -3651,6 +3713,17 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
     placement_inputs_with_forward(args, None)
 }
 
+/// The census `(f16_shadows, shared_i8_shadows)` terms of a load: the charged
+/// bytes, or `(0, 0)` when `shadows_borrowed > 0` (the shadows live in the
+/// donor tail and are never resident: [`DecodeShareForward::shadows_borrowed`]).
+pub fn census_shadow_terms(f16: u64, shared_i8: u64, shadows_borrowed: u64) -> (u64, u64) {
+    if shadows_borrowed > 0 {
+        (0, 0)
+    } else {
+        (f16, shared_i8)
+    }
+}
+
 /// The forward charge of an admitted decode-share `on` load: the dedicated
 /// bytes (resident bank, persistent token ids, speculative buffers) replace
 /// `qwen4_forward_device_bytes` in BOTH the census and the historical floor,
@@ -3661,6 +3734,11 @@ pub struct DecodeShareForward {
     pub dedicated: u64,
     /// [`crate::gpu_forward::qwen4_decode_share_borrow_bytes`].
     pub borrowed: u64,
+    /// Bytes of the weight-shadow region ([`crate::decode_share_shadows`])
+    /// that live at the start of the donor tail instead of resident VRAM: the
+    /// census `f16_shadows` and `shared_i8_shadows` terms are not charged. 0
+    /// keeps the shadows resident (and charged) as without decode-share.
+    pub shadows_borrowed: u64,
 }
 
 /// [`placement_inputs`] charging `share` as the forward term (`None` is
@@ -3799,6 +3877,13 @@ pub fn placement_inputs_with_forward(
         config.num_hidden_layers,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
+    // A decode-share load that keeps the shadows in the donor tail
+    // ([`DecodeShareForward::shadows_borrowed`]) never holds them resident:
+    // they are rebuilt into the donor tail per borrow epoch, so neither term
+    // is charged (the hot budget grows by that much).
+    let shadows_borrowed = share.map_or(0, |share| share.shadows_borrowed);
+    let (f16_shadows, shared_i8_shadows) =
+        census_shadow_terms(f16_shadows, shared_i8_shadows, shadows_borrowed);
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
@@ -3860,7 +3945,9 @@ pub fn placement_inputs_with_forward(
     let reserve =
         AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
     let reserve = match share {
-        Some(share) => reserve.with_decode_share(share.borrowed),
+        Some(share) => reserve
+            .with_decode_share(share.borrowed)
+            .with_decode_share_shadows(share.shadows_borrowed),
         None => reserve,
     };
     Ok(PlacementInputs {
@@ -4794,7 +4881,7 @@ mod tests {
         let config = crate::config::compact_test_config();
         let rows = crate::gpu_forward::qwen4_decode_share_classes(chunk);
         let spans =
-            crate::gpu_forward::qwen4_decode_share_class_spans(&config, chunk, mode).unwrap();
+            crate::gpu_forward::qwen4_decode_share_class_spans(&config, chunk, mode, 0).unwrap();
         assert_eq!(rows.len(), spans.len());
         assert_eq!(
             spans.last().copied(),
@@ -4849,6 +4936,148 @@ mod tests {
             })
             .collect();
         eprintln!("classes [{}] donors dirty, K = {k}", table.join(", "));
+    }
+
+    /// The real Flash-Next weight shadows (291 F16 owners, 48 INT8 shared
+    /// experts) borrowed at the start of the donor tail: the census terms are
+    /// zero, the reserve falls by exactly their sum, every class span grows by
+    /// the region, and every class dirties at least the donors the region spans.
+    #[test]
+    fn decode_share_shadows_borrowed_in_the_donor_tail() {
+        use crate::decode_share_shadows::{plan_shadow_region, SHADOW_REGION_ALIGN};
+        use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+        use crate::expert_slabs::ExpertFormat;
+        use crate::expert_tier_plan::plan_expert_tiers_from_slabs;
+
+        const MIB: u64 = 1 << 20;
+        const EXPERT: u64 = 2_611_200;
+        let (chunk, mode) = (16384usize, FnSymGfx1201);
+        let config = crate::config::compact_test_config();
+        let manifest = j1778_bf16_manifest();
+        let layers = config.num_hidden_layers;
+
+        // Census terms vs region.
+        let f16 = f16_shadow_charge(true, chunk, &manifest, layers).unwrap();
+        let i8 = shared_i8_charge(true, chunk, &manifest, layers).unwrap();
+        let region = plan_shadow_region(&manifest, layers, true, true).unwrap();
+        assert_eq!((region.f16_bytes, region.i8_bytes), (f16, i8));
+        let shadow = region.total_bytes;
+        assert_eq!(shadow % SHADOW_REGION_ALIGN, 0);
+        eprintln!(
+            "shadows: F16 {} MiB + INT8 {} MiB = {} MiB census ({} MiB region)",
+            f16 >> 20,
+            i8 >> 20,
+            (f16 + i8) >> 20,
+            shadow >> 20
+        );
+        assert!((1_400..1_560).contains(&((f16 + i8) >> 20)));
+
+        // The census terms vanish; the reserve falls by exactly their sum (census-only
+        // path and the historical path where the census wins).
+        assert_eq!(census_shadow_terms(f16, i8, 0), (f16, i8));
+        assert_eq!(census_shadow_terms(f16, i8, shadow), (0, 0));
+        let mut census = census_at(&config, 16384, chunk, mode, 700 << 20);
+        census.f16_shadows = f16;
+        census.shared_i8_shadows = i8;
+        let (zf, zi) = census_shadow_terms(f16, i8, shadow);
+        let borrowed = ReserveCensus {
+            f16_shadows: zf,
+            shared_i8_shadows: zi,
+            ..census
+        };
+        for historical in [None, Some(1u64)] {
+            let before = AutoReserve::new(historical, census).unwrap();
+            let after = AutoReserve::new(historical, borrowed)
+                .unwrap()
+                .with_decode_share(1 << 30)
+                .with_decode_share_shadows(shadow);
+            assert_eq!(
+                before.bytes() - after.bytes(),
+                f16 + i8,
+                "historical {historical:?}"
+            );
+            let text = after.describe();
+            assert!(
+                text.contains(&format!(
+                    "prefill scratch + {} MiB weight shadows borrowed from the donor tail",
+                    shadow >> 20
+                )),
+                "{text}"
+            );
+            assert!(text.contains("F16 weight shadows 0 MiB"), "{text}");
+        }
+
+        // Class spans: scratch spans plus the region; the donors each class dirties.
+        let plain =
+            crate::gpu_forward::qwen4_decode_share_class_spans(&config, chunk, mode, 0).unwrap();
+        let spans =
+            crate::gpu_forward::qwen4_decode_share_class_spans(&config, chunk, mode, shadow)
+                .unwrap();
+        assert_eq!(plain.len(), spans.len());
+        for (with, without) in spans.iter().zip(&plain) {
+            assert_eq!(*with, without + shadow);
+        }
+        let slabs: Vec<ExpertSlab> = (0..24_576usize)
+            .map(|i| {
+                let base = i * EXPERT as usize;
+                ExpertSlab {
+                    format: ExpertFormat::Mq4Xts,
+                    gate_up: ExpertSlabSpan {
+                        offset: base,
+                        len: 1_740_800,
+                    },
+                    down: ExpertSlabSpan {
+                        offset: base + 1_740_800,
+                        len: 870_400,
+                    },
+                }
+            })
+            .collect();
+        let rank: Vec<u32> = (0..24_576u64)
+            .map(|k| ((k * 7919 + 13) % 24_576) as u32)
+            .collect();
+        let plan = plan_expert_tiers_from_slabs(&slabs, &rank, 7_600 * EXPERT + (1 << 20)).unwrap();
+        let plain_k = {
+            let (_, tail) = plan
+                .clone()
+                .with_decode_share(&rank, *plain.last().unwrap())
+                .unwrap();
+            tail.donors.len() as u64
+        };
+        let need = *spans.last().unwrap();
+        let (shared, tail) = plan.with_decode_share(&rank, need).unwrap();
+        let k = tail.donors.len() as u64;
+        assert_eq!(k, need.div_ceil(EXPERT));
+        let shared = shared
+            .with_decode_share_classes(&spans)
+            .unwrap()
+            .with_decode_share_shadows(shadow)
+            .unwrap();
+        let tail = shared.decode_share_tail().unwrap();
+        assert_eq!(tail.shadow_bytes, shadow);
+        let shadow_donors = shadow.div_ceil(EXPERT) as usize;
+        for (class, &donors) in tail.class_donors.iter().enumerate() {
+            assert!(
+                donors >= shadow_donors,
+                "every class dirties the shadow region's donors"
+            );
+            assert_eq!(donors as u64, spans[class].div_ceil(EXPERT));
+        }
+        // A region larger than any class span, or unaligned, is refused.
+        assert!(shared
+            .clone()
+            .with_decode_share_shadows(spans[0] + SHADOW_REGION_ALIGN)
+            .is_err());
+        assert!(shared
+            .clone()
+            .with_decode_share_shadows(shadow + 1)
+            .is_err());
+        eprintln!(
+            "K without shadows {plain_k}, with shadows {k} (+{} donors for {} MiB); classes {:?}",
+            k - plain_k,
+            shadow / MIB,
+            tail.class_donors
+        );
     }
 
     /// Placement of the reproduction card with the real census: the layers
