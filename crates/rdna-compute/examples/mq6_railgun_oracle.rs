@@ -162,7 +162,7 @@ impl Output {
         // PreparedMq6Program joins the current HIP producer stream, so the
         // poison fill must be ordered on that stream too. A pre-fill device
         // sync does not order this later write against the independent PM4 IB.
-        match gpu.stream_ref() {
+        match gpu.active_stream.as_ref() {
             Some(stream) => {
                 gpu.hip
                     .memset_async(&self.owner.buf, i32::from(POISON), self.bytes(), stream)
