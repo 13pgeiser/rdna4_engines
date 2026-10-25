@@ -116,6 +116,7 @@ impl<'a> LayerRefs<'a> {
                 q: &state.fa_q,
                 k: &state.fa_k,
                 pos_buf: &state.pos_buf,
+                positions: None,
                 n_heads,
                 n_kv_heads: n_kv,
                 head_dim,
