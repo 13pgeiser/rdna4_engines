@@ -82,7 +82,8 @@ current-main host engine has no HIP backend. Accordingly, no fresh HYV3 or Qwen 
 
 The user's local Qwen `.rad` was inspected without downloading anything:
 `/mnt/gostar_data/models/StillDeadcode/qwen3.8-27b-mxfp4/qwen3.8-27b-mxfp4.rad` is a 19.4 GB
-`Qwen3_5ForConditionalGeneration` container with `n_expert=0` and group-32 MXFP4 weights. It does
+`Qwen3_5ForConditionalGeneration` container with `n_expert=0` and group-32 MXFP4 weights (SHA-256
+`a4908940c568f5f9dd24e88f46aefe9ac2ae07dfec023a2eaa1d14dcaa3df4f8`). It does
 not exercise this PR's asymmetric W4/W5 or per-128 I4 paths; if run once the engine build is
 available, it can only be a no-regression control for the unchanged MXFP4 path. The attempted
 launches exited before model load. No model was downloaded, no serving route was edited, and no
