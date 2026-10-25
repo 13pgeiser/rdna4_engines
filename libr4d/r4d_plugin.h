@@ -121,6 +121,11 @@ int     r4d_rad_attn_decode_h256_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_scratch(const RadArgs*);
+/* The prefill rows' KV-split partials (r4d_attn_paged_h256_gqa6.hip, prefill_scratch), by cache
+ * row: fp8 and bf16, fp8_v4, k6_v4. */
+int64_t r4d_rad_attn_prefill_h256_scratch(const RadArgs*);
+int64_t r4d_rad_attn_prefill_h256_v4_scratch(const RadArgs*);
+int64_t r4d_rad_attn_prefill_h256_k6_scratch(const RadArgs*);
 int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs*);
 /* Gemma 4 dense sliding window (r4d_attn_paged_h256_gqa2.hip): head_dim 256, 2 queries per KV
  * head. Both bands: decode (q_len*gqa <= 64, verify width 32 against the gqa6 leg's 10) and

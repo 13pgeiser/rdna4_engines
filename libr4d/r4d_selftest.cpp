@@ -1281,6 +1281,256 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
        fmt("corrupted ref must fail: max_err=%.5g bad=%d", nmax, nbadc));
 }
 
+/* The prefill kernel's KV split (prefill_splits, r4d_attn_paged_h256_gqa6.hip): a launch with too
+ * few query tiles to fill the card walks the KV in segments, each into f32 partials, and finishes in
+ * the split-KV merge. `seqs` are {q_len, ctx} each, ragged (cu_seqlens, q_len at the band's bound
+ * 2048 as the engine issues it) when there are two or more. The row runs three times on the same
+ * operands: unsplit (`splits` 1), at `force` segments, and at the law's own count, which must be
+ * what the law hook says (and above one when `law_splits`). Both split runs are checked against the
+ * oracle on sampled rows (every head of each sequence's rows 0, 62, 63, 64, middle and last) at
+ * attn_numeric_case's tolerance, and against the unsplit run on every element; the largest
+ * difference is in the case's name. A chunk long against its context (345 of 345 or 1000 keys)
+ * gives its early query tiles segments past their causal end, which must be written empty.
+ *
+ * `lead` and `tail`: rows of q and out before and after the launch's own, as the arch issues a
+ * launch over part of a step (ArPieces' two pieces, the prefill half of a band-split mixed step):
+ * cu_seqlens starts at `lead` and q/out are the whole step. Those rows must come out untouched. */
+struct SplitSeq { int64_t q, ctx; };
+static void attn_split_case(const Plugin& pl, const char* name, const char* kv_dtype,
+                            const std::vector<SplitSeq>& seqs, int force, bool law_splits,
+                            int64_t lead = 0, int64_t tail = 0) {
+    if (!sel(name) && !sel("attn_prefill_split")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    std::string tag = std::string(name) + " split";
+    for (const SplitSeq& s : seqs) tag += fmt(" %lld/%lld", (long long)s.q, (long long)s.ctx);
+    tag += fmt(" x%d", force);
+    if (lead || tail) tag += fmt(" rows %lld+..+%lld", (long long)lead, (long long)tail);
+    using LawFn  = int (*)(int, int, int, int, int);
+    using LastFn = int (*)(void);
+    const LawFn  law  = (LawFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_splits");
+    const LastFn last = (LastFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_last_splits");
+    if (!law || !last) { ok(tag.c_str(), false, "libr4d lacks the split's test hooks"); return; }
+
+    const int64_t head_dim = 256, gqa = 6, kv_heads = 2, bs = 16, q_heads = kv_heads * gqa;
+    const int64_t ns = (int64_t)seqs.size();
+    const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
+    const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
+    const int v4 = kvq != 0;
+    const uint32_t kvdt = kv_is_fp8 ? RAD_F8E4M3 : RAD_BF16;
+    const int ew = kv_is_fp8 ? 1 : 2;
+    const int64_t rowe = kvq == 2 ? 22 * head_dim / 16 : v4 ? 25 * head_dim / 16 : 2 * head_dim;
+    const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
+    const int64_t vsoff = kvq == 2 ? head_dim * 21 / 16 : head_dim * 3 / 2;
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+
+    int64_t mb = 0, qmax = 0;
+    std::vector<int32_t> cu((size_t)ns + 1, (int32_t)lead), used((size_t)ns);
+    for (int64_t s = 0; s < ns; ++s) {
+        cu[(size_t)s + 1] = cu[(size_t)s] + (int32_t)seqs[(size_t)s].q;
+        used[(size_t)s] = (int32_t)seqs[(size_t)s].ctx;
+        mb = std::max(mb, (seqs[(size_t)s].ctx + bs - 1) / bs);
+        qmax = std::max(qmax, seqs[(size_t)s].q);
+    }
+    const int64_t span0 = lead, span1 = cu[(size_t)ns];   /* the launch's own rows */
+    const int64_t total_q = span1 + tail;
+    const bool ragged = ns > 1 || lead || tail;
+    /* one disjoint run of mb blocks per sequence */
+    const std::vector<int32_t> bt = iota_i32(ns * mb);
+
+    /* q and the cache drawn as attn_numeric_case draws them */
+    std::vector<uint16_t> qh((size_t)(total_q * q_heads * head_dim));
+    for (size_t i = 0; i < qh.size(); ++i) qh[i] = st_rand_bf16(i);
+    const int64_t nelem = ns * mb * kv_heads * bs * rowe;
+    std::vector<uint8_t> kv((size_t)nelem * ew);
+    for (int64_t e = 0; e < nelem; ++e) {
+        const size_t bo = (size_t)e * ew;
+        if (kv_is_fp8) kv[bo] = st_rand_e4m3(e);
+        else { const uint16_t h = st_rand_bf16(e); kv[bo] = (uint8_t)h; kv[bo + 1] = (uint8_t)(h >> 8); }
+    }
+    if (v4)
+        for (int64_t r0 = 0; r0 < nelem; r0 += rowe) {
+            uint8_t* row = &kv[(size_t)r0];
+            for (int64_t b = 0; b < head_dim / 2; ++b)
+                row[voff + b] = (uint8_t)(st_rand_e4m3(r0 * 7 + b) * 37u + (uint32_t)b);
+            for (int64_t g = 0; g < head_dim / 32; ++g) {
+                const _Float16 s = (_Float16)(0.015625f * (float)(1 + (st_rand_e4m3(r0 + g) & 15)));
+                std::memcpy(row + vsoff + g * 2, &s, 2);
+            }
+            if (kvq == 2) {
+                for (int64_t b = 0; b < head_dim * 3 / 4; ++b)
+                    row[b] = (uint8_t)(st_rand_e4m3(r0 * 5 + b + 11) * 29u + (uint32_t)(3 * b));
+                for (int64_t g = 0; g < head_dim / 32; ++g) {
+                    const _Float16 s = (_Float16)(0.00390625f * (float)(1 + (st_rand_e4m3(r0 + g + 7) & 15)));
+                    std::memcpy(row + head_dim * 5 / 4 + g * 2, &s, 2);
+                }
+            }
+        }
+
+    const size_t on = (size_t)(total_q * q_heads * head_dim);
+    void* d_q  = dalloc(on * 2);
+    void* d_kv = dalloc(kv.size());
+    void* d_o[3] = { dalloc(on * 2), dalloc(on * 2), dalloc(on * 2) };
+    if (!d_q || !d_kv || !d_o[0] || !d_o[1] || !d_o[2]) {
+        ok(tag.c_str(), false, "hipMalloc failed");
+        dfree_all();
+        return;
+    }
+    st_memcpy(d_q, qh.data(), on * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kv, kv.data(), kv.size(), hipMemcpyHostToDevice);
+
+    /* sp 0 = the law, else forced; returns the count the launch used */
+    auto run = [&](int sp, void* out) {
+        st_memset(out, 0xff, on * 2);            /* NaN: a row nobody writes shows */
+        std::vector<RadTensor> ts = {
+            T(d_q,  RAD_BF16, { total_q, q_heads, head_dim }),
+            T(d_kv, kvdt,     { ns * mb, kv_heads, bs, rowe }),
+            TI32({ ns, mb }, bt),
+            TI32({ ns }, used),
+            TF32({ ns, kv_heads }, 1.0f),
+            TF32({ ns, kv_heads }, 1.0f),
+            ragged ? TI32({ ns + 1 }, cu) : T(nullptr, RAD_I32, { ns + 1 }),
+            T(out,  RAD_BF16, { total_q, q_heads, head_dim }),
+        };
+        if (kvdt == RAD_BF16) { absent(ts[4]); absent(ts[5]); }
+        if (!ragged) absent(ts[6]);
+        std::vector<RadParam> ps = {
+            PI("q_len", ragged ? 2048 : qmax), PI("head_dim", head_dim), PI("gqa", gqa),
+            PI("block_size", bs), PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
+            PS("kv_dtype", kv_dtype),
+        };
+        if (sp > 0) ps.push_back(PI("splits", sp));
+        /* run_case, with the scratch poisoned: 0x7f7f7f7f is m = 3.4e38, so a segment the merge
+         * reads but nobody wrote outweighs every real one and the row comes out wrong. Fresh
+         * device memory is often zero, which the merge would weigh as nothing. */
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int64_t need = r->scratch ? r->scratch(&a) : 0;
+        if (need > 0) {
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (a.scratch) st_memset(a.scratch, 0x7f, (size_t)need);
+        }
+        const int rc = r->launch(&a, nullptr);
+        const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+        ok(r->name, rc == RAD_OK && he == hipSuccess && need >= 0,
+           fmt("rc=%d need=%lld%s%s", rc, (long long)need, he != hipSuccess ? " hip=" : "",
+               he != hipSuccess ? hipGetErrorString(he) : ""));
+        return last();
+    };
+    const int s_un = run(1, d_o[0]);
+    const int s_fo = run(force, d_o[1]);
+    const int s_lw = run(0, d_o[2]);
+    const int want = law((int)(ragged ? std::min<int64_t>(2048, total_q) : qmax), (int)total_q,
+                         (int)ns, (int)kv_heads, (int)(mb * bs));
+    ok((tag + ": splits 1 / forced / law").c_str(),
+       s_un == 1 && s_fo == force && s_lw == want && (!law_splits || want > 1),
+       fmt("launched %d / %d / %d, the law says %d%s", s_un, s_fo, s_lw, want,
+           law_splits ? " and must split" : ""));
+
+    std::vector<uint16_t> o[3];
+    for (int k = 0; k < 3; ++k) {
+        o[k].resize(on);
+        st_memcpy(o[k].data(), d_o[k], on * 2, hipMemcpyDeviceToHost);
+    }
+    const float abs_tol = 1e-3f, rel_tol = 2e-2f;
+    float dmax[2] = { 0.0f, 0.0f };
+    int nbad = 0, nout = 0;
+    const size_t rowe_o = (size_t)(q_heads * head_dim);
+    for (size_t i = 0; i < on; ++i) {
+        if (i < (size_t)span0 * rowe_o || i >= (size_t)span1 * rowe_o) {
+            for (int k = 0; k < 3; ++k) nout += o[k][i] != 0xffffu;   /* not the launch's row */
+            continue;
+        }
+        const float u = h_bf16(o[0][i]);
+        for (int k = 1; k < 3; ++k) {
+            const float d = std::fabs(h_bf16(o[k][i]) - u);
+            if (!(d <= abs_tol + rel_tol * std::fabs(u))) ++nbad;   /* NaN counts */
+            if (d > dmax[k - 1]) dmax[k - 1] = d;
+        }
+    }
+    ok(fmt("%s: split against unsplit, max abs diff %.3g forced, %.3g law", tag.c_str(),
+           dmax[0], dmax[1]).c_str(), nbad == 0 && nout == 0,
+       fmt("bad=%d/%d, %d elements written outside the launch's rows", nbad,
+           (int)(2 * (span1 - span0) * rowe_o), nout));
+
+    float max_err = 0.0f;
+    int obad = 0, nchk = 0;
+    for (int64_t s = 0; s < ns; ++s) {
+        const int64_t q = seqs[(size_t)s].q;
+        std::vector<int64_t> rows = { 0, 62, 63, 64, q / 2, q - 1 };
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        for (const int64_t i : rows) {
+            if (i < 0 || i >= q) continue;
+            const int64_t tok = cu[(size_t)s] + i;
+            for (int64_t h = 0; h < q_heads; ++h) {
+                float ref[256];
+                attn_oracle_one(&qh[(size_t)((tok * q_heads + h) * head_dim)], kv.data(), kv_is_fp8,
+                                head_dim, kv_heads, bs, h / gqa, &bt[(size_t)(s * mb)], mb,
+                                (int)seqs[(size_t)s].ctx, 1.0f, 1.0f, 1, 0, scale, q, i, ref, kvq);
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    const size_t idx = (size_t)((tok * q_heads + h) * head_dim + d);
+                    for (int k = 0; k < 3; ++k) {
+                        const float diff = std::fabs(h_bf16(o[k][idx]) - ref[d]);
+                        if (!(diff <= abs_tol + rel_tol * std::fabs(ref[d]))) ++obad;
+                        if (diff > max_err) max_err = diff;
+                        ++nchk;
+                    }
+                }
+            }
+        }
+    }
+    ok((tag + ": all three runs against the oracle").c_str(), obad == 0,
+       fmt("max_err=%.5g bad=%d/%d", max_err, obad, nchk));
+    dfree_all();
+}
+
+/* The split's scratch at declare (the band's bound 2048, Qwen3.8-27B's per-rank 12 heads over 2,
+ * the model's context, no tensors): the hook must cover the largest launch the law can split in the
+ * band, over every sequence count up to max_seqs, and stay near the 25.4 MB bound its comment
+ * derives. Sizes it in the name. */
+static void attn_split_scratch_case(const Plugin& pl, const char* name, const char* kv_dtype) {
+    if (!sel(name) && !sel("attn_prefill_split")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    using LawFn = int (*)(int, int, int, int, int);
+    const LawFn law = (LawFn)dlsym(pl.h, "r4d_attn_prefill_h256_gqa6_splits");
+    if (!r->scratch || !law) {
+        ok((std::string(name) + ": split scratch at declare").c_str(), false,
+           !r->scratch ? "the row has no scratch hook" : "libr4d lacks the law's test hook");
+        return;
+    }
+    const int band = 2048, n_head = 12, kv = 2, mctx = 262144;
+    for (const int ms : { 1, 16, 64 }) {
+        std::vector<RadParam> ps = {
+            PI("q_len", band), PI("head_dim", 256), PI("gqa", 6), PI("n_head", n_head),
+            PI("max_seqs", ms), PI("max_ctx", mctx), PI("block_size", 16), PI("causal", 1),
+            PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", kv_dtype),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int64_t need = r->scratch(&a);
+        int64_t worst = 0;
+        for (int n = 1; n <= ms; ++n)
+            for (int t = n; t <= band; ++t) {
+                int sp = law(std::min(band, t), t, n, kv, mctx);
+                if (t % n == 0) sp = std::max(sp, law(t / n, t, n, kv, mctx));
+                if (sp > 1) worst = std::max(worst, (int64_t)t * sp * n_head * (256 + 2) * 4);
+            }
+        ok(fmt("%s: split scratch at declare, %d sequences: %.2f MB (the law's worst %.2f MB)", name,
+               ms, need / 1e6, worst / 1e6).c_str(),
+           worst > 0 && need >= worst && need <= 24576LL * 1032,
+           fmt("need %lld worst %lld bound %lld", (long long)need, (long long)worst,
+               24576LL * 1032));
+    }
+}
+
 
 /* The h256/gqa6 prefill over an 8-bit cache with e4m3 products (`prefill_fp8` 1 Q.K^T, 2 P.V, 3
  * both), against the inline oracle and against `exact`, the cache's exact row, on the same data.
@@ -26116,6 +26366,39 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 4,   "k6_v4",  0, 2048);
+    /* The prefill KV split at Qwen3.8-27B's per-rank geometry, every cache layout: the tails the
+     * audits measured (11 to 345 rows over 8k to 20k keys, where the law splits), one row through
+     * the prefill kernel, chunks long against their context (early query tiles own empty
+     * segments), and ragged batches of a chunk beside decode rows of other contexts. Then the
+     * declare-time scratch. */
+    static const struct { const char* row; const char* kv; } split_rows[] = {
+        { "attn_prefill_h256_gqa6_k6v4", "k6_v4" },     { "attn_prefill_h256_gqa6_fp8v4", "fp8_v4" },
+        { "attn_prefill_h256_gqa6_fp8kv", "fp8_e4m3" }, { "attn_prefill_h256_gqa6_bf16kv", "bf16" },
+    };
+    for (const auto& sr : split_rows) {
+        const char* n = sr.row;
+        const char* kv = sr.kv;
+        attn_split_case(pl, n, kv, { { 1, 20000 } }, 16, true);
+        attn_split_case(pl, n, kv, { { 11, 8192 } }, 7, true);
+        attn_split_case(pl, n, kv, { { 53, 18000 } }, 16, true);
+        attn_split_case(pl, n, kv, { { 64, 12000 } }, 13, true);
+        attn_split_case(pl, n, kv, { { 65, 9000 } }, 8, true);
+        attn_split_case(pl, n, kv, { { 345, 16000 } }, 16, true);
+        attn_split_case(pl, n, kv, { { 345, 345 } }, 16, false);
+        attn_split_case(pl, n, kv, { { 345, 1000 } }, 16, true);
+        attn_split_case(pl, n, kv, { { 640, 2000 } }, 5, true);
+        attn_split_case(pl, n, kv, { { 53, 12000 }, { 1, 20000 } }, 16, true);
+        attn_split_case(pl, n, kv, { { 11, 8192 }, { 64, 9000 }, { 1, 12000 } }, 6, true);
+        attn_split_case(pl, n, kv, { { 300, 600 }, { 1, 10000 } }, 16, true);
+        /* Launches over part of a step: ArPieces' first piece (rows after it) and second (rows
+         * before it), and a band-split mixed step's prefill half behind its decode rows. The law
+         * sees the step's rows (total_q), so it leaves the 512-row pieces unsplit. */
+        attn_split_case(pl, n, kv, { { 512, 12000 } }, 4, false, 0, 512);
+        attn_split_case(pl, n, kv, { { 512, 12512 } }, 4, false, 512, 0);
+        attn_split_case(pl, n, kv, { { 53, 12000 } }, 16, true, 8, 0);
+        attn_split_case(pl, n, kv, { { 64, 9000 }, { 11, 8192 } }, 6, true, 3, 0);
+        attn_split_scratch_case(pl, n, kv);
+    }
     /* Flash-Next's QSA layers: twelve queries per KV head over 4-token pages, and six at
      * four ranks, each layout's prefill (a long history and a ragged last tile), decode, and the
      * widest verify (q_len 5 at gqa 12, 10 at gqa 6). */

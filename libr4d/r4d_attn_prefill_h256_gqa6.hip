@@ -69,6 +69,13 @@
 // O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
 #define O_V4    33554432
 #define O_K6    67108864
+// O_PSPLIT: a KV split for launches with too few workgroups to fill the card (prefill_splits in
+// r4d_attn_paged_h256_gqa6.hip). blockIdx.x is qtile * a.splits + split, and the workgroup walks
+// only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
+// split-KV merge recomputes from ctx), clipped at its causal end. Instead of bf16 out it stores the
+// unnormalised f32 O, m_ref and l in the decode kernel's partial layout (r4d_attn_decode_body,
+// !PF16); r4d_attn_splitkv_combine* finishes the rows, so only the summation order changes.
+#define O_PSPLIT 536870912
 
 typedef int v2i32_r4d __attribute__((ext_vector_type(2)));   // one fp8 WMMA operand (8 e4m3)
 // pack 4 floats -> 4 e4m3 bytes in element order (RNE, saturating), 2 instructions
@@ -95,6 +102,24 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
     if (!FOLDQ) return F16 ? D::from_bf16w(w) : w;
     return D::pk(__builtin_bit_cast(float, w << 16) * s,
                  __builtin_bit_cast(float, w & 0xffff0000u) * s);
+}
+
+// O_PSPLIT's store: segment `sp` of row (tok, qhead) in the decode kernel's f32 partial layout,
+// O at [idx][HEAD_DIM] then m[nrow] and l[nrow], idx = (tok * q_heads + qhead) * splits + sp. Lane
+// (c, h) holds dims 16 dt + 8 h .. + 7 of its row, as at the bf16 store. An empty segment stores
+// O = 0, m = -3e38 (at the merge's zero-weight cut) and l = 0.
+template<int NKS, int HEAD_DIM>
+__device__ __forceinline__ void r4d_prefill_store_partial(const R4DArgs& a, int tok, int qhead,
+                                                          int sp, const v8f* acc, float m, float l,
+                                                          int h) {
+    const size_t idx  = (size_t)(tok * a.q_heads + qhead) * a.splits + sp;
+    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * a.splits;
+    float* so = (float*)a.scratch;
+    float* op = so + idx * HEAD_DIM;
+    #pragma unroll
+    for (int dt = 0; dt < NKS; ++dt)
+        *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
+    if (h == 0) { so[nrow * HEAD_DIM + idx] = m; so[nrow * HEAD_DIM + nrow + idx] = l; }
 }
 
 // WIN enables a sliding window (a.window positions ending at each row's causal limit), as in the
@@ -126,6 +151,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
     static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP,
                   "the e4m3 legs need an 8-bit cache, or they compile to the exact form");
+    constexpr int SPLIT = (OPT & O_PSPLIT) ? 1 : 0;
+    static_assert(!SPLIT || !WIN, "the split partition has no window floor (the merge's WIN has)");
     static_assert(!QK8 || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
@@ -159,7 +186,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int c = lane & 15, h = lane >> 4;
 
-    const int qb = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    // SPLIT: blockIdx.x = qtile * splits + segment; wave-uniform, so the divide is scalar.
+    const int qb = SPLIT ? (int)blockIdx.x / a.splits : (int)blockIdx.x;
+    const int sp = SPLIT ? (int)blockIdx.x - qb * a.splits : 0;
+    const int kvh = blockIdx.y, seq = blockIdx.z;
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
@@ -177,6 +207,19 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qhead = kvh * GQA + hi;
 
     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
+
+    // SPLIT: tps tiles a segment, as r4d_attn_tps (decode unit, included after this one) cuts
+    // tiles(ctx). A segment at or past the merge's segment count u = ceil(tiles / tps) is never
+    // read: exit. One the merge reads but that lies wholly past this workgroup's causal end (an
+    // early query tile of a multi-tile chunk) must still be written: the merge reads all u segments
+    // of every row. It is, by the ordinary path: its walk below is empty, so the epilogue stores
+    // the empty partial (O = 0, m_ref = -3e38, l = 0); the prologue's prefetch of tile tstart reads
+    // inside the sequence (tstart < tiles) and is dropped. A separate early store measured worse:
+    // its extra live range spilled k6_v4's next-tile fetch addresses inside the tile loop.
+    const int sp_tps = SPLIT ? ((ctx + TILE - 1) / TILE + a.splits - 1) / a.splits : 0;
+    if constexpr (SPLIT) {
+        if (sp * sp_tps >= (ctx + TILE - 1) / TILE) return;
+    }
 
     const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
     const float vdesc = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
@@ -223,12 +266,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
     const int klimit_cta = ctx - qlen + qmax_cta;
-    const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    const int ctiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    // SPLIT: the segment's tiles, clipped at the causal end (empty when it starts past it).
+    const int ntiles = SPLIT ? min((sp + 1) * sp_tps, ctiles) : ctiles;
     // First window tile, taken at this workgroup's first query row (the one reaching furthest
     // back), not the chunk's row 0, so fully masked tiles are never walked. Starts at 0 without a
     // window.
     const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen + qb * BLOCK_Q - a.window + 1) : 0;
-    const int tstart = (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
+    const int tstart = SPLIT ? sp * sp_tps
+                     : (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
 
     // ---- staging, split into a global fetch (registers) and an LDS store ------------------------
     // The split lets GPREV move the fetch out from between the barriers.
@@ -615,6 +661,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     if (!live) return;
     l_i += swap16(l_i);
+    if constexpr (SPLIT) {
+        // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.
+        r4d_prefill_store_partial<NKS, HEAD_DIM>(a, qoff + qpos, qhead, sp, acc, m_ref, l_i, h);
+        return;
+    }
     const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
     uint16_t* op = (uint16_t*)a.out
                  + ((size_t)(qoff + qpos) * a.q_heads + qhead) * HEAD_DIM;

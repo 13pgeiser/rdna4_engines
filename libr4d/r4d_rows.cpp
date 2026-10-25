@@ -6215,7 +6215,8 @@ static const RadKernelInfo kKernels[] = {
   "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
   ROW(cAttnPrefillFp8), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8, r4d_rad_attn_prefill_h256_scratch,
+  nullptr, nullptr,
   r4d_shape_attn_paged },
 
 /* Lossy: they match only a caller whose `prefill_fp8` accepts their legs. */
@@ -6255,7 +6256,8 @@ static const RadKernelInfo kKernels[] = {
   "bf16 query, fp8_v4 kv cache (E4M3 K, int4 V in groups of 32 with f16 scales), bf16 out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
   ROW(cAttnPrefillFp8v4), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8v4, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8v4, r4d_rad_attn_prefill_h256_v4_scratch,
+  nullptr, nullptr,
   nullptr },
 
 { "attn_prefill_h256_gqa6_fp8v4_qk8", "attn_paged", "attn",
@@ -6297,7 +6299,8 @@ static const RadKernelInfo kKernels[] = {
   "bf16 query, k6_v4 kv cache (int6 K, int4 V, each in groups of 32 with f16 scales), bf16 out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
   ROW(cAttnPrefillK6v4), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h256_k6v4, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_k6v4, r4d_rad_attn_prefill_h256_k6_scratch,
+  nullptr, nullptr,
   nullptr },
 
 { "attn_prefill_h256_gqa6_k6v4_qk8", "attn_paged", "attn",
@@ -6339,7 +6342,8 @@ static const RadKernelInfo kKernels[] = {
   "bf16 query, bf16 kv cache, bf16 out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
   ROW(cAttnPrefillBf16), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h256_bf16, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_bf16, r4d_rad_attn_prefill_h256_scratch,
+  nullptr, nullptr,
   r4d_shape_attn_paged },
 
 { "attn_decode_h256_gqa6_fp8kv", "attn_paged", "attn",

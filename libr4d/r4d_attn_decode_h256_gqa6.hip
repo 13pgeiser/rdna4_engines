@@ -650,7 +650,13 @@ void r4dchain_attn_decode(const R4DArgs a, int splits)
 // to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
 // each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
 // No barrier and no LDS, so rows in one block may have different contexts and segment counts.
-template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ>
+//
+// SPAN: merge only rows [cu_q[0], cu_q[num_seqs]). A launch over part of a step (the prefill
+// kernel's split under ArPieces, or a band-split step's prefill half) gets q and out whole with
+// cu_q at its own first row; every other row belongs to another launch, and r4d_q_seq would map it
+// onto this launch's first or last sequence and overwrite it. The decode launchers never offset
+// cu_q and do not instantiate it.
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
@@ -659,6 +665,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     const int job  = blockIdx.x * JPB + (int)(threadIdx.x >> 5);
     if (job >= r4d_q_total(a) * a.q_heads) return;
     const int tok = job / a.q_heads;
+    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
     const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
     const int ctx = a.seqused_k[seq];
     uint16_t* outp = (uint16_t*)a.out + (size_t)job * HEAD_DIM + lane * DPL;
@@ -808,12 +815,12 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     finish(ob);
 }
 
-template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
 {
-    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
-                                                                   R4DGateQuant{});
+    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0, SPAN>(a, splits, tile,
+                                                                         R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
 __global__ __launch_bounds__(32 * JPB)
@@ -834,8 +841,9 @@ void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int til
 
 // Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 reads
 // unnormalised f32 partials with l summed separately. Both walk segments in fixed index order so
-// rounding never depends on workgroup scheduling.
-template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ>
+// rounding never depends on workgroup scheduling. SPAN as in the vectorised form (the return is
+// block-uniform, ahead of every barrier).
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
@@ -843,6 +851,7 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     __shared__ float red[HEAD_DIM];
     const int job = blockIdx.x, d = threadIdx.x;
     const int tok = job / a.q_heads;
+    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
     const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
     const int ctx = a.seqused_k[seq];
 
@@ -952,11 +961,11 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     finish(f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f));
 }
 
-template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
 {
-    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
+    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0, SPAN>(a, splits, tile, R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
