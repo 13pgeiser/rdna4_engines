@@ -9,7 +9,8 @@
 //! DeltaNet key and value heads) and of the FFN intermediate
 //! ([`tp_rank_layouts`], the hand route's `dense_tp_rank_layouts` restricted
 //! to even splits). The split plan ([`qwen35_tp_plan`]) runs the embedding
-//! and the head replicated. Per layer the mixer (`SplitRule::HeadMixer`)
+//! replicated and the head on rank 0 only (`Pin(Output)`). Per layer the
+//! mixer (`SplitRule::HeadMixer`)
 //! writes this rank's output-projection partial into
 //! [`QWEN35_MIX_OUT_RESOURCE`] and the FFN (`SplitRule::GatedMlp`, `Product`
 //! ladder) into [`QWEN35_FFN_OUT_RESOURCE`]; the residual `Accumulate` after
@@ -67,7 +68,7 @@ use hipfire_runtime::multi_gpu::executor::{
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
 use hipfire_runtime::multi_gpu::{Gpus, TpGraphStep};
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
-use hipfire_runtime::weight_manifest::{plan_manifest, ShardPolicy, WeightEntry};
+use hipfire_runtime::weight_manifest::{plan_manifest, PinTarget, ShardPolicy, WeightEntry};
 use rdna_compute::{DType, Gpu};
 
 type Result<T, E = String> = std::result::Result<T, E>;
@@ -96,7 +97,7 @@ enum TpOp {
     /// `x += mix_out` or `x += ffn_out`; replaced by the `AllReduceAdd` on a
     /// TP mesh.
     Residual,
-    /// Final norm and LM head into the logits.
+    /// Final norm and LM head into the logits, on rank 0 (`Pin(Output)`) only.
     Head,
 }
 
@@ -327,6 +328,28 @@ fn tp_program(
             &[x],
         )?;
     }
+    // The head runs on the rank that owns `Pin(Output)` (rank 0 of a pure TP
+    // mesh) and nowhere else: the serve loop reads rank 0's logits only, and
+    // the hand route also runs the head on rank 0 alone. The model-level
+    // weights are declared for placement only (the ranks load them whole);
+    // the plan never consults their dtype.
+    let mut head_weights = [
+        ("output_norm", vec![dim]),
+        ("lm_head", vec![config.vocab_size, dim]),
+    ]
+    .into_iter()
+    .map(|(name, shape)| {
+        let class = ResourceClass::Weight {
+            name: name.to_string(),
+            layer: None,
+            group: 1,
+        };
+        let id = resource(&mut graph, class, &shape)?;
+        let policy = ShardPolicy::Pin(PinTarget::Output);
+        entries.push(WeightEntry::model(name, shape, DType::F16, policy));
+        Ok::<_, String>(id)
+    });
+    let (norm_w, head_w) = (head_weights.next().unwrap()?, head_weights.next().unwrap()?);
     op(
         &mut graph,
         &mut ops,
@@ -334,7 +357,7 @@ fn tp_program(
         OpKind::Gemv,
         None,
         SplitRule::RowComplete,
-        &[x],
+        &[x, norm_w, head_w],
         &[logits],
     )?;
     Ok((graph, ops, entries))
@@ -1343,10 +1366,10 @@ mod tests {
             .collect()
     }
 
-    /// Every rank runs the whole program except the residual adds; each
-    /// layer's mixer partial and then its FFN partial are added into `x` by
-    /// one rank-ordered `AllReduceAdd` each, replacing the residual op that
-    /// follows the producer.
+    /// Every rank runs the whole program except the residual adds and the
+    /// head, which only rank 0 runs; each layer's mixer partial and then its
+    /// FFN partial are added into `x` by one rank-ordered `AllReduceAdd`
+    /// each, replacing the residual op that follows the producer.
     #[test]
     fn tp_plan_adds_each_mixer_and_ffn_partial_into_the_residual() {
         let config = dense_config(0);
@@ -1385,8 +1408,17 @@ mod tests {
                 expected.push(RankItem::Collective(c.id));
                 next += 1;
             }
+            // The head is pinned to rank 0 (`Pin(Output)`): the last op runs
+            // there and on no other rank.
+            let head = expected.pop().unwrap();
+            assert_eq!(head, RankItem::Op(OpId(ops.len() as u32 - 1)));
+            assert_eq!(ops.last(), Some(&TpOp::Head));
             for rank in &plan.ranks {
-                assert_eq!(rank.items, expected, "rank {}", rank.device);
+                let mut want = expected.clone();
+                if rank.device == 0 {
+                    want.push(head.clone());
+                }
+                assert_eq!(rank.items, want, "rank {}", rank.device);
             }
             for (rank, layout) in tp_rank_layouts(&config, parts).unwrap().iter().enumerate() {
                 let block = |n: usize| rank * n / parts..(rank + 1) * n / parts;
@@ -1803,14 +1835,8 @@ mod hw_tests {
             if let Some(ticket) = ticket {
                 gpus.drain_mesh_epoch(ticket).unwrap();
             }
-            let rows: Vec<_> = gpus
-                .devices
-                .iter()
-                .zip(&ranks)
-                .map(|(gpu, r)| download(gpu, &r.scratch.logits, vocab))
-                .collect();
-            assert!(rows.iter().all(|row| row == &rows[0]), "TP ranks disagree");
-            rows[0].clone()
+            // Only rank 0 runs the head; the serve loop reads its logits.
+            download(&gpus.devices[0], ranks[0].logits(), vocab)
         });
         assert!(ranks.iter().all(|rank| rank.position == rows + GREEDY));
         for (index, (rank, gpu)) in ranks.iter().zip(&gpus.devices).enumerate() {
