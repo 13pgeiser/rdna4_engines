@@ -176,7 +176,7 @@ declares a range other than the default; it must contain the build's ROCm.
 ### Windows — status
 
 > **Native Windows and WSL2 are both untested on GPU hardware.** The only
-> Windows CI job is `Windows MSVC (advisory, no GPU)` on a hosted runner without
+> Windows CI job is `Windows MSVC (no GPU)` on a hosted runner without
 > a GPU, and the hardware gate runs on Linux only. Neither route is certified
 > until a community test report lands; the notes below describe what the code
 > does, not what has been observed on a card. To help, see
@@ -353,7 +353,7 @@ The limits below are properties of the code, not observations from a card:
 
 #### CI developer artifact
 
-The advisory `Windows MSVC (advisory, no GPU)` job in
+The required `Windows MSVC (no GPU)` job in
 [CI](../.github/workflows/ci.yml) builds the native CLI and daemon, tests the
 config/registry/client libraries, checks that `scripts/*.ps1` parse and that
 `install.ps1`'s parameters bind, checks `hipfire --version` and parseable
