@@ -940,14 +940,14 @@ pub const DECISIONS: &[Decision] = &[
     },
     Decision {
         id: "gfx1201-fp8-fa2-split-verify",
-        predicates: &[IsRecording],
-        condition: "fp8_fa2_split_verify_route() (HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<2..=64>, default unset = off) && gfx1201 && H24/KV4/D256 && no tree bias && block_cols == 0 && 2 <= batch <= 32 && !is_recording() && partials large enough (attention.rs attention_flash_fp8_e4m3_tile_batched)",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "fp8_fa2_split_verify_admitted (fp8_fa2_split_verify_route(): HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8 unset = 16 splits from 8192 LIVE context for 2..=16 rows, =<2..=64> = that many splits, no floor, 2..=32 rows, =0 off) && gfx1201 && H24/KV4/D256 && no tree bias && block_cols == 0 && !is_recording() && partials large enough, and under capture additionally live_ctx given (DFlash ChainVerify only; pos + batch) && fp8_fa2_split_verify_capture_ready (module + merge + pre-convert loaded, Q16 scratch grown) (attention.rs attention_flash_fp8_e4m3_tile_batched)",
         effect: KernelSelection,
-        switches: "eager opt-in: native-fp8 split-KV FA2 verifier; recorded / default: VerifyAttn and the existing tile routes",
+        switches: "eager and captured (route-class graph, re-captured when the live context crosses the floor): native-fp8 split-KV FA2 verifier; recorded: VerifyAttn and the existing tile routes",
         kernels: &["attention_fp8_e4m3_fa2_gqa_*_gfx1201"],
         verdict: NotEquivalent,
-        evidence: "f16 Q/K/V/P operands, not byte-identical to VerifyAttn. Opt-in developer env (default off since 7d13089534); recorded windows keep VerifyAttn; reaches no default recorded program",
-        reaches: &[],
+        evidence: "f16 Q/K/V/P operands, not byte-identical to VerifyAttn (verify_route_logits B=16 KL pooled 1.0e-4 nats, max 9.2e-3); below the floor and above 16 rows byte-identical. Recorded windows keep VerifyAttn, so a railgun recording of an fp8 DFlash verify at live context >= 8192 differs from the eager window",
+        reaches: &[reach(DflashGfx1201, "live context >= 8192 (default 16 splits), 2..=16 rows, native fp8 KV, H24/KV4/D256 (the stock 27B DFlash B=16 verify window)", "g0; arm3")],
     },
     Decision {
         id: "gfx1100-wmma-verify-attn",
@@ -2846,6 +2846,18 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/attention.rs",
         function: "attention_flash_fp8_e4m3_tile_batched",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "fp8_fa2_split_verify_admitted",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/attention.rs",
+        function: "dispatch_attend",
         occurrences: 1,
         decisions: &["gfx1201-fp8-fa2-split-verify"],
     },
