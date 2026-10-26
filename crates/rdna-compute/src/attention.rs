@@ -756,18 +756,47 @@ enum VerifyGqaRef {
     Rows(usize),
 }
 
-/// `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<splits>` (2..=64): opt-in native-fp8
-/// split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`. Unset,
-/// `0` or out of range keeps VerifyAttn. Read once per process.
-fn fp8_fa2_split_verify_splits() -> Option<usize> {
-    static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| (2..=64).contains(n))
+/// Native-fp8 split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`
+/// (exact gfx1201, H24/KV4/D256). `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8` unset:
+/// on by default at [`FP8_FA2_SPLIT_DEFAULT_SPLITS`] splits, only from
+/// [`FP8_FA2_SPLIT_DEFAULT_MIN_CTX`] context; `0` (or any value outside
+/// `2..=64`) keeps VerifyAttn; `2..=64` picks the split count with no
+/// context floor. Returns `(splits, context floor)`. Read once per process.
+fn fp8_fa2_split_verify_route() -> Option<(usize, usize)> {
+    static ROUTE: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
+        fp8_fa2_split_verify_route_for(
+            hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8")
+                .ok()
+                .as_deref(),
+        )
     });
-    *SPLITS
+    *ROUTE
 }
+
+/// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value.
+fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<(usize, usize)> {
+    match raw {
+        None => Some((FP8_FA2_SPLIT_DEFAULT_SPLITS, FP8_FA2_SPLIT_DEFAULT_MIN_CTX)),
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (2..=64).contains(n))
+            .map(|n| (n, 0)),
+    }
+}
+
+/// Default split count of the fp8 split-KV verifier (R9700, B=8/16, 32K-128K:
+/// S16 is the fastest count; S32/S64 never beat it).
+const FP8_FA2_SPLIT_DEFAULT_SPLITS: usize = 16;
+/// Default-route context floor. Below it the route is byte-identical to
+/// VerifyAttn. R9700 eager B=8 kernel time, VerifyAttn / split: 0.62x at 512
+/// tokens, 0.81x at 1K, 1.07x at 2K, 1.44x at 4K, 1.84x at 8K. The serve A/B
+/// at 3.7-5K contexts (floor 4,096) measured -0.9% with different text, so
+/// the floor sits one step above, where the split is clearly ahead.
+/// `max_ctx_len` is the live context eager and the capture grid under
+/// verify-graph capture.
+const FP8_FA2_SPLIT_DEFAULT_MIN_CTX: usize = 8192;
 
 /// Query rows one group-6 VerifyAttn workgroup serves (compile-time in the
 /// kernel; `VA_ROWS`).
@@ -9750,11 +9779,11 @@ impl Gpu {
                 kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
             )
         };
-        let merge_src = src;
         // F4b: the partial body reads f16 Q from Gpu-owned scratch
-        // (pre-converted on the same stream just below); the pre-convert
-        // symbol resolves out of this same Q8 module object, so a
-        // standalone bench run compiles exactly one module.
+        // (pre-converted on the same stream just below); the pre-convert and
+        // merge symbols resolve out of this same module object (named for the
+        // partial symbol, which is also the registry module name of the fp8
+        // build), so a run compiles or binds exactly one module.
         let precon: &'static str = if fp8_kv {
             "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
         } else {
@@ -9767,7 +9796,7 @@ impl Gpu {
             self.ensure_kernel(partial, src, precon)?;
         }
         if !self.functions.contains_key(merge) {
-            self.ensure_kernel(merge, merge_src, merge)?;
+            self.ensure_kernel(partial, src, merge)?;
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
@@ -10951,13 +10980,14 @@ impl Gpu {
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_flash_fp8_e4m3_tile_batched",
         )?;
-        // Opt-in native-fp8 split-KV FA2 verifier (gfx1201 H24/KV4/D256):
+        // Native-fp8 split-KV FA2 verifier (gfx1201 H24/KV4/D256):
         // WMMA QK/PV over KT64 tiles split across `splits` workgroups per kv
         // head, then a stable LSE merge. Not byte-identical to VerifyAttn
         // (f16 Q/K/V/P operands); every unadmitted shape keeps the routes
         // below.
-        if let Some(splits) = fp8_fa2_split_verify_splits() {
+        if let Some((splits, min_ctx)) = fp8_fa2_split_verify_route() {
             if self.arch == "gfx1201"
+                && max_ctx_len >= min_ctx
                 && n_heads == 24
                 && n_kv_heads == 4
                 && head_dim == 256
@@ -26058,6 +26088,29 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fp8_fa2_split_verify_route_default_and_overrides() {
+        use super::{
+            fp8_fa2_split_verify_route_for, FP8_FA2_SPLIT_DEFAULT_MIN_CTX,
+            FP8_FA2_SPLIT_DEFAULT_SPLITS,
+        };
+        // Unset: on by default, with the context floor.
+        assert_eq!(
+            fp8_fa2_split_verify_route_for(None),
+            Some((FP8_FA2_SPLIT_DEFAULT_SPLITS, FP8_FA2_SPLIT_DEFAULT_MIN_CTX))
+        );
+        assert_eq!(FP8_FA2_SPLIT_DEFAULT_SPLITS, 16);
+        assert_eq!(FP8_FA2_SPLIT_DEFAULT_MIN_CTX, 8192);
+        // `0`, `1`, out of range and garbage: VerifyAttn.
+        for off in ["0", "1", "65", "", "off", "-3", "16x"] {
+            assert_eq!(fp8_fa2_split_verify_route_for(Some(off)), None, "{off:?}");
+        }
+        // An explicit split count has no context floor.
+        assert_eq!(fp8_fa2_split_verify_route_for(Some("8")), Some((8, 0)));
+        assert_eq!(fp8_fa2_split_verify_route_for(Some(" 64 ")), Some((64, 0)));
+        assert_eq!(fp8_fa2_split_verify_route_for(Some("2")), Some((2, 0)));
+    }
+
     #[test]
     fn a3b_qresident_full_planes_and_ragged_ranges() {
         use super::a3b_qresident_spans;
