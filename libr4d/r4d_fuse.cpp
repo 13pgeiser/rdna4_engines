@@ -512,7 +512,9 @@ extern "C" int r4d_fuse_gemm_nt_q_gated(const RadParam* p, int n_p, uint64_t pre
 
 /* ==========================================================================================
  * gemm_nt_q_gated_mx -- the same fold over an OCP-MXFP4 weight.
- * (row: gemm_mxfp4a8_gated_gemv; kernel: libr4d/r4d_gemm_mxfp4a8_gemv.hip, the gated form)
+ * (rows: gemm_mxfp4a8_gated_gemv, M <= 8, and gemm_mxfp4a8_gated_gemv_wide, 9..64; kernels:
+ * libr4d/r4d_gemm_mxfp4a8_gemv.hip, the gated forms. The chain's gemm_nt_q resolves to gemv and
+ * gemv_wide in those bands, the rows each form is byte-identical to.)
  *
  * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] b_ref  [5] q  [6] scale  [7] out_bf16
  *

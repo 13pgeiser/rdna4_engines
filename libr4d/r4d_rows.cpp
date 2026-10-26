@@ -4833,6 +4833,16 @@ static const RadConstraint cGemmNtQGatedMx[] = {
     C_LE("M", 8), C_DIV("K", 128), C_DIV("N", 256), C_EQ("group", 32), C_IN("dtype", "mxfp4a8"),
     C_IN("act", "silu gelu_tanh"),
 };
+/* r4d_gemm_mxfp4a8_gated_gemv_wide: the same fold at 9..64 rows, over gemv_wide's WMMA form (the GEMM
+ * row of that band, which it is byte-identical to), a block per tile pair with both halves' words in
+ * each of its eight K waves. No decode_shortk corner: that row sums 33..64 rows in the decode
+ * kernel's order, so a gate_up in its corner (K <= 2560, N 8192..36864) would differ from its pair
+ * there; its K bound excludes this row's callers (TranslateGemma 5376, Qwen3.8 5120) and the row
+ * refuses the corner rather than claim it. */
+static const RadConstraint cGemmNtQGatedMxWide[] = {
+    C_GE("M", 9), C_LE("M", 64), C_DIV("K", 128), C_GE("K", 2688), C_DIV("N", 256), C_EQ("group", 32),
+    C_IN("dtype", "mxfp4a8"), C_IN("act", "silu gelu_tanh"),
+};
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
@@ -7815,6 +7825,24 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
   r4d_fuse_gemm_nt_q_gated_mx },
 
+{ "gemm_mxfp4a8_gated_gemv_wide", "gemm_nt_q_gated_mx", "gemm",
+  "gemm_mxfp4a8_gated_gemv at 9 to 64 rows: gemv_wide's WMMA form over the gate and up tiles of one "
+  "16-column tile of the gated output, eight K waves each loading both tiles' weight words and "
+  "running one chain per 16-row tile over each, then that row's epilogue (the product and row amaxes "
+  "in the op's scratch, the 128-column group's last block quantising)",
+  "9 <= M <= 64; K a multiple of 128, at least 2688 (above decode_shortk's corner); N a multiple of "
+  "256; act silu, or gelu_tanh without out_bf16; the skinny kernel's fragment-order weight, [K/32][N] "
+  "E8M0 exponents and per-row reference exponent, gate rows then up rows",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K, and the "
+  "QUANTISER's outputs: E4M3 codes, an f32 scale per (row, 128 columns) and an optional bf16 "
+  "product. Byte-identical to gemm_mxfp4a8_gemv_wide followed by gated_quant_fp8 (silu), or by "
+  "gelu_mul and quant_act_fp8 (gelu_tanh)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQGatedMxWide), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated_wide, r4d_rad_gemm_mxfp4a8_gated_wide_scratch,
+  r4d_rad_layout_mxfp4_gated, r4d_rad_relayout_mxfp4_gated, nullptr, nullptr,
+  r4d_fuse_gemm_nt_q_gated_mx },
+
 { "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
   "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "
   "reduction, the weight unpacked through LDS, streaming weight loads",
@@ -9814,7 +9842,7 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *
  * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream and the output;
  * gemm_mxfp4a8_decode's (and gemm_mxfp4a8_decode_shortk's, the same entry) and
- * gemm_mxfp4a8_gated_gemv's split partials are the op's scratch and their arrival counters are keyed
+ * gemm_mxfp4a8_gated_gemv's (and _gated_gemv_wide's) split partials are the op's scratch and their arrival counters are keyed
  * on the output alone; router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance
  * (taken at init, one per declared op and band). Concurrent launches never share these, so those
  * five rows are concurrent. A new row with stream-ordered state belongs in the list above.

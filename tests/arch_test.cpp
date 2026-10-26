@@ -7618,6 +7618,227 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
     CHECK_EQ(q.draft_depth, 0);
 }
 
+/* ---- TranslateGemma as served: the MXFP4 trunk with DFlash2 at speculation 7 over two ranks, a lossy
+ * wire whose fused junction takes the steps of up to 12 rows, eight sequences (verify steps of 8..64
+ * rows). The A/B knobs over its decode steps (RADIANCE_G3_PF_ROWS, _PF_MIB, _PF_EARLY, _FOLD_ROWS)
+ * are read at declare. */
+namespace {
+
+struct G3Served {
+    MetaKV     mk = gemma3_dflash2_meta();
+    RadBuilder b;
+    int        rank = 0;
+    int        rc = RAD_E_INVAL;
+    using Env = std::vector<std::pair<const char*, const char*>>;
+    explicit G3Served(int rk, const Env& env = {}) : rank(rk) {
+        const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+        b.encs = { { "blk.", mx } };
+        RadBuildCtx ctx = spec_ctx(rank, 2, 7);
+        ctx.max_tok = 2048;
+        ctx.tp_wire_lossy = 1;
+        ctx.tp_wire_min_bytes = 128 * 1024;
+        for (const auto& e : env) setenv(e.first, e.second, 1);
+        rc = stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); });
+        for (const auto& e : env) unsetenv(e.first);
+    }
+    std::vector<std::unique_ptr<Kit>> kits;   /* a step's context points into its kit */
+    /* A verify step of `n_seq` sequences, 8 rows each. */
+    std::vector<std::unique_ptr<RadCtx>> verify(int n_seq) {
+        kits.push_back(kit(b, std::vector<int>((size_t)n_seq, 8), {}));
+        return run_passes(b, gemma3::step, { kits.back().get() }, rank, 2);
+    }
+};
+
+/* The decode-side fingerprint: three plain decodes, every verify height a deployment of eight
+ * sequences reaches (8..64 rows), a prefill chunk and a mixed step. */
+uint64_t g3_decode_steps(G3Served& s) {
+    std::vector<std::unique_ptr<Kit>> ks;
+    ks.push_back(kit(s.b, { 1, 1, 1 }, {}));
+    for (int n = 1; n <= 8; ++n) ks.push_back(kit(s.b, std::vector<int>((size_t)n, 8), {}));
+    ks.push_back(kit(s.b, {}, { 24 }));
+    ks.push_back(kit(s.b, { 8 }, { 6 }));
+    std::vector<std::unique_ptr<RadCtx>> all;
+    std::vector<const Kit*> kp;
+    for (const auto& k : ks) {
+        auto v = run_passes(s.b, gemma3::step, { k.get() }, s.rank, 2);
+        CHECK_PASSES(s.b, v);
+        for (auto& c : v) all.push_back(std::move(c));
+        kp.push_back(k.get());
+    }
+    return issue_hash(s.b, all, kp);
+}
+
+/* The trunk's reads beside the reductions in one step: issue indices and their ops. */
+std::vector<size_t> g3_trunk_reads(const RadBuilder& b, const RadCtx& c) {
+    std::vector<size_t> at;
+    for (size_t i = 0; i < c.issues.size(); ++i) {
+        const RecOp* o = b.op_of(c.issues[i].op);
+        if (o && o->op == "prefetch" && o->w.size() == 1 &&
+            b.weights[o->w[0] - 1].name.rfind("blk.", 0) == 0)
+            at.push_back(i);
+    }
+    return at;
+}
+
+}  /* namespace */
+
+/* With the knobs set to their defaults the served build declares and steps exactly what it does with
+ * them unset: graph and decode-side steps per rank against the knobs-unset build of the same tree.
+ * RADIANCE_G3_PF_MIB alone changes nothing, since it sizes only the reads above 32 rows. */
+TEST(gemma3_served_knobs_at_their_defaults_keep_the_graph_and_steps) {
+    struct Pin { uint64_t graph, steps; };
+    Pin pins[2] = {};
+    for (int rank = 0; rank < 2; ++rank) {
+        G3Served k(rank, {});
+        REQUIRE_EQ(k.rc, RAD_OK);
+        pins[rank] = { graph_hash(k.b), g3_decode_steps(k) };
+    }
+    const std::vector<G3Served::Env> envs = {
+        { { "RADIANCE_G3_PF_ROWS", "32" }, { "RADIANCE_G3_PF_MIB", "24" },
+          { "RADIANCE_G3_PF_EARLY", "0" }, { "RADIANCE_G3_FOLD_ROWS", "0" } },
+        { { "RADIANCE_G3_PF_MIB", "12" } },
+        { { "RADIANCE_G3_FOLD_ROWS", "8" } },
+    };
+    for (int rank = 0; rank < 2; ++rank)
+        for (const auto& env : envs) {
+            G3Served k(rank, env);
+            REQUIRE_EQ(k.rc, RAD_OK);
+            const uint64_t g = graph_hash(k.b), st = g3_decode_steps(k);
+            fprintf(stderr, "    pin: gemma3 served rank %d (%zu knobs): graph 0x%016llxull, steps "
+                            "0x%016llxull\n", rank, env.size(), (unsigned long long)g,
+                    (unsigned long long)st);
+            CHECK_EQ(g, pins[rank].graph);
+            CHECK_EQ(st, pins[rank].steps);
+        }
+}
+
+/* RADIANCE_G3_PF_ROWS raises the height up to which a decode step reads the next GEMM's weight
+ * beside each reduction (32 by default, as qwen35_fp8's). At 64 a verify of eight sequences takes
+ * the reads too, every one of the 2L - 1; RADIANCE_G3_PF_MIB sizes the reads of the steps above 32
+ * rows (24 MiB, the narrow steps' size, by default) as ops of their own, so the narrow steps keep
+ * theirs. A prompt's rows never take them. */
+TEST(gemma3_prefetch_rows_knob_reads_beside_the_wider_verify_steps) {
+    const int L = 12;
+    for (const char* mib : { (const char*)nullptr, "12" }) {
+        for (const char* rows : { (const char*)nullptr, "48", "64" }) {
+            G3Served::Env env;
+            if (rows) env.push_back({ "RADIANCE_G3_PF_ROWS", rows });
+            if (mib) env.push_back({ "RADIANCE_G3_PF_MIB", mib });
+            G3Served s(0, env);
+            REQUIRE_EQ(s.rc, RAD_OK);
+            const int64_t ceil = rows ? std::atoll(rows) : 32;
+            const int64_t wide_bytes = (int64_t)(mib ? std::atoll(mib) : 24) << 20;
+            for (int n = 1; n <= 8; ++n) {
+                const auto v = s.verify(n);
+                CHECK_PASSES(s.b, v);
+                const RadCtx& c = *v[0];
+                const std::vector<size_t> at = g3_trunk_reads(s.b, c);
+                const int64_t T = 8 * n;
+                CHECK_EQ((int)at.size(), T <= ceil ? 2 * L - 1 : 0);
+                for (size_t i : at) {
+                    const RecOp* o = s.b.op_of(c.issues[i].op);
+                    CHECK_EQ(pint(o, "bytes"), T <= 32 ? (int64_t)24 << 20 : wide_bytes);
+                    CHECK_EQ(c.issues[i].lane, 1);
+                }
+                CHECK_EQ(races(s.b, c), 0);
+            }
+            for (const auto& k : { kit(s.b, {}, { 24 }), kit(s.b, { 8, 8 }, { 6 }) }) {
+                const auto v = run_passes(s.b, gemma3::step, { k.get() }, 0, 2);
+                CHECK_PASSES(s.b, v);
+                CHECK(g3_trunk_reads(s.b, *v[0]).empty());
+            }
+        }
+    }
+    /* Out of range or not a number: refused at declare, naming the knob. */
+    for (const auto& bad : { std::make_pair("RADIANCE_G3_PF_ROWS", "0"),
+                             std::make_pair("RADIANCE_G3_PF_ROWS", "x"),
+                             std::make_pair("RADIANCE_G3_PF_MIB", "0"),
+                             std::make_pair("RADIANCE_G3_PF_MIB", "257"),
+                             std::make_pair("RADIANCE_G3_PF_EARLY", "2") }) {
+        G3Served s(0, { bad });
+        CHECK(s.rc != RAD_OK);
+    }
+}
+
+/* Above 12 rows the lossy wire's all-reduce runs bare (unfused), issued by the block itself, so a
+ * read issued after the block waits for that reduction rather than sitting beside it (its lane-1
+ * join comes after the all-reduce). RADIANCE_G3_PF_EARLY=1 issues the read between the GEMM and the
+ * bare all-reduce, as the fused junction's steps always have it. The fused steps (8 rows) are the
+ * same either way: GEMM, read, fused all-reduce. */
+TEST(gemma3_prefetch_early_knob_puts_the_read_in_front_of_a_bare_all_reduce) {
+    for (int early : { 0, 1 }) {
+        G3Served s(1, early ? G3Served::Env{ { "RADIANCE_G3_PF_EARLY", "1" } } : G3Served::Env{});
+        REQUIRE_EQ(s.rc, RAD_OK);
+        for (int n : { 1, 2, 4 }) {
+            const auto v = s.verify(n);
+            CHECK_PASSES(s.b, v);
+            const RadCtx& c = *v[0];
+            const std::vector<std::string> ops = issued_ops(s.b, c);
+            const std::vector<size_t> at = g3_trunk_reads(s.b, c);
+            REQUIRE(!at.empty());
+            const bool fused = n == 1;
+            for (size_t i : at) {
+                REQUIRE(i > 0 && i + 1 < ops.size());
+                const std::string& before = ops[i - 1];
+                const std::string& after = ops[i + 1];
+                if (fused) {
+                    CHECK_EQ(before, std::string("gemm_nt_q"));
+                    CHECK_EQ(after, std::string("ar_rmsnorm_post_quant_fp8"));
+                } else if (early) {
+                    CHECK_EQ(before, std::string("gemm_nt_q"));
+                    CHECK_EQ(after, std::string("all_reduce"));
+                    CHECK(ordered(c, i - 1, i));
+                } else {
+                    CHECK_EQ(before, std::string("all_reduce"));
+                }
+            }
+            CHECK_EQ(races(s.b, c), 0);
+        }
+    }
+}
+
+/* RADIANCE_G3_FOLD_ROWS declares the gated fold (gate_up, the GeGLU and down's quantiser in one
+ * launch) up to that many rows instead of 8: a verify step at or under the ceiling issues the fold
+ * once a layer and neither gelu_mul nor down's own quantiser; above it, the unfused three. Only o's
+ * quantiser is left at a folded step. Out of range (past 64, or not a number) is refused. */
+TEST(gemma3_fold_rows_knob_folds_the_gated_gemm_up_to_its_ceiling) {
+    const int L = 12;
+    for (const char* fr : { (const char*)nullptr, "16", "32", "64" }) {
+        G3Served s(0, fr ? G3Served::Env{ { "RADIANCE_G3_FOLD_ROWS", fr } } : G3Served::Env{});
+        REQUIRE_EQ(s.rc, RAD_OK);
+        const int64_t hi = fr ? std::atoll(fr) : 8;
+        int folds = 0;
+        for (const auto& o : s.b.ops)
+            if (o.op == "gemm_nt_q_gated_mx" && !o.w.empty() &&
+                s.b.weights[o.w[0] - 1].name.rfind("blk.", 0) == 0) {
+                ++folds;
+                CHECK_EQ(pstr(&o, "act"), std::string("gelu_tanh"));
+                CHECK_EQ(param(&o, "M")->ihi, hi);
+                CHECK_EQ(pint(&o, "N"), 21504);   /* gate|up, this rank's half of 2 x 21504 */
+            }
+        CHECK_EQ(folds, L);
+        for (int n = 1; n <= 8; ++n) {
+            const auto v = s.verify(n);
+            CHECK_PASSES(s.b, v);
+            const std::vector<std::string> ops = issued_ops(s.b, *v[0]);
+            const bool fold = 8 * n <= hi;
+            int gated = 0;
+            for (size_t i = 0; i < ops.size(); ++i)
+                if (ops[i] == "gemm_nt_q_gated_mx") {
+                    ++gated;
+                    CHECK_EQ(v[0]->issues[i].n, 8 * n);
+                }
+            CHECK_EQ(gated, fold ? L : 0);
+            CHECK_EQ(count_issued(ops, "gelu_mul"), fold ? 0 : L);
+            CHECK_EQ(count_issued(ops, "quant_act_fp8"), fold ? L : 2 * L);
+        }
+    }
+    for (const char* bad : { "65", "-1", "x" }) {
+        G3Served s(0, { { "RADIANCE_G3_FOLD_ROWS", bad } });
+        CHECK(s.rc != RAD_OK);
+    }
+}
+
 /* --kv-cache-dtype fp8_v4: the trunk's attention cache is E4M3 K (256 bytes), int4 V (128) and
  * eight f16 scales, 400 bytes a token and head, declared as 25 * 256 / 32 = 200 E4M3 columns so the
  * core sizes its pages; every trunk op on it bands on kv_dtype fp8_v4. The DFlash2 drafter's own

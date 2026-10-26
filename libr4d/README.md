@@ -55,6 +55,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_mxfp4a8_gemv` | the same operands for one to eight rows: the weight streamed straight to registers, no LDS staging; WMMA when K is a multiple of 128, `v_dot4` otherwise, chosen from K alone so a row's bits do not depend on M |
 | `gemm_mxfp4a8_gemv_wide` | its WMMA form at 9..64 rows: up to four 16-row tiles a wave over each weight word, two 16-column tiles a block on wide, deep weights |
 | `gemm_mxfp4a8_gated_gemv` | `gemm_nt_q_gated_mx`: the gemv WMMA form over a gate_up weight with `gated_quant_fp8`'s pass (or GeGLU's `gelu_mul` and `quant_act_fp8`) in its epilogue, M ≤ 8; the [M, 2n] product is never written |
+| `gemm_mxfp4a8_gated_gemv_wide` | the same fold at 9..64 rows over `gemv_wide`'s WMMA form: a block per gate/up tile pair, eight K waves each running both tiles, K ≥ 2688 |
 | `gemm_mxfp4a8_decode` | the same operands for the decode band (M ≤ 128): split-K across workgroups with a last-arriver reduction, the partial in the op's scratch |
 | `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
@@ -210,6 +211,20 @@ gfx1201 however little it does, so the launch it saves is the point. TranslateGe
 one stream at speculation 7: 144.5 / 144.9 → 151.5 / 150.5 tok/s, measured with the first form of
 this row (a block per 128-column group, the same bytes); the tile-pair form, Qwen3.8-27B without
 speculation x1 / x4 / x8 +1.4 / +1.8 / +1.5 %.
+
+**`gemm_mxfp4a8_gated_gemv_wide`** (`gemm_nt_q_gated_mx`, 9 ≤ M ≤ 64, K a multiple of 128 and at
+least 2688, N of 256, the same `act` rule). The fold over `gemv_wide`, the GEMM row of that band:
+`gemv_wide`'s kernel at two column tiles a block with the tiles taken as one gate tile and its up
+tile, so each of the eight K waves loads both tiles' weight words of its chunks and reads a chunk's
+activation fragments once for both (the narrow row's sixteen waves, eight a tile, would be
+`gemv_wide` at one tile a block, which at 32 and 64 rows took TranslateGemma's gate_up 39 % and 22 % longer).
+Up to four 16-row tiles; the waves' partials meet through LDS one half at a time (32 KB at 64 rows),
+then the narrow row's epilogue. Byte for byte `gemm_mxfp4a8_gemv_wide` followed by `gated_quant_fp8`,
+or by `gelu_mul` and `quant_act_fp8` (`r4d_selftest`, M = 9..64). No spills: 101 / 137 / 166 / 196
+VGPRs at one to four row tiles (per-(row, 128) activation scale), against `gemv_wide`'s 131 / 160 / 190
+at two to four tiles and two columns. K from 2688 keeps it out of `decode_shortk`'s corner, where the
+unfused GEMM sums 33..64 rows in the decode kernel's order. gemma3 declares it up to
+RADIANCE_G3_FOLD_ROWS rows (default 8, i.e. not at all).
 
 **Tunables.** `gemv`, `gemv_wide` and `gated_gemv` have none, so a `RADIANCE_TUNE` pin on
 `gemm_nt_q` passes them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of

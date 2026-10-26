@@ -30,7 +30,8 @@
 //   shuffles. TN only widens a block; the sum order of a column is fixed by KW, which is constant.
 //
 // The column's 2^(ref - 127) is applied once, as in the decode kernel's epilogue. No scratch and no
-// counters: there is no split across blocks (the gated fold at the end of the file has both).
+// counters: there is no split across blocks (the gated folds at the end of the file, at 1..8 rows and
+// at 9..64, have both).
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
@@ -506,6 +507,174 @@ void r4d_gemm_mxfp4a8_gated_kernel(
   }
 }
 
+// ============================================================== the gated form at 9..64 rows
+// (gemm_mxfp4a8_gated_gemv_wide)
+//
+// From 9 rows the GEMM the fold replaces is gemv_wide's (r4d_gemm_mxfp4a8_gemvw_kernel, RT row tiles).
+// This is that kernel over a tile PAIR, gate tile j and up tile n / 16 + j, in place of two adjacent
+// tiles (its TN = 2): eight K waves, each loading both tiles' words of its chunks and running one WMMA
+// chain per row tile over each, so a chunk's activation fragments are read once for both halves. The
+// narrow form's sixteen waves (eight a half, each reading the activation for its own tile) would be
+// gemv_wide at TN = 1, which at 25..64 rows took TranslateGemma's gate_up 21504 x 5376 from 111 to 154
+// us at 32 rows and from 150 to 183 at 64 (the comment above r4d_gemm_mxfp4a8_gemvw_kernel). Then the
+// narrow form's epilogue: a thread a (row, column) of the pair, the GeGLU or SwiGLU product rounded to
+// bf16, each row's amax over the tile, and the 128-column group's last block quantising it.
+//
+// Byte-identical to gemv_wide followed by gelu_mul and quant_act_fp8 (or gated_quant_fp8). A row's sum
+// in gemv_wide is its row tile's chain alone, the same at every RT and TN; wave v here sums chunks v,
+// v + KW, .. in order with the same fmaf of each chunk's chain by its activation scale, the waves'
+// partials meet through LDS one half at a time and are added w = 0, 1, .. from zero (gemv_wide adds them
+// one column tile at a time, in that order), and the scaled sum is rounded to bf16 by the same
+// conversion. From there the arithmetic is the narrow form's, which is the pair's.
+//
+// LDS: one half's partials at a time, [KW][16 RT][16] floats, 32 KB at four row tiles -- both halves at
+// once would be 64 KB, past a workgroup's allocation with the counter word beside it.
+template <bool ABLK, int ACT, int RT>
+__global__ __launch_bounds__(R4D_MXG_KW * 32)
+void r4d_gemm_mxfp4a8_gatedw_kernel(
+    const unsigned char* __restrict__ A, const float* __restrict__ As,
+    const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
+    const unsigned char* __restrict__ Wref, uint8_t* __restrict__ Q, float* __restrict__ S,
+    uint16_t* __restrict__ Y, uint16_t* __restrict__ H, float* __restrict__ X,
+    unsigned* __restrict__ cnt, int M, int K, int n, int as_rs, int lda, int ldws, int q_ld,
+    int s_ld, int y_ld) {
+  constexpr int KW = R4D_MXG_KW;
+  constexpr int NT = KW * 32;
+  __shared__ float sP[KW][16 * RT][16];
+  __shared__ unsigned s_last;
+  const int lane = threadIdx.x & 31;
+  const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+  const int j = blockIdx.x;                        // the gated output's 16-column tile
+  const int nt[2] = { j, (n >> 4) + j };           // its gate and up weight tiles
+  const int col = lane & 15, khalf = lane >> 4;
+  const int ksteps = K >> 4, chunks = K >> 7;
+  const unsigned* __restrict__ Wp = (const unsigned*)W;
+  int ref[2];
+#pragma unroll
+  for (int t = 0; t < 2; ++t) ref[t] = (int)Wref[nt[t] * 16 + col];
+  mxg_v8f tot[RT][2];
+#pragma unroll
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int t = 0; t < 2; ++t) tot[r][t] = (mxg_v8f)(0.f);
+  for (int ch = wave; ch < chunks; ch += KW) {
+    unsigned wv[2][8];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
+        wv[t][s] = __builtin_nontemporal_load(&Wp[((size_t)nt[t] * ksteps + ch * 8 + s) * 32 + lane]);
+    int e8[2][4];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) e8[t][q] = (int)Ws[(size_t)(ch * 4 + q) * ldws + nt[t] * 16 + col];
+    mxg_v2i wf[2][8];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        unsigned lo, hi;
+        r4d_mxfp4_unpack8(wv[t][s], r4d_mxfp4_fold_d(ref[t], e8[t][s >> 1]), &lo, &hi);
+        wf[t][s][0] = (int)lo; wf[t][s][1] = (int)hi;
+      }
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+      const int row = r * 16 + col;               // A fragment: this lane's row in tile r
+      const bool live = row < M;
+      mxg_v2i af[8];
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        if (live) {
+          const unsigned* pa = (const unsigned*)(A + (size_t)row * lda + (ch * 8 + s) * 16 + khalf * 8);
+          af[s][0] = (int)pa[0]; af[s][1] = (int)pa[1];
+        } else {
+          af[s][0] = 0; af[s][1] = 0;
+        }
+      }
+      const float sc = ABLK ? (live ? As[(size_t)row * as_rs + ch] : 0.f) : 1.f;
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+        mxg_v8f acc = (mxg_v8f)(0.f);
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+          acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[t][s], af[s], acc);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) tot[r][t][e] = fmaf(acc[e], sc, tot[r][t][e]);
+      }
+    }
+  }
+  // Each half's K partials, summed per (row, column): a thread takes (row tid / 16 + 16 i, column
+  // tid % 16) for i < RT, so sixteen consecutive lanes hold one row.
+  const int tid = threadIdx.x;
+  float sum[2][RT];
+#pragma unroll
+  for (int t = 0; t < 2; ++t) {
+    if (t) __syncthreads();
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) sP[wave][r * 16 + col][khalf * 8 + e] = tot[r][t][e];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+      const int idx = tid + i * NT, m = idx >> 4, c = idx & 15;
+      float s_ = 0.f;
+      if (m < M) {
+#pragma unroll
+        for (int w = 0; w < KW; ++w) s_ += sP[w][m][c];
+      }
+      sum[t][i] = s_;
+    }
+  }
+  const int g = j >> 3;                            // the 128-column group
+#pragma unroll
+  for (int i = 0; i < RT; ++i) {
+    const int idx = tid + i * NT, m = idx >> 4, c = idx & 15;
+    if (m < M) {
+      const int cg = j * 16 + c, cu = n + j * 16 + c;
+      const float rg = __int_as_float((int)Wref[cg] << 23), ru = __int_as_float((int)Wref[cu] << 23);
+      const float am = ABLK ? 1.f : As[(size_t)m * as_rs];
+      const __hip_bfloat16 hg = (__hip_bfloat16)(ABLK ? sum[0][i] * rg : sum[0][i] * rg * am);
+      const __hip_bfloat16 hu = (__hip_bfloat16)(ABLK ? sum[1][i] * ru : sum[1][i] * ru * am);
+      const float gv = mxg_bf2f(*(const uint16_t*)&hg);
+      const float a = ACT == 0 ? gv / (1.0f + expf(-gv))
+                               : 0.5f * gv * (1.0f + tanhf(0.7978845608028654f * (gv + 0.044715f * gv * gv * gv)));
+      const uint16_t h = mxg_f2bf(a * mxg_bf2f(*(const uint16_t*)&hu));
+      if (Y) Y[(size_t)m * y_ld + cg] = h;
+      H[(size_t)m * n + cg] = h;
+      float mx = fabsf(mxg_bf2f(h));
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 16));
+      if (c == 0) X[(size_t)j * M + m] = mx;
+    }
+  }
+  // As the narrow form: every thread's stores ordered before the counter, the group's last arriver
+  // quantises, a wave a row.
+  __threadfence();
+  __syncthreads();
+  if (tid == 0)
+    s_last = __hip_atomic_fetch_add(&cnt[g], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+  __syncthreads();
+  if (s_last != 7u) return;
+  if (tid == 0) cnt[g] = 0u;
+  __threadfence();
+  for (int m = wave; m < M; m += KW) {
+    const int c0 = lane * 4;
+    const size_t gcol = (size_t)g * 128 + c0;
+    float mx = 0.f;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) mx = fmaxf(mx, X[(size_t)(g * 8 + t) * M + m]);
+    float vq[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) vq[i] = mxg_bf2f(H[(size_t)m * n + gcol + i]);
+    const float sc = mx > 0.0f ? mx * (1.0f / q8_top<false>()) : 1.0f;
+    if (lane == 0) S[(size_t)m * s_ld + g] = sc;
+    const float inv = 1.0f / sc;
+    *(uint32_t*)(Q + (size_t)m * q_ld + gcol) = q8_pack4<false>(vq[0], vq[1], vq[2], vq[3], inv);
+  }
+}
+
 namespace {
 // The arrival counters, one block per output buffer, as the decode row's (mxd_out_ctr): not in the
 // scratch, which other ops overwrite, since they must be zero at entry. One allocation per (device,
@@ -554,6 +723,31 @@ void mxgg_launch(bool ablk, int act, const void* a, const void* as, const void* 
   else          { if (ablk) MXGG_L(true, 1); else MXGG_L(false, 1); }
 #undef MXGG_L
 }
+
+// The wide form: one block of eight K waves a 16-column tile of the gated output, ceil(M / 16) row
+// tiles.
+void mxggw_launch(bool ablk, int act, const void* a, const void* as, const void* w, const void* ws,
+                  const void* wr, void* q, void* s, void* y, void* scratch, unsigned* cnt, int M,
+                  int K, int n, int as_rs, int lda, int ldws, int q_ld, int s_ld, int y_ld,
+                  RadStream stream) {
+  const dim3 grid((uint32_t)(n / 16)), block(R4D_MXG_KW * 32);
+  hipStream_t st = (hipStream_t)stream;
+  uint16_t* h = (uint16_t*)scratch;
+  float* x = (float*)((char*)scratch + mxgg_h_bytes(M, n));
+  const int rt = (M + 15) / 16;
+#define MXGW_L(AB_, ACT_, RT_)                                                                    \
+  hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gatedw_kernel<AB_, ACT_, RT_>), grid, block, 0, st,       \
+                     (const unsigned char*)a, (const float*)as, (const unsigned char*)w,          \
+                     (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,  \
+                     (uint16_t*)y, h, x, cnt, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld)
+#define MXGW_RT(AB_, ACT_)                                                                        \
+  { if (rt <= 1) MXGW_L(AB_, ACT_, 1); else if (rt == 2) MXGW_L(AB_, ACT_, 2);                     \
+    else if (rt == 3) MXGW_L(AB_, ACT_, 3); else MXGW_L(AB_, ACT_, 4); }
+  if (act == 0) { if (ablk) MXGW_RT(true, 0) else MXGW_RT(false, 0) }
+  else          { if (ablk) MXGW_RT(true, 1) else MXGW_RT(false, 1) }
+#undef MXGW_RT
+#undef MXGW_L
+}
 }  // namespace
 
 /* The gated GEMM's shim. Operand indices are `gemm_nt_q_gated_mx`'s (oGemmNtQGatedMx in
@@ -562,7 +756,9 @@ void mxgg_launch(bool ablk, int act, const void* a, const void* as, const void* 
 enum { MXGG_A = 0, MXGG_AS = 1, MXGG_B = 2, MXGG_BS = 3, MXGG_BR = 4, MXGG_Q = 5, MXGG_S = 6,
        MXGG_Y = 7 };
 
-extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
+/* Both rows' entry: the narrow form at 1..8 rows (gemm_mxfp4a8_gated_gemv), the wide one at 9..64
+ * (gemm_mxfp4a8_gated_gemv_wide), each refusing the other's band as its GEMM row does. */
+static int mxgg_entry(const RadArgs* a, RadStream s, bool wide) {
     const RadTensor* x  = r4d_opt(a, MXGG_A);
     const RadTensor* xs = r4d_opt(a, MXGG_AS);
     const RadTensor* w  = r4d_opt(a, MXGG_B);
@@ -590,7 +786,8 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
      * weight operands are packed bytes. */
     const long long M = q->shape[0], nout = q->shape[1];
     const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
-    if (M < 1 || M > R4D_MXG_MAX_M || nout < 128 || nout % 128 || nout / 128 > R4D_MXGG_MAX_GROUPS)
+    const long long m_lo = wide ? R4D_MXG_MAX_M + 1 : 1, m_hi = wide ? R4D_MXG_WMMA_MAX_M : R4D_MXG_MAX_M;
+    if (M < m_lo || M > m_hi || nout < 128 || nout % 128 || nout / 128 > R4D_MXGG_MAX_GROUPS)
         return R4D_NO(RAD_E_SHAPE);
     if (N != 2 * nout || K < 128 || K % 128) return R4D_NO(RAD_E_SHAPE);
     if (x->shape[0] != M || r4d_numel(x) != M * K) return R4D_NO(RAD_E_SHAPE);
@@ -619,17 +816,36 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
     unsigned* cnt = mxgg_out_ctr(q->data);
     if (!cnt) return R4D_NO(RAD_E_NOMEM);
 
-    R4D_TRY("gemm_mxfp4a8_gated",
-        mxgg_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
-                    y ? y->data : nullptr, a->scratch, cnt, (int)M, (int)K, (int)nout, (int)as_rs,
-                    (int)lda, (int)N, (int)qp, (int)sp, (int)yp, s));
+    if (wide)
+        R4D_TRY("gemm_mxfp4a8_gated_wide",
+            mxggw_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
+                         y ? y->data : nullptr, a->scratch, cnt, (int)M, (int)K, (int)nout, (int)as_rs,
+                         (int)lda, (int)N, (int)qp, (int)sp, (int)yp, s));
+    else
+        R4D_TRY("gemm_mxfp4a8_gated",
+            mxgg_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
+                        y ? y->data : nullptr, a->scratch, cnt, (int)M, (int)K, (int)nout, (int)as_rs,
+                        (int)lda, (int)N, (int)qp, (int)sp, (int)yp, s));
     return RAD_OK;
+}
+
+extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
+    return mxgg_entry(a, s, false);
+}
+extern "C" int r4d_rad_gemm_mxfp4a8_gated_wide(const RadArgs* a, RadStream s) {
+    return mxgg_entry(a, s, true);
 }
 
 /* The op's scratch: the product and amaxes at the band's widest M, from N (twice the gated
  * width). */
-extern "C" int64_t r4d_rad_gemm_mxfp4a8_gated_scratch(const RadArgs* a) {
+static int64_t mxgg_scratch(const RadArgs* a, long long m_hi) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
-    if (M < 1 || M > R4D_MXG_MAX_M || N < 256 || N % 256) return 0;
+    if (M < 1 || M > m_hi || N < 256 || N % 256) return 0;
     return (int64_t)mxgg_scratch_bytes(M, N / 2);
+}
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_gated_scratch(const RadArgs* a) {
+    return mxgg_scratch(a, R4D_MXG_MAX_M);
+}
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_gated_wide_scratch(const RadArgs* a) {
+    return mxgg_scratch(a, R4D_MXG_WMMA_MAX_M);
 }

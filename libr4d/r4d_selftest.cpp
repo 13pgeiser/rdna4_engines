@@ -6720,21 +6720,23 @@ static void w4a8_multi_user_exact(const Plugin& pl) {
 
 /* ---- the MXFP4 gated fold, against the pair it replaces -------------------------------------
  *
- * gemm_mxfp4a8_gated_gemv (gemm_nt_q_gated_mx) against gemm_mxfp4a8_gemv followed by
+ * gemm_mxfp4a8_gated_gemv (gemm_nt_q_gated_mx, M <= 8) against gemm_mxfp4a8_gemv followed by
  * gated_quant_fp8, on the same weight bytes (one relayout, through the gemv row's hooks, which the
- * gated row shares) and activation. Codes, scales and the bf16 product must be identical, and the
- * codes mostly non-zero (zeroed buffers compare equal). Run twice: with `out_bf16`, and without it,
- * where the codes and scales must still match. */
+ * gated row shares) and activation; from 9 rows gemm_mxfp4a8_gated_gemv_wide against
+ * gemm_mxfp4a8_gemv_wide, the row the unfused GEMM takes there. Codes, scales and the bf16 product
+ * must be identical, and the codes mostly non-zero (zeroed buffers compare equal). Run twice: with
+ * `out_bf16`, and without it, where the codes and scales must still match. */
 static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K, bool ablk,
                                bool gelu = false) {
-    const char* row = "gemm_mxfp4a8_gated_gemv";
+    const bool wide = M > 8;
+    const char* row = wide ? "gemm_mxfp4a8_gated_gemv_wide" : "gemm_mxfp4a8_gated_gemv";
     if (!sel(row)) return;
     char nm[192];
     std::snprintf(nm, sizeof nm, "%s byte-identical to gemv + %s, M=%lld N=%lld K=%lld%s", row,
                   gelu ? "gelu_mul + quant_act_fp8" : "gated_quant_fp8", (long long)M, (long long)N,
                   (long long)K, ablk ? " ascale=row x 128" : "");
     const RadKernelInfo* rg = find(pl, row);
-    const RadKernelInfo* rv = find(pl, "gemm_mxfp4a8_gemv");
+    const RadKernelInfo* rv = find(pl, wide ? "gemm_mxfp4a8_gemv_wide" : "gemm_mxfp4a8_gemv");
     const RadKernelInfo* rq = find(pl, gelu ? "quant_act_fp8" : "gated_quant_fp8");
     const RadKernelInfo* rm = find(pl, "gelu_mul_bf16");
     if (!rg || !rv || !rq || (gelu && !rm) || !rg->layout || !rg->relayout) {
@@ -13941,30 +13943,41 @@ static void mx_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
         std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
                                      PS("dtype", "mxfp4a8") };
         perf_row(pl, row, ts, ps, d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
-        /* At a gate_up shape the gemv row's GEMM is half of a pair: time the other half
-         * (gated_quant_fp8 over its output) and the fold that replaces both. */
-        if (!std::strcmp(row, "gemm_mxfp4a8_gemv") && N % 256 == 0 && K % 128 == 0) {
+        /* At a gate_up shape the gemv row's GEMM (gemv_wide's from 9 rows) is half of a pair:
+         * time the other half -- gated_quant_fp8 over its output (SwiGLU), and gelu_mul then
+         * quant_act_fp8 (GeGLU) -- and the fold that replaces each, the gated row of the band. */
+        if (!std::strcmp(row, "gemm_mxfp4a8_gemv") && N % 256 == 0 && K % 128 == 0 && M <= 64) {
             const int64_t n = N / 2;
             void* d_q = dalloc((size_t)(M * n));
             void* d_z = dalloc((size_t)(M * (n / 128) * 4));
-            if (!d_q || !d_z) { std::printf("  gated: hipMalloc failed\n"); continue; }
+            void* d_g = dalloc((size_t)(M * n * 2));
+            if (!d_q || !d_z || !d_g) { std::printf("  gated: hipMalloc failed\n"); continue; }
             RadTensor nob = T(nullptr, RAD_BF16, { M, n });
             absent(nob);
             perf_row(pl, "gated_quant_fp8", { T(d_y, RAD_BF16, { M, N }), T(d_q, RAD_F8E4M3, { M, n }),
                                               T(d_z, RAD_F32, { M, n / 128 }), nob },
                      { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") },
                      d_y, (size_t)(M * N * 2), 1, (double)(M * N * 2), iters, 0);
-            const RadKernelInfo* rg = find(pl, "gemm_mxfp4a8_gated_gemv");
+            perf_row(pl, "gelu_mul_bf16", { T(d_y, RAD_BF16, { M, N }), T(d_g, RAD_BF16, { M, n }) },
+                     { PI("M", M), PI("n", n), PS("dtype", "bf16") },
+                     d_y, (size_t)(M * N * 2), 1, (double)(M * N * 2 + M * n * 2), iters, 0);
+            perf_row(pl, "quant_act_fp8", { T(d_g, RAD_BF16, { M, n }), T(d_q, RAD_F8E4M3, { M, n }),
+                                            T(d_z, RAD_F32, { M, n / 128 }) },
+                     { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16") },
+                     d_g, (size_t)(M * n * 2), 1, (double)(M * n * 3), iters, 0);
+            const char* gname = M > 8 ? "gemm_mxfp4a8_gated_gemv_wide" : "gemm_mxfp4a8_gated_gemv";
+            const RadKernelInfo* rg = find(pl, gname);
             std::vector<uint8_t> gr;
             if (rg && stored(rg, lp, 4, p, { "scale" }, &gr) == RAD_OK && gr == wr)
-                perf_row(pl, "gemm_mxfp4a8_gated_gemv",
-                         { T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
-                           T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
-                           T(d_r, RAD_U8, { (int64_t)wr.size() }), T(d_q, RAD_F8E4M3, { M, n }),
-                           T(d_z, RAD_F32, { M, n / 128 }), nob },
-                         { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8"),
-                           PS("act", "silu") },
-                         d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
+                for (const char* act : { "silu", "gelu_tanh" })
+                    perf_row(pl, gname,
+                             { T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
+                               T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+                               T(d_r, RAD_U8, { (int64_t)wr.size() }), T(d_q, RAD_F8E4M3, { M, n }),
+                               T(d_z, RAD_F32, { M, n / 128 }), nob },
+                             { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8"),
+                               PS("act", act) },
+                             d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
         }
     }
 }
@@ -28146,6 +28159,18 @@ static void device_phase(const Plugin& pl) {
         for (const int64_t m : { 1, 4, 8 }) mxfp4a8_gated_case(pl, m, 21504, 5376, true, true);
         mxfp4a8_gated_case(pl, 3, 256, 256, true, true);
         mxfp4a8_gated_case(pl, 2, 1024, 640, false, true);
+        /* The fold from 9 to 64 rows against gemv_wide and the same pair: TranslateGemma's per-rank
+         * gate_up (GeGLU) at the heights a verify of two to eight sequences makes and at a ragged
+         * 9, one to four row tiles each partly live; small weights (four groups, one) at the row's
+         * shallowest K and an uneven chunk count a wave, on both activation grids; the SwiGLU
+         * form at Qwen's shape and a small one. */
+        for (const int64_t m : { 9, 16, 24, 32, 48, 64 }) mxfp4a8_gated_case(pl, m, 21504, 5376, true, true);
+        for (const int64_t m : { 9, 33, 64 }) mxfp4a8_gated_case(pl, m, 1024, 2688, false, true);
+        for (const int64_t m : { 17, 50 }) mxfp4a8_gated_case(pl, m, 1024, 2688, true, true);
+        mxfp4a8_gated_case(pl, 31, 256, 2816, true, true);
+        for (const int64_t m : { 24, 64 }) mxfp4a8_gated_case(pl, m, 17408, 5120, true);
+        for (const int64_t m : { 12, 40 }) mxfp4a8_gated_case(pl, m, 1024, 2688, false);
+        mxfp4a8_gated_case(pl, 57, 256, 2816, true);
         /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
          * kernel's tile, two and three parts, at every band. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 400, 640, 0, true, {}, 144);

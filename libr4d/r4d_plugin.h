@@ -481,6 +481,8 @@ int r4d_rad_gemm_m2xfp4a8_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_m2xfp4a8_tiled_scratch(const RadArgs*);
 int r4d_rad_gemm_m2xfp4a8_decode(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_m2xfp4a8_decode_scratch(const RadArgs*);
+int r4d_rad_gemm_mxfp4a8_gated_wide(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_gated_wide_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
