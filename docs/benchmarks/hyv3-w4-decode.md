@@ -155,9 +155,13 @@ Quality comparisons on the same two builds:
 
 Additional compatibility smokes using the same candidate build passed for the local Qwen4Exp W5
 container (returned `42`; prompt-lookup drafted 6 tokens and accepted 1), Qwen Flash-Next IQ4R
-(answered `42`), Qwen3.8 27B MXFP4 (answered `42`), Breeze-TTS-2 (valid 24 kHz mono PCM), and
-HYV3 (answered `42`). These are smoke tests, not matched performance/quality results for those
-models. No model was downloaded and no llama-swap route was changed.
+(TP1 and TP2 launchers, answered `42`), Qwen3.8 27B MXFP4 (answered `42`), Breeze-TTS-2 (valid
+24 kHz mono PCM), and HYV3 (answered `42`). The verified deployment build was moved intact to
+`/mnt/gostar_data/radiance-builds/radiance-v1.12-hyv3-pr237/build-gfx1201`; all six local model
+launchers were syntax-checked and updated to use it. The W5 launcher dropped a stale
+`--draft-coupling on` option rejected by this container (it declares no linear drafter); its
+six-token prompt-lookup setting remains. These are smoke tests, not matched performance/quality
+results for those models. No model was downloaded and no llama-swap route was changed.
 
 Logs, summaries and raw rows are under
 `/mnt/gostar_data/radiance-calib/hyv3-pr-validation-20261025/pr237/` and
