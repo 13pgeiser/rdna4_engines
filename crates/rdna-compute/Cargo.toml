@@ -1159,6 +1159,10 @@ name = "gate_up_tiles_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_railgun_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_vit_gemm_shapes"
 required-features = ["lab"]
 
