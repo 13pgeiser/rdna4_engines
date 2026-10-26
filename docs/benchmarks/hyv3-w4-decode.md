@@ -11,7 +11,7 @@ selection, or speculative decoding settings.
 | Compact one-row W4/W5 epilogue | Callers of the asymmetric W4/W5 GEMM at one live row and a compatible tile; includes Gemma callers | Fresh whole-model W4/W5 comparisons outside HYV3 |
 | BF16-to-F16 narrowing inside W4 GEMM | Non-rotated group-128 asymmetric W4 `LinearFP8` decode through 64 rows | Other models using this path; Gemma's separate a4 graph still keeps its cast |
 | Fragment-tiled expert I4 and one-row register loads | Per-128-scale signed-I4 experts, including plain and Hadamard-rotated formats | Other models/recipes that actually use this encoding, plus prefill and TP regressions |
-| Fused Q/K prologue and residual/shared-combine folding | HYV3's graph; TP2 keeps separate routed/shared reductions | Fresh HYV3 throughput, text/tool quality and TP1/TP2 checks on the rebased engine |
+| Fused Q/K prologue and residual/shared-combine folding | HYV3's graph; TP2 keeps separate routed/shared reductions | Fresh TP2 whole-model A/B; other models affected by shared-kernel changes |
 
 Subgroup-scaled codebooks retain their row-major packing. In particular, the served Flash-Next
 W5DN64 recipe is not evidence for the per-128 I4 kernel: its routed experts use a different
@@ -47,10 +47,10 @@ cast-fusion result used a stale architecture plugin and must not be used to quan
 graph casts. A separate launch-cache experiment near 120.5 tokens/s changed reduction order and
 is not part of this patch.
 
-The historical native-tool check also needs a new, isolated A/B. The untuned stack scored 102/113
-exact and 112/113 executable cases versus 105/113 and 113/113 in an earlier baseline that predated
-intervening engine changes. This was a small curated executable subset, not a broad quality test;
-the unmatched baseline prevents attributing the difference, but it does not clear a quality gate.
+The earlier native-tool comparison was unmatched: the untuned stack scored 102/113 exact and
+112/113 executable cases versus 105/113 and 113/113 in an older baseline. The matched release-tag
+A/B below supersedes it for this PR validation: both arms scored 102/113 and 112/113, with identical
+per-case results. This remains a small curated subset, not a broad quality test.
 
 ## Validation on the rebased optimization branch
 
@@ -91,11 +91,11 @@ Accordingly, no fresh HYV3 or Qwen inference A/B ran.
 The user's local Qwen `.rad` was inspected without downloading anything:
 `/mnt/gostar_data/models/StillDeadcode/qwen3.8-27b-mxfp4/qwen3.8-27b-mxfp4.rad` is a 19.4 GB
 `Qwen3_5ForConditionalGeneration` container with `n_expert=0` and group-32 MXFP4 weights (SHA-256
-`a4908940c568f5f9dd24e88f46aefe9ac2ae07dfec023a2eaa1d14dcaa3df4f8`). It does
-not exercise this PR's asymmetric W4/W5 or per-128 I4 paths; if run once the engine build is
-available, it can only be a no-regression control for the unchanged MXFP4 path. The attempted
-launches exited before model load. No model was downloaded, no serving route was edited, and no
-serving process was stopped or replaced.
+`a4908940c568f5f9dd24e88f46aefe9ac2ae07dfec023a2eaa1d14dcaa3df4f8`). It does not exercise this
+PR's asymmetric W4/W5 or per-128 I4 paths; on the release-tag build it was used only as an MXFP4
+compatibility smoke (answered `42`), not as an affected-model A/B. Attempts against the current-main
+candidate exited before model load because that engine could not be built. No model was downloaded
+and no llama-swap route was edited.
 
 ### Release-tag plus PR build experiment
 
@@ -121,23 +121,62 @@ Follow-up validation used only the third R9700 (GPU index 2, UUID
   port 18100. `/health` was OK and a chat request asking for 6×7 returned `42`. The process was
   stopped afterward and the port was confirmed free; no route was changed.
 
-This is focused kernel correctness plus one inference smoke, not a full GPU suite, A/B benchmark,
-or broad quality result. Logs and response are in
-`/mnt/gostar_data/radiance-calib/hyv3-pr-validation-20261025/pr237/` (`release-v112-*-selftest.log`
-and `release-v112-hy-memory-smoke*`). Current-main build results above remain separate: its missing
-`core/kvstream/` module still blocks the newer engine target.
+### Full-suite, performance and quality A/B (completed on the release-tag stack)
 
-## Before this PR is ready
+The full CTest suite on the release+HYV3-support+PR candidate passed **121/121** tests, including
+83 unit tests and all 10 GPU-labelled tests. The full `r4d_selftest` passed on a standalone rerun
+and again in the final complete suite. An earlier full-suite attempt had an intermittent
+`hc_read_e4m3` assertion; the same untouched family also failed on the baseline run, while four
+isolated baseline/candidate reruns passed 38/38 each. The final full-suite run was clean.
 
-1. Restore/fix the missing upstream KV-stream source and build a matched ABI-30 HIP engine; rerun
-   the full host/unit suite.
-2. Resolve or formally baseline the existing `hc_read_e4m3` GPU test failure so the full GPU suite
-   has a clean, interpretable result; keep any unrelated fix separate from this PR.
-3. Run current-base vs PR HYV3 TP1/TP2 A/Bs on ordinary prose, code and native tools, with cold
-   prompts, identical deployment settings and quality checks.
-4. Use the local Qwen 27B only as an MXFP4 no-regression control. It is not an affected W4/I4 model;
-   check for another already-local artifact that actually uses those encodings, but download none.
-   Measure prefill/decode and quality for every affected model that is available locally.
+A matched TP1 full-GPTQ W4 A/B used the exact frozen 10,030-token prompt and 2,000-token decode
+request (`e04af05f...`), on the third R9700, BF16 KV, one sequence, 65,536 context, 4,096 batched
+tokens, and no launch tune or speculative decoding. The reference was release `v1.12.0` plus HYV3
+model support; the candidate added only PR #237's delta. Each arm had three repetitions, with the
+same 16-token prefix-cache behavior after the first run.
+
+| Arm | Median decode tokens/s | Median prefill tokens/s | Answer SHA-256 |
+| --- | ---: | ---: | --- |
+| v1.12.0 + HYV3 support (baseline) | 76.567 | 7,876.292 | `caca914b...` |
+| v1.12.0 + HYV3 support + PR #237 | 109.618 | 7,926.569 | `caca914b...` |
+
+That is **+43.17% median decode throughput** and **+0.64% prefill throughput** on this narrow
+synthetic workload; all six generated-answer hashes were identical. The speed result is specific
+to this matched release-tag comparison, not a claim about other models or current-main performance.
+
+Quality comparisons on the same two builds:
+
+- Greedy output hashes matched **12/12** fixed probes.
+- Teacher-forced evaluation on the frozen eight-document, 578-position corpus measured mean KL
+  `7.61e-8`, maximum KL `1.57e-6`, **100% top-1 agreement**, and identical PPL `2.875200`.
+- The 113-case native-tool BFCL subset was identical row-for-row: **102/113** exact calls,
+  **112/113** execution successes, and zero API errors on both arms. This is a curated subset, not
+  broad capability evidence.
+
+Additional compatibility smokes using the same candidate build passed for the local Qwen4Exp W5
+container (returned `42`; prompt-lookup drafted 6 tokens and accepted 1), Qwen Flash-Next IQ4R
+(answered `42`), Qwen3.8 27B MXFP4 (answered `42`), Breeze-TTS-2 (valid 24 kHz mono PCM), and
+HYV3 (answered `42`). These are smoke tests, not matched performance/quality results for those
+models. No model was downloaded and no llama-swap route was changed.
+
+Logs, summaries and raw rows are under
+`/mnt/gostar_data/radiance-calib/hyv3-pr-validation-20261025/pr237/` and
+`/mnt/gostar_data/radiance-calib/hyv3-w4-round2-20261024/` (labels `release-v112-baseline` and
+`release-v112-pr`).
+
+## Integration caveat and scope of claims
+
+The successful full builds, full test suite and A/B above use the release-tag stack because the
+current-main source still lacks the engine-side `core/kvstream/` headers introduced by upstream
+`486c933`; it therefore cannot produce the matching ABI-30 HIP engine. That unrelated upstream
+build break remains outside this PR, so the A/B must not be described as a current-main-vs-PR run.
+The PR is validated and ready for review against the buildable release-tag stack, but after the
+upstream KV-stream integration is restored, current-main builds/tests should be rerun.
+
+Performance and quality claims are limited to the HYV3 TP1 full-GPTQ W4 A/B above. The Qwen W5,
+IQ4R and MXFP4 runs were compatibility smokes only; no broad speedup or quality claims are made for
+other model families or formats. The native BFCL corpus is also a small safe subset, not a broad
+quality benchmark.
 
 The cold-weight diagnostics are `r4d_selftest --perfw4`, `--perfw4bf16`, `--perfbf16` and
 `--perfhyv3moe`; see [libr4d/README.md](../../libr4d/README.md). Their byte/canonical checks and
