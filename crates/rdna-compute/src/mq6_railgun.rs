@@ -413,6 +413,11 @@ impl PreparedMq6Program {
                     commands.wait_compute_idle();
                     commands.acquire_system();
                 }
+                Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                    return Err(failure(
+                        "explicit MQ6 programs do not support conditional PM4 operations",
+                    ));
+                }
             }
         }
         let ib_sha256 = digest(&commands.as_bytes());

@@ -111,7 +111,7 @@ impl Mq6Facts {
                 && !receipt.strict
                 && digest(&record.receipt_sha256)
                 && digest(&receipt.round_trip_proof_sha256),
-            "MQ6 requires a verified schema-7 tier-D receipt",
+            "MQ6 requires a verified schema-8 tier-D receipt",
         )?;
         for (id, status) in [("roundtrip", "pass"), ("g8-metadata-differential", "pass")] {
             require(
@@ -205,6 +205,7 @@ fn validate_record(
     integers: &[u32],
 ) -> Result<(), String> {
     let symbol = &record.symbol;
+    record.validate_case(BUNDLE_SHA256, DEVICE_ELF_SHA256, "gfx1151")?;
     require(
         record.status == "proven"
             && record.unresolved.is_empty()
@@ -747,6 +748,19 @@ mod tests {
 
     #[test]
     fn actual_receipt_mutations_are_refused_instead_of_inventing_facts() {
+        let mut value = hit();
+        value.receipt.schema_version = 7;
+        assert!(Mq6Facts::from_hit(&value).is_err());
+        let mut value = hit();
+        value.receipt.railgun.kernels[0]
+            .guards
+            .push(railgun_corpus::receipt::GuardRecord {
+                kind: "kernarg_eq".into(),
+                arg_offset: 0,
+                size: 8,
+                value: "0".into(),
+            });
+        assert!(Mq6Facts::from_hit(&value).is_err());
         let mut value = hit();
         value.receipt.railgun.kernels[0].status = "unknown".into();
         assert!(Mq6Facts::from_hit(&value).is_err());
