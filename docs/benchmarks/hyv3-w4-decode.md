@@ -54,11 +54,37 @@ per-case results. This remains a small curated subset, not a broad quality test.
 
 ## Validation on the rebased optimization branch
 
-The GPU, layout and reference results below were recorded with the candidate based on merged main
-`2d2f638`. Main later advanced to `d650eca` with two Gemma4 changes, and the PR branch was rebased
-on it. On that final rebased tip, `arch_test` was rebuilt and passed (`ctest -R arch_test`, 1/1).
-I then retried the `radiance` build target from this latest source; it still fails on the missing
-KV-stream headers noted below. The full unit, GPU and inference suites were not rerun after rebasing.
+The full-suite GPU, layout and reference results below were recorded with the candidate based on
+merged main `2d2f638`. The PR was later rebased onto `d650eca` and then onto current `origin/main`
+`96bc046`. The full unit, GPU and inference suites have not been rerun on that latest base. Its
+`radiance` target remains blocked by the missing KV-stream headers noted below; focused validation
+of the latest source is recorded separately here.
+
+### Code-review follow-up on current main
+
+The review found that removing the explicit BF16-to-F16 graph cast changed CPU/reference results for
+BF16 values in F16's subnormal range. The host backends now explicitly narrow BF16 activations to
+F16 before W4/W5 asymmetric GEMM, preserving the old cast semantics. This does not change the HIP
+kernel path.
+
+On the latest rebased source (`origin/main` `96bc046` plus this PR):
+
+- Built the updated `libref`, `libavx`, and `rad-avx-check` host plugins, plus the complete `gfx1201`
+  `libr4d` HIP plugin and `r4d_selftest`. The full Radiance engine build is still blocked by the
+  missing upstream KV-stream headers.
+- The new direct `libref` regression test passed 7 checks: BF16-subnormal W4 output matched the
+  explicit-F16 input byte-for-byte and produced BF16 `0x3900`.
+- `rad-avx-check --op gemm_nt_q` passed 26 generated geometries and 46 hand-built cases at scalar,
+  AVX and AVX2 levels, with four-thread reruns byte-identical. This CPU exposes AVX2 but not AVX-512.
+- Stored-layout parity passed 1,145 checks over 20 cases.
+- On the authorized GPU, focused W4 checks passed 341/341, including finite and raw-bit BF16-to-F16
+  cast parity. The signed-I4/MoE `moe_gemm_w4a8` test had 647 passes, zero failures and 12 expected
+  skips for unsupported aligned prefill tiles above the 512-expert run-map limit (the harness exits
+  2 when skips occur).
+- A short post-fix HYV3 full-GPTQ W4 compatibility smoke on the existing release-plus-PR deployment
+  build returned `42`; it was stopped afterward, the temporary port was free, and no serving route
+  was changed. That build does not include the updated CPU plugins, so this smoke is not evidence
+  for the CPU fix or a current-main A/B.
 
 - Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed
   before the base advance.
