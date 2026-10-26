@@ -659,6 +659,10 @@ same path runs. Trivial means served as stored:
   `fp4_e2m1*e8m0[1x32]`, byte for byte;
 - GGUF `F32`, `F16` and `BF16`.
 
+A GGUF `Q8_0`, `Q4_K` or `Q6_K` tensor is not trivial, because its blocks interleave what the planes
+of §4.1 hold apart. `rad-convert` imports it without a recipe as those planes, bit for bit, and the
+loader refuses it with that hint. Other GGUF block types are dequantised for a recipe or refused.
+
 **A torch.save file beside the safetensors is read as data** (`core/format/torch_zip.h`), for a
 model part that ships only that way (Fish Audio drama-3's `codec.pth`): its tensors join the
 namespace under `<stem>.`. The zip's stored entries are mapped, and its pickle is read by a machine
@@ -697,7 +701,9 @@ A rule names an algorithm (`rtn`, `gptq`, `cast`); its options name the grid (`c
 `group` or `block`, `scale`, a second level `scale2`, `zero`, `rule`) and the transform
 (`transform=fwht128`) (§4.5). First match wins, so a protected expert's `cast` rule sits above the
 rule every other expert takes. A quantiser that declines a weight (`rtn` declines a rank-1 tensor)
-leaves it to the checkpoint's encoding, so a broad pattern need not exclude every norm.
+leaves it to the checkpoint's encoding, so a broad pattern need not exclude every norm. A GGUF block
+tensor is the exception: a rule that declines it is an error, since keeping its planes would hide
+that the rule did not apply.
 
 `--recipe FILE` names a file and `--quant 'PATTERN=QUANTISER:k=v,...'` adds rules ahead of it.
 `$NAME` in an option is read from the environment.

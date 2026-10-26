@@ -6,6 +6,7 @@
  * checkpoint holds them, so one conversion writes a quantised and a copied weight of every kind.
  */
 #include "rad_test.h"
+#include "gguf_writer.h"
 #include "tiny_model.h"
 
 #include "format/encoding.h"
@@ -754,6 +755,49 @@ TEST(a_recipe_or_flag_that_cannot_be_honoured_is_refused_before_writing) {
         CHECK_EQ(convert(w.ckpt, a, nullptr), 2);
         CHECK(!exists(d / "f.rad"));
     }
+}
+
+/* A rule that declines a GGUF block tensor stops the run rather than keep the tensor's planes: the
+ * tiny LLaMA as a GGUF with its first attn_norm in Q8_0, under an `rtn` rule, which declines a
+ * rank-1 tensor. */
+TEST(a_rule_that_declines_a_gguf_block_tensor_is_an_error) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_gguf");
+    const tiny::Llama s;
+    const std::vector<ggufw::GKv> kvs = {
+        { "general.architecture", 8, 0, { "llama" } },
+        { "llama.block_count", 4, (double)s.layers, {} },
+        { "llama.embedding_length", 4, (double)s.hidden, {} },
+        { "llama.attention.head_count", 4, (double)s.heads, {} },
+        { "llama.attention.head_count_kv", 4, (double)s.kv_heads, {} },
+        { "llama.attention.key_length", 4, (double)s.head_dim, {} },
+        { "llama.feed_forward_length", 4, (double)s.ffn, {} },
+        { "llama.context_length", 4, (double)s.ctx, {} },
+        { "llama.vocab_size", 4, (double)s.vocab, {} },
+    };
+    std::vector<ggufw::GTensor> ts;
+    for (const auto& [name, t] : w.src) {
+        ggufw::GTensor g{ name, t.dtype == "F32" ? 0u : 30u, {}, t.bytes };
+        g.ne.assign(t.shape.rbegin(), t.shape.rend());
+        if (name == "model.layers.0.input_layernorm.weight") {
+            g.type = 8;
+            g.bytes.clear();
+            for (uint64_t b = 0; b < g.ne[0] / 32; ++b) {
+                g.bytes.insert(g.bytes.end(), { 0x00, 0x3C });   /* d = 1 in f16 */
+                g.bytes.insert(g.bytes.end(), 32, 1);
+            }
+        }
+        ts.push_back(std::move(g));
+    }
+    REQUIRE(ggufw::write_gguf(d / "llama.gguf", kvs, ts));
+    std::string log;
+    CHECK(convert(d / "llama.gguf",
+                  { "-o", d / "g.rad", "--recipe", w.recipe, "--quant",
+                    "blk.0.attn_norm.weight=rtn:codes=i8,group=32,scale=bf16" },
+                  &log) != 0);
+    CHECK(has(log, "(rtn) refuses it"));
+    CHECK(!exists(d / "g.rad"));
 }
 
 /* ================================================================== an int4 release */

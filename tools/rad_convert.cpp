@@ -589,8 +589,10 @@ int main(int argc, char** argv) {
             const RadQuantWeight qw = quant_weight(L, nullptr);
             const int st = L.rule->q->encoding(L.rule->params.data(), (int)L.rule->params.size(),
                                                &qw, &L.enc);
-            if (st == RAD_E_UNSUPPORTED && (L.src.trivial || L.src.imported)) {
-                /* declined (e.g. a norm under a matrix pattern): keep as is */
+            if (st == RAD_E_UNSUPPORTED &&
+                (L.src.trivial || (L.src.imported && !L.src.ggml_blocks))) {
+                /* declined (e.g. a norm under a matrix pattern): keep as is. Not a GGUF block
+                 * tensor: keeping its planes would hide that the rule did not apply. */
                 L.rule = nullptr;
                 L.enc = L.src.enc;
             } else if (st != RAD_OK) {
