@@ -1153,7 +1153,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "gemv_hfq4g256_multirow_r2",
                 "gemv_hfq4g256_multirow_r4",
-                "gemv_hfq4g256_multirow_r8"
+                "gemv_hfq4g256_multirow_r8",
+                "gemv_hfq4g256_multirow_r2_x4",
+                "gemv_hfq4g256_multirow_r2_x8"
             ]
         );
         add!(
@@ -4418,7 +4420,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_mw16_residual_wmma",
             kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
-            ["gemm_mw16_residual_wmma"]
+            [
+                "gemm_mw16_residual_wmma",
+                "gemm_mw16_residual_wmma_gfx1151_xlds"
+            ]
         );
         // Sparse sampled DFlash host-accept target rows (speculative.rs
         // `dflash_target_rows_into`; the device accept path is gfx1201-only).
