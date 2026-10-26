@@ -1704,9 +1704,25 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                // DFlash is not served on an EP/TP mesh (tp>1 refuses a draft
+                // below). An `auto` mode only pairs the registry draft when one
+                // exists, so on tp>1 it drops the pairing instead of failing
+                // the load; an explicit `on` still reaches that refusal.
+                let draft_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 let draft_path = if dflash_mode == "off" {
                     if let Some(d) = raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
+                    }
+                    None
+                } else if dflash_mode == "auto" && draft_tp > 1 {
+                    if let Some(d) = raw_draft {
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=auto with tp={draft_tp} — DFlash is not served on EP/TP; skipping draft load ({d})"
+                        );
                     }
                     None
                 } else {

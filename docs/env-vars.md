@@ -532,6 +532,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` | Explicit peer all-reduce selector for logical EP decode proofs; do not set it to `0`. |
 | `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
 | `HIPFIRE_TP_PEER_DIRECT` / `HIPFIRE_TP_PEER_ALTERNATING` / `HIPFIRE_TP_FULL_GRAPH` | Developer-only dense-TP2 residual reduction controls; every route computes the same rank-ordered `x + (p0 + p1)`. `HIPFIRE_TP_PEER_DIRECT=0` replaces the default symmetric direct-peer read with the rooted fold. `HIPFIRE_TP_PEER_ALTERNATING` and `HIPFIRE_TP_FULL_GRAPH` are tri-state (`1` forces on, `0` forces off, unset takes the default); **both default on for an exact gfx1201 pair and off everywhere else**, so `HIPFIRE_TP_FULL_GRAPH=0` is the gfx1201 kill switch. `HIPFIRE_TP_PEER_ALTERNATING` uses the fact that the attention and FFN partials live in different buffers: each reduction waits only on the peer's producer event, without the consumer-complete reverse wait; unset follows `HIPFIRE_TP_FULL_GRAPH`, and `=0` also disables the whole-token graph. `HIPFIRE_TP_FULL_GRAPH` admits an exact homogeneous gfx1100 pair or an exact homogeneous gfx1201 pair (TP=2, peer access, AR decode; mixed or other arches are not admitted) and captures each rank's whole decode token as one hipGraph, with device-resident signal barriers and a host-mapped coherent payload exchange; enabling it turns on the alternating protocol unless that is set to `0`. See [multi-gpu.md](multi-gpu.md#dense-tp2-reduction-protocol-developer). |
+| `HIPFIRE_DENSE_TP_ROUTE` | **Developer-only.** Which route `serve --tp N` loads for a dense Qwen3.5/3.6/3.8 model (`developer.dense_tp_route`; read at load): `auto` (default; also unset or empty) loads the generic mesh executor (`qwen35::mesh_tp`, every KV backend, AR decode and chunked prefill, peer or host-staged reduction chosen by byte qualification) whenever it admits the load, else the hand dense-TP route with the log line `[loader] dense qwen TP route=auto -> hand: <reason>` (`speculation.mtp = on`, or an uneven TP3/TP5 split); `mesh` forces the mesh route and refuses MTP and uneven splits; `hand` is the rollback to the hand route. Any other value is a load error. The mesh route builds no drafter and refuses sessions and prefix repair. See [multi-gpu.md](multi-gpu.md#generic-mesh-executor-tp-collectives-developer). |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` | Pipeline-parallel band layer counts: `a,b,…` lists the trunk layer count of each band in **logical band order** (the first count is band 0, the first layers; the last count is the last band; it is not the card order), `pp` entries, none zero, summing to the trunk layer count. Read once at admission; unset or empty gives the uniform split (remainder on the first bands). **Flash-Next/Qwen4** (`topology.pp` 2..=8) also needs band 0 to hold at least 2 layers (the PLE layer) and runs the last band on the output card, physical card 0; a bad list is refused naming `topology.pp` and `HIPFIRE_PP_LAYERS`. The generic Qwen3.5/3.6 route (`params.pp`) skips the uniform free-VRAM delta check when it is set. See [multi-gpu.md](multi-gpu.md#band-placement-hipfire_pp_layers). |
 | `HIPFIRE_TOPOLOGY_PP` | Compat env for `topology.pp` (experimental; integer `1..=8`, default `1`): the pipeline degree `hipfire run`, `serve` and `bench` send as the load's `pp`. There is **no load-time `--pp` CLI flag** (`hipfire bench --pp` is the prompt-size list). An explicit `params.pp` above `1` on a daemon load wins and this value is not read; a request of `1` or none uses it. An invalid configured value is refused naming `1..=8` only when it is the value in effect. Flash-Next/Qwen4 admits `2..=8` with `tp = ep = 1` and host-staged edges; generic Qwen3.5/3.6 HFQ uses the same degree over peer memcpys. See [multi-gpu.md](multi-gpu.md#flash-next-pipeline-parallelism-host-staged). |
@@ -882,7 +883,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1765
+**Count:** 1766
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1176,6 +1177,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEMOTE_MQ6` | crates/hipfire-runtime/examples/hfq_splice_attn.rs | harness |
 | `HIPFIRE_DENSE_FIXTURE` | crates/hipfire-arch-muse-glimmer/tests/kv_cap_gpu.rs, crates/hipfire-generate/tests/dense_rollback_gpu.rs | harness |
 | `HIPFIRE_DENSE_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
+| `HIPFIRE_DENSE_TP_ROUTE` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_DERIVED_K_ORACLE_FIXTURE` | crates/hipfire-runtime/tests/support/derived_k_full_log_replay.rs | harness |
 | `HIPFIRE_DETECTED_ARCH` | scripts/_detect-gpu.sh, scripts/test-kernels.sh | harness |
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh | harness |
@@ -2289,10 +2291,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs | developer |
 | `HIPFIRE_RAILGUN_CHECK_OUT` | crates/rdna-compute/src/railgun_check.rs | developer |
 | `HIPFIRE_RAILGUN_DIGEST` | crates/hip-bridge/src/registry.rs, crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs | developer |
-| `HIPFIRE_RAILGUN_INVENTORY` | crates/rdna-compute/src/replay/railgun_shadow.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_INVENTORY` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | crates/rdna-compute/src/railgun_check.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_SHADOW` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/rdna-compute/src/railgun_check.rs | developer |
-| `HIPFIRE_RAILGUN_SHADOW_OUT` | crates/rdna-compute/src/replay/railgun_shadow.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_SHADOW_OUT` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RDNA3` | crates/hipfire-runtime/examples/tmp_halo_iu4_calibrate.rs | harness |
@@ -2621,7 +2623,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_VLLM_CHECKOUT` | crates/hipfire-arch-qwen4/reference_oracle/upstream.py | harness |
 | `HIPFIRE_VL_DUMP_DIR` | benchmarks/vision/dump_qwen35_tower_reference.py, crates/hipfire-arch-qwen35-vl/examples/vl_tower_dump.rs | developer |
 | `HIPFIRE_VL_FILE` | crates/hipfire-arch-embeddinggemma2/examples/vision_parity.rs, crates/hipfire-arch-embeddinggemma2/src/carrier.rs | developer |
-| `HIPFIRE_VL_MAX_PIXELS` | crates/hipfire-arch-qwen35-vl/src/image.rs | developer |
+| `HIPFIRE_VL_MAX_PIXELS` | crates/hipfire-arch-qwen35-vl/src/image.rs, crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs | developer |
 | `HIPFIRE_VL_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/vl_prefill.rs, crates/hipfire-generate/src/vision.rs | developer |
 | `HIPFIRE_VL_SEQUENTIAL` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-runtime/src/scheduler.rs | developer |
 | `HIPFIRE_VMM_ACCESS_DEVICE` | crates/hip-bridge/examples/vmm_arena_smoke.rs | harness |

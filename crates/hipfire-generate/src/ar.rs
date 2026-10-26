@@ -1684,6 +1684,8 @@ pub struct GenerationRouteInputs {
     pub ep: bool,
     /// EP-shaped topology that is actually a dense tensor-parallel trunk
     /// (`EpArch::Qwen35DenseTp`), the one mesh route that carries a drafter.
+    /// The generic mesh-executor route (`EpArch::Qwen35MeshTp`) carries none
+    /// (no MTP/DFlash/n-gram), so it stays `false` and serves on the EP AR arm.
     pub dense_tp: bool,
     pub pp: usize,
     pub has_speculator: bool,
