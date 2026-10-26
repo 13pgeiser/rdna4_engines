@@ -7,7 +7,7 @@ to the native MQ6 capture work in #941. It supplies an explicit reusable
 operator API; automatic model capture integration remains a separate step.
 
 `railgun::mq6::Mq6Facts::from_hit` requires the canonical bundle's actual
-schema-7 A1/G8 receipt from a verified `JitCorpus` lookup. The author derives
+schema-8 A1/G8 receipt from a verified `JitCorpus` lookup. The author derives
 memory effects from those facts through `kernel::author`, then the runtime
 executes the resulting `plan::Pm4Plan` with ROCr's existing PM4 transport.
 No name-based MQ6 `pointer_effects` entry is added to the Redline recorder.
@@ -30,7 +30,7 @@ embedded bundle, extracted device ELF and loaded ABI before preparing an IB.
 - Multiple nodes may form a dependency chain. The program uses conservative
   allocation-wide M1 effects and a private WaitIdle + System cache table for
   all hazards. This does not qualify global gfx1151 cache rows or claim A2
-  span proofs. IF/WHILE from #963 is unnecessary for this straight-line API.
+  span proofs. IF/WHILE is unnecessary for this straight-line API; conditional PM4 operations are explicitly refused before submission.
 - Replay joins the current HIP producer stream, submits the retained planned
   PM4 IB and synchronously waits for terminal completion before returning to
   a HIP consumer. The existing PM4 transport is reused; no Redline recording

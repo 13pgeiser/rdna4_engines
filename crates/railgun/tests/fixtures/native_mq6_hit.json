@@ -26,7 +26,7 @@
     "argv": [],
     "object": "native/gfx1151/qwen4_lane_rows_pm.hxaco",
     "receipt": "receipts/gfx1151/bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963.receipt.json",
-    "receipt_sha256": "c343fa457e16e95a9d76e144dcd31d25d81d66cd1a3b25a3ff3cedf36fa8c285",
+    "receipt_sha256": "944c38d5c8e974992d77f32ea2ee77c3741c3d3dcdd4b936518db27d65cc47e6",
     "kernels": [
       {
         "symbol": "gemv_mq6g256v2_xbatch_pm",
@@ -87,7 +87,7 @@
   },
   "receipt": {
     "schema": "peacemaker-receipt",
-    "schema_version": 7,
+    "schema_version": 8,
     "object_sha256": "bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963",
     "device_elf_sha256": "b0a702507aa5420261ac90742e3665403e47636c24e034918507997bb14c53dc",
     "arch": "gfx1151",
@@ -96,12 +96,12 @@
     "lifter": {
       "name": "peacemaker-lift",
       "crate_version": "0.4.4",
-      "git_sha": "9cb35862c400286067b91ef6b5275c40fb571f4c"
+      "git_sha": "847130e7a1177fdc29105d13d4055464082dddfb"
     },
     "certifier": {
       "name": "railgun-cert",
       "crate_version": "0.4.4",
-      "git_sha": "9cb35862c400286067b91ef6b5275c40fb571f4c"
+      "git_sha": "847130e7a1177fdc29105d13d4055464082dddfb"
     },
     "round_trip_proof_sha256": "f79e477edeb94f34f5c5842dc130926e93ba86b30f282661480c27e86c38745e",
     "kernels": [
@@ -225,7 +225,7 @@
       {
         "id": "railgun-a1",
         "status": "proven",
-        "detail": "11/11 kernels Proven"
+        "detail": "11/11 kernels Proven, 0 Conditional (witness required)"
       },
       {
         "id": "g8-metadata-differential",
@@ -238,7 +238,7 @@
       "InBoundsNoAlias"
     ],
     "railgun": {
-      "section_version": 1,
+      "section_version": 2,
       "analysis": "peacemaker_ir::passes::kernargs (A1/A3/A4)",
       "assumptions": [
         "AddressArithmetic: a pointer is never rebuilt by multiplication, shifting or bit-field extraction of a value loaded from memory",
@@ -514,10 +514,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_mq6g256v2_x4_xbatch_pm",
@@ -1175,10 +1182,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k8_xbatch_pm",
@@ -1505,10 +1519,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k320_xbatch_pm",
@@ -1746,10 +1767,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_mq6g256v2_rows_t8_pm_gfx1151",
@@ -2022,10 +2050,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
@@ -2685,10 +2720,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k8_rows_t8_pm_gfx1151",
@@ -3017,10 +3059,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k320_rows_t8_pm_gfx1151",
@@ -3293,10 +3342,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
@@ -3569,10 +3625,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
@@ -3974,10 +4037,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         },
         {
           "symbol": "gemv_q8_0_wide_rows_t8_pm_gfx1151",
@@ -4250,10 +4320,17 @@
                 "reason": ""
               }
             ],
-            "radiowave_mutable_read_cache": null
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
           },
           "pm_obligations": {},
-          "pm_analyze_error": null
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
         }
       ]
     }
