@@ -168,6 +168,9 @@ output.weight                  rtn        codes=fp8_e4m3 block=128x128 scale=bf1
 blk.*.weight                   rtn        codes=fp8_e4m3 block=128x128 scale=bf16
 ```
 
+A ParoQuant M2XFP4 checkpoint (`quant_method` `paroquant_m2xfp4`) is imported plane by plane: the
+codes, exponents and metadata bytes as shipped, the rotations as the encoding's `givens` tables.
+
 A pattern is a glob over the whole name: `*` crosses dots, `?` is one character. `$NAME` (or
 `${NAME}`) in an option is taken from the environment; an unset variable is refused. `--quant`
 adds rules ahead of the file's:
