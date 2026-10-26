@@ -1150,6 +1150,16 @@ TEST(a_template_that_does_not_parse_is_a_value_and_not_a_throw) {
     CHECK(!t.ready());
 }
 
+/* A template that compiles but cannot render a conversation (here it calls a function the engine
+ * does not have) is refused at load as a value too: the first full render, the thinking probe,
+ * used to throw out of load() and end the process. */
+TEST(a_template_that_cannot_render_is_refused_at_load_and_not_thrown) {
+    ChatTemplate t;
+    CHECK(t.load("{%- for m in messages -%}{{- dict(m, x=1).content -}}{%- endfor -%}", "", "") ==
+          RAD_E_FORMAT);
+    CHECK(!t.ready());
+}
+
 /* Messages come from an HTTP request, so any malformed shape is refused, never thrown. */
 TEST(a_message_list_that_is_not_one_is_refused_rather_than_thrown) {
     ChatTemplate t;
