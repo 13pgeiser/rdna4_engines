@@ -4905,6 +4905,86 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
 }
 
 
+/* --perfwpa N K M [iters] [pb1]: the int4/int5 x int8 tiled GEMM, warmed, with an FNV hash of the
+ * output (the inputs are deterministic, so two builds can be compared bit for bit). */
+static void wpa_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters, int64_t pb1) {
+    for (int bits = 5; bits >= 4; --bits) {
+        const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
+        const PartCut cut(N, pb1, 0);
+        const int parts = cut.parts;
+        const RadKernelInfo* r = find(pl, row);
+        if (!r || !r->layout || !r->relayout) { std::printf("--perfwpa: row %s absent\n", row); return; }
+        const int64_t G = K / 128;
+        const Planes p = asym_planes(bits, N, K, RAD_U8);
+        std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
+        std::vector<uint8_t> wq, ws;
+        if (stored(r, lp, 2, p, { "codes" }, &wq) != RAD_OK || stored(r, lp, 3, p, { "scale", "zero" }, &ws) != RAD_OK) {
+            std::printf("--perfwpa: relayout failed\n"); return;
+        }
+        const int64_t PK = parts * K, PG = parts * G;
+        std::vector<uint8_t> ha((size_t)(M * PK));
+        std::vector<float> as((size_t)(M * PG));
+        for (int64_t i = 0; i < M; ++i) {
+            for (int64_t c = 0; c < PG; ++c)
+                as[(size_t)(i * PG + c)] = 0.002f * (float)(1 + st_mix32((uint32_t)(i * PG + c) ^ 0xa5u) % 97);
+            for (int64_t k = 0; k < PK; ++k)
+                ha[(size_t)(i * PK + k)] = (uint8_t)(int8_t)((int)(st_mix32((uint32_t)(i * PK + k) ^ 0x3cu) % 255u) - 127);
+        }
+        std::vector<uint16_t> hy((size_t)(M * N), 0);
+        void* d_a = dalloc(ha.size());
+        void* d_s = dalloc(as.size() * 4);
+        void* d_w = dalloc(wq.size());
+        void* d_e = dalloc(ws.size());
+        void* d_y = dalloc(hy.size() * 2);
+        if (!d_a || !d_s || !d_w || !d_e || !d_y) { std::printf("--perfwpa: hipMalloc failed\n"); return; }
+        st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(d_a, RAD_I8, { M, PK }), T(d_s, RAD_F32, { M, PG }),
+            T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+            T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(nullptr, RAD_F32, { 1 }),
+        };
+        absent(ts[5]); absent(ts[6]);
+        std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                     PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
+        if (pb1) ps.push_back(PI("pb1", pb1));
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (r->scratch) {
+            const int64_t sb = r->scratch(&a);
+            if (sb > 0) { a.scratch = dalloc((size_t)sb); a.scratch_bytes = sb; }
+        }
+        for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+        uint64_t hash = 1469598103934665603ull;
+        for (uint16_t x : hy) { hash ^= x; hash *= 1099511628211ull; }
+        std::vector<double> us;
+        for (int round = 0; round < 10; ++round) {
+            hipEvent_t e0, e1;
+            st_ev_create(&e0); st_ev_create(&e1);
+            st_ev_record(e0, nullptr);
+            for (int i = 0; i < iters; ++i) r->launch(&a, nullptr);
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0;
+            st_ev_elapsed(&ms, e0, e1);
+            st_ev_destroy(e0); st_ev_destroy(e1);
+            us.push_back((double)ms * 1000.0 / iters);
+        }
+        std::sort(us.begin(), us.end());
+        std::printf("perfwpa w%d N=%lld K=%lld M=%lld pb1=%lld  min %9.1f  med %9.1f us  %6.1f TF/s(min)  hash %016llx\n",
+                    bits, (long long)N, (long long)K, (long long)M, (long long)pb1, us.front(), us[us.size() / 2],
+                    2.0 * M * N * K / (us.front() * 1e6), (unsigned long long)hash);
+    }
+}
+
+
 /* Two decode GEMMs the engine may overlap (gemm_mxfp4a8_decode is a concurrent row: its split
  * partial is the op's scratch and its arrival counters are keyed on the output). Each GEMM has its
  * own operands and a disjoint slice of one scratch allocation, with a split (ks > 1) so the partial
@@ -28678,6 +28758,8 @@ static void usage(void) {
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
                 "             weight bandwidth each reaches.\n"
+                "  --perfwpa N K M [iters] [pb1]:  the int5 and int4 x int8 tiled GEMMs (gemm_w5a8i8_tiled,\n"
+                "             gemm_w4a8i8_tiled), warmed, min / median time and a hash of the output.\n"
                 "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
                 "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
@@ -28792,7 +28874,8 @@ int main(int argc, char** argv) {
     const char* real_file = nullptr;
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
-    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0, perf_mx = 0;
+    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0, perf_mx = 0, perf_wpa = 0;
+    long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
     long long qsa_ctx = 0, qsa_m = 4, dsa_ctx = 0, dsa_m = 6;
@@ -28853,6 +28936,14 @@ int main(int argc, char** argv) {
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfwpa")) {
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_wpa = 1;
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_pb1 = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmxd")) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_mx = 1;
@@ -29261,6 +29352,7 @@ int main(int argc, char** argv) {
 #ifdef RAD_HAVE_HIP
         if (perf_f32)     f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
         else if (perf_q)  q_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
         else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
