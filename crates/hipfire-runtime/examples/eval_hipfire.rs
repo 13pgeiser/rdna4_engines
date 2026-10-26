@@ -1469,7 +1469,7 @@ fn main() {
         // ----- lfm2 11 — WIRED (dense 1.2b/350m, num_experts==0) -----
         // Quant dtypes admitted: dense projections Q8_0/HFQ4G256/MQ4G256 (batch_weight_formats_supported);
         // embeddings Q8/HFQ4; lm_head Q8/HFQ4/MQ4/HFQ6/MQ6/MQ3 (+F32/BF16 teachers).
-        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and forward_batch::batched_proj.
+        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and dispatch's ProjectLadder::Gemm.
         // Uses forward_decode_batch_lfm with explicit positions; KV is q8 and only some layers carry KV
         // (KvCache q8 filtered on is_kv_layer, lane_capacity = n_ctx+16).
         use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
