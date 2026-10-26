@@ -86,6 +86,40 @@ On the latest rebased source (`origin/main` `96bc046` plus this PR):
   was changed. That build does not include the updated CPU plugins, so this smoke is not evidence
   for the CPU fix or a current-main A/B.
 
+### Non-target model dispatch checks (Flash-Next and Qwen3.8-27B)
+
+These graph-only checks used the local artifacts and the ABI-compatible release-plus-PR engine; the
+engine exits after `declare`, before placing or loading model weights. The latest-source engine still
+cannot be built because of the unrelated KV-stream integration gap.
+
+- **Qwen3.8-Flash-Next IQ4R (QFN):** the graph declared 2,054 ops and contained 98
+  `moe_gemm_q` bands at `w4nl64a8h`; all resolved to the existing `libr4d` row
+  `moe_gemm_w4a8`. This shared row is selected for QFN, so its decode geometry was benchmarked below.
+  The new `moe_w4_rows_kernel` is not selected: QFN's W4NL64 format maps to `moe_gemm_launch<2>`,
+  while its dispatch is guarded by `if constexpr (W4 == 1)`. For W4NL64, the modified loader wrapper
+  takes its `W4 != 1` branch and calls the previous `w4_load_w` implementation.
+- **Qwen3.8-27B MXFP4:** the graph declared 1,821 ops, with 329 MXFP4 `gemm_nt_q` bands (plus one
+  W2A8 band); it selected existing `gemm_mxfp4a8_*` rows. It had no `moe_gemm_q`, asymmetric W4 or
+  W5 bands. The PR's new expert-I4/W4/W5 paths are therefore not selected for this model; its
+  MXFP4 rows are unchanged.
+  No benchmark was needed for an untouched path.
+
+For QFN's shared W4NL64 row, `r4d_selftest --perfmoe 1 12 512 10 23 --cold 256` was run three
+times per arm on the same `gfx1201` device. It uses QFN's TP2 rank-0 gate/up and down widths, one
+decode token, 512 experts, top-10 routing, and 23% pooled experts. Baseline is `origin/main`
+`96bc046`; candidate is that base plus this PR. The decode-selected forms had matching output
+hashes and no measurable regression:
+
+| QFN W4NL64 decode projection | Baseline median | PR median | Change |
+| --- | ---: | ---: | ---: |
+| Gate/up, two-K-block decode form | 23.60 us | 23.50 us | -0.4% |
+| Sorted down decode form | 17.10 us | 17.00 us | -0.6% |
+
+This is an op-level microbenchmark with synthetic weights at the exact QFN geometry, not a
+whole-model QFN performance or quality A/B. Logs: `/tmp/pr237-qfn-debug-graph.log`,
+`/tmp/pr237-qfn-moebench-{candidate,baseline}-cold{1,2,3}.log`, and
+`/tmp/pr237-qwen27-debug-graph.log`.
+
 - Release and ASan/UBSan/leak architecture suites, including HYV3 TP1/TP2 graph checks: passed
   before the base advance.
 - `gfx1201` `libr4d`, `r4d_selftest`, and all three HYV3 plugins: compiled.
@@ -117,11 +151,11 @@ Accordingly, no fresh HYV3 or Qwen inference A/B ran.
 The user's local Qwen `.rad` was inspected without downloading anything:
 `/mnt/gostar_data/models/StillDeadcode/qwen3.8-27b-mxfp4/qwen3.8-27b-mxfp4.rad` is a 19.4 GB
 `Qwen3_5ForConditionalGeneration` container with `n_expert=0` and group-32 MXFP4 weights (SHA-256
-`a4908940c568f5f9dd24e88f46aefe9ac2ae07dfec023a2eaa1d14dcaa3df4f8`). It does not exercise this
-PR's asymmetric W4/W5 or per-128 I4 paths; on the release-tag build it was used only as an MXFP4
-compatibility smoke (answered `42`), not as an affected-model A/B. Attempts against the current-main
-candidate exited before model load because that engine could not be built. No model was downloaded
-and no llama-swap route was edited.
+`a4908940c568f5f9dd24e88f46aefe9ac2ae07dfec023a2eaa1d14dcaa3df4f8`). Its graph-only dispatch check
+found only unchanged MXFP4 rows, not this PR's asymmetric W4/W5 or per-128 I4 paths. A prior
+release-tag compatibility smoke answered `42`; neither check is an affected-model A/B. The current-main
+engine still cannot be built because the KV-stream sources are missing. No model was downloaded and
+no llama-swap route was edited.
 
 ### Release-tag plus PR build experiment
 
