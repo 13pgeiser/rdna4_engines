@@ -1674,6 +1674,18 @@ pub enum EpArch {
 }
 
 impl EpArch {
+    /// Whether this EP load's serve loop applies a request's repeat, presence
+    /// and frequency penalties to its logits. The Qwen3.5 loops (dense TP on
+    /// either route, MoE EP) do, over rank 0's logits with the single-GPU host
+    /// arithmetic; DeepSeek4 and MiniMax sample without a penalty stage, so
+    /// the daemon refuses penalties for them.
+    pub fn applies_request_penalties(&self) -> bool {
+        matches!(
+            self,
+            EpArch::Qwen35 { .. } | EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }
+        )
+    }
+
     // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
     pub fn model_dims(&self) -> (usize, usize, usize) {
         match self {

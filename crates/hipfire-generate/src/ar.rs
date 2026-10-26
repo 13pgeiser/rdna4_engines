@@ -2797,6 +2797,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
@@ -2824,6 +2828,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
