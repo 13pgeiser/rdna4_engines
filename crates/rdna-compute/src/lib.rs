@@ -48,6 +48,7 @@ mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
+mod gemv_q8x;
 #[cfg(test)]
 mod gpu_test;
 pub mod graph;
