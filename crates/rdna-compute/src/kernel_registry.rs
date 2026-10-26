@@ -10153,6 +10153,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The head_dim 64 Q8 flash decode tile (HIPF-124).
+        const HD64_FLASH_TILE_ADDED_MODULES: [&str; 1] = ["attention_flash_q8_0_tile_hd64"];
+        for module in HD64_FLASH_TILE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing hd64 flash tile module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10166,7 +10180,8 @@ mod tests {
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
-                + MQ4RS_DECODE_ADDED_MODULES.len(),
+                + MQ4RS_DECODE_ADDED_MODULES.len()
+                + HD64_FLASH_TILE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
