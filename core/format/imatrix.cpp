@@ -384,11 +384,18 @@ bool ImatrixFile::importance(const std::string& name, int64_t expert,
 
 bool ImatrixFile::importance_for(const std::string& weight, int64_t cols,
                                  std::vector<float>* out) const {
+    /* llama.cpp's imatrix names each entry by its tensor, `.weight` and all
+     * (blk.0.attn_q.weight.in_sum2); some writers drop the suffix. Either spelling is found. */
     std::string base = weight;
-    if (base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0)
-        base.resize(base.size() - 7);
+    const bool suffixed = base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0;
+    if (suffixed) base.resize(base.size() - 7);
+    auto look = [&](const std::string& b) -> const ImatrixEntry* {
+        if (const ImatrixEntry* e = find(b)) return e;
+        return suffixed ? find(b + ".weight") : nullptr;
+    };
     int64_t expert = 0;
-    if (!find(base)) {
+    const ImatrixEntry* e = look(base);
+    if (!e) {
         /* `<stem>.<expert>`: the last component must be a plain decimal index. */
         const size_t dot = base.find_last_of('.');
         if (dot == std::string::npos || dot + 1 == base.size()) return false;
@@ -397,10 +404,10 @@ bool ImatrixFile::importance_for(const std::string& weight, int64_t cols,
             expert = expert * 10 + (base[i] - '0');
         }
         base.resize(dot);
+        e = look(base);
     }
-    const ImatrixEntry* e = find(base);
     if (!e || e->cols != cols) return false;
-    return importance(base, expert, out);
+    return importance(e->name, expert, out);
 }
 
 double ImatrixFile::count(const std::string& name, int64_t expert) const {
