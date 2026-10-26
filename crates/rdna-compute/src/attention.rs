@@ -756,12 +756,13 @@ enum VerifyGqaRef {
     Rows(usize),
 }
 
-/// Native-fp8 split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`
-/// (exact gfx1201, H24/KV4/D256). `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8` unset:
-/// on by default at [`FP8_FA2_SPLIT_DEFAULT_SPLITS`] splits, only from
-/// [`FP8_FA2_SPLIT_DEFAULT_MIN_CTX`] context; `0` (or any value outside
-/// `2..=64`) keeps VerifyAttn; `2..=64` picks the split count with no
-/// context floor. Returns `(splits, context floor)`. Read once per process.
+/// `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<splits>` (2..=64): opt-in native-fp8
+/// split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`. Unset,
+/// `0` or out of range keeps VerifyAttn. Read once per process.
+///
+/// Do NOT combine with the verify graph: the launcher binds kernels and grows
+/// scratch at launch, which is illegal under stream capture (no capture-time
+/// admission yet), and the lane-batched CB verify does not take this route.
 fn fp8_fa2_split_verify_route() -> Option<(usize, usize)> {
     static ROUTE: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
         fp8_fa2_split_verify_route_for(
@@ -773,30 +774,15 @@ fn fp8_fa2_split_verify_route() -> Option<(usize, usize)> {
     *ROUTE
 }
 
-/// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value.
+/// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value:
+/// `(splits, context floor)`; unset is off.
 fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<(usize, usize)> {
-    match raw {
-        None => Some((FP8_FA2_SPLIT_DEFAULT_SPLITS, FP8_FA2_SPLIT_DEFAULT_MIN_CTX)),
-        Some(v) => v
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|n| (2..=64).contains(n))
-            .map(|n| (n, 0)),
-    }
+    raw?.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (2..=64).contains(n))
+        .map(|n| (n, 0))
 }
-
-/// Default split count of the fp8 split-KV verifier (R9700, B=8/16, 32K-128K:
-/// S16 is the fastest count; S32/S64 never beat it).
-const FP8_FA2_SPLIT_DEFAULT_SPLITS: usize = 16;
-/// Default-route context floor. Below it the route is byte-identical to
-/// VerifyAttn. R9700 eager B=8 kernel time, VerifyAttn / split: 0.62x at 512
-/// tokens, 0.81x at 1K, 1.07x at 2K, 1.44x at 4K, 1.84x at 8K. The serve A/B
-/// at 3.7-5K contexts (floor 4,096) measured -0.9% with different text, so
-/// the floor sits one step above, where the split is clearly ahead.
-/// `max_ctx_len` is the live context eager and the capture grid under
-/// verify-graph capture.
-const FP8_FA2_SPLIT_DEFAULT_MIN_CTX: usize = 8192;
 
 /// Query rows one group-6 VerifyAttn workgroup serves (compile-time in the
 /// kernel; `VA_ROWS`).
@@ -26089,26 +26075,14 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fp8_fa2_split_verify_route_default_and_overrides() {
-        use super::{
-            fp8_fa2_split_verify_route_for, FP8_FA2_SPLIT_DEFAULT_MIN_CTX,
-            FP8_FA2_SPLIT_DEFAULT_SPLITS,
-        };
-        // Unset: on by default, with the context floor.
-        assert_eq!(
-            fp8_fa2_split_verify_route_for(None),
-            Some((FP8_FA2_SPLIT_DEFAULT_SPLITS, FP8_FA2_SPLIT_DEFAULT_MIN_CTX))
-        );
-        assert_eq!(FP8_FA2_SPLIT_DEFAULT_SPLITS, 16);
-        assert_eq!(FP8_FA2_SPLIT_DEFAULT_MIN_CTX, 8192);
-        // `0`, `1`, out of range and garbage: VerifyAttn.
+    fn fp8_fa2_split_verify_route_is_opt_in() {
+        use super::fp8_fa2_split_verify_route_for as f;
+        assert_eq!(f(None), None);
         for off in ["0", "1", "65", "", "off", "-3", "16x"] {
-            assert_eq!(fp8_fa2_split_verify_route_for(Some(off)), None, "{off:?}");
+            assert_eq!(f(Some(off)), None, "{off:?}");
         }
-        // An explicit split count has no context floor.
-        assert_eq!(fp8_fa2_split_verify_route_for(Some("8")), Some((8, 0)));
-        assert_eq!(fp8_fa2_split_verify_route_for(Some(" 64 ")), Some((64, 0)));
-        assert_eq!(fp8_fa2_split_verify_route_for(Some("2")), Some((2, 0)));
+        assert_eq!(f(Some("8")), Some((8, 0)));
+        assert_eq!(f(Some(" 64 ")), Some((64, 0)));
     }
 
     #[test]
