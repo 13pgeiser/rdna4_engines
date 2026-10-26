@@ -8700,6 +8700,13 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
 
+/// head_dim 64 twin of [`ATTENTION_FLASH_Q8_0_TILE_SRC`]
+/// (`attention_flash_q8_0_tile_hd64`): same ABI and partials, so it pairs with
+/// the shared `attention_flash_q8_0_reduce`. The reference tile only covers
+/// head_dim in multiples of 128.
+pub const ATTENTION_FLASH_Q8_0_TILE_HD64_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_hd64.hip");
+
 /// Flat-BF16 sibling of the Q8_0 flash tile. Same partials layout and same
 /// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
 /// unmodified — that reduce only ever touches f32 partials.
@@ -8920,6 +8927,12 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
 /// `kernels/src`, so the header is prepended and the source's guarded
 /// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+/// Exact-gfx1100 WMMA split-K verify attention over plain Q8_0 KV (H24/KV4/
+/// HD256, 1..=8 rows; default on, `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` off;
+/// see `attention_wmma_verify.rs`): `attention_verify_wmma_q8_qt{1,2,3}_gfx1100`
+/// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
+pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),

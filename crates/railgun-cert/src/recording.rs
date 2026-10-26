@@ -928,6 +928,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "gfx1100-wmma-verify-attn",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "wmma_verify_attn_active: gfx1100_wmma_verify_attn flag (default on, exact gfx1100) && verify_attn && arch == gfx1100 && 1 <= rows <= WMMA_VERIFY_ATTN_MAX_ROWS && n_heads == GQA * n_kv_heads && n_kv_heads == 4 && head_dim == 256 && !is_recording() && !capture_mode; caller checks the Q8_0 KV codec (attention_wmma_verify.rs:94-111)",
+        effect: KernelSelection,
+        switches: "eager: attention_verify_wmma_q8_qt*_gfx1100 split-K + attention_verify_wmma_reduce_gfx1100; recorded/captured: existing verify attention route",
+        kernels: &["attention_verify_wmma_q8_qt*_gfx1100", "attention_verify_wmma_reduce_gfx1100"],
+        verdict: NotEquivalent,
+        evidence: "split-K WMMA, different summation order; PR #989 verify-shaped KLD ON-OFF |d| <= 6e-4, standard pins byte-identical. Recorded windows keep the existing route; reaches no default recorded program",
+        reaches: &[],
+    },
+    Decision {
         id: "widened-prefill-batching",
         predicates: &[IsRecording, CaptureMode],
         condition: "wide_candidate: ordinary whole-stack prefill with no PBS/cap/tree/tape/hidden ring/fusion and `!capture_mode && !recording`; the facts come from `ordinary_call_facts` (`gpu.graphs.capture_mode`, `gpu.replay.is_recording()`) into `OrdinaryCallFacts::wide_candidate` (prefill.rs)",
@@ -2803,6 +2814,12 @@ pub const SITES: &[Site] = &[
         function: "q8x_verify_active",
         occurrences: 2,
         decisions: &["gfx1100-q8x-verify-gemv"],
+    },
+    Site {
+        file: "rdna-compute/src/attention_wmma_verify.rs",
+        function: "wmma_verify_attn_active",
+        occurrences: 2,
+        decisions: &["gfx1100-wmma-verify-attn"],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
