@@ -917,6 +917,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "gfx1100-q8x-verify-gemv",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "q8x_verify_active: gfx1100_q8x_verify flag (default on, exact gfx1100) && arch == gfx1100 && 2 <= batch <= Q8X_MAX_BATCH && k % 256 == 0 && k <= Q8X_MAX_K && !is_recording() && !capture_mode && !fp8_verify_scope (gemv_q8x.rs:192-202)",
+        effect: KernelSelection,
+        switches: "eager: int8-activation small-batch GEMV (quantize activations to Q8 + mq4v2_q8x_*); recorded/captured: base *_mq4g256v2_wmma",
+        kernels: &["mq4v2_q8x_*"],
+        verdict: NotEquivalent,
+        evidence: "int8-quantized activations, numeric not byte-identical (CHANGELOG 0.4.4, PR #987 KLD verify-shaped deltas <= 1e-4). Recorded windows keep the WMMA route; reaches no default recorded program",
+        reaches: &[],
+    },
+    Decision {
         id: "widened-prefill-batching",
         predicates: &[IsRecording, CaptureMode],
         condition: "wide_candidate: ordinary whole-stack prefill with no PBS/cap/tree/tape/hidden ring/fusion and `!capture_mode && !recording`; the facts come from `ordinary_call_facts` (`gpu.graphs.capture_mode`, `gpu.replay.is_recording()`) into `OrdinaryCallFacts::wide_candidate` (prefill.rs)",
@@ -2786,6 +2797,12 @@ pub const SITES: &[Site] = &[
         function: "fp8_f2_row_active",
         occurrences: 2,
         decisions: &["gfx1201-fp8-f2-row-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv_q8x.rs",
+        function: "q8x_verify_active",
+        occurrences: 2,
+        decisions: &["gfx1100-q8x-verify-gemv"],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
