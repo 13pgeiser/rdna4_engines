@@ -4063,6 +4063,7 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
     static const Grid kGrids[] = {
         { "w2a8", RAD_U2, 0, 1 },         { "w4a8_asym", RAD_U4, 0, 1 },
         { "w4a16_asym", RAD_U4, 2, 1 },   { "w4a16_asym", RAD_U4, 2, 2 },
+        { "w4a16_asym", RAD_U4, 3, 1 },   /* BF16 input, oracle is the former F16 cast */
         { "w5a16", RAD_U5, 2, 1 },        { "w5a16", RAD_U5, 2, 3 },
         { "w4a8i8_asym", RAD_U4, 1, 1 },  { "w4a8i8_asym", RAD_U4, 1, 2 },
         { "w5a8i8", RAD_U5, 1, 1 },       { "w5a8i8", RAD_U5, 1, 3 },
@@ -4085,6 +4086,11 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
                 const int64_t k = (r * G + c) % 4;
                 return (float)(k == 0 ? 0 : k == 1 ? top : hint(251, r * G + c, 0, top));
             });
+            if (gd.act == 3) {
+                w.fill(0, [](int64_t, int64_t) { return 1.0f; });
+                w.fill(1, [](int64_t, int64_t) { return 1.0f; });
+                w.fill(2, [](int64_t, int64_t) { return 0.0f; });
+            }
             const int64_t pb1 = P > 1 ? (P == 3 ? 32 : 16) : 0, pb2 = P == 3 ? 64 : 0;
             std::vector<RadParam> p = rp({ { "M", M }, { "N", N }, { "K", K }, { "group", GS } },
                                          { { "dtype", gd.dtype } });
@@ -4100,6 +4106,7 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
             const int64_t AC = P * K;
             /* The activation as the grid means it, for the oracle, and its operands. */
             std::vector<float> af((size_t)(M * AC));
+            std::vector<float> bf_input((size_t)(M * AC));
             std::vector<float> codes((size_t)(M * AC)), sa;
             if (gd.act == 0) {
                 for (int64_t t = 0; t < M * AC; ++t)
@@ -4116,9 +4123,15 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
                 for (int64_t t = 0; t < M * AC; ++t)
                     af[(size_t)t] =
                         codes[(size_t)t] * sa[(size_t)((t / AC) * P * G + (t % AC) / GS)];
-            } else {
+            } else if (gd.act == 2) {
                 for (int64_t t = 0; t < M * AC; ++t)
                     af[(size_t)t] = rad_f16_to_f32(rad_f32_to_f16(hfill(254)(t)));
+            } else {
+                const float edge = std::ldexp(1.0f + 1.0f / 128.0f, -20);
+                const float bf = rad_bf16_to_f32(rad_f32_to_bf16(edge));
+                const float f16 = rad_f16_to_f32(rad_f32_to_f16(bf));
+                std::fill(bf_input.begin(), bf_input.end(), bf);
+                std::fill(af.begin(), af.end(), f16);
             }
             const std::string nm = std::string(gd.dtype) +
                                    (P > 1 ? ", " + std::to_string(P) + " parts" : "") + ", M=" +
@@ -4156,7 +4169,9 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
                 add_joined(h, jdt, { N, K }, j);
                 h.dense(RAD_BF16, { M, N }, zero, true).none().none();
             } else {
-                h.dense(RAD_F16, { M, AC }, [af](int64_t t) { return af[(size_t)t]; }).none();
+                const uint32_t adt = gd.act == 3 ? RAD_BF16 : RAD_F16;
+                const auto& input = gd.act == 3 ? bf_input : af;
+                h.dense(adt, { M, AC }, [input](int64_t t) { return input[(size_t)t]; }).none();
                 h.raw(gd.codes, { N, K }, w.data[0].data());
                 add_joined(h, jdt, { N, K }, j);
                 h.dense(RAD_BF16, { M, N }, zero, true).none().none();
@@ -4171,7 +4186,7 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
             h.oracle = oracle_gemm(af, AC, core_decode(w), M, N, K, [e1, e2, K](int64_t n) {
                 return (n < e1 ? 0 : n < e2 ? 1 : 2) * K;
             });
-            h.oracle_tol = 6e-3;
+            h.oracle_tol = gd.act == 3 ? 1e-7 : 6e-3;
             hs.push_back(std::move(h));
         }
 

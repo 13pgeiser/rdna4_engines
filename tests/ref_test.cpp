@@ -18,6 +18,7 @@
 #include "rad_sample.h"
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
+#include "rad_planes.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1319,6 +1320,52 @@ TEST(bf16_add_matches_explicit_fp32_combine) {
     CHECK_OK(run("cast", r)); CHECK_OK(run("cast", s));
     CHECK_OK(run("add", a)); CHECK_OK(run("cast", c)); CHECK_OK(run("add", f));
     CHECK_EQ(std::memcmp(chain.mem.data(), folded.mem.data(), M * N * 2), 0);
+}
+
+TEST(w4a16_bf16_activation_matches_the_former_explicit_f16_cast) {
+    constexpr int64_t M = 1, N = 16, K = 128;
+    T bf16(RAD_BF16, {M, K}), f16(RAD_F16, {M, K});
+    T codes(RAD_U4, {N, K}), scales(RAD_F16, {N, 1}), zeros(RAD_U8, {N, 1});
+    T out_bf16(RAD_BF16, {M, N}), out_f16(RAD_BF16, {M, N});
+    const float edge = std::ldexp(1.0f + 1.0f / 128.0f, -20);
+    const uint16_t b = f32_to_bf16(edge);
+    const uint16_t f = f32_to_f16(bf16_to_f32(b));
+    for (int64_t k = 0; k < K; ++k) {
+        std::memcpy((uint8_t*)bf16.t.data + k * 2, &b, 2);
+        std::memcpy((uint8_t*)f16.t.data + k * 2, &f, 2);
+    }
+    std::fill(codes.mem.begin(), codes.mem.end(), 0x11); // every u4 code is one
+    scales.f(std::vector<float>((size_t)N, 1.0f));
+    zeros.n(std::vector<int64_t>((size_t)N, 0));
+
+    RadEncoding enc = rad_enc_affine(RAD_U4, RAD_F16, 1, K);
+    rad_enc_add_plane(&enc, "zero", RAD_U8, 1, K);
+    const int selected[] = { 1, 2 };
+    RadTensor planes[] = { scales.t, zeros.t };
+    RadLayout layout{};
+    REQUIRE_EQ(rad_planes_layout(&enc, selected, planes, 2, &layout), RAD_OK);
+    std::vector<uint8_t> joined((size_t)layout.bytes);
+    REQUIRE_EQ(rad_planes_relayout(&enc, selected, planes, 2, joined.data(), layout.bytes), RAD_OK);
+    RadTensor scale_zero{};
+    scale_zero.data = joined.data(); scale_zero.dtype = layout.dtype; scale_zero.rank = 1;
+    scale_zero.shape[0] = layout.bytes; scale_zero.stride[0] = 1;
+
+    const RadKernelInfo* gemm = kern("gemm_nt_q");
+    REQUIRE(gemm && gemm->launch);
+    RadParam params[] = { { "M", RAD_P_INT, M }, { "N", RAD_P_INT, N },
+                          { "K", RAD_P_INT, K }, { "group", RAD_P_INT, K },
+                          { "dtype", RAD_P_STR, 0, 0, "w4a16_asym" } };
+    auto launch = [&](T& activation, T& output) {
+        RadTensor ts[7]{};
+        ts[0] = activation.t; ts[2] = codes.t; ts[3] = scale_zero; ts[4] = output.t;
+        RadArgs args{}; args.t = ts; args.n_t = 7; args.p = params; args.n_p = 5;
+        args.world_size = 1;
+        return gemm->launch(&args, nullptr);
+    };
+    REQUIRE_EQ(launch(f16, out_f16), RAD_OK);
+    REQUIRE_EQ(launch(bf16, out_bf16), RAD_OK);
+    CHECK_EQ(std::memcmp(out_f16.t.data, out_bf16.t.data, (size_t)M * N * 2), 0);
+    CHECK_EQ(*(const uint16_t*)out_bf16.t.data, (uint16_t)0x3900);
 }
 
 /* add's `div` divides the sum after its rounding to y's dtype: 1 + 0.01953125 rounds to bf16
