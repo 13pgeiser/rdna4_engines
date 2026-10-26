@@ -4691,30 +4691,39 @@ static const RadConstraint cGemmNt64[] = {
 static const RadConstraint cGemmNtTiled[] = {
     C_GE("M", 65), C_LE("M", 65536), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
 };
+/* The dense integer kernels take their group from a build constant and read no `group` argument.
+ * A declaration at another group gets no kernel rather than a silent 128. */
 static const RadConstraint cGemmNtW4[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a16"),
 };
 /* w5a16 serves any M: the dispatcher takes rows past 64 as chunks of 64. */
 static const RadConstraint cGemmNtW5[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a16"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w5a16"),
 };
 static const RadConstraint cGemmNtW4Asym[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a16_asym"),
 };
 static const RadConstraint cGemmNtW4A8I8[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8i8_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8i8_asym"),
 };
 static const RadConstraint cGemmNtW5A8I8[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a8i8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w5a8i8"),
 };
 static const RadConstraint cGemmNtW2A8[] = {
-    C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w2a8"),
+    C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_W2_GROUP), C_IN("dtype", "w2a8"),
 };
 static const RadConstraint cGemmNtW8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w8a16"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a16"),
 };
 static const RadConstraint cGemmNtW4A8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8 w4a8_asym"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8 w4a8_asym"),
 };
 static const RadConstraint cGemmNtMxfp4A8[] = {
     C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
@@ -5040,11 +5049,13 @@ static const RadConstraint cDequantW4Bf16[] = {
  * K % (SK*group)). Its MAX_M of 32768 is not structural; as a skinny kernel with a tiled sibling
  * above 64, it takes the w4a8 row's band. */
 static const RadConstraint cGemmNtW8A8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w8a8"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a8"),
 };
 /* r4d_gemm_w4a8_tiled / _asym_tiled. Entry point: N % 256, K % group, M >= 1. */
 static const RadConstraint cGemmW4A8Tiled[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8 w4a8_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8 w4a8_asym"),
 };
 /* r4d_gemm_mxfp4a8_decode. Entry point: M <= 128, N % 16, K % 64, and N up to its counter block's
  * 36864. Above the skinny row by priority, so it takes the decode band; the skinny row keeps the
@@ -5095,13 +5106,15 @@ static const RadConstraint cGemmM2xfp4A8Tiled[] = {
 /* r4d_gemm_w8a8_tiled: the same kernel at radix 8. Its asym arm is not declared in r4d.h, so
  * `w8a8_asym` is absent from the dtype set. */
 static const RadConstraint cGemmW8A8Tiled[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w8a8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a8"),
 };
 /* r4d_gemm_w4a8_prefill. Entry point: N % BN and K % group, BN being the variant's block width
  * (256 except for the two 1024-thread arms). N % 256 is the default's condition; the shim refuses
  * a variant whose BN does not divide N (the per-call half of spec §2.1). */
 static const RadConstraint cGemmW4A8Prefill[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8"),
 };
 
 /* =================================================================================== tunables
