@@ -42,6 +42,7 @@ use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
@@ -2162,7 +2163,7 @@ pub fn ep_serve_ds4(
                 local_emitted_ids.len(),
             );
         }
-        let _ = ds4_apply_cache_action(
+        let _ = apply_turn_cache_action(
             |fp, seq| {
                 if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                     .ok()
@@ -3552,9 +3553,16 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let qwen4_native_mtp = is_qwen4 && spec_name == "mtp";
-    // Qwen4's shared history planner only renders; its native MTP route plans
-    // reuse separately through the session cache. Other Qwen4 speculators are cold.
+    // Qwen4's shared history planner only renders; its speculators plan reuse
+    // separately through the session cache: native MTP on its own route,
+    // DFlash2 (no device head state) on the target-only AR route.
+    let qwen4_session_route = if is_qwen4 && spec_name == "mtp" {
+        Some(SessionRoute::Mtp)
+    } else if is_qwen4 && spec_name == "dflash2" {
+        Some(SessionRoute::Ar)
+    } else {
+        None
+    };
     let cache_disabled = spec_cache_disabled_for(
         is_qwen4,
         !is_qwen4
@@ -3727,19 +3735,26 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
-    // Native Qwen4 MTP plans against the full canonical prompt. A hit is the
+    // Qwen4 speculators plan against the full canonical prompt. A hit is the
     // longest of the live state (this conversation's previous turn) and a
     // cold-exact session snapshot.
-    if qwen4_native_mtp {
+    if let Some(route) = qwen4_session_route {
         // Native MTP never reuses a session under pipeline parallelism (its
         // sessions are not distributed); `plan_qwen4_session` returns 0 for a
-        // mesh on the MTP route.
-        let start = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Mtp);
+        // mesh on the MTP route. DFlash2 never runs on a mesh.
+        let mut start = plan_qwen4_session(m, &prompt_tokens, route);
+        // DFlash2 resumes only where its draft context can restart.
+        if m.speculator
+            .as_ref()
+            .is_some_and(|s| !s.can_resume_at(&prompt_tokens, start))
+        {
+            start = 0;
+        }
         let start_is_live = m
             .qwen4()
-            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, SessionRoute::Mtp, start));
+            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, route, start));
         trace_qwen4_session_plan(
-            SessionRoute::Mtp,
+            route,
             &m.conversation_tokens,
             &prompt_tokens,
             start,
@@ -3994,7 +4009,7 @@ pub fn generate_dflash(
                 // emit_fail_closed_error appends ep.context when !rolled_back.
                 emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, ep);
                 // Fail-closed: no done, no cache, no tool release.
-                let _ = qwen_dflash_apply_cache_action(
+                let _ = apply_turn_cache_action(
                     |_fp, _seq| {},
                     &qwen_dflash_cache_action(&terminal),
                     cached_seq,
@@ -4077,7 +4092,7 @@ pub fn generate_dflash(
                     // Shared AR/spec value contract (`qwen_cached_turn_entry`);
                     // primer stays lookup-side.
                     let tok = m.tokenizer.as_ref().unwrap();
-                    let _ = qwen_dflash_apply_cache_action(
+                    let _ = apply_turn_cache_action(
                         |fp, seq| {
                             let entry = qwen_cached_turn_entry(tok, seq, started_in_think);
                             if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
@@ -7617,40 +7632,20 @@ pub fn qwen_dflash_wire_terminal(
     }
 }
 
-pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> QwenDflashCacheAction {
+pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {
     match terminal {
-        QwenDflashWireTerminal::Malformed { .. } => QwenDflashCacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
+        QwenDflashWireTerminal::Malformed { .. } => TurnCacheAction::skip(),
         QwenDflashWireTerminal::Done {
             store_cache,
             fingerprint_text,
             wire_tool_calls,
             ..
-        } => QwenDflashCacheAction {
+        } => TurnCacheAction {
             store: *store_cache,
             fingerprint_text: fingerprint_text.clone(),
             tool_calls: wire_tool_calls.clone(),
         },
     }
-}
-
-pub fn qwen_dflash_apply_cache_action<F>(
-    mut insert: F,
-    action: &QwenDflashCacheAction,
-    cached_seq: Vec<u32>,
-) -> Option<u64>
-where
-    F: FnMut(u64, Vec<u32>),
-{
-    if !action.store || cached_seq.is_empty() {
-        return None;
-    }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
-    Some(fp)
 }
 
 /// The one `asst_turn_cache` value contract for an emitted Qwen assistant turn,
@@ -8557,14 +8552,6 @@ pub struct QwenClientCommitEffects {
     pub emit_done: bool,
 }
 
-/// Cache-store action for Qwen DFlash — production and tests share this seam.
-#[derive(Debug, Clone)]
-pub struct QwenDflashCacheAction {
-    pub store: bool,
-    pub fingerprint_text: String,
-    pub tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-}
-
 /// Host-side bookkeeping after one SpecStep is consumed by the semantic loop.
 ///
 /// `consumed` is the number of step.emit tokens the emitter actually observed
@@ -8930,7 +8917,8 @@ mod ep_serve_target_tests {
 #[cfg(test)]
 mod qwen_lookup_primer_tests {
     use super::qwen_jinja_lookup_turn;
-    use crate::common::{asst_turn_fingerprint, normalize_asst_turn_for_fingerprint};
+    use crate::common::normalize_asst_turn_for_fingerprint;
+    use hipfire_engine::turn_cache::asst_turn_fingerprint;
     use hipfire_loader::AsstTurnCache;
 
     fn assistant_msg(content: &str) -> hipfire_runtime::prompt_frame::Message {
@@ -9023,13 +9011,11 @@ mod qwen_lookup_primer_tests {
 #[cfg(test)]
 mod qwen_history_chain_tests {
     use super::{
-        qwen_cached_turn_entry, qwen_dflash_apply_cache_action, qwen_dflash_cache_action,
-        qwen_dflash_cache_seq, qwen_dflash_wire_terminal, qwen_jinja_cached_history_tokens,
-        qwen_jinja_lookup_turn,
+        qwen_cached_turn_entry, qwen_dflash_cache_action, qwen_dflash_cache_seq,
+        qwen_dflash_wire_terminal, qwen_jinja_cached_history_tokens, qwen_jinja_lookup_turn,
     };
-    use crate::ar::{
-        qwen_ar_apply_cache_action, qwen_ar_cache_action, QwenArRouteFinish, QwenArTerminalCause,
-    };
+    use crate::ar::{qwen_ar_cache_action, QwenArRouteFinish, QwenArTerminalCause};
+    use hipfire_engine::turn_cache::{apply_turn_cache_action, asst_turn_fingerprint};
     use hipfire_loader::AsstTurnCache;
     use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
     use hipfire_runtime::spec::FinishSummary;
@@ -9342,7 +9328,7 @@ mod qwen_history_chain_tests {
                     ..FinishSummary::default()
                 };
                 let terminal = qwen_dflash_wire_terminal(&finish, false, false, visible, false);
-                qwen_dflash_apply_cache_action(
+                apply_turn_cache_action(
                     &mut insert,
                     &qwen_dflash_cache_action(&terminal),
                     cached_seq,
@@ -9356,7 +9342,7 @@ mod qwen_history_chain_tests {
                     trailing_visible: Vec::new(),
                     cause: QwenArTerminalCause::DecodedEot,
                 };
-                qwen_ar_apply_cache_action(
+                apply_turn_cache_action(
                     &mut insert,
                     &qwen_ar_cache_action(&finish, visible),
                     cached_seq,
@@ -9522,7 +9508,7 @@ mod qwen_history_chain_tests {
         let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
         let mut cache = AsstTurnCache::new_from_env();
         cache.insert(
-            crate::common::asst_turn_fingerprint(
+            asst_turn_fingerprint(
                 &crate::common::normalize_asst_turn_for_fingerprint(prose),
                 &[call("read_file", "he.txt")],
             ),
@@ -9757,7 +9743,7 @@ mod qwen_history_chain_tests {
                     super::qwen_dflash_visible_from_finish(&finish)
                 };
                 let terminal = qwen_dflash_wire_terminal(&finish, length, false, &visible, false);
-                let stored = qwen_dflash_apply_cache_action(
+                let stored = apply_turn_cache_action(
                     &mut insert,
                     &qwen_dflash_cache_action(&terminal),
                     qwen_dflash_cache_seq(&streamed, Some(IM_END), &nl),
@@ -9801,7 +9787,7 @@ mod qwen_history_chain_tests {
                     },
                     "AR terminal cause"
                 );
-                let stored = qwen_ar_apply_cache_action(
+                let stored = apply_turn_cache_action(
                     &mut insert,
                     &qwen_ar_cache_action(&finish, &visible),
                     qwen_dflash_cache_seq(&streamed, Some(IM_END), &nl),
@@ -11135,6 +11121,32 @@ fn spec_prefill(
     abort: &dyn Fn() -> bool,
 ) -> Result<PrefillOutcome, String> {
     let Some(gpus) = pp else {
+        // Qwen4 DFlash2 prefills inside an AR-route session turn: the begin
+        // restores the planned prefix (or cold-starts) and arms the snapshot
+        // boundaries `spec_advance` publishes, so the speculator continues
+        // the target in place rather than resetting it (which would drop the
+        // turn).
+        if spec.name() == "dflash2" {
+            if let Some(bundle) = slot
+                .as_any_mut()
+                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            {
+                let start = if cache_hit { prefill_start } else { 0 };
+                bundle
+                    .session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)
+                    .map_err(|e| e.to_string())?;
+                return spec.prefill(
+                    gpu,
+                    slot,
+                    prompt_tokens,
+                    &prompt_tokens[start..],
+                    start,
+                    true,
+                    None,
+                    abort,
+                );
+            }
+        }
         return spec.prefill(
             gpu,
             slot,
