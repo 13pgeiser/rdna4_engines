@@ -928,6 +928,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "gfx1201-fp8-fa2-split-verify",
+        predicates: &[IsRecording],
+        condition: "fp8_fa2_split_verify_route() (HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<2..=64>, default unset = off) && gfx1201 && H24/KV4/D256 && no tree bias && block_cols == 0 && 2 <= batch <= 32 && !is_recording() && partials large enough (attention.rs attention_flash_fp8_e4m3_tile_batched)",
+        effect: KernelSelection,
+        switches: "eager opt-in: native-fp8 split-KV FA2 verifier; recorded / default: VerifyAttn and the existing tile routes",
+        kernels: &["attention_fp8_e4m3_fa2_gqa_*_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "f16 Q/K/V/P operands, not byte-identical to VerifyAttn. Opt-in developer env (default off since 7d13089534); recorded windows keep VerifyAttn; reaches no default recorded program",
+        reaches: &[],
+    },
+    Decision {
         id: "gfx1100-wmma-verify-attn",
         predicates: &[IsRecording, CaptureMode],
         condition: "wmma_verify_attn_active: gfx1100_wmma_verify_attn flag (default on, exact gfx1100) && verify_attn && arch == gfx1100 && 1 <= rows <= WMMA_VERIFY_ATTN_MAX_ROWS && n_heads == GQA * n_kv_heads && n_kv_heads == 4 && head_dim == 256 && !is_recording() && !capture_mode; caller checks the Q8_0 KV codec (attention_wmma_verify.rs:94-111)",
@@ -2814,6 +2825,12 @@ pub const SITES: &[Site] = &[
         function: "q8x_verify_active",
         occurrences: 2,
         decisions: &["gfx1100-q8x-verify-gemv"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fp8_e4m3_tile_batched",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
     },
     Site {
         file: "rdna-compute/src/attention_wmma_verify.rs",
