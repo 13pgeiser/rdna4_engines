@@ -1595,6 +1595,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_reduce_gfx1100"
             ]
         );
+        // Default-on WMMA split-K verify attention (`attention_wmma_verify.rs`).
+        add!(
+            "attention_verify_wmma_gfx1100",
+            kernels::ATTENTION_VERIFY_WMMA_GFX1100_SRC,
+            [
+                "attention_verify_wmma_q8_qt1_gfx1100",
+                "attention_verify_wmma_q8_qt2_gfx1100",
+                "attention_verify_wmma_q8_qt3_gfx1100",
+                "attention_verify_wmma_reduce_gfx1100"
+            ]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,

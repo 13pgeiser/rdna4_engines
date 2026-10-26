@@ -2093,6 +2093,30 @@ pub fn batch_chunk_fa_attend(
                 n,
             )?;
         }
+        // Exact-gfx1100 WMMA split-K verify attention (default on;
+        // `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` keeps the routes below). Plain
+        // Q8 K and V only; the launcher declines (Ok(false)) outside 1..=8
+        // rows / H24-KV4-HD256, under capture or recording, or when
+        // `flash_partials` is too small.
+        if kv_cache.quant_q8
+            && kv_cache.v_q8
+            && !kv_cache.quant_fp8
+            && gpu.attention_verify_wmma_q8_gfx1100(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                start_pos + n,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
+        }
         // Experimental gfx1201 verifier arm: retain the FA2 packed-Q8/LDS
         // front end, split the live KV tile range to restore occupancy at
         // small verifier batches, then combine CK-style LSE/Oacc partials.

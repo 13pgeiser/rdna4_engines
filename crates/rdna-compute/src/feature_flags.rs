@@ -586,6 +586,15 @@ pub struct FeatureFlags {
     /// inside its existing VMM-KV admission envelope. This switch and the
     /// stable [`Self::verify_attn`] parent are independent opt-outs.
     pub gfx1100_fa2_split_verify: bool,
+    /// `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` routes the exact-gfx1100 admitted
+    /// multi-row Q8 verify attention (1..=8 rows, H24/KV4/HD256, plain Q8 K
+    /// and V) to the WMMA split-K kernel (`attention_wmma_verify.rs`) ahead of
+    /// the FA2 split-KV verifier / VerifyAttn rows twin / R4-R8 tile. Eager
+    /// only (capture/recording keep those routes). Not byte-identical (f16
+    /// WMMA operands, KLD-gated). Default on for exact gfx1100, false
+    /// elsewhere; `=0` restores the incumbent routes. The [`Self::verify_attn`]
+    /// parent opts out too.
+    pub gfx1100_wmma_verify_attn: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
     pub gfx12_fa_prep_fused: bool,
@@ -1287,6 +1296,8 @@ impl FeatureFlags {
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
             gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
                 .unwrap_or(arch == "gfx1100"),
+            gfx1100_wmma_verify_attn: parse_bool("HIPFIRE_GFX1100_WMMA_VERIFY_ATTN")
+                .unwrap_or(arch == "gfx1100"),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -1904,6 +1915,7 @@ impl FeatureFlags {
             attn_qresident_v2: false,
             verify_attn: false,
             gfx1100_fa2_split_verify: false,
+            gfx1100_wmma_verify_attn: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
             gfx11_q8_fa2_wide: false,
