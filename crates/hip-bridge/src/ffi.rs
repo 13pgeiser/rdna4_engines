@@ -59,17 +59,18 @@ fn dladdr_fname(ptr: *const c_void) -> Option<String> {
 mod win32 {
     use std::ffi::c_void;
 
-    pub const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
-    pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
 
     #[link(name = "kernel32")]
     extern "system" {
-        pub fn GetModuleHandleExW(
+        pub(super) fn GetModuleHandleExW(
             flags: u32,
             module_name_or_address: *const u16,
             module: *mut *mut c_void,
         ) -> i32;
-        pub fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+        pub(super) fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32)
+            -> u32;
     }
 }
 
