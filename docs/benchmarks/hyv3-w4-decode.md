@@ -165,13 +165,14 @@ was loaded separately on each card, with no other Radiance process using either 
 | PCI `0000:06:00.0`, UUID `GPU-048200e09844fd51` | 118.380 | 8,077.674 | `caca914b...` |
 | PCI `0000:0f:00.0`, UUID `GPU-7f082536d27449f3` | 109.834 | 8,011.282 | `caca914b...` |
 
-The same candidate was **7.2% slower on the designated PCI `0f:00.0` card**. The older 115.678
-tok/s untuned run was on PCI `06:00.0`, so the earlier 115-versus-109 comparison was confounded by
-card/operating-point differences, not evidence that splitting the branch caused a regression.
-This isolates a material card-dependent decode difference; it does **not** identify whether power
-limit, clocks, thermals, or silicon variation caused it. Per-run power/clock telemetry was not
-captured, and PCIe bandwidth is not established as the cause. Raw-request repeats that reused
-10,000 cached prompt tokens are retained separately and excluded from this comparison.
+The same candidate was **7.2% slower on the designated PCI `0f:00.0` card**. A fresh confirmation
+on that card measured **110.311 tok/s**, within 0.44% of the initial 109.834 tok/s result. The older
+115.678 tok/s untuned run was on PCI `06:00.0`, so the earlier 115-versus-109 comparison was
+confounded by card/operating-point differences, not evidence that splitting the branch caused a
+regression. This isolates a material card-dependent decode difference; it does **not** identify
+whether power limit, clocks, thermals, or silicon variation caused it. Per-run power/clock
+telemetry was not captured, and PCIe bandwidth is not established as the cause. Raw-request repeats
+that reused 10,000 cached prompt tokens are retained separately and excluded from this comparison.
 
 Additional compatibility smokes using the same candidate build passed for the local Qwen4Exp W5
 container (returned `42`; prompt-lookup drafted 6 tokens and accepted 1), Qwen Flash-Next IQ4R
