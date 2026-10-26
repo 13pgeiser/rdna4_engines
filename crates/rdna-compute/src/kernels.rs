@@ -8847,6 +8847,12 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
 /// `kernels/src`, so the header is prepended and the source's guarded
 /// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+/// Exact-gfx1100 WMMA split-K verify attention over plain Q8_0 KV (H24/KV4/
+/// HD256, 1..=8 rows; default on, `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` off;
+/// see `attention_wmma_verify.rs`): `attention_verify_wmma_q8_qt{1,2,3}_gfx1100`
+/// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
+pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),

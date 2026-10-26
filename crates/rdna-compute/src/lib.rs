@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod attention_wmma_verify;
 pub mod byte_arena;
 pub mod cdna;
 pub mod code_object;
