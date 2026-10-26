@@ -688,6 +688,17 @@ const fn reach(program: Program, domain: &'static str, seen_by: &'static str) ->
 
 pub const DECISIONS: &[Decision] = &[
     Decision {
+        id: "mq6-explicit-railgun-refusal",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "rdna-compute mq6_railgun::check_gpu rejects Redline recording, G0 observation and HIP graph capture before preparing or replaying an explicit fixed-binding MQ6 program; an active stream capture is also refused",
+        effect: Refusal,
+        switches: "error before authoring/submission; the explicit railgun API never becomes a node of an enclosing recorder or captured graph",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branches submit no work. This API owns its independent certified program and PM4 transport; model dispatch, Redline recording/default admission and name-based pointer effects are unchanged",
+        reaches: &[],
+    },
+    Decision {
         id: "launch-funnel-blob-path",
         predicates: &[IsRecording, CaptureMode],
         condition: "`record || capture_mode || force_blob_path` in Gpu::launch_maybe_blob_bound (dispatch.rs:2416-2522) and scratch::launch_maybe_blob (scratch.rs:356-431); `use_blob_path` (scratch.rs:457); the recorder's own `if !is_recording() return` (replay.rs:6107, 6186)",
@@ -1656,6 +1667,12 @@ pub const DECISIONS: &[Decision] = &[
     },
 ];
 pub const SITES: &[Site] = &[
+    Site {
+        file: "rdna-compute/src/mq6_railgun.rs",
+        function: "check_gpu",
+        occurrences: 3,
+        decisions: &["mq6-explicit-railgun-refusal"],
+    },
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
         function: "compressor_op",
