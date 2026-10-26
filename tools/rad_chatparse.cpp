@@ -30,7 +30,11 @@
  * chunk JSON, and the tool-call grammar's accept_token / fill_mask), with every SSE event checked
  * against nlohmann's serialisation.
  *
- * Exit status is non-zero when any reply breaks the contract or a verdict is not allowed. */
+ * Exit status is non-zero when any reply breaks the contract or a verdict is not allowed.
+ *
+ * With --request or --render-raw it instead renders one request and reads its replies the way the
+ * server does, against a container's vocabulary and its plugin's reply format
+ * (chatparse_serve.cpp). */
 #include "chatdiff.h"
 #include "iface.h"
 #include "sample/grammar.h"
@@ -525,7 +529,12 @@ int breakdown(const Bench& b, const Tok& tk, const TokenView& view, int reps) {
 
 }  /* namespace */
 
+int serve_main(int argc, char** argv);   /* chatparse_serve.cpp */
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "--request") || !std::strcmp(argv[i], "--render-raw"))
+            return serve_main(argc, argv);
     std::vector<std::pair<std::string, std::string>> want;   /* model name, folder */
     int fuzz = 300;
     int reps = 5;
