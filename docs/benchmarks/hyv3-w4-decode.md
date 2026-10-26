@@ -153,6 +153,26 @@ Quality comparisons on the same two builds:
   **112/113** execution successes, and zero API errors on both arms. This is a curated subset, not
   broad capability evidence.
 
+#### Same-build cross-card diagnostic
+
+At the user's request, I reran the same candidate executable, `.rad` artifact, launch flags, and
+three 2,000-token repetitions on two individual R9700s. The frozen 10,030-token benchmark used the
+same per-repetition prefix scheme on both cards; no launch tune or drafter was enabled. The model
+was loaded separately on each card, with no other Radiance process using either device.
+
+| Device | Median decode tok/s | Median prefill tok/s | Answer SHA-256 |
+| --- | ---: | ---: | --- |
+| PCI `0000:06:00.0`, UUID `GPU-048200e09844fd51` | 118.380 | 8,077.674 | `caca914b...` |
+| PCI `0000:0f:00.0`, UUID `GPU-7f082536d27449f3` | 109.834 | 8,011.282 | `caca914b...` |
+
+The same candidate was **7.2% slower on the designated PCI `0f:00.0` card**. The older 115.678
+tok/s untuned run was on PCI `06:00.0`, so the earlier 115-versus-109 comparison was confounded by
+card/operating-point differences, not evidence that splitting the branch caused a regression.
+This isolates a material card-dependent decode difference; it does **not** identify whether power
+limit, clocks, thermals, or silicon variation caused it. Per-run power/clock telemetry was not
+captured, and PCIe bandwidth is not established as the cause. Raw-request repeats that reused
+10,000 cached prompt tokens are retained separately and excluded from this comparison.
+
 Additional compatibility smokes using the same candidate build passed for the local Qwen4Exp W5
 container (returned `42`; prompt-lookup drafted 6 tokens and accepted 1), Qwen Flash-Next IQ4R
 (TP1 and TP2 launchers, answered `42`), Qwen3.8 27B MXFP4 (answered `42`), Breeze-TTS-2 (valid
