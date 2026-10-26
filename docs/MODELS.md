@@ -240,15 +240,17 @@ prefill with A4 activations). Measured on hipfire ff859c360 with the q4 rows
 `bf16src-wt2-c512x32`, code24 `fn-bf16-code24-24x512.v3`). The matched
 reference is the MQ4 XTS monolith with its `.trunk-overlay`, which gives it
 the same QT44 linear-attention trunk as the MQ3 base, so the difference is
-the W3 experts alone. Prefill (all-row) KLD: WT2 0.1073 → 0.1369 (+0.030,
-95% chunk bootstrap [+0.021, +0.038]); code24 0.1075 → 0.1393 (+0.032
-[+0.021, +0.043]). Decode (`--decode`, 8 chunks): WT2 0.0750 → 0.1150; code24
-0.0754 → 0.1358. The overlay alone moves the plain monolith by at most
-+0.007. Tool calls (12 cases) and reasoning answers (18 problems, up to 6.3K
-reasoning tokens) passed with every one of seeds 1–3 on both models; the
-reasoning length is the same (mean 844 vs 931 tokens on the long set).
-Decode throughput: greedy 34.3 vs 33.8 tok/s, but sampled (T=1, top-k 20)
-30.0 vs 32.1 tok/s. The K1 slab GEMV matches its CPU twin byte for byte on
+the W3 experts alone. Prefill (all-row) KLD, MQ4 → W3: WT2 0.1073 → 0.1369
+(+0.030, 95% chunk bootstrap [+0.021, +0.038]); code24 0.1075 → 0.1393 (+0.032
+[+0.021, +0.043]). Decode (`--decode`, 8 chunks), MQ4 → W3: WT2 0.0750 →
+0.1150; code24 0.0754 → 0.1358. The overlay alone moves the plain monolith's
+code24 prefill KLD by +0.0072 (95% t [+0.0001, +0.0143]). Tool calls (12
+cases) and reasoning answers (18 problems, up to 6.3K reasoning tokens) passed
+with every one of seeds 1–3 on both models; reasoning length shows no
+detectable difference on the long set (10 problems × 3 seeds; mean W3 844 vs
+MQ4 931 tokens, W3/MQ4 ratio 0.91, 95% CI 0.75–1.17). Decode throughput:
+greedy W3 34.3 vs MQ4 33.8 tok/s, but sampled (T=1, top-k 20, top-p 0.95) W3
+30.0 vs MQ4 32.1 tok/s. The K1 slab GEMV matches its CPU twin byte for byte on
 real layers 0, 31 and 47 and over every wide R=1–8 slab cell, with C1 on and off.
 
 **MQ2 XTS tier (split bases).** `qwen3.8:flash-next-mq2-xts`
