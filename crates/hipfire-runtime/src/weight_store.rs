@@ -1278,9 +1278,10 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     let k_alignment = match dtype {
         DType::MQ4G256V2 => 256usize,
         DType::MQ4G128V2 => 1,
-        // Matrix rows only; other ranks are packed flat. The MQ4 FWHT
-        // rotation spans whole 256-element groups of a row.
-        DType::MQ4G256 if shape.len() >= 2 => 256,
+        // `[rows, K]` matrices only: the MQ4 FWHT rotation spans whole
+        // 256-element groups of a row. Higher ranks are packed flat, e.g. the
+        // GDN conv1d `[C, 1, 4]` (K = 4) in A3B mq4r files.
+        DType::MQ4G256 if shape.len() == 2 => 256,
         // A `[rows, K]` HFQ4G128 matrix pads each row to whole groups. Files
         // quantized before `b4846285e` packed groups across rows when
         // `K % 128 != 0`; per-row kernels read past such a buffer. A conv1d
@@ -4277,6 +4278,12 @@ mod tests {
         assert!(validate_payload_extent(&[960, 960], DType::HFQ4G128, 960 * 540).is_err());
         assert!(expected_payload_bytes(&[960, 2560], DType::MQ4G256).is_ok());
         assert!(expected_payload_bytes(&[2560, 960], DType::MQ4G256).is_err());
+        // The GDN conv1d in `qwen3.6:35b-a3b-mq4r` is a flat-packed MQ4G256
+        // `[8192, 1, 4]`; it must keep loading.
+        assert_eq!(
+            expected_payload_bytes(&[8192, 1, 4], DType::MQ4G256).unwrap(),
+            None
+        );
         // A flat-packed conv1d `[C, 1, 4]` has no row-padded extent.
         assert_eq!(
             expected_payload_bytes(&[64, 1, 4], DType::HFQ4G128).unwrap(),
