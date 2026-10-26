@@ -163,8 +163,8 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         for (const std::string* s : { &f.section_open, &f.section_close, &f.call_separator,
                                       &f.call_open, &f.call_close, &f.name_suffix, &f.call_end,
                                       &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
-                                      &f.arg_value_suffix, &f.object_string_open,
-                                      &f.object_string_close })
+                                      &f.arg_json_value_prefix, &f.arg_value_suffix,
+                                      &f.object_string_open, &f.object_string_close })
             if (!s->empty()) return no("tool-call delimiters are set but name_prefix is empty");
         if (f.object_args() || f.object_bare_keys)
             return no("an argument object is described but name_prefix is empty");
@@ -235,9 +235,24 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
             f.object_bare_keys)
             return no("the object_* fields describe an argument object, and args_form is "
                       "RAD_CHAT_ARGS_TAGGED");
+        if (f.typed_tags()) {
+            /* The two tags are told apart where the name ends: one may not begin the other. */
+            if (f.arg_value_prefix.empty())
+                return no("arg_json_value_prefix is set and arg_value_prefix, the string tag, is "
+                          "empty");
+            const std::string s = f.arg_name_suffix + f.arg_value_prefix;
+            const std::string j = f.arg_name_suffix + f.arg_json_value_prefix;
+            if (confusable(s, j))
+                return no("arg_value_prefix " + show(f.arg_value_prefix) +
+                          " and arg_json_value_prefix " + show(f.arg_json_value_prefix) +
+                          " cannot be told apart");
+            if (f.other_value != ChatValue::Json)
+                return no("arg_json_value_prefix opens a JSON value, and other_value is not "
+                          "RAD_CHAT_VALUE_JSON");
+        }
     } else {
         for (const std::string* s : { &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
-                                      &f.arg_value_suffix })
+                                      &f.arg_json_value_prefix, &f.arg_value_suffix })
             if (!s->empty())
                 return no("the arg_* fields describe tagged arguments, and args_form is "
                           "RAD_CHAT_ARGS_OBJECT");
@@ -337,6 +352,7 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.object_string_close = s(c.object_string_close);
     f.object_bare_keys    = c.object_bare_keys != 0;
     f.reasoning_anywhere  = c.reasoning_anywhere != 0;
+    f.arg_json_value_prefix = s(c.arg_json_value_prefix);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -464,6 +480,7 @@ std::string chat_format_describe(const ChatFormat& f) {
     } else if (f.has_tools()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " " + show(f.arg_prefix) + "ARG" + show(f.arg_name_suffix) + show(f.arg_value_prefix) +
+             (f.typed_tags() ? "|" + show(f.arg_json_value_prefix) : std::string()) +
              "VALUE" + show(f.arg_value_suffix) + " " + show(f.call_end) + show(f.call_close);
     }
     if (f.has_tools()) {
@@ -484,8 +501,9 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
     for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.section_open,
                                   &f.section_close, &f.call_open, &f.call_close, &f.name_prefix,
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
-                                  &f.arg_value_prefix, &f.arg_value_suffix,
-                                  &f.object_string_open, &f.object_string_close }) {
+                                  &f.arg_value_prefix, &f.arg_json_value_prefix,
+                                  &f.arg_value_suffix, &f.object_string_open,
+                                  &f.object_string_close }) {
         const std::string t = trim_ws(*s);
         if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
     }
@@ -878,6 +896,9 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                      * refused there by name. */
                     if (!required.count(pname) && info.unsatisfiable(pschema)) continue;
                     G value;
+                    /* A format whose tag types the value writes the JSON tag before a JSON
+                     * value; the string tag otherwise. */
+                    const std::string* vprefix = &f.arg_value_prefix;
                     if (f.other_value != ChatValue::Json || info.resolves_to_string(pschema)) {
                         value = wrap(rule_ref("until-suffix"));
                     } else {
@@ -885,10 +906,11 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                         const std::string sch = b.add_schema(
                             "tool-" + name + "-arg-" + pname + "-schema", pschema);
                         value = alt({ seq({ wrap(leaf(sch)), space() }), wrap(rule_ref("until-suffix")) });
+                        if (f.typed_tags()) vprefix = &f.arg_json_value_prefix;
                     }
                     G arm = wrap(seq({ wrap(seq({ lit(f.arg_prefix), wrap(lit(pname)),
                                                   lit(f.arg_name_suffix) })),
-                                       lit(f.arg_value_prefix), value,
+                                       lit(*vprefix), value,
                                        wrap(lit(f.arg_value_suffix)) }));
                     const std::string rule = rule_name("tool-" + name + "-arg-" + pname);
                     b.add_rule(rule, render(arm));
@@ -899,10 +921,13 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 /* The generic arm for an undeclared name; not emitted for a tool that declares
                  * no parameters, since it takes no arguments. */
                 if (!any.empty()) {
+                    G tag = f.typed_tags() ? alt({ lit(f.arg_value_prefix),
+                                                   lit(f.arg_json_value_prefix) })
+                                           : lit(f.arg_value_prefix);
                     G arm = wrap(seq({ wrap(seq({ lit(f.arg_prefix),
                                                   wrap(leaf(until_pattern({ name_end }))),
                                                   lit(f.arg_name_suffix) })),
-                                       lit(f.arg_value_prefix), wrap(rule_ref("until-suffix")),
+                                       tag, wrap(rule_ref("until-suffix")),
                                        wrap(lit(f.arg_value_suffix)) }));
                     const std::string rule = rule_name("tool-" + name + "-arg-undeclared");
                     b.add_rule(rule, render(arm));

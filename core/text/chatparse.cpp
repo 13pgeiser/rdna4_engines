@@ -729,12 +729,14 @@ struct ReplyFormat::Impl {
     size_t section_open_hit = (size_t)-1, section_close_hit = (size_t)-1;
     size_t think_open_hit = (size_t)-1, think_close_hit = (size_t)-1;
     size_t body_section_close_hit = (size_t)-1;
-    /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. */
-    std::string name_end;
-    /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so it was
+    /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. With
+     * typed tags (arg_json_value_prefix) also `name_end_json`, which opens a JSON value; the
+     * arg_name automata report it as pattern 1. */
+    std::string name_end, name_end_json;
+    /* The same, whitespace-trimmed. A loose call is one the grammar never opened, so it was
      * written unconstrained; its argument tags, like its name and close, are read with their
      * surrounding whitespace optional. */
-    std::string name_end_core, value_core;
+    std::string name_end_core, name_end_json_core, value_core;
     /* call_close's core, when distinct from what else may follow inside a call, so a wrapped
      * call missing its own close is ended by its wrapper's. */
     std::string cc_core;
@@ -806,6 +808,7 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.text_markers.push_back(m.section_close_core);
     }
     m.name_end = f.arg_name_suffix + f.arg_value_prefix;
+    if (f.typed_tags()) m.name_end_json = f.arg_name_suffix + f.arg_json_value_prefix;
     m.object = f.has_tools() && f.object_args();
     m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
     if (m.object && f.name_suffix.empty()) {
@@ -866,12 +869,18 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.obj_key.build(key);
     } else if (f.has_tools()) {
         m.text.build(m.text_markers);
-        m.arg_name.build({ m.name_end });
-        m.value.build({ f.arg_value_suffix });
         std::string trail;
         split_ws(m.name_end, &m.name_end_core, &trail);
+        split_ws(m.name_end_json, &m.name_end_json_core, &trail);
         split_ws(f.arg_value_suffix, &m.value_core, &trail);
-        m.arg_name_loose.build({ m.name_end_core });
+        if (f.typed_tags()) {
+            m.arg_name.build({ m.name_end, m.name_end_json });
+            m.arg_name_loose.build({ m.name_end_core, m.name_end_json_core });
+        } else {
+            m.arg_name.build({ m.name_end });
+            m.arg_name_loose.build({ m.name_end_core });
+        }
+        m.value.build({ f.arg_value_suffix });
         m.value_loose.build({ m.value_core });
         split_ws(f.call_close, &m.cc_core, &trail);
         auto apart = [](const std::string& a, const std::string& b) {
@@ -890,7 +899,8 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
                                           &f.section_close, &f.call_open, &f.call_close,
                                           &f.name_prefix, &f.name_suffix,
                                           &f.call_end, &f.arg_prefix, &m.name_end,
-                                          &f.arg_value_suffix, &f.object_string_open,
+                                          &m.name_end_json, &f.arg_value_suffix,
+                                          &f.object_string_open,
                                           &f.object_string_close };
     for (const std::string* s : delims) m.longest = std::max(m.longest, s->size());
     for (const std::string& s : f.reasoning_breaks) m.longest = std::max(m.longest, s.size());
@@ -991,12 +1001,15 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
                 /* A name its own delimiter could end early would be read as a different name.
                  * Object keys are delimited by the object's punctuation instead, and a key
                  * containing it is written as a string. */
-                const std::string probe = pname + F.name_end;
-                if (!F.object && probe.find(F.name_end) != pname.size()) {
-                    *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
-                           F.name_end + "', which this model's tool-call format uses to end an "
-                           "argument name";
-                    return RAD_E_INVAL;
+                for (const std::string* ne : { &F.name_end, &F.name_end_json }) {
+                    if (ne->empty()) continue;
+                    const std::string probe = pname + *ne;
+                    if (!F.object && probe.find(*ne) != pname.size()) {
+                        *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
+                               *ne + "', which this model's tool-call format uses to end an "
+                               "argument name";
+                        return RAD_E_INVAL;
+                    }
                 }
                 t.params.emplace(pname, p);
             }
@@ -1189,6 +1202,8 @@ struct ReplyStream::Impl {
     int         depth = 0;              /* unclosed braces in the arguments so far */
     bool        in_str = false, esc = false;
     const Param* param = nullptr;
+    /* The argument's tag was the JSON one (typed tags): its value is read as JSON. */
+    bool        json_tag = false;
     /* a value */
     ValueOut    val;
     ValueOut::Mode vmode = ValueOut::String;
@@ -1957,7 +1972,9 @@ struct ReplyStream::Impl {
         args_out(key);
         ++argc;
         name.clear();
-        if (param && param->typed) {
+        /* With typed tags the reply's own tag says JSON or string, for any name; else the
+         * declared schema does. */
+        if (F.f.typed_tags() ? json_tag : (param && param->typed)) {
             js.reset();
             vheld.clear();
             st = St::ValJson;
@@ -1968,7 +1985,10 @@ struct ReplyStream::Impl {
 
     /* What ends an argument name and a value in the call being read: the tags as the format
      * writes them, or their cores in a loose call. */
-    const std::string& name_end() const { return loose ? F.name_end_core : F.name_end; }
+    const std::string& name_end() const {
+        if (json_tag) return loose ? F.name_end_json_core : F.name_end_json;
+        return loose ? F.name_end_core : F.name_end;
+    }
     const std::string& value_suffix() const { return loose ? F.value_core : F.f.arg_value_suffix; }
 
     /* A CDATA section is punctuation around any value the format lets carry one, typed or not. */
@@ -2221,11 +2241,15 @@ struct ReplyStream::Impl {
             const char c = *p;
             att.push_back(c);
             lhold.push_back(c);
-            const std::string& ne = F.name_end_core;
             if (lhold.size() > kMaxLooseName) { fail_attempt(); return p + 1; }
-            if (lhold.size() >= ne.size() &&
-                lhold.compare(lhold.size() - ne.size(), ne.size(), ne) == 0) {
-                const std::string_view nm(lhold.data(), lhold.size() - ne.size());
+            const std::string* ne = &F.name_end_core;
+            auto ends = [&](const std::string& s) {
+                return !s.empty() && lhold.size() >= s.size() &&
+                       lhold.compare(lhold.size() - s.size(), s.size(), s) == 0;
+            };
+            if (!ends(*ne) && ends(F.name_end_json_core)) ne = &F.name_end_json_core;
+            if (ends(*ne)) {
+                const std::string_view nm(lhold.data(), lhold.size() - ne->size());
                 if (nm.empty() || nm.find('<') != std::string_view::npos) {
                     fail_attempt();
                     return p + 1;
@@ -2278,6 +2302,7 @@ struct ReplyStream::Impl {
                          name.append(q, n);
                          if (loose && std::memchr(q, '<', n)) name_lt = true;
                      });
+            json_tag = hit == 1;
             if (name_lt) { end_loose_call_at_arg(hit >= 0); return p; }
             if (hit >= 0) { name += name_end(); begin_value(); }
             return p;

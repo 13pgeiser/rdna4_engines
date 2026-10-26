@@ -1401,7 +1401,9 @@ derived from it: the reply parser, the lazy tool-call grammar and its trigger wo
 tokens the decoder must render as text.
 
 There are two families of call syntax. In the tagged family each argument has its own tags (Qwen's
-`<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema. In the
+`<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema, or by its
+own tag where the format's tag says the type (DeepSeek-V4.1's DSML writes `string="true"` before
+text and `string="false"` before JSON; the grammar writes the tag the schema calls for). In the
 object family a call is its name and one object holding the arguments: JSON, or a dialect with
 strings between declared delimiters and bare keys, as Gemma 4 writes
 `call:NAME{path:<|"|>/a<|"|>,limit:3}`; values carry their own types.

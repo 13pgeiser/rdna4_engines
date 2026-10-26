@@ -1526,6 +1526,12 @@ int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
  *       arg_prefix ARG arg_name_suffix arg_value_prefix VALUE arg_value_suffix  ...
  *   call_end [call_close]
  *
+ * An argument's tag may also say its value's type, with arg_json_value_prefix written in place of
+ * arg_value_prefix before a JSON value. DeepSeek-V4.1's DSML, inside a section
+ * "<｜DSML｜ calls>" / "</｜DSML｜ calls>", is "<｜DSML｜ invoke name=\"" / "\">\n" / "</｜DSML｜ invoke>",
+ * arguments "<｜DSML｜ parameter name=\"" / "\"" / " string=\"true\">" (or
+ * " string=\"false\">") / "</｜DSML｜ parameter>".
+ *
  * Qwen3.8, for example, is "<think>\n" / "\n</think>\n\n", calls "<tool_call>\n" / "</tool_call>",
  * "<function=" / ">\n" / "</function>\n", arguments "<parameter=" / ">\n" / "" / "</parameter>\n".
  * Whitespace at the ends of a tag is optional when matching. Every string is NUL-terminated
@@ -1626,6 +1632,12 @@ typedef struct RadChatFormat {
      * calls) and is read as reasoning there too, and a reasoning_close with no block open is not
      * part of the answer. Zero: only a block the reply starts with is reasoning. */
     uint32_t    reasoning_anywhere;
+
+    /* Tagged arguments whose tag says the value's type: written in place of arg_value_prefix,
+     * this opens a JSON value, and arg_value_prefix then opens a string. The tag the reply writes
+     * decides how its value is read, whatever the schema says; the grammar writes the one the
+     * schema calls for. NULL: the schema alone types a value. */
+    const char* arg_json_value_prefix;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */
