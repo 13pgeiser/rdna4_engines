@@ -1039,7 +1039,7 @@ pub struct SourceAdmission {
     /// arch crate opens at load. `None` = trunk-only (or explicit opt-out via
     /// empty string).
     pub vision_path: Option<std::path::PathBuf>,
-    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// The resolved `vision.mode` ladder value (`auto`/`resident`/`on`/`off`). The
     /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
     /// alone cannot distinguish "off" (never probe a sibling) from "auto with
     /// no explicit sidecar" (probe allowed). `off` suppresses discovery.

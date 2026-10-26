@@ -8148,8 +8148,34 @@ impl Carrier for Qwen35Carrier {
                 // sidecars, so a sidecar failure here fails the load closed —
                 // an explicitly requested tower must never silently serve text.
                 let (vision_config, vision_weights) = {
+                    use hipfire_arch_qwen35_vl::qwen35_vl::{
+                        self, load_vision_weights, TowerResidency,
+                    };
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
+
+                    let residency = TowerResidency::from_vision_mode(&ctx.vision_mode);
+                    // After a tower loads (either residency) the automatic
+                    // max_seq must leave room for its activation scratch.
+                    fn reserve_tower_activation(
+                        ctx: &mut LoadCtx<'_>,
+                        vc: &qwen35_vl::VisionConfig,
+                        residency: TowerResidency,
+                    ) {
+                        let patches = qwen35_vl::max_image_patches(vc);
+                        let bytes = qwen35_vl::tower_activation_peak_bytes(vc, patches);
+                        if let Some(seq) = ctx.sequence.as_mut() {
+                            seq.reserve_bytes = seq.reserve_bytes.saturating_add(bytes);
+                        }
+                        eprintln!(
+                            "  vision tower: {}; activation reserve {} MiB for {patches} patches",
+                            match residency {
+                                TowerResidency::Resident => "resident",
+                                TowerResidency::Streamed => "streamed",
+                            },
+                            bytes >> 20
+                        );
+                    }
 
                     // Vision tower sidecar resolution: an explicit
                     // `--vision-path` (or HIPFIRE_VL_FILE) must never be
@@ -8180,7 +8206,7 @@ impl Carrier for Qwen35Carrier {
                             "  loading vision weights from .vl sidecar: {}",
                             vl.display()
                         );
-                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                        let vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                         let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
                             .map_err(|e| format!(".vl vision_config: {e}"))?;
@@ -8223,8 +8249,9 @@ impl Carrier for Qwen35Carrier {
                         // misleading "no vision encoder" message. A corrupt
                         // or truncated .vl must be a load-time error the
                         // operator can see.
-                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                        let vw = load_vision_weights(&vl_hfq, &vc, ctx.gpu, residency)
                             .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model: vision encoder (hidden={}, layers={})",
                             vc.hidden_size, vc.num_layers
@@ -8234,9 +8261,12 @@ impl Carrier for Qwen35Carrier {
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                         match vc {
                             Some(vc) => {
-                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                let vw = load_vision_weights(&hfq_file, &vc, ctx.gpu, residency)
                                     .map_err(|e| eprintln!("  VL weight load failed: {e}"))
                                     .ok();
+                                if vw.is_some() {
+                                    reserve_tower_activation(ctx, &vc, residency);
+                                }
                                 eprintln!(
                                     "  VL model: vision encoder (hidden={}, layers={})",
                                     vc.hidden_size, vc.num_layers
@@ -8245,11 +8275,11 @@ impl Carrier for Qwen35Carrier {
                             }
                             _ => (None, None),
                         }
-                    } else if let Some(p) = ctx.vision_path.as_ref() {
-                        let mut sidecar =
-                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
-                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
-                            )?;
+                    } else if let Some(p) = ctx.vision_path.clone().as_ref() {
+                        let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p))
+                            .map_err(|e| {
+                                format!("vision sidecar '{}': open failed: {e}", p.display())
+                            })?;
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file)
                             .ok()
                             .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
@@ -8259,10 +8289,10 @@ impl Carrier for Qwen35Carrier {
                                  the sidecar with --include-vision"
                                     .to_string()
                             })?;
-                        let vw =
-                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
-                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
-                            })?;
+                        let vw = load_vision_weights(&sidecar, &vc, ctx.gpu, residency).map_err(
+                            |e| format!("vision sidecar '{}': tower load failed: {e}", p.display()),
+                        )?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
                             p.display(),
@@ -8536,6 +8566,9 @@ impl Carrier for Qwen35Carrier {
             swap_disk_bytes: cfg.swap_disk_bytes,
             is_vl: cfg.is_vl,
             vl_path: cfg.vl_path,
+            vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::from_vision_mode(
+                &cfg.vision_mode,
+            ),
             mtp_k: cfg.mtp_k,
             mtp_mode: cfg.mtp_mode,
             kv_mode_raw: cfg.kv_mode_raw,

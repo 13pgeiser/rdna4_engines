@@ -983,6 +983,10 @@ impl KernelCompiler {
         source: &str,
         symbol: &str,
     ) -> Result<Option<PathBuf>, String> {
+        #[cfg(windows)]
+        let local_toolchain = "";
+        #[cfg(not(windows))]
+        let local_toolchain = self.toolchain_id.as_str();
         Self::check_indexed_object(
             dir,
             &self.arch,
@@ -991,7 +995,10 @@ impl KernelCompiler {
             &[symbol],
             &self.extra_flags,
             &self.packaging_hash(module, source),
-            &self.toolchain_id,
+            // Windows: installed pack objects come from the Linux release
+            // build and are loaded by the HIP runtime, so a differing local
+            // hipcc identity must not reject them ("" skips the comparison).
+            local_toolchain,
         )
         .map(|found| found.map(|(object, _)| object))
     }
@@ -3446,8 +3453,8 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // Keep the sealed inventory unchanged; beta later added the
-                // HC-write widening to the shared source on every arch.
+                // Keep the sealed inventory unchanged. The later HC x8
+                // export is gfx1201-only and does not alter gfx11 exports.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3455,10 +3462,7 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain([
-                            "hyper_write_bf16x8_gfx1201",
-                            "indexed_attention_rope_table_f32"
-                        ])
+                        .chain(["indexed_attention_rope_table_f32"])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

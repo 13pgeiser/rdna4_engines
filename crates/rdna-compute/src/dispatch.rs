@@ -2775,6 +2775,21 @@ impl Gpu {
             hip_major,
             hip_minor
         );
+        // Windows only: System32 can shadow an SDK's amdhip64/comgr, so log which
+        // DLL actually loaded alongside the raw runtime/driver versions.
+        #[cfg(windows)]
+        {
+            let raw = |v: hip_bridge::HipResult<i32>| {
+                v.map(|n| n.to_string())
+                    .unwrap_or_else(|_| "unknown".into())
+            };
+            eprintln!(
+                "HIP runtime: {} (runtime {}, driver {})",
+                hip.mapped_hip_library().as_deref().unwrap_or("unknown"),
+                raw(hip.runtime_version_raw()),
+                raw(hip.driver_version()),
+            );
+        }
 
         let flags = Arc::new(FeatureFlags::from_active_config(&arch));
         crate::scratch::enable_qsa_code_check(&flags);
@@ -2886,6 +2901,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
@@ -4111,6 +4127,7 @@ impl Gpu {
             .validate_launch_grid(grid)
             .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
+        let plan = self.hip.plan_active();
         let observe = self.replay.is_g0_observing();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
@@ -4132,9 +4149,15 @@ impl Gpu {
             || observe
             || self.graphs.capture_mode
             || self.flags.force_blob_path
+            // Plan mode records the exact blob: the params path cannot be
+            // reconstructed from `kernelParams` pointers.
+            || plan
         {
             let mut blob = blob_builder();
             blob.pad_to(16);
+            if plan {
+                crate::plan_sink::note_declared(self.hip.plan_event_count(), railgun_words);
+            }
             if observe {
                 self.replay
                     .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
@@ -4549,7 +4572,7 @@ impl Gpu {
     }
 
     /// Shared loaded-symbol/Arc-owner proof, borrowing the registry's owner.
-    fn loaded_owner(
+    pub(crate) fn loaded_owner(
         &self,
         symbol: &str,
     ) -> HipResult<(String, &crate::code_object::RecordedArtifact)> {
@@ -9393,6 +9416,9 @@ impl Gpu {
     /// Growth inside a capture keeps the historical behaviour (warmup-first
     /// flows size scratch before capturing, so this is not expected).
     pub fn invalidate_for_scratch_growth(&mut self) {
+        // Every growth is announced here first: cached railgun skeletons key on
+        // this epoch (pointers into a replaced scratch buffer go stale).
+        crate::scratch::note_scratch_growth();
         if !crate::scratch::scratch_growth_invalidates(
             crate::graph::any_graph_captured(),
             self.graphs.capture_mode,

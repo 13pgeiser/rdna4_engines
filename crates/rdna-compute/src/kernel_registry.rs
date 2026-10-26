@@ -77,6 +77,7 @@ mod kernels {
     );
     /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
     pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
+    pub const RAILGUN_FILL_SRC: &str = include_str!("../../../kernels/src/railgun_fill.hip");
 }
 
 pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
@@ -428,6 +429,84 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
             ["kv_cache_write_asym3_q8_pair_gfx1100"]
         );
+        // Default-on int8 small-batch verify GEMV (`gemv_q8x.rs`): the
+        // activation quantizer and every v4/v3 batch x residual variant, each
+        // module with its `_multi` twin, so the pack carries them precompiled.
+        add!(
+            "mq4v2_q8x_quant",
+            kernels::GEMV_MQ4G256V2_Q8X_QUANT_SRC,
+            ["mq4v2_q8x_quant"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b2",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B2_SRC,
+            ["mq4v2_q8x_v4_b2", "mq4v2_q8x_v4_b2_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b2_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B2_RES_SRC,
+            ["mq4v2_q8x_v4_b2_res", "mq4v2_q8x_v4_b2_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b3",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B3_SRC,
+            ["mq4v2_q8x_v4_b3", "mq4v2_q8x_v4_b3_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b3_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B3_RES_SRC,
+            ["mq4v2_q8x_v4_b3_res", "mq4v2_q8x_v4_b3_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b4",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B4_SRC,
+            ["mq4v2_q8x_v4_b4", "mq4v2_q8x_v4_b4_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b4_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B4_RES_SRC,
+            ["mq4v2_q8x_v4_b4_res", "mq4v2_q8x_v4_b4_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b2",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B2_SRC,
+            ["mq4v2_q8x_v3_b2", "mq4v2_q8x_v3_b2_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b2_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B2_RES_SRC,
+            ["mq4v2_q8x_v3_b2_res", "mq4v2_q8x_v3_b2_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b3",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B3_SRC,
+            ["mq4v2_q8x_v3_b3", "mq4v2_q8x_v3_b3_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b3_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B3_RES_SRC,
+            ["mq4v2_q8x_v3_b3_res", "mq4v2_q8x_v3_b3_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b4",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B4_SRC,
+            ["mq4v2_q8x_v3_b4", "mq4v2_q8x_v3_b4_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b4_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B4_RES_SRC,
+            ["mq4v2_q8x_v3_b4_res", "mq4v2_q8x_v3_b4_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b5",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B5_SRC,
+            ["mq4v2_q8x_v3_b5", "mq4v2_q8x_v3_b5_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b5_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC,
+            ["mq4v2_q8x_v3_b5_res", "mq4v2_q8x_v3_b5_res_multi"]
+        );
     }
     if matches!(arch, "gfx906" | "gfx942") {
         add!(
@@ -565,6 +644,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "attention_flash_q8_0_tile",
         kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
         ["attention_flash_q8_0_tile"]
+    );
+    add!(
+        "attention_flash_q8_0_tile_hd64",
+        kernels::ATTENTION_FLASH_Q8_0_TILE_HD64_SRC,
+        ["attention_flash_q8_0_tile_hd64"]
     );
     add!(
         "attention_flash_q8_0_reduce",
@@ -1516,6 +1600,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_reduce_gfx1100"
             ]
         );
+        // Default-on WMMA split-K verify attention (`attention_wmma_verify.rs`).
+        add!(
+            "attention_verify_wmma_gfx1100",
+            kernels::ATTENTION_VERIFY_WMMA_GFX1100_SRC,
+            [
+                "attention_verify_wmma_q8_qt1_gfx1100",
+                "attention_verify_wmma_q8_qt2_gfx1100",
+                "attention_verify_wmma_q8_qt3_gfx1100",
+                "attention_verify_wmma_reduce_gfx1100"
+            ]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -1918,7 +2013,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_norm_rope_batch_arena",
                 "gated_delta_gate_batched_rotate_arena",
                 "indexed_attention_cache_append_q8_batch_arena",
-                "hyper_write_bf16x8_gfx1201",
             ]
         );
         add!(
@@ -2170,7 +2264,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -2300,6 +2393,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
             [
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560",
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
             ]
         );
@@ -2372,6 +2467,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
             ]
         );
+        // Match the exact gfx1151-only launcher admission in moe_few.rs.
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq4g128v2_moe_down_top10_k640",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_K640_SRC,
+                ["gemv_mq4g128v2_moe_down_top10_k640",]
+            );
+        }
         add!(
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
             kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
@@ -2591,6 +2694,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_MQ6G256V2_SRC,
             ["gemv_mq6g256v2"]
         );
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq6g256v2_k2560_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_SRC,
+                ["gemv_mq6g256v2_k2560"]
+            );
+            add!(
+                "gemv_mq6g256v2_k2560_u2_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_U2_SRC,
+                ["gemv_mq6g256v2_k2560_u2"]
+            );
+        }
+
         // Default-on `HIPFIRE_QWEN4_ROUTER_FAST`: every eager multi-row router call.
         add!(
             "moe_router_softmax_top10_f32_fast",
@@ -2798,7 +2914,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -3957,8 +4072,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
             [
                 "attention_verify_wmma_pv1s_d4_gfx1151",
+                "attention_verify_wmma_pv1s_d4_hd128_gfx1151",
                 "attention_verify_wmma_pv2_d2_gfx1151",
+                "attention_verify_wmma_pv2_d2_hd128_gfx1151",
                 "attention_verify_wmma_qk_gfx1151",
+                "attention_verify_wmma_qk_hd128_gfx1151",
             ]
         );
         add!(
@@ -4724,6 +4842,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
                 "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_k5120",
                 "npu_trunk_pack_a_bf16_old",
             ]
         );
@@ -5770,7 +5889,8 @@ pub fn default_route_entries(
 /// Modules railgun's own lowering launches (design §1.1 `Node::Copy` and
 /// `Node::CopyBatch`): the hipfire-owned copy kernels, JIT-compiled as module
 /// `railgun::copy::MODULE` from `railgun::copy::SOURCE`, on every arch
-/// railgun certifies. No Redline program loads them.
+/// railgun certifies, the typed fill, and on exact gfx1201 the DFlash window's
+/// device selector. No Redline program loads them.
 pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
     let arch: &'static str = SUPPORTED_ARCHES
         .iter()
@@ -5784,6 +5904,26 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
             "railgun_copy",
             &["railgun_copy", "railgun_copy_batch"],
             kernels::RAILGUN_COPY_SRC.into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "railgun_fill",
+            &["railgun_fill_u32"],
+            kernels::RAILGUN_FILL_SRC.into(),
+            extra_flags,
+        ));
+    }
+    // The certified DFlash window's (design A, exact gfx1201) device greedy
+    // selector: a node of the window program, JIT-loaded by
+    // `Gpu::ensure_dflash_selector_greedy_exact`. The window refuses any node
+    // whose exact object has no corpus record, so it is inventoried here.
+    if arch == "gfx1201" {
+        entries.push(entry(
+            arch,
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_MODULE,
+            &[crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SYMBOL],
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SRC.into(),
             extra_flags,
         ));
     }
@@ -8197,6 +8337,52 @@ mod tests {
     }
 
     #[test]
+    fn k640_registry_matches_gfx1151_only_launcher_admission() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let registry = entries(arch, "").unwrap();
+            assert_eq!(
+                registry
+                    .iter()
+                    .any(|entry| entry.module == "gemv_mq4g128v2_moe_down_top10_k640"),
+                arch == "gfx1151",
+                "{arch}: K640 registry must match the launchers architecture guard",
+            );
+        }
+    }
+
+    #[test]
+    fn native_qwen4_gfx1151_route_entries_refuses_partial_closed_plan() {
+        let flags = default_feature_flags("gfx1151").unwrap();
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            let input = RouteKernelInput {
+                arch: "gfx1151",
+                model_arch: 16,
+                tensors: &[],
+                n_heads: 32,
+                n_kv_heads: 4,
+                head_dim: 128,
+                max_seq: 32768,
+                prefill_chunk_rows: 8192,
+                kv_k: "fp8",
+                kv_v: "fp8",
+                state_quant: "q8",
+                spec,
+                host_mapped_experts: false,
+                retained_decode: true,
+                hipcc_extra_flags: "",
+                flags: &flags,
+                route_axes: &[],
+            };
+            match route_entries(&input) {
+                Err(RegistryError::UnsupportedRoute(reason)) => {
+                    assert_eq!(reason, "model arch 16 on gfx1151 has no closed route",)
+                }
+                other => panic!("gfx1151 must keep lazy loading, not a partial plan: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn mq4v2_k5120_inventory_preserves_generic_and_limits_arch() {
         let module = "fused_gate_up_mq4g256v2_k5120_gfx1100";
         let registry = entries("gfx1100", "").unwrap();
@@ -9531,6 +9717,11 @@ mod tests {
         // qualification twins) at the 64-byte ABI.
         for (label, image, count) in [
             ("gfx1151 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151, 6),
+            (
+                "gfx1151 streamed GU K2",
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                1,
+            ),
             ("gfx1201 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201, 6),
             ("gfx1201 W3 K2", kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201, 4),
             (
@@ -10054,6 +10245,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The head_dim 64 Q8 flash decode tile (HIPF-124).
+        const HD64_FLASH_TILE_ADDED_MODULES: [&str; 1] = ["attention_flash_q8_0_tile_hd64"];
+        for module in HD64_FLASH_TILE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing hd64 flash tile module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10067,7 +10272,8 @@ mod tests {
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
-                + MQ4RS_DECODE_ADDED_MODULES.len(),
+                + MQ4RS_DECODE_ADDED_MODULES.len()
+                + HD64_FLASH_TILE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -10413,7 +10619,7 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap, while accounting explicitly for the later beta source addition.
+    /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports.
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10433,10 +10639,7 @@ mod tests {
         let current: BTreeSet<String> = elf
             .iter()
             .cloned()
-            .chain([
-                "hyper_write_bf16x8_gfx1201".to_owned(),
-                "indexed_attention_rope_table_f32".to_owned(),
-            ])
+            .chain(["indexed_attention_rope_table_f32".to_owned()])
             .collect();
         assert_eq!(tensor_ops_source_exports("gfx1100"), current);
         let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();
@@ -10454,7 +10657,7 @@ mod tests {
                 "indexed_attention_decode_prologue_q8",
             ]
         );
-        // The current registry includes the measured exports and the later beta addition.
+        // The current gfx11 registry contains exactly the measured source exports.
         for arch in ["gfx1100", "gfx1151"] {
             let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
                 .unwrap()
@@ -10505,6 +10708,8 @@ mod tests {
             }
         }
         for (symbol, gfx11, gfx12) in [
+            ("hyper_write_bf16x2", true, true),
+            ("hyper_write_bf16x8_gfx1201", false, true),
             ("indexed_attention_decode_prologue_fp8", false, true),
             ("gated_delta_step_pipe128_q8", false, true),
         ] {
@@ -12578,5 +12783,52 @@ extern "C" __global__ void NAMED(int* p) {}
         assert!(parse_walked_route_plan(concat!(base!(), "#! sealed turbo\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,4\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,x,256\n")).is_err());
+    }
+
+    /// Every node kernel of the certified DFlash window that is not a default
+    /// Redline route kernel has a corpus record on exact gfx1201: the window
+    /// refuses a node whose object the corpus lacks.
+    #[test]
+    fn corpus_entries_cover_the_dflash_window_node_kernels_on_gfx1201() {
+        let entries = corpus_entries("gfx1201", "").unwrap();
+        let has = |module: &str, symbol: &str| {
+            entries
+                .iter()
+                .any(|e| e.module == module && e.symbols.contains(&symbol))
+        };
+        for (module, symbol) in [
+            (
+                "dflash_selector_greedy_exact",
+                "dflash_selector_greedy_exact",
+            ),
+            ("railgun_copy", "railgun_copy"),
+            ("railgun_fill", "railgun_fill_u32"),
+            ("select_regrid", "topk_values_regrid_f32"),
+            ("topk_values_fixup_f32", "topk_values_fixup_f32"),
+            ("select_regrid", "argmax_f32_batched_regrid"),
+            (
+                "attention_dflash_sliding_f32",
+                "attention_dflash_sliding_f32",
+            ),
+            (
+                "dflash_hidden_commit5_gfx1100",
+                "dflash_hidden_commit5_gfx1100",
+            ),
+            ("embedding_q8_batched", "embedding_q8_batched"),
+        ] {
+            assert!(
+                has(module, symbol),
+                "gfx1201 corpus lacks {module}/{symbol}"
+            );
+        }
+        for arch in ["gfx1100", "gfx1151"] {
+            assert!(
+                !corpus_entries(arch, "")
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.module == "dflash_selector_greedy_exact"),
+                "{arch} must not inventory the gfx1201 window selector"
+            );
+        }
     }
 }

@@ -2553,6 +2553,49 @@ pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3
 pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
 /// MQ6G256V2: dual-scale 6-bit (qt=47).
 pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
+/// gfx1151 K2560 scalar MQ6: fold the group/tail control at compile time.
+/// The non-unrolled body keeps 76 VGPR; the measured vocabulary-sized head
+/// uses two explicit quad iterations (95 VGPR). Arithmetic/32-byte ABI match
+/// the generic entry; selection is limited by `gemv_mq6g256v2_specialized`.
+pub const GEMV_MQ6G256V2_K2560_SRC: &str = concat!(
+    "#define MQ6_GEMV_COMPILE_K2560 1\n",
+    "#define MQ6_GEMV_ENTRY gemv_mq6g256v2_k2560\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
+pub const GEMV_MQ6G256V2_K2560_U2_SRC: &str = concat!(
+    "#define MQ6_GEMV_COMPILE_K2560 1\n",
+    "#define MQ6_GEMV_COMPILE_K2560_UNROLL2 1\n",
+    "#define MQ6_GEMV_ENTRY gemv_mq6g256v2_k2560_u2\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
+
+/// `(source, module stem, symbol)` for measured scalar MQ6 shapes.
+/// Only owning HIP allocations carry the residency proof used by this
+/// selector; host-mapped weights and borrowed/VMM views retain generic K.
+pub fn gemv_mq6g256v2_specialized(
+    arch: &str,
+    hip_allocation: bool,
+    m: usize,
+    k: usize,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if arch != "gfx1151" || !hip_allocation || k != 2560 {
+        return None;
+    }
+    match m {
+        1..=10240 => Some((
+            GEMV_MQ6G256V2_K2560_SRC,
+            "gemv_mq6g256v2_k2560",
+            "gemv_mq6g256v2_k2560",
+        )),
+        248320 => Some((
+            GEMV_MQ6G256V2_K2560_U2_SRC,
+            "gemv_mq6g256v2_k2560_u2",
+            "gemv_mq6g256v2_k2560_u2",
+        )),
+        _ => None,
+    }
+}
+
 /// `gemv_mq6g256v2.hip` as #774 left it (shared row helper): Qwen4's
 /// `gemv_mq6g256v2_x4` loads from module `qwen4_gemv_mq6g256v2`, and the
 /// x-batch and draft-head re-score sources below build on it.
@@ -2720,6 +2763,79 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
+
+/// Exact-gfx1100 int8-activation small-batch MQ4G256V2 GEMV for speculative
+/// verify (default on exact gfx1100, `HIPFIRE_GFX1100_Q8X_VERIFY=0` off; see
+/// `gemv_q8x.rs`; registered in `kernel_registry.rs` for the gfx1100 pack): the
+/// activation quantizer and the v4 (persistent, all of K in LDS) / v3
+/// (LDS-staged chunks, two rows per warp) GEMVs, one module per batch (2..=5)
+/// and residual flavour, each with a `_multi` twin for up to four weights.
+pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
+    "#define Q8X_QUANT 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+);
+macro_rules! gemv_mq4g256v2_q8x_v4_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
+            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+macro_rules! gemv_mq4g256v2_q8x_v3_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
+            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "", "mq4v2_q8x_v4_b2");
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "", "mq4v2_q8x_v4_b3");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "", "mq4v2_q8x_v4_b4");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "", "mq4v2_q8x_v3_b2");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "", "mq4v2_q8x_v3_b3");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "", "mq4v2_q8x_v3_b4");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "", "mq4v2_q8x_v3_b5");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
@@ -3065,6 +3181,14 @@ pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMV_MQ4G128V2_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g128v2_moe_ninepath_d4.hip");
 
+/// Exact K640/top-10 QT53 indexed down: the original 48-byte ABI, wave32
+/// reduction, flat output and asymmetric scale/zero arithmetic. The generic
+/// entry additionally accepts runtime `k_top` (52 explicit bytes).
+pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_K640_SRC: &str = concat!(
+    "#define QT53_DOWN_ENTRY gemv_mq4g128v2_moe_down_top10_k640\n",
+    "#define QT53_DOWN_K640 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip")
+);
 /// Portable F32 parity consumer for qt53 grouped down.  It preserves the
 /// indexed decode kernel's 32-lane reduction association while reusing one
 /// decoded same-expert weight across the sixteen grouped route slots.
@@ -4342,6 +4466,11 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// Separate measured gfx1151 streamed NT8 gate/up, 64-byte ABI, 208 VGPR.
+/// No incumbent module bytes move. Source: emit --kernel qwen4_moe_sym
+/// --epi gate_up_stream8 --arch gfx1151; adjacent ISA contract pins resources.
+pub const QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco");
 /// Certified builder module of the MQ3-I4 (`WeightCodec::Mq3I4`, planar qt131/qt132
 /// experts) NT1 entries of the same grouped symmetric IU4 MoE GEMMs, gfx1201
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1201`, one
@@ -8373,6 +8502,17 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Native-fp8-KV split-KV verifier ([`ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC`]
+/// + `HIPFIRE_FA2_SPLIT_LSE_FP8=1`): the KMODE=8 f16 body with the Q8
+/// verifier's LSE + normalized-Oacc partial/merge records. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_{partial,merge}_lse_gfx1201` and
+/// `attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201`, distinct from the Q0
+/// module's. JIT-only via `Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    "#define HIPFIRE_FA2_SPLIT_LSE_FP8 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 /// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
 /// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
 /// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from
@@ -8570,6 +8710,13 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 /// for its tile of positions, writing partials to global memory.
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
+
+/// head_dim 64 twin of [`ATTENTION_FLASH_Q8_0_TILE_SRC`]
+/// (`attention_flash_q8_0_tile_hd64`): same ABI and partials, so it pairs with
+/// the shared `attention_flash_q8_0_reduce`. The reference tile only covers
+/// head_dim in multiples of 128.
+pub const ATTENTION_FLASH_Q8_0_TILE_HD64_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_hd64.hip");
 
 /// Flat-BF16 sibling of the Q8_0 flash tile. Same partials layout and same
 /// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
@@ -8791,6 +8938,12 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
 /// `kernels/src`, so the header is prepended and the source's guarded
 /// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+/// Exact-gfx1100 WMMA split-K verify attention over plain Q8_0 KV (H24/KV4/
+/// HD256, 1..=8 rows; default on, `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` off;
+/// see `attention_wmma_verify.rs`): `attention_verify_wmma_q8_qt{1,2,3}_gfx1100`
+/// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
+pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),
@@ -8801,8 +8954,8 @@ pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
 /// S = Q.K^T tiles, one K dequant per kv head, f16 S to scratch) and
 /// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online
 /// softmax + P.V walk), the byte-identical parallel twin of
-/// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256,
-/// GQA 4 or 6) that every gfx1151 speculative verify runs.
+/// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256 or
+/// 128 (`_hd128` entries), GQA 4 or 6) that every gfx1151 speculative verify runs.
 pub const ATTENTION_VERIFY_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_wmma.gfx1151.hip");
 
@@ -12063,3 +12216,26 @@ pub const GELU_NEW_MUL_F32_SRC: &str = include_str!("../../../kernels/src/gelu_n
 
 /// OpenAI CLIP quick-GELU: `out = x * sigmoid(1.702 x)`.
 pub const QUICK_GELU_F32_SRC: &str = include_str!("../../../kernels/src/quick_gelu_f32.hip");
+
+#[cfg(test)]
+mod mq6_scalar_specialization_tests {
+    use super::gemv_mq6g256v2_specialized as select;
+    #[test]
+    fn only_measured_arch_residency_and_k_select_specialized_entries() {
+        for m in [1, 33, 512, 2560, 2571, 10240, 248320] {
+            let (_, module, symbol) = select("gfx1151", true, m, 2560).unwrap();
+            assert_eq!(module, symbol);
+            assert_eq!(symbol.ends_with("_u2"), m == 248320);
+            assert!(select("gfx1151", false, m, 2560).is_none());
+            for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942"] {
+                assert!(select(arch, true, m, 2560).is_none());
+            }
+            for k in [0, 640, 2048, 2561, 5120] {
+                assert!(select("gfx1151", true, m, k).is_none());
+            }
+        }
+        for m in [0, 10241, 32768, 248319, 248321] {
+            assert!(select("gfx1151", true, m, 2560).is_none());
+        }
+    }
+}

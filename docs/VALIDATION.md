@@ -63,12 +63,20 @@ who approves judges that the evidence matches the claim.
 The `Windows MSVC (advisory, no GPU)` job in the same workflow is initially
 advisory (`continue-on-error: true`), to be promoted to required after its first
 green run on `beta`. It builds the native CLI/daemon, runs config/registry/client
-library tests, smoke-checks version and parseable JSON diagnostics without HIP,
-and packages/uploads an unsigned developer ZIP plus SHA-256. It does not run
+library tests, checks that `scripts/*.ps1` parse and that `install.ps1`'s
+parameters bind (guard for #979), smoke-checks version and parseable JSON
+diagnostics without HIP, lists the DLLs the packaged `daemon.exe` and
+`hipfire.exe` import against the allowlist in
+[`scripts/check-pe-imports.ps1`](../scripts/check-pe-imports.ps1), and
+packages/uploads an unsigned developer ZIP plus SHA-256. It does not run
 inference or certify an AMD GPU, driver, runtime tuple, kernel pack, signed
 installer, or update path. Until a GitHub run exercises it, the Windows job and
 PowerShell packaging are unverified; see
-[the artifact description](GETTING_STARTED.md#ci-developer-artifact).
+[the artifact description](GETTING_STARTED.md#ci-developer-artifact). GPU
+evidence for Windows (native or WSL2) comes only from community test reports
+filed through the Windows test report issue form (native installs run
+[`scripts/windows-check.ps1`](../scripts/windows-check.ps1)); see
+[Help test Windows](GETTING_STARTED.md#help-test-windows).
 
 ## hw-gate (optional evidence automation)
 
