@@ -4853,6 +4853,23 @@ fn main() {
                     kv_warning_json,
                     kv_mode_json,
                 );
+                // Windows only: which amdhip64*.dll actually loaded (System32's
+                // driver copy can shadow an SDK's) and the raw runtime/driver
+                // version ints. null when unavailable. Same splice as
+                // `append_diag_emu` below.
+                #[cfg(windows)]
+                {
+                    let lib_json = serde_json::to_string(&gpu.hip.mapped_hip_library())
+                        .expect("hip_runtime_library serializable");
+                    let rt_json = serde_json::to_string(&gpu.hip.runtime_version_raw().ok())
+                        .expect("hip_runtime_version_raw serializable");
+                    let drv_json = serde_json::to_string(&gpu.hip.driver_version().ok())
+                        .expect("hip_driver_version_raw serializable");
+                    diag_line.pop();
+                    diag_line.push_str(&format!(
+                        r#","hip_runtime_library":{lib_json},"hip_runtime_version_raw":{rt_json},"hip_driver_version_raw":{drv_json}}}"#
+                    ));
+                }
                 emu_daemon::append_diag_emu(&gpu, &mut diag_line);
                 let _ = writeln!(stdout, "{diag_line}");
                 let _ = stdout.flush();

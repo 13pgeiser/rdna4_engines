@@ -9497,6 +9497,25 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0)
             );
+            // Windows daemon only: the amdhip64*.dll that actually loaded (a
+            // System32 driver copy can shadow an SDK's) and the raw versions.
+            // Fields are null/absent when the daemon could not read them.
+            #[cfg(windows)]
+            {
+                let raw = |key: &str| {
+                    live.get(key)
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+                };
+                println!(
+                    "HIP runtime:   {} (runtime {}, driver {})",
+                    live.get("hip_runtime_library")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    raw("hip_runtime_version_raw"),
+                    raw("hip_driver_version_raw")
+                );
+            }
             if matches!(
                 live.get("arch").and_then(serde_json::Value::as_str),
                 Some("gfx1150" | "gfx1151" | "gfx1152")
