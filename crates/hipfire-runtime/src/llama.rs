@@ -2078,17 +2078,17 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 /// Whether the AR route prefills a prompt with [`forward_prefill_batch`] rather
 /// than the per-token decode forward. Speculators that must reproduce AR's
 /// prompt KV (generic DFlash / n-gram on `LlamaBundle`) use the same gate.
+/// Both `ModelArch`s (LLaMA/Mistral/SmolLM2 and Qwen3/Qwen2) run the same
+/// block; Qwen3's QK-norm is gated on `has_qk_norm` inside the chunk.
 #[inline]
-pub fn llama_qwen3_batched_prefill_eligible(
+pub fn llama_batched_prefill_eligible(
     gpu_arch: &str,
-    model_arch: ModelArch,
     prefill_batched_enabled: bool,
     quant_q8: bool,
     has_eviction: bool,
     token_count: usize,
 ) -> bool {
-    model_arch == ModelArch::Qwen3
-        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
+    (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
         && prefill_batched_enabled
         && quant_q8
         && !has_eviction
