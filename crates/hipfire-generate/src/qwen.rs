@@ -3741,7 +3741,14 @@ pub fn generate_dflash(
         // Native MTP never reuses a session under pipeline parallelism (its
         // sessions are not distributed); `plan_qwen4_session` returns 0 for a
         // mesh on the MTP route. DFlash2 never runs on a mesh.
-        let start = plan_qwen4_session(m, &prompt_tokens, route);
+        let mut start = plan_qwen4_session(m, &prompt_tokens, route);
+        // DFlash2 resumes only where its draft context can restart.
+        if m.speculator
+            .as_ref()
+            .is_some_and(|s| !s.can_resume_at(&prompt_tokens, start))
+        {
+            start = 0;
+        }
         let start_is_live = m
             .qwen4()
             .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, route, start));
