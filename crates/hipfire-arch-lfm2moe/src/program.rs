@@ -16,7 +16,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::moe::{
-    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSelectionBias,
+    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeScores, MoeSelectionBias,
 };
 use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
 use hipfire_dispatch::pipeline::{seal_decode, BoundMoeExperts, GatedShortConvOp, GemvInput, Step};
@@ -246,6 +246,7 @@ impl<'a> LayerRefs<'a> {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            mq2_lloyd: None,
             recipe: MoeRecipe::SigmoidRoutedNoShared,
             route_policy: None,
             normalization: MoeNormalization::RmsNorm {
@@ -262,6 +263,7 @@ impl<'a> LayerRefs<'a> {
             selection_bias: Some(MoeSelectionBias {
                 bias: &m.expert_bias,
                 route_scale: cfg.routed_scaling_factor,
+                scores: MoeScores::Sigmoid,
             }),
             x_rot_prerotated: false,
             defer_routed_combine: false,
