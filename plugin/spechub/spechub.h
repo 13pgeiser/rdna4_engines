@@ -44,15 +44,38 @@ struct RadMtpCoupleVerifyCall {
     int64_t         M, n_cand, vocab, ld[5];
 };
 
+/* DFlash2's coupled walk (`dflash_couple_propose`, abi/rad_spechub.h): one sequence a row. Its
+ * operands, in schema order: cand, unary, hp?, anchor, pred w, succ w, seq_ids, draw, tokens
+ * (INOUT: dflash_select's greedy walk, rewritten for a sampled row), state. */
+struct RadDflashCoupleCall {
+    const int32_t*  cand;     /* [M*steps, >= K] */
+    const float*    unary;    /* [M*steps, >= K] */
+    const uint16_t* hp;       /* [M*steps, >= R] bf16, or null for ones */
+    const int32_t*  anchor;   /* the step's token ids, the anchor of sequence s at s*anchor_stride */
+    const uint16_t* pred;     /* [vocab, R] bf16 */
+    const uint16_t* succ;     /* [vocab, R] bf16 */
+    const int32_t*  card;     /* [>= M] RadBatch::seq_ids */
+    const uint32_t* draw;     /* [M, DRAW_WORDS] */
+    int32_t*        tokens;   /* [M, >= steps] */
+    uint32_t*       state;    /* [rounds, >= M, STATE_WORDS] */
+    int64_t M, steps, K, R, vocab, anchor_stride;
+    int64_t ld_cand, ld_unary, ld_hp, ld_draw, ld_tok, st_round, st_row;
+    float   q_temp;
+};
+
 int rad_mtp_couple_propose_shape(const RadParam*, int, int, RadOpdDesc*);
 int rad_mtp_couple_verify_shape(const RadParam*, int, int, RadOpdDesc*);
+int rad_dflash_couple_shape(const RadParam*, int, int, RadOpdDesc*);
 int rad_mtp_couple_propose_args(const RadArgs*, RadMtpCoupleProposeCall*);
 int rad_mtp_couple_verify_args(const RadArgs*, RadMtpCoupleVerifyCall*);
+int rad_dflash_couple_args(const RadArgs*, RadDflashCoupleCall*);
 
 /* The geometry/validation the shape hooks and the arg readers share. `op` 0 proposes, 1 verifies. */
 int rad_couple_validate(const RadArgs*, int op, int64_t* M, int64_t* vocab, int64_t* n_cand);
 
-/* The op set. Two schemas, two device rows and two host-reference rows. */
+/* The op set. Three schemas, three device rows and three host-reference rows; row/schema index 2 is
+ * dflash_couple_propose. */
+#define RAD_SPECHUB_N_OPS 3
 int rad_spechub_schema_count();
 const RadOpSchema* rad_spechub_schema_at(int i);
 RadKernelInfo rad_spechub_row(int i, RadLaunchFn launch);
@@ -62,6 +85,8 @@ int rad_mine_mtp_couple_propose_launch(const RadArgs*, RadStream);
 int rad_mine_mtp_couple_verify_launch(const RadArgs*, RadStream);
 int rad_ref_mtp_couple_propose(const RadArgs*, RadStream);
 int rad_ref_mtp_couple_verify(const RadArgs*, RadStream);
+int rad_mine_dflash_couple_launch(const RadArgs*, RadStream);
+int rad_ref_dflash_couple(const RadArgs*, RadStream);
 
 /* One propose row, host and device: x ~ Q over the final eight. Column 0 is what ADV_ROUND and
  * ADV_TAKE read, and it becomes x only for a valid sampled row. */

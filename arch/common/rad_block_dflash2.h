@@ -98,6 +98,7 @@
 
 #include "rad_arch.h"
 #include "rad_fp8.h"
+#include "rad_spechub.h"   /* RAD_MTP_COUPLE_*: the coupling wire (--draft-coupling) */
 
 namespace rad {
 namespace arch {
@@ -135,6 +136,10 @@ struct Dflash2 {
          * architecture that does not call rad_drafter_short_block leaves it off and its graph as
          * it was. */
         int     short_block = 0;
+        /* --draft-coupling: the temperature of the draft law Q the coupled walk samples from
+         * (dflash_couple_propose's `q_temp`). Any value keeps the output exact; it only moves
+         * acceptance, sum min(P, Q). */
+        double  q_temp = 1.0;
         int64_t steps() const { return block - 1; }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
         /* The kernel projection emits [2, taps, NG] per token (prepare's set, then finish's);
@@ -190,6 +195,9 @@ struct Dflash2 {
         rad_buf dpair = 0;  /* [srows, sel_topk, 2]         f32 */
         rad_buf dgath = 0;  /* [srows, world * sel_topk, 2] f32 */
         rad_buf tokens = 0; /* [max_seqs, steps] i32  the draft; the engine reads it by name */
+        /* --draft-coupling: [max_seqs, DRAW_WORDS] draws the engine stages, and [steps, max_seqs,
+         * STATE_WORDS] states it reads back (abi/rad_spechub.h). Both or neither. */
+        rad_buf couple_draws = 0, couple_state = 0;
     };
 
     /* Whether the 2-bit draft head is vocab-sharded (rad_arch.h: vocab_head_sharded), so whoever
@@ -296,6 +304,9 @@ struct Dflash2 {
     static constexpr int64_t kRerankR = 32;
     int64_t    top_w = 0;                   /* the coarse top-K's width: kRerankR or sel_topk */
     rad_op op_hp = 0, op_sel = 0;
+    /* --draft-coupling: the sampled walk after the greedy one (dflash_couple_propose), for the
+     * drafter's block and its short one. 0 when the coupling is off. */
+    rad_op op_couple = 0, op_couple_lo = 0;
     /* The short block: kShortBlock rows (depth 3, the window that pays at many sequences), when
      * the drafter's own block is longer (rad_drafter_short_block). */
     static constexpr int64_t kShortBlock = 4;
@@ -949,6 +960,35 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                           RAD_WEIGHTS(w_pred, w_succ)),
                       {w.cand, w.unary, w.hp}, {w.tokens});
 
+    /* --draft-coupling: the walk again, sampled (abi/rad_spechub.h, rad_dflash_couple_step), over
+     * the same lattice right after the greedy walk. A greedy request's row keeps the selector's
+     * tokens; a sampled one gets x ~ Q at every position and the Q it was drawn from, which the
+     * engine reads back and binds to the verify. The tokens stay global ids, so the engine's take
+     * (ADV_BTAKE) is unchanged. */
+    if (w.couple_draws || w.couple_state) {
+        if (!w.couple_draws || !w.couple_state || cfg.steps() > RAD_MTP_COUPLE_MAX_ROUNDS ||
+            cfg.sel_topk > RAD_DFLASH_COUPLE_MAX_K)
+            return RAD_E_UNSUPPORTED;
+        auto couple = [&](int64_t steps, int64_t stride) {
+            return rw(b, RAD_OP(b, "dflash_couple_propose",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", steps),
+                                    RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
+                                    RAD_INT("n_vocab", g.n_vocab_all),
+                                    RAD_INT("anchor_stride", stride),
+                                    RAD_INT("max_rounds", cfg.steps()),
+                                    RAD_F64("q_temp", cfg.q_temp)),
+                         RAD_WEIGHTS(w_pred, w_succ)),
+                      {w.cand, w.unary, w.hp, w.couple_draws, w.tokens},
+                      {w.tokens, w.couple_state});
+        };
+        op_couple = couple(cfg.steps(), cfg.block);
+        if (!op_couple) return RAD_E_INVAL;
+        if (block_lo) {
+            op_couple_lo = couple(block_lo - 1, block_lo);
+            if (!op_couple_lo) return RAD_E_INVAL;
+        }
+    }
+
     /* The reads beside the all-reduces, after every weight they read is declared. */
     if (op_ar && cfg.prefetch > 0)
         for (int64_t l = 0; l < g.n_layer; ++l) {
@@ -1161,6 +1201,13 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                 bcol(w.unary, 0, cfg.sel_topk, S), brows(w.hp, S),
                 praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
                 brows(w.tokens, batch->n_seq));
+    if (op_couple)
+        RAD_ISSUE_N(c, lo ? op_couple_lo : op_couple, batch->n_seq,
+                    bcol(w.cand, 0, cfg.sel_topk, S), bcol(w.unary, 0, cfg.sel_topk, S),
+                    brows(w.hp, S), praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred),
+                    RAD_W(w_succ), praw(batch->seq_ids, RAD_I32, batch->n_seq),
+                    brows(w.couple_draws, batch->n_seq), brows(w.tokens, batch->n_seq),
+                    RAD_B(w.couple_state));
 }
 
 }  /* namespace arch */

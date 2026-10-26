@@ -449,7 +449,9 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
-    int  stage_couple_draws(int n);
+    /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
+    template <class Row> int stage_couple_draws(const Row* rows, int n);
+    int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);
     /* One INFO line at the first coupled verify that completed: the step, the live requests whose
      * rows carried a bound state, the kernel and its domain. Read from the sampler's build
      * snapshot after collect_step's wait, so it reports a finished verify, not an enqueue. */

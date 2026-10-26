@@ -936,8 +936,9 @@ struct Config {
      * the step just run; 0 never. Ignored without a drafter that declares one. */
     int64_t draft_short_from = 0;       /* --draft-short-from */
 
-    /* --draft-coupling off|on: a linear serial drafter samples its proposals and the sampler
-     * applies the maximal coupling at the verify (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
+    /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
+     * proposals and the sampler applies the maximal coupling at the verify
+     * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
 

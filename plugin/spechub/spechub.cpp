@@ -1,4 +1,4 @@
-/* plugin/spechub/spechub.cpp -- the two coupling ops' schemas, shapes and argument validation.
+/* plugin/spechub/spechub.cpp -- the coupling ops' schemas, shapes and argument validation.
  *
  * Shape hooks and geometry only: the arithmetic is in abi/rad_spechub.h (inline, host and device) and
  * the launches are in spechub.hip and ref_spechub.cpp. This file is host C++ and compiles with no
@@ -16,6 +16,10 @@ const RadParamSpec kProposeParams[] = {
     PI("M"), PI("n_vocab"), PI("round"), PI("max_rounds"),
 };
 const RadParamSpec kVerifyParams[] = { PI("M"), PI("n_cand"), PI("n_vocab") };
+const RadParamSpec kDflashParams[] = {
+    PI("M"), PI("steps"), PI("top_k"), PI("rank"), PI("n_vocab"), PI("anchor_stride"),
+    PI("max_rounds"), { "q_temp", RAD_P_F64, RAD_OPTIONAL, 0 },
+};
 #undef PI
 
 /* `idx` is INOUT: the round's proposal IS the head's column 0, and a sampled row overwrites it. */
@@ -38,6 +42,21 @@ const RadOperandSpec kVerifyOperands[] = {
     { "token",    RAD_OPD_INOUT, 0 },
 };
 
+/* DFlash2's coupled walk: dflash_select's operands, then the coupling's. `tokens` is INOUT because a
+ * greedy request's row keeps the selector's walk; `state` holds one row per (round, sequence). */
+const RadOperandSpec kDflashOperands[] = {
+    { "cand",    RAD_OPD_IN,     0 },
+    { "unary",   RAD_OPD_IN,     0 },
+    { "hp",      RAD_OPD_IN,     1 },
+    { "anchor",  RAD_OPD_IN,     0 },
+    { "pred",    RAD_OPD_WEIGHT, 0 },
+    { "succ",    RAD_OPD_WEIGHT, 0 },
+    { "seq_ids", RAD_OPD_IN,     0 },
+    { "draw",    RAD_OPD_IN,     0 },
+    { "tokens",  RAD_OPD_INOUT,  0 },
+    { "state",   RAD_OPD_INOUT,  0 },
+};
+
 const RadOpSchema kSchemas[] = {
     { "mtp_couple_propose", kProposeParams, 4, kProposeOperands, 5,
       "Linear MTP round `round`: x~Q, Q = FP64 T1 softmax of the final top8 scores; x into idx "
@@ -48,13 +67,19 @@ const RadOpSchema kSchemas[] = {
       "candidates, FP64 P and 53-bit ACCEPT/RESID uniforms at params.pos; residual (P-Q)+ with "
       "r(x)=0. Rows whose state is not status 1, not bound to params seed/pos, malformed, or whose "
       "(P,Q) admit no coupling keep the ordinary token." },
+    { "dflash_couple_propose", kDflashParams, 8, kDflashOperands, 10,
+      "DFlash2's candidate walk, sampled: at each step Q = FP64 softmax of (unary + low-rank edge "
+      "from the previous token) / q_temp over the best eight in-vocabulary candidates, x~Q at the "
+      "draw's (seed, base, KEY_DRAFT + step + 1), x the next step's predecessor; tokens and "
+      "state[step][row] written. mode0 rows keep tokens (status 0); a Q that cannot be built or "
+      "seq_ids != draw.card takes the walk's argmax (status -1)." },
 };
 
 }  /* namespace */
 
-int rad_spechub_schema_count() { return 2; }
+int rad_spechub_schema_count() { return RAD_SPECHUB_N_OPS; }
 const RadOpSchema* rad_spechub_schema_at(int i) {
-    return i >= 0 && i < 2 ? &kSchemas[i] : nullptr;
+    return i >= 0 && i < RAD_SPECHUB_N_OPS ? &kSchemas[i] : nullptr;
 }
 
 namespace {
@@ -238,8 +263,145 @@ int rad_mtp_couple_verify_args(const RadArgs* a, RadMtpCoupleVerifyCall* out) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ dflash_couple_propose */
+
+namespace {
+
+/* The walk's geometry, shared by the shape hook and the arg reader. `range` reads M as the band's
+ * high bound (a shape hook sizes the whole band). */
+int dflash_geometry(const RadParam* p, int n, bool range, int64_t* M, int64_t* steps, int64_t* K,
+                    int64_t* R, int64_t* vocab, int64_t* astr, int64_t* rounds) {
+    if (!p) return RAD_E_INVAL;
+    *M      = range ? rad_param_getdim(p, n, "M", 0) : rad_param_geti(p, n, "M", 0);
+    *steps  = rad_param_geti(p, n, "steps", 0);
+    *K      = rad_param_geti(p, n, "top_k", 0);
+    *R      = rad_param_geti(p, n, "rank", 0);
+    *vocab  = rad_param_geti(p, n, "n_vocab", 0);
+    *astr   = rad_param_geti(p, n, "anchor_stride", 1);
+    *rounds = rad_param_geti(p, n, "max_rounds", 0);
+    if (*M < 1 || *M > INT32_MAX || *vocab < 1 || *vocab > INT32_MAX || *astr < 1)
+        return RAD_E_UNSUPPORTED;
+    if (*rounds < 1 || *rounds > RAD_MTP_COUPLE_MAX_ROUNDS || *steps < 1 || *steps > *rounds)
+        return RAD_E_UNSUPPORTED;
+    if (*K < 1 || *K > RAD_DFLASH_COUPLE_MAX_K) return RAD_E_UNSUPPORTED;
+    if (*R < RAD_DFLASH_EDGE_PARTS || *R > RAD_DFLASH_COUPLE_MAX_R || *R % RAD_DFLASH_EDGE_PARTS)
+        return RAD_E_UNSUPPORTED;
+    return RAD_OK;
+}
+
+/* A rank-2 plane of at least `rows` x `width` with a unit inner stride; its row pitch, or -1. */
+int64_t plane2(const RadTensor& t, uint32_t dtype, int64_t rows, int64_t width) {
+    if (!t.data || t.dtype != dtype || t.rank != 2) return -1;
+    if (t.shape[0] < rows || t.shape[1] < width || (t.shape[1] > 1 && t.stride[1] != 1)) return -1;
+    return t.stride[0] >= width ? t.stride[0] : -1;
+}
+
+bool dense_at_least(const RadTensor& t, uint32_t dtype, int64_t numel) {
+    if (!t.data || t.dtype != dtype || t.rank < 1) return false;
+    if (!rad_tensor_is_contiguous(&t)) return false;
+    return rad_tensor_numel(&t) >= numel;
+}
+
+}  /* namespace */
+
+int rad_dflash_couple_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
+    if (!out || i < 0 || i >= 10) return RAD_E_INVAL;
+    int64_t M, steps, K, R, v, astr, rounds;
+    const int rc = dflash_geometry(p, n, true, &M, &steps, &K, &R, &v, &astr, &rounds);
+    if (rc != RAD_OK) return rc;
+    RadOpdDesc d{};
+    d.idx_const = -1;
+    d.rank = 2;
+    switch (i) {
+    case 0: d.dtype = RAD_I32; d.shape[0] = M * steps; d.shape[1] = K;
+            d.fill = RAD_FILL_INDEX; d.idx_max = v; break;
+    case 1: d.dtype = RAD_F32; d.shape[0] = M * steps; d.shape[1] = K; break;
+    case 2: d.dtype = RAD_BF16; d.shape[0] = M * steps; d.shape[1] = R; break;
+    case 3: d.dtype = RAD_I32; d.rank = 1; d.shape[0] = M * astr;
+            d.fill = RAD_FILL_INDEX; d.idx_max = v; break;
+    case 4:
+    case 5: d.dtype = RAD_BF16; d.shape[0] = v; d.shape[1] = R; break;
+    case 6: d.dtype = RAD_I32; d.rank = 1; d.shape[0] = M;
+            d.fill = RAD_FILL_INDEX; d.idx_max = M; break;
+    case 7: d.dtype = RAD_U32; d.shape[0] = M; d.shape[1] = RAD_MTP_COUPLE_DRAW_WORDS; break;
+    case 8: d.dtype = RAD_I32; d.shape[0] = M; d.shape[1] = steps;
+            d.fill = RAD_FILL_INDEX; d.idx_max = v; break;
+    default:
+        d.dtype = RAD_U32;
+        d.rank = 3;
+        d.shape[0] = rounds;
+        d.shape[1] = M;
+        d.shape[2] = RAD_MTP_COUPLE_STATE_WORDS;
+        break;
+    }
+    *out = d;
+    return RAD_OK;
+}
+
+/* The live row count is the token plane's (one row a drafting sequence), as dflash_select takes it:
+ * RadArgs carries the band's bound for M, and the input planes are read at row s*steps+l. */
+int rad_dflash_couple_args(const RadArgs* a, RadDflashCoupleCall* out) {
+    if (!a || !a->t || !out || a->n_t != 10) return RAD_E_INVAL;
+    int64_t M, steps, K, R, v, astr, rounds;
+    int rc = dflash_geometry(a->p, a->n_p, false, &M, &steps, &K, &R, &v, &astr, &rounds);
+    if (rc != RAD_OK) return rc;
+    const RadTensor* t = a->t;
+    const int64_t live = t[8].rank == 2 ? t[8].shape[0] : 0;
+    if (live < 1 || live > M) return RAD_E_SHAPE;
+    M = live;
+    RadDflashCoupleCall c{};
+    c.M = M; c.steps = steps; c.K = K; c.R = R; c.vocab = v; c.anchor_stride = astr;
+    c.q_temp = (float)rad_param_getf(a->p, a->n_p, "q_temp", 1.0);
+    if (!(c.q_temp > 0.0f) || c.q_temp != c.q_temp || c.q_temp > 1e6f) return RAD_E_INVAL;
+    if ((c.ld_cand  = plane2(t[0], RAD_I32, M * steps, K)) < 0) return RAD_E_SHAPE;
+    if ((c.ld_unary = plane2(t[1], RAD_F32, M * steps, K)) < 0) return RAD_E_SHAPE;
+    if (t[2].data && (c.ld_hp = plane2(t[2], RAD_BF16, M * steps, R)) < 0) return RAD_E_SHAPE;
+    if (!dense_at_least(t[3], RAD_I32, (M - 1) * astr + 1)) return RAD_E_SHAPE;
+    if (!dense_at_least(t[4], RAD_BF16, v * R) || !dense_at_least(t[5], RAD_BF16, v * R))
+        return RAD_E_SHAPE;
+    if (!dense_at_least(t[6], RAD_I32, M)) return RAD_E_SHAPE;
+    if ((c.ld_draw = plane2(t[7], RAD_U32, M, RAD_MTP_COUPLE_DRAW_WORDS)) < 0) return RAD_E_SHAPE;
+    if ((c.ld_tok  = plane2(t[8], RAD_I32, M, steps)) < 0) return RAD_E_SHAPE;
+    const RadTensor& st = t[9];
+    if (!st.data || st.dtype != RAD_U32 || st.rank != 3 || st.shape[0] < steps ||
+        st.shape[1] < M || st.shape[2] != (int64_t)RAD_MTP_COUPLE_STATE_WORDS || st.stride[2] != 1 ||
+        st.stride[1] < (int64_t)RAD_MTP_COUPLE_STATE_WORDS || st.stride[0] < st.stride[1] * M)
+        return RAD_E_SHAPE;
+    /* The wire rows are loaded whole as structs with doubles. */
+    if ((uintptr_t)t[7].data % 8 || c.ld_draw % 2 || (uintptr_t)st.data % 8 || st.stride[0] % 2 ||
+        st.stride[1] % 2)
+        return RAD_E_INVAL;
+    c.cand   = (const int32_t*)t[0].data;
+    c.unary  = (const float*)t[1].data;
+    c.hp     = (const uint16_t*)t[2].data;
+    c.anchor = (const int32_t*)t[3].data;
+    c.pred   = (const uint16_t*)t[4].data;
+    c.succ   = (const uint16_t*)t[5].data;
+    c.card   = (const int32_t*)t[6].data;
+    c.draw   = (const uint32_t*)t[7].data;
+    c.tokens = (int32_t*)t[8].data;
+    c.state  = (uint32_t*)st.data;
+    c.st_round = st.stride[0];
+    c.st_row   = st.stride[1];
+    *out = c;
+    return RAD_OK;
+}
+
 RadKernelInfo rad_spechub_row(int i, RadLaunchFn launch) {
     RadKernelInfo r{};
+    if (i == 2) {
+        r.name = "spechub_dflash_couple_propose";
+        r.op = "dflash_couple_propose";
+        r.family = "draft";
+        r.computes = "DFlash2's candidate walk with x~Q per step, FP64 softmax of the edge scores";
+        r.shape = "M,steps<=max_rounds<=8,top_k<=32,rank%8==0<=512,n_vocab,anchor_stride";
+        r.dtypes = "bf16,f32,i32,u32";
+        r.domain = RAD_DOMAIN_DEVICE;
+        r.priority = 100;
+        r.launch = launch;
+        r.opd_shape = rad_dflash_couple_shape;
+        return r;
+    }
     r.name = i ? "spechub_mtp_couple_verify" : "spechub_mtp_couple_propose";
     r.op = i ? "mtp_couple_verify" : "mtp_couple_propose";
     r.family = "draft";

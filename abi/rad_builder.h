@@ -242,8 +242,9 @@ typedef struct RadBuildCtx {
 
     /* ---- appended in ABI 27 (draft coupling) */
     /* Nonzero from --draft-coupling on: a linear serial drafter samples each round's proposal from
-     * its own shortlist law and declares the planes and ops the coupled verify reads
-     * (abi/rad_spechub.h, docs/OPS.md `mtp_couple_propose`). 0, the zero-initialised default,
+     * its own shortlist law, or a block drafter's walk each position's (DFlash2), and declares the
+     * planes and ops the coupled verify reads (abi/rad_spechub.h, docs/OPS.md `mtp_couple_propose`,
+     * `dflash_couple_propose`). 0, the zero-initialised default,
      * declares the greedy drafter. A plugin that cannot couple returns RAD_E_UNSUPPORTED from
      * declare when it is set; the engine refuses a model whose program carries no coupled planes.
      *

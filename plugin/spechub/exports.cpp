@@ -26,7 +26,7 @@ int          r4d_dispatch_n   = 0;
 namespace {
 const RadPluginInfo kInfo = {
     RAD_PLUGIN_KERNEL, "spechub", "0.1.0",
-    "Linear-MTP maximal coupling: a Q draw per round and the coupled target verify", "gfx1201",
+    "Maximal coupling of speculative drafts: Q draws (MTP, DFlash2), coupled verify", "gfx1201",
 };
 }  /* namespace */
 
@@ -35,12 +35,12 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Mixed library: 0, and the per-row answer below does the classifying. */
 extern "C" int rad_plugin_reference(void) { return 0; }
 
-/* Row layout is [device 0, device 1, ref 0, ref 1] with a card, [ref 0, ref 1] without. The
- * device rows are the production kernels; the host rows are the oracle rad-kbench checks them
- * against and the only thing a card-less machine can run. */
+/* Row layout is [device 0..2, ref 0..2] with a card, [ref 0..2] without; row/op index 2 is
+ * dflash_couple_propose. The device rows are the production kernels; the host rows are the oracle
+ * rad-kbench checks them against and the only thing a card-less machine can run. */
 extern "C" int rad_kernel_reference(int i) {
 #ifdef RAD_SPECHUB_WITH_DEVICE
-    return (i == 0 || i == 1) ? 0 : 1;
+    return (i >= 0 && i < RAD_SPECHUB_N_OPS) ? 0 : 1;
 #else
     (void)i;
     return 1;
@@ -50,48 +50,41 @@ extern "C" int rad_kernel_reference(int i) {
 extern "C" int rad_kernel_schema_count(void) { return rad_spechub_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) { return rad_spechub_schema_at(i); }
 
-/* Two device rows and the two host references beside them, in that order. A card-less machine loads
- * the same library and resolves only the reference rows. */
+/* The device rows and the host references beside them, in that order. A card-less machine loads the
+ * same library and resolves only the reference rows. */
 extern "C" int rad_kernel_count(void) {
 #ifdef RAD_SPECHUB_WITH_DEVICE
-    return 4;
+    return 2 * RAD_SPECHUB_N_OPS;
 #else
-    return 2;
+    return RAD_SPECHUB_N_OPS;
 #endif
 }
 
+namespace {
+RadKernelInfo ref_row(int op, RadLaunchFn launch, const char* name) {
+    RadKernelInfo x = rad_spechub_row(op, launch);
+    x.name = name;
+    x.domain = RAD_DOMAIN_HOST;
+    x.priority = 0;
+    return x;
+}
+}  /* namespace */
+
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
-    const int op = i & 1;
 #ifdef RAD_SPECHUB_WITH_DEVICE
-    if (i == 0 || i == 1) {
-        static const RadKernelInfo r[2] = {
-            rad_spechub_row(0, rad_mine_mtp_couple_propose_launch),
-            rad_spechub_row(1, rad_mine_mtp_couple_verify_launch),
-        };
-        return &r[i];
-    }
-#endif
-    static const RadKernelInfo ref[2] = {
-        [] {
-            RadKernelInfo x = rad_spechub_row(0, rad_ref_mtp_couple_propose);
-            x.name = "ref_mtp_couple_propose";
-            x.domain = RAD_DOMAIN_HOST;
-            x.priority = 0;
-            return x;
-        }(),
-        [] {
-            RadKernelInfo x = rad_spechub_row(1, rad_ref_mtp_couple_verify);
-            x.name = "ref_mtp_couple_verify";
-            x.domain = RAD_DOMAIN_HOST;
-            x.priority = 0;
-            return x;
-        }(),
+    static const RadKernelInfo dev[RAD_SPECHUB_N_OPS] = {
+        rad_spechub_row(0, rad_mine_mtp_couple_propose_launch),
+        rad_spechub_row(1, rad_mine_mtp_couple_verify_launch),
+        rad_spechub_row(2, rad_mine_dflash_couple_launch),
     };
-#ifdef RAD_SPECHUB_WITH_DEVICE
-    if (i < 2 || i > 3) return nullptr;
-    return &ref[op];
-#else
-    if (i < 0 || i > 1) return nullptr;
-    return &ref[i];
+    if (i >= 0 && i < RAD_SPECHUB_N_OPS) return &dev[i];
+    i -= RAD_SPECHUB_N_OPS;
 #endif
+    static const RadKernelInfo ref[RAD_SPECHUB_N_OPS] = {
+        ref_row(0, rad_ref_mtp_couple_propose, "ref_mtp_couple_propose"),
+        ref_row(1, rad_ref_mtp_couple_verify, "ref_mtp_couple_verify"),
+        ref_row(2, rad_ref_dflash_couple, "ref_dflash_couple_propose"),
+    };
+    if (i < 0 || i >= RAD_SPECHUB_N_OPS) return nullptr;
+    return &ref[i];
 }

@@ -177,10 +177,11 @@ static const Flag g_flags[] = {
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
                                         "from N decoding sequences on (0 never, the default): the\n"
                                         "long block pays at one sequence, the short one at many" },
-    { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter samples each proposal\n"
-    "                                    from its own shortlist and the sampler couples the target's draw\n"
-    "                                    to it: more accepted drafts on sampled requests, the same output\n"
-    "                                    law, other tokens than off for a fixed seed" },
+    { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
+    "                                    samples each proposal from its own shortlist and the sampler\n"
+    "                                    couples the target's draw to it: more accepted drafts on sampled\n"
+    "                                    requests, the same output law, other tokens than off for a fixed\n"
+    "                                    seed" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },

@@ -421,6 +421,41 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
      * selector, never through the sampler's token buffer. */
     dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
 
+    /* --draft-coupling (RadBuildCtx::draft_coupling): the walk samples each draft from Q, its
+     * scores' softmax over the best eight candidates, and the sampler couples the target's own draw
+     * to it (abi/rad_spechub.h). The planes are named as the MTP head's, which is how the engine
+     * finds them. RADIANCE_DFLASH_Q_TEMP sets Q's temperature (default 1); any value keeps the
+     * output exact and moves only acceptance. */
+    if (ctx->draft_coupling) {
+        if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
+            dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
+            rad_note(b, "--draft-coupling on: DFlash2's coupled walk takes at most %d drafts, %d "
+                        "candidates and a selector rank that is a multiple of %d up to %d",
+                     RAD_MTP_COUPLE_MAX_ROUNDS, RAD_DFLASH_COUPLE_MAX_K, RAD_DFLASH_EDGE_PARTS,
+                     RAD_DFLASH_COUPLE_MAX_R);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (const char* e = std::getenv("RADIANCE_DFLASH_Q_TEMP")) {
+            const double t = std::strtod(e, nullptr);
+            if (!(t > 0.0) || t > 100.0) {
+                fprintf(stderr, "radiance: RADIANCE_DFLASH_Q_TEMP=%s is not a temperature in "
+                                "(0, 100]\n", e);
+                return RAD_E_INVAL;
+            }
+            dc.q_temp = t;
+        }
+        dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                 {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+        dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                 {dc.steps(), dg.max_seqs, RAD_MTP_COUPLE_STATE_WORDS},
+                                 RAD_BUF_PERSIST);
+        if (!dw.couple_draws || !dw.couple_state) return RAD_E_INVAL;
+        rad_note(b, "DFlash2 coupled: the walk samples x~Q (FP64 softmax of its edge scores / %g "
+                    "over the best eight candidates) at each of %lld positions, and the sampler "
+                    "couples the target's own draw to it; fixed-seed tokens are NOT preserved",
+                 dc.q_temp, (long long)dc.steps());
+    }
+
     RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft",
                               nm.ckpt("lm_head.weight"), dw));
     m.have_df = true;

@@ -2692,11 +2692,13 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
 | `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
+| `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
 
-`mtp_couple_propose` and `mtp_couple_verify` are the linear-MTP coupling (`--draft-coupling on`),
-and nothing else in the engine knows about coupling. Turning coupling on requires the
-linear serial draft chain: a block drafter (`RAD_DRAFT_BLOCK`) or no drafter at all is refused at
-bringup, because neither has a per-round draw to couple. The `spechub` plugin ships both rows and
+`mtp_couple_propose`, `dflash_couple_propose` and `mtp_couple_verify` are the speculative coupling
+(`--draft-coupling on`), and nothing else in the engine knows about coupling. Turning coupling on
+requires a linear chain of drafts: a serial head's rounds, or a block drafter whose architecture
+declares the coupled walk (DFlash2); no drafter, or a block drafter without the walk, is refused at
+bringup, because neither has a per-round draw to couple. The `spechub` plugin ships every row and
 their host oracle in one library and marks them per row, so the device rows count as production
 kernels while the oracle stays reference; on a machine with no card only the oracle is left, and
 the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
@@ -2713,6 +2715,22 @@ residual `(P - Q)+`. Both use 53-bit uniforms at `params.pos`; a row whose state
 that seed and position keeps the ordinary token. `P` is FP64-normalised where `sample_pick` is
 FP32/24-bit, so a coupled row realizes the ideal filtered target law and is **not** seed-identical
 to the ordinary pick.
+
+`dflash_couple_propose` is DFlash2's block walk sampled (abi/rad_spechub.h,
+`rad_dflash_couple_step`). It runs right after `dflash_select` over the same lattice, one workgroup a
+sequence. At position `l` every candidate scores `dflash_select`'s
+`unary + Σ_r pred[pid][r]·hp[l][r]·succ[cand][r]`, with `pid` the anchor at `l = 0` and the walk's
+own previous token after it; `Q_l` is the FP64 softmax of `score / q_temp` over the best eight
+in-vocabulary candidates, `x_l ~ Q_l` at the draw's `(seed, base, KEY_DRAFT + l + 1)`, and `x_l` is
+both the proposal (into `tokens`) and position `l + 1`'s predecessor. Position `l` writes the state
+row of round `l + 1`, so the engine binds and the sampler verifies it exactly as an MTP round. A
+greedy request's row (draw mode 0) keeps `dflash_select`'s tokens (`status = 0`); a draw staged for
+another card, or a position whose eight cannot form a `Q`, takes the walk's argmax (`status = -1`)
+and the ordinary verify. `Q_l` depends on the committed text and on `x_0 .. x_{l-1}`, never on the
+verify, and is stored exactly, which is all the coupling needs to be lossless; `q_temp` (the
+architecture's, `RADIANCE_DFLASH_Q_TEMP` on Qwen3.5/3.8) moves acceptance only. Each edge is eight
+partial `fmaf` chains over contiguous slices of the rank, added in order, so the device kernel and
+the host oracle agree bit for bit.
 
 `sample_temp` divides a row's logits by its `temp` and leaves a row whose `temp` is 0 or less, or
 exactly 1, as it is. The sampler relies on that: a step none of whose chain rows has another

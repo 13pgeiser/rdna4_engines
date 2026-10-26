@@ -1,4 +1,4 @@
-/* plugin/spechub/spechub.hip -- the device launches for the two coupling ops.
+/* plugin/spechub/spechub.hip -- the device launches for the coupling ops.
  *
  * The propose kernel is one thread a row over abi/rad_spechub.h's helpers. The verify is one
  * workgroup a row: the masses are computed in parallel, and the sums and walks run on one thread
@@ -152,7 +152,201 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     c.token[row * c.ld[4]] = out;
 }
 
+/* DFlash2's coupled walk: one workgroup a sequence. Per step the workgroup forms the
+ * candidate-independent half `sa` of the edge, then thread (c, j) computes part j of candidate c's
+ * edge (rad_dflash_edge_part, the host's serial fmaf chain over the same slice), and thread 0 adds
+ * the parts in order, takes the step (rad_dflash_couple_step) and publishes the token as the next
+ * predecessor. The arithmetic and its order are the host reference's, so tokens and states match
+ * rad_ref_dflash_couple bit for bit. */
+constexpr int kDfThreads = RAD_DFLASH_COUPLE_MAX_K * RAD_DFLASH_EDGE_PARTS;   /* 256 */
+
+__global__ __launch_bounds__(kDfThreads) void dflash_couple(
+    const int32_t* cand, const float* unary, const uint16_t* hp, const int32_t* anchor,
+    const uint16_t* pred, const uint16_t* succ, const int32_t* card, const uint32_t* draw,
+    int32_t* tokens, uint32_t* state, int64_t steps, int64_t K, int64_t R, int64_t vocab,
+    int64_t astr, int64_t ld_cand, int64_t ld_unary, int64_t ld_hp, int64_t ld_draw,
+    int64_t ld_tok, int64_t st_round, int64_t st_row, float q_temp) {
+    __shared__ float   sa[RAD_DFLASH_COUPLE_MAX_R];
+    __shared__ float   part[kDfThreads];
+    __shared__ float   sc[RAD_DFLASH_COUPLE_MAX_K];
+    __shared__ int32_t sid[RAD_DFLASH_COUPLE_MAX_K];
+    __shared__ int32_t spid;
+    /* The step's Q in the making: its live (id, score / q_temp) in selection order, their count
+     * (-1: no Q), the top score, the FP64 weights, their sum and the normalised q. */
+    __shared__ int32_t lid[8], slot_id[8];
+    __shared__ float   lv[8], slot_v[8];
+    __shared__ int     sn;
+    __shared__ float   stop;
+    __shared__ double  w[8], wq[8], ssum;
+    __shared__ RadMtpCoupleState sst;
+    const int64_t s   = blockIdx.x;
+    const int     tid = threadIdx.x;
+    const RadMtpCoupleDraw d = *reinterpret_cast<const RadMtpCoupleDraw*>(draw + s * ld_draw);
+    int32_t* tok = tokens + s * ld_tok;
+    uint32_t* st0 = state + s * st_row;
+    if (d.mode != 1) {
+        /* A greedy request: dflash_select's walk stands, and each round records it (status 0). */
+        if (tid == 0)
+            for (int64_t l = 0; l < steps; ++l)
+                (void)rad_dflash_couple_step(sc, sid, (int)K, q_temp, d, false, (int)l + 1, vocab,
+                                             tok[l],
+                                             reinterpret_cast<RadMtpCoupleState*>(st0 + l * st_round));
+        return;
+    }
+    const bool card_ok = d.card == card[s];
+    if (tid == 0) spid = anchor[s * astr];
+    __syncthreads();
+    const int c = tid / RAD_DFLASH_EDGE_PARTS, j = tid % RAD_DFLASH_EDGE_PARTS;
+    for (int64_t l = 0; l < steps; ++l) {
+        const int64_t row = s * steps + l;
+        const int32_t pid = spid;
+        const bool ok = pid >= 0 && pid < vocab;
+        for (int64_t r = tid; r < R; r += kDfThreads)
+            sa[r] = ok ? rad_dflash_bf2f(pred[(int64_t)pid * R + r]) *
+                             (hp ? rad_dflash_bf2f(hp[row * ld_hp + r]) : 1.0f)
+                       : 0.0f;
+        __syncthreads();
+        if (c < K) {
+            const int32_t id = cand[row * ld_cand + c];
+            float pv = 0.0f;
+            if (id >= 0 && id < vocab) {
+                const uint16_t* srow = succ + (int64_t)id * R;
+                if (R == 32 * RAD_DFLASH_EDGE_PARTS) {
+                    /* DFlash2's rank 256: the slice's 32 values in four 16-byte loads issued
+                     * together, then rad_dflash_edge_part's fmaf chain over them in its order. A
+                     * load inside the chain would wait out one memory latency per element. */
+                    const uint4* src = reinterpret_cast<const uint4*>(srow + j * 32);
+                    uint4 v[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) v[i] = src[i];
+                    const uint16_t* h = reinterpret_cast<const uint16_t*>(v);
+                    const float* a = sa + j * 32;
+#pragma unroll
+                    for (int r = 0; r < 32; ++r) pv = fmaf(a[r], rad_dflash_bf2f(h[r]), pv);
+                } else {
+                    pv = rad_dflash_edge_part(sa, srow, R, j);
+                }
+            }
+            part[tid] = pv;
+            if (j == 0) sid[c] = id;
+        }
+        __syncthreads();
+        /* Each candidate's score from its parts, in the host's order. */
+        if (tid < K) {
+            float acc = 0.0f;
+            if (sid[tid] >= 0 && sid[tid] < vocab)
+                for (int q = 0; q < RAD_DFLASH_EDGE_PARTS; ++q)
+                    acc += part[tid * RAD_DFLASH_EDGE_PARTS + q];
+            sc[tid] = unary[row * ld_unary + tid] + acc;
+        }
+        if (tid < 8) slot_id[tid] = -2;
+        __syncthreads();
+        RadMtpCoupleState* so = reinterpret_cast<RadMtpCoupleState*>(st0 + l * st_round);
+        /* rad_dflash_couple_step, spread over the workgroup: one lane walking the selection and
+         * build_q's FP64 work serially waits out an LDS or FP64 latency per element. Each operation
+         * and its order are the helper's, so the bits are too.
+         *
+         * The eight: candidate k's place is the number of eligible candidates ahead of it (a higher
+         * score, or an equal one at a lower index), which is exactly the order the helper's repeated
+         * first-maximum scan takes them in. */
+        if (tid < K) {
+            const int32_t id = sid[tid];
+            const float   v  = sc[tid];
+            if (id >= 0 && id < vocab && v == v) {
+                int rank = 0;
+                for (int k = 0; k < K; ++k) {
+                    const int32_t ik = sid[k];
+                    const float   vk = sc[k];
+                    rank += (ik >= 0 && ik < vocab && vk == vk && (vk > v || (vk == v && k < tid)));
+                }
+                if (rank < 8) { slot_id[rank] = id; slot_v[rank] = v / q_temp; }
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            sn = -1;
+            if (card_ok) {
+                int live = 0;
+                bool bad = false;
+                for (int n = 0; n < 8 && slot_id[n] != -2; ++n) {
+                    const float v = slot_v[n];
+                    /* build_q: +inf refuses the whole Q, -inf carries no mass, a repeat refuses. */
+                    if (v == INFINITY) { bad = true; break; }
+                    if (v == -INFINITY) continue;
+                    for (int i = 0; i < live; ++i) bad = bad || lid[i] == slot_id[n];
+                    if (bad) break;
+                    lid[live] = slot_id[n];
+                    lv[live++] = v;
+                }
+                if (!bad && live > 0) {
+                    float top = lv[0];
+                    for (int i = 1; i < live; ++i)
+                        if (lv[i] > top) top = lv[i];
+                    stop = top;
+                    sn = live;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 8 && tid < sn) w[tid] = ::exp((double)lv[tid] - stop);
+        __syncthreads();
+        if (tid == 0 && sn > 0) {
+            double sum = 0;
+            for (int i = 0; i < sn; ++i) sum += w[i];
+            ssum = sum;
+        }
+        __syncthreads();
+        if (tid < 8 && tid < sn) wq[tid] = w[tid] / ssum;
+        __syncthreads();
+        /* The state is built in LDS: a private struct indexed by a runtime count lives in scratch,
+         * and every access to it is a memory round trip. */
+        if (tid == 0) {
+            RadMtpCoupleState& s = sst;
+            s.draw = d;
+            s.pos = 0;
+            s.round = (int)l + 1;
+            s.status = -1;
+            s.count = 0;
+            for (int i = 0; i < 8; ++i) { s.ids[i] = -1; s.q[i] = 0; }
+            for (int i = 0; i < sn; ++i)
+                if (wq[i] > 0) { s.ids[s.count] = lid[i]; s.q[s.count++] = wq[i]; }
+            if (s.count > 0) {
+                const double u = rad_spechub_uniform(d.seed, d.base,
+                                                     RAD_MTP_COUPLE_KEY_DRAFT + (uint64_t)(l + 1));
+                s.x = s.ids[rad_mtp_couple_pick(s, u)];
+                s.status = 1;
+            } else {
+                s.count = 0;
+                for (int i = 0; i < 8; ++i) { s.ids[i] = -1; s.q[i] = 0; }
+                int   best = 0;
+                float bv = -INFINITY;
+                for (int k = 0; k < K; ++k)
+                    if (sc[k] > bv) { bv = sc[k]; best = k; }
+                s.x = sid[best];
+            }
+            tok[l] = s.x;
+            spid = s.x;
+        }
+        __syncthreads();
+        /* One word a lane out to the state plane. */
+        if (tid < (int)RAD_MTP_COUPLE_STATE_WORDS)
+            reinterpret_cast<uint32_t*>(so)[tid] = reinterpret_cast<const uint32_t*>(&sst)[tid];
+        /* The next step reads spid and overwrites sa, part and the Q scratch (the copy above reads
+         * sst, which the next step writes only after its own barriers). */
+    }
+}
+
 }  /* namespace */
+
+int rad_mine_dflash_couple_launch(const RadArgs* a, RadStream stream) {
+    RadDflashCoupleCall c{};
+    const int rc = rad_dflash_couple_args(a, &c);
+    if (rc != RAD_OK) return rc;
+    return R4D_EMIT(stream, dflash_couple, dim3((unsigned)c.M), dim3(kDfThreads), 0,
+                    c.cand, c.unary, c.hp, c.anchor, c.pred, c.succ, c.card, c.draw, c.tokens,
+                    c.state, c.steps, c.K, c.R, c.vocab, c.anchor_stride, c.ld_cand, c.ld_unary,
+                    c.ld_hp, c.ld_draw, c.ld_tok, c.st_round, c.st_row, c.q_temp);
+}
 
 int rad_mine_mtp_couple_propose_launch(const RadArgs* a, RadStream stream) {
     RadMtpCoupleProposeCall c{};
