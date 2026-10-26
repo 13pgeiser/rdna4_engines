@@ -6009,13 +6009,30 @@ pub(crate) fn apply_http_reasoning_request(
                             }
                         }
                         "high" | "max" | "minimal" | "med" => {
+                            // Off-ladder aliases normalize to the nearest
+                            // supported tier instead of dropping to the
+                            // default, so intent-ordered clients
+                            // (minimal<low<medium<high<xhigh<max) keep their
+                            // ordering. When the model's advertised ladder
+                            // excludes the nearest tier, fall as before.
+                            let nearest: &str = match raw.as_str() {
+                                "minimal" => "low",
+                                "med" => "medium",
+                                _ => "xhigh",
+                            };
+                            let target = if !supported_efforts.is_empty()
+                                && !supported_efforts.iter().any(|e| e == nearest)
+                            {
+                                QWEN_JINJA_DEFAULT_EFFORT
+                            } else {
+                                nearest
+                            };
                             push_warn(format!(
-                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                "reasoning_effort '{}' normalized to {target} (qwen_jinja ladder is low|medium|xhigh)",
                                 raw
                             ));
-                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
-                            request["reasoning_effort"] =
-                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
+                            effective_effort = Some(target.to_string());
+                            request["reasoning_effort"] = serde_json::json!(target);
                         }
                         "native" => {
                             push_warn(format!(
@@ -19922,6 +19939,50 @@ effort = "high"
         )
         .unwrap_err();
         assert!(format!("{err3}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_qwen_jinja_off_ladder_effort_normalizes_to_nearest() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for (raw, want) in [
+            ("high", "xhigh"),
+            ("max", "xhigh"),
+            ("med", "medium"),
+            ("minimal", "low"),
+        ] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": raw }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], want, "{raw}");
+            assert_eq!(res.effective_effort.as_deref(), Some(want), "{raw}");
+            assert!(
+                res.warnings.iter().any(|w| w.contains("normalized")),
+                "{raw}"
+            );
+        }
+        // A restricted ladder that excludes the nearest tier still falls to the
+        // qwen_jinja default.
+        let restricted = vec!["low".to_string(), "medium".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &restricted,
+        )
+        .unwrap();
+        assert_eq!(req["reasoning_effort"], "medium");
+        assert_eq!(res.effective_effort.as_deref(), Some("medium"));
     }
 
     #[test]

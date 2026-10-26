@@ -4056,8 +4056,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
             [
                 "attention_verify_wmma_pv1s_d4_gfx1151",
+                "attention_verify_wmma_pv1s_d4_hd128_gfx1151",
                 "attention_verify_wmma_pv2_d2_gfx1151",
+                "attention_verify_wmma_pv2_d2_hd128_gfx1151",
                 "attention_verify_wmma_qk_gfx1151",
+                "attention_verify_wmma_qk_hd128_gfx1151",
             ]
         );
         add!(

@@ -101,6 +101,8 @@ jobs:
         run: cargo test --locked -p rdna-compute --test dflash_accept_emu
       - name: Run MoE launcher ABI test (no GPU)
         run: cargo test --locked -p rdna-compute --test all_launcher_abi
+      - name: Run NPU transport CPU tests
+        run: cargo test --locked -p npu-tools --bin npu-trunk-transport
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
