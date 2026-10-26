@@ -636,6 +636,7 @@ fn moe_params_for_decode<'a>(
     });
     hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
+        mq2_lloyd: None,
         recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
             bf16_round_trip: false,
             shared_after_combine: false,
