@@ -3047,6 +3047,9 @@ fn resolve_route_plan(
             }
         }
     }
+    // The tower's kernels are outside the closed route plan whether the tower
+    // is resident or streamed, so every non-`off` mode that resolves a tower
+    // (`auto`, `resident`, `on`) falls back to the ordinary loader.
     if req.vision_path.is_some()
         || hfq
             .find_tensor_info("model.visual.patch_embed.proj.weight")
@@ -3725,6 +3728,7 @@ pub fn load_admitted_with_gemma4_drafter(
                 model_ctx: s.model_ctx,
                 automatic: s.bound != "user",
                 card_cap: 0,
+                reserve_bytes: 0,
             }),
         deepseek4_compute_placement,
         deepseek4_experts_per_token,

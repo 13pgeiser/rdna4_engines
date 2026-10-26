@@ -228,7 +228,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--dspark-conf-threshold <f>` | DSpark confidence cutoff in `[0,1]` (qwen3 + deepseek4). |
 | `--system <text>` | System prompt. |
 | `--image <path>` | Vision input (when the model supports it). |
-| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off`; required when `on`; used under the default `auto`. Also accepted by `serve` (where `serve -d` does not forward it to the detached child). |
+| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off`; required when `on`; used under the default `auto` and under `resident`. Also accepted by `serve` (where `serve -d` does not forward it to the detached child). |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
 | `--stats` | Emit one statistics footer on stderr after successful generation (local or HTTP, streaming or `--no-stream`); generated stdout is unchanged. Suppressed with `--json` and on failed/aborted generation. |
@@ -865,7 +865,7 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_SPECULATION=...` | Speculation selector from the environment: overrides per-model and global config; a CLI `--spec` still wins. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
 | `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |
-| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `off` / `auto` (default) / `on`. |
+| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `auto` (default) / `resident` / `on` / `off`. |
 | `HIPFIRE_DFLASH_MODE=...` | Daemon-side mode (CLI default config is still `off`). |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry. |
 | `HIPFIRE_REGISTRY_URL=...` | Alternate registry URL. |

@@ -5259,13 +5259,14 @@ fn resolve_xdna_sidecar(
 /// Call only once the final `vision_mode` is known (`load_params` projects it
 /// from `vision.mode`). `off` is a hard override mirroring the daemon's
 /// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
-/// one. `auto` uses the registry/sibling sidecar when present and runs
-/// silently text-only when absent. `on` requires the declared sidecar and
+/// one. `auto` and `resident` use the registry/sibling sidecar when present
+/// and run silently text-only when absent (they differ only in tower
+/// residency, decided at load). `on` requires the declared sidecar and
 /// fails the load closed when it cannot be resolved (same shape as the
 /// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
 /// and is unaffected by this key under every mode.
 ///
-/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// Priority under `auto`/`resident`/`on`: an already-projected `params["vision"]`
 /// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
 /// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
 /// `entry.vision`, looked up in `models_dir` first — `find_model_path`
@@ -5287,7 +5288,7 @@ fn resolve_vision_sidecar(
     let mode = params["vision_mode"]
         .as_str()
         .unwrap_or(hipfire_config::vision_mode_default());
-    if !matches!(mode, "off" | "auto" | "on") {
+    if !matches!(mode, "off" | "auto" | "resident" | "on") {
         return Ok(());
     }
     if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
@@ -13483,6 +13484,41 @@ effort = "high"
         fs::remove_dir_all(&paths.root).unwrap();
     }
     #[test]
+    pub(crate) fn resident_vision_mode_projects_and_resolves_like_auto() {
+        let paths = test_paths("vision-sidecar-resident");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(&entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some("qwen3.8:27b"),
+                false,
+                None,
+            )
+        };
+        let resolved = resolved_with_vision_mode("resident");
+        let missing = load(&resolved).unwrap();
+        assert_eq!(missing["vision_mode"], "resident");
+        assert!(
+            missing.get("vision").is_none(),
+            "missing sidecar stays text-only"
+        );
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let present = load(&resolved).unwrap();
+        assert_eq!(present["vision_mode"], "resident");
+        assert_eq!(present["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
     pub(crate) fn derived_packs_finds_the_tower_pack_beside_the_trunk() {
         // `hipfire quantize --install` must carry the arch-18 `.vl` pack the
         // quantizer wrote beside the trunk: installing the trunk alone left the
@@ -13519,7 +13555,7 @@ effort = "high"
         let pack = paths.models.join("embeddinggemma-2.vl");
         fs::write(&pack, b"towers").unwrap();
         let entry = vision_sidecar_entry("embeddinggemma-2.vl");
-        for mode in ["auto", "on"] {
+        for mode in ["auto", "resident", "on"] {
             let params = embed_load_params(
                 &resolved_with_vision_mode(mode),
                 Some(&entry),

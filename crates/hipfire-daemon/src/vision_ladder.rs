@@ -10,7 +10,7 @@ use hipfire_config::developer_var;
 ///
 /// `off` is a hard override that drops even an explicit
 /// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
-/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
+/// Every other mode (`auto`, `resident`, `on`) passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
 /// ladder result through untouched. Pure string plumbing — no arch or
 /// tensor knowledge; admission still validates the surviving path.
 pub(crate) fn apply_vision_mode_gate(

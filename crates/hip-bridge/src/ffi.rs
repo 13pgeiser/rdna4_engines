@@ -3304,6 +3304,19 @@ impl HipRuntime {
         self.check(code, "hipStreamWaitEvent")
     }
 
+    /// [`Self::stream_wait_event`] on an optional stream: `None` is the
+    /// legacy/default (null) stream, the one `rdna_compute::Gpu` launches on
+    /// while it has no active stream.
+    pub fn stream_wait_event_on(&self, stream: Option<&Stream>, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitEvent")?;
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
+        let code = unsafe { (self.fn_stream_wait_event)(stream_raw, event.0, 0) };
+        self.check(code, "hipStreamWaitEvent")
+    }
+
     // ── Error query ─────────────────────────────────────────────
 
     pub fn last_error(&self) -> u32 {

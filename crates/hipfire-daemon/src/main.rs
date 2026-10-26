@@ -590,7 +590,7 @@ fn media_refusal_message(tower: MediaTower, vision_gated_off: Option<&str>) -> S
     let noun = tower.noun();
     match vision_gated_off {
         Some(sidecar) => format!(
-            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `resident`/`on`) and reload"
         ),
         None => format!("model has no {noun} encoder"),
     }
@@ -5036,8 +5036,8 @@ mod tests {
     }
 
     #[test]
-    fn vision_mode_auto_and_on_pass_the_ladder_result_through() {
-        for mode in ["auto", "on"] {
+    fn vision_mode_auto_resident_and_on_pass_the_ladder_result_through() {
+        for mode in ["auto", "resident", "on"] {
             assert_eq!(
                 apply_vision_mode_gate(mode, Some("/models/qwen3.8-27b-vision.hfq".into())),
                 Some("/models/qwen3.8-27b-vision.hfq".to_owned())
