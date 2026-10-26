@@ -169,9 +169,11 @@ The same candidate was **7.2% slower on the designated PCI `0f:00.0` card**. A f
 on that card measured **110.311 tok/s**, within 0.44% of the initial 109.834 tok/s result. The older
 115.678 tok/s untuned run was on PCI `06:00.0`, so the earlier 115-versus-109 comparison was
 confounded by card/operating-point differences, not evidence that splitting the branch caused a
-regression. This isolates a material card-dependent decode difference; it does **not** identify
-whether power limit, clocks, thermals, or silicon variation caused it. Per-run power/clock
-telemetry was not captured, and PCIe bandwidth is not established as the cause. Raw-request repeats
+regression. All three R9700 UUIDs are configured for PPT0=210 W in
+`/usr/local/sbin/gpu-power-caps`; its AMD cap loop runs before the separate NVIDIA stage where the
+service fails. So a different *configured* cap is not established as the cause. Per-run live
+cap/clock telemetry was not captured; card-specific boost, thermal/board behavior, or silicon
+variation could still matter. PCIe bandwidth is not established as the cause. Raw-request repeats
 that reused 10,000 cached prompt tokens are retained separately and excluded from this comparison.
 
 Additional compatibility smokes using the same candidate build passed for the local Qwen4Exp W5
