@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -267,12 +268,28 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
 
 /* The quantisation descriptor, which with the architecture selects the plugin (spec §2.4): the
  * quant_method plus its fmt ("fp8_e4m3"), so the checkpoint, not a flag, distinguishes fp8 from
- * bf16 releases. */
+ * bf16 releases.
+ *
+ * A Gemma 4 E2B/E4B checkpoint states no quantization_config: it is the bf16 release that
+ * arch/gemma4_bf16 serves as compressed-tensors, which is what rad-convert's
+ * `--set quantization_config.quant_method=compressed-tensors` said by hand. Its per-layer
+ * embeddings or shared KV layers name the E form; arch/gemma4 serves only the 26B-A4B/31B shape
+ * and refuses those two keys, so the bare (gemma4, "") descriptor must not win. */
 std::string quant_descriptor(const MetaOwn& m) {
     std::string q;
     if (const char* qm = m.get("quantization_config.quant_method")) {
         q = qm;
         if (const char* fm = m.get("quantization_config.fmt")) { q += "_"; q += fm; }
+        return q;
+    }
+    if (m.arch == "gemma4") {
+        auto gi = [&](const char* k) -> int64_t {
+            const char* v = m.get(std::string("text_config.") + k);
+            if (!v) v = m.get(k);
+            return v ? std::strtoll(v, nullptr, 10) : 0;
+        };
+        if (gi("hidden_size_per_layer_input") > 0 || gi("num_kv_shared_layers") > 0)
+            q = "compressed-tensors";
     }
     return q;
 }

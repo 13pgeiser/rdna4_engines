@@ -1078,10 +1078,14 @@ reads change no value; on 4x R9700 the 31B with DFlash2 decoded 15% faster with 
 a drafter about 2%.
 
 **The E2B/E4B form.** `arch/gemma4_bf16` serves Gemma 4's small dense form (tested on
-NVIDIA-Nemotron-3.5-Bolt-E4B, `deploy/compose/nemotron-3.5-bolt-e4b-bf16.yaml`) at one rank:
+NVIDIA-Nemotron-3.5-Bolt-E4B, `deploy/compose/nemotron-3.5-bolt-e4b-bf16.yaml`, and on Google's
+gemma-4-E2B-it) at one rank:
 - KV-shared layers: from layer `n_layer - num_kv_shared_layers` on, a layer projects q only and
   attends over the cache of the last earlier layer of its class that keeps one (E4B: sliding layers
   read 22, full layers 23). Shared layers are not bound to a KV group, so their pages hold nothing.
+- Double-wide MLP (`use_double_wide_mlp`, E2B): those same layers have 2 * `intermediate_size` in
+  both projections. Each layer declares its own weight shapes and op widths, and the two widths keep
+  a pair of activation buffers each.
 - Per-layer embeddings (`hidden_size_per_layer_input`): a token table scaled by sqrt(width), plus
   the normed projection of the scaled embedding, mixed at 2^-0.5. Each layer runs a branch after
   its feed-forward: gate, gelu times its slice, projection, norm, add. On a w4a8 or w8a8 trunk

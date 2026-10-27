@@ -4469,6 +4469,27 @@ RadModelMeta gemma4_e4b_meta() {
     return m;
 }
 
+/* E2B: the same twelve layers with `use_double_wide_mlp`, so the four KV-shared layers (8..11)
+ * declare 2 * intermediate_size (transformers' Gemma4TextMLP). */
+RadModelMeta gemma4_e2b_meta() {
+    static const std::vector<const char*> keys = [] {
+        std::vector<const char*> v(std::begin(k_gem4e_keys), std::end(k_gem4e_keys));
+        v.push_back("use_double_wide_mlp");
+        return v;
+    }();
+    static const std::vector<const char*> vals = [] {
+        std::vector<const char*> v(std::begin(k_gem4e_vals), std::end(k_gem4e_vals));
+        v.push_back("true");
+        return v;
+    }();
+    RadModelMeta m = gemma4_e4b_meta();
+    m.name   = "test-gemma4-e2b-form";
+    m.n_kv   = (int)keys.size();
+    m.kv_key = keys.data();
+    m.kv_val = vals.data();
+    return m;
+}
+
 /* Layers 8..11 keep no cache: only 0..7 are bound, and each shared layer's attention reads the last
  * earlier layer of its class that keeps one (sliding 8..10 -> 7, global 11 -> 5). Every layer runs
  * the per-layer branch (gate, gelu times its slice, projection, norm, add), and the step lints
@@ -4678,6 +4699,54 @@ TEST(the_gemma4_e4b_form_replicates_kv_heads_at_four_ranks) {
                      (int)(2 + 2 * L));
         }
     }
+}
+
+/* A double-wide MLP is per layer: layers 0..7 declare gate_up [2F, E] and down [E, F] with F =
+ * intermediate_size, layers 8..11 [4F, E] and [E, 2F], and every activation op carries its layer's
+ * width. The shared `gate_up` and `ffn` buffers hold the widest layer, so a narrow layer's slice
+ * keeps the wide row pitch. */
+TEST(a_gemma4_e2b_form_declares_the_double_wide_layers) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_e2b_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    const int64_t E = meta.n_embd, F = meta.n_ff;
+    for (int l : { 0, 7, 8, 11 }) {
+        const int64_t w = l >= 8 ? 2 * F : F;
+        const RecWeight* gu = find_w(b, "blk." + std::to_string(l) + ".ffn_gate_up.weight");
+        const RecWeight* dn = find_w(b, "blk." + std::to_string(l) + ".ffn_down.weight");
+        REQUIRE(gu != nullptr && dn != nullptr);
+        CHECK_EQ(gu->d.shape[0], 2 * w);
+        CHECK_EQ(gu->d.shape[1], E);
+        CHECK_EQ(gu->d.n_row_parts, 2);
+        CHECK_EQ(gu->d.row_parts[0], w);
+        CHECK_EQ(gu->d.row_parts[1], w);
+        CHECK_EQ(dn->d.shape[0], E);
+        CHECK_EQ(dn->d.shape[1], w);
+    }
+    for (int l = 0; l < 12; ++l) {
+        const RecOp* act = find_op(b, "gelu_mul", l);
+        REQUIRE(act != nullptr);
+        CHECK_EQ(pint(act, "n"), l >= 8 ? 2 * F : F);
+    }
+    /* The narrow and the wide layers keep their own pair, since a GEMM reads its activation packed. */
+    const RecBuf* gu = find_b(b, "gate_up");
+    const RecBuf* ff = find_b(b, "ffn");
+    const RecBuf* guw = find_b(b, "gate_up_wide");
+    const RecBuf* ffw = find_b(b, "ffn_wide");
+    REQUIRE(gu != nullptr && ff != nullptr && guw != nullptr && ffw != nullptr);
+    CHECK_EQ(gu->d.shape[0], ctx.max_tok);
+    CHECK_EQ(gu->d.shape[1], 2 * F);
+    CHECK_EQ(ff->d.shape[1], F);
+    CHECK_EQ(guw->d.shape[1], 4 * F);
+    CHECK_EQ(ffw->d.shape[1], 2 * F);
+
+    RadBatch batch = decode_batch();
+    RadCtx c{ .b = &b, .batch = &batch, .world = 1 };
+    gemma4_bf16::step(&c, &batch);
+    CHECK_LINT(b, &c);
+    CHECK(c.step_fail.empty());
 }
 
 /* A world the heads do not divide over, and a model whose every layer shares KV, are refused. */

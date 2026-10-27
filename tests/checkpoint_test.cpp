@@ -165,6 +165,47 @@ TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
 }
 
+/* Google's bf16 E2B needs no `--set quantization_config.quant_method`: its per-layer embeddings
+ * name the E form, which arch/gemma4 refuses and arch/gemma4_bf16 serves. */
+TEST(a_gemma4_e2b_checkpoint_selects_the_bf16_plugin_on_its_own) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":1536,"
+        "\"intermediate_size\":6144,\"hidden_size_per_layer_input\":256,"
+        "\"num_kv_shared_layers\":20,\"use_double_wide_mlp\":true}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("gemma4"));
+    CHECK_EQ(ck.meta().quant, std::string("compressed-tensors"));
+}
+
+/* E4B states shared KV layers without per-layer embeddings; either key selects the same plugin. */
+TEST(a_gemma4_e4b_checkpoint_selects_the_bf16_plugin_on_its_own) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":2560,"
+        "\"intermediate_size\":10240,\"num_kv_shared_layers\":6,"
+        "\"use_double_wide_mlp\":false}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().quant, std::string("compressed-tensors"));
+    /* The rule is gemma4's: another architecture with the same key keeps its own descriptor. */
+    const std::string other = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"ltx2\",\"text_config\":{\"num_kv_shared_layers\":6}}");
+    Checkpoint ok;
+    REQUIRE_EQ(ok.open(other), RAD_OK);
+    CHECK_EQ(ok.meta().quant, std::string());
+}
+
+/* The 26B-A4B/31B shape declares neither key and keeps the bare descriptor arch/gemma4 owns. */
+TEST(a_gemma4_31b_checkpoint_keeps_the_bare_descriptor) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":5376,"
+        "\"intermediate_size\":21504,\"num_hidden_layers\":62}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("gemma4"));
+    CHECK_EQ(ck.meta().quant, std::string());
+}
+
 TEST(a_plain_tensor_is_its_own_encoding_and_reads_back_as_itself) {
     const std::string dir = write_checkpoint({ bf16("a.weight", { 4, 8 }, 1.0f) }, "{}");
     Checkpoint ck;

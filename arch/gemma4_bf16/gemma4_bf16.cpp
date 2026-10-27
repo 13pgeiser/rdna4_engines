@@ -57,6 +57,15 @@ static int g4_parse_types(const char* lt, int64_t n, std::vector<int>& is_global
     return RAD_OK;
 }
 
+/* A config boolean, flattened as "true"/"false" (`use_double_wide_mlp`). */
+static bool g4_getb(const RadModelMeta* m, const char* k, bool dflt) {
+    const char* s = meta_text_gets(m, k, nullptr);
+    if (!s) return dflt;
+    if (!std::strcmp(s, "true") || !std::strcmp(s, "True")) return true;
+    if (!std::strcmp(s, "false") || !std::strcmp(s, "False") || !std::strcmp(s, "null")) return false;
+    return std::atoll(s) != 0;
+}
+
 static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
                        std::vector<int>& is_global) {
     const char* lt = meta_text_gets(m, "layer_types", nullptr);
@@ -996,7 +1005,7 @@ struct Gemma4Mlp {
     struct Wire { rad_buf x = 0, h = 0, gu = 0, ffn = 0; };
 
     Wire  w{};
-    Geom  g{};
+    Geom  g{};              /* g.n_ff is this layer's width (double-wide layers are wider) */
     int   layer = 0;
     rad_weight w_norm = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_gu{}, ln_down{};      /* the GEMM weights (bf16 or w4a8) */
@@ -1008,7 +1017,8 @@ struct Gemma4Mlp {
     rad_op     op_pf = 0;
     rad_weight pf_w  = 0;
 
-    int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre);
+    int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre,
+                 int64_t n_ff);
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
               bool ar_fused = false) const;
     /* For the prefill overlap, over rows [r0, r0 + n): the arm from the pair a junction wrote to
@@ -1037,8 +1047,9 @@ void Gemma4Mlp::tail(RadCtx* c, int64_t r0, int64_t n) const {
                 brow_slice(w.x, r0, n, E));
 }
 
-int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre) {
-    g = geom; layer = l; w = wire;
+int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
+                       const char* pre, int64_t n_ff) {
+    g = geom; layer = l; w = wire; g.n_ff = n_ff;
 
     /* The norms: always bf16 (no rule matches them), name map first. */
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_norm.weight", l), nm.ckpt("%s.%lld.pre_feedforward_layernorm.weight", pre, (long long)l)));
@@ -1738,6 +1749,9 @@ struct Model {
     rad_buf b_qg = 0, b_kg = 0, b_vg = 0, b_atting = 0;  /* global rows  */
     rad_buf b_qkvs = 0, b_qkvg = 0;   /* the fused projections' rows, where a layer has one */
     rad_buf b_gu = 0, b_ffn = 0;
+    /* ...and the double-wide layers' own pair, since a GEMM reads its activation packed (a narrow
+     * layer in the wide buffer would read a padded row). Declared only for use_double_wide_mlp. */
+    rad_buf b_gu_w = 0, b_ffn_w = 0;
 
     rad_weight w_tok = 0, w_out = 0, w_lm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final = 0, op_gather = 0, op_logits = 0, op_cap = 0;
@@ -2130,6 +2144,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* A double-wide MLP (use_double_wide_mlp, Gemma 4 E2B): the layers from first_shared on have
+     * 2 * intermediate_size, as transformers' Gemma4TextMLP builds them (`use_double_wide_mlp and
+     * is_kv_shared_layer`). Each layer declares its own weights and op widths, and the two widths
+     * keep a pair of activation buffers each (b_gu_w). */
+    const bool wide_mlp = g4_getb(meta, "use_double_wide_mlp", false) && kv_shared > 0;
+    const int64_t n_ff_wide = 2 * g.n_ff;
+
     /* The sliding class comes from geom_from (head_dim 256, 16 kv heads, full rotation, theta_s);
      * the global class is built from the container header. */
     m.cs.n_head = g.n_head;      m.cs.n_head_kv = g.n_head_kv; m.cs.head_dim = g.head_dim;
@@ -2169,6 +2190,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_atting= decl_b(b, nm.f("attn_outg"),  g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_gu   = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.b_ffn  = decl_b(b, nm.f("ffn"),     g.act_dtype, {g.max_tok, g.n_ff});
+    if (wide_mlp) {
+        m.b_gu_w  = decl_b(b, nm.f("gate_up_wide"), g.act_dtype, {g.max_tok, 2 * n_ff_wide});
+        m.b_ffn_w = decl_b(b, nm.f("ffn_wide"),     g.act_dtype, {g.max_tok, n_ff_wide});
+        if (!m.b_gu_w || !m.b_ffn_w) return RAD_E_INVAL;
+    }
     m.b_hout = decl_b(b, nm.f("h_out"),   g.act_dtype, {g.max_logit_rows, g.n_embd});
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
@@ -2336,7 +2362,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (kv_src[(size_t)l] < 0) RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
                                       lay.global ? &m.b_qkvg : &m.b_qkvs, kv_src[(size_t)l]));
-        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
+        /* The double-wide layers write their own pair of buffers (see b_gu_w). */
+        Gemma4Mlp::Wire lw = mw;
+        const bool wide = wide_mlp && l >= first_shared;
+        if (wide) { lw.gu = m.b_gu_w; lw.ffn = m.b_ffn_w; }
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, lw, pre, wide ? 2 * g.n_ff : g.n_ff));
 
         /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.layer_scalar", (int)l),
