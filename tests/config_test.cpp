@@ -437,6 +437,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
+        { "--prefix-resume", { "nearest" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
@@ -863,6 +864,20 @@ TEST(expert_stats_is_off_until_it_names_a_file) {
     CHECK_EQ(row(c).value, std::string("/s/experts.json"));
     CHECK_EQ(row(c).source, std::string("command line"));
     CHECK(parse_fresh({ "--expert-stats" }) < 0);
+}
+
+/* A prefix hit resumes on the cold run's chunk grid unless the operator trades that for a shorter
+ * re-prefill; any other word is refused. */
+TEST(prefix_resume_is_exact_unless_nearest_is_asked_for) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.prefix_exact);
+    Config c;
+    CHECK_EQ(parse({ "--prefix-resume", "nearest" }, &c), RAD_OK);
+    CHECK(!c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "exact" }, &c), RAD_OK);
+    CHECK(c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "deepest" }, &c), RAD_E_INVAL);
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;

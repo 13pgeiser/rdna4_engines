@@ -898,6 +898,14 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* --prefix-resume exact|nearest. Exact (the default) resumes a prefix hit only on the grid an
+     * idle server's cold prefill chunks the same prompt on (ChunkGeometry::grid), and takes a
+     * prompt's tail snapshot where its last chunk starts: the hit recomputes the cold run's own
+     * chunks, so its output is the cold run's bit for bit, where a kernel rounds a row differently
+     * at another chunk length. Nearest resumes at the deepest snapshot or block, a prompt's tail
+     * snapshot at its last quantum boundary: up to a chunk less re-prefilled a turn, and a hit that
+     * can differ from a cold run in the last bits (a near-tie in greedy text). */
+    bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";

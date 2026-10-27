@@ -167,6 +167,11 @@ static const Flag g_flags[] = {
     "                                    one, for each of --max-num-seqs, within an eighth of host\n"
     "                                    memory. N fixes the total; 0 keeps none" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
+    { "--prefix-resume",      "MODE",   "where a prefix hit resumes: exact (default) only where\n"
+    "                                    an idle server's cold prefill of the prompt starts a\n"
+    "                                    chunk, so the hit answers bit-identically to a cold run;\n"
+    "                                    nearest at the deepest snapshot, up to a chunk less to\n"
+    "                                    re-prefill" },
     { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
                                         "(default), tip-only, keep-all" },
 
@@ -682,6 +687,15 @@ int config_parse(int argc, char** argv, Config* c) {
             }
         }
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
+        else if (S("--prefix-resume")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "exact"))        c->prefix_exact = true;
+            else if (!std::strcmp(v, "nearest")) c->prefix_exact = false;
+            else {
+                RAD_ERR("--prefix-resume '%s' is not one of exact, nearest", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--checkpoint-policy")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* Validated, so an unknown name does not silently fall back to the default. */
@@ -1182,6 +1196,8 @@ const ShowRow kShow[] = {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
+    { "--prefix-resume",      [](const Config& c) {
+          return std::string(c.prefix_exact ? "exact" : "nearest"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },

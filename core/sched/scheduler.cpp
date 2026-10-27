@@ -871,7 +871,38 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 
     int64_t want = remaining < budget ? remaining : budget;
 
-    if (geo_.checkpoints()) {
+    if (geo_.checkpoints() && geo_.exact) {
+        /* --prefix-resume exact: checkpoints only where an idle cold prefill of this prompt starts
+         * a chunk (ChunkGeometry::grid), so a hit that resumes at one recomputes the cold run's
+         * own chunks. Splits as below at the interval and a span's end; the tail snapshot is at
+         * the start of the prompt's last chunk (tail_checkpoint), a boundary an idle chunk already
+         * ends on, so it costs a copy and no step. A step that shares the budget (another
+         * request, decode rows) may straddle it, and is split there. */
+        const int64_t I = geo_.checkpoint_interval;
+        const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
+        const int64_t next = periodic ? ((n_computed / I) + 1) * I : INT64_MAX;
+        int64_t far = next;
+        if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0)
+            far = n_computed + geo_.span * I;
+        if (n_computed + want > far)
+            want = far - n_computed;
+        else if (n_computed + want > next && n_computed + want < n_target)
+            want = (n_computed + want) / I * I - n_computed;
+        const int64_t tail = tail_checkpoint(n_target);
+        if (tail > n_computed && n_computed + want >= tail) {
+            want = tail - n_computed;
+            if (checkpoint_pos) *checkpoint_pos = tail;
+        } else if (periodic && (n_computed + want) % I == 0 && geo_.on_grid(n_computed + want)) {
+            if (checkpoint_pos) *checkpoint_pos = n_computed + want;
+        }
+        /* A request's own checkpoint (Request::checkpoint_at) as below, wherever it falls: the
+         * head the request shares with others resumes there by design. */
+        const int64_t keep = keep_at / geo_.quantum * geo_.quantum;
+        if (keep > n_computed && keep <= n_computed + want && keep <= n_target) {
+            want = keep - n_computed;
+            if (checkpoint_pos) *checkpoint_pos = keep;
+        }
+    } else if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
         if (geo_.window_ckpt && !geo_.window_periodic) {
@@ -955,6 +986,16 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
+    if (geo_.exact) {
+        /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
+         * exact repeat re-prefills that chunk as the cold run did, and an appended turn that chunk
+         * and what it added. A window snapshot keeps its margin below (next comment): the grid
+         * point under the end less a block. Past the first interval, as below. */
+        const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
+        const int64_t t = geo_.grid_floor(target - margin);
+        if (geo_.window_ckpt) return t >= I ? t : -1;
+        return t > I ? t : -1;
+    }
     const int64_t tail = target / Q * Q;
     /* A window snapshot is taken at the tail of any prompt of an interval or more, a block short
      * of the end: the next turn re-renders the last few tokens (the generation prompt is replaced
@@ -1156,6 +1197,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         int32_t last = (int32_t)r.prompt.size() - 1;   /* one token must remain to produce logits */
         if (reuse > last) reuse = last;
         if (reuse < 0) reuse = 0;
+
+        /* --prefix-resume exact: resume only on the grid an idle cold prefill chunks this prompt
+         * on (ChunkGeometry::grid), so the tokens recomputed below are cut into the cold run's own
+         * chunks. A snapshot is already on it (plan_chunk writes none off it, but for a request's
+         * own Request::checkpoint_at); a hit at a block (no snapshot needed) steps back to it. */
+        if (geo_.exact && reuse > 0 &&
+            !(geo_.checkpoints() && h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens)) {
+            const int32_t g = (int32_t)geo_.grid_floor(reuse);
+            if (g < reuse)
+                RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at %lld, on the "
+                          "%lld-token chunk grid (--prefix-resume exact)", (unsigned long long)r.id,
+                          (long long)reuse, (long long)g, (long long)geo_.grid);
+            reuse = g;
+        }
 
         /* A hit on a hybrid model needs a checkpoint. The adopted blocks cover the paged
          * attention groups, but nothing covers a recurrent group, whose state lives in a

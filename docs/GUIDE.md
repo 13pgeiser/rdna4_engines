@@ -1193,6 +1193,31 @@ snapshot lets it skip at least 256 tokens of that head, the request takes one wh
 ends, at the cost of one chunk split, and the requests after it resume there. A conversation's
 next turn has only its own earlier turn past that point, so it splits nothing extra.
 
+A prefix hit answers exactly as the same prompt prefilled cold, by default
+(`--prefix-resume exact`). A kernel can round a row differently at another chunk
+length (the fp8 GEMM's split-K count is chosen from `M`, spec §17), so a hit that
+recomputes its tail in other chunks than a cold prefill can flip a near-tie in
+greedy text. The hit therefore resumes only where an idle server's cold prefill of
+that prompt starts a chunk: every `--max-num-batched-tokens` tokens (rounded down
+to the chunk quantum), or every `--checkpoint-interval` when that is smaller. A
+prompt's tail snapshot is taken where its last chunk starts, a boundary the chunk
+already ends on, so it costs a copy and no step. An exact repeat re-prefills the
+cold run's last chunk; an appended turn, that chunk and what the turn added: up to
+one chunk more than `--prefix-resume nearest`, which resumes at the deepest
+snapshot or block and splits a prompt's last chunk at its last quantum boundary.
+The interval must be a multiple of the chunk when it is larger; otherwise it is
+rounded up, and startup says so:
+
+  ```
+  --checkpoint-interval 6144 resolves to 8192: --prefix-resume exact needs it a multiple of the
+  4096-token prefill chunk (--max-num-batched-tokens 4096) ...
+  ```
+
+It is an idle-server property, as greedy batching is: a prefill that shares its
+steps with other requests or decode rows (`--busy-prefill-chunk`,
+`--prefill-interleave`) is cut differently, and a request's own checkpoint
+(`/v1/systemone`'s shared head) resumes where it was asked.
+
 **One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
 from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the
 fused fp8 junctions, a step of at least 1024 tokens that carries one prefill sequence and nothing
@@ -1947,6 +1972,7 @@ by 0.002-0.003 nats.
 | `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; the startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
+| `--prefix-resume MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `--no-prefix-cache` | prefix cache on | disable prefix caching |
 
 **Parallel**
