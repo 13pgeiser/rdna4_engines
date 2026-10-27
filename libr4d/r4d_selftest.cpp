@@ -25142,6 +25142,23 @@ struct ArThread {
     int64_t spitch = 0;
 };
 
+/* Whether every rank device a collective case is about to use can reach every other directly.
+ * The engine carries this fact (device.p2p, RAD_FACT_P2P) and selects around its absence; a card
+ * count is not enough. hipDeviceCanAccessPeer answers it without a kernel: on a box with the IOMMU
+ * off the peer path is absent, the enable call throws `enable_peer: invalid device ordinal`, and
+ * init returns RAD_E_DEVICE — a skip line, like the card-count gates, not a failure. */
+static bool ar_peer_path_ok(const std::vector<int>& devs, int world) {
+    if (world < 2 || (int)devs.size() < world) return false;
+    for (int a = 0; a < world; ++a)
+        for (int b = 0; b < world; ++b) {
+            if (a == b) continue;
+            int can = 0;
+            if (hipDeviceCanAccessPeer(&can, devs[a], devs[b]) != hipSuccess) return false;
+            if (!can) return false;
+        }
+    return true;
+}
+
 static void ar_worker(ArThread* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     std::vector<RadParam> ps = {
@@ -25179,6 +25196,7 @@ static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs, const ch
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
 
     /* 8192 fp32 elements: whole 16-byte pushes, small enough to exercise the handshake rather
      * than the link. */
@@ -25290,6 +25308,7 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, co
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
     std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
     ta.join();
@@ -25314,6 +25333,7 @@ static void ar_two_rank_late(const Plugin& pl, const std::vector<int>& devs, con
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     pl.pin_late_push(1);
     ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
     std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
@@ -25402,6 +25422,7 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
 
     const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
     ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel };
@@ -25493,6 +25514,7 @@ static void ar_wide_rank(const Plugin& pl, const std::vector<int>& devs, const c
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const int64_t numel = 8192;
     const std::string w = std::to_string(world);
     std::vector<ArThread> t;
@@ -25787,6 +25809,7 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     using Run = ArPatternRun;
     /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four- and
      * eight-rank rows cannot be given one -- cArTsExact4/cArTsExact8/cArTi8Ts4 constrain numel so
@@ -25869,6 +25892,7 @@ static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, con
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if ((int)devs.size() < W) { skip(name, "needs 8 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, W)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* bf16: 72 elements are 9 words, 8 are one; 8256 is 1032 words, 4196352 is 524544. Without
      * weights the words must divide by eight. */
     const std::vector<ArPatternRun> uneven = {
@@ -26476,6 +26500,7 @@ static void ar_lane_forms(const Plugin& pl, const std::vector<int>& devs, const 
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     struct Run { bool coded; int pat; const char* dtype; std::vector<int64_t> sizes; int oop; };
     /* 1024: one wave a shard; 1055744: 1031 waves, an odd split over the blocks; 524352: bf16
      * outside the coded form; 46137344: the feed-forward reduce at an 8192-token chunk. */
@@ -26610,6 +26635,7 @@ static void ar_wide_ti8(const Plugin& pl, const std::vector<int>& devs, const ch
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* 32768 is under the 128 KiB floor and 65544 is not whole groups (at four ranks, not whole
      * SHARD groups -- the 4-rank wire tiles numel by 128): both exact. The rest are
      * lossy: 65536 sits ON the floor (2048 groups, % 3 = 2), then 2048 x 2048 / 2049 / 2050 rows
@@ -26980,6 +27006,7 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     struct Shape { int64_t M, n, hc, top_k; const char* act; bool scratch; };
     std::vector<Shape> shapes;
     if (!want_gather) {
@@ -27279,6 +27306,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
         skip(name, world == 4 ? "needs 4 gfx1201 cards" : "needs 2 gfx1201 cards");
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* Only the four-rank P2P row ends the engine's link hold; the host twin and the two-rank rows
      * leave it alone. */
     const bool releases = world == 4 && !nm_ends_with(name, "_host");
