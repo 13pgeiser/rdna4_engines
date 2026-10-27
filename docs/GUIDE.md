@@ -3103,7 +3103,8 @@ workflow, and is otherwise read off the parts:
 - **Keyframes**: a `first_frame` (`i2va`), a `last_frame` (`l2va`) or both (`fl2va`), each an image
   pinned at that end of the video. The first frame is stretched to the video's size, or, with
   `"first_frame_mode": "center"`, scaled to cover it and cropped at the centre; the last frame is
-  always cropped. A keyframe request takes no `latent_upscale`: the pins are on the video's own grid.
+  always cropped. With `latent_upscale` each keyframe is prepared at both sizes and pinned on the
+  grid the steps run on (below).
 - **Reference media** (`ref2va`): `ref_image_1` .. `ref_image_9`, `ref_video_1` .. `ref_video_3`, each
   video with an optional soundtrack `ref_video_audio_N` of its own number, and `ref_audio_1` ..
   `ref_audio_3`, numbered from 1 without gaps. Pictures and video frames are fitted into 256 x 256
@@ -3142,7 +3143,9 @@ upscaler, re-noised, and the last **`upscale_refine_steps`** run at the full siz
 and 12 of the base model's 49 by default). The steps at the small size cost a fraction of a
 full-size step's, so most of the time goes to the refinement. The video object of an upscaled
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
-size. Reference media ride it unchanged; keyframes do not (above).
+size. Reference media ride it unchanged. Keyframes ride it too: each is encoded at the small size
+before the prompt and again at the full size after the upscale, into the same slot, so every step
+pins it on its own grid.
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{
