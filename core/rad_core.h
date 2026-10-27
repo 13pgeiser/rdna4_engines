@@ -1063,6 +1063,9 @@ struct Config {
     bool    debug_selection = false;
     bool    debug_placement = false;
     bool    profile_ops = false;
+    /* --expert-stats FILE: count the routed experts every layer selects, by step kind, and write
+     * the counts to FILE as JSON every 30 s and at shutdown (place/xstats.h). Empty is off. */
+    std::string expert_stats;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 

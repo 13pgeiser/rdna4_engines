@@ -465,6 +465,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--video-min-frames", { "2" } }, { "--video-max-frames", { "8" } },
         { "--video-max-frame-tokens", { "70" } }, { "--image-tokens", { "280" } },
         { "--max-source-pixels", { "1000000" } },
+        { "--expert-stats", { "/s/experts.json" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
@@ -840,6 +841,26 @@ TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.checkpoint_policy, std::string("geometric-backoff"));
+}
+
+/* --expert-stats is off until it names a file, and needs one. */
+TEST(expert_stats_is_off_until_it_names_a_file) {
+    LogGuard lg;
+    auto row = [](const Config& c) {
+        for (const diag::ConfigRow& r : diag::config_rows(c))
+            if (r.flag == "--expert-stats") return r;
+        return diag::ConfigRow{};
+    };
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.expert_stats.empty());
+    CHECK_EQ(row(d).value, std::string("off"));
+    Config c;
+    CHECK_EQ(parse({ "--expert-stats", "/s/experts.json" }, &c), RAD_OK);
+    CHECK_EQ(c.expert_stats, std::string("/s/experts.json"));
+    CHECK_EQ(row(c).value, std::string("/s/experts.json"));
+    CHECK_EQ(row(c).source, std::string("command line"));
+    CHECK(parse_fresh({ "--expert-stats" }) < 0);
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;

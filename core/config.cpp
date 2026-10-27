@@ -293,6 +293,10 @@ static const Flag g_flags[] = {
       "                              implementation is an oracle and a last resort, and falling back\n"
       "                              to it is orders of magnitude of speed with nothing to say so." },
     { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
+    { "--expert-stats",       "FILE",   "count the routed experts every layer selects, apart for prefill, decode,\n"
+    "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
+    "                                    JSON every 30 s and at shutdown. From the routing histograms the core\n"
+    "                                    already copies back: no device work, no synchronisation" },
     { "--live",               nullptr,  "the live view: cards, throughput, draft acceptance, the expert plane.\n"
     "                                    Redirected it prints one greppable key=value line instead" },
     { "-v",                   nullptr,  "verbose" },
@@ -908,6 +912,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-placement"))       c->debug_placement = true;
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
+        else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
         else if (S("--live"))                  c->live_view = true;
         else {
             RAD_ERR("unknown option '%s'", a.c_str());
@@ -1228,6 +1233,7 @@ const ShowRow kShow[] = {
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
+    { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },
     { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
     { "-vv",                  [](const Config& c) { return onoff(c.given.count("-vv") > 0); } },

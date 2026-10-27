@@ -2022,6 +2022,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-placement` | print the placement plan |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |
+| `--expert-stats FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `--live` | the live terminal view (§6.4) |
 | `-v` / `-vv` | verbose / very verbose |
 

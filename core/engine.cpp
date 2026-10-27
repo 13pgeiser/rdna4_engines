@@ -31,8 +31,10 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <climits>
 #include <cmath>
 #include <algorithm>
+#include <map>
 #include <fstream>
 #include <functional>
 #include <utility>
@@ -203,11 +205,9 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
  * `heat_seen` prevents crediting a bank twice: a bank keeps its counts until the next report, so a
  * step where a layer did not route (a drafter pass) would re-credit the stale plane.
  */
-void Engine::tiering_dispatch(Rank& r, int step) {
-    if (!r.heat.enabled()) return;
-
-    r.mover.begin_dispatch(step, &r.heat);
-
+/* Every landed histogram of a step before `before_step`, oldest first per layer, into
+ * `r.heat_rows`; nothing is credited yet. */
+void Engine::find_histograms(Rank& r, int before_step) {
     const int n_layer = r.ctx.n_route_layers();
     if ((int)r.heat_seen.size() != n_layer) r.heat_seen.assign((size_t)n_layer, -1);
     /* Find all histograms first, then credit them in order. Each is a card-written row in host
@@ -224,7 +224,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         int seen = r.heat_seen[(size_t)l];
         bool any = false;
         for (;;) {
-            const int bank = r.ctx.next_histogram(l, seen, step, landed);
+            const int bank = r.ctx.next_histogram(l, seen, before_step, landed);
             if (bank < 0) break;
             const int32_t* h = r.ctx.last_histogram(l, bank);
             if (!h) break;
@@ -234,8 +234,46 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         }
         if (!any) ++r.heat_idle;
     }
+}
+
+/* --expert-stats: one found histogram into the rank's tally (place/xstats.h), from the same row
+ * the heat engine reads. The caller holds the tally. */
+static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int32_t* h) {
+    const RadRouting* rt = ctx.last_routing(layer);
+    const int64_t n = rt ? std::min<int64_t>(rt->n_expert, ctx.route_n_expert()) : 0;
+    xs->credit(layer, ctx.last_histogram_step(layer, bank), h, n,
+               ctx.last_histogram_reports(layer, bank), rt ? rt->top_k : 0);
+}
+
+/* The drain alone, for the tally, where the heat engine is off or the engine is stopping
+ * (`before_step` INT_MAX once the streams are drained). */
+void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
+    find_histograms(r, before_step);
+    std::lock_guard<std::mutex> lk(xs->mutex());
+    for (const Rank::HeatRow& hr : r.heat_rows) {
+        xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
+        r.ctx.mark_credited(hr.layer, hr.bank);
+        ++r.heat_credited;
+    }
+    xs->note_dropped(r.ctx.route_dropped());
+}
+
+void Engine::tiering_dispatch(Rank& r, int step) {
+    XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
+    if (!r.heat.enabled()) {
+        if (xs) xstats_drain(r, xs, step);
+        return;
+    }
+
+    r.mover.begin_dispatch(step, &r.heat);
+
+    find_histograms(r, step);
+    std::vector<Rank::HeatRow>& rows = r.heat_rows;
     const int32_t n_ex = (int32_t)r.ctx.route_n_expert();
     constexpr size_t kAhead = 2;
+    std::unique_lock<std::mutex> xl;
+    if (xs) xl = std::unique_lock<std::mutex>(xs->mutex());
     for (size_t i = 0; i < rows.size() && i < kAhead; ++i) r.heat.prefetch(rows[i].h, n_ex);
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
@@ -244,9 +282,15 @@ void Engine::tiering_dispatch(Rank& r, int step) {
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        /* The row is in cache now. */
+        if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
+    }
+    if (xs) {
+        xs->note_dropped(r.ctx.route_dropped());
+        xl.unlock();
     }
 
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
@@ -278,6 +322,93 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     r.mover.hold_turnover(hold);
     (void)r.mover.balance(&r.heat, !hold);
 }
+
+/* ------------------------------------------------------------------ --expert-stats
+ *
+ * Which model-wide expert each index of each rank's histogram is (place/xstats.h, XsMap): index e
+ * is the rank's unit with group expert e, and the container's directory entry for that unit's
+ * weight names the expert in the model's numbering. A checkpoint served directly has no such entry
+ * and the map falls back to rank order. */
+int Engine::xstats_open() {
+    if (cfg_.expert_stats.empty()) return RAD_OK;
+    const int n_layer = ranks_[0]->ctx.n_route_layers();
+    if (n_layer <= 0) {
+        RAD_WARN("--expert-stats: '%s' routes no experts; there is nothing to count and %s is not "
+                 "written", meta_.name ? meta_.name : "the model", cfg_.expert_stats.c_str());
+        return RAD_OK;
+    }
+    constexpr int32_t kUnset = INT32_MIN, kClash = -3;
+    std::vector<std::vector<std::vector<int32_t>>> ids(ranks_.size());
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        const Program& P = ranks_[ri]->program;
+        auto& layers = ids[ri];
+        layers.assign((size_t)n_layer, {});
+        for (size_t w = 1; w < P.weights.size(); ++w) {
+            const WeightInfo& wi = P.weights[w];
+            const int32_t l = wi.decl.group.layer, e = wi.decl.group.expert;
+            if (l < 0 || l >= n_layer || e < 0) continue;
+            std::vector<int32_t>& row = layers[(size_t)l];
+            if ((size_t)e >= row.size()) row.resize((size_t)e + 1, kUnset);
+            const RadFileEntry* fe = file_ ? file_->find(wi.source) : nullptr;
+            const int32_t g = fe && fe->layer == l && fe->expert >= 0 ? fe->expert : -1;
+            int32_t& at = row[(size_t)e];
+            /* Every weight of one unit must name the same expert. */
+            at = at == kUnset ? g : at == g ? at : kClash;
+        }
+        for (auto& row : layers)
+            for (int32_t& v : row) if (v == kUnset || v < 0) v = -1;
+    }
+    std::vector<int32_t> n_model((size_t)n_layer, 0);
+    for (int l = 0; l < n_layer && l < meta_.n_layers; ++l) n_model[(size_t)l] = (int32_t)meta_.n_expert;
+    XsMap map;
+    RAD_TRY(xs_map_build(ids, n_model, (int32_t)meta_.n_layers, &map));
+
+    XsSnapshot info;
+    info.model = meta_.name ? meta_.name : "";
+    info.arch = meta_.arch_id ? meta_.arch_id : "";
+    info.container = cfg_.model;
+    xstats_ = std::make_unique<ExpertStats>();
+    if (const int st = xstats_->init(cfg_.expert_stats, map, std::move(info)); st < 0) {
+        RAD_ERR("--expert-stats: cannot write %s", cfg_.expert_stats.c_str());
+        xstats_.reset();
+        return st;
+    }
+    std::map<std::string, int> how;
+    int32_t mx = 0;
+    for (int l = 0; l < n_layer; ++l) {
+        if (map.n_expert[(size_t)l] <= 0) continue;
+        ++how[map.how[(size_t)l]];
+        mx = std::max(mx, map.n_expert[(size_t)l]);
+    }
+    std::string hs;
+    for (const auto& [k, v] : how) hs += fmt("%s%d by %s", hs.empty() ? "" : ", ", v, k.c_str());
+    int counting = 0;
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) counting += xstats_->tally((int)ri) != nullptr;
+    RAD_INFO("expert stats: %d routed layers (up to %d experts; ids %s), counted on %d of %d "
+             "rank%s, written to %s every 30 s and at shutdown",
+             n_layer, (int)mx, hs.c_str(), counting, cfg_.tp, cfg_.tp == 1 ? "" : "s",
+             cfg_.expert_stats.c_str());
+    xstats_->start();
+    return RAD_OK;
+}
+
+void Engine::xstats_close() {
+    if (!xstats_) return;
+    xstats_->stop();
+    /* The banks of the last steps are still in the ring: drain each counting rank's stream, then
+     * credit them. Not after a step-loop error, where a stream may never drain. */
+    if (loop_status_.load(std::memory_order_acquire) >= 0) {
+        for (auto& r : ranks_) {
+            XsTally* xs = xstats_->tally(r->index);
+            if (!xs) continue;
+            if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
+            xstats_drain(*r, xs, INT_MAX);
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    }
+    (void)xstats_->write(true);
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
@@ -303,6 +434,10 @@ void Engine::rank_loop(int index) {
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
+            /* --expert-stats files each pass's step kind for the drain, which reads it a step or
+             * more later. An encoder pass is not a step of the token stream. */
+            if (xstats_ && what != kIssueSampler && b->enc == 0)
+                if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -1775,6 +1910,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
+    if (const int xs = xstats_open(); xs < 0) return xs;
+
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
@@ -1799,6 +1936,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -1932,6 +2070,8 @@ std::string Engine::engine_info() const {
         sp["depth"]   = drafter_.depth;
     }
     e["speculation"] = std::move(sp);
+    /* --expert-stats: where the counts are, for a client that reads them. */
+    if (xstats_) e["expert_stats"] = { { "file", xstats_->path() }, { "interval_s", 30 } };
     return e.dump();
 }
 

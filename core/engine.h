@@ -51,6 +51,8 @@ namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPass
 struct TierPump;
 struct TierJob;
 struct StepSlot;
+class ExpertStats;   /* place/xstats.h */
+class XsTally;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
@@ -144,6 +146,9 @@ private:
     std::unique_ptr<CheckpointSources> ckpt_src_;
     /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
     WeightSourceFn sources() const;
+
+    /* --expert-stats FILE (place/xstats.h); null without the flag. */
+    std::unique_ptr<ExpertStats> xstats_;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -599,6 +604,14 @@ private:
      * what the heat engine proposes. A member because Rank is private; a no-op on a static plan.
      * The definition explains why a step is the unit. */
     void tiering_dispatch(Rank& r, int step);
+    /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
+     * for --expert-stats where the heat engine is off. */
+    void find_histograms(Rank& r, int before_step);
+    void xstats_drain(Rank& r, XsTally* xs, int before_step);
+    /* --expert-stats: the map and the file, opened before the rank threads start; closed after they
+     * stop, crediting what the ring still holds once the streams are drained. */
+    int  xstats_open();
+    void xstats_close();
     void rank_loop(int rank);
 };
 
