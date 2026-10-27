@@ -295,6 +295,16 @@ typedef struct RadBatch {
      * position tables per grid) reads them here; they live as long as the pass. */
     const int32_t* enc_seg_h;
     const int32_t* enc_seg_w;
+
+    /* ================================================ scored steps */
+
+    /* Non-zero when every row the sampler wants is a scored row (a /v1/systemone question: the raw
+     * logits at a few candidate ids, the sampled token discarded) and the program declared where
+     * the core finds the hidden rows and the head (rad_declare_scores). The plugin then skips its
+     * lm_head and leaves `rad_declare_scores`' hidden buffer holding the gathered, final-normed
+     * rows; the core computes the candidates' logits itself. Zero on every other step, and always
+     * for a program that declared no scores. Appended; an older plugin never sees it set. */
+    int32_t score_only;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

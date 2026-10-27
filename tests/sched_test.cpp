@@ -5843,6 +5843,46 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     CHECK_EQ((int)f.sch.find(a)->output.size(), 2);   /* the step ahead emitted nothing */
 }
 
+/* A SCORED row (Request::token_scores) the step in flight brings to max_tokens gets no step issued
+ * ahead: it would be a forward pass for a request that finishes at the commit. The step after the
+ * commit is planned as usual, and a decode that is not scored keeps its step of overlap. */
+TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    r->token_scores = std::make_shared<TokenScores>();
+    r->token_scores->tokens = { 1, 2 };
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() == nullptr);
+    f.commit_plain();                              /* the second token: finished */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);
+    CHECK(f.sch.step() == nullptr);
+}
+
+/* The same row without token_scores is an ordinary decode: the step ahead is issued, as upstream. */
+TEST(a_non_scored_row_keeps_the_step_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);
+}
+
 /* ================================================================== terminal paths */
 /* A lone request that outgrows the whole pool fails with the reason the client sees and gives its
  * blocks back; nothing is preempted, since there is nobody to preempt and preempting itself would

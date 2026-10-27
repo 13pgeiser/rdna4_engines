@@ -86,6 +86,8 @@ struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 using namespace rad_fake;
 
 struct RadBuilder {
+    rad_buf    score_hidden = 0;   /* rad_declare_scores */
+    rad_weight score_table = 0;
     std::vector<RecWeight> weights;
     std::vector<RecBuf>    bufs;
     std::vector<RecOp>     ops;
@@ -286,6 +288,14 @@ extern "C" void rad_note(RadBuilder* b, const char* fmt, ...) {
 extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     if (!b || !logits) return RAD_E_INVAL;
     b->logits = logits;
+    return RAD_OK;
+}
+
+/* Scored steps' hidden rows and head table, recorded for the tests. */
+extern "C" int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table) {
+    if (!b || !hidden || !table) return RAD_E_INVAL;
+    b->score_hidden = hidden;
+    b->score_table = table;
     return RAD_OK;
 }
 

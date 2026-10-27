@@ -315,6 +315,12 @@ private:
      * Written by the scheduler thread while the ranks are parked, read by them during the step,
      * consumed by collect_step. */
     std::vector<std::pair<int32_t, TokenScores*>> score_rows_;
+    /* A scored step (RadBatch::score_only): the plugin ran no lm_head, and the candidates' logits
+     * come from the hidden rows and the head table's rows at `score_ids_` (every scored row's
+     * candidates, sorted and unique), both read back into `score_host`. */
+    bool                 score_only_ = false;
+    std::vector<int32_t> score_ids_;
+    int64_t              score_embd_ = 0;
     int  stage_scored_rows(const StepPlan& plan, const StepOut& so);
     int  issue_scored_rows(Rank& r);
     int  collect_scored_rows();

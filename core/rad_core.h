@@ -367,6 +367,10 @@ public:
      * encoder-only or embedding-only plugin does; the engine refuses to serve such a program at
      * startup. */
     rad_buf logits_buf = 0;
+    /* Scored steps (rad_declare_scores): the final-normed hidden rows and the bf16 head table.
+     * Zero when the plugin declared none. */
+    rad_buf    score_hidden = 0;
+    rad_weight score_table  = 0;
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;

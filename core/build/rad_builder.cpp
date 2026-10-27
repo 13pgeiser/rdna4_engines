@@ -1134,6 +1134,30 @@ int Builder::decl_name_map(const RadNameMap* m) {
 /* The buffer the core samples from. A second call is refused rather than winning: a target and
  * its drafter declaring into one builder (spec §10) both have logits, and keeping the second would
  * sample the draft distribution. The drafter's logits are reached through its scope. */
+int Builder::declare_scores(rad_buf hidden, rad_weight table) {
+    if (finished_) { err(RAD_E_STATE, "declare_scores after declare finished"); return RAD_E_STATE; }
+    if (hidden == RAD_NULL_HANDLE || (size_t)hidden >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "declare_scores: %u is not a declared buffer", (unsigned)hidden);
+        return RAD_E_INVAL;
+    }
+    if (table == RAD_NULL_HANDLE || (size_t)table >= prog_.weights.size()) {
+        err(RAD_E_INVAL, "declare_scores: %u is not a declared weight", (unsigned)table);
+        return RAD_E_INVAL;
+    }
+    const RadBufDecl& h = prog_.buffers[hidden].decl;
+    const auto& w = prog_.weights[table];
+    if (h.dtype != RAD_BF16 || h.rank != 2 || w.decl.dtype != RAD_BF16 || w.decl.rank != 2 ||
+        w.decl.shape[1] != h.shape[1]) {
+        err(RAD_E_INVAL, "declare_scores: the hidden rows ('%s') and the table ('%s') must be bf16 "
+            "[rows, n_embd] and [n_vocab, n_embd]", prog_.buffers[hidden].name.c_str(),
+            w.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.score_hidden = hidden;
+    prog_.score_table  = table;
+    return RAD_OK;
+}
+
 int Builder::declare_logits(rad_buf b) {
     if (finished_) { err(RAD_E_STATE, "declare_logits after declare finished"); return RAD_E_STATE; }
     if (b == RAD_NULL_HANDLE || (size_t)b >= prog_.buffers.size()) {
@@ -2628,6 +2652,11 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
 int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_logits(logits);
+}
+
+int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_scores(hidden, table);
 }
 
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {

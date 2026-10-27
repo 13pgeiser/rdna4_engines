@@ -2103,6 +2103,12 @@ const RadBatch* Scheduler::step_next_locked() {
          * that cannot rewind decides at commit whether the next step may speculate; one that can,
          * or no grammar, keeps its answer. */
         if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        /* A SCORED row (Request::token_scores, a /v1/systemone question) that the step in flight
+         * brings to max_tokens gets no step issued ahead: it would run a whole forward pass for a
+         * request that finishes at the commit, and max_tokens=1 pays a decode step after its
+         * prefill. Scored rows only -- every other decode keeps the step of overlap it had. */
+        if (r.token_scores && r.max_tokens > 0 &&
+            (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
 
         /* The furthest context the row can reach: every position this step verifies committed,
          * counted from the last commit rather than this step's own bound (which would add a

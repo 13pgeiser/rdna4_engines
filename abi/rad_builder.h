@@ -671,6 +671,17 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
  * embedding-only or encoder-only plugin declares none. */
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
+/* Scored steps (RadBatch::score_only). A plugin whose lm_head is the bf16 table `table`
+ * ([n_vocab, n_embd], e.g. a tied embedding, whatever encoding the head itself is read at) and
+ * whose final-normed rows land in `hidden` ([rows, n_embd] bf16, row k the step's k-th sampled row,
+ * as the lm_head reads them) declares both here. On a step where every sampled row is a scored row
+ * the core sets RadBatch::score_only, the plugin issues everything but the lm_head, and the core
+ * reads the hidden rows and the candidates' table rows back and takes the dot products on the host
+ * in f64: the logits a scored request returns, at no head read on the card (half a gigabyte a step
+ * at a 128K bf16 vocabulary). Optional; one rank only (the core ignores it at --tp > 1).
+ * Additive export; RAD_ABI_VERSION does not move. */
+int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table);
+
 /* Which buffer holds this step's pooled vectors, what an embedding model returns instead of
  * logits. Row s is sequence s's whole input pooled into one vector, with whatever pooling the
  * model was trained with (a mean, the last token, a CLS row). The core reads rows [0, n_seq) back

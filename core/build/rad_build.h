@@ -123,6 +123,7 @@ public:
     int         op_declared  (const char* op) const;
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
+    int         declare_scores(rad_buf hidden, rad_weight table);
     int         declare_pooled(rad_buf b);
     int         declare_drafter(const RadDrafterDecl* d);
     int         drafter_shared_kv(int pos_offset);

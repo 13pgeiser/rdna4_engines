@@ -1858,6 +1858,7 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     release(n);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
 }

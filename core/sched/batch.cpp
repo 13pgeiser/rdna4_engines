@@ -1149,6 +1149,21 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         mm_ev_live_ = true;
     }
 
+    /* A scored step (RadBatch::score_only): every sampled row is a scored request's first row, on
+     * one rank, in a program that told the core where its hidden rows and head table are. */
+    int32_t score_only = 0;
+    if (n_out > 0 && n_dout == 0 && !plan.draft_pass && ranks_.size() == 1 &&
+        prog_->score_hidden != RAD_NULL_HANDLE && prog_->score_table != RAD_NULL_HANDLE) {
+        score_only = 1;
+        for (const StepEntry& e : plan.e) {
+            if (!e.produces_token) continue;
+            if (!e.req || !e.req->token_scores || !e.req->output.empty() || e.n_spec > 0) {
+                score_only = 0;
+                break;
+            }
+        }
+    }
+
     /* ---------------------------------------------------------- the batch, one per rank */
     for (size_t r = 0; r < ranks_.size(); ++r) {
         void* const base = s.dev[r];
@@ -1164,6 +1179,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;
         B.out_ids = n_out ? on_rank(base, b0, s.d_out) : nullptr;
+        B.score_only = score_only;
         B.n_draft_out = n_dout;
         B.draft_out_ids = n_dout ? on_rank(base, b0, s.d_dout) : nullptr;
         B.q_lens = on_rank(base, b0, s.d_q);
