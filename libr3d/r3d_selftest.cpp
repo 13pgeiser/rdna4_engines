@@ -21,9 +21,9 @@
  * over all 256 codes and the encoder over the saturating, subnormal, signed-zero and NaN cases,
  * int8 against `rad_round_even_sat` over every tie in its band. This is the check `rad-kbench`
  * cannot do: it compares whole ops, so a codec's disagreement appears as a diffuse percentage.
- * libr3d's codecs are software -- RDNA3 has no fp8 conversion instruction, and its bf16 packing is
- * `v_perm` and not `v_cvt_pk_bf16_f32` -- so they are the plugin's own arithmetic and belong to the
- * tests.
+ * libr3d's codecs are software -- the lane map, not a missing instruction, is the reason, and its
+ * bf16 packing is `v_perm` and not `v_cvt_pk_bf16_f32` -- so they are the plugin's own
+ * arithmetic and belong to the tests.
  *
  * Then, on a device, every launch is called with a minimal valid input built from the row's own
  * `opd_shape`, and every output plane is read back and checked to be finite. That catches the class

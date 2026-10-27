@@ -18,11 +18,10 @@
  * can match a geometry, it decides which serves. Each group states the reason for its order.
  * Values are spaced by ten so a row can be slipped between two without renumbering.
  *
- * libr3d ships one row per (op, dtype) pair far more often than libr4d does: on RDNA3 there is no
- * matrix instruction whose fragment layout, tile shape or operand width a kernel has to design
- * around, so the dot2 kernel that serves bf16 serves f16 with a template argument, and there is
- * nothing to specialise a second row for. Where two rows of one op do exist, the reason is the
- * geometry, and it is written next to the pair.
+ * libr3d ships one row per (op, dtype) pair far more often than libr4d does: the matrix work runs
+ * on the dot2 path, whose lane map takes a dtype as a template argument, so the kernel that serves
+ * bf16 serves f16 as is, and there is nothing to specialise a second row for. Where two rows of
+ * one op do exist, the reason is the geometry, and it is written next to the pair.
  */
 enum {
     /* The common case: this op, these dtypes, one row. Nothing competes with it. */

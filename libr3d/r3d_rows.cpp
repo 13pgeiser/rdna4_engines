@@ -43,8 +43,8 @@
  * joined operands they store -- the w2a8 row's `b_scale`, the fp8 weight's codes and scale, the
  * logits head -- and repack nothing, so a container converted on this card keeps row-major codes
  * against row-major scales. A dot2 GEMM reads a weight in the order it is stored; libr4d's fragment
- * permutations are a WMMA fact, and RDNA3's tensor cores are not reachable from this toolchain
- * (r3d_common.h has the measurements).
+ * permutations are a WMMA fact, and RDNA3's wave-matrix instructions use a 16x16 fragment layout
+ * this table's dot2 kernels do not (r3d_common.h has the measurements).
  *
  * Pure host C++: no r3d.h, no HIP, so this table compiles and can be read and tested without ROCm.
  */

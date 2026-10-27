@@ -1,8 +1,9 @@
 # libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
 # instructions RDNA3 has: v_dot2acc_f32_f16 for the matrix work, v_cvt_pkrtz_f16_f32, DPP16 and
-# v_permlanex16. They do not use the gfx12 WMMA fragment layouts or gfx12-only instructions such as
-# global_load_tr_b128, and they decode every quantised weight in software, because RDNA3 has no
-# fp8 conversion instruction and this ROCm declares no WMMA builtin for any gfx11 target.
+# v_permlanex16. They do not use the WMMA fragment layouts (RDNA3's 16x16x16 wave-matrix family is
+# a re-tile of the dot2 lane map, not a drop-in) or gfx12-only instructions such as
+# global_load_tr_b128, and they decode every quantised weight in software: the lane map, not a
+# missing instruction, is the reason.
 #
 # A build targeting other cards skips libr3d. The engine then has no device kernel library for that
 # card and refuses ops only a reference library implements, unless

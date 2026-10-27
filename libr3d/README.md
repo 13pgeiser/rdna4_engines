@@ -8,10 +8,11 @@ ABI ([`r3d.h`](r3d.h)) plus the kernel-plugin rows the engine selects from
 
 It claims `^gfx11` where [`libr4d`](../libr4d/README.md) claims `^gfx12`: a card gets
 one device library, picked by the rows and never by the name. The kernels are not
-libr4d's ported — RDNA3 has no matrix instruction a compiler will emit, no fp8
-conversion, no bf16 pack, no VOPD — so every arithmetic path is its own:
-`v_dot2acc_f32_f16` for products, software codecs for every format, a weight read in
-the order the container stores it. The contract is shared: the same op schemas (copied
+libr4d's ported: the matrix work runs on the dot2 path — RDNA3's 16×16 wave-matrix
+family is a fragment layout these kernels' lane map does not use, and gfx11 has no
+bf16 pack and no VOPD — so every arithmetic path is its own: `v_dot2acc_f32_f16` for
+products, software codecs for every format, a weight read in the order the container
+stores it. The contract is shared: the same op schemas (copied
 slot for slot from libref, as the loader requires), the same numerics rules, the same
 geometry in constraints. Family parts differ in CU count and clock, never in these
 instructions, so one code object per family suffices — and every number here is quoted
@@ -166,16 +167,33 @@ Measured by reading emitted assembly for the gfx11 targets (`__has_builtin` off
 tree builds against; where a claim was taken on one chip it says which. Nothing here
 changes between gfx110x and gfx115x — which is what makes the family one code object.
 
-**No matrix instructions a compiler will emit.** Every `v_wmma_*` mnemonic is rejected
-by the assembler on gfx1100, gfx1102 and gfx1151 (and on gfx12, where libr4d does
-carry a WMMA path: the feature is the target's, not the assembler's); inline asm
-clears the frontend and dies in `amdgcn-link`. The tile builtin that *does* compile
-for gfx1100/1102/1151 measured 1.99 against the dot path's 1.97 TFLOP/s at four
-occupancies, so the tile buys a fragment layout and a block-alignment requirement and
-no throughput. Products go through `__builtin_amdgcn_fdot2` → `v_dot2acc_f32_f16` on
-every gfx11 target, paired as `v_dual_dot2acc_f32_f16` where the scheduler can — about
-a quarter of RDNA4's matrix rate. No fragment layouts, so no repacked weights, so no
-layout hook except the container's own planes force.
+**The dot2 path, and the wave-matrix instructions it does not use.** RDNA3 carries
+exactly six wave-matrix instructions, all 16×16×16 wave32: f16, bf16, int8 and int4
+in, f32, f16, bf16 and i32 accumulating, and the toolchain emits them on every gfx11
+target. They are not a separate matrix unit: the ISA states the WMMA ops run over
+multiple cycles and drive the DOT pipeline internally, and the MAC-core measurement
+on this part confirms it (512 waves, K depth 4096, operands preloaded: f32-acc f16
+19.11, f32-acc bf16 19.24, f16-acc f16 19.44, i32-acc i8 19.29, dot2 paired as
+`v_dual_dot2acc_f32_f16` 18.86 TFLOP/s — the f16/bf16/i8 tiles and the dot path sit
+on the same pipe within three percent, matching the full-kernel 1.99-vs-1.97 of
+r3d_common.h). The i32-acc i4 tile is the exception at 25.68 TFLOP/s, 35% above the
+dot path, but that instruction takes i4 in *both* operands and the grids this
+library serves pair i8 activations against i4 and i2 weights — there is no
+mixed-precision integer WMMA on RDNA3, so that pipe is unreachable from the w4a8
+and w2a8 rows. The i8 tile's only edge over the current w8a8 path is a decode, and
+the kernel-level measurement closes the question: the w8a8 m16 row runs 0.850
+TFLOP/s and w4a8 m16 0.789 (M=16, N=11008, K=4096, weights in device memory) --
+twenty-two times below the i8 tile's own MAC core, weight-byte-bound at the decode
+band's geometry, where no re-tile of the arithmetic moves the number. These
+kernels run
+the dot2 path: one wave a weight row, a k-split per lane, the group's exact sub-sum
+folded with one shfl. The WMMA fragment layout (lanes 0..15 replicated into 16..31,
+A one row a lane, B one column a lane, the accumulator's row i at lane (i%2)·16+j
+VGPR i/2) is a re-tile, not a drop-in, and no measured variant earns it. Products
+go through `__builtin_amdgcn_fdot2` → `v_dot2acc_f32_f16` on every gfx11 target,
+paired as `v_dual_dot2acc_f32_f16` where the scheduler can — about a quarter of
+RDNA4's matrix rate. No fragment layouts, so no repacked weights, so no layout hook
+except the container's own planes force.
 
 **No int8 dot.** `__builtin_amdgcn_s32sd4`, `__builtin_amdgcn_s32ud4`, `__dp4a`,
 `__builtin_amdgcn_madocx_i32_i8` / `_u32_u8` are all undeclared for gfx1102, and all
@@ -1055,10 +1073,10 @@ walked — because a ranking is a property of the shape, not of the model.
 Three properties are assumed throughout and not restated per kernel: **wave32 with a
 1024-entry VGPR file a SIMD**, so every lane map has a lane owning whole dwords and
 every budget is computed against 1024; **64 KiB of LDS a workgroup**, which sets the
-candidate kernels' `n_cand <= 1024` and the tile sizes; **no matrix instruction**,
-which is why the tile is a dot loop over LDS with an 8-element XOR swizzle, shared by
-every tiled row in [`r3d_tiling.h`](r3d_tiling.h) and proven byte-identical between
-them.
+candidate kernels' `n_cand <= 1024` and the tile sizes; **the dot2 path** (the
+wave-matrix fragment layout is a re-tile, not a drop-in for these lane maps), which is
+why the tile is a dot loop over LDS with an 8-element XOR swizzle, shared by every
+tiled row in [`r3d_tiling.h`](r3d_tiling.h) and proven byte-identical between them.
 
 **A staged chunk of 8 bytes against a row pitch of 512 is the 2-bit grid moving 8× the
 bytes it uses** at `kKC` 32: 24.151 ms at M=64, N=130560, K=2048 against a 0.449 ms
