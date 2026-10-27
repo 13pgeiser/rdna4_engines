@@ -131,8 +131,10 @@ fn main() {
         prefill_chunk: 256,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
+        swap_disk_bytes: 1 << 30,
         is_vl: false,
         vl_path: None,
+        vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::Streamed,
         mtp_k,
         mtp_mode: if mtp_k > 0 {
             hipfire_config::MtpMode::On
@@ -333,8 +335,10 @@ fn main() {
                     prefill_chunk: 256,
                     host_budget_bytes: 4 * 1024 * 1024 * 1024,
                     swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
+                    swap_disk_bytes: 1 << 30,
                     is_vl: false,
                     vl_path: None,
+                    vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::Streamed,
                     mtp_k,
                     mtp_mode: if mtp_k > 0 {
                         hipfire_config::MtpMode::On
@@ -489,8 +493,10 @@ fn main() {
             prefill_chunk: 256,
             host_budget_bytes: 4 * 1024 * 1024 * 1024,
             swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
+            swap_disk_bytes: 1 << 30,
             is_vl: false,
             vl_path: None,
+            vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::Streamed,
             mtp_k,
             mtp_mode: if mtp_k > 0 {
                 hipfire_config::MtpMode::On

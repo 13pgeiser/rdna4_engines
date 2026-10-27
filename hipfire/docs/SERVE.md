@@ -237,7 +237,8 @@ Config and env owners for bind, idle, queue, and body limits:
    generation runs wait for it to finish, so their TTFT includes that
    generation (known gap). The fixed-slot `serve.multi_slot` engine below is
    the legacy route.
-   With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
+
+With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
    is deterministic for a fixed batch composition.
@@ -255,6 +256,14 @@ Config and env owners for bind, idle, queue, and body limits:
    (**416 req/s, 5.2x**) in a single 72-row forward. 2 slots matched serial in
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
+
+Parked (swapped or cold) sessions are bounded even when clients abandon them:
+a session idle for `serve.multi_slot_session_ttl_secs` (default one hour; `0`
+disables the idle sweep) is closed by the next request or by the engine's idle
+timer (it wakes at most every 30 s), and the non-resident table is capped at
+`serve.multi_slot_max_sessions` (default auto `max(64, 16 × slots)`), oldest
+first. Closing one costs a cold re-prefill from the next prompt; resident
+sessions are never swept.
 
    The **embedding** route (arch 17) uses the same switch with a different
    engine behind it: `POST /v1/embeddings` requests arriving together are
@@ -294,9 +303,9 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`; `503` unless `status` is `ok` |
+| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`, `swap`; `503` unless `status` is `ok` |
 | `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
-| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s`, `loaded_config`. `loaded_config` is `{ model, kv_mode, kv_backend, max_seq }` — the values the resident model was actually loaded with, from the daemon's load ack (a field is `null` when the ack did not carry it); the whole object is `null` while no model is resident |
+| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s`, `loaded_config`, `swap`. `loaded_config` is `{ model, kv_mode, kv_backend, max_seq }` — the values the resident model was actually loaded with, from the daemon's load ack (a field is `null` when the ack did not carry it); the whole object is `null` while no model is resident |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
 | `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
@@ -341,7 +350,18 @@ resident model was loaded with (`null` while none is resident).
 `reasoning_contract`, `reasoning_effort_native` and `reasoning_efforts`
 publish the resident model's reasoning capability (see the reasoning contract
 below); `reasoning_effort_probe_error` is the full render error when the
-daemon's baseline effort probe failed, `null` otherwise. All of these come from serve's own metadata, so `/health` never waits
+daemon's baseline effort probe failed, `null` otherwise. `swap` publishes the
+multi-slot swap tier: `tier` (`host+disk`/`host`/`disk`/`none`), `evictions`,
+`restores`, `failures`, `host_budget`, `host_used`, `disk_budget`, `disk_used`.
+It is configured from the resolved process policy at startup, replaced with the
+daemon's effective budgets on the first `done` (a read-only swap directory can
+disable the disk tier), and refreshed from each subsequent `done`; it is
+`null` on the standard route. An idle sweep between requests updates the
+daemon's counters immediately but reaches `/health`/`/metrics` on the next
+`done`. The same snapshot is exposed as Prometheus gauges on `/metrics`
+(`hipfire_swap_info{tier=...}`, `hipfire_swap_evictions`,
+`hipfire_swap_restores`, `hipfire_swap_failures`, and the four `*_bytes`
+gauges). All of these come from serve's own metadata, so `/health` never waits
 on a model load.
 
 Model switch lifecycle: a load request is first admitted read-only; a refused

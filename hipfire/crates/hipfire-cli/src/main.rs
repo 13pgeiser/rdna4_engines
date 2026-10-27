@@ -984,6 +984,19 @@ pub(crate) struct ServeArgs {
     /// `memory.max_seq` bounds; overrides the configured/automatic context.
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
+    /// Multi-slot serve: host-RAM ceiling for parked swap snapshots, in
+    /// bytes; zero disables the host tier so snapshots spill to disk.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_host_bytes: Option<u64>,
+    /// Multi-slot serve: disk ceiling for parked swap snapshots, in bytes;
+    /// zero disables disk spill. LRU snapshots are evicted at the ceiling.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_disk_bytes: Option<u64>,
+    /// Multi-slot serve: directory for swap spill files; empty uses
+    /// `$XDG_RUNTIME_DIR/hipfire/swap/<pid>`, falling back to
+    /// `$TMPDIR/hipfire-swap-<pid>`.
+    #[arg(long, value_name = "DIR")]
+    swap_dir: Option<PathBuf>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
@@ -1951,7 +1964,12 @@ fn pull_with_sidecar_pins(
         eprintln!("Already downloaded: {}", path.display());
         false
     } else if destination.exists()
-        && existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes)
+        && existing_artifact_valid(
+            &VerifiedCache::in_home(&paths.root),
+            &destination,
+            entry.sha256.as_deref(),
+            entry.size_bytes,
+        )
     {
         eprintln!("Already downloaded: {}", destination.display());
         false
@@ -1992,6 +2010,7 @@ fn pull_with_sidecar_pins(
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
         download_verified(
+            &VerifiedCache::in_home(&paths.root),
             &url,
             &destination,
             entry.sha256.as_deref(),
@@ -2018,6 +2037,7 @@ fn pull_with_sidecar_pins(
     if let Some(plan) = &ple_plan {
         for (format, sidecar) in &plan.sidecars {
             ple::fetch_ple_sidecar(
+                &VerifiedCache::in_home(&paths.root),
                 entry,
                 *format,
                 sidecar,
@@ -2036,6 +2056,7 @@ fn pull_with_sidecar_pins(
             continue;
         }
         fetch_registry_sidecar(
+            &VerifiedCache::in_home(&paths.root),
             declared.label,
             &entry.repo,
             declared.sidecar,
@@ -2057,17 +2078,26 @@ fn pull_with_sidecar_pins(
     });
     let identity = served_identity.as_ref().unwrap_or(entry);
     if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, overlay_pins) {
-        fetch_registry_sidecar(
-            "Trunk overlay",
-            overlay.repo,
-            &overlay.sidecar,
-            &hipfire_config::memory::trunk_overlay_sidecar_path(&model_path),
-            args.force,
-        );
+        if pull_select::trunk_overlay_wanted(&ple::local_gpu_arches()) {
+            fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
+                "Trunk overlay",
+                overlay.repo,
+                &overlay.sidecar,
+                &hipfire_config::memory::trunk_overlay_sidecar_path(&model_path),
+                args.force,
+            );
+        } else {
+            eprintln!(
+                "  Skipping Trunk overlay sidecar (no gfx1151 GPU detected; the loader applies it only on gfx1151, or anywhere with HIPFIRE_QWEN4_TRUNK_OVERLAY=1): {}",
+                overlay.sidecar.file
+            );
+        }
     }
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
                 "Expert hot set",
                 hotset.repo,
                 &hotset.sidecar,
@@ -2079,8 +2109,12 @@ fn pull_with_sidecar_pins(
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
         if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
+            if existing_artifact_valid(
+                &VerifiedCache::in_home(&paths.root),
+                &destination,
+                sidecar.sha256.as_deref(),
+                sidecar.size_bytes,
+            ) {
                 eprintln!("  head {name} already present: {}", sidecar.file);
                 continue;
             }
@@ -2088,6 +2122,7 @@ fn pull_with_sidecar_pins(
         }
         eprintln!("  Fetching head {name}: {}", sidecar.file);
         download_verified(
+            &VerifiedCache::in_home(&paths.root),
             &artifact_url(entry, &sidecar.file),
             &destination,
             sidecar.sha256.as_deref(),
@@ -2102,6 +2137,7 @@ fn pull_with_sidecar_pins(
 /// kept, a stale one (or any under `force`) is refreshed through
 /// [`download_verified`]. A failed download only warns; the base stays usable.
 fn fetch_registry_sidecar(
+    cache: &VerifiedCache,
     label: &str,
     repo: &str,
     sidecar: &Sidecar,
@@ -2109,7 +2145,12 @@ fn fetch_registry_sidecar(
     force: bool,
 ) {
     if destination.exists() && !force {
-        if existing_artifact_valid(destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+        if existing_artifact_valid(
+            cache,
+            destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+        ) {
             eprintln!("  {label} sidecar already present: {}", sidecar.file);
             return;
         }
@@ -2117,6 +2158,7 @@ fn fetch_registry_sidecar(
     }
     eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
     if let Err(error) = download_verified(
+        cache,
         &artifact_url_in(repo, &sidecar.file),
         destination,
         sidecar.sha256.as_deref(),
@@ -2147,6 +2189,7 @@ fn artifact_url_in(repo: &str, file: &str) -> String {
 thread_local! { static DOWNLOAD_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 pub(crate) fn download_verified(
+    cache: &VerifiedCache,
     url: &str,
     destination: &Path,
     expected_sha256: Option<&str>,
@@ -2221,6 +2264,17 @@ pub(crate) fn download_verified(
                 destination.display()
             )
         })?;
+        // The digest above is the proof: record it against the installed file's
+        // stat so later loads and proof-requiring checks never re-hash it.
+        if expected_sha256.is_some() {
+            if let Ok(installed) = fs::metadata(destination) {
+                cache.remember(
+                    destination,
+                    verified_cache::StatKey::of(&installed),
+                    &actual,
+                );
+            }
+        }
         eprintln!(
             "  Saved: {} ({:.3} GB, sha256 {})",
             destination.display(),
@@ -2258,7 +2312,12 @@ fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
     let _ = std::io::stderr().flush();
 }
 
+/// True when `path` is the pinned artifact: size, and SHA-256 when pinned. A
+/// file the cache already proved (same stat, same digest) is not hashed again;
+/// a file hashed here is recorded, so one verification serves every later
+/// load, pull and proof-requiring check ([`verified_metadata`]).
 pub(crate) fn existing_artifact_valid(
+    cache: &VerifiedCache,
     path: &Path,
     expected_sha256: Option<&str>,
     expected_size: Option<u64>,
@@ -2271,15 +2330,10 @@ pub(crate) fn existing_artifact_valid(
             return false;
         }
     }
-    if let Some(expected) = expected_sha256 {
-        let Ok(digest) = sha256_path(path) else {
-            return false;
-        };
-        if !digest.eq_ignore_ascii_case(expected) {
-            return false;
-        }
+    match expected_sha256 {
+        Some(expected) => verified_metadata(cache, path, expected, metadata.len()).is_ok(),
+        None => true,
     }
-    true
 }
 
 fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
@@ -3787,6 +3841,9 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             tp: None,
             speculation: None,
             max_seq: None,
+            swap_host_bytes: None,
+            swap_disk_bytes: None,
+            swap_dir: None,
             continuous_batch_size: None,
             foreground_child: false,
             ui: false,
@@ -5202,13 +5259,14 @@ fn resolve_xdna_sidecar(
 /// Call only once the final `vision_mode` is known (`load_params` projects it
 /// from `vision.mode`). `off` is a hard override mirroring the daemon's
 /// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
-/// one. `auto` uses the registry/sibling sidecar when present and runs
-/// silently text-only when absent. `on` requires the declared sidecar and
+/// one. `auto` and `resident` use the registry/sibling sidecar when present
+/// and run silently text-only when absent (they differ only in tower
+/// residency, decided at load). `on` requires the declared sidecar and
 /// fails the load closed when it cannot be resolved (same shape as the
 /// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
 /// and is unaffected by this key under every mode.
 ///
-/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// Priority under `auto`/`resident`/`on`: an already-projected `params["vision"]`
 /// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
 /// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
 /// `entry.vision`, looked up in `models_dir` first — `find_model_path`
@@ -5227,8 +5285,10 @@ fn resolve_vision_sidecar(
     // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
     // override and the only place that decides; leaving the resolved path in
     // the params lets it tell an image request which sidecar it declined.
-    let mode = params["vision_mode"].as_str().unwrap_or("off");
-    if !matches!(mode, "off" | "auto" | "on") {
+    let mode = params["vision_mode"]
+        .as_str()
+        .unwrap_or(hipfire_config::vision_mode_default());
+    if !matches!(mode, "off" | "auto" | "resident" | "on") {
         return Ok(());
     }
     if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
@@ -5949,13 +6009,30 @@ pub(crate) fn apply_http_reasoning_request(
                             }
                         }
                         "high" | "max" | "minimal" | "med" => {
+                            // Off-ladder aliases normalize to the nearest
+                            // supported tier instead of dropping to the
+                            // default, so intent-ordered clients
+                            // (minimal<low<medium<high<xhigh<max) keep their
+                            // ordering. When the model's advertised ladder
+                            // excludes the nearest tier, fall as before.
+                            let nearest: &str = match raw.as_str() {
+                                "minimal" => "low",
+                                "med" => "medium",
+                                _ => "xhigh",
+                            };
+                            let target = if !supported_efforts.is_empty()
+                                && !supported_efforts.iter().any(|e| e == nearest)
+                            {
+                                QWEN_JINJA_DEFAULT_EFFORT
+                            } else {
+                                nearest
+                            };
                             push_warn(format!(
-                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                "reasoning_effort '{}' normalized to {target} (qwen_jinja ladder is low|medium|xhigh)",
                                 raw
                             ));
-                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
-                            request["reasoning_effort"] =
-                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
+                            effective_effort = Some(target.to_string());
+                            request["reasoning_effort"] = serde_json::json!(target);
                         }
                         "native" => {
                             push_warn(format!(
@@ -7164,6 +7241,21 @@ struct BenchLoadOpts {
     continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
+/// `bench` measures text generation and has no image/audio/video input, so
+/// its load is text-only whatever `vision.mode` resolves to. Under the schema
+/// default `auto` a pulled `qwen3.8-27b-vision.hfq` would otherwise be wired
+/// into every bench load: ~1.05 GB of resident tower VRAM that shifts KV and
+/// admission headroom (and, on cards where `max_seq` is derived from free
+/// memory, the context the run is sized to) relative to earlier releases.
+/// Projects `off` and drops the resolved sidecar so no `skipping tower
+/// sidecar` line fires either.
+fn pin_bench_text_only(params: &mut serde_json::Value) {
+    params["vision_mode"] = serde_json::json!("off");
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("vision");
+    }
+}
+
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
@@ -7243,6 +7335,7 @@ fn open_bench_engine(
         // No --head on this path yet; the model's own head is used.
         None,
     )?;
+    pin_bench_text_only(&mut params);
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
@@ -9404,6 +9497,25 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0)
             );
+            // Windows daemon only: the amdhip64*.dll that actually loaded (a
+            // System32 driver copy can shadow an SDK's) and the raw versions.
+            // Fields are null/absent when the daemon could not read them.
+            #[cfg(windows)]
+            {
+                let raw = |key: &str| {
+                    live.get(key)
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+                };
+                println!(
+                    "HIP runtime:   {} (runtime {}, driver {})",
+                    live.get("hip_runtime_library")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    raw("hip_runtime_version_raw"),
+                    raw("hip_driver_version_raw")
+                );
+            }
             if matches!(
                 live.get("arch").and_then(serde_json::Value::as_str),
                 Some("gfx1150" | "gfx1151" | "gfx1152")
@@ -13408,6 +13520,41 @@ effort = "high"
         fs::remove_dir_all(&paths.root).unwrap();
     }
     #[test]
+    pub(crate) fn resident_vision_mode_projects_and_resolves_like_auto() {
+        let paths = test_paths("vision-sidecar-resident");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(&entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some("qwen3.8:27b"),
+                false,
+                None,
+            )
+        };
+        let resolved = resolved_with_vision_mode("resident");
+        let missing = load(&resolved).unwrap();
+        assert_eq!(missing["vision_mode"], "resident");
+        assert!(
+            missing.get("vision").is_none(),
+            "missing sidecar stays text-only"
+        );
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let present = load(&resolved).unwrap();
+        assert_eq!(present["vision_mode"], "resident");
+        assert_eq!(present["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
     pub(crate) fn derived_packs_finds_the_tower_pack_beside_the_trunk() {
         // `hipfire quantize --install` must carry the arch-18 `.vl` pack the
         // quantizer wrote beside the trunk: installing the trunk alone left the
@@ -13444,7 +13591,7 @@ effort = "high"
         let pack = paths.models.join("embeddinggemma-2.vl");
         fs::write(&pack, b"towers").unwrap();
         let entry = vision_sidecar_entry("embeddinggemma-2.vl");
-        for mode in ["auto", "on"] {
+        for mode in ["auto", "resident", "on"] {
             let params = embed_load_params(
                 &resolved_with_vision_mode(mode),
                 Some(&entry),
@@ -13758,6 +13905,38 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn bench_load_is_text_only_under_the_default_vision_mode() {
+        // The schema default is `auto`, which wires a pulled sidecar into
+        // `run`/`serve`; `bench` has no media input and must not pay the tower.
+        let paths = test_paths("bench-vision-pin");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut params = load_params(
+            &defaults,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "auto");
+        assert!(params["vision"].is_string());
+        pin_bench_text_only(&mut params);
+        assert_eq!(params["vision_mode"], "off");
+        assert!(params.get("vision").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -19782,6 +19961,50 @@ effort = "high"
     }
 
     #[test]
+    fn http_reasoning_qwen_jinja_off_ladder_effort_normalizes_to_nearest() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for (raw, want) in [
+            ("high", "xhigh"),
+            ("max", "xhigh"),
+            ("med", "medium"),
+            ("minimal", "low"),
+        ] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": raw }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], want, "{raw}");
+            assert_eq!(res.effective_effort.as_deref(), Some(want), "{raw}");
+            assert!(
+                res.warnings.iter().any(|w| w.contains("normalized")),
+                "{raw}"
+            );
+        }
+        // A restricted ladder that excludes the nearest tier still falls to the
+        // qwen_jinja default.
+        let restricted = vec!["low".to_string(), "medium".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &restricted,
+        )
+        .unwrap();
+        assert_eq!(req["reasoning_effort"], "medium");
+        assert_eq!(res.effective_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
     fn http_reasoning_nested_max_tokens_and_qwen_deepseek_glimmer_contracts_intact() {
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
         // Nested reasoning.max_tokens still works
@@ -20181,17 +20404,25 @@ effort = "high"
         hasher.update(content);
         let sha = format!("{:x}", hasher.finalize());
         let size = content.len() as u64;
-        assert!(existing_artifact_valid(&path, Some(&sha), Some(size)));
-        assert!(!existing_artifact_valid(&path, Some(&sha), Some(size + 1)));
+        let off = VerifiedCache::disabled();
+        assert!(existing_artifact_valid(&off, &path, Some(&sha), Some(size)));
         assert!(!existing_artifact_valid(
+            &off,
+            &path,
+            Some(&sha),
+            Some(size + 1)
+        ));
+        assert!(!existing_artifact_valid(
+            &off,
             &path,
             Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             Some(size)
         ));
         // No expectations means existence alone is valid
-        assert!(existing_artifact_valid(&path, None, None));
+        assert!(existing_artifact_valid(&off, &path, None, None));
         // Missing file is invalid
         assert!(!existing_artifact_valid(
+            &off,
             &dir.join("missing"),
             Some(&sha),
             Some(size)
@@ -20461,6 +20692,7 @@ effort = "high"
         // Place stale artifact with same name but wrong hash/size
         fs::write(paths.models.join("test-model.mq4"), stale).unwrap();
         assert!(!existing_artifact_valid(
+            &VerifiedCache::disabled(),
             &paths.models.join("test-model.mq4"),
             Some(&sha(fresh)),
             Some(fresh.len() as u64)
@@ -20569,6 +20801,7 @@ effort = "high"
         fs::create_dir_all(&dir).unwrap();
         let destination = dir.join("model.mq4");
         let error = download_verified(
+            &VerifiedCache::disabled(),
             "http://127.0.0.1:1/model.mq4",
             &destination,
             None,
@@ -22204,6 +22437,146 @@ effort = "high"
         }
     }
 
+    /// A pull records the verification proof of every artifact it verifies (the
+    /// split base, its PLE sidecar, the trunk overlay, the expert hot set), with
+    /// the identity `verified_metadata` records for a retired monolithic. Nothing
+    /// is hashed again afterwards: not by the validity check, not by a second
+    /// pull, not by the loader's read-only proof lookup.
+    #[test]
+    fn pull_records_a_proof_for_the_split_base_and_every_sidecar() {
+        use hipfire_config::memory::{expert_hotset_sidecar_path, trunk_overlay_sidecar_path};
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[]);
+        let _arch = ple::GpuArchOverride::set(&["gfx1151"]);
+        let paths = test_paths("pull-proof");
+        write_test_registry_cache(&paths, &gf_registry_raw());
+        let overlay_pins = gf_overlay_pins();
+        let hotset_pins = gf_hotset_pins();
+        let pull = |paths: &Paths| {
+            pull_with_sidecar_pins(
+                paths,
+                PullArgs::defaults("qwen3.8:flash-next"),
+                &overlay_pins,
+                &hotset_pins,
+                &grandfather_table(),
+            )
+        };
+        let (base_url, handle) = serve_files(&[
+            (SHARED_FILE_A, SHARED_BASE_A),
+            (SHARED_Q4_FILE, PLE_Q4),
+            (
+                "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+                GF_OVERLAY_BYTES,
+            ),
+            (
+                "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+                GF_HOTSET_BYTES,
+            ),
+        ]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base_url);
+        HASH_INVOCATIONS.with(|count| count.set(0));
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        let base = pull(&paths).unwrap().unwrap();
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS
+            .with(|count| assert_eq!(count.get(), 4, "base + q4 + overlay + hotset"));
+        assert_eq!(base, paths.models.join(SHARED_FILE_A));
+
+        let artifacts = [
+            (base.clone(), SHARED_BASE_A),
+            (paths.models.join(SHARED_Q4_FILE), PLE_Q4),
+            (trunk_overlay_sidecar_path(&base), GF_OVERLAY_BYTES),
+            (expert_hotset_sidecar_path(&base), GF_HOTSET_BYTES),
+        ];
+        let cache = VerifiedCache::in_home(&paths.root);
+        for (path, bytes) in artifacts.clone() {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+            let record = cached_record(&paths, &path)
+                .unwrap_or_else(|| panic!("no proof recorded for {}", path.display()));
+            let stat = verified_cache::StatKey::of(&fs::metadata(&path).unwrap());
+            let expected = format!("{:x}", Sha256::digest(bytes));
+            assert_eq!(record["sha256"], expected.as_str());
+            assert_eq!(record["size"], bytes.len() as u64);
+            assert!(record["verified_at"].as_u64().unwrap() > 0);
+            // The proof the loader and the identity gates read.
+            assert_eq!(cache.verified_digest(&path, &stat), Some(expected.clone()));
+            assert!(cache.satisfies(&path, &stat, &expected));
+        }
+        assert_eq!(hash_invocations(), 0, "the download hashed in stream");
+
+        // A validity check hashes nothing: the proof stands.
+        for (path, bytes) in artifacts {
+            for _ in 0..2 {
+                assert!(existing_artifact_valid(
+                    &cache,
+                    &path,
+                    Some(&format!("{:x}", Sha256::digest(bytes))),
+                    Some(bytes.len() as u64),
+                ));
+            }
+        }
+        assert_eq!(hash_invocations(), 0);
+
+        // A second pull finds everything present and re-hashes nothing.
+        let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+        assert_eq!(pull(&paths).unwrap().unwrap(), base);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 4));
+        assert_eq!(hash_invocations(), 0);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// An artifact already on disk (an older pull, a copied-in file) is hashed by
+    /// the first pull that finds it, the proof is recorded, and no later check
+    /// hashes it again until its stat changes.
+    #[test]
+    fn existing_artifact_valid_records_its_proof_and_hashes_once_per_stat() {
+        let paths = test_paths("valid-records");
+        fs::create_dir_all(&paths.models).unwrap();
+        let cache = VerifiedCache::in_home(&paths.root);
+        let path = paths.models.join("split-base.mq4-xts");
+        let bytes = b"synthetic split base";
+        fs::write(&path, bytes).unwrap();
+        let sha = format!("{:x}", Sha256::digest(bytes));
+        let size = bytes.len() as u64;
+        HASH_INVOCATIONS.with(|count| count.set(0));
+
+        assert!(existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 1);
+        assert!(cached_record(&paths, &path).is_some(), "proof recorded");
+        assert!(existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 1, "second check hits the proof");
+
+        // Same size, new bytes: the stat moves, the old proof no longer applies,
+        // and wrong bytes never earn one.
+        fs::write(&path, b"synthetic split BASE").unwrap();
+        assert!(!existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 2);
+        assert!(!existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 3, "a failed proof is never remembered");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     /// A local HTTP server that serves `files` for any number of requests and
     /// records which file names were requested (404 for the rest).
     struct RecordingServer {
@@ -22425,14 +22798,19 @@ effort = "high"
                     .collect();
                 // The base downloads only with nothing local; the overlay and hot
                 // set are the ones bound to whichever artifact serves the tags.
+                // The overlay is fetched only where the loader applies it
+                // (gfx1151, or no detected GPU).
+                let overlay_fetched = arches.is_empty() || arches.contains(&"gfx1151");
                 if mono_present {
-                    expected.extend([overlay_mono.to_owned(), hotset_mono.to_owned()]);
+                    expected.push(hotset_mono.to_owned());
+                    if overlay_fetched {
+                        expected.push(overlay_mono.to_owned());
+                    }
                 } else {
-                    expected.extend([
-                        SHARED_FILE_A.to_owned(),
-                        overlay_base.to_owned(),
-                        hotset_base.to_owned(),
-                    ]);
+                    expected.extend([SHARED_FILE_A.to_owned(), hotset_base.to_owned()]);
+                    if overlay_fetched {
+                        expected.push(overlay_base.to_owned());
+                    }
                 }
                 expected.sort();
                 assert_eq!(seen, expected, "{case}");
@@ -22926,7 +23304,9 @@ effort = "high"
         }]
     }
 
-    fn pull_overlay_model(paths: &Paths, force: bool) {
+    /// `PullArgs::defaults("overlay-model")` on a host with the given GPU arches.
+    fn pull_overlay_model_on(paths: &Paths, force: bool, arches: &[&str]) {
+        let _arch = ple::GpuArchOverride::set(arches);
         pull_with_sidecar_pins(
             paths,
             PullArgs {
@@ -22938,6 +23318,52 @@ effort = "high"
             &grandfather_table(),
         )
         .unwrap();
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_overlay_model_on(paths, force, &["gfx1151"]);
+    }
+
+    #[test]
+    fn pull_skips_the_trunk_overlay_where_no_gpu_applies_it() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        for (arches, fetched) in [
+            (&["gfx1201"][..], false),
+            (&["gfx1100"][..], false),
+            (&["gfx1100", "gfx1201"][..], false),
+            (&["gfx1151"][..], true),
+            (&["gfx1100", "gfx1151"][..], true),
+            (&[][..], true),
+        ] {
+            let paths = test_paths("overlay-arch");
+            write_test_registry_cache(&paths, &overlay_registry_raw());
+            let mut files = std::collections::HashMap::new();
+            files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+            if fetched {
+                files.insert(
+                    "overlay-model.mq4.trunk-overlay".to_owned(),
+                    OVERLAY_BYTES.to_vec(),
+                );
+            }
+            // The server holds only what the pull should fetch; the download
+            // counter below proves a skipped overlay was never requested.
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            pull_overlay_model_on(&paths, false, arches);
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1 + usize::from(fetched)));
+            assert_eq!(
+                paths
+                    .models
+                    .join("overlay-model.mq4.trunk-overlay")
+                    .exists(),
+                fetched,
+                "{arches:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
     }
 
     #[test]

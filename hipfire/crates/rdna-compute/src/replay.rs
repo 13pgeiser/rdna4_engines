@@ -36,6 +36,7 @@ use redline_dispatch::{
 use crate::code_object::{CodeObjectId, RecordedArtifact};
 use crate::dispatch::VmmResourceMove;
 
+pub(crate) mod railgun_lower;
 pub(crate) mod railgun_shadow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,7 +747,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
                 read(24),
                 read(32),
                 write(40),
-            ])
+            ]);
         }
         "gemm_mq4g256v2_fp8_qkv_row_b1" => {
             return Some(vec![
@@ -758,7 +759,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
                 write(40),
                 write(48),
                 write(56),
-            ])
+            ]);
         }
         "gemm_mq4g256v2_fp8_qkvza_row_b1" => {
             return Some(vec![
@@ -771,7 +772,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
                 write(48),
                 write(56),
                 write(64),
-            ])
+            ]);
         }
         _ => {}
     }
@@ -918,6 +919,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
     }
+    if kernel == "gemv_mq4g128v2_moe_ninepath_d4" {
+        // expert_ptrs, topk_indices, topk_weights, gate, up, signs1, signs2
+        // (read); out is RMW.
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            write(56),
+        ]);
+    }
     if matches!(
         kernel,
         "gemm_mq4g256v2_moe_grouped_wmma_k2"
@@ -972,6 +987,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
+            | "gemv_mq6g256v2_k2560"
+            | "gemv_mq6g256v2_k2560_u2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
             | "gemv_mq4g256v2_multirow_r4"
@@ -1377,7 +1394,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
-        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512" => {
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -1466,6 +1484,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
+        | "attention_flash_q8_0_tile_hd64"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
@@ -1737,6 +1756,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     ) {
         return Some(64);
     }
+    if kernel == "gemv_mq4g128v2_moe_ninepath_d4" {
+        // 8 ptr + down_m,down_k,n_experts = 76 explicit bytes, padded to 16 B.
+        return Some(80);
+    }
     if matches!(
         kernel,
         "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
@@ -1772,6 +1795,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
+            | "gemv_mq6g256v2_k2560"
+            | "gemv_mq6g256v2_k2560_u2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
             | "gemv_mq4g256v2_multirow_r4"
@@ -1901,6 +1926,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
@@ -1949,6 +1975,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816" => Some(64),
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
+        | "attention_flash_q8_0_tile_hd64"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
@@ -6643,7 +6670,7 @@ impl ReplayController {
                             None => {}
                             Some(Ok(railgun_commands)) => commands = railgun_commands,
                             Some(Err(reason)) => {
-                                return Err(format!("railgun backend refused: {reason}"))
+                                return Err(format!("railgun backend refused: {reason}"));
                             }
                         }
                     }
@@ -7024,7 +7051,7 @@ impl ReplayController {
                     return Err(RetainedReplayFailure {
                         error: "no prepared PM4 replay".to_owned(),
                         quiescence: ReplayQuiescence::Proven,
-                    })
+                    });
                 }
             };
             // SAFETY: forwarded from the model owner.
@@ -8199,14 +8226,14 @@ impl ReplayController {
                     return Err(format!(
                         "retained route identity for table {key:#x} (latched {latched}) is not \
                          bound at replay"
-                    ))
+                    ));
                 }
                 Some(identity) if identity == latched => {}
                 Some(identity) => {
                     return Err(format!(
                         "retained route identity for table {key:#x} changed since capture: \
                          latched {latched}, bound {identity}"
-                    ))
+                    ));
                 }
             }
         }
@@ -10120,6 +10147,8 @@ mod tests {
             "gemv_mq4g256v2_residual",
             "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
             "gemv_mq6g256v2",
+            "gemv_mq6g256v2_k2560",
+            "gemv_mq6g256v2_k2560_u2",
             "gemv_mq6g256v2_residual",
             "gemv_mq4g256v2_multirow_r2",
             "gemv_mq4g256v2_multirow_r4",

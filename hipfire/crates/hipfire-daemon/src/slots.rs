@@ -389,6 +389,132 @@ impl PendingToolBroker {
     }
 }
 
+/// JSON shape for the swap-tier snapshot carried by the load ack and every
+/// `done` event. `tier` is derived from the effective budgets, so a disabled
+/// or read-only disk tier reads `host`/`none` rather than the configured value.
+pub(crate) fn swap_stats_json(stats: &hipfire_runtime::serve::EngineStats) -> serde_json::Value {
+    let tier = match (stats.swap_host_budget > 0, stats.swap_disk_budget > 0) {
+        (true, true) => "host+disk",
+        (true, false) => "host",
+        (false, true) => "disk",
+        (false, false) => "none",
+    };
+    serde_json::json!({
+        "tier": tier,
+        "evictions": stats.evictions,
+        "restores": stats.restores,
+        "failures": stats.swap_failures,
+        "host_budget": stats.swap_host_budget,
+        "host_used": stats.swap_host_used,
+        "disk_budget": stats.swap_disk_budget,
+        "disk_used": stats.swap_disk_used,
+    })
+}
+
+/// Default swap directory for a daemon that did not set `serve.swap_dir`.
+///
+/// Per process, under the user's runtime directory when one exists, so two
+/// daemons (multi-GPU or test ports) never share spill files. The temp
+/// fallback encodes the pid for the same reason. `SwapStore` still creates it
+/// 0700, requires this user to own it, and locks it for the store's lifetime.
+fn default_swap_dir() -> PathBuf {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR");
+    let temp = std::env::temp_dir();
+    sweep_dead_swap_dirs(xdg.as_deref(), &temp);
+    default_swap_dir_from(xdg.as_deref(), &temp, std::process::id())
+}
+
+/// Remove per-pid swap dirs left by crashed daemons. `$XDG_RUNTIME_DIR` is
+/// usually cleaned on logout; the `$TMPDIR` fallback is not, so a crash there
+/// would otherwise leak a directory of snapshots per run.
+#[cfg(target_os = "linux")]
+fn sweep_dead_swap_dirs(xdg_runtime: Option<&std::ffi::OsStr>, temp: &std::path::Path) {
+    let (parent, prefix) = match xdg_runtime.filter(|dir| !dir.is_empty()) {
+        Some(runtime) => (PathBuf::from(runtime).join("hipfire").join("swap"), ""),
+        None => (temp.to_path_buf(), "hipfire-swap-"),
+    };
+    sweep_dead_pid_dirs(&parent, prefix);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sweep_dead_swap_dirs(_xdg_runtime: Option<&std::ffi::OsStr>, _temp: &std::path::Path) {}
+
+#[cfg(target_os = "linux")]
+fn sweep_dead_pid_dirs(parent: &std::path::Path, prefix: &str) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let current = std::process::id();
+    let uid = std::fs::metadata("/proc/self").ok().map(|meta| meta.uid());
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == current || std::path::Path::new("/proc").join(pid.to_string()).exists() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        if uid.is_some_and(|uid| meta.uid() != uid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn default_swap_dir_from(
+    xdg_runtime: Option<&std::ffi::OsStr>,
+    temp: &std::path::Path,
+    pid: u32,
+) -> PathBuf {
+    if let Some(runtime) = xdg_runtime.filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(runtime)
+            .join("hipfire")
+            .join("swap")
+            .join(pid.to_string());
+    }
+    temp.join(format!("hipfire-swap-{pid}"))
+}
+
+/// Resolve the swap policy from the process config, falling back to the
+/// registered defaults when a key is absent. The CLI projects `serve --swap-*`
+/// into this same config layer, so flags, environment, and TOML cannot drift.
+fn resolve_swap_policy(process: &hipfire_config::ProcessConfig) -> (u64, u64, PathBuf) {
+    let config_u64 = |key: &str| {
+        process.values.get(key).and_then(|value| match value {
+            hipfire_config::ConfigValue::Integer(i) => u64::try_from(*i).ok(),
+            _ => None,
+        })
+    };
+    let host = config_u64("serve.swap_host_bytes")
+        .unwrap_or(hipfire_runtime::swap::DEFAULT_HOST_BUDGET_BYTES);
+    let disk = config_u64("serve.swap_disk_bytes")
+        .unwrap_or(hipfire_runtime::swap::DEFAULT_DISK_BUDGET_BYTES);
+    let dir = process
+        .values
+        .get("serve.swap_dir")
+        .and_then(|value| match value {
+            hipfire_config::ConfigValue::String(s) if !s.is_empty() => Some(PathBuf::from(s)),
+            _ => None,
+        })
+        .unwrap_or_else(default_swap_dir);
+    (host, disk, dir)
+}
+
 impl SlotBackend {
     /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
     /// `kv_mode_raw`/`kv_backend` are the load's effective KV selector and
@@ -541,11 +667,17 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
+        let (swap_host_bytes, swap_disk_bytes, swap_dir) =
+            resolve_swap_policy(&hipfire_config::active_or_local_process_config());
+        eprintln!(
+            "serve: swap policy host-budget={swap_host_bytes} B disk-budget={swap_disk_bytes} B dir={}",
+            swap_dir.display()
+        );
+
         // Arch dispatch point: the carrier that claims `arch_id` spawns its
         // multi-slot engine via `Carrier::spawn_slot_engine`. Everything
         // downstream drives the family-neutral `SlotEngineHandle` surface
-        // only. `host_budget_bytes` / `swap_dir` are engine-policy constants
-        // the family-neutral config carries for the spawn arm.
+        // only.
         let engine = spawn_slot_engine(
             arch_id,
             SlotEngineConfig {
@@ -553,12 +685,14 @@ impl SlotBackend {
                 n_slots,
                 cap_tokens,
                 prefill_chunk,
-                host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                host_budget_bytes: swap_host_bytes,
+                swap_dir,
+                swap_disk_bytes,
                 mtp_k,
                 mtp_mode,
                 is_vl,
                 vl_path,
+                vision_mode: vision_mode.to_string(),
                 kv_mode_raw: kv_mode_raw.to_string(),
                 kv_backend: kv_backend.to_string(),
                 prefix_cache,
@@ -654,6 +788,23 @@ impl SlotBackend {
         Some(SlotGuard { backend: self })
     }
 
+    /// Drop broker state for sessions the engine swept on its own. Called at
+    /// the start of each generate/embed request and on `Accepted` (an admit
+    /// can sweep), so a swept tool session's pending entries do not linger.
+    fn reap_closed_sessions(&self) {
+        let closed = self.engine.take_closed_sessions();
+        if closed.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for session in closed {
+            pending.remove_session(session);
+        }
+    }
+
     fn close_session(&self, session: u64) {
         self.pending_tools
             .lock()
@@ -737,6 +888,7 @@ impl SlotBackend {
             );
             return;
         };
+        self.reap_closed_sessions();
         hipfire_generate::embed::generate_embed_slot(&*self.engine, stdout, id, msg);
     }
 
@@ -793,6 +945,7 @@ impl SlotBackend {
         };
         hipfire_engine::terminal::set_active_attempt_id(attempt_id);
         let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+        self.reap_closed_sessions();
 
         // Require experimental marker.
         if !is_experimental_generate(msg) {
@@ -1543,6 +1696,9 @@ impl SlotBackend {
                         reused,
                         prefill,
                     } => {
+                        // An admit may have swept parked sessions; prune their
+                        // broker state before this request can name one.
+                        self.reap_closed_sessions();
                         if let Some(expected) =
                             claimed_session.filter(|expected| *expected != session)
                         {
@@ -1744,6 +1900,9 @@ impl SlotBackend {
             "engine_stats": self.engine.stats(),
         });
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
+        // Live swap-tier counters for /health. The engine refreshes its stats
+        // each step, so this is the state as of (at worst) the current step.
+        pending_done["swap"] = swap_stats_json(&self.engine.stats());
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
         let Some(ticket) = accepted_ticket else {
@@ -1852,9 +2011,12 @@ fn cpu_preflight(
         // The carrier reports the tower it FOUND (an explicit path, or the
         // `.vl` sibling); the load's ladder owns whether it is used — the
         // same rule the sequential arm applies (`vision_mode=off` is a hard
-        // override; `on` requires a tower). Without this gate the mode never
-        // reached a carrier-delegated preflight at all, so a multi-slot load
-        // asking for `auto` came back text-only and refused media.
+        // override; `on` requires a tower; `auto` and `resident` discover and
+        // never fail closed — `resident` only changes how a found tower is
+        // held, see `TowerResidency::from_vision_mode`). Without this gate the
+        // mode never reached a carrier-delegated preflight at all, so a
+        // multi-slot load asking for `auto` came back text-only and refused
+        // media.
         let (vl_path, is_vl) = match vision_mode {
             "off" => (None, false),
             _ => {
@@ -1908,11 +2070,13 @@ fn cpu_preflight(
     // tensors. If no .vl file exists, fall back to inline (backward compat).
     //
     // `vision_mode` is the SAME documented ladder the sequential load arm
-    // applies (`apply_vision_mode_gate`): `off` (the default) never wires a
+    // applies (`apply_vision_mode_gate`): `off` never wires a
     // sidecar — not even an explicit one — so a text load pays no tower
-    // VRAM; `on` requires a tower to resolve. The multi-slot arm used to
+    // VRAM; `on` requires a tower to resolve; `auto` and `resident` discover
+    // and never fail closed (`resident` uploads the found tower whole, the
+    // others stream it). The multi-slot arm used to
     // discover the sibling unconditionally, so a VL trunk paid the tower's
-    // ~1 GB even under the documented text-only default, and `serve --vision`
+    // ~1 GB even under `vision_mode=off`, and `serve --vision`
     // was dropped on this route entirely.
     let has_inline_vision = is_vision_hfq(&hfq);
     let vl_path: Option<PathBuf> = if vision_mode == "off" {
@@ -3942,5 +4106,67 @@ mod tests {
         }
         batch_clear_all_terminals();
         hipfire_engine::terminal::set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn swap_policy_resolves_defaults_and_cli_overrides() {
+        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let mut process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let (host, disk, dir) = resolve_swap_policy(&process);
+        assert_eq!(host, hipfire_runtime::swap::DEFAULT_HOST_BUDGET_BYTES);
+        assert_eq!(disk, hipfire_runtime::swap::DEFAULT_DISK_BUDGET_BYTES);
+        assert_eq!(dir, default_swap_dir());
+
+        process
+            .values
+            .set_cli("serve.swap_host_bytes", "1048576")
+            .unwrap();
+        process
+            .values
+            .set_cli("serve.swap_disk_bytes", "0")
+            .unwrap();
+        process
+            .values
+            .set_cli("serve.swap_dir", "/tmp/hipfire-swap-test")
+            .unwrap();
+        let (host, disk, dir) = resolve_swap_policy(&process);
+        assert_eq!(host, 1_048_576);
+        assert_eq!(disk, 0);
+        assert_eq!(dir, PathBuf::from("/tmp/hipfire-swap-test"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dead_pid_swap_dirs_are_swept() {
+        let parent = std::env::temp_dir().join("hipfire-deadpid-test");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let dead = parent.join("hipfire-swap-4000000");
+        let live = parent.join(format!("hipfire-swap-{}", std::process::id()));
+        let keep = parent.join("keep");
+        for dir in [&dead, &live, &keep] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        assert_eq!(sweep_dead_pid_dirs(&parent, "hipfire-swap-"), 1);
+        assert!(!dead.exists(), "a dead pid's dir is removed");
+        assert!(live.exists(), "the current pid's dir is kept");
+        assert!(keep.exists(), "names outside the pattern are kept");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn default_swap_dir_is_per_process_and_prefers_the_runtime_dir() {
+        use std::ffi::OsStr;
+        let xdg = default_swap_dir_from(
+            Some(OsStr::new("/run/user/1000")),
+            std::path::Path::new("/tmp"),
+            4242,
+        );
+        assert_eq!(xdg, PathBuf::from("/run/user/1000/hipfire/swap/4242"));
+        let temp = default_swap_dir_from(None, std::path::Path::new("/var/tmp"), 4242);
+        assert_eq!(temp, PathBuf::from("/var/tmp/hipfire-swap-4242"));
+        let empty =
+            default_swap_dir_from(Some(OsStr::new("")), std::path::Path::new("/var/tmp"), 7);
+        assert_eq!(empty, PathBuf::from("/var/tmp/hipfire-swap-7"));
     }
 }
