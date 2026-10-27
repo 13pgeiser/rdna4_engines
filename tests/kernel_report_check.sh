@@ -13,6 +13,8 @@
 set -u
 REPORT=$1
 test -f "$REPORT" || { echo "kernel_report_check: no report at $REPORT"; exit 1; }
+# The counting is one python3 pass; a host without it skips, like ops_doc's skip codes.
+command -v python3 >/dev/null 2>&1 || { echo "  SKIP python3 not present"; exit 77; }
 
 python3 - "$REPORT" <<'PY'
 import re, sys

@@ -603,6 +603,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/docs/KERNELS.md)
                    ${CMAKE_SOURCE_DIR}/docs/KERNELS.md)
   set_tests_properties(kernel_report_check PROPERTIES
     LABELS "fast;unit"
+    SKIP_RETURN_CODE 77
     TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
