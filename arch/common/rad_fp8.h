@@ -768,6 +768,11 @@ struct LinearFP8 {
     /* probe() found an int8 weight; lets a model learn its trunk's format from one linear before
      * declaring activation buffers (ActFP8::declare_qs's `i8`). */
     bool       probed_i8 = false;
+    /* Whether this linear's block-fp8 GEMM takes the short-prompt split rule
+     * (`gemm_nt_q_short`, narrow_ksplit's `short_unsplit`): at N <= 512, K <= 5120 and 41..64 rows
+     * the split's per-slice floors dominate, so the row runs unsplit. Opt-in, so every other
+     * caller keeps the split and its bits. Set before declare(). */
+    bool       short_split = false;
     /* Whether this linear reads the input's bf16 plane, known from probe() before the producer is
      * declared. A producer writes the bf16 plane only when asked, so the block must ask for it when
      * this is set; otherwise the linear reads unwritten arena bytes. */
@@ -1509,7 +1514,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * caller with a tighter bound (the lm_head, over sampled rows only) passes `max_rows`, so the
      * narrow kernel's split-K scratch is not sized for max_tok. */
     const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-    op = rw(b, RAD_OP(b, "gemm_nt_q",
+    op = rw(b, RAD_OP(b, short_split && !f32_scale ? "gemm_nt_q_short" : "gemm_nt_q",
                RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", f32_scale?"fp8a8f32":"fp8a8")),
                RAD_WEIGHTS(w, ws)),
@@ -1724,14 +1729,16 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
 
 /* gate_up, silu_mul and the E4M3 quantiser in one GEMM epilogue (`gemm_nt_q_gated`, an fp8a8
  * tile over a block-fp8 [2n, K] weight), declared for M up to min(rows, 64): the kernel refuses M
- * past that band. Optional: when it does not resolve the caller's unfused ops run, and the issue
+ * past that band, unless the caller asks for the wide row (`wide`), whose gated prefill tile
+ * serves every M. Optional: when it does not resolve the caller's unfused ops run, and the issue
  * site checks `*gated_rows`, set to the band only when the op exists. */
 inline rad_op decl_gated_fold(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
                               rad_weight ws, std::initializer_list<rad_buf> reads,
-                              std::initializer_list<rad_buf> writes, int64_t* gated_rows) {
-    const int64_t hi = rows < 64 ? rows : 64;
+                              std::initializer_list<rad_buf> writes, int64_t* gated_rows,
+                              bool wide = false) {
+    const int64_t hi = wide ? rows : (rows < 64 ? rows : 64);
     if (hi <= 0) return 0;
-    const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated",
+    const rad_op op = rw(b, RAD_OP(b, wide ? "gemm_nt_q_gated_wide" : "gemm_nt_q_gated",
                              RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
                                         RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8"),
                                         RAD_STR("act", "silu")),

@@ -4007,8 +4007,8 @@ RadModelMeta lfm2_meta(int n_kv = 4) {
 std::vector<std::string> lfm2_layer_ops(bool attention) {
     std::vector<std::string> v = { "rmsnorm" };
     if (attention) {
-        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm", "rmsnorm", "rope",
-                               "rope", "attn_paged", "kv_store", "gemm_nt" })
+        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm_rows", "rmsnorm_rows",
+                               "rope_rows", "rope_rows", "attn_paged", "kv_store", "gemm_nt" })
             v.push_back(s);
     } else {
         for (const char* s : { "gemm_nt", "mul", "causal_conv1d", "mul", "gemm_nt" })
@@ -4043,12 +4043,14 @@ TEST(lfm2_declares_the_checkpoints_own_schedule) {
     for (const auto& bd : b.binds)
         CHECK_EQ(bd.second, bd.first == 2 ? (rad_kvgroup)1 : (rad_kvgroup)2);
 
-    /* A plain RMSNorm at the checkpoint's epsilon, NeoX over the whole head. */
+    /* A plain RMSNorm at the checkpoint's epsilon, NeoX over the whole head; the head norms and
+     * rope ask for the rows forms (their prefill row counts are what those forms are for). */
     const RecOp* norm = find_op(b, "rmsnorm");
     CHECK_NEAR(pflt(norm, "eps"), 1e-5, 1e-9);
     CHECK_EQ(param(norm, "wadd") ? pflt(norm, "wadd") : 0.0, 0.0);
-    CHECK_EQ(pstr(find_op(b, "rope"), "mode"), "neox");
-    CHECK_EQ(pint(find_op(b, "rope"), "rotary_dim"), 16);
+    REQUIRE(find_op(b, "rmsnorm_rows") != nullptr);
+    CHECK_EQ(pstr(find_op(b, "rope_rows"), "mode"), "neox");
+    CHECK_EQ(pint(find_op(b, "rope_rows"), "rotary_dim"), 16);
     CHECK_EQ(pint(find_op(b, "attn_paged"), "gqa"), 4);
     CHECK_EQ(pint(find_op(b, "causal_conv1d"), "width"), 3);
 
@@ -4163,6 +4165,85 @@ TEST(lfm2_issues_the_convolution_once_per_half_of_a_mixed_step) {
         }
     }
     CHECK_EQ(convs, 6);   /* three conv layers, two halves each */
+}
+
+TEST(lfm2_fp8_fuses_the_conv_gate_into_the_quantiser) {
+    /* A block-fp8 LFM2 whose linears are all whole 128-blocks: 128 hidden, 128 query/key/value,
+     * 256 ffn. The convolution gate's multiply and the quantiser the out projection reads become
+     * one op where gate_quant_fp8 is served; without it, the pair is unchanged. */
+    RadModelMeta meta = lfm2_meta();
+    meta.n_embd = 128; meta.n_head = 4; meta.n_head_kv = 4; meta.head_dim = 32;
+    meta.n_ff = 256;
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    auto encs = [&](RadBuilder& b) {
+        for (const char* s : { "conv_in.", "conv_out.", "attn_q.", "attn_k.", "attn_v.",
+                               "attn_output.", "ffn_gate_up.", "ffn_down." })
+            b.encs.push_back({ s, fp8 });
+    };
+
+    /* A bf16 model keeps the plain mul: the candidate is a block-fp8 producer only. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+        CHECK_EQ(count_op(b, "gate_quant_fp8"), 0);
+    }
+
+    for (int how = 0; how < 2; ++how) {
+        RadBuilder b;
+        encs(b);
+        if (how == 0) b.undeclared.insert("gate_quant_fp8");
+        else          b.refuse.insert("gate_quant_fp8");
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        int resolved = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gate_quant_fp8" && o.resolved) ++resolved;
+        CHECK_EQ(resolved, 0);
+        CHECK_EQ(count_op(b, "quant_act_fp8"), 4);   /* three conv mixers + the attention output */
+        CHECK_EQ(count_op(b, "mul"), 6);             /* gate_in and gate_out per conv layer */
+    }
+
+    RadBuilder b;
+    encs(b);
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "gate_quant_fp8"), 3);       /* the three convolution layers */
+    CHECK_EQ(count_op(b, "quant_act_fp8"), 1);        /* only the attention output remains */
+    CHECK_EQ(count_op(b, "mul"), 3);                  /* gate_in alone */
+    const RecOp* gq = find_op(b, "gate_quant_fp8");
+    REQUIRE(gq != nullptr);
+    CHECK_EQ(pstr(gq, "act"), std::string("none"));
+    CHECK_EQ(pint(gq, "n"), 128);
+    CHECK_EQ((int)gq->reads.size(), 2);
+    CHECK_EQ((int)gq->writes.size(), 2);               /* codes and scales; no bf16 product */
+
+    /* Decode (one row) and a 32-row chunk: the fused op carries both, and its gate is the C
+     * third of the [B|C|x] row while the value it scales is the convolution output. */
+    auto buf_id = [&](const char* name) -> rad_buf {
+        for (size_t j = 0; j < b.bufs.size(); ++j)
+            if (b.bufs[j].name == name) return (rad_buf)(j + 1);
+        return 0;
+    };
+    for (const auto& k : { kit(b, { 1 }, {}), kit(b, {}, { 32 }) }) {
+        const auto v = run_passes(b, lfm2_bf16::step, { k.get() });
+        CHECK_PASSES(b, v);
+        const std::vector<std::string> ops = issued_ops(b, *v[0]);
+        CHECK_EQ(count_issued(ops, "gate_quant_fp8"), 3);
+        CHECK_EQ(count_issued(ops, "quant_act_fp8"), 1);
+        int seen = 0;
+        for (const RecIssue& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "gate_quant_fp8" || seen++) continue;
+            REQUIRE(i.opd.size() == 5);  /* Optional BF16 output still occupies its schema slot. */
+            CHECK_EQ(i.opd[0].offset, (int64_t)128);   /* C in [B|C|x] */
+            CHECK_EQ(i.opd[0].cols, (int64_t)128);
+            CHECK_EQ(i.opd[1].handle, buf_id("conv_out"));
+            CHECK_EQ(i.opd[2].handle, buf_id("conv_out.q"));
+            CHECK_EQ(i.opd[3].handle, buf_id("conv_out.s"));
+        }
+        CHECK_EQ(seen, 3);
+    }
 }
 
 /* ==================================================================== LFM2-VL's tower */
@@ -7749,6 +7830,14 @@ TEST(qwen35_fp8_declares_fp8_linears_and_the_fused_output_gate) {
         if (o.resolved) CHECK(o.uses_declared);
     for (const auto& w : b.weights)
         if (!w.d.source) CHECK(find_map(b, w.name) != nullptr);
+    /* The lfm2-only rows are that model's own declarations: nothing here names one, so every op
+     * resolves to the row it always did (gemm_nt keeps its band, rmsnorm and rope their launches). */
+    for (const auto& o : b.ops) {
+        CHECK(o.op != "gemm_nt_q_short");
+        CHECK(o.op != "gemm_nt_q_gated_wide");
+        CHECK(o.op != "rmsnorm_rows");
+        CHECK(o.op != "rope_rows");
+    }
     /* No speculation: no head, no drafter. */
     CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_NONE);
     CHECK(find_b(b, "mtp_x") == nullptr);
@@ -10640,7 +10729,7 @@ struct ArchCases {
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
-            lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
+            lfm2_bf16::step, 0, {}, 0x5bce917918dbd478ull);
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
             gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
