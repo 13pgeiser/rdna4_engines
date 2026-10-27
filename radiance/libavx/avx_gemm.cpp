@@ -838,7 +838,29 @@ static int gemm_zp(const avxp::ZpGrid& zg, const RadTensor* A, const RadTensor* 
     const int64_t acols = parts * K;
     if (numel(A) < M * acols) return RAD_E_SHAPE;
     if (A->rank >= 2 && A->shape[A->rank - 1] != acols) return RAD_E_SHAPE;
-    const int64_t ars = row_stride(A, acols), acs = laststride(A);
+    int64_t ars = row_stride(A, acols), acs = laststride(A);
+
+    /* The W4 decode graph supplies BF16 directly so HIP can narrow on load. Keep the previous
+     * explicit BF16->F16 cast semantics for CPU execution before entering the F16 activation grid. */
+    std::vector<uint16_t> narrowed;
+    RadTensor a_f16{};
+    if (zg.act == ZP_F16 && A->dtype == RAD_BF16) {
+        narrowed.resize((size_t)(M * acols));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t k = 0; k < acols; ++k)
+                narrowed[(size_t)(m * acols + k)] = rad_f32_to_f16(ldt(A, m * ars + k * acs));
+        a_f16 = *A;
+        a_f16.data = narrowed.data();
+        a_f16.dtype = RAD_F16;
+        a_f16.rank = 2;
+        a_f16.shape[0] = M;
+        a_f16.shape[1] = acols;
+        a_f16.stride[0] = acols;
+        a_f16.stride[1] = 1;
+        A = &a_f16;
+        ars = acols;
+        acs = 1;
+    }
 
     const bool i8 = zg.act != ZP_F16;
     if (i8 && A->dtype != RAD_I8) return RAD_E_DTYPE;

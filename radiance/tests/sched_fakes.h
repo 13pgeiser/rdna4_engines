@@ -339,11 +339,30 @@ struct FakeKV : IKVManager {
         const KVGeom::G& gg = geom.g[(size_t)g];
         return gg.paged ? gg.block_size : 0;
     }
+    /* A streamed group's view, as KVManager::stream_view returns it. Tests install fake
+     * addresses to check that the builder rebases them into each rank's pool; with `streams`
+     * false the fake has none, which is every other scheduler test. */
+    RadKVStream stream{};
+    bool        streams = false;
+    const RadKVStream* stream_view(int32_t g) const override {
+        return streams && g == 0 ? &stream : nullptr;
+    }
+    /* Groups a test says the window snapshot carries (KVGroupPlan::win_snap): a checkpoint slot
+     * then holds their window, and a hit at a snapshot seeds them (nothing to copy here). */
+    std::vector<int32_t> snap;
+    /* False: the snapshot is taken but window_snapshot() does not report its groups. */
+    bool snap_reported = true;
+    bool window_snapshot(int32_t g) const override {
+        return snap_reported && std::find(snap.begin(), snap.end(), g) != snap.end();
+    }
+    bool has_window_snapshot() const override { return !snap.empty(); }
+    int  seed_window(uint64_t, int64_t) override { return snap.empty() ? -1 : 0; }
 };
 
 struct FakePC : IPrefixCache {
     FakeKV* kv = nullptr;
     int32_t attn = 0, lin = 0, src = -1;
+    int32_t branch_at = 0;       /* CacheHit::branch_at, as the real cache reports it */
     int32_t next_slot = 0;
     int32_t reserved = 0;
     int64_t evicted = 0, ckpt_evicted = 0;
@@ -389,6 +408,7 @@ struct FakePC : IPrefixCache {
                 (*out)[i] = seeded[i];
         }
         CacheHit h{ attn, lin, src };
+        h.branch_at = branch_at;
         const int64_t whole = src >= 0 ? lin : 0;
         if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
             const int64_t a = cap->tokens / 16 * 16;

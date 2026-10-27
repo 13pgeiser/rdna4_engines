@@ -22,6 +22,38 @@ typedef struct RadCtx RadCtx;
  * scheduler and the run phase the bounds without a device read. */
 enum { RAD_PHASE_PREFILL = 0, RAD_PHASE_DECODE = 1, RAD_PHASE_MIXED = 2 };
 
+/* ================================================================== KV streaming */
+/* A streamed KV group keeps its whole context in pinned host memory and a ring of blocks on the
+ * card (docs/KV-STREAMING.md). The step batch points every group that streams at this view, which
+ * is fixed from bring-up (so a recorded pass replays a resolve); a resident group's is null.
+ *
+ * The mirror is laid out like the pool, layer by layer: layer l's row for block b is at
+ * `host + l * host_layer_stride + b * block_bytes`. `res`, `slot_block`, `slot_state` and `ctl`
+ * are device memory, read and rewritten by every resolve launch. */
+typedef struct RadKVStream {
+    /* The mirror: pinned host memory a kernel reads over the link in place, every layer, zeroed at
+     * bring-up. */
+    uint8_t* host;
+    /* Residency, one slice a layer: `res` is block -> ring slot or -1 (layer l at `res + l *
+     * blocks`), `slot_block` is slot -> block or -1, `slot_state` is [slots, 2]: the epoch of a
+     * slot's last use and its CLOCK reference bit. Per layer, because the resolve copies one
+     * layer's bytes. */
+    int32_t* res;
+    int32_t* slot_block;
+    int32_t* slot_state;
+    /* The group's control block: epoch, clock hand, the last launch's miss count, the overflow
+     * latch and cumulative counters (docs/OPS.md "kv_resolve"). */
+    int32_t* ctl;
+    /* Bytes one block of one layer occupies: the mirror's row pitch and the ring's slot pitch. */
+    int64_t  block_bytes;
+    /* Bytes between one layer's mirror and the next. */
+    int64_t  host_layer_stride;
+    /* The ring's depth in blocks; a selection names block ids over the whole context. */
+    int64_t  slots;
+    /* The whole mirror's bytes, every layer. */
+    int64_t  host_bytes;
+} RadKVStream;
+
 typedef struct RadKVGroupBatch {
     rad_kvgroup group;
     int32_t*    slot_mapping;    /* [n_tok] flat slot index per token, device */
@@ -36,6 +68,8 @@ typedef struct RadKVGroupBatch {
     int64_t     state_index_pitch;
     int64_t     block_size;
     int64_t     max_blocks;
+    /* Null unless this group streams (RadKVStream). Trailing and zero-defaulted. */
+    const RadKVStream* stream;
 } RadKVGroupBatch;
 
 typedef struct RadBatch {
@@ -135,9 +169,9 @@ typedef struct RadBatch {
     /* The longest query in each half. max_q_len over a mixed step is the prefill chunk's, and
      * banding the decode half with it would give eight rows a thousand-row GEMM's band.
      *
-     * Only the decode value is currently read (by the GDN blocks). The prefill value is for a
-     * block whose prefill path bands on a per-sequence query length; the GDN prefill ops band on
-     * the step's total tokens, taken from their operands. */
+     * The decode value is read by the GDN blocks and the fp8 gated attention's per-band issue
+     * (rad_block_attn_gated_fp8.h), which also bands its prefill half on the prefill value; the
+     * GDN prefill ops band on the step's total tokens, taken from their operands. */
     int32_t max_q_len_decode;
     int32_t max_q_len_prefill;
 
@@ -399,8 +433,13 @@ typedef struct RadGenBatch {
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
 enum {
-    RAD_GEN_COND_REBALANCE = 1   /* the conditioning at the plugin's fixed rebalance gains (the
+    RAD_GEN_COND_REBALANCE = 1,  /* the conditioning at the plugin's fixed rebalance gains (the
                                   * request field `rebalance`; Krea 2: its text taps) */
+    /* which of the plugin's rebalance presets, beside RAD_GEN_COND_REBALANCE: 0 its default
+     * gains, Krea 2: 1 balanced, 2 detail, 3 subtle (arch/krea2). A plugin declares these bits in
+     * RadGeneratorDecl::cond_opts when it has presets. */
+    RAD_GEN_COND_REBALANCE_PRESET = 0xff00,
+    RAD_GEN_COND_REBALANCE_PRESET_SHIFT = 8
 };
 
 /* An entry's flags on a DENOISE pass. */
@@ -534,8 +573,11 @@ enum {
  *   ADECODE  no rows of the pass's own.
  *   VDECODE  `dec_rows` rows of the decoder's own (rad_arch_video_positions, RAD_VPOS_DECODE).
  *   VUPSCALE no rows of the pass's own: the lane's video latent from `geom_from` to `geom`.
+ *   VENCODE  no rows of the pass's own: a picture's or a video's frames in `enc_pixels`.
+ *   AENCODE  no rows of the pass's own: a soundtrack's samples in `enc_samples`.
  *
  * Every pointer is device memory unless the name ends in _h. */
+
 typedef struct RadVideoGenBatch {
     int32_t         lane;
     RadVideoGeom    geom;          /* the request's geometry */
@@ -544,9 +586,10 @@ typedef struct RadVideoGenBatch {
     /* The same lane, i32 [1], and 1 on a request's first step (0 otherwise), i32 [1]. */
     const int32_t*  lane_d;
     const int32_t*  first_d;
-    /* i32 [4]: the packed sequence's segments, {0, n_text, n_text + audio rows, n_tok} -- text,
-     * soundtrack, video -- and i32 [4] {0, video rows, 0, audio rows}, the bounds of the lane's two
-     * latents counted from each one's first row. */
+    /* i32: the packed sequence's segment boundaries, {0, n_text, n_text + audio rows, n_tok} --
+     * text, soundtrack, video -- or rad_arch_video_pack's for a request with references; and i32
+     * [4] {0, video rows, 0, audio rows}, the bounds of the lane's two latents counted from each
+     * one's first row. */
     const int32_t*  seg_cu;
     const int32_t*  lat_cu;
 
@@ -557,7 +600,8 @@ typedef struct RadVideoGenBatch {
 
     /* ---- VSTEP */
     int32_t         step;          /* from 0; the first draws the lane's noise */
-    /* f32 [6]: the video's timestep, sigma and next sigma, then the soundtrack's. */
+    /* f32 [16]: the video's timestep, sigma and next sigma, then the soundtrack's; from [6] the
+     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below). */
     const float*    sched;
     const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
     /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first (VSTEP, VUPSCALE and
@@ -597,7 +641,54 @@ typedef struct RadVideoGenBatch {
     /* VDECODE: the decoder the request named (RadVideoGenDecl::decoders), its index; 0 the
      * default. */
     int32_t         decoder;
+
+    /* ---- appended in ABI 31 (rad_builder.h, "Reference conditioning") */
+    /* The sampler a VSTEP advances the latents with: RAD_SAMPLER_EULER, the first-order step on
+     * sched[0..5], or RAD_SAMPLER_RES_MULTISTEP, the second-order one on the clean estimate
+     * (k-diffusion's res_multistep at eta 0), which keeps the previous step's estimate. Its scalars
+     * are sched[6..10] for the video and sched[11..15] for the soundtrack: sigma, r = next sigma /
+     * sigma, the weights hb1 and hb2 of this step's estimate and the previous one, and the order,
+     * 1 where there is no previous estimate on the same grid. */
+    int32_t         sampler;
+    /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
+     * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
+     * [enc_channels, enc_n_samples], each channel padded with zeros to the hop (entry 0). Both:
+     * the pass's geometry as rad_arch_encode_geom gave it, i32 on the device, and the media's
+     * kind (RAD_ENC_*, below) and its number within the kind from 1. */
+    const float*    enc_pixels;
+    int32_t         enc_frames, enc_height, enc_width;
+    const float*    enc_samples;
+    int64_t         enc_n_samples;
+    int32_t         enc_channels;
+    const int32_t*  enc_geom_d;
+    int32_t         enc_kind, enc_slot;
+    /* VCOND and VSTEP of a request with reference media or keyframes: their table, host i32, null
+     * without. [0] the references, [1] the keyframes, then 6 words a reference {kind, slot, latent
+     * height, latent width, latent frames, soundtrack latents} in presentation order and 3 a
+     * keyframe {frame, latent frames, soundtrack latents}, then the prompt's vision pads: a count
+     * and {first token, tokens} of each picture's run. A reference's kind is RAD_VREF_PICTURE,
+     * _AUDIO or _VIDEO; its slot is its encode pass's. */
+    const int32_t*  ref_tab;
+    /* VSTEP: i32, rad_arch_video_pack's `mod`: the boundaries of the modulation groups, then the
+     * cell each reads; `seg_cu` then holds the segment boundaries. A request without references
+     * stages `seg_cu`'s four and no cells. */
+    const int32_t*  mod_cu;
 } RadVideoGenBatch;
+
+enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+
+/* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
+ * keyframe is 1 for the first frame and 2 for the last. */
+enum {
+    RAD_ENC_IMAGE = 1,      /* a reference picture; Vencode */
+    RAD_ENC_VIDEO = 2,      /* a reference video; Vencode */
+    RAD_ENC_VAUDIO = 3,     /* the soundtrack of reference video `enc_slot`; Aencode */
+    RAD_ENC_AUDIO = 4,      /* a standalone soundtrack; Aencode */
+    RAD_ENC_KEYFRAME = 5    /* a first or last frame; Vencode */
+};
+
+/* RadVideoGenBatch::ref_tab: a reference's kind. */
+enum { RAD_VREF_PICTURE = 0, RAD_VREF_AUDIO = 1, RAD_VREF_VIDEO = 2 };
 
 /* RadVideoGenBatch::geom_d. The request's latent geometry, then a VDECODE pass's chunk: the latent
  * frames it reads (from latent frame `chunk_lat0`), its latent grid again so that (frames, h, w,
@@ -721,6 +812,18 @@ int rad_step_fail(RadCtx* c, const char* what);
 
 /* ================================================================== run-phase queries */
 const RadBatch* rad_batch(RadCtx* c);
+/* The position of model layer `layer` among `group`'s bound layers, or -1 when this rank has no
+ * pool for it or the group does not hold the layer: the lookup a RAD_KV operand makes, and the
+ * index of the layer's host mirror row. Bound layers need not be contiguous. */
+int             rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer);
+/* Prefill staging of a streamed group (the ordering rule is in core/kvstream/stage.h).
+ * rad_kv_stage_layer, before the layer's store: when the pass uses the one-layer stage view, make
+ * the layer's mirror row whole in it (once a pass) and return 1, after which the caller reads
+ * block ids directly and must not resolve; 0 when the group has no stage view.
+ * rad_kv_stage_next, after every attention launch of the layer: start the next layer's copy. */
+int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb,
+                                   int layer);
+int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
 int             rad_world_size(RadCtx* c);
 RadStream       rad_stream(RadCtx* c);

@@ -273,6 +273,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
     }
     o["uptime_s"]  = unix_now() - started_at_;
+    /* The process's start, unix seconds: with a request id, a key unique across restarts. */
+    o["started_at"] = started_at_;
     /* Seconds this process took to come up, the cost of a restart; 0 before the server listens. */
     o["startup_s"] = startup_s_;
     o["in_flight"] = in_flight_.load(std::memory_order_relaxed);
@@ -666,6 +668,8 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
    * narrow screens let the scroll chain to the document. `.body .hold` rather than `.hold`: the
    * base .hold rule comes later in this sheet and would win at equal specificity. */
   .body .panel > .pbody, .body .hold { overscroll-behavior:auto; }
+  /* The history table is the card's scroller, and the same trap on a phone. */
+  #hist .hlist { overscroll-behavior:auto; }
 }
 
 /* the request table */
@@ -700,6 +704,29 @@ th + th, td + td { padding-left:14px; }
 .hold::-webkit-scrollbar-thumb { background:var(--edge); border-radius:4px; }
 .hold::-webkit-scrollbar-track { background:transparent; }
 .hold { scrollbar-width:thin; scrollbar-color:var(--edge) transparent; }
+
+
+/* The requests card: the live table, which stays put, over the history, which scrolls. The card
+   is half again the stock height to make room for history rows. */
+#reqpanel { height:459px; }
+#reqpanel > .pbody { overflow:hidden; }
+#reqpanel .hold { flex:0 0 auto; height:auto; overflow:visible; }
+#reqpanel .hold thead th { position:static; }   /* the live table is short: it never scrolls */
+#hist { flex:1 1 auto; min-height:0; display:flex; flex-direction:column;
+        margin-top:14px; padding-top:12px; border-top:1px solid var(--rule); }
+#hist .hhead { display:flex; align-items:baseline; gap:10px; margin-bottom:8px; }
+#hist .hsum { flex:1; font-family:var(--mono); font-size:11px; color:var(--dim); line-height:1.5; }
+#hist .hbtn { font-family:var(--mono); font-size:10px; color:var(--faint); cursor:pointer;
+              user-select:none; padding:0 4px; }
+#hist .hbtn:hover { color:var(--bad); }
+#hist .hlist { flex:1 1 auto; min-height:0; overflow-y:auto; overscroll-behavior:contain;
+               scrollbar-width:thin; scrollbar-color:var(--edge) transparent; }
+#hist .hlist::-webkit-scrollbar { width:8px; }
+#hist .hlist::-webkit-scrollbar-thumb { background:var(--edge); border-radius:4px; }
+#hist thead th { position:sticky; top:0; z-index:1; background:var(--card); }
+#hist tbody td.b { font-weight:700; }
+#hist tbody td.dim { color:var(--faint); }
+#hist tr.gap td { text-align:left; color:var(--faint); font-size:11px; white-space:normal; }
 
 /* the draft chart */
 .chart { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:0 12px;
@@ -1176,6 +1203,19 @@ nav button.on { color:var(--fg); background:var(--track); }
               <tbody id="rbody"></tbody>
             </table>
             <div class="empty" id="rempty">nothing in flight</div>
+          </div>
+          <div id="hist">
+            <div class="hhead"><span class="cap">history</span>
+              <span class="hsum" id="hsum"></span>
+              <span class="hbtn" id="hjson" title="copy the stored rows as JSON">json</span>
+              <span class="hbtn" id="hclr" title="clear the stored history">clear</span></div>
+            <div class="hlist">
+              <table>
+                <thead><tr id="hhead"></tr></thead>
+                <tbody id="hbody"></tbody>
+              </table>
+              <div class="empty" id="hempty">no completed requests captured yet</div>
+            </div>
           </div>
         </div>
       </section>
@@ -1953,6 +1993,177 @@ function renderRequests(list, poolTokens) {
   $("rempty").hidden = list.length > 0;
 }
 
+/* ---------------------------------------------------------------- history
+ *
+ * A request is in /stats only while it exists: its finished row leaves the payload within about
+ * 20 ms (a one-token reply) to half a second. The history keeps every finished request a poll
+ * saw, per browser in localStorage, and shows the last HMAX under the live table.
+ *
+ * A request is recorded when a poll sees it "done", or, usually, from its last sighting once it
+ * has left the payload. Requests that began and ended between two polls are counted in a grey
+ * row. Rows are keyed by the engine's start and request id, so every tab and reload keys a
+ * request alike; a save unions with what is stored, and a clear is a timestamp every tab
+ * honours. The history id shown starts at 0 again after a clear. */
+const HK  = "radiance.history.v3";         /* rows */
+const HKN = HK + ".next";                  /* next history id: 0 after a clear */
+const HKC = HK + ".clear";                 /* clear marker: rows older than this stay deleted */
+const HMAX = 200;
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+let hRows = [];                             /* oldest first, unique by k */
+let hNext = 0;                             /* next history id; the clear button writes 0 here */
+let hTracked = new Map();                  /* engine id -> { last, fin } */
+let hSeen = new Set(), hBase = null, hBaseSeen = 0;
+let hDrawn = null;
+
+/* Stored rows, minus the ones a clear deleted. A corrupt read is ignored rather than shown. */
+function histStored() {
+  try { const a = JSON.parse(lsGet(HK) || "[]"); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+function histMerge(lists) {
+  const cleared = +lsGet(HKC) || 0, by = new Map();
+  for (const rows of lists) for (const h of rows)
+    if (h && h.k != null && (h.at || 0) > cleared) {
+      const p = by.get(h.k);
+      if (!p || (h.at || 0) > (p.at || 0)) by.set(h.k, h);
+    }
+  return [...by.values()].sort((a, b) => a.at - b.at).slice(-HMAX);
+}
+/* The whole table, on load and on every poll: another tab's rows join this one's. */
+function histLoad() {
+  hRows = histMerge([histStored(), hRows]);
+  let n = 0;
+  for (const h of hRows) n = Math.max(n, (h.id || 0) + 1);
+  hNext = Math.max(n, +lsGet(HKN) || 0);
+}
+function histSave() {
+  hRows = histMerge([hRows]);
+  lsSet(HK, JSON.stringify(hRows));
+  lsSet(HKN, String(hNext));
+}
+
+/* Prefill rate: the prompt tokens computed (not from the prefix cache) over the time to first
+ * token; none for a fully cached prompt. */
+function histPrefill(r) {
+  if (!finite(r.prompt) || !finite(r.ttft_s) || r.ttft_s <= 0) return null;
+  const fresh = r.prompt - (r.cached || 0);
+  return fresh > 0 ? fresh / r.ttft_s : null;
+}
+function histFinish(r, run) {
+  if (!r || !r.id) return;
+  hRows.push({
+    k: run + ":" + r.id,
+    id: hNext++,                       /* 0 after a clear, then 1, 2, … */
+    prompt: finite(r.prompt) ? r.prompt : null,
+    out: finite(r.output) ? r.output : null,
+    ctx: finite(r.ctx) ? r.ctx : null,
+    ttft: finite(r.ttft_s) ? r.ttft_s : null,
+    pf: histPrefill(r),
+    tps: finite(r.tps) && r.tps > 0 ? r.tps : null,
+    at: Date.now(),
+  });
+  if (hRows.length > HMAX) hRows.shift();
+  histSave();
+}
+/* Returns the requests that finished unseen between two polls, for the grey row. */
+function histIngest(s) {
+  const total = s.total_requests || 0;
+  const run = s.started_at || 0;
+  if (hBase === null) { hBase = total; hBaseSeen = hSeen.size; }
+  else if (total < hBase) {            /* a new engine run: its ids restart at 1 */
+    hBase = total; hBaseSeen = 0; hSeen.clear(); hTracked.clear();
+  }
+  histLoad();
+  const live = new Set();
+  for (const r of s.requests || []) {
+    if (!r.id) continue;
+    live.add(r.id); hSeen.add(r.id);
+    let t = hTracked.get(r.id);
+    if (!t) { t = {}; hTracked.set(r.id, t); }
+    t.last = r;
+    if (r.state === "done" && !t.fin) { t.fin = true; histFinish(r, run); }
+  }
+  /* Gone without a "done" sighting: finalise it from its last sighting, then forget it. */
+  for (const [id, t] of [...hTracked])
+    if (!live.has(id)) { if (!t.fin) histFinish(t.last, run); hTracked.delete(id); }
+
+  return Math.max(0, total - hBase - (hSeen.size - hBaseSeen));
+}
+
+const HCOLS = [
+  { h: "id",            f: (h) => "#" + h.id },
+  { h: "prompt",        f: (h) => cnt3(h.prompt) },
+  { h: "out",           f: (h) => cnt3(h.out) },
+  { h: "ctx",           f: (h) => cnt3(h.ctx) },
+  { h: "ttft",          f: (h) => dur(h.ttft) },
+  { h: "prefill tok/s", f: (h) => cnt3(h.pf) },
+  { h: "tok/s",         f: (h) => tps(h.tps) },
+  { h: "age",           f: null },     /* rewritten in place every poll */
+];
+for (const c of HCOLS) $("hhead").appendChild(el("th", null, c.h));
+
+function histRender(missed) {
+  const mean = (a) => a.length ? a.reduce((p, c) => p + c, 0) / a.length : null;
+  /* Overall, then the last 20 and last 5 captured requests: one long request should not decide
+   * the headline, and the recent window is what a change in the workload shows up in first. */
+  const group = (vals, fmt, label) => {
+    const all = mean(vals), a20 = mean(vals.slice(-20)), a5 = mean(vals.slice(-5));
+    return label + " avg " + fmt(all) +
+           (a20 != null ? " (20: " + fmt(a20) + ", 5: " + fmt(a5) + ")" : "");
+  };
+  const tpsV = hRows.map((h) => h.tps).filter((v) => v != null);
+  const pfV  = hRows.map((h) => h.pf).filter((v) => v != null);
+  const tfs  = hRows.map((h) => h.ttft).filter((v) => v != null).sort((a, b) => a - b);
+  const parts = [hRows.length + " done"];
+  if (tpsV.length) parts.push(group(tpsV, tps, "tok/s"));
+  if (pfV.length)  parts.push(group(pfV, cnt3, "prefill"));
+  if (tfs.length)  parts.push("ttft " + dur(tfs[Math.floor(tfs.length / 2)]));
+  $("hsum").textContent = parts.join(" · ");
+
+  /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
+  const body = $("hbody");
+  const shape = hRows.length + ":" + (hRows.length ? hRows[hRows.length - 1].k : "") + ":" + missed;
+  if (shape !== hDrawn) {
+    hDrawn = shape;
+    body.textContent = "";
+    const frag = document.createDocumentFragment();
+    for (let i = hRows.length - 1; i >= 0; i--) {
+      const h = hRows[i], tr = el("tr");
+      for (const c of HCOLS) {
+        const td = tr.appendChild(el("td", c.f === null ? "dim" : null));
+        if (c.f) td.textContent = c.f(h);
+        else td.dataset.at = h.at;
+      }
+      frag.appendChild(tr);
+    }
+    if (missed > 0) {
+      const tr = el("tr", "gap");
+      const td = tr.appendChild(el("td", null,
+                   missed + " request(s) finished between polls — not captured"));
+      td.colSpan = HCOLS.length;
+      frag.appendChild(tr);
+    }
+    body.appendChild(frag);
+    $("hempty").hidden = hRows.length > 0 || missed > 0;
+  }
+  for (const td of body.querySelectorAll("td.dim"))
+    td.textContent = dur((Date.now() - td.dataset.at) / 1000);
+}
+
+$("hclr").addEventListener("click", () => {
+  hRows = []; hTracked.clear(); hSeen.clear(); hBase = null; hNext = 0;
+  lsSet(HK, "[]"); lsSet(HKN, "0"); lsSet(HKC, String(Date.now()));
+  hDrawn = null; histRender(0);
+});
+$("hjson").addEventListener("click", () => {
+  try { navigator.clipboard.writeText(JSON.stringify(hRows)); } catch (e) {}
+});
+histLoad();
+histRender(0);
+
 /* ---------------------------------------------------------------- update */
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
 let lastStepMs = null;
@@ -2079,6 +2290,7 @@ function update(s, dt) {
   renderRequests(list, s.kv_tokens_total || 0);
   renderBatch(list, s);
   $("reqaside").textContent = list.length ? s.running + " running · " + s.waiting + " waiting" : "";
+  histRender(histIngest(s));
 
   totals["Requests"].textContent    = cnt(s.total_requests);
   totals["Steps"].textContent       = cnt(s.steps);
@@ -3365,9 +3577,13 @@ $("cvbox").addEventListener("change", async (e) => {
   }
 });
 
+/* The poll runs every 100 ms while a request is in flight, so the history sees most finished
+ * requests before they leave /stats, and every 500 ms otherwise. */
+let pollTimer = null;
+function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
 async function poll() {
   /* A background tab watches nothing, and neither does the Model view -- which is static. */
-  if (document.hidden || $("view-dash").hidden) return;
+  if (document.hidden || $("view-dash").hidden) { schedulePoll(500); return; }
   try {
     const r = await api("stats");
     if (!r.ok) throw new Error(r.status);
@@ -3377,8 +3593,10 @@ async function poll() {
     prev = s; prevAt = now;
     $("view-dash").classList.remove("boot");
     $("dot").className = "dot";
+    schedulePoll((s.in_flight || 0) > 0 ? 100 : 500);
   } catch (e) {
     $("dot").className = "dot stale";
+    schedulePoll(500);
   }
 }
 identify();
@@ -3388,7 +3606,6 @@ else if (location.hash === "#sessions") show("sess");
  * the reader nothing to tell "starting up" apart from "broken". */
 setTimeout(() => $("view-dash").classList.remove("boot"), 1500);
 poll();
-setInterval(poll, 500);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 </script>
 </body></html>

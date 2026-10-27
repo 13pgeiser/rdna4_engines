@@ -1,0 +1,62 @@
+# minimax-h3-curve-fp8.recipe -- MiniMax-H3 from a curve-form checkpoint, block-scaled fp8 linears.
+#
+# minimax-h3-fp8.recipe without its modulation rule. A curve-form checkpoint (config.json's
+# adaln_curve_grid set) ships its timestep embeddings precomputed, adaln_t_table, in place of the
+# sinusoid and its MLP, and its modulation projections take eight inputs. A 128 x 128 E4M3 block
+# does not fit an eight-column weight, so the plugin declares those projections bf16 and they are
+# stored as the checkpoint holds them; the table matches no rule and keeps its f32. Every other
+# weight converts as minimax-h3-fp8.recipe describes.
+#
+#   rad-convert <pipeline directory with the curve-form transformer/> \
+#       --recipe data/recipes/minimax-h3-curve-fp8.recipe -o minimax-h3-curve-fp8.rad
+#
+# A container of the base model supplies every weight outside the DiT, with the transformer's
+# tensor names (one a line, "transformer." first) listed as changed:
+#
+#   rad-convert <that directory> --recipe data/recipes/minimax-h3-curve-fp8.recipe \
+#       --reuse minimax-h3-fp8.rad --changed <the transformer's tensor names> \
+#       -o minimax-h3-curve-fp8.rad
+#
+# A checkpoint distributed as a single ComfyUI file is laid out as that directory first: the
+# transformer's tensors under their diffusers names and dtypes in transformer/, and its
+# config.json with adaln_curve_grid.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention and MLP block run in bf16 inside the
+# f32 chain (declare_aenc): conv1d, layernorm and gemm take one dtype for every operand, so their
+# weights are cast. The chain's own convolutions are stored f32, their weight norms folded.
+aenc.d*.w                            cast dtype=bf16
+aenc.d*.b                            cast dtype=bf16
+aenc.pb.*                            cast dtype=bf16
+aenc.b*.u*.c1.weight                 cast dtype=f32
+aenc.b*.u*.c2.weight                 cast dtype=f32
+aenc.cin.weight                      cast dtype=f32
+aenc.fin.weight                      cast dtype=f32
+# The video encoder's 3x3x3 convolutions are bf16, as the implicit-GEMM kernel reads them;
+# conv_in (three input channels) and the 1x1x1 shortcut and quant convolutions read their f32
+# weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                       cast dtype=bf16
+venc.l*.b*.c2w                       cast dtype=bf16
+venc.l*.dnw                          cast dtype=bf16
+venc.cout.weight                     cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32

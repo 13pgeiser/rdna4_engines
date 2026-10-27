@@ -1,0 +1,40 @@
+# q38-27b-paro-m2xfp4-df2.recipe -- a ParoQuant M2XFP4 Qwen3.8-27B (quant_method paroquant_m2xfp4)
+# with the DFlash2 drafter.
+#
+#   rad-convert <paroquant_m2xfp4 checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-paro-m2xfp4-df2.recipe -o q38-27b-paro-m2xfp4-df2.rad
+#
+# The trunk's linears are imported as they ship, and need no rule: e2m1 codes, an E8M0 exponent a
+# 32 of K and the m2xfp4 scheme's metadata byte a group (four 2-bit subgroup multipliers) -- the
+# checkpoint's planes byte for byte -- stored in the ROTATED basis ParoQuant trained them in, with
+# the rotations beside them as the encoding's "givens" transform (abi/rad_encoding.h): per
+# projection the Givens pairs and angles inside groups of 128 columns, and the channel scales. A
+# fused gate|up or qkv|z keeps one set of tables a checkpoint tensor (parts). rad-convert writes
+# them as planes of the weight; the GEMM is the plain M2XFP4 one, and the activation is rotated in
+# front of it (givens_dense_quant) -- nothing is re-quantised, so the weights are the checkpoint's
+# to the bit.
+#
+# What the checkpoint does NOT ship in a form the architecture declares gets a rule. ParoQuant's
+# convert writes what it does not quantise in fp16 (the delta net's a|b and conv, the embedding,
+# the vision tower), where the plugin declares bf16: `cast` rounds f16 to bf16 once. The head goes
+# block fp8 like every other recipe here. Its MTP head is not read: the DFlash2 drafter displaces
+# it.
+#
+# THE DRAFTER is made as small as its acceptance allows, as in q38-27b-m2xfp4-df2.recipe: its
+# linears at M2XFP4, beside a 2-bit copy of the target's head.
+
+blk.*.ssm_ab.weight                  cast dtype=bf16
+blk.*.ssm_conv1d.weight              cast dtype=bf16
+token_embd.weight                    cast dtype=bf16
+v.*                                  cast dtype=bf16
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     m2xfp4
+dflash.blk.*.attn_q.weight           m2xfp4
+dflash.blk.*.attn_k.weight           m2xfp4
+dflash.blk.*.attn_v.weight           m2xfp4
+dflash.blk.*.attn_output.weight      m2xfp4
+dflash.blk.*.ffn_gate_up.weight      m2xfp4
+dflash.blk.*.ffn_down.weight         m2xfp4

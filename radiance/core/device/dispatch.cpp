@@ -535,6 +535,7 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
 
 extern "C" {
 
+int  rad_dev_peer_access(int self, int peer)      { return rad::dev_peer_access(self, peer); }
 
 int  rad_event_create_as(RadEvent* out, unsigned flags) {
     const int s = dev()->event_create(out, flags);
@@ -549,6 +550,11 @@ void rad_event_destroy(RadEvent e) {
     dev()->event_destroy(e);
 }
 int  rad_event_record(RadEvent e, RadStream s)    { return dev()->event_record(e, s); }
+int  rad_event_dma(RadEvent e, RadStream s, uint32_t** w) {
+    if (const auto f = dev()->event_dma) return f(e, s, w);
+    rad::device_set_error("rad_event_dma: the device backend has no DMA queue to complete an event");
+    return RAD_E_UNSUPPORTED;
+}
 int  rad_event_wait(RadStream s, RadEvent e)      { return dev()->event_wait(s, e); }
 int  rad_event_query(RadEvent e)                  { return dev()->event_query(e); }
 int  rad_event_sync(RadEvent e) {
@@ -630,8 +636,8 @@ void rad_ride_release(void* token, RadStream after, int64_t packets) {
     if (const auto f = dev()->ride_release) f(token, after, packets);
 }
 int rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
-                uint32_t* done, uint32_t done_val) {
-    if (const auto f = dev()->xp_list) return f(device, mark, n, src, dst, bytes, done, done_val);
+                uint32_t* done, uint32_t done_val, unsigned flags) {
+    if (const auto f = dev()->xp_list) return f(device, mark, n, src, dst, bytes, done, done_val, flags);
     return RAD_E_UNSUPPORTED;
 }
 int64_t rad_xp_behind(int device) {

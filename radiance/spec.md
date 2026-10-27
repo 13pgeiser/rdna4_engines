@@ -552,6 +552,7 @@ which people, logs and `rad-info` read; kernels read the struct:
 | `u2*f16[1x128]-u8[1x128]` | a 2-bit draft head, asymmetric |
 | `fp4_e2m1*e8m0[1x32]` | MXFP4 |
 | `fp4_e2m1*fp8_e4m3[1x16]*f32[*x*]` | NVFP4: two scale levels |
+| `m2xfp4:codes=fp4_e2m1[1x1],scale=e8m0[1x32],meta=u8[1x32]` | M2XFP: MXFP4 with a metadata byte a group |
 | codes `u4`, `scale u6[1x32] . f16[1x256]`, `min u6[1x32] . f16[1x256]` | llama.cpp's Q4_K |
 | codes `u4`, `table i8{1x16}`, two scale levels | IQ4_XS |
 | codes `u8[1x8]` into `grid u8{256x8}`, `signs`, two scale levels | IQ2_XXS |
@@ -561,6 +562,26 @@ which people, logs and `rad-info` read; kernels read the struct:
 
 A GGUF file's K- and I-quants are therefore a lossless rearrangement into planes; serving one needs
 only a kernel that reads it.
+
+A scheme the core does not decode is `m2xfp4`: M2XFP (adapted from "M2XFP:
+A Metadata-Augmented Microscaling Data Format for Efficient Low-bit Quantization", arXiv
+2601.19213, the paper's weight-side Sg-EM only -- its element-side activation scheme is not
+encoded here). An OCP MXFP4 group of 32 columns carries, beside its E8M0 exponent, one metadata
+byte: four 2-bit extra mantissas, one a subgroup of 8 columns. Subgroup s (columns [8s, 8s+8))
+refines the group's shared scale to (1 + k/4) . 2^E with k its two bits, little-endian in bits
+[2s, 2s+2), so a group decodes as
+
+```
+w[j] = e2m1(codes[j]) . 2^(scale[g] - 127) . (1 + k_s/4),   g = j/32, s = (j%32)/8
+```
+
+4.5 bits an element. The three planes sit apart -- codes fp4_e2m1 [1 x 1] as a bit stream along
+the row (the MXFP4 codes' bytes), the scale e8m0 [1 x 32] and the metadata u8 [1 x 32] one byte a
+group -- as the paper's memory organisation keeps them (its §5.2). The exponent byte follows the
+MXFP4 grid's OCP rule and its conventions, zeros and short final groups included
+(`libquant/lq_m2xfp.cpp`); the quantiser's search chooses the bias of the shared exponent and each
+subgroup's k by least squared error (§4.5). The core cannot follow the equation, so the quantiser
+supplies the decoder, as below.
 
 The core decodes every `plain` and `affine` encoding to f32 (for the oracle, `rad-convert`'s error
 report, and requantising). A quantiser whose scheme the core cannot decode supplies the decoder
@@ -739,6 +760,7 @@ Each algorithm pairs with any grid it makes sense for, and a recipe names all th
 | `autoround` | sign-gradient descent on rounding offsets and block ranges against H | integer codes, row blocks, one level | the grid |
 | `paroquant` | Givens pair rotations and channel scales fitted against H, then AutoRound | every untransformed one | the grid and a `givens` transform |
 | `ggml` | llama.cpp's own searches, imatrix-weighted | its legacy, K- and I-quant types | each type's affine form |
+| `m2xfp4` | M2XFP's weight-side Sg-EM: per group of 32, each subgroup of 8's extra mantissa k in {0..3} and the shared exponent's bias in {-1, 0, 1} (`adaptive=0` pins the bias, `wide=1` widens it to {-2..2}) chosen by least squared error, the OCP exponent and its rounding otherwise the MXFP4 grid's | none of the grid options | its own scheme `m2xfp4`, which it decodes: MXFP4's codes and E8M0 exponent plus a u8 metadata byte a group (arXiv 2601.19213) |
 | `cast` | a float in another float dtype | none | `plain` |
 
 The grid is `codes` (integers to 32 bits, fp8/6/4) or `table` (a codebook: NF4, IQ4_NL's values,
@@ -906,6 +928,7 @@ utilisation fraction:
 | `--host-headroom-mib` | host RAM left free for the system at startup (default 4096) |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
+| `--kv-resident` | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card; off by default. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing; ignored with a warning on an architecture that cannot stream (docs/KV-STREAMING.md) |
 
 Nothing is inferred from the free VRAM at startup, which would size pools differently depending on
 what else is open. Each term is a fixed property, a computed quantity, or a measurement printed on
@@ -1378,7 +1401,9 @@ derived from it: the reply parser, the lazy tool-call grammar and its trigger wo
 tokens the decoder must render as text.
 
 There are two families of call syntax. In the tagged family each argument has its own tags (Qwen's
-`<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema. In the
+`<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema, or by its
+own tag where the format's tag says the type (DeepSeek-V4.1's DSML writes `string="true"` before
+text and `string="false"` before JSON; the grammar writes the tag the schema calls for). In the
 object family a call is its name and one object holding the arguments: JSON, or a dialect with
 strings between declared delimiters and bare keys, as Gemma 4 writes
 `call:NAME{path:<|"|>/a<|"|>,limit:3}`; values carry their own types.

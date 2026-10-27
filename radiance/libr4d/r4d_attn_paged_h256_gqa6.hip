@@ -25,6 +25,7 @@
 using std::max;
 #include "r4d_attn_prefill_h256_gqa6.hip"
 #include "r4d_attn_decode_h256_gqa6.hip"
+#include "r4d_attn_prefill_split.h"
 
 #define CHK() do { hipError_t e_ = hipGetLastError(); if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
@@ -51,13 +52,45 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 // (36-48 bytes per lane, ~4% of the prefill). At 2 the spill is 20 bytes, outside the WMMA groups.
 #define P_OPT    3954187
 
+// ---- the prefill KV split (r4d_attn_prefill_split.h) -------------------------------------------
+// Query positions a workgroup: 64.
+#define P_BQ ((P_NWARPS * 16) / A_GQA)
+
+// The law at this unit's geometry and this card's WGP count. A test hook (r4d_selftest), not a
+// plugin entry.
+extern "C" int r4d_attn_prefill_h256_gqa6_splits(int q_len, int total_q, int num_seqs,
+                                                 int kv_heads, int max_ctx) {
+    return r4d_prefill_splits_law(P_BQ, P_TILE, q_len, total_q, num_seqs, kv_heads, max_ctx,
+                                  r4d_prefill_wgps());
+}
+// The split count this unit's last prefill launch used, 1 unsplit. A test hook (r4d_selftest).
+extern "C" int r4d_attn_prefill_h256_gqa6_last_splits(void) { return g_prefill_last_splits; }
+
+static int prefill_combine(const R4DArgs* a, int splits, hipStream_t s);
+
 // KVP: 0 = an 8-bit cache (XOPT names fp8_v4 or k6_v4 and the e4m3 legs), 1 = bf16 cache.
+// a->splits > 1 with a->scratch set (the plugin entries below, prefill_splits) is the split form:
+// segments in the scratch, then the merge. Anything else is the plain form, unchanged.
 template <int KVP, int XOPT = 0>
 static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
-    dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
+    // The split form serves the f16 operand legs; the lossy e4m3 legs (O_QK8, O_PV8 rows) stay unsplit
+    // rather than double their instances.
+    constexpr bool CAN_SPLIT = !(XOPT & (O_QK8 | O_PV8));
+    const int splits = (CAN_SPLIT && a->scratch && a->splits > 1) ? a->splits : 1;
+    g_prefill_last_splits = splits;
+    dim3 grid((a->q_len + BQ - 1) / BQ * splits, a->kv_heads, a->num_seqs);
+    if constexpr (CAN_SPLIT) {
+        if (splits > 1) {
+            hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
+                                                        KVP, P_OPT | XOPT | O_PSPLIT>),
+                               grid, dim3(P_NWARPS * 32), 0, s, *a);
+            CHK();
+            return prefill_combine(a, splits, s);
+        }
+    }
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
                                                 KVP, P_OPT | XOPT>),
                        grid, dim3(P_NWARPS * 32), 0, s, *a);
@@ -101,6 +134,11 @@ static int prefill_legs_launch(const R4DArgs* a, hipStream_t s, int legs) {
 // one request (96 rows, most segments) it loses up to 23%; the crossover is ~192 rows and above
 // 288 it wins by 1.2-20%. The cut is four rows per CU.
 #define D_VECMIN 256
+
+// The prefill split's merge (r4d_prefill_combine), vectorised on the decode launcher's terms.
+static int prefill_combine(const R4DArgs* a, int splits, hipStream_t s) {
+    return r4d_prefill_combine<A_HEAD_DIM, D_JPB, D_VECMIN>(a, splits, P_TILE, s);
+}
 
 // Split law: r4d_decode_splits (r4d_attn_decode_h256_gqa6.hip).
 extern "C" long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
@@ -171,11 +209,33 @@ extern "C" int r4d_attn_decode_h256_gqa6_k6v4kv(const R4DArgs* a, hipStream_t s)
 // the .so carries an undefined symbol that only r4d_selftest catches.
 /* ------------------------------------------------------------------ paged prefill */
 
+/* The launch's KV split count (r4d_prefill_splits) at this unit's geometry, 1 for the plain form. */
+static int prefill_splits(const RadArgs* a, const R4DArgs* r) {
+    return r4d_prefill_splits(a, r, P_BQ, P_TILE);
+}
+
+/* The split's f32 partials at declare (r4d_prefill_scratch: 23.8 MB is reached at this geometry,
+ * at 384 rows x 5 and 640 x 3), by the cache's token row: fp8 and bf16 (2 * head_dim), fp8_v4 (400
+ * bytes), k6_v4 (352). */
+static int64_t prefill_scratch(const RadArgs* a, long long row) {
+    return r4d_prefill_scratch(a, A_HEAD_DIM, row, P_BQ, P_TILE);
+}
+extern "C" int64_t r4d_rad_attn_prefill_h256_scratch(const RadArgs* a) {
+    return prefill_scratch(a, 512);
+}
+extern "C" int64_t r4d_rad_attn_prefill_h256_v4_scratch(const RadArgs* a) {
+    return prefill_scratch(a, 400);
+}
+extern "C" int64_t r4d_rad_attn_prefill_h256_k6_scratch(const RadArgs* a) {
+    return prefill_scratch(a, 352);
+}
+
 extern "C" int r4d_rad_attn_prefill_h256_fp8(const RadArgs* a, RadStream s) {
     if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
     R4DArgs r;
     int rc = fill_paged(a, &r, 256);
     if (rc != RAD_OK) return rc;
+    r.splits = prefill_splits(a, &r);
     /* Absent descales mean 1.0, not an error: the kernels read them that way, vLLM defaults both
      * scales to 1.0, and kv_store_fp8 at its default scale needs no descale plane. The operands
      * are optional in the schema and the kernel, so they are optional here too. A calibrated pair
@@ -227,6 +287,7 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
     R4DArgs r;
     int rc = fill_paged(a, &r, 256);
     if (rc != RAD_OK) return rc;
+    r.splits = prefill_splits(a, &r);
     return r4d_attn_prefill_h256_gqa6_bf16kv(&r, (hipStream_t)s);
 }
 
@@ -335,6 +396,7 @@ extern "C" int r4d_rad_attn_prefill_h256_fp8v4(const RadArgs* a, RadStream s) {
     R4DArgs r;
     int rc = fill_paged_row(a, &r, 256, 400);
     if (rc != RAD_OK) return rc;
+    r.splits = prefill_splits(a, &r);
     return r4d_attn_prefill_h256_gqa6_fp8v4kv(&r, (hipStream_t)s);
 }
 
@@ -356,6 +418,7 @@ extern "C" int r4d_rad_attn_prefill_h256_k6v4(const RadArgs* a, RadStream s) {
     R4DArgs r;
     int rc = fill_paged_row(a, &r, 256, 352);
     if (rc != RAD_OK) return rc;
+    r.splits = prefill_splits(a, &r);
     return r4d_attn_prefill_h256_gqa6_k6v4kv(&r, (hipStream_t)s);
 }
 

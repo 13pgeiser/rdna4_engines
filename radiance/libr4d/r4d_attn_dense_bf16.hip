@@ -304,6 +304,7 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
 // ---- launch ----------------------------------------------------------------------------------
 // One instantiation per (head_dim, gqa), at a workgroup shape picked for it:
 //   h64  gqa1: 8 query blocks of 16, K/V tiles of 64 keys          (the vision towers' heads)
+//   h256 gqa1: 8 query blocks of 16, tiles of 32 (LDS: 37 KiB)
 //   h256 gqa2, 4, 8: 8, 4, 2 query blocks x the heads, tiles of 32 (LDS: 37 KiB)
 //   h512 gqa2, 4, 8: 4, 2, 1 query blocks x the heads x 2 head halves, tiles of 16 (LDS: 57 KiB)
 // The LDS holds one K/V tile, so the query heads a workgroup carries change its waves, not it.
@@ -358,6 +359,7 @@ extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, 
                                                     cdiv, causal, q_ld, k_ld, v_ld, o_ld, s, krep)
     if (head_dim == 256) {
         switch (gqa) {
+            case 1: R4D_DENSE(256, 1, 8, 1, 32);
             case 2: R4D_DENSE(256, 2, 8, 1, 32);
             case 4: R4D_DENSE(256, 4, 4, 1, 32);
             case 8: R4D_DENSE(256, 8, 2, 1, 32);

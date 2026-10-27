@@ -87,6 +87,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
     }
 
+    /* KV streaming's totals are not per group, so they pass through. */
+    o.kv_resident_blocks = m.kv_resident_blocks;
+    o.kv_stream_misses = m.kv_stream_misses;
+    o.kv_stream_bytes_in = m.kv_stream_bytes_in;
+
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged
      * in. */
@@ -744,6 +749,53 @@ public:
                   std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t0).count(), rc);
         return rc;
+    }
+
+    /* A decoded frame (a keyframe on the output canvas) through the processor's resize and
+     * patching, as a prepared file's would go. */
+    int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out,
+                      std::string* why) override {
+        if (!accepts(MediaKind::Image)) {
+            if (why) *why = "this model's vision tower serves no pictures";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->image_from(f, out, why);
+    }
+
+    int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                      mm::Frame* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no picture decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_image(bytes, n, ratio, max_side, out, why);
+    }
+
+    int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h, bool cover,
+                             mm::Frame* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no picture decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_image_canvas(bytes, n, w, h, cover, out, why);
+    }
+
+    int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                      int32_t max_frames, std::vector<mm::Frame>* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no video decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_video(bytes, n, ratio, max_side, max_frames, out, why);
+    }
+
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                      std::vector<float>* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no audio decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_audio(bytes, n, rate, max_samples, out, why);
     }
 
     int32_t audio_rate() const override {

@@ -1,0 +1,24 @@
+# nomic-embed-v2-moe-bf16.recipe -- nomic-embed-text-v2-moe from the HF checkpoint, as the
+# nomicbert plugin serves it.
+#
+#   rad-convert /data --recipe data/recipes/nomic-embed-v2-moe-bf16.recipe -o nomic.rad
+#
+# The checkpoint stores every tensor f32 (config.json says torch_dtype float32). The plugin runs
+# the linears, the token table and the token-type table in bf16 and keeps norms and biases f32, so
+# this recipe casts exactly the weights that plugin declares bf16. Without it rad-convert refuses
+# the checkpoint at declare: a declare-time bf16 weight cannot hold an f32 checkpoint's codes.
+#
+# token_type.weight is bf16 because libr4d's table_add_bf16 reads a bf16 table; libref's and
+# libavx's table_add read any dtype the tensor carries, so the same container serves all three.
+# The checkpoint's mlp.experts.bias tensors are not mapped by the plugin at all and do not appear
+# in the plan.
+
+token_embd.weight             cast  dtype=bf16
+token_type.weight             cast  dtype=bf16
+blk.*.attn_qkv.weight         cast  dtype=bf16
+blk.*.attn_out.weight         cast  dtype=bf16
+blk.*.ffn_fc1.weight          cast  dtype=bf16
+blk.*.ffn_fc2.weight          cast  dtype=bf16
+blk.*.ffn_router.weight       cast  dtype=bf16
+blk.*.ffn_exp_w1.*.weight     cast  dtype=bf16
+blk.*.ffn_exp_w2.*.weight     cast  dtype=bf16

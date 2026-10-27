@@ -71,7 +71,8 @@ struct RecMap {
     std::vector<std::string> src;
     int                      concat_dim = 0;
 };
-struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false; };
+struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
+                  bool dense = false; };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -147,6 +148,11 @@ struct RadBuilder {
     const RecOp* op_of(rad_op h) const { return h ? &ops[h - 1] : nullptr; }
 };
 
+struct StageRec {
+    size_t issue = 0;   /* the issue count when the stage copy was issued */
+    int    layer = -1;
+};
+
 struct RadCtx {
     RadBuilder*     b     = nullptr;
     const RadBatch* batch = nullptr;
@@ -160,6 +166,13 @@ struct RadCtx {
     /* Device copies into a buffer (rad_memcpy_async to a rad_buf_ptr address): the buffer and the
      * issue number the copy came before. The step lint counts each as a write there. */
     std::vector<std::pair<size_t, rad_buf>> copies;
+    /* The prefill-stage test: a stage call is recorded at the current issue index so the test can
+     * assert it sits between the layer's store and its attention. */
+    bool                  stage_on = false;
+    int                   stage_last = -1;
+    std::vector<StageRec> stages;
+    /* kv_stage_next: after which issue index the next layer's copy was handed over. */
+    std::vector<StageRec> stages_next;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -236,6 +249,14 @@ extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
 }
 
 extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { (void)g; return b->kv_block; }
+
+extern "C" int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
+    if (!b || !g || g > b->kv_groups.size()) return 0;
+    const RadKVGroupDecl& d = b->kv_groups[g - 1].d;
+    if (d.kind != RAD_KV_FULL && d.kind != RAD_KV_WINDOW) return 0;
+    const int64_t nh = d.n_head_kv > 0 ? d.n_head_kv : 1;
+    return rad_dtype_bytes(d.dtype, 2 * b->kv_block * nh * d.head_dim);
+}
 
 extern "C" int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     b->binds.push_back({layer, g});
@@ -346,6 +367,15 @@ extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     b->kv_groups[g - 1].zero = true;
     return RAD_OK;
 }
+/* Recorded like zero, and like the real builder refused on a non-full group. Not part of
+ * graph_hash(): the flag changes how much of the group the carve funds, not the graph, so the
+ * pinned graphs stand. */
+extern "C" int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g) {
+    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
+    if (b->kv_groups[g - 1].d.kind != RAD_KV_FULL) return RAD_E_INVAL;
+    b->kv_groups[g - 1].dense = true;
+    return RAD_OK;
+}
 /* Recorded like zero, and like the real builder refused on a zero or unpaged group. Not part of
  * graph_hash(): the flag changes what a host tier slot holds, not the graph, so the pinned
  * graphs stand. */
@@ -434,6 +464,29 @@ extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     c->joins.push_back({ c->issues.size(), from, to });
     return RAD_OK;
+}
+/* No pool binding here, so a layer is at the index it names: the arch test uses layer 0 where it
+ * checks the mirror offset. */
+extern "C" int rad_kv_layer_index(RadCtx* c, rad_kvgroup g, int layer) {
+    (void)c; (void)g;
+    return layer;
+}
+/* The prefill stage: no device here, so record the first call for a layer at its place in the
+ * issue stream, which is before the layer's store. Off unless a test selects the stage view. */
+extern "C" int rad_kv_stage_layer(RadCtx* c, rad_kvgroup g, const RadKVGroupBatch* kvb, int layer) {
+    (void)g;
+    if (!c || !kvb || !kvb->stream || !c->stage_on) return 0;
+    if (layer == c->stage_last) return 1;
+    c->stage_last = layer;
+    c->stages.push_back(StageRec{ c->issues.size(), layer });
+    return 1;
+}
+/* The next layer's copy is handed to the DMA engine after this layer's attention. */
+extern "C" int rad_kv_stage_next(RadCtx* c, rad_kvgroup g, int layer) {
+    (void)g;
+    if (!c || !c->stage_on) return 0;
+    c->stages_next.push_back(StageRec{ c->issues.size(), layer });
+    return 0;
 }
 /* A block that refuses the batch records the reason for the tests. */
 extern "C" int rad_step_fail(RadCtx* c, const char* what) {

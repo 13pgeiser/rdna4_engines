@@ -1,7 +1,8 @@
 // R4D -- the video generator's ops (docs/OPS.md, "Video generation"): a diffusion transformer's
 // modulated RMS norm and its sampler step, the video decoder's patch unfold, the tiles it runs
-// over, their stitch back into frames and their rotary positions; and its soundtrack decoder's
-// alias-free SnakeBeta (docs/OPS.md, "Audio generation").
+// over, their stitch back into frames and their rotary positions; the video encoder's plan, cut
+// and blend for a picture bigger than one volume; and its soundtrack decoder's alias-free
+// SnakeBeta (docs/OPS.md, "Audio generation").
 //
 // Each kernel rounds where its libref function does (libref/ref_gen.cpp, libref/ref_video.cpp,
 // libref/ref_audio.cpp), under the library's -ffp-contract=off. The norm's sum of squares is a
@@ -77,16 +78,21 @@ __device__ __forceinline__ float rdv(const float*, float v) { return v; }
 // r4d_q8.h's. `s` is a column slice of the modulation table, [shift | scale] in each entry's row.
 constexpr int kRmChunks = 4;   // 8-wide chunks a thread keeps: n <= kT * 8 * 4 = 8192
 
-template <bool GATED, bool QUANT>
+// QMODE: 0 writes the bf16 chain to `z`, 1 also quantises it to E4M3 (q, scale), 2 to int8, the
+// two differing only in r4d_q8.h's `q8_top` and `q8_pack4`.
+template <bool GATED, int QMODE>
 __global__ __launch_bounds__(kT) void rms_mod_kernel(
     const uint16_t* __restrict__ yd, const uint16_t* __restrict__ g, const uint16_t* __restrict__ s,
     const uint16_t* __restrict__ w, const int* __restrict__ cu, uint16_t* __restrict__ x,
     uint8_t* __restrict__ q, float* __restrict__ qs, uint16_t* __restrict__ z, int n, int n_seq,
     float eps, int y_ld, int g_ld, int s_ld, int x_ld, int q_ld, int qs_ld, int z_ld, float wadd,
-    int once, int layer, int none) {
+    int once, int layer, int none, const int* __restrict__ colmap) {
     __shared__ float sh[kT / 32];
     const int r = blockIdx.x;
-    const int e = seq_of(cu, n_seq, r);
+    int e = seq_of(cu, n_seq, r);
+    // Optional: `cu` may bound more groups than the modulation table has rows (groups that share
+    // a cell share a row), so the map turns a group into its row; without it the group is the row.
+    if (colmap) e = colmap[e];
     uint16_t* xr = x + (size_t)r * x_ld;
     float v[kRmChunks][8];
     float ss = 0.0f;
@@ -152,7 +158,7 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
             o[j] = bfr(bfr(n2 * bfr(1.0f + scf[j])) + shf[j]);
         }
         if (z) st8(z + (size_t)r * z_ld + i, o);
-        if (QUANT) {
+        if (QMODE) {
             float m = 0.0f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(o[j]));
@@ -160,12 +166,12 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
             m = fmaxf(m, r4d_xor_lane<4>(m));
             m = fmaxf(m, r4d_xor_lane<2>(m));
             m = fmaxf(m, r4d_xor_lane<1>(m));
-            const float sc = m > 0.0f ? m * (1.0f / q8_top<false>()) : 1.0f;
+            const float sc = m > 0.0f ? m * (1.0f / q8_top<QMODE == 2>()) : 1.0f;
             const float inv = 1.0f / sc;
             if ((threadIdx.x & 15) == 0) qs[(size_t)r * qs_ld + i / 128] = sc;
             *(uint2*)(q + (size_t)r * q_ld + i) =
-                make_uint2(q8_pack4<false>(o[0], o[1], o[2], o[3], inv),
-                           q8_pack4<false>(o[4], o[5], o[6], o[7], inv));
+                make_uint2(q8_pack4<QMODE == 2>(o[0], o[1], o[2], o[3], inv),
+                           q8_pack4<QMODE == 2>(o[4], o[5], o[6], o[7], inv));
         }
     }
 }
@@ -188,6 +194,33 @@ __global__ __launch_bounds__(kT) void flow_x0_kernel(
     const float xv = *xp;
     const float d = xv + st * ldv(v, r * v_ld + c);
     *xp = ra * xv + omr * d;
+}
+
+// ---------------------------------------------------------------------------- flow_res_multistep
+// The second-order step on the clean estimate d = x + sigma v: x' = r x + hb1 d + hb2 x0, x0 the
+// last step's estimate, which d then replaces. With order < 2 it is Euler, x' = r x + (1 - r) d.
+template <typename TV>
+__global__ __launch_bounds__(kT) void flow_rm_kernel(
+    const TV* __restrict__ v, float* __restrict__ x0, const float* __restrict__ sg,
+    const float* __restrict__ rr, const float* __restrict__ hb1, const float* __restrict__ hb2,
+    const float* __restrict__ ord, float* __restrict__ x, int n, int v_ld, int x_ld, int x0_ld,
+    int64_t total) {
+    const int64_t id = (int64_t)blockIdx.x * kT + threadIdx.x;
+    if (id >= total) return;
+    const int64_t r = id / n;
+    const int c = (int)(id % n);
+    const float sgv = sg[0];
+    const float ra = rr[0];
+    const float b1 = hb1[0];
+    const float b2 = hb2[0];
+    const bool two = ord[0] >= 1.5f;
+    const float omr = 1.0f - ra;
+    float* xp = x + r * x_ld + c;
+    float* op = x0 + r * x0_ld + c;
+    const float xv = *xp;
+    const float d = xv + sgv * ldv(v, r * v_ld + c);
+    *xp = two ? ra * xv + b1 * d + b2 * (*op) : ra * xv + omr * d;
+    *op = d;
 }
 
 // ---------------------------------------------------------------------------- patch_unfold
@@ -240,6 +273,20 @@ __device__ __forceinline__ Tiles split_tiles(int len, int tile, int overlap) {
     t.q = rem / (n - 1);
     t.rr = rem % (n - 1);
     return t;
+}
+
+// The encoder's split over one axis (libref's split_tiles_axis): the decoder's split above, except
+// that an axis no longer than a tile is one tile, short if need be. A lone tile starts at 0 with no
+// overlap, which the closed form already gives at n = 1.
+__device__ __forceinline__ Tiles split_tiles_axis(int len, int tile, int overlap) {
+    if (tile >= len && len > 0 && tile > 0 && overlap >= 0 && overlap < tile) {
+        Tiles t;
+        t.n = 1;
+        t.tile = tile;
+        t.overlap = overlap;
+        return t;
+    }
+    return split_tiles(len, tile, overlap);
 }
 
 // ---------------------------------------------------------------------------- vtile_gather
@@ -348,6 +395,118 @@ __global__ __launch_bounds__(kT) void vtile_stitch_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- the tiled encoder
+// A one-frame media larger than a tile is encoded as vae.py's `tiled_encode` does: the plan, the
+// cut and the blend (libref's ref_vtile_plan/crop/join); the encoder is the per-level ops, issued
+// per tile.
+
+// A thread a (tile, entry): the tile's first pixel, its pixel extent and the six level volumes,
+// as ref_vtile_plan's row of 22 i32.
+__global__ __launch_bounds__(kT) void vtile_plan_kernel(
+    const int* __restrict__ geom, int* __restrict__ y, int tile, int overlap, int ratio, int y_ld,
+    int64_t M, int64_t y_rows) {
+    const int64_t id = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (id >= M * 22 || id >= y_rows * 22 || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
+    const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
+    const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
+    if (ty.n == 0 || tx.n == 0) return;
+    const int64_t t = id / 22;
+    const int c = (int)(id % 22);
+    const int nh = ty.n, nw = tx.n;
+    if (t >= (int64_t)nh * nw) return;
+    const int i = (int)(t / nw), j = (int)(t % nw);
+    const int th = min(tile, H / ratio - ty.start(i)) * ratio;
+    const int tw = min(tile, W / ratio - tx.start(j)) * ratio;
+    int v;
+    if (c < 4) {
+        v = c == 0 ? ty.start(i) * ratio : c == 1 ? tx.start(j) * ratio : c == 2 ? th : tw;
+    } else {
+        const int L = (c - 4) / 3, k = (c - 4) % 3, d = 1 << min(L, 4);
+        v = k == 0 ? 1 : k == 1 ? th / d : tw / d;
+    }
+    y[t * y_ld + c] = v;
+}
+
+// A thread a tile pixel row: its plane row copied. The tile is found by walking the tiles' sizes,
+// at most a hundred of them (libref's upper_bound over the same prefix sums).
+template <typename T>
+__global__ __launch_bounds__(kT) void vtile_crop_kernel(
+    const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
+    int overlap, int ratio, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
+    const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (r >= M || r >= y_rows || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
+    const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
+    const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
+    if (ty.n == 0 || tx.n == 0 || (int64_t)H * W > x_rows) return;
+    const int nh = ty.n, nw = tx.n;
+    int t = -1;
+    int64_t acc = 0, k = 0;
+    for (int tt = 0; tt < nh * nw; ++tt) {
+        const int64_t sz = (int64_t)min(tile, H / ratio - ty.start(tt / nw)) * ratio *
+                           min(tile, W / ratio - tx.start(tt % nw)) * ratio;
+        if (r < acc + sz) { t = tt; k = r - acc; break; }
+        acc += sz;
+    }
+    if (t < 0) return;  // r past the tiles' sum: M was not it
+    const int tw = min(tile, W / ratio - tx.start(t % nw)) * ratio;
+    const int64_t src = ((int64_t)ty.start(t / nw) * ratio + k / tw) * W +
+                        (int64_t)tx.start(t % nw) * ratio + k % tw;
+    for (int c = 0; c < 3; ++c) stv(y + r * (int64_t)y_ld, c, ldv(x + src * (int64_t)x_ld, c));
+}
+
+// A thread a canvas row: its tile's moments blended with the unblended top, then left neighbour,
+// every product and sum rounded to x's dtype (ref_vtile_join). A thread a (row, channel) would
+// repeat the tile walk n times.
+template <typename T>
+__global__ __launch_bounds__(kT) void vtile_join_kernel(
+    const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
+    int overlap, int n, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
+    const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
+    const int H = geom[1], W = geom[2];
+    if (r >= M || r >= y_rows || r >= (int64_t)H * W || H <= 0 || W <= 0) return;
+    const Tiles ty = split_tiles_axis(H, tile, overlap), tx = split_tiles_axis(W, tile, overlap);
+    if (ty.n == 0 || tx.n == 0) return;
+    const int nh = ty.n, nw = tx.n;
+    // The tiles' row extents and their prefix sums, in tile-major order.
+    const int64_t ext_y = nh == 1 ? H : (int64_t)tile * nh, ext_x = nw == 1 ? W : (int64_t)tile * nw;
+    if (ext_y * ext_x > x_rows) return;
+    auto sz = [&](int ii, int jj) {
+        return (int64_t)min(tile, H - ty.start(ii)) * min(tile, W - tx.start(jj));
+    };
+    auto off = [&](int ii, int jj) {
+        int64_t a = 0;
+        for (int t = 0; t < ii * nw + jj; ++t) a += sz(t / nw, t % nw);
+        return a;
+    };
+    const int Y = (int)(r / W), X = (int)(r % W);
+    int i = 0;
+    while (i + 1 < nh && Y >= ty.start(i + 1)) ++i;
+    int j = 0;
+    while (j + 1 < nw && X >= tx.start(j + 1)) ++j;
+    const int ly = Y - ty.start(i), lx = X - tx.start(j);
+    const int ev = i > 0 ? ty.ov(i - 1) : 0, eh = j > 0 ? tx.ov(j - 1) : 0;
+    const int64_t own = off(i, j), up = i > 0 ? off(i - 1, j) : 0, left = j > 0 ? off(i, j - 1) : 0;
+    // A tile's width: this tile and the one above share a column (`own_w`, short only in the last
+    // column); the left neighbour's column is never the last, so it is `tile` wide.
+    const int own_w = min(tile, W - tx.start(j));
+    const auto fetch = [&](int64_t base, int w, int ay, int ax, int c) {
+        return ldv(x, (base + (int64_t)ay * w + ax) * x_ld + c);
+    };
+    auto rd = [&](float v) { return rdv(x, v); };
+    auto wb = [&](int p, int e) { return rd((float)p / (float)e); };
+    auto wa = [&](int p, int e) { return rd(1.0f - rd((float)p / (float)e)); };
+    for (int c = 0; c < n; ++c) {
+        float v = fetch(own, own_w, ly, lx, c);
+        if (ly < ev)
+            v = rd(rd(fetch(up, own_w, ly + tile - ev, lx, c) * wa(ly, ev)) + rd(v * wb(ly, ev)));
+        if (lx < eh)
+            v = rd(rd(fetch(left, tile, ly, lx + tile - eh, c) * wa(lx, eh)) + rd(v * wb(lx, eh)));
+        stv(y + r * (int64_t)y_ld, c, v);
+    }
+}
+
 // ---------------------------------------------------------------------------- grid_pos3
 // A thread a row: its token's three centred, scaled coordinates, or zeros past the tile's tokens.
 __global__ __launch_bounds__(kT) void grid_pos3_kernel(
@@ -452,22 +611,25 @@ int parse_f32_list(const char* s, float* out, int max) {
 
 // rms_mod (QUANT false: y, g, s, w, cu, x, z) and rms_mod_quant_fp8 (y, g, s, w, cu, x, q, scale,
 // z), one shim.
-static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
+static int rms_mod_launch(const RadArgs* a, RadStream st, int qmode) {
     const RadTensor *y = r4d_opt(a, 0), *g = r4d_opt(a, 1), *sc = r4d_opt(a, 2);
     const RadTensor *w = r4d_opt(a, 3), *cu = r4d_opt(a, 4), *x = r4d_opt(a, 5);
-    const RadTensor* q = quant ? r4d_opt(a, 6) : nullptr;
-    const RadTensor* qs = quant ? r4d_opt(a, 7) : nullptr;
-    const RadTensor* z = r4d_opt(a, quant ? 8 : 6);
-    if (!sc || !cu || !x || (quant ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* q = qmode ? r4d_opt(a, 6) : nullptr;
+    const RadTensor* qs = qmode ? r4d_opt(a, 7) : nullptr;
+    const RadTensor* z = r4d_opt(a, qmode ? 8 : 6);
+    // The optional group->row map, after the last operand of either form (slot 9 quantising,
+    // slot 7 plain).
+    const RadTensor* cm = r4d_opt(a, qmode ? 9 : 7);
+    if (!sc || !cu || !x || (qmode ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
     const bool gated = r4d_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(sc) || (w && !is_bf16(w)) || !is_i32(cu) ||
         (gated && (!is_bf16(y) || !is_bf16(g))) || (z && !is_bf16(z)) ||
-        (quant && (q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32)))
+        (qmode && (q->dtype != (qmode == 2 ? RAD_I8 : RAD_F8E4M3) || qs->dtype != RAD_F32)))
         return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
     if (n <= 0 || (n & 7) || n > (long long)kT * 8 * kRmChunks ||
-        (quant && (n % 128 || r4d_geti_or(a, "group", 0) != 128)))
+        (qmode && (n % 128 || r4d_geti_or(a, "group", 0) != 128)))
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, xl = 0, ry = 0, yl = 0, rg = 0, gl = 0, rs = 0, sl = 0, rz = 0, zl = 0;
     long long rq = 0, rqs = 0, ql = 0, qsl = 0;
@@ -476,14 +638,18 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
         (gated && (!rows8(y, n, &ry, &yl) || !rows8(g, n, &rg, &gl))) ||
         (z && !rows8(z, n, &rz, &zl)))
         return R4D_NO(RAD_E_STRIDE);
-    if (quant) {
+    if (qmode) {
         ql = r4d_rows_pitch(q, n, &rq);
         qsl = r4d_rows_pitch(qs, n / 128, &rqs);
         if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return R4D_NO(RAD_E_STRIDE);
     }
-    const long long n_seq = r4d_numel(cu) - 1, rows = quant ? rq : rz;
-    if (rows <= 0 || n_seq <= 0 || rx < rows || rs < n_seq || (w && r4d_numel(w) < n) ||
-        (quant && rqs < rows) || (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
+    const long long n_seq = r4d_numel(cu) - 1, rows = qmode ? rq : rz;
+    if (cm && (!is_i32(cm) || !r4d_contig(cm) || r4d_numel(cm) < n_seq))
+        return R4D_NO(RAD_E_SHAPE);
+    // With the map the table may hold fewer rows than groups; the issuer keeps every mapped row
+    // inside it.
+    if (rows <= 0 || n_seq <= 0 || rx < rows || (!cm && rs < n_seq) || (w && r4d_numel(w) < n) ||
+        (qmode && rqs < rows) || (gated && (ry < rows || (!cm && rg < n_seq))) || (z && rz < rows))
         return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
@@ -501,22 +667,29 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
                        Q ? (uint8_t*)q->data : nullptr, Q ? (float*)qs->data : nullptr,           \
                        z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq, eps, (int)yl,        \
                        (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl, wadd, once, layer, \
-                       none)
-    if (quant) {
-        if (gated) R4D_RMQ(true, true);
-        else       R4D_RMQ(false, true);
+                       none, cm ? (const int*)cm->data : nullptr)
+    if (qmode == 2) {
+        if (gated) R4D_RMQ(true, 2);
+        else       R4D_RMQ(false, 2);
+    } else if (qmode == 1) {
+        if (gated) R4D_RMQ(true, 1);
+        else       R4D_RMQ(false, 1);
     } else {
-        if (gated) R4D_RMQ(true, false);
-        else       R4D_RMQ(false, false);
+        if (gated) R4D_RMQ(true, 0);
+        else       R4D_RMQ(false, 0);
     }
 #undef R4D_RMQ
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_rms_mod(const RadArgs* a, RadStream s) { return rms_mod_launch(a, s, false); }
+extern "C" int r4d_rad_rms_mod(const RadArgs* a, RadStream s) { return rms_mod_launch(a, s, 0); }
 
 extern "C" int r4d_rad_rms_mod_quant_fp8(const RadArgs* a, RadStream s) {
-    return rms_mod_launch(a, s, true);
+    return rms_mod_launch(a, s, 1);
+}
+
+extern "C" int r4d_rad_rms_mod_quant_i8(const RadArgs* a, RadStream s) {
+    return rms_mod_launch(a, s, 2);
 }
 
 extern "C" int r4d_rad_flow_x0_step(const RadArgs* a, RadStream s) {
@@ -540,6 +713,36 @@ extern "C" int r4d_rad_flow_x0_step(const RadArgs* a, RadStream s) {
     if (is_f32(v)) R4D_FX0(float);
     else           R4D_FX0(uint16_t);
 #undef R4D_FX0
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_flow_res_multistep(const RadArgs* a, RadStream s) {
+    const RadTensor *v = r4d_opt(a, 0), *x0 = r4d_opt(a, 1), *sg = r4d_opt(a, 2);
+    const RadTensor *rr = r4d_opt(a, 3), *hb1 = r4d_opt(a, 4), *hb2 = r4d_opt(a, 5);
+    const RadTensor *ord = r4d_opt(a, 6), *x = r4d_opt(a, 7);
+    if (!v || !x0 || !sg || !rr || !hb1 || !hb2 || !ord || !x) return R4D_NO(RAD_E_INVAL);
+    if (!is_f32(x) || !is_f32(x0) || !is_f32(sg) || !is_f32(rr) || !is_f32(hb1) || !is_f32(hb2) ||
+        !is_f32(ord) || (!is_f32(v) && !is_bf16(v)))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    long long rx = 0, rv = 0, rx0 = 0;
+    const long long xl = n > 0 ? r4d_rows_pitch(x, n, &rx) : -1;
+    const long long vl = n > 0 ? r4d_rows_pitch(v, n, &rv) : -1;
+    const long long x0l = n > 0 ? r4d_rows_pitch(x0, n, &rx0) : -1;
+    if (xl < 0 || vl < 0 || x0l < 0) return R4D_NO(RAD_E_STRIDE);
+    if (rx <= 0 || rv < rx || rx0 < rx || r4d_numel(sg) < 1 || r4d_numel(rr) < 1 ||
+        r4d_numel(hb1) < 1 || r4d_numel(hb2) < 1 || r4d_numel(ord) < 1)
+        return R4D_NO(RAD_E_SHAPE);
+    const int64_t total = (int64_t)rx * n;
+#define R4D_FRM(TV)                                                                               \
+    hipLaunchKernelGGL(flow_rm_kernel<TV>, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,  \
+                       (const TV*)v->data, (float*)x0->data, (const float*)sg->data,              \
+                       (const float*)rr->data, (const float*)hb1->data, (const float*)hb2->data,  \
+                       (const float*)ord->data, (float*)x->data, (int)n, (int)vl, (int)xl,        \
+                       (int)x0l, total)
+    if (is_f32(v)) R4D_FRM(float);
+    else           R4D_FRM(uint16_t);
+#undef R4D_FRM
     return st_of(hipGetLastError());
 }
 
@@ -639,6 +842,78 @@ extern "C" int r4d_rad_vtile_stitch(const RadArgs* a, RadStream s) {
     else           R4D_VTS_P(uint16_t);
 #undef R4D_VTS_P
 #undef R4D_VTS
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_plan(const RadArgs* a, RadStream s) {
+    const RadTensor *geom = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!geom || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_i32(geom) || !is_i32(y)) return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 ||
+        r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    /* The tile count comes from y; the ranged `M` is the band's bound, a ceiling only
+     * (ref_common.h, band_rows). */
+    long long ry = 0;
+    const long long yl = r4d_rows_pitch(y, 22, &ry);
+    if (yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
+    const int64_t total = ry * 22;
+    hipLaunchKernelGGL(vtile_plan_kernel, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,
+                       (const int*)geom->data, (int*)y->data, (int)tile, (int)overlap, (int)ratio,
+                       (int)yl, ry, ry);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_crop(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !geom || !y) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(x) && !is_bf16(x)) || x->dtype != y->dtype || !is_i32(geom))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 ||
+        r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    /* y's rows are the tiles' pixel rows; the ranged `M` is a ceiling only (band_rows). Rows past
+     * the tiles' sum write nothing. */
+    const long long xl = r4d_rows_pitch(x, 3, &rx), yl = r4d_rows_pitch(y, 3, &ry);
+    if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
+#define R4D_VTC(T)                                                                                \
+    hipLaunchKernelGGL((vtile_crop_kernel<T>), dim3(blocks_for(ry)), dim3(kT), 0, (hipStream_t)s, \
+                       (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
+                       (int)overlap, (int)ratio, (int)xl, (int)yl, ry, rx, ry)
+    if (is_f32(x)) R4D_VTC(float);
+    else           R4D_VTC(uint16_t);
+#undef R4D_VTC
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vtile_join(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !geom || !y) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(x) && !is_bf16(x)) || x->dtype != y->dtype || !is_i32(geom))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long M = r4d_geti_or(a, "M", 0), tile = r4d_geti_or(a, "tile", 0);
+    const long long overlap = r4d_geti_or(a, "overlap", 0), n = r4d_geti_or(a, "n", 0);
+    if (M <= 0 || tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    /* A thread a row of the canvas y; the ranged `M` is a ceiling only (band_rows). */
+    const long long xl = r4d_rows_pitch(x, n, &rx), yl = r4d_rows_pitch(y, n, &ry);
+    if (xl < 0 || yl < 0 || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || (M > 0 && ry > M)) return R4D_NO(RAD_E_SHAPE);
+#define R4D_VTJ(T)                                                                                \
+    hipLaunchKernelGGL((vtile_join_kernel<T>), dim3(blocks_for(ry)), dim3(kT), 0, (hipStream_t)s, \
+                       (const T*)x->data, (const int*)geom->data, (T*)y->data, (int)tile,         \
+                       (int)overlap, (int)n, (int)xl, (int)yl, ry, rx, ry)
+    if (is_f32(x)) R4D_VTJ(float);
+    else           R4D_VTJ(uint16_t);
+#undef R4D_VTJ
     return st_of(hipGetLastError());
 }
 

@@ -88,7 +88,7 @@ struct Fixture {
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
-               int64_t max_ctx = 4096, bool windowed = false) {
+               int64_t max_ctx = 4096, bool windowed = false, bool linear = true) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -109,17 +109,21 @@ struct Fixture {
         attn.block_size = 16;
         prog.kv_groups.push_back(attn);
 
-        KVGroupInfo lin;
-        lin.name = "gdn";
-        lin.decl.kind = RAD_KV_LINEAR;
-        lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
-        prog.kv_groups.push_back(lin);
+        /* `linear` false: a full-attention trunk, as Gemma 4's (with `windowed`, its sliding
+         * layers), and no GDN op or state buffers below. */
+        if (linear) {
+            KVGroupInfo lin;
+            lin.name = "gdn";
+            lin.decl.kind = RAD_KV_LINEAR;
+            lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
+            prog.kv_groups.push_back(lin);
 
-        KVGroupInfo conv;
-        conv.name = "conv";
-        conv.decl.kind = RAD_KV_CONV;
-        conv.decl.conv_width = 4;
-        prog.kv_groups.push_back(conv);
+            KVGroupInfo conv;
+            conv.name = "conv";
+            conv.decl.kind = RAD_KV_CONV;
+            conv.decl.conv_width = 4;
+            prog.kv_groups.push_back(conv);
+        }
 
         /* A windowed paged group, as sliding-window checkpoints pair with a full group. Not
          * prefix-cached: prefix.cpp indexes only groups whose blocks below the window stay put.
@@ -138,22 +142,24 @@ struct Fixture {
                                         * stays unbound, and unbound is not trunk-owned */
         }
 
-        OpInfo op;
-        op.op = "gdn_chunk_scan";
-        op.schema = &g_gdn_schema;
-        Band b;
-        b.hi = 4096;
-        b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
-        /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's spelling,
-         * the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's constraint
-         * contribute. */
-        b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
-        op.bands.push_back(b);
-        prog.ops.push_back(op);
+        if (linear) {
+            OpInfo op;
+            op.op = "gdn_chunk_scan";
+            op.schema = &g_gdn_schema;
+            Band b;
+            b.hi = 4096;
+            b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
+            /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's
+             * spelling, the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's
+             * constraint contribute. */
+            b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
+            op.bands.push_back(b);
+            prog.ops.push_back(op);
 
-        add_derived("seq_start", "seq_start_index", 257);
-        add_derived("chunk_bounds", "state_chunk_bounds", 4097);
-        add_derived("conv_idx", "conv_state_index", 256);
+            add_derived("seq_start", "seq_start_index", 257);
+            add_derived("chunk_bounds", "state_chunk_bounds", 4097);
+            add_derived("conv_idx", "conv_state_index", 256);
+        }
 
         cfg.max_tok = max_tok;
         cfg.max_seqs = 32;
@@ -426,6 +432,47 @@ TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
     CHECK_EQ(f.pc.reserved, 1);
     CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
+}
+
+/* A hit that ends at a head other prompts share (CacheHit::branch_at) and resumes nothing there:
+ * the request takes a snapshot at that point (Request::checkpoint_at), so the requests after it
+ * skip the head. TranslateGemma's chunks: the same instructions, then a different text each. Not
+ * when a snapshot already resumes within Scheduler::kSharedHeadMin of it, nor for an ordinary hit. */
+TEST(a_hit_at_a_shared_head_takes_a_snapshot_there) {
+    {   /* a window model, tip-only: the head's snapshot comes in addition to the tail's */
+        Fixture f;
+        f.build(4096, 64, 512, 4096, /*windowed=*/true);
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_policy = "tip-only";
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(640);
+        f.pc.branch_at = 640;
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)640);
+        f.commit_plain();
+        for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
+        CHECK_EQ(f.sch.metrics().checkpoints_written, 2ll);
+        const std::vector<int64_t> want = { 640, 1072 };
+        CHECK(f.pc.committed == want);
+    }
+    for (int c = 0; c < 3; ++c) {   /* a hybrid model, interval 256, quantum 64 */
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.pc.seed(640);
+        if (c == 1) { f.pc.lin = 512; f.pc.src = 3; }   /* resumes 128 short: not worth a split */
+        f.pc.branch_at = c == 2 ? 0 : 640;              /* an ordinary hit: no branch */
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)(c == 1 ? 512 : 0));
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)(c == 0 ? 640 : 0));
+    }
 }
 
 TEST(tip_only_does_not_disable_recurrent_interval_checkpoints) {
@@ -1573,6 +1620,49 @@ TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
     CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
     CHECK_EQ(r.rows, 0);
+}
+
+/* z-lab's DFlash on the Gemma 4 31B: a full-attention block drafter (no window), whose own group the
+ * prefix cache indexes like the trunk's full layers. A hit resumes the trunk's window from the
+ * window snapshot, so no paged group is left with a hole and the drafter drafts from the first
+ * decode. Counting the trunk's window as a hole would put the drafter's floor at the hit, and a
+ * drafter with no window to slide would not draft again that turn. */
+TEST(a_full_attention_drafter_drafts_at_once_after_a_hit_the_window_snapshot_resumes) {
+    for (int counted = 0; counted < 2; ++counted) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192,
+                /*windowed=*/true, /*linear=*/false);
+        f.cfg.n_spec = 7;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.window = 0;
+        KVGroupInfo d;
+        d.name = "draft";
+        d.decl.kind = RAD_KV_FULL;
+        d.block_size = 16;
+        f.prog.kv_groups.push_back(d);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        const int32_t swa = 1, draft = 2;
+        f.kv.snap = { swa };
+        f.kv.snap_reported = counted != 0;
+        f.pc.groups = { 0, draft };
+        f.pc.ckpt_lo = 2048;
+        CHECK_OK(f.start());
+        CHECK(f.sch.geometry().window_ckpt);
+        f.pc.seed(2048); f.pc.lin = 2048; f.pc.src = 3;
+        const uint64_t a = f.submit(2200, 64);
+        Scheduler::BlockRow rows[4];
+        int n_rows = -1;
+        for (int st = 0; st < 40; ++st) {
+            CHECK(f.sch.step() != nullptr);
+            if (st == 0) CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)2048);
+            f.commit_plain(11);
+            const int n = f.sch.block_begin(8, 7, 0, 99, rows, 4);
+            f.sch.block_end();
+            if (!f.sch.find(a)->output.empty()) { n_rows = n; break; }
+        }
+        CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
+        CHECK_EQ(n_rows, counted ? 1 : 0);
+    }
 }
 
 TEST(no_prefix_hit_gives_nothing_back) {
@@ -3336,6 +3426,78 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     CHECK(checked > 100);
 }
 
+/* A streamed group's residency map and ring bookkeeping live in each rank's KV pool,
+ * but the manager the builder is given is rank 0's, so its pointers are rank 0's addresses. A
+ * two-rank batch must name rank r's own copies or device r resolves through device 0's memory
+ * (a page-not-present fault at --tp 2). The host mirror is the exception: RAD_MEM_HOST_MAPPED's
+ * device view is its host address on every card, so it is the same pointer on both ranks.
+ *
+ * The bases are fake and no map is dereferenced: what is under test is the rebasing arithmetic,
+ * not two cards. Both ranks use device 0 so the test runs on the host backend. */
+TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mirror) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+
+    /* Two pools' worth of address space, only ever differenced, never dereferenced. */
+    alignas(16) char pool0[0x200], pool1[0x200];
+    char* const base[2] = { pool0, pool1 };
+    const int64_t res_off = 0x40, sblk_off = 0x80, sst_off = 0xc0, ctl_off = 0x100;
+    alignas(16) uint8_t mirror[0x100];
+    f.kv.streams = true;
+    f.kv.stream.host        = mirror;
+    f.kv.stream.res         = (int32_t*)(base[0] + res_off);
+    f.kv.stream.slot_block  = (int32_t*)(base[0] + sblk_off);
+    f.kv.stream.slot_state  = (int32_t*)(base[0] + sst_off);
+    f.kv.stream.ctl         = (int32_t*)(base[0] + ctl_off);
+    f.kv.stream.block_bytes = 64;
+    f.kv.stream.slots       = 8;
+
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog, base[0] });
+    rio.push_back({ 0, nullptr, &f.prog, base[1] });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 80));
+    StepPlan p;
+    p.reset();
+    StepEntry e;
+    e.seq = 1;
+    e.card = 0;
+    e.n_tokens = 1;
+    e.ctx_len = 79;
+    p.e.push_back(e);
+    p.n_tok = 1;
+    REQUIRE(bb.build(p, f.kv, 0) != nullptr);
+
+    for (int r = 0; r < 2; ++r) {
+        const RadBatch* b = bb.batch_for(r);
+        REQUIRE(b != nullptr);
+        const RadKVStream* s = b->kv[0].stream;
+        REQUIRE(s != nullptr);
+        CHECK_EQ((void*)s->res,        (void*)(base[r] + res_off));
+        CHECK_EQ((void*)s->slot_block, (void*)(base[r] + sblk_off));
+        CHECK_EQ((void*)s->slot_state, (void*)(base[r] + sst_off));
+        CHECK_EQ((void*)s->ctl,        (void*)(base[r] + ctl_off));
+        /* Same mirror address, and the geometry is rank-independent. */
+        CHECK_EQ((void*)s->host, (void*)mirror);
+        CHECK_EQ(s->block_bytes, (int64_t)64);
+        CHECK_EQ(s->slots, (int64_t)8);
+        /* Groups that do not stream keep a null view. */
+        for (int gi = 1; gi < b->n_kv_groups; ++gi)
+            CHECK(b->kv[gi].stream == nullptr);
+    }
+    bb.fini();
+}
+
 /* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
  * wherever it is written, so the old row's copy goes stale; restaging only later changes would
  * keep entries a rollback replaced earlier. The scheduler's own passes reorder rows, so this
@@ -4010,6 +4172,64 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     r->sp.grammar = "root ::= \"a\"";
     r->speculation_fixed = true;                    /* a grammar whose backend rewinds */
     CHECK(f.sch.step_next() != nullptr);
+}
+
+/* No step is issued ahead behind one that ends every request it carries: its rows would
+ * belong to finished requests, and a request arriving after the last token would wait out its
+ * forward pass. The verify ends a request most likely when its drafts hold an end-of-generation
+ * id, certainly when its first token is the request's last (max_tokens), and possibly when that
+ * token and its accepted drafts reach max_tokens. An ignore_eos request's drafted end ends
+ * nothing, nor do drafts without one, and a request that even every draft accepted leaves short
+ * of max_tokens goes on. The refusal reserves nothing for the step it does not issue. */
+TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
+    constexpr int32_t kEog = 2;
+    int32_t ends[4] = { 21, kEog, 23, 24 }, goes_on[4] = { 21, 22, 23, 24 };
+    /* One request: its prompt's token committed, then the verify of `draft`. */
+    auto ahead = [&](const int32_t* draft, int max_tokens, bool ignore_eos) -> bool {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog, 3 });
+        const uint64_t id = f.submit(160, max_tokens, 0, ignore_eos);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, draft, 4));
+        const bool verify = f.sch.step() != nullptr;
+        CHECK(verify);
+        if (!verify) return false;
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+        f.sch.find(id)->speculation_fixed = true;
+        f.sch.expect_draft(id, 4);
+        const int64_t free_before = f.kv.free_blocks(0);
+        const bool issued = f.sch.step_next() != nullptr;
+        if (!issued) CHECK_EQ(f.kv.free_blocks(0), free_before);
+        return issued;
+    };
+    CHECK(ahead(goes_on, 64, false));
+    CHECK(!ahead(ends, 64, false));               /* a drafted end */
+    CHECK(ahead(ends, 64, true));                 /* ignore_eos: an end-of-text like any token */
+    CHECK(!ahead(goes_on, 2, false));             /* one token committed, its next the last */
+    CHECK(!ahead(goes_on, 6, false));             /* 1 + its token + 4 accepted drafts reach it */
+    CHECK(ahead(goes_on, 7, false));              /* all four accepted leave it a token short */
+
+    /* Two requests: one ends, the other goes on, so the step is issued ahead for both. */
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    f.sch.set_eog({ kEog });
+    const uint64_t a = f.submit(160, 64), b = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, ends, 4));
+    CHECK_OK(f.sch.set_draft(b, goes_on, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);
 }
 
 /* The context bounds a sequence whatever max_tokens says, "no limit" included. Positions past the
@@ -4966,13 +5186,15 @@ TEST(a_cancel_while_a_step_runs_ahead_keeps_the_request_until_that_step_commits)
 }
 
 /* A request that finishes at the commit of a step whose successor is already issued keeps its
- * blocks for that successor, which writes them, and returns them at its commit. */
+ * blocks for that successor, which writes them, and returns them at its commit. The end is one
+ * the scheduler could not see coming (an end-of-text it did not draft): a step known to end the
+ * request issues nothing ahead (no_step_is_issued_ahead_behind_one_that_ends_its_requests). */
 TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_step) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
     const int64_t before = f.kv.free_blocks(0);
-    auto r = f.request(40, /*max_tokens=*/2);
+    auto r = f.request(40, /*max_tokens=*/64);
     r->speculation_fixed = true;
     const uint64_t a = f.add(std::move(r));
     REQUIRE(f.sch.step() != nullptr);
@@ -4980,7 +5202,7 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     REQUIRE(f.sch.step() != nullptr);
     REQUIRE(f.sch.step_next() != nullptr);
     const int64_t held = f.kv.free_blocks(0);
-    f.commit_plain();                              /* the second token: finished */
+    CHECK_OK(f.commit(7, /*eos=*/1));              /* the second token, an end of text: finished */
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
     CHECK_EQ(f.kv.free_blocks(0), held);
     f.sch.promote_next();
@@ -5661,8 +5883,8 @@ uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_
 TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     struct Case { int64_t max_tok, interval, busy; uint64_t want; };
     const Case cases[] = {
-        { 256, 256, -1, 0x17b8231a20db9d46ull }, { 512, 256, -1, 0xe155e72b6a4cc94full }, { 1024, 256, -1, 0x54ba52dac3f4f61cull },
-        { 1024, 256, 0, 0x54ba52dac3f4f61cull }, { 1024, 256, 128, 0x3d9cbbf533e3c4b5ull }, { 2048, 512, -1, 0x400205b7b9afcf12ull },
+        { 256, 256, -1, 0x9b2fe92b1919355cull }, { 512, 256, -1, 0xdae73489249b5339ull }, { 1024, 256, -1, 0x44975a352e78619aull },
+        { 1024, 256, 0, 0x44975a352e78619aull }, { 1024, 256, 128, 0x3c0b9b1a1f864e4aull }, { 2048, 512, -1, 0xd6c184d0563159eeull },
     };
     for (const Case& c : cases) {
         int n = 0;

@@ -1,6 +1,7 @@
 /* video_driver.cpp -- the video generator's pass driver (video_driver.h), the ticket a caller
  * waits on, and a request's shape and schedule (video.h). */
 #include "video_driver.h"
+#include "gen.h"
 #include "rad_internal.h"
 #include "rad_plugin.h"
 
@@ -144,7 +145,10 @@ static std::vector<float> flow_sigmas(const RadVideoGenDecl& d, int32_t n, int64
 }
 
 VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens,
-                             bool refine) {
+                             bool refine, double shift_video, double shift_audio) {
+    /* A request's shift replaces the declaration's, form 0 only. */
+    const double sv = shift_video > 0.0 ? shift_video : d.shift_video;
+    const double sa = shift_audio > 0.0 ? shift_audio : d.shift_audio;
     VideoSchedule v;
     if (d.sched_kind == 1) {
         if (d.n_rungs > 0) {
@@ -164,13 +168,13 @@ VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t vi
     }
     if (d.n_rungs > 0) {
         if (steps != d.n_rungs + 1) return v;
-        v.sig_v = rung_sigmas(d.shift_video, d.rungs, d.n_rungs);
-        v.sig_a = rung_sigmas(d.shift_audio, d.rungs, d.n_rungs);
+        v.sig_v = rung_sigmas(sv, d.rungs, d.n_rungs);
+        v.sig_a = rung_sigmas(sa, d.rungs, d.n_rungs);
         v.steps = d.n_rungs;
         return v;
     }
-    v.sig_v = shifted_sigmas(d.shift_video, steps);
-    v.sig_a = shifted_sigmas(d.shift_audio, steps);
+    v.sig_v = shifted_sigmas(sv, steps);
+    v.sig_a = shifted_sigmas(sa, steps);
     const size_t n = std::min(v.sig_v.size(), v.sig_a.size());
     v.steps = n > 0 ? (int32_t)(n - 1) : 0;
     return v;
@@ -181,26 +185,42 @@ namespace {
 
 constexpr int64_t kAlign = 256;
 
+/* The segment boundaries a step with references may have: text, keyframes, a segment or two a
+ * reference at nine pictures, three videos and three soundtracks, the two latents, the end. */
+constexpr int64_t kSegCap = 64;
+/* An encode pass's geometry, rad_arch_encode_geom's int32s at most. */
+constexpr int64_t kEncGeomCap = 32;
+
 /* Region offsets and sizes, in the enum's order (video_driver.h), and the total; shared by the
- * allocation and the VRAM budget. */
-int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t (*bytes)[2], int n) {
+ * allocation and the VRAM budget. `ep` and `pd` are the vision tower's patches a pass and patch
+ * width, 0 without one. */
+int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
+              int64_t (*bytes)[2], int n) {
     /* A guided model's VCOND carries the negative prompt after the positive. */
     const int64_t prompts = d.guidance ? 2 : 1;
     const int64_t want[] = {
         prompts * d.max_text * 4,   /* R_TOK */
         prompts * d.max_text * 4,   /* R_POS */
         3 * 4,                   /* R_CU */
-        3 * max_tok * 4,         /* R_ROPE: a step's rotary positions */
+        3 * max_tok * 4,         /* R_ROPE: a step's positions, or the prompt's M-RoPE */
         RAD_VGEOM_N * 4,         /* R_GEOM */
-        6 * 4,                   /* R_SCHED */
+        16 * 4,                  /* R_SCHED */
         d.max_steps * 4,         /* R_TV */
         d.max_steps * 4,         /* R_TA */
         4 * 4,                   /* R_SEED */
         4,                       /* R_LANE */
         4,                       /* R_FIRST */
-        4 * 4,                   /* R_SEG */
+        kSegCap * 4,             /* R_SEG */
+        2 * kSegCap * 4,         /* R_MOD: the boundaries, then a cell a group */
         4 * 4,                   /* R_LAT */
         4,                       /* R_UP */
+        d.max_text * 4,          /* R_MMROW: a row a placeholder token */
+        ep * pd * 2,             /* R_ENCPIX: [ep, pd] bf16 */
+        4 * ep * 4,              /* R_ENCCRD: [4, ep] i32 */
+        (ep + 2) * 4,            /* R_ENCCU */
+        d.max_enc_frames * d.max_enc_side * d.max_enc_side * 3 * 4,   /* R_ENCPX: f32 */
+        d.max_enc_samples * d.audio_channels * 4,                     /* R_ENCSM: f32 */
+        kEncGeomCap * 4,         /* R_ENCG */
         d.image_cond ? d.max_area * 3 * 2 : 0,   /* R_IMG: a first frame, bf16 */
         8 * 4,                   /* R_GUIDE */
     };
@@ -224,16 +244,23 @@ int64_t samples_of(const RadVideoGenDecl& d, int32_t frames) {
     return (num / d.fps_num + 1) * (d.sample_rate / d.audio_rate);
 }
 
+/* The vision tower's patches a pass and patch width, 0 without a tower. */
+void encoder_bounds(const Program& prog, int64_t* ep, int64_t* pd) {
+    *ep = prog.encoder.modalities != 0 ? prog.ctx.max_enc_patches : 0;
+    *pd = prog.encoder.modalities != 0 ? prog.encoder.patch_dim : 0;
+}
 }  /* namespace */
 
 int64_t VideoDriver::device_bytes(const Program& prog) {
     if (!prog.is_video_generator()) return 0;
+    int64_t ep = 0, pd = 0;
+    encoder_bounds(prog, &ep, &pd);
     int64_t b[R_N][2];
-    return carve(prog.video_gen, prog.ctx.max_tok, b, R_N);
+    return carve(prog.video_gen, prog.ctx.max_tok, ep, pd, b, R_N);
 }
 
 int VideoDriver::init(const Program& prog, PositionsFn positions,
-                      const std::vector<RankIO>& ranks) {
+                      const std::vector<RankIO>& ranks, PackFn pack, EncodeGeomFn enc_geom) {
     fini();
     if (!prog.is_video_generator()) return RAD_E_STATE;
     decl_  = prog.video_gen;
@@ -242,7 +269,10 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
     name_  = prog.vgen_str.name;
     ranks_ = ranks;
     positions_ = positions;
+    pack_ = pack;
+    enc_geom_ = enc_geom;
     max_tok_ = prog.ctx.max_tok;
+    encoder_bounds(prog, &max_enc_, &patch_dim_);
     if (!positions_) {
         RAD_ERR("video generator '%s': the plugin exports no rad_arch_video_positions, which a "
                 "video generator must", name_.c_str());
@@ -262,7 +292,7 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
         return RAD_E_UNSUPPORTED;
     }
     int64_t b[R_N][2];
-    bytes_ = carve(decl_, max_tok_, b, R_N);
+    bytes_ = carve(decl_, max_tok_, max_enc_, patch_dim_, b, R_N);
     for (int r = 0; r < R_N; ++r) { reg_[r].off = b[r][0]; reg_[r].bytes = b[r][1]; reg_[r].used = 0; }
 
     frames_bytes_ = frames_bytes_of(decl_);
@@ -349,6 +379,137 @@ int32_t VideoDriver::predicted_chunks(double log_seconds, std::string* note) con
     return (int32_t)n;
 }
 
+/* The encode passes and the reference table (RadVideoGenBatch::ref_tab) of a request's media, in
+ * the order of `refs`. A video's soundtrack is in the video's row and encoded under its number.
+ * The latent counts are rad_arch_encode_geom's, which refuses here the media an encode pass would
+ * fail the engine on. */
+int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::string* why) const {
+    const RadVideoGenDecl& d = decl_;
+    auto no = [&](const std::string& w) {
+        if (why) *why = w;
+        return RAD_E_INVAL;
+    };
+    j.ref_tab.clear();
+    j.enc_q.clear();
+    if (r.refs.empty()) return RAD_OK;
+    if (!pack_ || !enc_geom_)
+        return no("this model conditions on no reference media");
+    int32_t eg[kEncGeomCap];
+    /* A picture's or video's latent frames or a soundtrack's latents, -1 for media refused. */
+    auto latents = [&](const VideoRefMedia& m) -> int64_t {
+        const bool audio = m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO;
+        if (audio ? d.max_enc_samples <= 0 : d.max_enc_side <= 0) return -1;
+        if (audio ? m.enc_samples.empty() : m.enc_pixels.empty()) return -1;
+        const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : m.enc_h,
+                                audio ? 0 : m.enc_w, audio ? m.enc_channels : 3 };
+        const int32_t kind = audio ? RAD_GEN_PASS_AENCODE : RAD_GEN_PASS_VENCODE;
+        if (enc_geom_(kind, in, eg, kEncGeomCap) < 0) return -1;
+        return audio ? eg[12] : eg[24];
+    };
+    auto refused = [&](const VideoRefMedia& m) {
+        return no("'" + m.name + "' is not media this model's encoders take (" +
+                  (m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO
+                       ? std::to_string(m.enc_n) + " samples"
+                       : std::to_string(m.enc_w) + "x" + std::to_string(m.enc_h) + ", " +
+                             std::to_string(m.enc_frames) + " frames") + ")");
+    };
+    auto grid = [&](const VideoRefMedia& m, int32_t* lh, int32_t* lw) {
+        if (d.enc_ratio < 1 || m.enc_h % d.enc_ratio || m.enc_w % d.enc_ratio) return false;
+        *lh = m.enc_h / d.enc_ratio;
+        *lw = m.enc_w / d.enc_ratio;
+        return true;
+    };
+    std::vector<int32_t> keys;
+    j.ref_tab.assign(2, 0);
+    for (size_t i = 0; i < r.refs.size(); ++i) {
+        const VideoRefMedia& m = r.refs[i];
+        if (m.kind == VideoRefMedia::VIDEO_AUDIO) continue;
+        const int64_t t = latents(m);
+        int32_t lh = 0, lw = 0;
+        if (t < 1 || (m.kind != VideoRefMedia::AUDIO && !grid(m, &lh, &lw))) return refused(m);
+        if (m.kind == VideoRefMedia::FIRST_FRAME || m.kind == VideoRefMedia::LAST_FRAME) {
+            if (lh != j.geom.lat_h || lw != j.geom.lat_w)
+                return no("'" + m.name + "' is not the video's size");
+            const int32_t n = (int32_t)keys.size() / 3 + 1;
+            j.enc_q.push_back({ RAD_ENC_KEYFRAME, n, (int32_t)i });
+            keys.insert(keys.end(), { m.kind == VideoRefMedia::FIRST_FRAME ? 0 : frames - 1,
+                                      (int32_t)t, 0 });
+            continue;
+        }
+        int32_t kind = RAD_VREF_PICTURE, enc = RAD_ENC_IMAGE, sound = 0;
+        int64_t cap = d.max_ref_images;
+        if (m.kind == VideoRefMedia::AUDIO) {
+            kind = RAD_VREF_AUDIO;
+            enc = RAD_ENC_AUDIO;
+            cap = d.max_ref_audios;
+        } else if (m.kind == VideoRefMedia::VIDEO) {
+            kind = RAD_VREF_VIDEO;
+            enc = RAD_ENC_VIDEO;
+            cap = d.max_ref_videos;
+            for (size_t k = 0; k < r.refs.size(); ++k) {
+                const VideoRefMedia& a = r.refs[k];
+                if (a.kind != VideoRefMedia::VIDEO_AUDIO || a.index != m.index) continue;
+                const int64_t at = latents(a);
+                if (at < 1) return refused(a);
+                sound = (int32_t)at;
+                j.enc_q.push_back({ RAD_ENC_VAUDIO, m.index, (int32_t)k });
+            }
+        }
+        if (m.index < 1 || m.index > cap)
+            return no("'" + m.name + "' is reference " + std::to_string(m.index) + " of its kind "
+                      "and this model takes " + std::to_string(cap));
+        j.enc_q.push_back({ enc, m.index, (int32_t)i });
+        ++j.ref_tab[0];
+        j.ref_tab.insert(j.ref_tab.end(),
+                         { kind, m.index, lh, lw, kind == RAD_VREF_AUDIO ? 0 : (int32_t)t,
+                           kind == RAD_VREF_AUDIO ? (int32_t)t : sound });
+    }
+    j.ref_tab[1] = (int32_t)keys.size() / 3;
+    j.ref_tab.insert(j.ref_tab.end(), keys.begin(), keys.end());
+    /* The prompt's vision pads: each picture's tokens, which ComfyUI modulates as video. */
+    const size_t at = j.ref_tab.size();
+    j.ref_tab.push_back(0);
+    if (r.media)
+        for (const mm::Placed& pl : r.media->items) {
+            if (!pl.item || pl.item->kind != mm::Kind::Image) continue;
+            const int64_t n = (int64_t)pl.item->expand.size();
+            if (pl.tok < 0 || n < 1 || pl.tok + n > j.geom.n_text) continue;
+            ++j.ref_tab[at];
+            j.ref_tab.insert(j.ref_tab.end(), { pl.tok, (int32_t)n });
+        }
+    return RAD_OK;
+}
+
+/* A step's packed sequence with the request's references in, at geometry `g`. */
+int VideoDriver::lay_out(const RadVideoGeom& g, const std::vector<int32_t>& tab, Pack* out,
+                         std::string* why) const {
+    auto no = [&](const std::string& w) {
+        if (why) *why = w;
+        return RAD_E_INVAL;
+    };
+    int32_t n_seg = 0, n_mod = 0;
+    const int64_t rows = pack_(&g, tab.data(), nullptr, &n_seg, nullptr, &n_mod, nullptr, 0);
+    if (rows <= 0 || n_seg < 2 || n_mod < 3 || n_mod % 2 == 0 || n_seg > kSegCap ||
+        n_mod > 2 * kSegCap)
+        return no("the model cannot lay these references out");
+    if (rows > max_tok_)
+        return no("a step with these references is " + std::to_string(rows) + " rows and a pass "
+                  "carries " + std::to_string(max_tok_) + "; ask for a shorter or smaller video, "
+                  "or fewer references");
+    out->rows = rows;
+    out->seg.assign((size_t)n_seg, 0);
+    out->mod.assign((size_t)n_mod, 0);
+    out->pos.assign((size_t)(3 * rows), 0.0f);
+    if (pack_(&g, tab.data(), out->seg.data(), &n_seg, out->mod.data(), &n_mod, out->pos.data(),
+              3 * rows) != rows)
+        return no("the model cannot lay these references out");
+    const int32_t cells = 1 + *std::max_element(out->mod.begin() + (n_mod + 1) / 2, out->mod.end());
+    if (decl_.max_mod_cells > 0 && cells > decl_.max_mod_cells)
+        return no("these references read " + std::to_string(cells) + " modulations and this "
+                  "model's table holds " + std::to_string(decl_.max_mod_cells));
+    return RAD_OK;
+}
+
 /* The request's shape at `chunks` long: its geometry, rows and positions, its schedule, the
  * upscale's split and what its ticket says it makes. Run at submit, and again for a request whose
  * length the model predicts once its VCOND pass has written the prediction. */
@@ -380,6 +541,17 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
     j.pos.assign((size_t)(3 * nr), 0.0f);
     if (positions_(RAD_VPOS_STEP, &j.geom, j.pos.data(), nr) != nr)
         return no("the model could not lay this video out");
+    RAD_TRY(plan_refs(j, r, s.frames, why));
+    j.pack = Pack{};
+    j.pack_small = Pack{};
+    if (!j.ref_tab.empty()) {
+        /* A keyframe is pinned on the video's grid, which an upscale's small steps are not on. */
+        if (r.upscale > 1.0 && j.ref_tab[1] > 0)
+            return no("a keyframe pins a frame of the video at its size, and latent_upscale "
+                      "denoises a smaller one first: send the keyframe request without "
+                      "latent_upscale");
+        RAD_TRY(lay_out(j.geom, j.ref_tab, &j.pack, why));
+    }
     /* The schedule follows the upscale's split, which needs the small size first. */
     const bool upscaling = r.upscale > 1.0;
     const bool own_refine = upscaling && d.n_refine_rungs > 0;
@@ -389,7 +561,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         video_small_size(d, r.width, r.height, r.upscale, &sw, &sh);
         first_tokens = video_shape(d, sw, sh, chunks).video_rows;
     }
-    j.sched = video_schedule(d, steps, first_tokens, own_refine);
+    j.sched = video_schedule(d, steps, first_tokens, own_refine, r.shift_video, r.shift_audio);
     if (j.sched.steps < 1) return no("the schedule has no steps");
     int32_t first_w = r.width, first_h = r.height;
     if (upscaling) {
@@ -437,6 +609,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         j.pos_small.assign((size_t)(3 * ns), 0.0f);
         if (positions_(RAD_VPOS_STEP, &j.geom_small, j.pos_small.data(), ns) != ns)
             return no("the model could not lay the small size out");
+        if (!j.ref_tab.empty()) RAD_TRY(lay_out(j.geom_small, j.ref_tab, &j.pack_small, why));
         j.split = evals - refine;
         j.factor = (float)(((double)r.width / sw + (double)r.height / sh) / 2.0);
         r.ticket->small_width = sw;
@@ -456,7 +629,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
     VideoTicket& t = *r.ticket;
     t.frames = s.frames;
     t.steps = j.sched.steps;
-    t.rows = j.rows;
+    t.rows = j.pack.rows > 0 ? j.pack.rows : j.rows;
     return RAD_OK;
 }
 
@@ -471,6 +644,21 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (T < 1 || T > d.max_text)
         return no("the prompt is " + std::to_string(T) + " tokens; this model takes 1.." +
                   std::to_string(d.max_text));
+    /* A reference picture is shown to the text encoder too: `media` places it in the prompt. */
+    for (const VideoRefMedia& m : r->refs)
+        if (m.kind == VideoRefMedia::IMAGE && !r->media)
+            return no("'" + m.name + "' is a reference picture and the prompt does not show it");
+    if (r->media) {
+        int64_t n_patch = 0;
+        for (const mm::Placed& p : r->media->items) {
+            if ((int64_t)p.tok + (int64_t)p.item->expand.size() > T)
+                return no("a reference's placeholder run is placed past the end of the prompt");
+            n_patch += p.item->n_patch;
+        }
+        if (n_patch > max_enc_)
+            return no("the pictures are " + std::to_string(n_patch) + " patches; this model "
+                      "encodes at most " + std::to_string(max_enc_) + " in one pass");
+    }
     if (r->chunks != 0 && (r->chunks < d.min_chunks || r->chunks > d.max_chunks))
         return no("the length must be " + std::to_string(d.min_chunks) + ".." +
                   std::to_string(d.max_chunks) + " chunks");
@@ -607,7 +795,8 @@ int VideoDriver::upload() {
 /* The geometry a pass's ops read off the device (RAD_VGEOM_*) for a pass at geometry `g` of
  * `rows` step rows, with chunk `chunk`'s span when it is a decode's and both grids when the job
  * upscales. */
-void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows, int32_t chunk) {
+void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows, int32_t chunk,
+                             const Pack* pack) {
     int32_t* g = hptr<int32_t>(R_GEOM);
     std::memset(g, 0, RAD_VGEOM_N * 4);
     g[RAD_VGEOM_LAT_FRAMES] = g0.lat_frames;
@@ -647,11 +836,16 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
     const int64_t video_rows = rows - g0.n_text - audio_rows;
     *hptr<int32_t>(R_LANE) = j.lane;
     *hptr<int32_t>(R_FIRST) = j.step == 0;
-    int32_t* seg = hptr<int32_t>(R_SEG);
-    seg[0] = 0;
-    seg[1] = g0.n_text;
-    seg[2] = (int32_t)(g0.n_text + audio_rows);
-    seg[3] = (int32_t)rows;
+    /* A step with references takes the plugin's segments and modulation groups; every other pass
+     * the plain sequence's segments, which are its modulation groups as well. */
+    const std::vector<int32_t> plain = { 0, g0.n_text, (int32_t)(g0.n_text + audio_rows),
+                                         (int32_t)rows };
+    const std::vector<int32_t>& seg = pack ? pack->seg : plain;
+    const std::vector<int32_t>& mod = pack ? pack->mod : plain;
+    std::memcpy(hptr<int32_t>(R_SEG), seg.data(), seg.size() * 4);
+    std::memcpy(hptr<int32_t>(R_MOD), mod.data(), mod.size() * 4);
+    reg_[R_SEG].used = (int64_t)seg.size() * 4;
+    reg_[R_MOD].used = (int64_t)mod.size() * 4;
     int32_t* lat = hptr<int32_t>(R_LAT);
     lat[0] = 0;
     lat[1] = (int32_t)video_rows;
@@ -661,7 +855,6 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
     reg_[R_GUIDE].used = sizeof j.guidance;
     reg_[R_LANE].used = 4;
     reg_[R_FIRST].used = 4;
-    reg_[R_SEG].used = 4 * 4;
     reg_[R_LAT].used = 4 * 4;
 }
 
@@ -688,11 +881,13 @@ void VideoDriver::base_batches(const Job& j, const RadVideoGeom& g, int64_t n_to
         V.lane_d = dptr<int32_t>(ri, R_LANE);
         V.first_d = dptr<int32_t>(ri, R_FIRST);
         V.seg_cu = dptr<int32_t>(ri, R_SEG);
+        V.mod_cu = dptr<int32_t>(ri, R_MOD);
         V.lat_cu = dptr<int32_t>(ri, R_LAT);
         V.n_steps = j.sched.steps;
         V.t_video = dptr<float>(ri, R_TV);
         V.t_audio = dptr<float>(ri, R_TA);
         V.step = j.step;
+        V.sampler = j.req->sampler;
         V.sched = dptr<float>(ri, R_SCHED);
         V.pos = dptr<float>(ri, R_ROPE);
         V.seed = dptr<uint32_t>(ri, R_SEED);
@@ -701,6 +896,7 @@ void VideoDriver::base_batches(const Job& j, const RadVideoGeom& g, int64_t n_to
         V.dec_rows = j.dec_rows;
         V.n_samples = j.n_samples;
         V.upscale = dptr<float>(ri, R_UP);
+        V.ref_tab = j.ref_tab.empty() ? nullptr : j.ref_tab.data();
         V.guidance_h = j.guidance;
         V.guidance = dptr<float>(ri, R_GUIDE);
         V.has_image = !j.req->image.empty();
@@ -735,12 +931,18 @@ const RadBatch* VideoDriver::next(int step) {
         if (!j.audio_done) return build_audio(j, step);
         if (j.chunk < j.n_chunks) return build_chunk(j, step);
     }
-    /* 2. A prompt. */
+    /* 2. The encodes of an admitted request's media, before its prompt. */
+    for (auto& jp : jobs_) {
+        Job& j = *jp;
+        if (!j.admitted || j.failed || j.cond_done) continue;
+        if (j.enc_next < j.enc_q.size()) return build_encode(j, step);
+    }
+    /* 3. A prompt. */
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (j.admitted && !j.failed && !j.cond_done) return build_cond(j, step);
     }
-    /* 3. The oldest lane's next step, or its upscale once its small steps are done. */
+    /* 4. The oldest lane's next step, or its upscale once its small steps are done. */
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed || !j.cond_done || j.step >= j.sched.steps) continue;
@@ -794,8 +996,45 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     reg_[R_TA].used = j.sched.steps * 4;
     const RadVideoGeom& g = small_now(j) ? j.geom_small : j.geom;
     stage_geom(j, g, small_now(j) ? j.rows_small : j.rows, 0);
+
+    /* The prompt's pictures for the vision tower, and its M-RoPE in R_ROPE. */
+    StagedMedia sm;
+    if (j.req->media) {
+        const mm::PromptMedia& pm = *j.req->media;
+        int32_t* rope = hptr<int32_t>(R_ROPE);
+        for (int64_t i = 0; i < T; ++i) {
+            int32_t p3[3] = { (int32_t)i, (int32_t)i, (int32_t)i };
+            pm.rope.at(i, p3);
+            rope[i] = p3[0];
+            rope[T + i] = p3[1];
+            rope[2 * T + i] = p3[2];
+        }
+        reg_[R_ROPE].used = 3 * T * 4;
+        sm = stage_media(pm, patch_dim_, hptr<uint16_t>(R_ENCPIX), hptr<int32_t>(R_ENCCRD),
+                         hptr<int32_t>(R_ENCCU), hptr<int32_t>(R_MMROW));
+        reg_[R_ENCPIX].used = sm.n_patch * patch_dim_ * 2;
+        reg_[R_ENCCRD].used = 4 * sm.n_patch * 4;
+        reg_[R_ENCCU].used = (sm.n_seg + 1) * 4;
+        reg_[R_MMROW].used = sm.n_rows * 4;
+    }
     if (upload() < 0) return nullptr;
     base_batches(j, g, T + N, step);
+    if (j.req->media)
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            RadBatch& B = out_[r];
+            const int ri = (int)r;
+            B.rope_pos = dptr<int32_t>(ri, R_ROPE);
+            B.rope_mixed = 1;
+            B.n_mm_rows = sm.n_rows;
+            B.mm_rows = sm.n_rows ? dptr<int32_t>(ri, R_MMROW) : nullptr;
+            B.enc = 0;
+            B.enc_n_patch = sm.n_patch;
+            B.enc_pixels = sm.n_patch ? dptr<uint16_t>(ri, R_ENCPIX) : nullptr;
+            B.enc_coord = sm.n_patch ? dptr<int32_t>(ri, R_ENCCRD) : nullptr;
+            B.enc_n_seg = sm.n_seg;
+            B.enc_cu = sm.n_seg ? dptr<int32_t>(ri, R_ENCCU) : nullptr;
+            B.enc_max_seg = sm.max_seg;
+        }
     for (size_t r = 0; r < out_.size(); ++r) {
         RadBatch& B = out_[r];
         B.gen = RAD_GEN_PASS_VCOND;
@@ -811,8 +1050,15 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     return &out_[0];
 }
 
-/* Step i's timesteps and sigmas, the video's then the soundtrack's (RadVideoGenBatch::sched);
- * with `to_clean` the next sigmas are 0, so the step lands on its clean estimate. */
+/* Step i's timesteps, sigmas and res_multistep scalars (RadVideoGenBatch::sched). With
+ * `to_clean` the next sigmas are 0, so the step lands on its clean estimate. res_multistep is
+ * k-diffusion's at eta 0 (DPM-Solver++ 2M): with h = log(sigma / sigma_next) and
+ * rs = log(sigma_prev / sigma) / h,
+ *
+ *   hb1 = (1 - r) (1 + 1 / (2 rs)),  hb2 = -(1 - r) / (2 rs),  order 2,
+ *
+ * and order 1 (Euler) on a step with no last estimate on its grid: the first, the first after an
+ * upscale (i == split) and one to sigma 0. */
 void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     float* s = hptr<float>(R_SCHED);
     s[0] = 1.0f - j.sched.sig_v[(size_t)i];
@@ -821,7 +1067,30 @@ void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     s[3] = 1.0f - j.sched.sig_a[(size_t)i];
     s[4] = j.sched.sig_a[(size_t)i];
     s[5] = to_clean ? 0.0f : j.sched.sig_a[(size_t)i + 1];
-    reg_[R_SCHED].used = 6 * 4;
+    /* A stream's five: sigma, r, hb1, hb2, order. */
+    auto coeffs = [&](const std::vector<float>& sig, float* out) {
+        const float sg = sig[(size_t)i];
+        const float sgn = to_clean ? 0.0f : sig[(size_t)i + 1];
+        const float r = sg > 0.0f ? sgn / sg : 0.0f;
+        float hb1 = 1.0f - r, hb2 = 0.0f, order = 1.0f;
+        const bool two = sgn > 0.0f && i > 0 && !(j.split > 0 && i == j.split);
+        if (two) {
+            const float h = std::log(sg / sgn);
+            const float h_last = std::log(sig[(size_t)i - 1] / sg);
+            const float rs = h_last / h;
+            hb1 = (1.0f - r) * (1.0f + 1.0f / (2.0f * rs));
+            hb2 = -(1.0f - r) / (2.0f * rs);
+            order = 2.0f;
+        }
+        out[0] = sg;
+        out[1] = r;
+        out[2] = hb1;
+        out[3] = hb2;
+        out[4] = order;
+    };
+    coeffs(j.sched.sig_v, s + 6);
+    coeffs(j.sched.sig_a, s + 11);
+    reg_[R_SCHED].used = 16 * 4;
 }
 
 /* The video's noise seed is the request's; the soundtrack's the same with its top bit flipped, so
@@ -840,8 +1109,11 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const bool small = small_now(j);
     const RadVideoGeom& g = small ? j.geom_small : j.geom;
-    const int64_t rows = small ? j.rows_small : j.rows;
-    const std::vector<float>& pos = small ? j.pos_small : j.pos;
+    /* With references the step is the plugin's packed sequence at this size. */
+    const Pack* pack = small ? &j.pack_small : &j.pack;
+    if (pack->rows == 0) pack = nullptr;
+    const int64_t plain = small ? j.rows_small : j.rows, rows = pack ? pack->rows : plain;
+    const std::vector<float>& pos = pack ? pack->pos : small ? j.pos_small : j.pos;
     stage_sched(j, j.step, small && j.step == j.split - 1);
     std::memcpy(hptr<float>(R_ROPE), pos.data(), pos.size() * 4);
     reg_[R_ROPE].used = (int64_t)pos.size() * 4;
@@ -851,7 +1123,7 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     cu[0] = 0;
     cu[1] = (int32_t)rows;
     reg_[R_CU].used = 2 * 4;
-    stage_geom(j, g, rows, 0);
+    stage_geom(j, g, plain, 0, pack);
     if (upload() < 0) return nullptr;
     base_batches(j, g, rows, step);
     for (auto& B : out_) B.gen = RAD_GEN_PASS_VSTEP;
@@ -910,6 +1182,73 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     return &out_[0];
 }
 
+/* The job's next media through its encoder: its frames padded to whole clips by repeating the
+ * last, or its samples padded with zeros to the hop, as the plugin's geometry says. */
+const RadBatch* VideoDriver::build_encode(Job& j, int step) {
+    for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
+    const Job::EncItem& it = j.enc_q[j.enc_next];
+    const VideoRefMedia& m = j.req->refs[(size_t)it.ref];
+    const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO;
+    int32_t* gd = hptr<int32_t>(R_ENCG);
+    const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : m.enc_h,
+                            audio ? 0 : m.enc_w, audio ? m.enc_channels : 3 };
+    const int64_t ng = enc_geom_(audio ? RAD_GEN_PASS_AENCODE : RAD_GEN_PASS_VENCODE, in, gd,
+                                 kEncGeomCap);
+    int64_t stage_frames = 0, stage_samples = 0;
+    if (audio) {
+        const int64_t n = m.enc_n, ch = m.enc_channels;
+        stage_samples = ng > 0 ? gd[0] : 0;
+        if (stage_samples < n || stage_samples * ch * 4 > reg_[R_ENCSM].bytes) {
+            fail_locked(j, RAD_E_STATE, "'" + m.name + "' does not fit an encode pass");
+            return nullptr;
+        }
+        float* sm = hptr<float>(R_ENCSM);
+        std::memset(sm, 0, (size_t)(stage_samples * ch) * 4);
+        for (int64_t c = 0; c < ch; ++c)
+            std::memcpy(sm + c * stage_samples, m.enc_samples.data() + c * n, (size_t)n * 4);
+        reg_[R_ENCSM].used = stage_samples * ch * 4;
+    } else {
+        const int64_t nf = m.enc_frames, area = (int64_t)m.enc_h * m.enc_w * 3;
+        stage_frames = ng > 23 ? gd[23] : 0;
+        if (stage_frames < nf || stage_frames * area * 4 > reg_[R_ENCPX].bytes) {
+            fail_locked(j, RAD_E_STATE, "'" + m.name + "' does not fit an encode pass");
+            return nullptr;
+        }
+        float* px = hptr<float>(R_ENCPX);
+        std::memcpy(px, m.enc_pixels.data(), (size_t)(nf * area) * 4);
+        for (int64_t f = nf; f < stage_frames; ++f)
+            std::memcpy(px + f * area, px + (nf - 1) * area, (size_t)area * 4);
+        reg_[R_ENCPX].used = stage_frames * area * 4;
+    }
+    reg_[R_ENCG].used = ng * 4;
+    stage_seed(j);   /* the condition noise draws from the request's seed */
+    stage_geom(j, j.geom, j.rows, 0);
+    if (upload() < 0) return nullptr;
+    base_batches(j, j.geom, 0, step);
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        const int ri = (int)r;
+        RadVideoGenBatch& V = vout_[(size_t)r];
+        V.enc_geom_d = dptr<int32_t>(ri, R_ENCG);
+        V.enc_kind = it.kind;
+        V.enc_slot = it.slot;
+        if (audio) {
+            V.enc_samples = dptr<float>(ri, R_ENCSM);
+            V.enc_n_samples = stage_samples;
+            V.enc_channels = m.enc_channels;
+        } else {
+            V.enc_pixels = dptr<float>(ri, R_ENCPX);
+            V.enc_frames = (int32_t)stage_frames;
+            V.enc_height = m.enc_h;
+            V.enc_width = m.enc_w;
+        }
+    }
+    const int32_t kind = audio ? RAD_GEN_PASS_AENCODE : RAD_GEN_PASS_VENCODE;
+    for (auto& B : out_) B.gen = kind;
+    pass_.kind = kind;
+    pass_.job = j.id;
+    return &out_[0];
+}
+
 int VideoDriver::done() {
     std::lock_guard<std::mutex> lk(mu_);
     const int64_t now = (int64_t)rad_mono_ns();
@@ -938,6 +1277,10 @@ int VideoDriver::done() {
             e.n = j->geom.frames;
             j->req->ticket->push(std::move(e));
         }
+        break;
+    case RAD_GEN_PASS_VENCODE:
+    case RAD_GEN_PASS_AENCODE:
+        ++j->enc_next;
         break;
     case RAD_GEN_PASS_VSTEP: {
         ++j->step;

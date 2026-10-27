@@ -24,7 +24,7 @@
 //         groups. Without the barrier PF has no effect.
 //   DOT2  v_dot2_f32_f16 row sum from the packed f16 P: 4 instructions instead of 8, and the
 //         denominator uses the p values the PV matmul used.
-//   BTS/KWIDE/GPREV  tile staging; see each define.
+//   BTS/KWIDE/GPREV/KLATE  tile staging; see each define.
 //   QK8   Lossy. Q rounded to e4m3 once at load, after the folded scale; K as e4m3 bytes in LDS
 //         (half the tile) and Q.K^T runs as fp8 WMMA at twice the f16 rate.
 //   PV8   Lossy. P rounded to e4m3 and V as e4m3 bytes in LDS, P.V as fp8 WMMA. GROW is 8
@@ -66,9 +66,24 @@
 // LDSB: an LDS-scoped barrier instead of __syncthreads() (lds_barrier() in r4d_common.h). The
 // default fence invalidates the vector cache twice per tile, though only LDS needs ordering.
 #define O_LDSB  2097152
+// KLATE: on the fp8 and k6_v4 caches (the wide K fetch), tile ti+1's K is fetched once tile ti's
+// last m-tile has its scores (its K fragments are dead there, so kreg adds no live range across the
+// WMMAs), and the staging between the barriers only widens and stores. Otherwise every wave of the
+// workgroup (the only one on its WGP) waits out a global round trip each tile. With the branch-free
+// K fetch and the V scales packed at the store, k6_v4 over 100k keys runs 25.96 -> 21.48 ms (2048
+// queries, r4d_selftest --perfpaged) and fp8 24.6 -> 22.7; the gain is largest once the KV no
+// longer fits the 64 MB Infinity Cache.
+#define O_KLATE 4194304
 // O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
 #define O_V4    33554432
 #define O_K6    67108864
+// O_PSPLIT: a KV split for launches with too few workgroups to fill the card (r4d_prefill_splits
+// in r4d_attn_prefill_split.h). blockIdx.x is qtile * a.splits + split, and the workgroup walks
+// only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
+// split-KV merge recomputes from ctx), clipped at its causal end. Instead of bf16 out it stores the
+// unnormalised f32 O, m_ref and l in the decode kernel's partial layout (r4d_attn_decode_body,
+// !PF16); r4d_attn_splitkv_combine* finishes the rows, so only the summation order changes.
+#define O_PSPLIT 536870912
 
 typedef int v2i32_r4d __attribute__((ext_vector_type(2)));   // one fp8 WMMA operand (8 e4m3)
 // pack 4 floats -> 4 e4m3 bytes in element order (RNE, saturating), 2 instructions
@@ -97,6 +112,24 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
                  __builtin_bit_cast(float, w & 0xffff0000u) * s);
 }
 
+// O_PSPLIT's store: segment `sp` of row (tok, qhead) in the decode kernel's f32 partial layout,
+// O at [idx][HEAD_DIM] then m[nrow] and l[nrow], idx = (tok * q_heads + qhead) * splits + sp. Lane
+// (c, h) holds dims 16 dt + 8 h .. + 7 of its row, as at the bf16 store. An empty segment stores
+// O = 0, m = -3e38 (at the merge's zero-weight cut) and l = 0.
+template<int NKS, int HEAD_DIM>
+__device__ __forceinline__ void r4d_prefill_store_partial(const R4DArgs& a, int tok, int qhead,
+                                                          int sp, const v8f* acc, float m, float l,
+                                                          int h) {
+    const size_t idx  = (size_t)(tok * a.q_heads + qhead) * a.splits + sp;
+    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * a.splits;
+    float* so = (float*)a.scratch;
+    float* op = so + idx * HEAD_DIM;
+    #pragma unroll
+    for (int dt = 0; dt < NKS; ++dt)
+        *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
+    if (h == 0) { so[nrow * HEAD_DIM + idx] = m; so[nrow * HEAD_DIM + nrow + idx] = l; }
+}
+
 // WIN enables a sliding window (a.window positions ending at each row's causal limit), as in the
 // decode kernel. Keys below the window are masked, and the KV walk starts at the tile holding the
 // workgroup's earliest window token. window <= 0 (or WIN off) is full attention.
@@ -122,10 +155,16 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
+    // fp8_v4 takes none of the three (KLATE, the assume, the scale pack): they gain at 100k but lose
+    // 3-7 % at 25k and 50k.
+    constexpr int OLDV4 = V4 && !K6;
+    constexpr int KLATE = ((OPT & O_KLATE) && KWIDE && !KVP && !OLDV4) ? 1 : 0;
     constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
     static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP,
                   "the e4m3 legs need an 8-bit cache, or they compile to the exact form");
+    constexpr int SPLIT = (OPT & O_PSPLIT) ? 1 : 0;
+    static_assert(!SPLIT || !WIN, "the split partition has no window floor (the merge's WIN has)");
     static_assert(!QK8 || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
@@ -157,9 +196,16 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     uint8_t* const sV8 = (uint8_t*)sV16;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // The launch is NTHR threads. Stated, so the wide K fetch's `key >= TILE` test (never true:
+    // KITEMS == NTHR) folds: as a branch its join made the compiler wait on every load in flight right
+    // after the K fetch, the V stores' cover included.
+    if constexpr (!OLDV4) __builtin_assume(tid < NTHR);
     const int c = lane & 15, h = lane >> 4;
 
-    const int qb = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    // SPLIT: blockIdx.x = qtile * splits + segment; wave-uniform, so the divide is scalar.
+    const int qb = SPLIT ? (int)blockIdx.x / a.splits : (int)blockIdx.x;
+    const int sp = SPLIT ? (int)blockIdx.x - qb * a.splits : 0;
+    const int kvh = blockIdx.y, seq = blockIdx.z;
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
@@ -177,6 +223,17 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qhead = kvh * GQA + hi;
 
     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
+
+    // SPLIT: tps tiles a segment, as r4d_attn_tps cuts tiles(ctx). A segment at or past the merge's
+    // segment count u = ceil(tiles / tps) is never read: exit. One wholly past this workgroup's
+    // causal end must still be written, since the merge reads all u segments of every row: its walk
+    // is empty, so the epilogue stores the empty partial (O = 0, m_ref = -3e38, l = 0), and the
+    // prologue's prefetch of tile tstart stays inside the sequence. (A separate early store spills
+    // k6_v4's next-tile fetch addresses inside the tile loop.)
+    const int sp_tps = SPLIT ? ((ctx + TILE - 1) / TILE + a.splits - 1) / a.splits : 0;
+    if constexpr (SPLIT) {
+        if (sp * sp_tps >= (ctx + TILE - 1) / TILE) return;
+    }
 
     const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
     const float vdesc = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
@@ -223,12 +280,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
     const int klimit_cta = ctx - qlen + qmax_cta;
-    const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    const int ctiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    // SPLIT: the segment's tiles, clipped at the causal end (empty when it starts past it).
+    const int ntiles = SPLIT ? min((sp + 1) * sp_tps, ctiles) : ctiles;
     // First window tile, taken at this workgroup's first query row (the one reaching furthest
     // back), not the chunk's row 0, so fully masked tiles are never walked. Starts at 0 without a
     // window.
     const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen + qb * BLOCK_Q - a.window + 1) : 0;
-    const int tstart = (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
+    const int tstart = SPLIT ? sp * sp_tps
+                     : (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
 
     // ---- staging, split into a global fetch (registers) and an LDS store ------------------------
     // The split lets GPREV move the fetch out from between the barriers.
@@ -245,7 +305,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     static_assert(!V4 || F16, "fp8_v4 widens V to f16");
     constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
-    uint32_t v4c[U4][2], v4s[U4];
+    // The pair's two scales stay apart until storeV4 packs them: packed here, the prefetch a tile
+    // ahead would be waited on right after it is issued (fp8_v4 packs here, see KLATE).
+    uint32_t v4c[U4][2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -262,7 +324,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
-                v4s[r] = sc[0] | (sc[1] << 16);
+                if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
+                else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
             }
         }
     };
@@ -278,7 +341,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
+                const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
                 const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
@@ -456,6 +519,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     if (BTS) load_bt(tstart * NB, blk);
     if (GPREV) fetchV(tstart * TILE, blk);
     if (V4) fetchV4(tstart * TILE, blk);
+    if (KLATE) fetchK(tstart * TILE, blk);
 
     for (int ti = tstart; ti < ntiles; ++ti) {
         const int k0 = ti * TILE;
@@ -464,8 +528,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             load_bt((ti + 1) * NB, blkn);
         }
         if (LDSB) lds_barrier(); else __syncthreads();
-        fetchK(k0, blk);
-        // V first: already in registers, so it covers K's load latency.
+        if (!KLATE) fetchK(k0, blk);
+        // V first: already in registers.
         if constexpr (V4) { storeV4(); } else { if (!GPREV) fetchV(k0, blk); storeV(); }
         storeK();
         if (LDSB) lds_barrier(); else __syncthreads();
@@ -513,6 +577,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
                 }
             }
+            if (KLATE && mt == MT - 1 && ti + 1 < ntiles) fetchK(k0 + TILE, blkn);
             float sc[8];
             #pragma unroll
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
@@ -615,6 +680,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     if (!live) return;
     l_i += swap16(l_i);
+    if constexpr (SPLIT) {
+        // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.
+        r4d_prefill_store_partial<NKS, HEAD_DIM>(a, qoff + qpos, qhead, sp, acc, m_ref, l_i, h);
+        return;
+    }
     const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
     uint16_t* op = (uint16_t*)a.out
                  + ((size_t)(qoff + qpos) * a.q_heads + qhead) * HEAD_DIM;

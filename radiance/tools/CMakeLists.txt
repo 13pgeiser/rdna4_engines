@@ -88,9 +88,18 @@ install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokchec
 # template, compared with the legacy parser in tests/legacy/. It shares that parser and the
 # differential harness with tests/chatparse_test, so it is built only with the tests.
 if(RAD_BUILD_TESTS)
-  add_executable(rad-chatparse rad_chatparse.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp)
-  target_link_libraries(rad-chatparse PRIVATE rad_legacy_toolparse)
+  # Its --request mode loads the architecture plugin for the model's declared reply format, so it
+  # is a plugin host like rad_add_tool's tools: the whole of rad_core, with its symbols exported.
+  # The legacy parser's sources are compiled in rather than linked as rad_legacy_toolparse, which
+  # links rad_core without that feature.
+  add_executable(rad-chatparse rad_chatparse.cpp chatparse_serve.cpp
+                               ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp
+                               ${CMAKE_SOURCE_DIR}/tests/legacy/toolparse_legacy.cpp
+                               ${CMAKE_SOURCE_DIR}/tests/legacy/chatdiff.cpp)
+  target_link_libraries(rad-chatparse PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
   target_include_directories(rad-chatparse PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
-                                                   ${CMAKE_CURRENT_SOURCE_DIR})
-  set_target_properties(rad-chatparse PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+                                                   ${CMAKE_CURRENT_SOURCE_DIR}
+                                                   ${CMAKE_SOURCE_DIR}/tests/legacy)
+  set_target_properties(rad-chatparse PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                                                 ENABLE_EXPORTS ON)
 endif()

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include "ctx.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 #include "wtab.h"
 
 #include <cstring>
@@ -594,8 +595,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               : "has no device kernel for this band");
     /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
      * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
-     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. */
-    if (program_ && program_->lane1_w1 >= 0) {
+     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. An op
+     * that names no buffer (prefetch_beside's weight read) touches nothing the window keeps live,
+     * so it may run on lane 1 anywhere. */
+    bool names_buf = false;
+    for (int i = 0; i < n_opd && !names_buf; ++i) names_buf = opd[i].kind == RAD_OPK_BUF;
+    if (program_ && program_->lane1_w1 >= 0 && names_buf) {
         const bool outside = p.order < program_->lane1_w0 || p.order > program_->lane1_w1;
         if (lane_ == 1 && outside)
             return abort_step_msg(h, RAD_E_STATE,
@@ -609,7 +614,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                 return abort_step_msg(h, js, "joining the second lane outside its window failed");
         }
     }
-    if (lane_ == 1) lane1_pending_ = true;
+    if (lane_ == 1 && names_buf) lane1_pending_ = true;
 
     /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
     if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
@@ -622,13 +627,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_INVAL,
                               fmt("issued with %d operands; the runtime carries at most %d",
                                   n_opd, MAX_OPERANDS));
-    if (p.n_opd_schema >= 0 && n_opd != p.n_opd_schema)
+    /* A count below the schema is legal only when every dropped slot is a *trailing optional*
+     * operand (rad_abi.h: "an absent optional operand is a null RadTensor.data" -- the shims
+     * branch on exactly that: r4d_opt(), rad_args_have(), libref's finish()). A count below the
+     * required floor shifts positions or drops a required operand, and operands are positional,
+     * so a miscount is silent numerical garbage. */
+    if (p.n_opd_schema >= 0 && (n_opd > p.n_opd_schema || n_opd < p.n_opd_required))
         return abort_step_msg(h, RAD_E_SCHEMA,
-                              fmt("issued with %d operands; the op's schema declares %d. Operands "
-                                  "are positional, so a miscount is silent numerical garbage",
-                                  n_opd, (int)p.n_opd_schema));
+                              fmt("issued with %d operands; the op's schema declares %d "
+                                  "(%d required, only trailing optional operands may be omitted). "
+                                  "Operands are positional, so a miscount is silent numerical "
+                                  "garbage",
+                                  n_opd, (int)p.n_opd_schema, (int)p.n_opd_required));
 
     RadTensor* t = tbuf_;
+    /* The schema slots the issue stopped short of: absent operands, null tensors rather than
+     * stale ones, since args.n_t covers every schema slot (rad_plugin.h). */
+    for (int i = n_opd; i < p.n_opd_schema; ++i) t[i] = RadTensor{};
     bool touches_host = false;   /* a host-domain buffer among the operands; see host_touch_ev_ */
 
     for (int i = 0; i < n_opd; ++i) {
@@ -802,7 +817,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             const int64_t layer = (o.offset >= 0 && (size_t)o.offset < b.layer_slot.size())
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
-            const int64_t off   = layer * b.layer_stride;
+            const int64_t off   = kv_binding_offset(b, layer);
             if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes))
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d asks KV group %u for layer %lld, which is "
@@ -836,8 +851,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
-    /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. */
-    ip.args.n_t = n_opd;
+    /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. There is one
+     * entry per schema operand, the trailing optional ones the issue left out null. */
+    ip.args.n_t = std::max(n_opd, (int)p.n_opd_schema);
     p.issued    = true;
     ++n_issues_;
 
@@ -852,7 +868,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* The oracle snapshots every operand before the launch, so the host kernel sees the same
      * input bytes even for an in-place op. */
-    const IssuePlan* horacle = oracle_ ? oracle_before(h, b, n_opd) : nullptr;
+    const IssuePlan* horacle = oracle_ ? oracle_before(h, b, ip.args.n_t) : nullptr;
 
     /* ============================== a host launch is a join ==============================
      *
@@ -1069,7 +1085,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         if (er < 0) return abort_step(h, b, dom, ip, n, er);
         host_touch_pending_[l] = true;
     }
-    if (horacle) oracle_after(h, *horacle, ip, n_opd);
+    if (horacle) oracle_after(h, *horacle, ip, ip.args.n_t);
     return RAD_OK;
 }
 
@@ -1251,6 +1267,17 @@ int rad_step_fail(RadCtx* c, const char* what) {
 }
 
 const RadBatch* rad_batch(RadCtx* c)      { return c ? static_cast<rad::Ctx*>(c)->batch() : nullptr; }
+
+int64_t rad::Ctx::kv_layer_index(rad_kvgroup g, int layer) const {
+    if (g >= kv_.size() || !kv_[g].base || layer < 0) return -1;
+    const std::vector<int32_t>& ls = kv_[g].layer_slot;
+    if ((size_t)layer >= ls.size()) return -1;
+    return ls[(size_t)layer];
+}
+
+int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
+    return c ? (int)static_cast<rad::Ctx*>(c)->kv_layer_index(group, layer) : -1;
+}
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }

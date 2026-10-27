@@ -351,6 +351,22 @@ struct RowCache {
             /* The set changed between the scan and the claim: retry. */
         }
     }
+
+    /* Where `key` sits, without claiming it: HIT with *slot (decode from it), THEIRS with *slot (being
+     * read), or NONE with *slot = -1. */
+    Found lookup(uint64_t key, int64_t* slot) const {
+        const uint64_t set = mix(key) & set_mask;
+        const uint64_t s0  = set * kWays;
+        for (int w = 0; w < kWays; ++w) {
+            const uint64_t x = word[s0 + w].load(std::memory_order_acquire);
+            if (x != EMPTY && (x >> 10) == key) {
+                *slot = (int64_t)(s0 + w);
+                return (x & 3) == READY ? HIT : THEIRS;
+            }
+        }
+        *slot = -1;
+        return NONE;
+    }
 };
 
 template <class T>
@@ -598,11 +614,83 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     return RAD_OK;
 }
 
+/* The decode regime: a step wants a hundred-odd rows now, and never waits on another thread's read.
+ * Rows READY in the cache decode from it; a missing row whose slot is free to take is claimed and
+ * read into the cache, so the ranks' gathers and the later steps that meet the same trigram find it
+ * READY instead of reading the file again (Flash-Next decode at c4 lost 2.5% when these reads were
+ * never cached); a row another thread is reading, or one with no slot, is read straight into its
+ * output row. */
+constexpr long long kOnDemandMaxRows = 4096;
+
+int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
+                    avx::RowDecode decode, const uint16_t* lut) {
+    Gather& g = gather_state();
+    const uint64_t me = owner_tag();
+    if (!me) return RAD_E_UNSUPPORTED;
+    const long long M = q.M, n = q.row_bytes, ne = q.n_embd, x_ld = q.x_ld;
+    const long long base = tf.off + (long long)(q.tab - tf.lo);
+    auto row_of = [&](long long m) { return (long long)q.ids[m] - q.voff; };
+    auto pad    = [&](long long id) { return id < 0 || id >= q.n_vocab; };
+    auto key_of = [&](long long m) { return (uint64_t)(base + row_of(m) * n); };
+
+    g.src.clear();
+    g.dst.clear();
+    g.dm.clear();
+    g.dw.clear();
+    g.slot.resize((size_t)M);
+    g.reads.clear();
+    g.again.clear();
+    for (long long m = 0; m < M; ++m) {
+        uint16_t* dst = q.out + m * x_ld;
+        if (pad(row_of(m))) { std::memset(dst, 0, (size_t)ne * sizeof(uint16_t)); continue; }
+        const uint64_t key = key_of(m);
+        int64_t s = -1;
+        const RowCache::Found f = rc.find_or_claim(key, me, &s);
+        g.slot[m] = s;
+        if (f == RowCache::HIT) {
+            g.src.push_back(rc.data + (size_t)s * (size_t)n);
+            g.dst.push_back(dst);
+            g.dm.push_back(m);
+            g.dw.push_back(RowCache::ready(key));
+        } else {
+            /* THEIRS, MINE (a row twice in one call) and NONE are read directly: no wait. */
+            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1});
+        }
+    }
+    if (!g.reads.empty()) {
+        const int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+        if (rs != RAD_OK) return rs;
+        /* The claimed rows were published into the cache, not decoded: decode them from it. */
+        for (const SpanRead& r : g.reads) {
+            if (r.slot < 0) continue;
+            g.src.push_back(rc.data + (size_t)r.slot * (size_t)n);
+            g.dst.push_back(q.out + r.m * x_ld);
+            g.dm.push_back(r.m);
+            g.dw.push_back(RowCache::ready(r.key));
+        }
+    }
+    if (g.src.empty()) return RAD_OK;
+    /* The seqlock, as gather_rows reads it: a row whose word changed during the decode was taken
+     * over, and is read again directly. */
+    decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    for (size_t i = 0; i < g.dm.size(); ++i)
+        if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
+            g.again.push_back(g.dm[i]);
+    if (g.again.empty()) return RAD_OK;
+    g.reads.clear();
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
+    return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+}
+
 /* out[m] = decoded row ids[m] - voff for every m < M, through the cache: find or claim each row
  * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
  * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
                 long long first, avx::RowDecode decode, const uint16_t* lut) {
+    /* A decode step's rows are read on demand; a prefill chunk's tens of thousands, whose future is
+     * known, go through the claims and the read-ahead queue. */
+    if (q.M <= kOnDemandMaxRows) return gather_ondemand(tf, rc, rr, q, decode, lut);
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
@@ -693,10 +781,14 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
  *
  * A prefill chunk gathers `heads` rows per token (32,768 for a 2048-token chunk); on unseen text
  * most are file reads (~30 ms per chunk on NVMe), during which the issuing thread waits and the card
- * idles. The next chunk's ids are known a step early (RadBatch::n_ahead, ngram_ids' `ahead_ids`), so
+ * idles. The next chunks' ids are known a step early (RadBatch::n_ahead, ngram_ids' `ahead_ids`), so
  * the call hands them to one process-wide reader thread, which claims, reads and publishes the
  * missing rows while the chunk runs. The next call waits for LOADING rows as it would for the other
  * rank's.
+ *
+ * The rows go over in jobs of at most kJobRows keys, claimed and published one job at a time in
+ * list order. A claim is a promise a gather may wait on, so jobs stay small: a gather that outruns
+ * the reader finds unclaimed rows and reads them itself.
  *
  * Both ranks hand over the same ids; a repeated list is dropped. A failed read releases its claims
  * and the next call reads those rows itself. The reader is detached and never destroyed. */
@@ -705,12 +797,18 @@ struct AheadJob {
     RowCache*             rc = nullptr;
     long long             n  = 0;
     std::vector<uint64_t> keys;
+    bool                  retry = false;   /* the keys a full set refused once already */
 };
+
+/* Keys per reader job, about two ring batches: a job's claims are promises a consuming gather may
+ * wait on, so it stays short. */
+constexpr size_t kJobRows = 8192;
 
 struct AheadReader {
     std::mutex              mu;
     std::condition_variable cv;
-    std::deque<AheadJob>    q;
+    std::deque<AheadJob>    urgent;   /* keys a full set refused, tried once more first */
+    std::deque<AheadJob>    q;        /* the read-ahead queue: future chunks, in order */
     uint64_t                last = 0;     /* hash of the last id list accepted */
 
     void run() {
@@ -721,22 +819,33 @@ struct AheadReader {
             AheadJob j;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return !q.empty(); });
-                j = std::move(q.front());
-                q.pop_front();
+                cv.wait(lk, [&] { return !urgent.empty() || !q.empty(); });
+                if (!urgent.empty()) { j = std::move(urgent.front()); urgent.pop_front(); }
+                else                 { j = std::move(q.front());      q.pop_front(); }
             }
             if (!rr || !me) continue;
             g.reads.clear();
+            std::vector<uint64_t> retry;   /* sets full of LOADING rows: claim once more */
             for (size_t i = 0; i < j.keys.size(); ++i) {
                 if (i + kPrefetchRows < j.keys.size())
                     __builtin_prefetch(j.rc->set_line(j.keys[i + kPrefetchRows]));
                 int64_t slot = -1;
-                if (j.rc->find_or_claim(j.keys[i], me, &slot) == RowCache::CLAIMED)
+                const auto f = j.rc->find_or_claim(j.keys[i], me, &slot);
+                if (f == RowCache::CLAIMED)
                     g.reads.push_back({0, j.keys[i], slot});
+                else if (f == RowCache::NONE && !j.retry)
+                    retry.push_back(j.keys[i]);
             }
             /* Every read has a slot, so nothing is decoded and there is no output. */
             (void)read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
                                    nullptr, 0);
+            if (!retry.empty()) {
+                std::lock_guard<std::mutex> lk(mu);
+                AheadJob r;
+                r.tf = j.tf; r.rc = j.rc; r.n = j.n; r.keys = std::move(retry); r.retry = true;
+                urgent.push_front(std::move(r));
+                cv.notify_one();
+            }
         }
     }
 };
@@ -750,7 +859,8 @@ AheadReader* ahead_reader() {
     return r;
 }
 
-/* Hands the rows of `q.ahead` (to be gathered by a later call) to the reader. */
+/* Hands the rows of `q.ahead` (gathered by later calls) to the reader as kJobRows-key jobs in list
+ * order, so the nearest chunk's rows come first. */
 void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
     uint64_t h = 1469598103934665603ull ^ (uint64_t)(uintptr_t)&rc;
     for (long long m = 0; m < q.n_ahead; ++m) { h ^= (uint32_t)q.ahead[m]; h *= 1099511628211ull; }
@@ -760,17 +870,26 @@ void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
         if (h == r->last) return;
         r->last = h;
     }
+    const long long base = tf.off + (long long)(q.tab - tf.lo);
     AheadJob j;
     j.tf = &tf;
     j.rc = &rc;
     j.n  = q.row_bytes;
-    const long long base = tf.off + (long long)(q.tab - tf.lo);
-    j.keys.reserve((size_t)q.n_ahead);
+    j.keys.reserve(kJobRows);
     for (long long m = 0; m < q.n_ahead; ++m) {
         const long long id = (long long)q.ahead[m] - q.voff;
-        if (id >= 0 && id < q.n_vocab) j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+        if (id < 0 || id >= q.n_vocab) continue;
+        j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+        if (j.keys.size() == kJobRows) {
+            {
+                std::lock_guard<std::mutex> lk(r->mu);
+                r->q.push_back(j);
+            }
+            r->cv.notify_one();
+            j.keys.clear();
+        }
     }
-    {
+    if (!j.keys.empty()) {
         std::lock_guard<std::mutex> lk(r->mu);
         r->q.push_back(std::move(j));
     }

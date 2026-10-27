@@ -279,9 +279,11 @@ __global__ __launch_bounds__(WM * WN * 32, 8) void r4d_gemm_w4a8_prefill_kernel(
       for (int e = 0; e < 8; e++) {
         const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
         const int m = mb + e;
-        const __hip_bfloat16 v =
-            (__hip_bfloat16)(acc[j][i][e] * (ASCVEC ? as[e] : Ascale[m]) * 0.0625f);
         if (inside || (n < N && m < M)) {
+          // The scale read stays under the guard: past the last full tile `m >= M`, and the row it
+          // would read belongs to the next tile or to nothing at all.
+          const __hip_bfloat16 v =
+              (__hip_bfloat16)(acc[j][i][e] * (ASCVEC ? as[e] : Ascale[m]) * 0.0625f);
           // the non-temporal builtin does not take a __hip_bfloat16*, so store its bits
           if (STNT)
             __builtin_nontemporal_store(*(const unsigned short*)&v,

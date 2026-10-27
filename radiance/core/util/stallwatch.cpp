@@ -245,13 +245,14 @@ struct StallWatch::Impl {
                  stall_describe_thread(holder, true).c_str(), others.c_str(), phase.c_str());
     }
 
-    void run() {
+    void run(const std::atomic<uint64_t>& beat) {
         uint64_t since = rad_mono_ns();       /* the start of the current silence */
         uint64_t own = 0;                     /* the time of this watch's own last report */
         uint64_t next = quiet_ns;             /* the silence that is reported next */
         std::unique_lock<std::mutex> lk(mu);
         while (!cv.wait_for(lk, std::chrono::nanoseconds(poll_ns), [&] { return stop; })) {
-            const uint64_t last = log_last_line_ns();
+            const uint64_t last = std::max(log_last_line_ns(),
+                                           beat.load(std::memory_order_relaxed));
             if (last > since && last != own) { since = last; next = quiet_ns; }
             const uint64_t now = rad_mono_ns();
             if (now - since < next) continue;
@@ -272,8 +273,10 @@ StallWatch::StallWatch(const char* phase, uint64_t quiet_ms) : p_(std::make_uniq
                                                                     p_->quiet_ns / 4));
     p_->holder = (pid_t)syscall(SYS_gettid);
     install_stack_handler();
-    p_->th = std::thread([this] { p_->run(); });
+    p_->th = std::thread([this] { p_->run(beat_); });
 }
+
+void StallWatch::progress() { beat_.store(rad_mono_ns(), std::memory_order_relaxed); }
 
 StallWatch::~StallWatch() {
     {

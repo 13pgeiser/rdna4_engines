@@ -1,0 +1,62 @@
+# minimax-h3-w8a8.recipe -- MiniMax-H3 with the DiT's per-token linears at int8 (W8A8).
+#
+# minimax-h3-fp8.recipe with the four per-token linears of the DiT's blocks (qkv, output, gate_up,
+# down) quantised to symmetric int8 with a bf16 scale per 128 columns of a row, and read by the
+# w8a8 GEMMs with int8 activations. At one byte a weight either way the container and the served
+# memory are the fp8 sizes; int8 spreads 255 uniform levels over each group's own range where E4M3
+# has three mantissa bits. The text encoder, the token refiner and the modulation projections stay
+# E4M3: they run once a request or once a step, not on every video token. The minimaxh3 plugin
+# serves the DiT in either encoding.
+#
+#   rad-convert <MiniMax-H3 pipeline directory> --recipe data/recipes/minimax-h3-w8a8.recipe \
+#       -o minimax-h3-w8a8.rad
+#
+# A container of minimax-h3-fp8.recipe supplies every other weight. A reused weight is copied only
+# at the same encoding, so the DiT's four linears are quantised again from the checkpoint:
+#
+#   rad-convert <pipeline directory> --recipe data/recipes/minimax-h3-w8a8.recipe \
+#       --reuse minimax-h3-fp8.rad -o minimax-h3-w8a8.rad
+#
+# The directory's contents, FastH3, the latent upscaler, the VAEs' encoders and which weights keep
+# the checkpoint's precision are as minimax-h3-fp8.recipe describes them.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.attn_output.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_down.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ada*.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention and MLP block run in bf16 inside the
+# f32 chain (declare_aenc): conv1d, layernorm and gemm take one dtype for every operand, so their
+# weights are cast. The chain's own convolutions are stored f32, their weight norms folded.
+aenc.d*.w                            cast dtype=bf16
+aenc.d*.b                            cast dtype=bf16
+aenc.pb.*                            cast dtype=bf16
+aenc.b*.u*.c1.weight                 cast dtype=f32
+aenc.b*.u*.c2.weight                 cast dtype=f32
+aenc.cin.weight                      cast dtype=f32
+aenc.fin.weight                      cast dtype=f32
+# The video encoder's 3x3x3 convolutions are bf16, as the implicit-GEMM kernel reads them;
+# conv_in (three input channels) and the 1x1x1 shortcut and quant convolutions read their f32
+# weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                       cast dtype=bf16
+venc.l*.b*.c2w                       cast dtype=bf16
+venc.l*.dnw                          cast dtype=bf16
+venc.cout.weight                     cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32

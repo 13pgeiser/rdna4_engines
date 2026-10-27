@@ -54,6 +54,8 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_mxfp4a8_nt_m64` | OCP-MXFP4 weight, fp8 activation, skinny |
 | `gemm_mxfp4a8_gemv` | the same operands for one to eight rows: the weight streamed straight to registers, no LDS staging; WMMA when K is a multiple of 128, `v_dot4` otherwise, chosen from K alone so a row's bits do not depend on M |
 | `gemm_mxfp4a8_gemv_wide` | its WMMA form at 9..64 rows: up to four 16-row tiles a wave over each weight word, two 16-column tiles a block on wide, deep weights |
+| `gemm_mxfp4a8_gated_gemv` | `gemm_nt_q_gated_mx`: the gemv WMMA form over a gate_up weight with `gated_quant_fp8`'s pass (or GeGLU's `gelu_mul` and `quant_act_fp8`) in its epilogue, M ≤ 8; the [M, 2n] product is never written |
+| `gemm_mxfp4a8_gated_gemv_wide` | the same fold at 9..64 rows over `gemv_wide`'s WMMA form: a block per gate/up tile pair, eight K waves each running both tiles, K ≥ 2688 |
 | `gemm_mxfp4a8_decode` | the same operands for the decode band (M ≤ 128): split-K across workgroups with a last-arriver reduction, the partial in the op's scratch |
 | `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
@@ -112,6 +114,36 @@ diverge by about 1 ULP.
    write its geometry as constraints as well as prose.
 6. Add a case to `libr4d/r4d_selftest.cpp` so the row is called at least once; a row without one
    reports `no smoke case`.
+
+## Measuring W4 and BF16 decode GEMMs
+
+`r4d_selftest <libr4d.so> --perfw4 N K M [iters]` sweeps configurations of the asymmetric
+W4-weight/F16-activation kernel. `--perfw4bf16` has the same arguments but reads BF16 activations,
+with the existing BF16-to-F16 conversion inside the GEMM, as HYV3's attention and dense MLP do at
+decode. For example, `--perfw4bf16 4096 2048 1` measures its TP1 query projection. Activations are
+initialized and weights rotate through more than 256 MiB, including at small shapes.
+
+`--perfbf16 N K M [iters]` sweeps the plain BF16 skinny GEMMs. Its weights also rotate through
+more than 256 MiB and at least two complete banks, without a copy-count cap that would leave small
+shared-expert projections in cache. HYV3 TP1's shared gate/up and down are `1536 2048 1` and
+`2048 768 1` respectively.
+
+These are timing diagnostics, not correctness checks or whole-model throughput results; validate
+candidate settings numerically and end to end before keeping them. Store machine-specific choices
+in the normal rad-tune cache, not architecture-specific launch overrides. Neither dense sweep
+measures the routed-expert `moe_gemm_q` kernel.
+
+`r4d_selftest <libr4d.so> --perfhyv3moe M [iters]` measures HYV3's actual TP1
+signed-I4 expert projections (gate/up 1536x2048, down 2048x768, top-8 of 128).
+It rotates the actively addressed expert codes **and** scales through more than 256 MiB,
+using identical copies behind pointer tables, and checks all output bytes against the
+original decode form. Missing rows, failed launches and mismatching outputs fail the command.
+This is a kernel timing/parity diagnostic, not a whole-model benchmark or an independent
+numerical oracle; the `moe_gemm_w4a8` selftest supplies host-decoded numerical checks.
+
+The older `--perfmoe` retains Flash-Next's asymmetric TP2 projection geometry even if a
+different expert count/top-k is given. It repeatedly addresses the same experts; a large
+allocation alone does not make its single-token measurements cold-weight measurements.
 
 ## The OCP-MXFP4 GEMM by row count
 
@@ -197,10 +229,36 @@ rows their outputs differ from the decode row's in the last bf16 place on a few 
 thousand (within the selftest's bound). A greedy text can therefore differ from one produced
 with the decode row at those rows. Within the family a row's bits do not depend on M, as above.
 
-**Tunables.** `gemv` and `gemv_wide` have none, so a `RADIANCE_TUNE` pin on `gemm_nt_q` passes
-them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of
-those reaches both. A pin applies to every row serving the op, and an axis a serving row lacks
-stops startup by name.
+**`gemm_mxfp4a8_gated_gemv`** (`gemm_nt_q_gated_mx`, M ≤ 8, K a multiple of 128, N of 256, `act`
+`silu`, or `gelu_tanh` without `out_bf16`). The `gemv` WMMA form over a gate_up weight, a block per
+16-column tile pair of the gated output (eight K waves on the gate tile, eight on the up tile, in
+`gemv`'s K order), the bf16 product and row amaxes in the op's scratch; the last of a 128-column
+group's blocks to arrive (a counter keyed on the output) writes the group's codes and scales. Byte
+for byte `gemm_mxfp4a8_gemv` followed by `gated_quant_fp8`, or by `gelu_mul` and `quant_act_fp8`
+(`r4d_selftest`, M = 1..8, Qwen's and TranslateGemma's gate_up). It saves a launch: a dependent
+kernel costs 3.5-6.4 µs in a replayed graph on gfx1201 however little it does, and a Qwen3.8-27B
+TP2 decode step issues 631 a card. About +1.5 % at one to eight streams on Qwen3.8-27B, +4.5 % on
+TranslateGemma 27B at speculation 7.
+
+**`gemm_mxfp4a8_gated_gemv_wide`** (`gemm_nt_q_gated_mx`, 9 ≤ M ≤ 64, K a multiple of 128 and at
+least 2688, N of 256, the same `act` rule). The fold over `gemv_wide`, the GEMM row of that band:
+`gemv_wide`'s kernel at two column tiles a block with the tiles taken as one gate tile and its up
+tile, so each of the eight K waves loads both tiles' weight words of its chunks and reads a chunk's
+activation fragments once for both (the narrow row's sixteen waves, eight a tile, would be
+`gemv_wide` at one tile a block, which at 32 and 64 rows took TranslateGemma's gate_up 39 % and 22 % longer).
+Up to four 16-row tiles; the waves' partials meet through LDS one half at a time (32 KB at 64 rows),
+then the narrow row's epilogue. Byte for byte `gemm_mxfp4a8_gemv_wide` followed by `gated_quant_fp8`,
+or by `gelu_mul` and `quant_act_fp8` (`r4d_selftest`, M = 9..64). No spills: 101 / 137 / 166 / 196
+VGPRs at one to four row tiles (per-(row, 128) activation scale), against `gemv_wide`'s 131 / 160 / 190
+at two to four tiles and two columns. K from 2688 keeps it out of `decode_shortk`'s corner, where the
+unfused GEMM sums 33..64 rows in the decode kernel's order. gemma3 declares the fold up to 64 rows
+where K reaches it, which at two to eight TranslateGemma streams with speculation 7 is 2-5 % more
+throughput than the unfused three past 8 rows.
+
+**Tunables.** `gemv`, `gemv_wide` and `gated_gemv` have none, so a `RADIANCE_TUNE` pin on
+`gemm_nt_q` passes them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the
+rule), so a pin of those reaches both. A pin applies to every row serving the op, and an axis a
+serving row lacks stops startup by name.
 
 ## The OCP-MXFP4 tiled GEMM (prefill)
 

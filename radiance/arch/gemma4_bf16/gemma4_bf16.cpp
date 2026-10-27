@@ -1,4 +1,5 @@
-/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h).
+/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h) and,
+ * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h).
  *
  * Two attention classes over one residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
@@ -15,6 +16,7 @@
  * RedHatAI's gemma-4-31B-it-speculator.dflash2 (arch/common/rad_block_dflash2.h; 7 a pass).
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_audio.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -55,6 +57,15 @@ static int g4_parse_types(const char* lt, int64_t n, std::vector<int>& is_global
     return RAD_OK;
 }
 
+/* A config boolean, flattened as "true"/"false" (`use_double_wide_mlp`). */
+static bool g4_getb(const RadModelMeta* m, const char* k, bool dflt) {
+    const char* s = meta_text_gets(m, k, nullptr);
+    if (!s) return dflt;
+    if (!std::strcmp(s, "true") || !std::strcmp(s, "True")) return true;
+    if (!std::strcmp(s, "false") || !std::strcmp(s, "False") || !std::strcmp(s, "null")) return false;
+    return std::atoll(s) != 0;
+}
+
 static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
                        std::vector<int>& is_global) {
     const char* lt = meta_text_gets(m, "layer_types", nullptr);
@@ -86,6 +97,10 @@ struct ClassGeom {
     float   scale  = 1.0f;
     bool    head_ladder = false;   /* true: proportional over head_dim (global) */
     bool    has_v       = true;    /* false: k == v (global) */
+    /* Fewer KV heads than ranks: each rank keeps the one at row `kv_off` of the n_head_kv_all,
+     * shared with the other world / n_head_kv_all ranks of its group. */
+    bool    kv_rep      = false;
+    int64_t kv_off = 0, n_head_kv_all = 0;
     int64_t q_dim()  const { return n_head * head_dim; }
     int64_t kv_dim() const { return n_head_kv * head_dim; }
     int64_t gqa()    const { return n_head / n_head_kv; }
@@ -142,6 +157,17 @@ struct G4Linear {
      * whole step's (see "the prefill overlap" below). */
     void step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const;
     void gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const;
+    /* This rank's rows of each row part where they are not an even share (a replicated KV head),
+     * on the weight and on its scale plane: every grid here keeps one scale row a weight row. */
+    int  span_parts(RadBuilder* b, const int64_t* lo, const int64_t* hi, const int64_t* total,
+                    int n) const {
+        for (rad_weight x : { w, ws }) {
+            if (!x) continue;
+            RAD_ARCH_TRY(n == 1 ? rad_weight_shard_span(b, x, lo[0], hi[0])
+                                : rad_weight_shard_span_parts(b, x, lo, hi, total, n));
+        }
+        return RAD_OK;
+    }
 };
 
 /* A weight on the w4a8 / w8a8 grid: i4 or i8 codes with an f16 scale per [1 x 128], the encoding
@@ -515,6 +541,22 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
                               { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
                               g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
+
+    /* A replicated KV head: this rank's k and v rows are its head's, not an even share. q stays
+     * an even share; a rank's q heads all read that head. */
+    if (cls.kv_rep) {
+        const int64_t kv_all = cls.n_head_kv_all * cls.head_dim, q0 = (int64_t)g.rank * qd;
+        if (fused) {
+            const int64_t lo[3]  = { q0, cls.kv_off, cls.kv_off };
+            const int64_t hi[3]  = { q0 + qd, cls.kv_off + kvd, cls.kv_off + kvd };
+            const int64_t tot[3] = { qd * g.world, kv_all, kv_all };
+            RAD_ARCH_TRY(ln_qkv.span_parts(b, lo, hi, tot, cls.has_v ? 3 : 2));
+        } else {
+            const int64_t lo = cls.kv_off, hi = cls.kv_off + kvd;
+            RAD_ARCH_TRY(ln_k.span_parts(b, &lo, &hi, &kv_all, 1));
+            if (cls.has_v) RAD_ARCH_TRY(ln_v.span_parts(b, &lo, &hi, &kv_all, 1));
+        }
+    }
 
     /* input norm: x_hat * w over the residual stream. */
     op_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -963,7 +1005,7 @@ struct Gemma4Mlp {
     struct Wire { rad_buf x = 0, h = 0, gu = 0, ffn = 0; };
 
     Wire  w{};
-    Geom  g{};
+    Geom  g{};              /* g.n_ff is this layer's width (double-wide layers are wider) */
     int   layer = 0;
     rad_weight w_norm = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_gu{}, ln_down{};      /* the GEMM weights (bf16 or w4a8) */
@@ -975,7 +1017,8 @@ struct Gemma4Mlp {
     rad_op     op_pf = 0;
     rad_weight pf_w  = 0;
 
-    int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre);
+    int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre,
+                 int64_t n_ff);
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
               bool ar_fused = false) const;
     /* For the prefill overlap, over rows [r0, r0 + n): the arm from the pair a junction wrote to
@@ -1004,8 +1047,9 @@ void Gemma4Mlp::tail(RadCtx* c, int64_t r0, int64_t n) const {
                 brow_slice(w.x, r0, n, E));
 }
 
-int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre) {
-    g = geom; layer = l; w = wire;
+int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
+                       const char* pre, int64_t n_ff) {
+    g = geom; layer = l; w = wire; g.n_ff = n_ff;
 
     /* The norms: always bf16 (no rule matches them), name map first. */
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_norm.weight", l), nm.ckpt("%s.%lld.pre_feedforward_layernorm.weight", pre, (long long)l)));
@@ -1705,6 +1749,9 @@ struct Model {
     rad_buf b_qg = 0, b_kg = 0, b_vg = 0, b_atting = 0;  /* global rows  */
     rad_buf b_qkvs = 0, b_qkvg = 0;   /* the fused projections' rows, where a layer has one */
     rad_buf b_gu = 0, b_ffn = 0;
+    /* ...and the double-wide layers' own pair, since a GEMM reads its activation packed (a narrow
+     * layer in the wide buffer would read a padded row). Declared only for use_double_wide_mlp. */
+    rad_buf b_gu_w = 0, b_ffn_w = 0;
 
     rad_weight w_tok = 0, w_out = 0, w_lm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final = 0, op_gather = 0, op_logits = 0, op_cap = 0;
@@ -1712,12 +1759,14 @@ struct Model {
     /* Per-layer embeddings (hidden_size_per_layer_input > 0): the token-identity table
      * (embed_tokens_per_layer, n_layer x n_ple wide), the context projection of the scaled
      * embedding and its per-(token, layer) norm, combined into `b_ple` [max_tok, n_layer * n_ple]
-     * that every layer reads its slice of. */
+     * that every layer reads its slice of. At two ranks the table is vocab-sharded like the token
+     * table, and its lookup is reduced the same way (op_ple_ar). The rest of the branch is
+     * replicated, so no layer reduces it. */
     int64_t    n_ple = 0;
     rad_weight w_ple_tok = 0, w_ple_norm = 0;
     G4Linear   ln_ple_proj{};
     rad_buf    b_ple = 0, b_ple_tok = 0, b_pg = 0;
-    rad_op     op_ple_tok = 0, op_ple_norm = 0, op_ple_add = 0;
+    rad_op     op_ple_tok = 0, op_ple_ar = 0, op_ple_norm = 0, op_ple_add = 0;
     /* An image's placeholder positions take the token-identity row of pad_token_id, as the
      * reference looks them up (Gemma4Model.forward: llm_input_ids = pad where multimodal): that row
      * times sqrt(n_ple), made as fill(sqrt(n_ple)) * the row, scattered over the image rows. */
@@ -1732,9 +1781,11 @@ struct Model {
     Gemma4Head head{};
     bool       have_head = false;
 
-    /* The vision tower (rad_block_gemma4_vision.h), declared when the container carries one and
-     * the deployment serves media; `op_mm` writes its rows over the placeholders' embeddings. */
+    /* The vision tower and the audio encoder, each declared when the container carries it and
+     * the deployment serves that medium; `op_mm` writes their rows over the placeholders'
+     * embeddings. */
     Gemma4Vision vis{};
+    Gemma4Audio  aud{};
     rad_op       op_mm = 0;
 
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
@@ -1830,7 +1881,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dc.group    = df2_geti(meta, "conv_group_size", 16);
     dc.sel_rank = df2_geti(meta, "selector_rank", 0);
     dc.sel_topk = df2_geti(meta, "selector_top_k", 0);
-    dc.prefetch = gemma4::kPrefetchBytes;
+    dc.prefetch = ctx->weight_prefetch_off ? 0 : gemma4::kPrefetchBytes;
     if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
         fprintf(stderr, "radiance: gemma4: the DFlash2 drafter states no selector geometry (rank "
                         "%lld, top_k %lld)\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
@@ -2030,12 +2081,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.n_ple < 0) { fprintf(stderr, "radiance: gemma4: hidden_size_per_layer_input %lld is negative\n", (long long)m.n_ple); return RAD_E_INVAL; }
     if (m.n_ple > 0) {
         const int64_t v_ple = meta_text_geti(meta, "vocab_size_per_layer_input", g.n_vocab_all);
-        if (g.world > 1) {
-            fprintf(stderr, "radiance: gemma4: per-layer embeddings (hidden_size_per_layer_input %lld) "
-                            "are served at one rank only; this model is small enough for one card\n",
-                    (long long)m.n_ple);
-            return RAD_E_UNSUPPORTED;
-        }
         if (v_ple != g.n_vocab_all) {
             fprintf(stderr, "radiance: gemma4: vocab_size_per_layer_input %lld differs from the "
                             "vocabulary (%lld)\n", (long long)v_ple, (long long)g.n_vocab_all);
@@ -2050,8 +2095,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
-    int64_t kv_g = 0;
-    if (divide_or_fail(kv_g_all, g.world, "num_global_key_value_heads", &kv_g) < 0) return RAD_E_INVAL;
+    /* The global class's KV heads, replicated like the sliding class's when there are fewer than
+     * ranks (geom_from): each rank keeps one, at row kv_off_g. */
+    int64_t kv_g = 0, kv_off_g = 0;
+    if (g.world > kv_g_all) {
+        if (g.world % kv_g_all) {
+            fprintf(stderr, "radiance: gemma4: %d ranks cannot replicate %lld global KV heads; the "
+                            "world must be a multiple of the KV head count\n",
+                    g.world, (long long)kv_g_all);
+            return RAD_E_INVAL;
+        }
+        kv_g = 1;
+        kv_off_g = (int64_t)(g.rank / (g.world / kv_g_all)) * head_g;
+    } else if (divide_or_fail(kv_g_all, g.world, "num_global_key_value_heads", &kv_g) < 0) {
+        return RAD_E_INVAL;
+    }
 
     /* Plain RMSNorm, x_hat * w, on every norm including the post-projection ones. Unlike
      * Gemma 2/3, Gemma 4 does not use the (1 + w) form: vLLM's stock RMSNorm, HF's Gemma4RMSNorm
@@ -2086,6 +2144,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* A double-wide MLP (use_double_wide_mlp, Gemma 4 E2B): the layers from first_shared on have
+     * 2 * intermediate_size, as transformers' Gemma4TextMLP builds them (`use_double_wide_mlp and
+     * is_kv_shared_layer`). Each layer declares its own weights and op widths, and the two widths
+     * keep a pair of activation buffers each (b_gu_w). */
+    const bool wide_mlp = g4_getb(meta, "use_double_wide_mlp", false) && kv_shared > 0;
+    const int64_t n_ff_wide = 2 * g.n_ff;
+
     /* The sliding class comes from geom_from (head_dim 256, 16 kv heads, full rotation, theta_s);
      * the global class is built from the container header. */
     m.cs.n_head = g.n_head;      m.cs.n_head_kv = g.n_head_kv; m.cs.head_dim = g.head_dim;
@@ -2094,6 +2159,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.cg.n_head = g.n_head;      m.cg.n_head_kv = kv_g;        m.cg.head_dim = head_g;
     m.cg.n_rot  = n_rot_g;       m.cg.window = 0;              m.cg.theta = theta_g;
     m.cg.scale  = g.rope_scale;  m.cg.head_ladder = true;      m.cg.has_v = k_eq_v == 0;
+    m.cs.kv_rep = g.world > g.n_head_kv_all;  m.cs.kv_off = g.kv_off;
+    m.cs.n_head_kv_all = g.n_head_kv_all;
+    m.cg.kv_rep = g.world > kv_g_all;         m.cg.kv_off = kv_off_g;
+    m.cg.n_head_kv_all = kv_g_all;
 
     /* ---- the two KV groups. */
     const uint32_t kvdt = rad_kv_cache_dtype(ctx, RAD_BF16);
@@ -2121,6 +2190,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_atting= decl_b(b, nm.f("attn_outg"),  g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_gu   = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.b_ffn  = decl_b(b, nm.f("ffn"),     g.act_dtype, {g.max_tok, g.n_ff});
+    if (wide_mlp) {
+        m.b_gu_w  = decl_b(b, nm.f("gate_up_wide"), g.act_dtype, {g.max_tok, 2 * n_ff_wide});
+        m.b_ffn_w = decl_b(b, nm.f("ffn_wide"),     g.act_dtype, {g.max_tok, n_ff_wide});
+        if (!m.b_gu_w || !m.b_ffn_w) return RAD_E_INVAL;
+    }
     m.b_hout = decl_b(b, nm.f("h_out"),   g.act_dtype, {g.max_logit_rows, g.n_embd});
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
@@ -2177,10 +2251,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
-    /* An image's rows overwrite its placeholders' embeddings after the (all-reduced) lookup and
-     * before the first block: the reference scales token embeddings by sqrt(n_embd) and scatters
-     * the image features in unscaled. */
-    if (Gemma4Vision::present(meta) && ctx->max_enc_patches > 0)
+    /* Media rows (an image's or an audio clip's) overwrite their placeholders' embeddings after
+     * the lookup and before its all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other
+     * rank zeros). The reference scales token embeddings by sqrt(n_embd) and scatters the media
+     * features in unscaled. */
+    if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
+        (Gemma4Audio::present(meta) && ctx->max_audio_frames > 0))
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                           RAD_STR("dtype", "bf16")),
@@ -2216,6 +2292,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      RAD_F64("mult", std::sqrt((double)m.n_ple))),
                           RAD_WEIGHTS(m.w_ple_tok)),
                          {}, {m.b_ple_tok});
+        /* A rank's lookup writes zeros for ids outside its vocabulary slice; the all-reduce makes
+         * every row whole. */
+        if (g.world > 1) {
+            m.op_ple_ar = rw(b, RAD_OP(b, "all_reduce",
+                                 RAD_PARAMS(RAD_INT("world_size", g.world),
+                                            RAD_RANGE("numel", P, g.max_tok * P),
+                                            RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
+                                 RAD_NOWEIGHTS),
+                             {m.b_ple_tok}, {m.b_ple_tok});
+            if (!m.op_ple_ar) return RAD_E_INVAL;
+        }
         RAD_ARCH_TRY(m.ln_ple_proj.declare(b, nm, g, nm.f("ple_model_proj"),
                                            { nm.ckpt("model.language_model.per_layer_model_projection.weight") },
                                            P, g.n_embd, RAD_SHARD_NONE, grp_model(), m.b_x, m.b_ple));
@@ -2275,7 +2362,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (kv_src[(size_t)l] < 0) RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
                                       lay.global ? &m.b_qkvg : &m.b_qkvs, kv_src[(size_t)l]));
-        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
+        /* The double-wide layers write their own pair of buffers (see b_gu_w). */
+        Gemma4Mlp::Wire lw = mw;
+        const bool wide = wide_mlp && l >= first_shared;
+        if (wide) { lw.gu = m.b_gu_w; lw.ffn = m.b_ffn_w; }
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, lw, pre, wide ? 2 * g.n_ff : g.n_ff));
 
         /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.layer_scalar", (int)l),
@@ -2359,8 +2450,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * taps the stream */
                 bool tapped = false;
                 for (int t = 0; t < m.n_taps; ++t) tapped = tapped || m.tap_layer[t] == (int)l;
+                /* every row also where the per-layer branch follows: the feed-forward then closes
+                 * with its own all-reduce, post-norm and add */
                 RAD_ARCH_TRY(lay.j_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.attn.w_post, 0,
-                                              lay.mlp.ln_gu, l + 1 == m.n_main));
+                                              lay.mlp.ln_gu, l + 1 == m.n_main || m.n_ple > 0));
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
@@ -2391,8 +2484,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
      * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
      * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
-     * where there are reductions to sit beside. */
-    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+     * where there are reductions to sit beside, and not under --weight-prefetch off. */
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
         for (size_t l = 0; l < m.layers.size(); ++l) {
             Layer& lay = m.layers[l];
             lay.attn.pf_w  = lay.mlp.ln_gu.w;
@@ -2417,7 +2510,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
      * arena's sharing, which the runtime asks of every buffer a second lane touches; it lives
      * across the whole trunk already. */
-    m.overlap = g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
+    /* Not with per-layer embeddings: the slices close each layer through j_ma alone, without the
+     * per-layer branch. */
+    m.overlap = g.world > 1 && g.wire_exact && m.fuse && m.n_ple == 0 &&
+                g.max_tok >= 2 * kOverlapRows;
     for (const Layer& lay : m.layers)
         m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
@@ -2546,7 +2642,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the vision tower, its weight groups past the trunk's and the draft model's: the
      * assistant's layers and its exit, or the DFlash drafter's layers. They are counted even when
-     * the draft model is not declared, so the groups do not move with max_spec. */
+     * the draft model is not declared, so the groups do not move with max_spec. The audio
+     * encoder's groups follow the tower's. */
     {
         int64_t head_groups = 0;
         if (has_assistant(meta))
@@ -2560,6 +2657,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
                                    "model.", "gemma4_bf16"));
+        RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, g.n_embd,
+                                   (int)(m.n_main + head_groups) + (int)m.vis.L.size(), "model.",
+                                   "gemma4_bf16"));
     }
 
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
@@ -2602,6 +2702,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             rad_note(b, "prefill overlap: off (%s)",
                      !g.wire_exact ? "the lossy all-reduce wire"
                      : !m.fuse     ? "the residual junctions are not fused"
+                     : m.n_ple > 0 ? "the per-layer branch is not split into slices"
                                    : "a step holds fewer than two slices");
     }
     if (m.fuse && (g.world == 2 || g.world == 4)) {
@@ -2784,9 +2885,10 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
-    /* An encoder pass runs only the tower. */
+    /* An encoder pass runs only its encoder. */
     if (batch->enc) {
-        m.vis.step(c, batch);
+        if (batch->enc == RAD_MM_AUDIO) m.aud.step(c, batch);
+        else                            m.vis.step(c, batch);
         return;
     }
     /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
@@ -2815,18 +2917,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
-    if (m.op_embed_ar)
-        RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
-                    brows(m.b_x, batch->n_tok), RAD_NONE);
+    /* Before the all-reduce: after it, every rank past 0 would write zeros over its image rows. */
     if (m.op_mm && batch->n_mm_rows > 0)
         RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
                     praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, m.g.n_embd),
                     praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
+    if (m.op_embed_ar)
+        RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
+                    brows(m.b_x, batch->n_tok), RAD_NONE);
 
     const int64_t T = batch->n_tok;
     if (m.n_ple > 0) {
         RAD_ISSUE(c, m.op_ple_tok, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_ple_tok),
                   brows(m.b_ple_tok, T));
+        /* before the pad rows of image positions go in: every rank writes those whole */
+        if (m.op_ple_ar)
+            RAD_ISSUE_N(c, m.op_ple_ar, T * m.g.n_layer * m.n_ple, brows(m.b_ple_tok, T), RAD_NONE);
         if (m.op_ple_pscat && batch->n_mm_rows > 0) {
             const int64_t nm_rows = batch->n_mm_rows;
             RAD_ISSUE_N(c, m.op_ple_pfill, nm_rows, brows(m.b_ple_pad, nm_rows));
@@ -2864,8 +2970,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             }
         }
         if (m.fuse && !last) {
-            /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
-            l.j_ma.step(c, T, far);
+            /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op.
+             * With per-layer embeddings it closes the branch, whose output every rank holds whole
+             * (the feed-forward's reduction ran above): no all-reduce in front. */
+            l.j_ma.step(c, T, far && !ple);
         } else {
             /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after
              * the mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The
@@ -2920,12 +3028,13 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
         if (k > 0) out->enc_merge = k * k;
     }
+    if (Gemma4Audio::present(meta)) out->audio_frames = Gemma4Audio::frames_for(meta);
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "Gemma 4 dense (text, images and E2B/E4B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
                 "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")

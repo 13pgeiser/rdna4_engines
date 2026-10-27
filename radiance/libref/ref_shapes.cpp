@@ -559,6 +559,16 @@ int ref_pool_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("pool_rows", operand, out);
 }
 
+int ref_pool_cols_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t n = gi(p, n_p, "n", 0), k = gi(p, n_p, "k", 0), M = gi(p, n_p, "M", 0);
+    if (M <= 0 || n <= 0 || k <= 0 || n % k) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { M, n / k });      /* y */
+    return o.finish("pool_cols", operand, out);
+}
+
 int ref_relu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1455,6 +1465,31 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("kv_store", operand, out);
 }
 
+/* The streamed store: kv_store's geometry plus the mirror (one block a row at the ring's pitch)
+ * and the residency map. The described call touches one block, resident in slot 0: the draw
+ * cannot express an injective map, and two blocks drawing one slot would race on a ring byte.
+ * Partly resident maps and mirror-only writes are built by hand in tests/ref_test.cpp and in
+ * libavx's hand cases. `M <= block_size` keeps every token on its own position of that block. */
+int ref_kv_store_streamed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t kvh = gi(p, n_p, "n_head_kv", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
+    const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
+    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_F8E4M3 : kv;
+    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+
+    Opd o;
+    o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* k */
+    o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* v */
+    o.t_idx({ M }, bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);        /* slot_mapping, one block */
+    o.t(KV, { 1, kvh, bs, 2 * hd });                               /* kv_cache, INOUT */
+    o.t_idx({ 1 }, 1, -1, 0);                                      /* res -- resident in slot 0 */
+    o.t((uint32_t)RAD_U8, { 1, row });                             /* host, INOUT */
+    return o.finish("kv_store_streamed", operand, out);
+}
+
 int ref_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -1642,6 +1677,27 @@ int ref_qsa_work_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t((uint32_t)RAD_I32, { work });                             /* bpos */
     o.t((uint32_t)RAD_I32, { S });                                /* nc */
     return o.finish("qsa_work", operand, out);
+}
+
+/* The residency map and the two byte planes. `sel` is block ids, -1 past `nsel`. A described map
+ * can only be all-resident (no draw expresses -1), so a tool's cold call exercises the epoch, the
+ * rewrite and the bookkeeping, never a miss, eviction or copy; those cases are built by hand in
+ * tests/ref_test.cpp and in libavx's hand cases. */
+int ref_kv_resolve_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t slots = gi(p, n_p, "slots", 0), pitch = gi(p, n_p, "sel_pitch", 0);
+    const int64_t bbytes = gi(p, n_p, "block_bytes", 0);
+    if (M <= 0 || blocks <= 0 || slots <= 0 || pitch <= 0 || bbytes <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M, pitch }, blocks, -1, 0);         /* sel -- one block id an entry */
+    o.t_idx({ M }, pitch + 1, -1, 0);             /* nsel -- 0 .. sel_pitch */
+    o.t_idx({ blocks }, slots, -1, 0);            /* res -- every block resident, no -2 */
+    o.t_idx({ slots }, blocks, -1, 0);            /* slot_block -- the reverse map */
+    o.t_idx({ slots, 2 }, 2, 0, 0);               /* slot_state -- cold: epoch 0, no reference */
+    o.t_idx({ 16 }, 2, 0, 0);                     /* ctl -- cold: epoch 0, hand 0 */
+    o.t((uint32_t)RAD_U8, { blocks, bbytes });    /* host -- the layer's mirror, a block a row */
+    o.t((uint32_t)RAD_U8, { slots, bbytes });     /* kv_cache -- the layer's ring, a block a row */
+    return o.finish("kv_resolve", operand, out);
 }
 
 /* `delta` is described as the whole [T, 2 * taps * NG] coefficient projection, of which the op
@@ -2587,6 +2643,7 @@ int ref_rms_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
     o.t(D, { M, n });                                         /* x, INOUT */
     o.t(D, { M, n });                                         /* z */
+    o.skip();                                                 /* colmap: the sweep passes none */
     return o.finish("rms_mod", operand, out);
 }
 int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2610,6 +2667,7 @@ int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdD
     o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
     o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
     o.t(D, { M, n });                                         /* z */
+    o.skip();                                                 /* colmap: the sweep passes none */
     return o.finish("rms_mod_quant_fp8", operand, out);
 }
 /* The sampler's three scalars in (0, 1), the state f32. */
@@ -2624,6 +2682,20 @@ int ref_flow_x0_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     o.t(F, { M, n });                                         /* x, INOUT */
     return o.finish("flow_x0_step", operand, out);
 }
+int ref_flow_res_multistep_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* v */
+    o.t(F, { M, n });                                         /* x0, INOUT */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* sigma */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* r */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* hb1 */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* hb2 */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* order */
+    o.t(F, { M, n });                                         /* x, INOUT */
+    return o.finish("flow_res_multistep", operand, out);
+}
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);
@@ -2635,10 +2707,11 @@ int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("gate_add", operand, out);
 }
 int ref_timestep_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), G = gi(p, n_p, "curve", 0);
     Opd o;
     o.t_fill((uint32_t)RAD_F32, { M }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* t: a sigma in (0, 1) */
     o.t(act_dt(p, n_p), { M, n });                                    /* y */
+    if (G > 0) o.t((uint32_t)RAD_F32, { G, n }); else o.skip();        /* table */
     return o.finish("timestep_embed", operand, out);
 }
 int ref_gather_rows2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2966,6 +3039,22 @@ static int64_t tile_count(int64_t len, int64_t tile, int64_t overlap) {
     return nt;
 }
 
+/* The encoder's split (ref_video.cpp split_tiles_axis) over one axis: the tile count and the
+ * tiles' extent sum along it, a lone tile short of `tile` if the axis is. -1 where the split
+ * refuses. The drawn encode planes are `axis_len` long, so the shape fns can size the tile
+ * operands exactly. */
+static int64_t axis_split(int64_t len, int64_t tile, int64_t overlap, int64_t* ext) {
+    if (len <= 0 || tile <= 0 || overlap < 0 || overlap >= tile) return -1;
+    if (tile >= len) {
+        *ext = len;
+        return 1;
+    }
+    const int64_t nt = tile_count(len, tile, overlap);
+    /* The extents telescope: sum of the tiles = len + sum of the overlaps = `tile` nt. */
+    *ext = tile * nt;
+    return nt;
+}
+
 /* A 2 x 2 x 2 grid of patches. */
 int ref_patch_unfold_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "C", 0);
@@ -3118,6 +3207,61 @@ int ref_flow_renoise_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("flow_renoise", operand, out);
 }
 
+/* aug in [0, 1); the condition rows f32. */
+int ref_cond_aug_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const double aug = rad_param_getf(p, n_p, "aug", -1.0);
+    if (M <= 0 || n <= 0 || !(aug >= 0.0 && aug < 1.0)) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ 2 }, (int64_t)1 << 30, -1, 0);                  /* seed: two words */
+    o.t((uint32_t)RAD_F32, { M, n });                         /* x, INOUT */
+    return o.finish("cond_aug", operand, out);
+}
+
+/* ---- the tiled encoder. The drawn frame is 20 latent units a side; with the sweep's tile of
+ * 16 and overlap of 4 the split lays 2 x 2 full tiles over it, so the crops, the plan's level
+ * triples and the blends all draw non-trivial. The kernels size by the geom; these only draw a
+ * plane that one gives them. */
+int ref_vtile_plan_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), ratio = gi(p, n_p, "ratio", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || ratio <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ 3 }, 0, 20 * ratio, 0);                         /* geom: (_, H, W) pixels */
+    o.t((uint32_t)RAD_I32, { M, 22 });                        /* y: one row a tile */
+    return o.finish("vtile_plan", operand, out);
+}
+
+int ref_vtile_crop_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), ratio = gi(p, n_p, "ratio", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || ratio <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { 20 * ratio * (20 * ratio), 3 });                 /* x: the pixel plane */
+    o.t_idx({ 3 }, 0, 20 * ratio, 0);                         /* geom: (_, H, W) pixels */
+    o.t(D, { M, 3 });                                         /* y: the tiles' pixels */
+    return o.finish("vtile_crop", operand, out);
+}
+
+int ref_vtile_join_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), n = gi(p, n_p, "n", 0);
+    int64_t e = 0;
+    const int64_t nt = axis_split(20, tile, ov, &e);
+    if (M <= 0 || nt < 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { e * e, n });                                     /* x: the tiles' moments */
+    o.t_idx({ 3 }, 0, 20, 0);                                 /* geom: (_, lat_h, lat_w) */
+    o.t(D, { M, n });                                         /* y: the canvas */
+    return o.finish("vtile_join", operand, out);
+}
+
 /* ================================================================== video sparse attention
  *
  * The tiles come from the values of `segs` and `geom`, which a description draws only as
@@ -3224,23 +3368,32 @@ int ref_attn_vsa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
  * REF_LANES lanes, as the image generator's are. */
 static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
 
+/* `M` is the input rows; with `stride` > 1 (bf16, one sequence, explicit `pad`) the output is
+ * PyTorch's strided length, `M` being the rows of the one sequence `cu_seqlens` must cover. */
 int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
-    const int64_t st = gi(p, n_p, "stride", 1), dil = gi(p, n_p, "dil", 1);
-    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || st < 1 ||
-        (st > 1 && (!causal || dil * (k - 1) + 1 < st || M % st)) || gi(p, n_p, "cu_div", 1) != 1)
+    const int64_t st = gi(p, n_p, "stride", 1), pp = gi(p, n_p, "pad", -1);
+    const int64_t dil = gi(p, n_p, "dil", 1);
+    const bool padded = pp >= 0 && st > 1;   /* the zero-padded strided form (explicit `pad`) */
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) ||
+        st < 1 || (pp >= 0 && (st <= 1 || causal)) ||
+        (st > 1 && pp < 0 && (!causal || dil * (k - 1) + 1 < st || M % st)) ||
+        (!padded && gi(p, n_p, "cu_div", 1) != 1))
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
+    if (padded && D != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
     /* A strided convolution is described over one sequence: two would each need a whole number
      * of strides. Bounds in coarser units (cu_div) are not drawn; ref_test checks them. */
     const int64_t S = st > 1 ? 1 : two_seqs(M);
+    const int64_t O = padded ? (M + 2 * pp - dil * (k - 1) - 1) / st + 1 : M / st;
+    if (O <= 0) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t(D, { M, cin });                                       /* x */
     o.t(D, { cout, cin, k });                                 /* w */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
-    o.t(D, { M / st, cout });                                 /* res */
-    o.t(D, { M / st, cout });                                 /* y */
+    o.t(D, { O, cout });                                      /* res */
+    o.t(D, { O, cout });                                      /* y */
     o.t(D, { cout });                                         /* b */
     return o.finish("conv1d", operand, out);
 }

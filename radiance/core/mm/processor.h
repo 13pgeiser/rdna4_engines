@@ -368,10 +368,31 @@ public:
               std::string* why, int64_t max_pixels = 0, const ImageMode& mode = ImageMode{}) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
-    /* From an already-decoded picture or frame list; for tests. */
+    /* image() from a decoded frame: a keyframe's canvas frame (IMultimodal::prepare_frame), or a
+     * test's synthetic one. */
     int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
                    const ImageMode& mode = ImageMode{}) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
+
+    /* Media for a video generator's VAE encoders (RadVideoGenDecl), decoded under `image`'s guard.
+     * A reference picture, scaled with its aspect kept to sides that are multiples of `ratio`, the
+     * longer at most `max_side`. */
+    int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side, Frame* out,
+                      std::string* why) const;
+
+    /* A keyframe, at the video's w x h: stretched, or with `cover` scaled to cover it and cropped
+     * at the centre. */
+    int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h, bool cover,
+                             Frame* out, std::string* why) const;
+
+    /* A reference video: frames spread over the stream, at most `max_frames` and 5 modulo 17
+     * (ComfyUI's trim), each at encoder_image's sides. */
+    int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                      int32_t max_frames, std::vector<Frame>* out, std::string* why) const;
+
+    /* A soundtrack: its first stream, mono at `rate` Hz, at most `max_samples`. */
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                      std::vector<float>* out, std::string* why) const;
 
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */

@@ -173,6 +173,25 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
     }
 }
 
+void resize_lanczos_rgb(const Frame& src, int32_t w, int32_t h, Frame* out) {
+    /* At alpha 255 the premultiply and the divide back are the identity. */
+    FrameRGBA pre;
+    pre.w = src.w;
+    pre.h = src.h;
+    pre.rgba.resize((size_t)src.w * src.h * 4);
+    for (size_t i = 0; i < (size_t)src.w * src.h; ++i) {
+        for (int c = 0; c < 3; ++c) pre.rgba[i * 4 + c] = src.rgb[i * 3 + c];
+        pre.rgba[i * 4 + 3] = 255;
+    }
+    FrameRGBA post;
+    resize_lanczos_rgba(pre, w, h, &post);
+    out->w = post.w;
+    out->h = post.h;
+    out->rgb.resize((size_t)post.w * post.h * 3);
+    for (size_t i = 0; i < (size_t)post.w * post.h; ++i)
+        for (int c = 0; c < 3; ++c) out->rgb[i * 3 + c] = post.rgba[i * 4 + c];
+}
+
 void composite_white(const FrameRGBA& src, Frame* out) {
     out->w = src.w;
     out->h = src.h;

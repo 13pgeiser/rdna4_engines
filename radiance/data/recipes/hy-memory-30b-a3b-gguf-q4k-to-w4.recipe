@@ -1,0 +1,30 @@
+# Convert the local llama.cpp Hy-Memory Q4_K_M GGUF into native Radiance encodings. Q4_K/Q6_K
+# source blocks are decoded to f32, then the attention, dense-first MLP and routed experts are
+# requantized to Radiance W4; embeddings, output head, routers, norms and shared MLPs are cast to
+# BF16. This adds loss to an already-quantized source; for best quality, quantize the BF16
+# safetensors checkpoint with hy-memory-30b-a3b-bf16-w4.recipe instead.
+#
+#   rad-convert Hy-Memory-30B-A3B-Q4_K_M.gguf \
+#       --tokenizer <Hy-Memory-30B-A3B-BF16>/tokenizer.json \
+#       --recipe data/recipes/hy-memory-30b-a3b-gguf-q4k-to-w4.recipe -o hy-memory-30b-a3b-gguf-w4.rad
+
+# The model matrices have 120832 rows while the GGUF tokenizer lists 120818 strings.
+token_embd.weight                    cast dtype=bf16
+output.weight                        cast dtype=bf16
+
+blk.*.attn_norm.weight               cast dtype=bf16
+blk.*.attn_q_norm.weight             cast dtype=bf16
+blk.*.attn_k_norm.weight             cast dtype=bf16
+blk.*.ffn_norm.weight                cast dtype=bf16
+blk.*.ffn_gate_up_shexp.weight       cast dtype=bf16
+blk.*.ffn_down_shexp.weight          cast dtype=bf16
+
+blk.*.attn_q.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_k.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_v.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_output.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+
+blk.0.ffn_gate_up.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.0.ffn_down.weight                rtn  codes=u4 zero=u8 group=128 scale=f16
+
+blk.*.ffn_*_exps.*.weight            rtn  codes=i4 group=128 scale=bf16

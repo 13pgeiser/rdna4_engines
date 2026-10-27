@@ -97,6 +97,10 @@ struct Plugin {
     /* Optional (rad_builder.h, rad_arch_serves_imports); absent is true. False keeps the plugin
      * out of the pick for an imported checkpoint (startup.h). */
     bool arch_serves_imports = true;
+    /* A video generator's reference conditioning (rad_builder.h); null for one without. */
+    int64_t (*arch_video_pack)(const RadVideoGeom*, const int32_t*, int32_t*, int32_t*, int32_t*,
+                               int32_t*, float*, int64_t) = nullptr;
+    int64_t (*arch_encode_geom)(int32_t, const int64_t*, int32_t*, int64_t) = nullptr;
 
     RadPluginCloseFn close = nullptr;
 };

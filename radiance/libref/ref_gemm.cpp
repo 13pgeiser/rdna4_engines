@@ -286,8 +286,8 @@ static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, c
  *                acc += (sub * a_scale[m]) * scale
  *   ZP_I8_GROUP  sub = sum(a * (code - zero))                  exact
  *                acc += (sub * a_scale[m][g]) * scale
- *   ZP_F16       sub = sum over ascending k of a * (code - zero), each product exact in f32
- *                acc += sub * scale
+ *   ZP_F16       BF16 inputs are first narrowed to F16 (as by the graph's former cast); sub is
+ *                the sum over ascending k of a * (code - zero), then acc += sub * scale
  *
  * `a` is already in column order (the caller undoes the step order). `a_sum` is quant_act_i8's,
  * group-major [K/group][Mpad], Mpad = ceil(M/16)*16; the grid's zero is removed through it, as
@@ -319,7 +319,29 @@ static int gemm_zp(const ZpGrid& zg, const RadTensor* A, const RadTensor* as_,
     const int64_t acols = parts * K;
     if (numel(A) < M * acols) return RAD_E_SHAPE;
     if (A->rank >= 2 && A->shape[A->rank - 1] != acols) return RAD_E_SHAPE;
-    const int64_t ars = row_stride(A, acols), acs = laststride(A);
+    int64_t ars = row_stride(A, acols), acs = laststride(A);
+
+    /* The W4 decode graph supplies BF16 directly so HIP can narrow on load. Preserve the former
+     * explicit BF16->F16 cast semantics on host backends before evaluating the F16 activation grid. */
+    std::vector<uint16_t> narrowed;
+    RadTensor a_f16{};
+    if (zg.act == ZP_F16 && A->dtype == RAD_BF16) {
+        narrowed.resize((size_t)(M * acols));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t k = 0; k < acols; ++k)
+                narrowed[(size_t)(m * acols + k)] = f32_to_f16(ldt(A, m * ars + k * acs));
+        a_f16 = *A;
+        a_f16.data = narrowed.data();
+        a_f16.dtype = RAD_F16;
+        a_f16.rank = 2;
+        a_f16.shape[0] = M;
+        a_f16.shape[1] = acols;
+        a_f16.stride[0] = acols;
+        a_f16.stride[1] = 1;
+        A = &a_f16;
+        ars = acols;
+        acs = 1;
+    }
 
     const bool i8 = zg.act != ZP_F16;
     if (i8 && A->dtype != RAD_I8) return RAD_E_DTYPE;

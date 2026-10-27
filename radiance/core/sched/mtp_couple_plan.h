@@ -1,4 +1,4 @@
-/* mtp_couple_plan.h -- which draw the engine stages for each serial drafting row.
+/* mtp_couple_plan.h -- which draw the engine stages for each drafting row (serial or block).
  *
  * Engine::stage_couple_draws (core/engine_draft.cpp) reads the draw of every sequence on its card
  * from the step plan and, for each drafting row, the plan entry naming the row's sequence on the
@@ -24,7 +24,8 @@ namespace rad {
  * RAD_OK, or RAD_E_STATE with `why` set: the plane is too small for the card slots, or a drafting
  * row's card carries no plan entry naming its sequence (a stale row -- the plugin would refuse the
  * staged draw, so it is refused here where the row can be named). */
-inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Scheduler::SerialRow* rows,
+template <class Row>   /* Scheduler::SerialRow or Scheduler::BlockRow: a sequence and its card */
+inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Row* rows,
                                  int n, std::vector<RadMtpCoupleDraw>* by_card,
                                  RadMtpCoupleDraw* stage, std::string* why) {
     if (!by_card || !stage || !why) return RAD_E_INVAL;
@@ -39,7 +40,7 @@ inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Schedul
             (*by_card)[(size_t)e.card] = { e.req->sp.seed, (uint64_t)e.req->output.size(), e.seq,
                                            e.card, e.req->sp.greedy() ? 0u : 1u };
     for (int i = 0; i < n; ++i) {
-        const Scheduler::SerialRow& row = rows[i];
+        const Row& row = rows[i];
         if (row.card < 0 || row.card >= n_card || (*by_card)[(size_t)row.card].seq != row.seq) {
             *why = "drafting row " + std::to_string(i) + " (sequence " + std::to_string(row.seq) +
                    ", card " + std::to_string(row.card) + ") has no plan entry on its card";

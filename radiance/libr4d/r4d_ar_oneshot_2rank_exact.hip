@@ -76,15 +76,26 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
 
+  // drain 4, tests only (r4d_ar_late_push_pin, r4d_selftest): the flag goes out before the push
+  // and the push ~20 us after it, so the peer sees a flag whose bytes have not landed -- what a
+  // push over PCIe P2P now and then does on its own -- on every launch.
+  if (drain == 4) {
+    if (tid == 0) store_sys_rel(&peer_flags[b], s);
+    const unsigned long long t0 = wall_clock64();
+    while (wall_clock64() - t0 < 2000ull) __builtin_amdgcn_s_sleep(8);   // 100 MHz: 20 us
+  }
   // Push the chunk to the peer slot, 4x unrolled for memory-level parallelism.
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
       int4 v0 = in4[k], v1 = in4[k + nt], v2 = in4[k + 2 * nt], v3 = in4[k + 3 * nt];
       ps[k] = v0; ps[k + nt] = v1; ps[k + 2 * nt] = v2; ps[k + 3 * nt] = v3;
+      hck += r4d_archk_u4(v0, 4u * (unsigned)k) + r4d_archk_u4(v1, 4u * (unsigned)(k + nt)) +
+             r4d_archk_u4(v2, 4u * (unsigned)(k + 2 * nt)) + r4d_archk_u4(v3, 4u * (unsigned)(k + 3 * nt));
     }
-    for (; k < end; k += nt) ps[k] = in4[k];
+    for (; k < end; k += nt) { const int4 v = in4[k]; ps[k] = v; hck += r4d_archk_u4(v, 4u * (unsigned)k); }
   }
   // Drain modes, ordering the pushes before the release flag so the peer sees data first:
   //  0 = none (relies on PCIe posted-write ordering and the release flag)
@@ -94,12 +105,13 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   //  3 = all-thread s_wait_storecnt 0: every wave drains its posted writes with no L2
   //      writeback-invalidate; PCIe keeps posted writes to one peer ordered, so the release flag
   //      lands after the data. Correct only for fine-grained memory (coarse leaves data in L2).
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s, drain == 4);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
-    store_sys_rel(&peer_flags[b], s);
+    if (drain != 4) store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
     // A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes.
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
@@ -108,6 +120,9 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   }
   __syncthreads();
   if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+  });
   // Reduce the chunk, 4x unrolled: out = local input + peer input (staged in local scratch).
   {
     int k = start + tid;
@@ -147,15 +162,19 @@ __global__ void r4d_ar_hc_write_kernel(
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
 
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
       int4 v0 = y4[k], v1 = y4[k + nt], v2 = y4[k + 2 * nt], v3 = y4[k + 3 * nt];
       ps[k] = v0; ps[k + nt] = v1; ps[k + 2 * nt] = v2; ps[k + 3 * nt] = v3;
+      hck += r4d_archk_u4(v0, 4u * (unsigned)k) + r4d_archk_u4(v1, 4u * (unsigned)(k + nt)) +
+             r4d_archk_u4(v2, 4u * (unsigned)(k + 2 * nt)) + r4d_archk_u4(v3, 4u * (unsigned)(k + 3 * nt));
     }
-    for (; k < end; k += nt) ps[k] = y4[k];
+    for (; k < end; k += nt) { const int4 v = y4[k]; ps[k] = v; hck += r4d_archk_u4(v, 4u * (unsigned)k); }
   }
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -168,8 +187,11 @@ __global__ void r4d_ar_hc_write_kernel(
     }
   }
   __syncthreads();
-  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
   if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+  });
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   const int wpr = n >> 3;                 // 16B words a row
   for (int k = start + tid; k < end; k += nt) {
@@ -231,6 +253,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
   const int wpr = n >> 3;                 // 16B words a row
   const int row_lo = start / wpr;
   const int nrow = end > start ? (end - 1) / wpr - row_lo + 1 : 0;
@@ -264,7 +287,9 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     const int4 out = r4d_ar_gather_word<INV>(G, inv, s_i, s_w, s_g, row, row - row_lo, i0);
     y4[k] = out;
     ps[k] = out;
+    hck += r4d_archk_u4(out, 4u * (unsigned)k);
   }
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -277,8 +302,11 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     }
   }
   __syncthreads();
-  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
   if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
+    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+  });
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   for (int k = start + tid; k < end; k += nt) {
     const int4 r = vadd<__hip_bfloat16, 8>(y4[k], ms[k]);
@@ -398,6 +426,7 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
+  nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
   r4d_ar_hc_write_kernel<<<nb, nt, 0, st>>>(
       (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
       (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
@@ -436,6 +465,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
+  nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
   /* Zeroed including padding: the struct is passed by value, so its tail padding is part of the
    * kernel-argument bytes a recorded pass's audit compares. */
   R4dArGather G;
@@ -505,6 +535,11 @@ void r4d_ar_ipc_enable_peer(long peer) {
     throw std::runtime_error(std::string("enable_peer: ") + hipGetErrorString(e));
 }
 
+/* r4d_ar_late_push_pin: 1 makes every 2-rank exact all-reduce send its flags before its pushes
+ * (drain 4). A test hook (r4d_selftest); nothing else sets it. */
+static int g_ar_late_push = 0;
+extern "C" void r4d_ar_late_push_pin(int on) { g_ar_late_push = on; }
+
 void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags,
                             long my_flags, long seq_ctrs, long slot_stride16,
                             long inp, long out, long n_elem, long dtype,
@@ -527,6 +562,10 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
+  nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
+  // Tests only: every push lands after its flag (drain 4 above). Not in the tuning table, so no
+  // tuner can pick it.
+  if (g_ar_late_push) drain = 4;
 #define L(T, LN) r4d_ar_oneshot_2rank_exact_kernel<T, LN><<<nb, nt, 0, st>>>(              \
     (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,        \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,              \

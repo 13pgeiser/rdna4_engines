@@ -113,13 +113,24 @@ extern "C" void* rad_link_gate(RadStream s);
  * counts lists handed over and not yet finished. The prefetch ring is uncached device memory
  * (rad_dev_alloc_uncached): the engine writes it and kernels read it, so no cache may hold a
  * slot's previous contents. */
+/* An event a DMA list completes instead of a dispatch. `*word` is its completion word, for
+ * rad_xp_list to write 0 to as the list's `done`; the caller arms it with a 1 in stream order (the
+ * weight table's patch dispatch). `rad_event_wait(s, ev)` then holds `s` on the device until the
+ * copy has landed. The caller waits for the previous copy before arming the next, so an older 0
+ * cannot release a later wait. RAD_E_STATE while a tape records: the caller re-runs it with the
+ * tape paused (core/kvstream/stage.cpp). */
+extern "C" int     rad_event_dma(RadEvent ev, RadStream s, uint32_t** word);
 extern "C" int     rad_xp_supported(int device);
 extern "C" int     rad_xp_stream_create(RadStream* out);
 extern "C" int     rad_ride(RadStream s, void** token);
 extern "C" int     rad_ride_wait(RadStream s, void* token);
 extern "C" void    rad_ride_release(void* token, RadStream after, int64_t packets);
+/* `flags` RAD_XP_NO_YIELD: the list does not yield the link to a hold by a stream of this card. A
+ * copy the compute stream waits on must set it, since the hold's release is behind that wait. */
+#define RAD_XP_NO_YIELD 1u
 extern "C" int     rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
-                               const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+                               const uint64_t* bytes, uint32_t* done, uint32_t done_val,
+                               unsigned flags);
 extern "C" int64_t rad_xp_behind(int device);
 extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
 extern "C" void    rad_dev_free_uncached(void* p);
@@ -316,7 +327,7 @@ struct DeviceBackend {
     int     (*ride_wait)(RadStream s, void* token);
     void    (*ride_release)(void* token, RadStream after, int64_t packets);
     int     (*xp_list)(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
-                       const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+                       const uint64_t* bytes, uint32_t* done, uint32_t done_val, unsigned flags);
     int64_t (*xp_behind)(int device);
     void*   (*alloc_uncached)(int64_t bytes);
     void    (*free_uncached)(void* p);
@@ -325,6 +336,9 @@ struct DeviceBackend {
     int     (*stream_gate)(RadStream s, void** gate);
     int     (*gate_open)(void* gate);
     int64_t (*gate_room)(RadStream s);
+
+    /* ---- rad_event_dma; null on a backend with no DMA queue. */
+    int     (*event_dma)(RadEvent e, RadStream s, uint32_t** word);
 };
 
 

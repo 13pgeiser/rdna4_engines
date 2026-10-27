@@ -273,11 +273,15 @@ and runs.
 | `qwen35_fp8` | the same, block-scaled fp8 |
 | `qwen35_w8a8` | the same, an int8 trunk rotated by a 128-wide Hadamard |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
+| `hyv3_bf16` | Tencent Hy-Memory-30B-A3B BF16 checkpoint; BF16, W4, W8A8, block-FP8 and MXFP4 recipes, TP1/2 |
+| `hyv3_fp8` | Tencent Hy-Memory-30B-A3B FP8 checkpoint: imported FP8 weights, dense-first MoE, TP1/2, BF16 or static-scaled E4M3 KV |
+| `hyv3_gguf` | llama.cpp Hy-Memory Q4_K_M input converted via `hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`; requires `--tokenizer <BF16-checkpoint>/tokenizer.json` |
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
 | `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
+| `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -959,6 +963,80 @@ speculation f16 also changes which drafts the greedy text accepts, so one and fo
 down; whether that is the text or the step was not separated. Use it for many concurrent sequences
 where the KL above is acceptable, and measure your own load.
 
+### 4.4.1 Streaming KV: context bigger than the card
+
+```sh
+radiance --model flashnext.rad --tp 2 --max-model-len 262144 --max-num-seqs 2 --kv-resident 32768
+```
+
+`--kv-resident N` keeps the whole KV cache of the model's sparse attention group in pinned host RAM
+and only a ring of N tokens on the cards. Each decode step makes the blocks it selected resident,
+copying in the missing ones and evicting the coldest; an evicted block is already in the host copy.
+Prefill reads the cache one layer at a time from the host copy. The ring is a fixed size at any
+context length, so the context is no longer bounded by VRAM: holding two 262k-token conversations
+on two 16 GB cards, the cache went from 3.84 GB of VRAM a card to 0.74 GB of VRAM and 3.22 GB of host
+RAM, and the VRAM it gave up went to the expert slab.
+
+- N is in tokens, rounded up to whole blocks (4 tokens on this family). Absent or `0`, nothing
+  streams. **Use 32 768**: a smaller value is raised to it, and to one decode step's selection
+  (`--max-num-seqs x (1 + speculative tokens) x 513` blocks) when that is larger, with one warning.
+  At or above `--max-num-seqs x --max-model-len` the ring covers the context and nothing streams.
+- Cost: the ring at the cache's per-token bytes for every layer (6.00 KiB a token a rank at fp8 on
+  two ranks: 192 MiB at 32 768), the prefill stage, one layer of the retained context (512 B a token
+  a rank), and the host copy of `--max-num-seqs x --max-model-len` tokens per rank. The VRAM pool
+  is the larger of ring and stage, not their sum.
+- Models: Qwen3.8-Flash-Next (`qwen4exp_fp8`) and GLM-5.3-Flash (`glm5next`), with a bf16 or fp8
+  cache. Anywhere else the flag is ignored with one warning and every block stays on the card;
+  so is a packed cache (`--kv-cache-dtype fp8_v4` or `k6_v4`).
+- The prefix cache's host tier (`--prefix-cache-mib`) is turned off while a group streams; prefix
+  hits still work from VRAM (§4.8).
+- The startup receipt's `kv streaming:` lines name the ring, the stage and the host copy;
+  `/metrics` carries `kv_resident_blocks`, `kv_stream_misses_total` and `kv_stream_bytes_total`.
+
+| model (arch id) | streams | KV dtypes | notes |
+|---|---|---|---|
+| Qwen3.8-Flash-Next (`qwen4exp_fp8`) | **yes** | bf16, fp8 | sparse QSA; the measured path |
+| GLM-5.3-Flash (`glm5next`) | **yes** | bf16, fp8 | sparse MLA + DSA; declare and issue are tested, not served here |
+| Qwen3.5/3.6/3.8 dense (`qwen35_*`, `qwen35moe_fp8`) | no | | dense attention reads the whole history every step |
+| all other architectures | no | | no streamed store and no `kv_resolve` |
+
+**Measured.** Flash-Next, fp8 cache, 2x16 GB gfx1201 at TP2, one request, two cold starts a
+configuration, 2 048 tokens decoded:
+
+| configuration | prompt | prefill tok/s | tok/step | decode tok/s |
+|---|---|---|---|---|
+| streaming off | 61 971 | 2 722 | 1.00 | 39.89 |
+| **streaming on** | 61 971 | **2 783** | 1.00 | 39.78 |
+| streaming off + MTP | 61 971 | 2 600 | 2.87–3.23 | 62.3 (56.8–67.7) |
+| **streaming on + MTP** | 61 971 | **2 671** | 3.02–3.45 | 64.8 (53.2–76.5) |
+| streaming off | 249 939 | 2 635 | 1.00 | 38.60 |
+| **streaming on** | 249 939 | **2 669** | 1.00 | 39.07 |
+| streaming off + MTP | 249 939 | 2 577 | 3.10 | 50.56 |
+| **streaming on + MTP** | 249 939 | **2 623** | 3.10 | 50.86 |
+
+Decode is unchanged, with and without MTP (the MTP rows' spread is the text's acceptance, not the
+configuration); prefill is 1-2 % faster, because the VRAM the cache gives up holds routed experts.
+Per card the host copy is smaller than the VRAM it displaces (3.22 against 3.58 GiB), because each
+rank keeps only its own slice.
+
+**When not to use it.**
+
+- Per token streaming costs the same bytes, in host RAM instead of VRAM; at one conversation that
+  fits it costs more than it saves. It is the way to keep a cache VRAM cannot hold.
+- The host copy is reserved for `--max-num-seqs x --max-model-len`, however short the requests.
+- At `--tp 1` the host copy for 2 x 262k (6.00 GiB) does not fit beside the weights, and the
+  start is refused.
+- The copies cost about 3 % of decode at `--tp 2` with a small context, and nothing at `--tp 1`.
+- Quality: perplexity 3.994 streaming off, 4.015 with a ring covering the context, 4.014 with a
+  ring a fraction of it.
+
+**Check it on your own machine.** `scripts/kv-parity.sh` checks the covering case: a ring at the
+group's context streams nothing and gives byte-identical completions to the same server without the
+flag. `scripts/kv-stage-parity-64k.sh` checks the streaming case: with the ring at 32 768 tokens and
+a ~64k document, every prefill chunk is staged layer by layer and the completions are
+byte-identical to streaming off. Both need the cards and the toolchain container. The design is in
+[KV-STREAMING.md](KV-STREAMING.md).
+
 ### 4.5 Prefill chunk size
 
 A long prompt is prefilled in chunks of at most `--max-num-batched-tokens`. On a mixture-of-experts
@@ -1085,6 +1163,12 @@ just retaining the tip afterward. This restores tail-only snapshot scheduling an
 avoids the extra copies, at the cost of full re-prefill if an edit precedes the tip.
 Recurrent-state models still checkpoint at intervals under `tip-only`; their
 existing scheduling is unchanged.
+Both kinds also take a snapshot at a head other prompts share: when a prompt leaves a cached
+head that at least two earlier prompts already left differently (the same system prompt or
+instructions in front of a different text, as a translation service sends its pieces) and no
+snapshot lets it skip at least 256 tokens of that head, the request takes one where the head
+ends, at the cost of one chunk split, and the requests after it resume there. A conversation's
+next turn has only its own earlier turn past that point, so it splits nothing extra.
 
 **One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
 from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the
@@ -1410,6 +1494,9 @@ radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
   gives the rest up; the startup log warns when the tier holds less than one `--max-model-len`
   conversation and says how many MiB would, and a `kv tiers: ... got no host copy` line appears when
   it happens (`/sessions` `moved.held_back`).
+  While a KV group streams (`--kv-resident`), the tier is off and its MiB are not reserved: a
+  cached conversation holds the streamed group, whose rows are its pinned mirror at the
+  conversation's block ids and cannot move to a host slot (`docs/KV-STREAMING.md` §3.8).
 - `--prefix-cache-ttl S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
   the memory is wanted.
 
@@ -1612,6 +1699,10 @@ below.
   unload while serving: `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/dir"}` and
   `POST /v1/unload_lora_adapter {"lora_name": "x"}` (vLLM's routes; loopback-only without
   `--api-key`).
+- On a video generator the slots come out of what its largest step leaves of the card, which
+  `--max-num-batched-tokens` cannot lower. MiniMax-H3 on two 32 GB cards has room for one slot at
+  rank 16 (265 MiB a card), two only when no other process holds VRAM on them; past that the
+  start stops with `vram_kv resolved to 0 MiB`.
 - An unload of an idle adapter answers 200 and frees its slot. An unload of an adapter requests
   are still using **drains** it and answers 202
   `{"action": "draining", "lora_name": "x", "in_flight": N}`: from then on a request naming `x`
@@ -1799,6 +1890,7 @@ by 0.002-0.003 nats.
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+| `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
@@ -1841,6 +1933,7 @@ by 0.002-0.003 nats.
 | `--tp N` | 1 | tensor-parallel ranks |
 | `--tp-wire MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
 | `--tp-wire-min-kb N` | 128 | smallest all-reduce, in KiB, the lossy wire is used for |
+| `--weight-prefetch MODE` | on | `on` or `off`: whether a plugin reads a GEMM's weight into the cache beside the collective before it, at decode heights. `off` for an engine that shares its cards with another server (§8, two engines on one set of cards); alone it costs a few percent of decode |
 | `--tp-attn-split MODE` | heads | `heads` or `rows`: how a prefill-sized step's attention splits over the ranks, on a plugin that serves the row split (§4.7) |
 | `--p2p MODE` | auto | `auto` asks the driver, `on` requires peer access, `off` exchanges through host memory (§4.7) |
 
@@ -1851,7 +1944,7 @@ by 0.002-0.003 nats.
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
 | `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
-| `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged; any other drafter is refused at startup |
+| `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature `RADIANCE_DFLASH_Q_TEMP` (default 0.6, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -1930,6 +2023,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-placement` | print the placement plan |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |
+| `--expert-stats FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `--live` | the live terminal view (§6.4) |
 | `-v` / `-vv` | verbose / very verbose |
 
@@ -2140,9 +2234,16 @@ token ids mixed, with its `add_special` and `parse_special` and their defaults);
 returns `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`. `/detokenize`
 returns the text as both `prompt` (vLLM) and `content` (llama-server).
 
-**An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` only; completions and chat answer
-501. One input is one vector and must fit one step (`--max-num-batched-tokens`); a longer one is
-refused with `context_length_exceeded`.
+**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe) serves `/v1/embeddings` only;
+completions and chat answer 501. One input is one vector and must fit one step
+(`--max-num-batched-tokens`); a longer one is refused with `context_length_exceeded`.
+
+nomic-embed-text-v2-moe is converted from its f32 checkpoint with `rad-convert <checkpoint dir>
+--recipe data/recipes/nomic-embed-v2-moe-bf16.recipe -o nomic-embed-v2-moe-bf16.rad` (959 MB);
+the directory must contain `tokenizer.json`. The `search_query: ` and `search_document: ` prefixes
+are the client's text and the engine adds neither; the checkpoint's prompt names work through
+`prompt_name`. The checkpoint's shared `experts.bias` tensors are not applied and stay in the
+checkpoint.
 
 ```sh
 # text, a batch of texts, or token ids
@@ -2255,7 +2356,7 @@ more field:
 
 | field | |
 |---|---|
-| `rebalance` | `true` multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1); it applies to the negative prompt's conditioning too. `false` (the default) is the plain model. A boolean, or `true`/`false`/`1`/`0` in a form; a model without it refuses `true` with a 400 |
+| `rebalance` | `true` (or `"legacy"`) multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1), about nine times the taps' RMS; it applies to the negative prompt's conditioning too. `"balanced"`, `"detail"` and `"subtle"` are comfyui-krea2-conditioning's presets (renormalize on, multiplier 1): their per-layer weights times a constant that keeps the taps' RMS, measured over twenty prompts through Krea 2 Turbo's text encoder (`scripts/krea2_rebalance_calib.py`; the node's per-prompt factor stayed within 1.7 % of it), so they shift the balance between layers without the default's overall gain. `false` (the default) is the plain model. A boolean or a preset's name, also in a form (`true`/`false`/`1`/`0` or the name); a model without it refuses anything but `false` with a 400 |
 
 **Anima** makes RGB pictures, 1024x1024 by default, sides rounded down to multiples of 16, up to
 1536x1536 (9216 latent tokens; the card's range is 512x512 to 1536x1536). Base and Aesthetic run 30
@@ -2952,7 +3053,8 @@ curl -s http://localhost:8000/v1/videos/video_.../content -o fox.mp4
 ```
 
 - **`prompt`** is read as written, with no template; MiniMax-H3 was trained on long structured
-  descriptions (a shot, its soundscape, its music), which follow it best. At most 2048 tokens.
+  descriptions (a shot, its soundscape, its music), which follow it best. At most 8192 tokens,
+  the vision tokens of any reference pictures included.
 - **`seconds`** is rounded up to the model's length steps (17 frames, 0.71 s, at 24 frames a
   second): 5.17 to 14.4 seconds, 5.17 by default. The video object's `seconds` is what is made.
 - **`size`** is the frame's `WIDTHxHEIGHT`: both sides multiples of 32 from 256, at most
@@ -2964,14 +3066,51 @@ curl -s http://localhost:8000/v1/videos/video_.../content -o fox.mp4
   evaluations, by default; at most 65). The model is guidance-distilled, so there is no guidance
   scale and no negative prompt. A step-distilled release (FastH3, below) runs only the schedule it
   was trained on: 9 grid points, and any other count is refused with a 400.
-- Only text is read: `input_reference` and non-empty `conditions` are refused, as is a `task`
-  other than `t2va`. Fields are JSON or a multipart form (OpenAI's clients send the form).
+- **`sampler`** is `euler` (the default) or `res_multistep`, the second-order step on the clean
+  estimate (k-diffusion's, as ComfyUI workflows for the model use it). **`shift`** and
+  **`audio_shift`** replace the shift of the video's and the soundtrack's sigma grid, each in
+  (0, 100]; the model's own are `video_shift` and `video_audio_shift` in its capabilities.
+- Fields are JSON or a multipart form (OpenAI's clients send the form); media come as form file
+  parts. `input_reference` and non-empty `conditions` are refused.
+
+**Keyframes and reference media.** A container converted with the VAEs' encoders (every pipeline
+directory since the ref2va release ships them; the recipe says how to add them to an older
+container) also makes a video between keyframes or from reference media; `task` may name the
+workflow, and is otherwise read off the parts:
+
+- **Keyframes**: a `first_frame` (`i2va`), a `last_frame` (`l2va`) or both (`fl2va`), each an image
+  pinned at that end of the video. The first frame is stretched to the video's size, or, with
+  `"first_frame_mode": "center"`, scaled to cover it and cropped at the centre; the last frame is
+  always cropped. A keyframe request takes no `latent_upscale`: the pins are on the video's own grid.
+- **Reference media** (`ref2va`): `ref_image_1` .. `ref_image_9`, `ref_video_1` .. `ref_video_3`, each
+  video with an optional soundtrack `ref_video_audio_N` of its own number, and `ref_audio_1` ..
+  `ref_audio_3`, numbered from 1 without gaps. Pictures and video frames are fitted into 256 x 256
+  and a video keeps at most 289 frames, soundtracks at most 15.6 s. The pictures are shown to the
+  text encoder as well, as `<Picture N>` in front of the prompt, so the container needs its vision
+  tower for them.
+
+A request carries keyframes or reference media, not both. `capabilities` reports the counts a
+model takes (`video_max_ref_images` and the rest). Every reference adds rows to each step, so
+many large ones may need a larger `--max-model-len`; a request that does not fit, or whose
+references alternate kinds too often for the model's modulation table (group them by kind), is
+refused naming why.
+
+```sh
+curl -s http://localhost:8000/v1/videos -F task=fl2va -F first_frame=@start.png \
+  -F last_frame=@end.png -F size=1344x768 -F 'prompt=...'
+```
 
 **FastH3.** FastVideo's FastH3 8-Step V2 (`FastVideo/FastVideo-FastH3-8-Step-V2`) is the same model
 distilled to eight steps with video sparse attention; it is converted with the same recipe, its text
 encoder and decoders taken from a MiniMax-H3 container (`data/recipes/minimax-h3-fp8.recipe` says
 how), served the same way and named `fastvideo-fasth3-8-step-v2`. Its card notes that difficult
 motion, fine detail and some audio may fall below the base model's; it serves text to video only.
+
+**Other encodings.** `data/recipes/minimax-h3-w8a8.recipe` stores the DiT's per-token linears as
+int8 with a scale per 128 columns, read at w8a8, in the same memory as the fp8 container. A
+curve-form checkpoint (its `config.json` sets `adaln_curve_grid`) ships its timestep embeddings
+as a table and its modulation projections bf16; `minimax-h3-curve-fp8.recipe` and
+`minimax-h3-curve-w8a8.recipe` convert one.
 
 **Latent upscaling.** A container that carries LBH-123-AI's latent upscaler
 (`LBH-123-AI/Minimax_h3_latent_Upscaler`, Apache-2.0; the recipe says how to add it to a container,
@@ -2981,7 +3120,7 @@ upscaler, re-noised, and the last **`upscale_refine_steps`** run at the full siz
 and 12 of the base model's 49 by default). The steps at the small size cost a fraction of a
 full-size step's, so most of the time goes to the refinement. The video object of an upscaled
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
-size.
+size. Reference media ride it unchanged; keyframes do not (above).
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{
@@ -3384,7 +3523,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.12.0
+I STARTUP REPORT -- radiance 1.13.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -3460,7 +3599,6 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
 | `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
-| `RADIANCE_PREFETCH_BESIDE` | `0` issues no weight prefetch beside the decode collectives. For an engine that shares its cards with another server (below); alone it costs a few percent of decode. Unset, nothing changes |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the
 peer card has pushed, and a prefill-sized fused all-reduce launches more blocks than a card holds at
@@ -3473,7 +3611,33 @@ low enough that their spinners together leave part of a card free, the cycle can
 Qwen3.8-27B (its decode at 16 sequences x 4 rows stays uncapped) and 16 for the Gemma ran 15
 minutes of concurrent long prompts on both without a stall. The ceiling costs prefill time, the
 reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapped, 9.8 s at 64,
-10.3 s at 32. Give the engine started first its `--gpu-headroom-mib` for the second. A model whose decode reads weights ahead on a second queue (Gemma 4 without chained launches) slows sharply beside a second server: an R9700 has four compute queue slots and the two servers hold eight, so every decode step waits for a queue switch. Gemma 4 31B at TP4 beside an idle Qwen3.8-Flash-Next went from 13 ms to 41 ms a step; with `RADIANCE_PREFETCH_BESIDE=0` in the Gemma engine it took 13.8 ms.
+10.3 s at 32. Give the engine started first its `--gpu-headroom-mib` for the second. A model whose
+decode reads weights ahead on a second queue (Gemma 4 without chained launches) slows sharply
+beside a second server: an R9700 has four compute queue slots and the two servers hold eight, so
+every decode step waits for a queue switch. Gemma 4 31B at TP4 beside an idle
+Qwen3.8-Flash-Next went from 13 ms to 41 ms a step; with `--weight-prefetch off` in the Gemma
+engine it took 13.8 ms.
+
+The four slots are what the amdgpu kernel driver leaves to user queues: by default it keeps four of
+the eight compute queues on the card's two pipes for the graphics stack (Vulkan and OpenGL in Mesa),
+and `num_cp_queues` in `/sys/class/kfd/kfd/topology/nodes/*/properties` reads 4. A machine that
+drives its cards through ROCm alone can give them back:
+
+- set the module option `amdgpu.num_kcq=0` (`options amdgpu num_kcq=0` in `/etc/modprobe.d/`, then
+  `update-initramfs -u` and a reboot). `num_cp_queues` then reads 8 and `dmesg` shows
+  `compute_hqd_mask 0x0000000f`; `num_kcq=1` leaves `0x0000000e`, three queues a pipe. Mesa then has
+  no compute ring of its own on those cards.
+- An engine holds up to four queues a card (the step's lane, the second lane, the mover's and the
+  runtime's own), so two engines fit and the weight reads beside the all-reduces can stay on.
+- Start them one after the other, and send the first a short request before starting the second:
+  an engine creates its second-lane queue at the first step that uses it, and a queue created after
+  the other engine's lands where both run slower (TranslateGemma at one stream 120 tok/s instead of
+  181).
+
+Qwen3.8-27B and TranslateGemma 27B on two R9700s, weight reads on in both: TranslateGemma at one
+stream 180.6-180.9 tok/s and Qwen beside a busy TranslateGemma 42.9 ms a step, against 152-154 tok/s
+and 41.0-42.8 ms with the default slots and `--weight-prefetch off`; Qwen beside an idle
+TranslateGemma 18.3 ms a step, against 19.8-20.5.
 
 **Tooling**
 
@@ -3483,7 +3647,9 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
+| `RADIANCE_G4_CALIB_LAYERS` | `lo:hi`: the same for `arch/gemma4`'s tap, which takes the Gemma 4 31B's Grams from its bf16 checkpoint (docs/GEMMA4-31B-GPTQ.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
+| `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: time every dispatch of one recorded pass in N on card 0, each with a completion signal of its own, without changing its barriers or chains (`--profile-ops` plays no recorded pass). One CSV line a dispatch (pass, record, queue, kernel, ordered, chained, start and end in ns) goes to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`); `scripts/stampgaps.py` summarises it per kind of pass. AQL backend only |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

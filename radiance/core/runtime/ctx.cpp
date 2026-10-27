@@ -3,6 +3,8 @@
  */
 #include <vector>
 #include "ctx.h"
+#include "kvstream/bind.h"
+#include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
 
@@ -327,6 +329,14 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
+        p.n_opd_required = -1;
+        if (oi.schema) {
+            /* One past the last required operand: an issue may leave out the optional ones after
+             * it. */
+            for (int o = 0; o < oi.schema->n_operands; ++o)
+                if (!oi.schema->operands[o].optional) p.n_opd_required = o + 1;
+            if (p.n_opd_required < 0) p.n_opd_required = 0;
+        }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
@@ -921,7 +931,7 @@ int Ctx::lane_join(int from, int to) {
  * (below). */
 static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 360,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 72,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
@@ -957,6 +967,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);
         mix((uint64_t)k.block_table_pitch); ptr(k.seqused); ptr(k.state_index);
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
+        /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
+        mix(kvstream_view_key(k.stream));
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);
@@ -1229,6 +1241,12 @@ int Ctx::play_pass(PassTape& t) {
             rc = xp_ ? xp_step_run(st.a) : RAD_OK;
             lane_ = l0;
             break;
+        case kTapeKvStage:
+        case kTapeKvStageAfter:
+            lane_ = st.lane;
+            rc = kvstage_run(this, st.a, st.b, st.kind == kTapeKvStageAfter);
+            lane_ = l0;
+            break;
         }
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
@@ -1320,7 +1338,6 @@ int Ctx::run_pass(const RadBatch* b) {
 }
 
 int Ctx::run_step(const RadBatch* b) {
-
     if (!b) return RAD_E_INVAL;
     if (!arch_step_) {
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
@@ -1337,6 +1354,7 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    kvstream_enter(this, b);
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;

@@ -10,6 +10,12 @@ that report the geometry a kernel was launched with rather than every geometry i
     BUILD=... ./waterfall.sh                        # divergent VGPR indices, per kernel
     ./loop.sh                                       # its K loop, classified
     ./trace.sh traces/dec -- ./bin/radiance ...     # then: ./tsum.sh traces/dec/k_kernel_trace.csv
+    ./selftest.sh                                   # the two parsers, on fixtures (ctest: isa_tools)
+
+`res.sh` and `waterfall.sh` exit nonzero when they looked at nothing -- no `.hip.o`, an object whose
+code object will not extract or disassemble, or not one kernel in the tree. Empty output from an
+instrument is a failed run, not a clean tree. A HIP translation unit that carries no kernels has no
+`.hip_fatbin` and is skipped rather than failed.
 
 `res.sh` prints mangled names; the substring `dis.sh` takes picks one template instantiation, and
 the parameter order is in the kernel's declaration (`gemm_fp8a8_kernel` is
@@ -27,6 +33,7 @@ anchor, because a largest-loop search finds the epilogue, a long unrolled store 
 | `loop.sh` | isolates the working loop of that disassembly and classifies its body by instruction class |
 | `res.sh` | one row per device kernel in a build tree: VGPRs, SGPRs, LDS, scratch, spills, waves a SIMD, workgroup size |
 | `waterfall.sh` | every kernel that indexes a VGPR array with an index the compiler could not prove uniform |
+| `selftest.sh` | the parsers behind `res.sh` and `waterfall.sh`, against fixtures |
 | `trace.sh` | runs a command under `rocprofv3 --kernel-trace` and leaves a CSV |
 | `tsum.sh` | summarises that CSV over a steady-state window: where device time goes, per (kernel, grid) |
 | `gaps.sh` | where the device is idle, and which op it was waiting for |

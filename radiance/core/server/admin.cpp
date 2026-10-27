@@ -399,6 +399,8 @@ json Server::capabilities() const {
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     caps["audio_generation"] = deps_.audio != nullptr;
     caps["video_generation"] = deps_.videos != nullptr;
+    /* What a video request may carry. */
+    if (deps_.videos) video_caps(caps, deps_.videos);
     /* The efforts a chat request may send, probed from the template at startup; null when it
      * takes any word. "none" and "minimal" are this server's and turn thinking off. */
     if (lim_.reasoning_efforts.empty()) {

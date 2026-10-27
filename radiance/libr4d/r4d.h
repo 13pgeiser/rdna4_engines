@@ -693,6 +693,10 @@ void r4d_mla_matrix_pin_form(int form);
 // key loads where aligned; the matrix row's kernel under 32 rows), 1 the element-wise key load
 // (bit-identical to 3), 2 32 heads a workgroup, 3 the rows kernel of the rule at any row count.
 void r4d_mla_rows_pin_form(int form);
+// Test hook: 1 makes every r4d_ar_oneshot_2rank_exact launch send its flags before its pushes and
+// push ~20 us later, so each reader finds a flag whose bytes have not landed; the push check
+// (r4d_ar_seq.h) must still give exact sums. 0 is the normal order.
+void r4d_ar_late_push_pin(int on);
 // Test hook: records the function each launch dispatches into `fns[0..cap)`, in order, until the
 // next call, and returns how many launches the previous recording saw (which may exceed its cap).
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel

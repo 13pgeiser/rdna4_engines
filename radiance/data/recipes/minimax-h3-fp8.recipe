@@ -31,6 +31,15 @@
 # four patch projections (f32), every norm and bias. The video decoder's linears are cast to bf16
 # from the checkpoint's f32, its norms, layer scales, biases and register tokens stay f32; the
 # audio decoder stays f32 (its weight norms folded at convert).
+#
+# The VAEs' encoders, which keyframes and reference media go through, are the encoder halves of
+# vae/ and audio_vae/ and convert with the rest: the audio encoder's chain convolutions f32 with
+# their weight norms folded, the video encoder's 3x3x3 convolutions bf16. A container converted
+# before the plugin declared the encoders gains them by a reuse with nothing marked changed:
+# every weight it holds is copied and only the encoders' are converted.
+#
+#   rad-convert <the directory the container was converted from> \
+#       --recipe data/recipes/minimax-h3-fp8.recipe --reuse <the container> -o <the new container>
 
 te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
 te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
@@ -53,5 +62,22 @@ vae.blk.*.ffn_up.weight              cast dtype=bf16
 vae.blk.*.ffn_down.weight            cast dtype=bf16
 vae.proj_out.*                       cast dtype=bf16
 aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention and MLP block run in bf16 inside the
+# f32 chain (declare_aenc): conv1d, layernorm and gemm take one dtype for every operand, so their
+# weights are cast. The chain's own convolutions are stored f32, their weight norms folded.
+aenc.d*.w                            cast dtype=bf16
+aenc.d*.b                            cast dtype=bf16
+aenc.pb.*                            cast dtype=bf16
+aenc.b*.u*.c1.weight                 cast dtype=f32
+aenc.b*.u*.c2.weight                 cast dtype=f32
+aenc.cin.weight                      cast dtype=f32
+aenc.fin.weight                      cast dtype=f32
+# The video encoder's 3x3x3 convolutions are bf16, as the implicit-GEMM kernel reads them;
+# conv_in (three input channels) and the 1x1x1 shortcut and quant convolutions read their f32
+# weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                       cast dtype=bf16
+venc.l*.b*.c2w                       cast dtype=bf16
+venc.l*.dnw                          cast dtype=bf16
+venc.cout.weight                     cast dtype=bf16
 ups.embed.*                          cast dtype=f32
 ups.*.emb_layers.*                   cast dtype=f32

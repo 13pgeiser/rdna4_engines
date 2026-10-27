@@ -104,7 +104,7 @@ struct ChatFormat {
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
      * format has no tool calls. */
-    std::string section_open, section_close;  /* around all calls; not read yet, must be empty */
+    std::string section_open, section_close;  /* around the complete list of calls */
     /* Between two calls, beyond whitespace (a JSON-array format would use ", "). Tagged calls are
      * self-delimiting. Not read yet, must be empty. */
     std::string call_separator;
@@ -129,6 +129,11 @@ struct ChatFormat {
      * they are then read as one delimiter, written back to back. */
     std::string arg_name_suffix;              /* ">\n"   (MiniCPM: empty, the value prefix ends it) */
     std::string arg_value_prefix;             /* ""      (MiniCPM: "\">") */
+    /* A second value prefix, for a format whose argument tag says the value's type (DSML:
+     * ` string="false">` before JSON, arg_value_prefix ` string="true">` before a string). The
+     * prefix the reply writes types its value, whatever the schema says; the grammar writes the
+     * one the schema calls for. Empty: the schema alone types a value. */
+    std::string arg_json_value_prefix;
     std::string arg_value_suffix;             /* "</parameter>\n" */
 
     ChatValue   string_value = ChatValue::Cdata;  /* a string-typed argument: Raw or Cdata */
@@ -143,6 +148,7 @@ struct ChatFormat {
     std::vector<std::string> triggers;
 
     bool has_reasoning() const { return !reasoning_close.empty(); }
+    bool typed_tags() const { return !arg_json_value_prefix.empty(); }
     bool has_tools() const { return !name_prefix.empty(); }
     bool object_args() const { return args_form == ChatArgs::Object; }
 };

@@ -15,6 +15,7 @@
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "kvstream/stage.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -30,8 +31,10 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <climits>
 #include <cmath>
 #include <algorithm>
+#include <map>
 #include <fstream>
 #include <functional>
 #include <utility>
@@ -73,6 +76,7 @@ Engine::~Engine() {
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
+    if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
@@ -96,6 +100,9 @@ Engine::~Engine() {
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
+    /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
+     * since a pass reads them. Safe after a failed bring-up. */
+    for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
@@ -198,11 +205,9 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
  * `heat_seen` prevents crediting a bank twice: a bank keeps its counts until the next report, so a
  * step where a layer did not route (a drafter pass) would re-credit the stale plane.
  */
-void Engine::tiering_dispatch(Rank& r, int step) {
-    if (!r.heat.enabled()) return;
-
-    r.mover.begin_dispatch(step, &r.heat);
-
+/* Every landed histogram of a step before `before_step`, oldest first per layer, into
+ * `r.heat_rows`; nothing is credited yet. */
+void Engine::find_histograms(Rank& r, int before_step) {
     const int n_layer = r.ctx.n_route_layers();
     if ((int)r.heat_seen.size() != n_layer) r.heat_seen.assign((size_t)n_layer, -1);
     /* Find all histograms first, then credit them in order. Each is a card-written row in host
@@ -219,7 +224,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         int seen = r.heat_seen[(size_t)l];
         bool any = false;
         for (;;) {
-            const int bank = r.ctx.next_histogram(l, seen, step, landed);
+            const int bank = r.ctx.next_histogram(l, seen, before_step, landed);
             if (bank < 0) break;
             const int32_t* h = r.ctx.last_histogram(l, bank);
             if (!h) break;
@@ -229,8 +234,46 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         }
         if (!any) ++r.heat_idle;
     }
+}
+
+/* --expert-stats: one found histogram into the rank's tally (place/xstats.h), from the same row
+ * the heat engine reads. The caller holds the tally. */
+static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int32_t* h) {
+    const RadRouting* rt = ctx.last_routing(layer);
+    const int64_t n = rt ? std::min<int64_t>(rt->n_expert, ctx.route_n_expert()) : 0;
+    xs->credit(layer, ctx.last_histogram_step(layer, bank), h, n,
+               ctx.last_histogram_reports(layer, bank), rt ? rt->top_k : 0);
+}
+
+/* The drain alone, for the tally, where the heat engine is off or the engine is stopping
+ * (`before_step` INT_MAX once the streams are drained). */
+void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
+    find_histograms(r, before_step);
+    std::lock_guard<std::mutex> lk(xs->mutex());
+    for (const Rank::HeatRow& hr : r.heat_rows) {
+        xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
+        r.ctx.mark_credited(hr.layer, hr.bank);
+        ++r.heat_credited;
+    }
+    xs->note_dropped(r.ctx.route_dropped());
+}
+
+void Engine::tiering_dispatch(Rank& r, int step) {
+    XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
+    if (!r.heat.enabled()) {
+        if (xs) xstats_drain(r, xs, step);
+        return;
+    }
+
+    r.mover.begin_dispatch(step, &r.heat);
+
+    find_histograms(r, step);
+    std::vector<Rank::HeatRow>& rows = r.heat_rows;
     const int32_t n_ex = (int32_t)r.ctx.route_n_expert();
     constexpr size_t kAhead = 2;
+    std::unique_lock<std::mutex> xl;
+    if (xs) xl = std::unique_lock<std::mutex>(xs->mutex());
     for (size_t i = 0; i < rows.size() && i < kAhead; ++i) r.heat.prefetch(rows[i].h, n_ex);
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
@@ -239,9 +282,15 @@ void Engine::tiering_dispatch(Rank& r, int step) {
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        /* The row is in cache now. */
+        if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
+    }
+    if (xs) {
+        xs->note_dropped(r.ctx.route_dropped());
+        xl.unlock();
     }
 
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
@@ -273,6 +322,93 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     r.mover.hold_turnover(hold);
     (void)r.mover.balance(&r.heat, !hold);
 }
+
+/* ------------------------------------------------------------------ --expert-stats
+ *
+ * Which model-wide expert each index of each rank's histogram is (place/xstats.h, XsMap): index e
+ * is the rank's unit with group expert e, and the container's directory entry for that unit's
+ * weight names the expert in the model's numbering. A checkpoint served directly has no such entry
+ * and the map falls back to rank order. */
+int Engine::xstats_open() {
+    if (cfg_.expert_stats.empty()) return RAD_OK;
+    const int n_layer = ranks_[0]->ctx.n_route_layers();
+    if (n_layer <= 0) {
+        RAD_WARN("--expert-stats: '%s' routes no experts; there is nothing to count and %s is not "
+                 "written", meta_.name ? meta_.name : "the model", cfg_.expert_stats.c_str());
+        return RAD_OK;
+    }
+    constexpr int32_t kUnset = INT32_MIN, kClash = -3;
+    std::vector<std::vector<std::vector<int32_t>>> ids(ranks_.size());
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        const Program& P = ranks_[ri]->program;
+        auto& layers = ids[ri];
+        layers.assign((size_t)n_layer, {});
+        for (size_t w = 1; w < P.weights.size(); ++w) {
+            const WeightInfo& wi = P.weights[w];
+            const int32_t l = wi.decl.group.layer, e = wi.decl.group.expert;
+            if (l < 0 || l >= n_layer || e < 0) continue;
+            std::vector<int32_t>& row = layers[(size_t)l];
+            if ((size_t)e >= row.size()) row.resize((size_t)e + 1, kUnset);
+            const RadFileEntry* fe = file_ ? file_->find(wi.source) : nullptr;
+            const int32_t g = fe && fe->layer == l && fe->expert >= 0 ? fe->expert : -1;
+            int32_t& at = row[(size_t)e];
+            /* Every weight of one unit must name the same expert. */
+            at = at == kUnset ? g : at == g ? at : kClash;
+        }
+        for (auto& row : layers)
+            for (int32_t& v : row) if (v == kUnset || v < 0) v = -1;
+    }
+    std::vector<int32_t> n_model((size_t)n_layer, 0);
+    for (int l = 0; l < n_layer && l < meta_.n_layers; ++l) n_model[(size_t)l] = (int32_t)meta_.n_expert;
+    XsMap map;
+    RAD_TRY(xs_map_build(ids, n_model, (int32_t)meta_.n_layers, &map));
+
+    XsSnapshot info;
+    info.model = meta_.name ? meta_.name : "";
+    info.arch = meta_.arch_id ? meta_.arch_id : "";
+    info.container = cfg_.model;
+    xstats_ = std::make_unique<ExpertStats>();
+    if (const int st = xstats_->init(cfg_.expert_stats, map, std::move(info)); st < 0) {
+        RAD_ERR("--expert-stats: cannot write %s", cfg_.expert_stats.c_str());
+        xstats_.reset();
+        return st;
+    }
+    std::map<std::string, int> how;
+    int32_t mx = 0;
+    for (int l = 0; l < n_layer; ++l) {
+        if (map.n_expert[(size_t)l] <= 0) continue;
+        ++how[map.how[(size_t)l]];
+        mx = std::max(mx, map.n_expert[(size_t)l]);
+    }
+    std::string hs;
+    for (const auto& [k, v] : how) hs += fmt("%s%d by %s", hs.empty() ? "" : ", ", v, k.c_str());
+    int counting = 0;
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) counting += xstats_->tally((int)ri) != nullptr;
+    RAD_INFO("expert stats: %d routed layers (up to %d experts; ids %s), counted on %d of %d "
+             "rank%s, written to %s every 30 s and at shutdown",
+             n_layer, (int)mx, hs.c_str(), counting, cfg_.tp, cfg_.tp == 1 ? "" : "s",
+             cfg_.expert_stats.c_str());
+    xstats_->start();
+    return RAD_OK;
+}
+
+void Engine::xstats_close() {
+    if (!xstats_) return;
+    xstats_->stop();
+    /* The banks of the last steps are still in the ring: drain each counting rank's stream, then
+     * credit them. Not after a step-loop error, where a stream may never drain. */
+    if (loop_status_.load(std::memory_order_acquire) >= 0) {
+        for (auto& r : ranks_) {
+            XsTally* xs = xstats_->tally(r->index);
+            if (!xs) continue;
+            if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
+            xstats_drain(*r, xs, INT_MAX);
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    }
+    (void)xstats_->write(true);
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
@@ -298,6 +434,10 @@ void Engine::rank_loop(int index) {
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
+            /* --expert-stats files each pass's step kind for the drain, which reads it a step or
+             * more later. An encoder pass is not a step of the token stream. */
+            if (xstats_ && what != kIssueSampler && b->enc == 0)
+                if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -346,6 +486,9 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    /* The stage bound for every rank (kvstream/stage.h, "Volume"). Rank 0's allocator hands out the
+     * block ids every rank uses, and the ranks are parked, so no allocation races the read. */
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, ranks_[0]->kv);
     return RAD_OK;
 }
 
@@ -409,11 +552,16 @@ int Engine::step_loop() {
      * pass issued ahead would overwrite them. */
     pipelining_ = !cfg_.kld() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    early_ids_ = !cfg_.kld() && !embedding_;
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
+    /* A step that runs for 20 s reports where the step loop waits: its syscall and its stack.
+     * Every iteration, idle or not, marks progress, so only a stuck step is reported. */
+    rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
+        step_watch.progress();
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
@@ -690,6 +838,9 @@ int Engine::step_loop() {
         st = block_drafting() ? issue_block_drafter(b->step, so)
                               : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
+        /* Behind the step's last resolve and before its end event, so collect_step's wait covers it. */
+        st = stream_probe_issue(b);
+        if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
@@ -754,6 +905,23 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        /* The step has drained, so its counters are readable. A chunk that produced no row did not
+         * wait, so its copy is read on a later step; a finished prompt or request always produced
+         * a row. */
+        if (so.n_rows > 0) {
+            st = stream_probe_take(b, res.n_prefill_done > 0, res.n_finished > 0);
+            if (st < 0) return fail_loop(st);
+        }
+
+        /* With the ids read ahead of the drafter's passes, the commit streamed the tokens while
+         * the card ran them. Wait for the passes now, before the slots below are read and before
+         * anything reuses what the commit released. */
+        if (so.early) {
+            st = rad_event_sync(step_end_);
+            if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step,
+                                  rad_strerror(st)); return fail_loop(st); }
+            so.early = false;
+        }
 
         /* The drafter for the next step already ran on the card; what remains is to check its
          * acceptance against the host's and publish its proposals. Each driver returns
@@ -795,11 +963,16 @@ int Engine::step_loop() {
 }
 
 /* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.
- * Issued by the serial drafter before its passes (a head sampling through the sampler's buffer
- * overwrites the ids), otherwise just before the wait. */
-int Engine::collect_issue(StepOut& so) {
+ * Issued by a drafter before its passes (a head sampling through the sampler's buffer overwrites
+ * the ids), otherwise just before the wait.
+ *
+ * With `fence` (a drafter queueing its passes behind the step) the copy records tok_end_, so
+ * collect_step waits for the ids alone (StepOut::early). Not at -vv, whose logits row is a
+ * pageable copy read in collect_step. */
+int Engine::collect_issue(StepOut& so, bool fence) {
     so.rb = nullptr;
     so.lg.clear();
+    so.early = false;
     if (so.n_rows <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
     void* src = r0.ctx.buf_ptr(r0.tok_buf);
@@ -820,8 +993,126 @@ int Engine::collect_issue(StepOut& so) {
             so.lg.resize((size_t)nv);
             rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.ctx.stream());
         }
+        return RAD_OK;
+    }
+    if (fence && early_ids_) {
+        RAD_TRY(rad_event_record(tok_end_, r0.ctx.stream()));
+        so.early = true;
     }
     return RAD_OK;
+}
+
+/* ================================================================== KV streaming's counters
+ *
+ * Each streamed group's device control block holds the resolve's cumulative counters, the largest
+ * union, misses and claims of one launch, and the overflow latch (libref/ref_kvstream.cpp, "The
+ * control block"). They show at run time whether the ring's depth holds; a launch that overflowed
+ * is failed, not served (docs/KV-STREAMING.md §3.4).
+ *
+ * The step path never waits on the card: the 64-byte copy per group is enqueued on rank 0's compute
+ * stream behind the step's last resolve and before its end event, and the commit that already
+ * waits for that event reads it. One rank's counters stand for all, since every rank resolves the
+ * same block ids through identically built maps. The counters are cumulative, so the metrics are
+ * charged the deltas. */
+int Engine::stream_probe_issue(const RadBatch* b) {
+    if (!b || b->n_kv_groups <= 0 || ranks_.empty()) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_ctl_n_ < n) {
+        if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
+        stream_ctl_p_ = static_cast<int32_t*>(
+            rad_dev_alloc((int64_t)n * 16 * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED));
+        stream_ctl_n_ = stream_ctl_p_ ? n : 0;
+        if (!stream_ctl_p_) {
+            RAD_ERR("kv streaming: no pinned host memory for the resolve's counters");
+            return RAD_E_NOMEM;
+        }
+        /* Zeroed, so a group whose first copy has not landed reads as no calls yet. */
+        std::memset(stream_ctl_p_, 0, n * 16 * sizeof(int32_t));
+    }
+    RadStream st = ranks_[0]->ctx.stream();
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv || !sv->ctl) continue;
+        if (rad_memcpy_async(stream_ctl_p_ + i * 16, sv->ctl, 16 * 4, st) < 0) {
+            RAD_ERR("kv streaming: the resolve's counters could not be copied to the host: %s",
+                    rad_dev_last_error());
+            return RAD_E_STATE;
+        }
+    }
+    return RAD_OK;
+}
+
+/* Read what stream_probe_issue() enqueued, charge the metrics and, at a prompt's or request's
+ * end, log the group's line. A newly latched overflow fails every request prefilling in the step
+ * just committed and clears the latch on the card, so the next request is measured on its own;
+ * the map stays consistent, because the resolve reverts a claim it could not place. */
+int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end) {
+    if (!b || !stream_ctl_p_ || b->n_kv_groups <= 0) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_prev_.size() < n) stream_prev_.assign(n, StreamRead{});
+    RadStream st = ranks_[0]->ctx.stream();
+    bool       overflowed = false;
+    std::string overflow_why;
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv) continue;
+        const int32_t* c = stream_ctl_p_ + i * 16;
+        /* The counters are three u64s from ctl[4], hence the 8-byte alignment. */
+        const uint64_t* ctr = (const uint64_t*)(c + 4);
+        StreamRead r;
+        r.group       = (int32_t)b->kv[i].group;
+        r.misses      = (int64_t)ctr[0];
+        r.lookups     = (int64_t)ctr[1];
+        r.resolves    = (int64_t)ctr[2];
+        r.overflow    = c[3] != 0;
+        r.max_union   = c[10];
+        r.max_misses  = c[11];
+        r.max_claims  = c[12];
+        r.slots       = sv->slots;
+        r.block_bytes = sv->block_bytes;
+        const StreamRead& p = stream_prev_[i];
+        const int64_t dm = r.misses - p.misses;
+        ranks_[0]->kv.note_stream_traffic(dm, dm * r.block_bytes);
+        if (request_end || prefill_done) stream_report(request_end ? "request end" : "prefill complete", r, p);
+        if (r.overflow && !p.overflow && !overflowed) {
+            overflowed = true;
+            const KVGroupPlan* gp = ranks_[0]->kv.plan(r.group);
+            const int64_t bs = gp && gp->block_size > 0 ? gp->block_size : 1;
+            /* The largest union since bring-up, which for the failing request is the launch that
+             * overflowed. */
+            overflow_why = fmt(
+                "kv streaming overflow: group '%s' ring holds %lld blocks (%lld tokens) and one "
+                "resolve launch selected %lld distinct blocks, %lld of them not resident, so the "
+                "request is failed; raise --kv-resident above %lld tokens",
+                gp ? gp->name.c_str() : "?", (long long)r.slots, (long long)(r.slots * bs),
+                (long long)r.max_union, (long long)r.max_misses,
+                (long long)(r.max_union * bs));
+            RAD_ERR("%s", overflow_why.c_str());
+        }
+        stream_prev_[i] = r;
+    }
+    if (overflowed) {
+        (void)sched_.fail_prefilling(overflow_why.c_str());
+        for (size_t i = 0; i < n; ++i) {
+            const RadKVStream* sv = b->kv[i].stream;
+            if (sv && sv->ctl) (void)rad_memset_async(sv->ctl + 3, 0, 4, st);
+        }
+    }
+    return RAD_OK;
+}
+
+/* One line per group: the cumulative counters, the misses since the previous report and the three
+ * largest-launch figures a ring and a claim list are sized from. A launch claims at most
+ * `max_seqs * sel_pitch` blocks; a larger `largest launch claims` means that derivation is wrong. */
+void Engine::stream_report(const char* when, const StreamRead& r, const StreamRead& prev) {
+    const KVGroupPlan* gp = ranks_.empty() ? nullptr : ranks_[0]->kv.plan(r.group);
+    RAD_INFO("kv streaming: group '%s' %s: %lld resolves, %lld lookups, %lld misses (+%lld this "
+             "interval); ring %lld blocks, largest launch union %lld distinct blocks, largest "
+             "launch misses %lld, largest launch claims %lld, overflow %s",
+             gp ? gp->name.c_str() : "?", when, (long long)r.resolves, (long long)r.lookups,
+             (long long)r.misses, (long long)(r.misses - prev.misses), (long long)r.slots,
+             (long long)r.max_union, (long long)r.max_misses, (long long)r.max_claims,
+             r.overflow ? "LATCHED" : "no");
 }
 
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
@@ -918,7 +1209,7 @@ int Engine::issue_scored_rows(Rank& r) {
 
 int Engine::collect_scored_rows() {
     if (score_rows_.empty()) return RAD_OK;
-    /* step_end_ fences rank 0's stream; every other rank's copies are fenced here. */
+    /* collect_step's wait fences rank 0's stream; every other rank's copies are fenced here. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         RAD_TRY(rad_dev_set(ranks_[i]->device));
         RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
@@ -964,8 +1255,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
-    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
-    RAD_TRY(rad_event_sync(step_end_));
+    /* Wait on an event, not the stream: a step issued ahead is queued behind it. With early ids
+     * that is the ids' own copy; the step loop waits for the rest after the commit. */
+    RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());
@@ -1554,14 +1846,25 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * PCIe read and unordered against the copies that fill it (see Set in batch.h). */
     std::vector<BatchBuilder::RankIO> rio;
     rio.reserve(ranks_.size());
-    for (auto& rk : ranks_)
-        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    rank_stream_views_.assign(ranks_.size(), {});
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        const size_t ng = ranks_[r]->program.kv_groups.size();
+        rank_stream_views_[r].resize(ng, nullptr);
+        for (size_t g = 0; g < ng; ++g)
+            rank_stream_views_[r][g] = ranks_[r]->kv.stream_view((int32_t)g);
+    }
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        auto& rk = ranks_[r];
+        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program, rk->pools.kv().base(),
+                        rank_stream_views_[r].data() });
+    }
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
         auto d = std::make_unique<gen::VideoDriver>();
-        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio));
+        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio,
+                        rad_tools_video_pack(plugins_), rad_tools_encode_geom(plugins_)));
         vid_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
@@ -1607,6 +1910,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
+    if (const int xs = xstats_open(); xs < 0) return xs;
+
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
@@ -1631,6 +1936,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -1696,6 +2002,7 @@ std::string Engine::engine_info() const {
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
     e["attn_prefill_fp8"]       = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
     e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
+    e["weight_prefetch"]        = cfg_.weight_prefetch;
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
@@ -1763,6 +2070,8 @@ std::string Engine::engine_info() const {
         sp["depth"]   = drafter_.depth;
     }
     e["speculation"] = std::move(sp);
+    /* --expert-stats: where the counts are, for a client that reads them. */
+    if (xstats_) e["expert_stats"] = { { "file", xstats_->path() }, { "interval_s", 30 } };
     return e.dump();
 }
 
@@ -2668,6 +2977,8 @@ int Engine::run_server() {
         in.default_steps = vd.default_steps;
         in.max_steps = vd.max_steps;
         in.fixed_steps = vd.n_rungs > 0;
+        in.shift_video = vd.shift_video;
+        in.shift_audio = vd.shift_audio;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
         in.step_evals = vd.sched_kind == 1;
@@ -2684,6 +2995,13 @@ int Engine::run_server() {
                      "needs libx264; this build's libavcodec has none, so input_reference is "
                      "refused", in.name.c_str(), (int)in.image_crf);
         in.max_lanes = vd.max_lanes;
+        in.max_ref_images = vd.max_ref_images;
+        in.max_ref_videos = vd.max_ref_videos;
+        in.max_ref_audios = vd.max_ref_audios;
+        in.max_enc_frames = vd.max_enc_frames;
+        in.max_enc_side = vd.max_enc_side;
+        in.max_enc_samples = vd.max_enc_samples;
+        in.enc_ratio = vd.enc_ratio;
         video_bridge.drv = vid_gen_;
         d.videos = &video_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {

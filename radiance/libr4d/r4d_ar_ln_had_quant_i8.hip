@@ -163,6 +163,7 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   float* Lsc = (float*)(Lpk + (size_t)cpb * ARN_WV * ARN_NWORD);
   const int lig = lane & (ARN_LPG - 1), gw = lane / ARN_LPG;
 
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
   if constexpr (WIRE == 0) {
     // Push my rows to the peer slot. A row is K/8 16B words and rows are contiguous, so a row
     // range is a word range.
@@ -173,8 +174,10 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
     for (; k + 3 * THR < wend; k += 4 * THR) {
       int4 v0 = in4[k], v1 = in4[k + THR], v2 = in4[k + 2 * THR], v3 = in4[k + 3 * THR];
       ps[k] = v0; ps[k + THR] = v1; ps[k + 2 * THR] = v2; ps[k + 3 * THR] = v3;
+      hck += r4d_archk_u4(v0, 4u * (unsigned)k) + r4d_archk_u4(v1, 4u * (unsigned)(k + THR)) +
+             r4d_archk_u4(v2, 4u * (unsigned)(k + 2 * THR)) + r4d_archk_u4(v3, 4u * (unsigned)(k + 3 * THR));
     }
-    for (; k < wend; k += THR) ps[k] = in4[k];
+    for (; k < wend; k += THR) { const int4 v = in4[k]; ps[k] = v; hck += r4d_archk_u4(v, 4u * (unsigned)k); }
   } else {
     // Rotate, amax, quantise and pack straight into the peer's slot, keeping the same words in
     // LDS. A wave owns whole chunks, so every lane emits exactly ARN_NWORD dwords per chunk and the
@@ -201,8 +204,10 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
         float scl = (a > 0.f) ? arn_bf16_round(a * (1.0f / (float)ARN_QMAX)) : 1.0f;
         if (!(scl > 0.f)) scl = 1.0f;
         if (lig == 0) {
-          p_sc[c * ARN_CG + gl] = (unsigned short)(__float_as_uint(scl) >> 16);
+          const unsigned short sc16 = (unsigned short)(__float_as_uint(scl) >> 16);
+          p_sc[c * ARN_CG + gl] = sc16;
           Lsc[(size_t)ci * ARN_CG + gl] = scl;
+          hck += r4d_archk_mix(sc16, R4D_ARCHK_U16 + (unsigned)(c * ARN_CG + gl));
         }
         const float inv = 1.0f / scl;
 #pragma unroll
@@ -217,20 +222,30 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
       // Flush lane-contiguously region by region, widest first, so each region is one coalesced
       // store of ARN_WV x width bytes (ARN_NWORD is 3).
       char* pb = p_pay + (size_t)c * ARN_CBYTES;
+      const unsigned int cd = (unsigned)c * (ARN_CBYTES / 4);   // the chunk's first dword
 #pragma unroll
-      for (int w4 = 0; w4 + 4 <= ARN_NWORD; w4 += 4)
+      for (int w4 = 0; w4 + 4 <= ARN_NWORD; w4 += 4) {
         *(uint4*)(pb + w4 * 4 * ARN_WV + lane * 16) =
             make_uint4(acc[w4], acc[w4 + 1], acc[w4 + 2], acc[w4 + 3]);
-      if constexpr (ARN_NWORD % 4 >= 2)
+        hck += r4d_archk_u4(make_uint4(acc[w4], acc[w4 + 1], acc[w4 + 2], acc[w4 + 3]),
+                            cd + (unsigned)(w4 * ARN_WV + lane * 4));
+      }
+      if constexpr (ARN_NWORD % 4 >= 2) {
         *(uint2*)(pb + (ARN_NWORD & ~3) * 4 * ARN_WV + lane * 8) =
             make_uint2(acc[ARN_NWORD & ~3], acc[(ARN_NWORD & ~3) + 1]);
-      if constexpr (ARN_NWORD % 2 == 1)
+        const unsigned int e = cd + (unsigned)((ARN_NWORD & ~3) * ARN_WV + lane * 2);
+        hck += r4d_archk_mix(acc[ARN_NWORD & ~3], e) + r4d_archk_mix(acc[(ARN_NWORD & ~3) + 1], e + 1u);
+      }
+      if constexpr (ARN_NWORD % 2 == 1) {
         *(unsigned int*)(pb + (ARN_NWORD - 1) * 4 * ARN_WV + lane * 4) = acc[ARN_NWORD - 1];
+        hck += r4d_archk_mix(acc[ARN_NWORD - 1], cd + (unsigned)((ARN_NWORD - 1) * ARN_WV + lane));
+      }
 #pragma unroll
       for (int w = 0; w < ARN_NWORD; ++w)
         Lpk[((size_t)ci * ARN_NWORD + w) * ARN_WV + lane] = acc[w];
     }
   }
+  r4d_archk_put(hck, peer_flags, nbw, s_slot, (unsigned)b, sq);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -245,6 +260,35 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   }
   __syncthreads();
   if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, sq, [&](unsigned int& h) {
+    if constexpr (WIRE == 0) {
+      const int wpr = K >> 3;
+      for (int k = r0 * wpr + tid; k < r1 * wpr; k += THR) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    } else {
+      for (int ci = wave; ci < cpb; ci += NW) {
+        const int c = c00 + ci;
+        const char* pb = m_pay + (size_t)c * ARN_CBYTES;
+        const unsigned int cd = (unsigned)c * (ARN_CBYTES / 4);
+#pragma unroll
+        for (int w4 = 0; w4 + 4 <= ARN_NWORD; w4 += 4)
+          h += r4d_archk_u4(*(const uint4*)(pb + w4 * 4 * ARN_WV + lane * 16),
+                            cd + (unsigned)(w4 * ARN_WV + lane * 4));
+        if constexpr (ARN_NWORD % 4 >= 2) {
+          const uint2 u = *(const uint2*)(pb + (ARN_NWORD & ~3) * 4 * ARN_WV + lane * 8);
+          const unsigned int e = cd + (unsigned)((ARN_NWORD & ~3) * ARN_WV + lane * 2);
+          h += r4d_archk_mix(u.x, e) + r4d_archk_mix(u.y, e + 1u);
+        }
+        if constexpr (ARN_NWORD % 2 == 1)
+          h += r4d_archk_mix(*(const unsigned int*)(pb + (ARN_NWORD - 1) * 4 * ARN_WV + lane * 4),
+                             cd + (unsigned)((ARN_NWORD - 1) * ARN_WV + lane));
+#pragma unroll
+        for (int t = 0; t < ARN_ITERS; ++t) {
+          const int gl = t * ARN_GPW + gw;
+          if (lig == 0) h += r4d_archk_mix(m_sc[c * ARN_CG + gl], R4D_ARCHK_U16 + (unsigned)(c * ARN_CG + gl));
+        }
+      }
+    }
+  });
 
   // The peer's rows are now in my scratch, in the same [M, K] layout as X.
   const __hip_bfloat16* P = (const __hip_bfloat16*)ms;
@@ -404,9 +448,10 @@ static size_t ar_ln_lds_bytes(int rows_max, int K, int thr, int wire) {
   }
   return b;
 }
-// Dynamic LDS ceiling: a workgroup's 64 KiB less the kernel's static words (seq and slot), which
-// the runtime places in front of it.
-static constexpr size_t kArnLdsCap = 65536 - 16;
+// Dynamic LDS ceiling: a workgroup's 64 KiB less the kernel's static words, which the runtime places
+// in front of it: seq and slot, and the push check's (r4d_ar_seq.h: two 32-word sums and a flag,
+// 260 bytes), rounded up.
+static constexpr size_t kArnLdsCap = 65536 - 16 - 512;
 
 // Fewest blocks at which this shape fits: each block owns ceil(M / nb) rows, and on the compressed
 // wire each row costs a staging slice and its chunks' packed half. -1 when no block count fits (a

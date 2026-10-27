@@ -45,8 +45,14 @@ void usage() {
         "      --iters N      launches per rep (default 32). One launch is short enough that\n"
         "                     launch overhead and clock ramp would otherwise dominate.\n"
         "      --max-tok N    the max_tok declare is run at (default 8192)\n"
+        "      --max-seqs N   the max_seqs declare is run at (default 256)\n"
         "      --tp N         tensor-parallel width to declare at (default 1). The shapes a\n"
         "                     sharded deployment runs are not the shapes tp=1 runs.\n"
+        "      --kv-cache-dtype T  bf16 (default) or fp8 -- attention bands are gated on it.\n"
+        "                     Declare what the served engine runs, or the tune rows will not\n"
+        "                     match the bands it selects.\n"
+        "      --tp-wire MODE exact (default) or wht6 -- selects the all-reduce family.\n"
+        "      --tp-wire-min-kb N  the message size from which the lossy wire is used.\n"
         "      --num-speculative-tokens N|auto\n"
         "                     draft depth to declare at (default auto: the container's own). It puts\n"
         "                     the drafter's kernels in the measured graph.\n"
@@ -55,9 +61,16 @@ void usage() {
         "  -h, --help\n");
 }
 
-/* A device allocation that frees itself, because the timing path has several ways out. */
+/* A device allocation that frees itself, because the timing path has several ways out. Neither
+ * copyable nor movable: a rank holds a vector of these, and a second handle to the same
+ * allocation would free the buffer out from under a launch still reading it. */
 struct DevBuf {
     void* p = nullptr;
+    DevBuf() = default;
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+    DevBuf(DevBuf&&) = delete;
+    DevBuf& operator=(DevBuf&&) = delete;
     ~DevBuf() { if (p) rad_dev_free(p, RAD_MEM_DEVICE); }
 };
 
@@ -121,37 +134,110 @@ tune_candidates(const RadKernelInfo* k, const Geometry& g, int64_t* space_size,
     return out;
 }
 
-/* Every OUT and INOUT operand's bytes after one launch at `g`, which carries the candidate point as
- * ordinary parameters. Used to compare a candidate with the defaults. */
-int capture_outputs(const KernelRow& row, std::vector<RadTensor>& t,
-                    const Geometry& g, const RadOpSchema* schema,
-                    const std::vector<OpdShape>& sh, RadStream stream,
-                    std::vector<uint8_t>* out) {
-    RadArgs a{};
-    a.t = t.data(); a.n_t = (int)t.size();
-    a.p = g.params(); a.n_p = g.n_params();
-    a.rank = 0; a.world_size = 1;
-    DevBuf scratch;
-    if (row.info->scratch) {
-        const int64_t need = row.info->scratch(&a);
-        if (need > 0) {
-            scratch.p = rad_dev_alloc(need, RAD_MEM_DEVICE);
-            if (!scratch.p) return RAD_E_NOMEM;
-            rad_memset_async(scratch.p, 0, need, stream);
-            a.scratch = scratch.p;
-            a.scratch_bytes = need;
-        }
-    }
-    if (row.info->launch(&a, stream) < 0) return RAD_E_SHAPE;
-    if (stream && rad_stream_sync(stream) < 0) return RAD_E_STATE;
+/* One rank's side of one candidate's launch: the instance its declare made, its operands on its
+ * card, its scratch and its stream. A plain row has one; a collective has one per rank, fired
+ * together, since a rank launching alone waits for a peer flag nobody raises. The instance is the
+ * only route to the peer bundle (scratch, flags, sequence counters) init() builds, so a
+ * collective cannot launch without it. */
+struct Rank {
+    int       rank = 0, world = 1;
+    void*     instance = nullptr;
+    RadStream stream = nullptr;              /* owned by the request's StreamSet */
+    std::vector<RadTensor>            t;     /* the operands, as the kernel sees them */
+    std::vector<DevBuf>               buf;   /* ...and the allocations behind them */
+    std::vector<std::vector<uint8_t>> host;  /* the draw, only ever a copy source */
+    DevBuf    scratch;
+    int64_t   scratch_bytes = 0;
+};
 
+/* Streams die with the request, every way out of it, skips included. */
+struct StreamSet {
+    std::vector<RadStream> s;
+    ~StreamSet() { for (RadStream x : s) if (x) rad_stream_destroy(x); }
+};
+
+/* The RadArgs a rank's launch takes. The candidate's axes ride in `g` exactly as at issue, so the
+ * kernel reads `sk` with rad_args_geti() like `M`. */
+void fill_args(const KernelRow& row, Rank& r, const Geometry& g, RadArgs* a) {
+    std::memset(a, 0, sizeof(*a));
+    a->t = r.t.data();  a->n_t = (int)r.t.size();
+    a->p = g.params();  a->n_p = g.n_params();
+    a->instance   = r.instance;
+    a->rank       = r.rank;
+    a->world_size = r.world;
+    if (r.scratch.p) { a->scratch = r.scratch.p; a->scratch_bytes = r.scratch_bytes; }
+}
+
+/* Every rank's stream drained. A stream's device has to be current to sync it. */
+int sync_all(std::vector<Rank>& rs) {
+    int st = RAD_OK;
+    for (Rank& r : rs) {
+        if (!r.stream) continue;
+        if (rad_dev_set(r.rank) < 0) return RAD_E_DEVICE;
+        if (rad_stream_sync(r.stream) < 0) st = RAD_E_STATE;
+    }
+    return st;
+}
+
+/* Scratch zeroed before a candidate starts, outside the timed region: a candidate must not be
+ * timed -- or judged -- on the leftovers of the one before it. */
+int zero_scratch(std::vector<Rank>& rs) {
+    for (Rank& r : rs) {
+        if (!r.scratch.p) continue;
+        if (rad_dev_set(r.rank) < 0) return RAD_E_DEVICE;
+        if (rad_memset_async(r.scratch.p, 0, (uint64_t)r.scratch_bytes, r.stream) < 0)
+            return RAD_E_STATE;
+    }
+    return RAD_OK;
+}
+
+/* `iters` launches on every rank. A collective's ranks launch from one thread each: the exchange
+ * pipelines only once every card has work queued. A single rank launches inline, so the timed
+ * region holds no thread start.
+ *
+ * A refusal is symmetric (every rank resolved the same kernel for the same geometry, and a launch
+ * checks only the geometry and the instance), so no rank has queued work to drain; the caller
+ * treats it as fatal for the candidate. */
+int launch_all(const KernelRow& row, std::vector<Rank>& rs, const Geometry& g, int iters) {
+    auto run = [&](Rank& r) {
+        if (rad_dev_set(r.rank) < 0) return (int)RAD_E_DEVICE;
+        RadArgs a;
+        fill_args(row, r, g, &a);
+        for (int k = 0; k < iters; ++k)
+            if (const int s = row.info->launch(&a, r.stream); s < 0) return s;
+        return (int)RAD_OK;
+    };
+    if (rs.size() == 1) return run(rs[0]);
+    std::vector<int> st(rs.size(), (int)RAD_E_STATE);
+    std::vector<std::thread> th;
+    th.reserve(rs.size());
+    for (size_t i = 0; i < rs.size(); ++i) th.emplace_back([&, i] { st[i] = run(rs[i]); });
+    for (std::thread& t : th) t.join();
+    for (int s : st) if (s < 0) return s;
+    return RAD_OK;
+}
+
+/* Rank 0's OUT and INOUT bytes after one launch at `g`, which carries the candidate point as
+ * ordinary parameters. Every candidate saw the same bytes on every rank, so a variant that
+ * reorders a reduction, drops a peer's term, or writes the wrong slice differs from the defaults
+ * here. */
+int capture_outputs(const KernelRow& row, std::vector<Rank>& rs, const Geometry& g,
+                    const RadOpSchema* schema, const std::vector<OpdShape>& sh,
+                    std::vector<uint8_t>* out) {
+    if (const int z = zero_scratch(rs)) return z;
+    const int w = launch_all(row, rs, g, 1);
+    if (w < 0) return w;
+    if (const int s = sync_all(rs)) return s;
+
+    Rank& r = rs[0];
+    if (rad_dev_set(r.rank) < 0) return RAD_E_DEVICE;
     /* Size the destination before copying: growing it between async copies would reallocate it
      * under copies still in flight. */
     size_t total = 0;
     for (size_t k = 0; k < sh.size() && k < (size_t)schema->n_operands; ++k) {
         const int role = schema->operands[k].role;
         if (role != RAD_OPD_OUT && role != RAD_OPD_INOUT) continue;
-        if (!t[k].data) continue;
+        if (!r.t[k].data) continue;
         const int64_t bytes = rad_dtype_bytes(sh[k].dtype, rad_numel(sh[k].shape));
         if (bytes > 0) total += (size_t)bytes;
     }
@@ -160,13 +246,14 @@ int capture_outputs(const KernelRow& row, std::vector<RadTensor>& t,
     for (size_t k = 0; k < sh.size() && k < (size_t)schema->n_operands; ++k) {
         const int role = schema->operands[k].role;
         if (role != RAD_OPD_OUT && role != RAD_OPD_INOUT) continue;
-        if (!t[k].data) continue;
+        if (!r.t[k].data) continue;
         const int64_t bytes = rad_dtype_bytes(sh[k].dtype, rad_numel(sh[k].shape));
         if (bytes <= 0) continue;
-        if (rad_memcpy_async(out->data() + at, t[k].data, bytes, stream) < 0) return RAD_E_STATE;
+        if (rad_memcpy_async(out->data() + at, r.t[k].data, bytes, r.stream) < 0)
+            return RAD_E_STATE;
         at += (size_t)bytes;
     }
-    if (stream && rad_stream_sync(stream) < 0) return RAD_E_STATE;
+    if (rad_stream_sync(r.stream) < 0) return RAD_E_STATE;
     return RAD_OK;
 }
 
@@ -203,43 +290,30 @@ double max_rel_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b
     return worst;
 }
 
-/* Median microseconds per launch at `g` (which carries the candidate point). Negative means the
- * kernel refused the shape at its entry point (spec 2.1), which is allowed: tune_valid prunes only
- * what the geometry alone can rule out. */
-double time_point(const KernelRow& row, std::vector<RadTensor>& t,
-                  const Geometry& g, int reps, int iters,
-                  RadStream stream, double* spread_pct) {
-    RadArgs a{};
-    a.t = t.data(); a.n_t = (int)t.size();
-    a.p = g.params(); a.n_p = g.n_params();
-    a.rank = 0; a.world_size = 1;
-    /* Scratch must be device memory: e.g. a split-K GEMM writes its partial planes there. */
-    DevBuf scratch;
-    if (row.info->scratch) {
-        const int64_t need = row.info->scratch(&a);
-        if (need > 0) {
-            scratch.p = rad_dev_alloc(need, RAD_MEM_DEVICE);
-            if (!scratch.p) return (double)RAD_E_NOMEM;
-            rad_memset_async(scratch.p, 0, need, stream);
-            a.scratch = scratch.p;
-            a.scratch_bytes = need;
-        }
-    }
+/* Median microseconds per iteration at `g` (which carries the candidate point): the wall time of
+ * `iters` launches on every rank, from the first launch to the last stream drained. Negative
+ * means the kernel refused the shape at its entry point (spec 2.1), which is allowed: tune_valid
+ * prunes only what the geometry alone can rule out.
+ *
+ * The clock stops only after the devices finish: launches are asynchronous, so without the sync
+ * this would time host submission. For a collective that is doubly true -- the exchange's cost is
+ * the wait for the peer, and the wait happens on the card, so a rank timed alone would report a
+ * local copy. */
+double time_point(const KernelRow& row, std::vector<Rank>& rs, const Geometry& g,
+                  int reps, int iters, double* spread_pct) {
+    if (const int z = zero_scratch(rs)) return (double)z;
 
     /* A warm-up launch; its status decides whether this candidate serves the shape at all. */
-    const int s = row.info->launch(&a, stream);
-    if (s < 0) return (double)s;
-    if (stream && rad_stream_sync(stream) < 0) return (double)RAD_E_STATE;
+    const int w = launch_all(row, rs, g, 1);
+    if (w < 0) return (double)w;
+    if (const int s = sync_all(rs)) return (double)s;
 
-    /* Stop the clock only after the device finishes: launches are asynchronous, so without the
-     * sync this would time host submission only. */
     std::vector<double> us;
     us.reserve((size_t)reps);
     for (int r = 0; r < reps; ++r) {
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i)
-            if (row.info->launch(&a, stream) < 0) return (double)RAD_E_SHAPE;
-        if (stream && rad_stream_sync(stream) < 0) return (double)RAD_E_STATE;
+        if (const int s = launch_all(row, rs, g, iters)) return (double)s;
+        if (const int s = sync_all(rs)) return (double)s;
         const auto t1 = std::chrono::steady_clock::now();
         us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count() / iters);
     }
@@ -257,7 +331,11 @@ int main(int argc, char** argv) {
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
     int      reps = 5, iters = 32;
     int64_t  max_tok = 8192;
+    int64_t  max_seqs = 256;
     int      tp = 1, spec = -1;          /* -1 = the container's own drafter depth */
+    int      kv_dtype = RAD_DT_INVALID;  /* RAD_F8E4M3 = the engine's --kv-cache-dtype fp8 */
+    int      wire_lossy = 0;             /* the engine's --tp-wire wht6 */
+    int64_t  wire_min_kb = 128;          /* the engine's --tp-wire-min-kb */
     bool     dry = false, verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -279,7 +357,24 @@ int main(int argc, char** argv) {
         else if (a == "--reps")    reps = (int)num("--reps", 1, INT32_MAX);
         else if (a == "--iters")   iters = (int)num("--iters", 1, INT32_MAX);
         else if (a == "--max-tok") max_tok = num("--max-tok", 1, INT64_MAX);
+        else if (a == "--max-seqs") max_seqs = num("--max-seqs", 1, INT64_MAX);
         else if (a == "--tp")      tp   = (int)num("--tp", 1, INT32_MAX);
+        else if (a == "--kv-cache-dtype") {
+            const char* v = next("--kv-cache-dtype");
+            if (!std::strcmp(v, "fp8"))      kv_dtype = RAD_F8E4M3;
+            else if (!std::strcmp(v, "bf16")) kv_dtype = RAD_DT_INVALID;
+            else { std::fprintf(stderr, "rad-tune: --kv-cache-dtype: '%s' is not one of "
+                                "bf16, fp8 (the tuner tunes the bands it declares; other "
+                                "encodings are the engine's)\n", v); return 2; }
+        }
+        else if (a == "--tp-wire") {
+            const char* v = next("--tp-wire");
+            if (!std::strcmp(v, "wht6"))        wire_lossy = 1;
+            else if (!std::strcmp(v, "exact"))  wire_lossy = 0;
+            else { std::fprintf(stderr, "rad-tune: --tp-wire: '%s' is not one of exact, wht6\n",
+                                v); return 2; }
+        }
+        else if (a == "--tp-wire-min-kb") wire_min_kb = num("--tp-wire-min-kb", 0, INT64_MAX);
         else if (a == "--num-speculative-tokens") {
             /* `auto` is the container's own depth, as the engine's flag of this name reads it. */
             const char* v = next("--num-speculative-tokens");
@@ -332,17 +427,44 @@ int main(int argc, char** argv) {
      * the speculative depth decides whether the drafter (and its shapes) is in the graph. */
     RadBuildCtx ctx{};
     ctx.rank = 0; ctx.world_size = tp; ctx.max_tok = max_tok;
+    ctx.max_seqs = max_seqs;
+    ctx.tp_wire_lossy = wire_lossy;
+    ctx.tp_wire_min_bytes = wire_min_kb * 1024;
+    ctx.kv_dtype = kv_dtype;
     RadArchProbe probe{};
     (void)rad_tools_probe(plugins, meta, &probe);
     ctx.max_spec = spec >= 0 ? spec : probe.draft_depth;
-    ctx.max_seqs = 256; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
+    ctx.max_seqs = max_seqs; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
+
+    /* Peer access, measured before selection, as Engine does: collectives constrain device.p2p
+     * (abi/rad_types.h), and with the fact unset neither the peer-to-peer row nor its host-memory
+     * twin can match, so every collective resolves to nothing -- silently, with no tune request
+     * for it ever reaching the loop below. Every ordered pair is asked, since access is granted
+     * one way at a time. */
+    long long p2p = 1;
+    for (int i = 0; i < tp; ++i)
+        for (int j = 0; j < tp; ++j) {
+            if (i == j) continue;
+            const int a = rad_dev_peer_access(i, j);
+            if (a < 0) {
+                std::fprintf(stderr, "rad-tune: could not ask whether card %d can reach card %d's "
+                                     "memory: %s\n", i, j, rad_dev_last_error());
+                return 1;
+            }
+            if (a == 0) p2p = 0;
+        }
+    rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
+    const char* p2p_note = p2p ? "peer to peer" : "the collectives run through pinned host memory";
 
     /* Every rank declares concurrently on its own thread and device, as Engine does: kernel init()
-     * runs from declare, and a collective's init is a rendezvous (libr4d's all-reduce waits for
-     * its peers), so declaring rank 0 alone would hang. Only rank 0's program is measured. */
-    Program prog;
+     * runs from declare, and a collective's init is a rendezvous (libr4d's all-reduce waits for its
+     * peers), so declaring rank 0 alone would hang.
+     *
+     * All the programs stay alive, not only rank 0's. A collective's launch needs the instance each
+     * rank's own declare made, and an instance is reachable only through the program that declared
+     * it, so rank 0's program is the one measured while the others supply the peers. */
+    std::vector<Program> progs((size_t)tp);
     {
-        std::vector<Program> progs((size_t)tp);
         std::vector<int>     st((size_t)tp, 0);
         std::vector<std::thread> th;
         for (int ri = 0; ri < tp; ++ri) {
@@ -362,7 +484,16 @@ int main(int argc, char** argv) {
         for (auto& t : th) t.join();
         if (tp > 1) rad_dev_set(0);
         for (int ri = 0; ri < tp; ++ri) if (st[(size_t)ri] < 0) return 1;
-        prog = std::move(progs[0]);
+    }
+    Program& prog = progs[0];
+
+    /* Name what resolved to nothing, so a hole is a printed line instead of a tune request that
+     * never appears: the engine's declare counts the misses, and this is the count's detail. */
+    if (!prog.misses.empty()) {
+        RadDeviceProps dp{};
+        const bool host_backend = rad_dev_props(0, &dp) >= 0 && dp.is_host_backend;
+        for (const Program::Miss* m : prog.device_holes(host_backend))
+            std::printf("  unresolved  %s\n", m->line().c_str());
     }
 
     if (machine.empty()) machine = rad_machine_key();
@@ -378,6 +509,7 @@ int main(int argc, char** argv) {
 
     std::printf("rad-tune %s\n", model.c_str());
     std::printf("  machine      %s\n", machine.c_str());
+    if (tp > 1) std::printf("  p2p          %s\n", p2p_note);
     std::printf("  cache        %s (%zu existing row(s))\n", src.c_str(), before);
     std::printf("  requests     %zu (kernel, shape) pair(s) the declared graph reaches\n\n",
                 prog.tune_requests.size());
@@ -392,14 +524,6 @@ int main(int argc, char** argv) {
     /* tune_requests lacks the operand list, so schemas are looked up by the kernel's op name. */
     int measured = 0, skipped = 0, single = 0;
     std::map<std::string, int> skip_why;
-
-    /* One explicit stream for the run; timing on the null stream would measure host submission.
-     * Without ROCm the device layer is a synchronous host stub, so the same path works. */
-    RadStream stream = nullptr;
-    if (rad_stream_create(&stream, 0) < 0) {
-        std::fprintf(stderr, "rad-tune: could not create a stream: %s\n", rad_dev_last_error());
-        return 1;
-    }
 
     for (const Program::TuneRequest& tr : prog.tune_requests) {
         const KernelRow* row = row_for(tr.plugin, tr.kernel);
@@ -480,31 +604,114 @@ int main(int argc, char** argv) {
         }
         const int64_t vocab_rows = kf_vocab_rows(kop);
 
-        /* One set of device buffers shared by all candidates, so they all see the same bytes.
-         * `store` is the host-side draw, only ever a copy source; RadTensor::data must be the
-         * device allocation (a host address would fail silently). */
-        std::vector<std::vector<uint8_t>> store(sh.size());
-        std::vector<DevBuf>               dev(sh.size());
-        std::vector<RadTensor>            t(sh.size());
+        /* One set of operands per rank: a collective's ranks contribute their own bytes on their own
+         * card, with the instance their own declare made. Each rank draws different bytes, so a
+         * kernel that read its own contribution twice cannot pass. `rs` is sized once and never
+         * grown: a moved DevBuf would leave its old handle to free the buffer too. */
+        const int world = row->collective && tp > 1 ? tp : 1;
+        std::string scale;
+        if (world > 1) scale = ", " + std::to_string(world) + " ranks";
+        std::vector<Rank> rs((size_t)world);
+        StreamSet streams;
         bool ok = true;
-        for (size_t k = 0; k < sh.size() && ok; ++k) {
-            const int64_t n = rad_numel(sh[k].shape);
-            const int64_t bytes = rad_dtype_bytes(sh[k].dtype, n);
-            if (bytes <= 0) { ok = false; break; }
-            kf_draw(kop, k, M, vocab_rows, rad_case_seed(1, op, 0, row->info->domain, (int)k),
-                    &store[k]);
-            dev[k].p = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
-            if (!dev[k].p) { ok = false; break; }
-            if (rad_memcpy_async(dev[k].p, store[k].data(), bytes, stream) < 0) { ok = false; break; }
-            t[k].data = dev[k].p;
-            t[k].dtype = sh[k].dtype;
-            t[k].rank = (uint32_t)sh[k].shape.size();
-            for (size_t d = 0; d < sh[k].shape.size() && d < RAD_MAX_RANK; ++d)
-                t[k].shape[d] = sh[k].shape[d];
-            rad_tensor_pack(&t[k]);
+        for (int ri = 0; ri < world && ok; ++ri) {
+            Rank& r = rs[(size_t)ri];
+            r.rank = ri;  r.world = world;
+            /* The instance is found by the key the cache uses, not by position: a rank that
+             * resolved a different kernel for this band has no peer to exchange with. A
+             * collective cannot launch without it; a plain kernel has none, and null is exactly
+             * what its launch expects. */
+            const Program::TuneRequest* q = &tr;
+            if (ri > 0) {
+                q = nullptr;
+                for (const auto& p : progs[(size_t)ri].tune_requests)
+                    if (p.kernel == tr.kernel && p.plugin == tr.plugin &&
+                        p.geom_key == tr.geom_key) { q = &p; break; }
+            }
+            if (world > 1 && (!q || !q->instance)) {
+                skip_why[op + "  (rank " + std::to_string(ri) + " declared no instance for this "
+                         "instantiation: no exchange to launch)"]++;
+                ++skipped; ok = false; break;
+            }
+            r.instance = q ? q->instance : nullptr;
+            if (rad_dev_set(ri) < 0) {
+                skip_why[op + "  (no device to put rank " + std::to_string(ri) + " on)"]++;
+                ++skipped; ok = false; break;
+            }
+            /* An explicit stream per rank; timing on the null stream would measure host
+             * submission. Without ROCm the device layer is a synchronous host stub, and the
+             * same path still works. */
+            RadStream s = nullptr;
+            if (rad_stream_create(&s, 0) < 0) {
+                std::fprintf(stderr, "rad-tune: could not create a stream for rank %d: %s\n", ri,
+                             rad_dev_last_error());
+                return 1;
+            }
+            streams.s.push_back(s);
+            r.stream = s;
+            /* Inputs come from kf_draw, the same draw rad-kbench checks with, so each operand
+             * stays in the domain its recipe states (constant `seqused`, cumulative lengths,
+             * distinct scatter destinations, in-range block tables). */
+            r.host.resize(sh.size());
+            r.buf = std::vector<DevBuf>(sh.size());
+            r.t   = std::vector<RadTensor>(sh.size());
+            for (size_t k = 0; k < sh.size(); ++k) {
+                /* An absent operand (attn's descales and cu_seqlens) is a zeroed tensor: no
+                 * draw, no allocation, data null -- what kbench passes and the kernel checks. */
+                if (sh[k].absent) continue;
+                const int64_t bytes = rad_dtype_bytes(sh[k].dtype, rad_numel(sh[k].shape));
+                if (bytes <= 0) {
+                    skip_why[op + "  (an operand has a plugin-private dtype the core cannot "
+                             "size)"]++;
+                    ++skipped; ok = false; break;
+                }
+                kf_draw(kop, k, M, vocab_rows,
+                        rad_case_seed(1, op, ri, row->info->domain, (int)k), &r.host[k]);
+                r.buf[k].p = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+                if (!r.buf[k].p) {
+                    skip_why[op + "  (no device memory for an operand on rank " +
+                             std::to_string(ri) + ")"]++;
+                    ++skipped; ok = false; break;
+                }
+                if (rad_memcpy_async(r.buf[k].p, r.host[k].data(), bytes, r.stream) < 0) {
+                    skip_why[op + "  (the operands would not copy onto rank " +
+                             std::to_string(ri) + ")"]++;
+                    ++skipped; ok = false; break;
+                }
+                /* RadTensor::data must be the device allocation; a host address fails silently. */
+                RadTensor& t = r.t[k];
+                t = RadTensor{};
+                t.data  = r.buf[k].p;
+                t.dtype = sh[k].dtype;
+                t.rank  = (uint32_t)sh[k].shape.size();
+                for (size_t d = 0; d < sh[k].shape.size() && d < RAD_MAX_RANK; ++d)
+                    t.shape[d] = sh[k].shape[d];
+                rad_tensor_pack(&t);
+            }
         }
-        if (!ok) { skip_why[op + "  (an operand has a plugin-private dtype the core cannot "
-                                 "size)"]++; ++skipped; continue; }
+        /* Scratch sized from each rank's own arguments: a split kernel writes its partials to
+         * device memory, and every card needs its own. */
+        if (ok && row->info->scratch) {
+            for (Rank& r : rs) {
+                if (rad_dev_set(r.rank) < 0) {
+                    skip_why[op + "  (no device to size scratch on for rank " +
+                             std::to_string(r.rank) + ")"]++;
+                    ++skipped; ok = false; break;
+                }
+                RadArgs a;
+                fill_args(*row, r, tr.geom, &a);
+                const int64_t need = row->info->scratch(&a);
+                if (need <= 0) continue;
+                r.scratch.p = rad_dev_alloc(need, RAD_MEM_DEVICE);
+                if (!r.scratch.p) {
+                    skip_why[op + "  (no device memory for the scratch it asks for)"]++;
+                    ++skipped; ok = false; break;
+                }
+                r.scratch_bytes = need;
+            }
+        }
+        if (!ok) continue;                    /* the reason is already counted */
+        if (world > 1) rad_dev_set(0);
 
         /* One geometry per candidate, built up front. As at issue, the chosen values are appended
          * to the resolved geometry, so a launch reads `sk` via rad_args_geti() like `M`. */
@@ -518,7 +725,7 @@ int main(int argc, char** argv) {
         std::vector<double> best_us((size_t)n_var, -1.0), spread((size_t)n_var, 0.0);
         for (int v = 0; v < n_var; ++v) {
             double sp = 0;
-            best_us[(size_t)v] = time_point(*row, t, gv[(size_t)v], reps, iters, stream, &sp);
+            best_us[(size_t)v] = time_point(*row, rs, gv[(size_t)v], reps, iters, &sp);
             spread[(size_t)v] = sp;
         }
 
@@ -530,7 +737,7 @@ int main(int argc, char** argv) {
          * kVariantTol allows the last-bit changes of a reordered reduction. */
         std::vector<uint8_t> ref;
         std::vector<double>  verr((size_t)n_var, 0.0);
-        if (best_us[0] <= 0 || capture_outputs(*row, t, gv[0], schema, sh, stream, &ref) < 0) {
+        if (best_us[0] <= 0 || capture_outputs(*row, rs, gv[0], schema, sh, &ref) < 0) {
             skip_why[tr.plugin + "/" + tr.kernel + "  (the defaults refused the shape: no "
                      "reference to check candidates against)"]++;
             ++skipped;
@@ -539,7 +746,7 @@ int main(int argc, char** argv) {
         for (int v = 1; v < n_var; ++v) {
             if (best_us[(size_t)v] <= 0) continue;
             std::vector<uint8_t> got;
-            if (capture_outputs(*row, t, gv[(size_t)v], schema, sh, stream, &got) < 0) {
+            if (capture_outputs(*row, rs, gv[(size_t)v], schema, sh, &got) < 0) {
                 best_us[(size_t)v] = (double)RAD_E_STATE;
                 continue;
             }
@@ -589,8 +796,9 @@ int main(int argc, char** argv) {
         cache.put(tr_out);
         ++measured;
 
-        std::printf("  %-22s %-46s %-28s %9.3f us  (%d of %lld)\n", op.c_str(),
-                    tr.geom.str().c_str(), wname.c_str(), tr_out.us, n_var, (long long)space);
+        std::printf("  %-22s %-46s %-28s %9.3f us  (%d of %lld%s)\n", op.c_str(),
+                    tr.geom.str().c_str(), wname.c_str(), tr_out.us, n_var, (long long)space,
+                    scale.c_str());
     }
 
     if (dry) {
@@ -606,8 +814,6 @@ int main(int argc, char** argv) {
     if (single)
         std::printf("\n%d request(s) had one point or none: nothing to choose, and the kernel's\n"
                     "own axis defaults are already what it runs.\n", single);
-
-    rad_stream_destroy(stream);
 
     cache.set_machine(machine);
     if (cache.save(save_home) < 0) return 1;

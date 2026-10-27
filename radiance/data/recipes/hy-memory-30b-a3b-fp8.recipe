@@ -1,0 +1,34 @@
+# hy-memory-30b-a3b-fp8.recipe -- Tencent's Hy-Memory-30B-A3B-FP8 release.
+#
+#   rad-convert <Hy-Memory-30B-A3B-FP8 checkpoint directory> \
+#       --recipe data/recipes/hy-memory-30b-a3b-fp8.recipe --kv-cache-dtype fp8 \
+#       -o hy-memory-30b-a3b-fp8.rad
+#
+# The checkpoint stores E4M3 projection codes with one F32 weight scale per tensor. Import keeps
+# those codes and expands each scalar to the 128x128 F32 scale grid read by Radiance's FP8 GEMMs.
+# Runtime activation quantization is dynamic; source `.input_scale` calibration scalars are ignored.
+# The attention/MLP norms and router projection are widened to F32 (exact for BF16 source values),
+# as required by their RMSNorm and FP32 sigmoid-router kernels. Embeddings, lm_head, and the model's
+# BF16 activations remain BF16; expert correction biases are already F32.
+#
+# The indexed kv_cache_scales.safetensors tensors are carried into model metadata during import.
+# The plugin can use those per-layer K/V descales for an E4M3 KV cache (`--kv-cache-dtype fp8`),
+# or use a BF16 cache for higher precision.
+
+blk.*.attn_q.weight                   import block=128x128 scale=f32
+blk.*.attn_k.weight                   import block=128x128 scale=f32
+blk.*.attn_v.weight                   import block=128x128 scale=f32
+blk.*.attn_output.weight              import block=128x128 scale=f32
+blk.0.ffn_gate_up.weight              import block=128x128 scale=f32
+blk.0.ffn_down.weight                 import block=128x128 scale=f32
+blk.*.ffn_gate_up_exps.*.weight       import block=128x128 scale=f32
+blk.*.ffn_down_exps.*.weight          import block=128x128 scale=f32
+blk.*.ffn_gate_up_shexp.weight        import block=128x128 scale=f32
+blk.*.ffn_down_shexp.weight           import block=128x128 scale=f32
+
+blk.*.attn_norm.weight                cast dtype=f32
+blk.*.attn_q_norm.weight              cast dtype=f32
+blk.*.attn_k_norm.weight              cast dtype=f32
+blk.*.ffn_norm.weight                 cast dtype=f32
+blk.*.glm_router.weight               cast dtype=f32
+output_norm.weight                    cast dtype=f32

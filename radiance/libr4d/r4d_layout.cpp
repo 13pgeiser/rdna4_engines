@@ -939,10 +939,168 @@ extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-/* ---- the MoE experts. The weight is staged through LDS, so it is not permuted: the int4 plane is
- * the canonical one with each dword's nibbles reordered for the expansion (byte b holds element b
- * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same
- * plane with the weight Hadamard-rotated per group, accepted only from an encoding that says so. */
+/* gemm_nt_q_gated_mx's weights are gemm_nt_q's mxfp4a8 planes in the same stored forms, but its
+ * `b_ref` is operand 4, where gemm_nt_q has `y`: mapped to gemm_nt_q's index, so both ops ask for
+ * the reference plane in one form and the loader stores it once. */
+static int mx_gated_operand(int operand) {
+    return operand == Q_B || operand == Q_BSCALE ? operand : operand == 4 ? Q_BREF : -1;
+}
+
+extern "C" int r4d_rad_layout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout* out) {
+    const int o = mx_gated_operand(operand);
+    return o < 0 ? RAD_E_UNSUPPORTED : r4d_rad_layout_mxfp4(p, n_p, o, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const RadTensor* pl, int n, void* dst,
+                                            int64_t dst_bytes) {
+    const int o = mx_gated_operand(operand);
+    return o < 0 ? RAD_E_UNSUPPORTED
+                 : r4d_rad_relayout_mxfp4(p, n_p, o, enc, sel, pl, n, dst, dst_bytes);
+}
+
+/* ---- M2XFP4: the M2 analogue of MXFP4 above, the paper's weight-side Sg-EM (arXiv 2601.19213
+ * §4.4.2). The quantiser's own scheme "m2xfp4", three TILED planes over the same 32-column groups:
+ *
+ *   codes  fp4_e2m1  [1 x 1]   element 2j in bits 0-3 of byte j -- radiance MXFP4's codes
+ *   scale  e8m0      [1 x 32]  per group, the adaptive bias already folded into the stored byte
+ *   meta   u8        [1 x 32]  one byte a group: subgroup s = columns [8s, 8s+8), bits [2s, 2s+2)
+ *
+ * The exact element is e2m1mag[c&7] . sign(c) . 2^(scale-127) . (1 + k_s/4). What the kernels read
+ * is the mxfp4 arrangement with the meta plane riding the stored weight's tail, in the scale
+ * plane's [K/32][N] order: codes in fragment order, then K/32 rows of N meta bytes, so both GEMM
+ * rows read it with the exponents' own geometry (r4d_gemm_m2xfp4a8_*.hip). b_ref stays each row's
+ * largest exponent byte, the same derivation a reader of the plane could compute -- and it is what
+ * bounds the fold: d >= 0 for every block, so the largest e4m3 a table cell holds is the x1.75
+ * magnitude 10.5 scaled by 2^-d, a normal at every d >= 0.
+ *
+ * Anything else is refused: this kernel library decodes one scheme, and a weight whose meta plane
+ * said something else would decode to other numbers.
+ *
+ * A rotated weight (ParoQuant's M2XFP4) carries the same three planes in the basis its "givens"
+ * transform names, with the rotation's tables beside them -- the rotated MXFP4 weight's shape plus
+ * the meta plane. The GEMM reads the planes as for an unrotated weight; the rotation is applied to
+ * the activation (givens_dense_quant), whose tables are separate weight operands. */
+namespace {
+/* The scheme's three planes, whichever kind of weight carries them. */
+bool m2_planes(const RadEncoding* enc) {
+    if (!enc || !rad_enc_is(enc, "m2xfp4")) return false;
+    if (enc->plane[0].dtype != RAD_FP4E2M1 || enc->plane[0].block[0] != 1 ||
+        enc->plane[0].block[1] != 1)
+        return false;
+    const int s = rad_enc_find(enc, "scale"), m = rad_enc_find(enc, "meta");
+    if (s < 0 || m < 0) return false;
+    if (enc->plane[s].dtype != RAD_E8M0 || enc->plane[s].kind != RAD_PLANE_TILED ||
+        enc->plane[s].block[0] != 1 || enc->plane[s].block[1] != R4D_MXFP4_GROUP)
+        return false;
+    if (enc->plane[m].dtype != RAD_U8 || enc->plane[m].kind != RAD_PLANE_TILED ||
+        enc->plane[m].block[0] != 1 || enc->plane[m].block[1] != R4D_MXFP4_GROUP)
+        return false;
+    return true;
+}
+
+/* A rotated one: the three planes in the basis of a "givens" transform, whose tables are views of
+ * the weight's planes. Only the presence and the dtype of the tables is checked here (the arch
+ * declares them as operands the rotation op reads); any other transform would decode to other
+ * numbers, so it is refused. */
+bool m2_paro_enc(const RadEncoding* enc, long long K) {
+    if (!enc || std::strncmp(enc->transform, "givens", RAD_ENC_STR) != 0) return false;
+    if (enc->n_planes < 6 || !rad_enc_valid(enc) || !m2_planes(enc)) return false;
+    const int p = rad_enc_find(enc, "t.pairs"), an = rad_enc_find(enc, "t.angle"),
+              sc = rad_enc_find(enc, "t.scale");
+    if (p < 0 || an < 0 || sc < 0) return false;
+    if (enc->plane[p].dtype != RAD_I32 || enc->plane[an].dtype != RAD_F32 ||
+        enc->plane[sc].dtype != RAD_F32)
+        return false;
+    /* The quantiser rotates whole groups of 128 columns, one scale per group. */
+    return K % 128 == 0 && enc->plane[p].extent[1] == K;
+}
+
+int m2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                  const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
+    if (!out || !pl) return RAD_E_INVAL;
+    WGeom g;
+    int rc = wgeom(p, n_p, R4D_MXFP4_GROUP, &g);
+    if (rc != RAD_OK) return rc;
+    if (g.group != R4D_MXFP4_GROUP || g.K % 16) return RAD_E_SHAPE;
+    if (!m2_planes(enc)) return RAD_E_DTYPE;
+    const bool plain = !enc->transform[0] && enc->n_planes == 3;
+    if (!plain && !m2_paro_enc(enc, g.K)) return RAD_E_DTYPE;
+    if (gout) *gout = g;
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    if (operand == Q_BSCALE || operand == Q_BREF) {
+        if (!selects(enc, sel, n, "scale") || !dims(pl[0], g.N, nblk)) return RAD_E_SHAPE;
+        if (operand == Q_BSCALE) fill(out, "r4d.mxfp4.e8m0", R4D_DT_E8M0, nblk, g.N, nblk * g.N);
+        else                     fill(out, "r4d.mxfp4.wref", R4D_DT_E8M0, g.N, 1, g.N);
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    /* The weight operand takes codes and meta: the codes go to fragment order, the meta to the
+     * stored blob's tail. */
+    if (!selects(enc, sel, n, "codes", "meta") || !dims(pl[0], g.N, g.K) ||
+        !dims(pl[1], g.N, nblk))
+        return RAD_E_SHAPE;
+    fill(out, "r4d.m2xfp4.frag.g32.meta", R4D_DT_M2XFP4_FRAG, g.N, g.K,
+         g.N * g.K / 2 + nblk * g.N);
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_m2xfp4(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, RadLayout* out) {
+    return m2_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
+}
+
+extern "C" int r4d_rad_relayout_m2xfp4(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                       int n, void* dst, int64_t dst_bytes) {
+    RadLayout L;
+    WGeom g;
+    const int rc = m2_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    std::memset(dst, 0, (size_t)dst_bytes);
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    uint8_t* d = (uint8_t*)dst;
+    if (operand == Q_BSCALE || operand == Q_BREF) {
+        const uint8_t* e = pdata(pl[0]);
+        for (long long nn = 0; nn < g.N; ++nn) {
+            uint8_t mx = 0;
+            for (long long b = 0; b < nblk; ++b) {
+                const uint8_t v = e[nn * nblk + b];
+                if (operand == Q_BSCALE) d[b * g.N + nn] = v;
+                if (v > mx) mx = v;
+            }
+            if (operand == Q_BREF) d[nn] = mx;
+        }
+        return RAD_OK;
+    }
+    /* Codes to fragment order (mx_slot, as r4d_rad_relayout_mxfp4), then the meta plane appended:
+     * canonical [N][K/32] read into stored [K/32][N]. */
+    const uint8_t* meta = pdata(pl[1]);
+    uint8_t* md = d + g.N * g.K / 2;
+    for (long long nn = 0; nn < g.N; ++nn) {
+        const uint8_t* row = pdata(pl[0]) + nn * (g.K / 2);
+        for (long long k = 0; k < g.K; ++k) {
+            const uint8_t code = (uint8_t)((row[k >> 1] >> (4 * (k & 1))) & 0xF);
+            const long long idx = mx_slot(g, nn, k);
+            if (k & 1) d[idx] = (uint8_t)((d[idx] & 0x0Fu) | (uint32_t)(code << 4));
+            else       d[idx] = (uint8_t)((d[idx] & 0xF0u) | code);
+        }
+        for (long long b = 0; b < nblk; ++b) md[b * g.N + nn] = meta[nn * nblk + b];
+    }
+    return RAD_OK;
+}
+
+/* ---- the MoE experts. I4 at BF16 scales per 128 K uses 16-column/64-K fragment tiles,
+ * coalescing a wave's register loads without another copy of the weight. The staged prefill
+ * kernels read the same tiles back in row segments. Subgroup-scaled codebooks keep their
+ * row-major nibble permutation, and FP8 is unchanged. `w4a8h` has the same packing with the weight Hadamard-rotated per group,
+ * accepted only from an encoding that says so. */
 namespace {
 int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
@@ -980,12 +1138,14 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
            : !selects(enc, sel, n, "codes"))
         return RAD_E_SHAPE;
     if (!dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+    if (!g64 && (g.N % 16 || g.K % 64)) return RAD_E_SHAPE;
     if (w5) {
         fill(out, "r4d.moew5nh64.w", R4D_DT_MOEW5, g.N, g.K, g.N * (g.K / 8) * 5);
         return RAD_OK;
     }
-    fill(out, g64 == 4 ? "r4d.moew4nh32.w" : g64 ? "r4d.moew4nh64.w" : nl ? "r4d.moew4nh.w.g128"
-                    : moe_w4_rot(p, n_p) ? "r4d.moew4h.w.g128" : "r4d.moew4.w.g128",
+    fill(out, g64 == 4 ? "r4d.moew4nh32.w" : g64 ? "r4d.moew4nh64.w"
+                    : nl ? "r4d.moew4nh.w.t16k64.g128"
+                    : moe_w4_rot(p, n_p) ? "r4d.moew4h.w.t16k64.g128" : "r4d.moew4.w.t16k64.g128",
          R4D_DT_MOEW4, g.N, g.K, g.N * g.K / 2);
     return RAD_OK;
 }
@@ -1039,10 +1199,39 @@ void moew4_permute(const uint8_t* s, uint8_t* d, int64_t bytes, bool forward) {
         std::memcpy(d + i, &w, 4);
     }
 }
+/* Signed-I4 fragment tiles: [N/16][K/64][lane=32][step=4] dwords. A lane owns column
+ * lane%16 and K bytes step*16 + (lane/16)*8 .. +7, in the nibble order above. Two adjacent
+ * canonical dwords supply the low/high lane halves; the inverse restores the exact source codes.
+ * No precision or byte-count change, and no second resident weight plane. */
+void moew4_frag_permute(const uint8_t* src, uint8_t* dst, int64_t N, int64_t K, bool forward) {
+    for (int64_t nt = 0; nt < N / 16; ++nt)
+        for (int64_t kb = 0; kb < K / 64; ++kb)
+            for (int64_t n = 0; n < 16; ++n)
+                for (int64_t s = 0; s < 4; ++s) {
+                    const size_t canonical = (size_t)((nt * 16 + n) * (K / 2) + kb * 32 + s * 8);
+                    const size_t packed = (size_t)(((nt * (K / 64) + kb) * 32 + n) * 16 + s * 4);
+                    uint64_t x;
+                    if (forward) {
+                        std::memcpy(&x, src + canonical, sizeof x);
+                        x = moew4_nibbles(moew4_bytes(x));
+                        const uint32_t lo = (uint32_t)x, hi = (uint32_t)(x >> 32);
+                        std::memcpy(dst + packed, &lo, sizeof lo);
+                        std::memcpy(dst + packed + 256, &hi, sizeof hi);
+                    } else {
+                        uint32_t lo, hi;
+                        std::memcpy(&lo, src + packed, sizeof lo);
+                        std::memcpy(&hi, src + packed + 256, sizeof hi);
+                        x = moew4_bytes(moew4_nibbles((uint64_t)lo | ((uint64_t)hi << 32)));
+                        std::memcpy(dst + canonical, &x, sizeof x);
+                    }
+                }
+}
+
 /* One w5nl64a8h row between container and kernel. Stored, a row is K five-bit codes, LSB first
  * (rad_plugin.h packing), so every eight codes are five bytes. Served, it is the codes' low nibbles
- * in canonical 4-bit order (two per byte, element 2i low) put through moew4_permute as w4nla8h's
- * are, then their high bits, one dword per 32 elements: K/2 + K/8 bytes, the same count.
+ * in canonical 4-bit order (two per byte, element 2i low) put through moew4_permute, then their
+ * high bits, one dword per 32 elements: K/2 + K/8 bytes, the same count. w4nla8h does not use this
+ * row: per-128 BF16-scale I4, including that codebook, uses the 16-column/64-K fragment tiles.
  *
  * The sign dword is transposed for the kernel's merge: element 4m+b of a 32 (byte b of the
  * expansion's output dword m) is bit 7-m of byte b, so `sg << m` aligns dword m's four signs with
@@ -1128,7 +1317,8 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         return RAD_OK;
     }
     if (moe_w4_nl(v.p, v.n) && !moew4_table_is_kernels(pl[1])) return RAD_E_DTYPE;
-    moew4_permute(pdata(pl[0]), (uint8_t*)dst, g.N * (g.K / 2), true);
+    if (moe_w4_g64(v.p, v.n)) moew4_permute(pdata(pl[0]), (uint8_t*)dst, g.N * (g.K / 2), true);
+    else moew4_frag_permute(pdata(pl[0]), (uint8_t*)dst, g.N, g.K, true);
     return RAD_OK;
 }
 
@@ -1156,7 +1346,9 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         std::memcpy(pl[1].data, kW5nlTable, sizeof kW5nlTable);
         return RAD_OK;
     }
-    moew4_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N * (g.K / 2), false);
+    if (moe_w4_g64(v.p, v.n))
+        moew4_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N * (g.K / 2), false);
+    else moew4_frag_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N, g.K, false);
     /* The table the stored codes index is the kernel's: the relayout refused any other. */
     if (moe_w4_nl(v.p, v.n)) std::memcpy(pl[1].data, kW4nlTable, sizeof kW4nlTable);
     return RAD_OK;

@@ -77,6 +77,11 @@ struct SchedMetrics {
          * difference is the VRAM the elastic pool released behind unheld blocks. */
         int64_t bytes_carved = 0;
     } kv[RAD_SCHED_MAX_KV_GROUPS];
+    /* KV streaming: the rings' depth over every streamed group, and the resolve's cumulative misses
+     * and bytes copied in from the host mirrors. Zero when nothing streams. */
+    int64_t kv_resident_blocks = 0;
+    int64_t kv_stream_misses = 0;
+    int64_t kv_stream_bytes_in = 0;
 
     /* Prefix caching (§7.3). Attention and linear are reported separately because they hit at
      * different granularities. */

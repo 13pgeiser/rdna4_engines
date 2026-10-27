@@ -78,15 +78,32 @@ struct VisionTower {
         return rad_meta_geti(m, "vision_config.depth", 0) > 0;
     }
 
+    /* With `gate_weights`, a checkpoint or container without the tower's weights declares nothing
+     * and leaves `on` false, for a model whose config names a tower its weights may not have. */
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
-                int64_t model_embd, int first_group, bool deepstack = false);
+                int64_t model_embd, int first_group, bool deepstack = false,
+                bool gate_weights = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx,
-                                Names& nm, int64_t model_embd, int first_group, bool deepstack) {
+                                Names& nm, int64_t model_embd, int first_group, bool deepstack,
+                                bool gate_weights) {
     on = false;
     if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
+
+    /* Whether the stem is there: its map first, then its encoding, which convert answers from the
+     * checkpoint and load from the container alike. A map left behind is inert. */
+    if (gate_weights) {
+        if (map_copy(b, nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight")) < 0)
+            return RAD_E_INVAL;
+        RadEncoding enc;
+        if (rad_weight_encoding(b, nm.f("v.patch.weight"), &enc, nullptr, nullptr) != RAD_OK) {
+            std::fprintf(stderr, "radiance: vision_config names a tower the checkpoint does not "
+                                 "ship; declaring without it\n");
+            return RAD_OK;
+        }
+    }
 
     depth    = rad_meta_geti(m, "vision_config.depth", 0);
     width    = rad_meta_geti(m, "vision_config.hidden_size", 0);
@@ -173,8 +190,12 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
         if (map_copy(b, dn, src) < 0) return 0;
         return decl_w(b, dn, dt, shp, ACC, RAD_SHARD_NONE, g);
     };
-    w_patch = bw(nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight"),
-                 RAD_BF16, { width, patch_dim }, grp_model());
+    /* Mapped above with `gate_weights`. */
+    w_patch = gate_weights
+        ? decl_w(b, nm.f("v.patch.weight"), RAD_BF16, { width, patch_dim },
+                 RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, grp_model())
+        : bw(nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight"),
+             RAD_BF16, { width, patch_dim }, grp_model());
     b_patch = bw(nm.f("v.patch.bias"), nm.ckpt("model.visual.patch_embed.proj.bias"),
                  RAD_BF16, { width }, grp_model());
     w_pos   = bw(nm.f("v.pos.weight"), nm.ckpt("model.visual.pos_embed.weight"),

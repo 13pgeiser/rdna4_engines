@@ -127,12 +127,15 @@ struct SchedReq {
 class Scheduler {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
-     * sampled at the accepted position, and whether the sequence ended. No logits. */
+     * sampled at the accepted position, and whether the sequence ended. No logits. commit() fills
+     * in the two counts. */
     struct StepResult {
         int             n_seq = 0;
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
+        int             n_prefill_done = 0;   /* prompts this step fully placed */
+        int             n_finished = 0;       /* requests that ended during this step */
         /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its
          * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
         const TokenLogprobs* lp = nullptr;
@@ -176,6 +179,10 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* Fail every request prefilling in the step just committed, with `why` for the client: a streamed
+     * group's resolve latched overflow, so their selection tables no longer address the pool
+     * (docs/KV-STREAMING.md §3.4). */
+    int      fail_prefilling(const char* why);
     /* Whether the request is still admitted and Running, read under the lock. */
     bool     running(uint64_t id) const;
     /* What the step just committed left for `seq`, copied by commit under the lock. False when
@@ -274,6 +281,9 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* The end-of-generation ids the card's acceptance reads, for ends_every_request. Set once at
+     * start; without them only max_tokens ends are predicted. */
+    void     set_eog(std::vector<int32_t> ids);
     /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
      * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
      * conversation is queued or running: its blocks would be skipped as live and its close
@@ -307,10 +317,14 @@ public:
     void            expect_draft(uint64_t id, int n);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
+    /* Whether the step just issued likely ends every request it carries; step_next_locked then
+     * issues nothing behind it. */
+    bool            ends_every_request() const;
     void            promote_next();
     /* Fold the step's outcome back in: append tokens, roll back rejected speculation, retire
-     * finished requests, feed the draft controller. */
-    int             commit(const StepResult& r);
+     * finished requests, feed the draft controller, and fill `r`'s report counts
+     * (n_prefill_done, n_finished). */
+    int             commit(StepResult& r);
     /* Ends the step for timing; call once per loop iteration that ran a step, after the drafter,
      * so the draft rounds are charged to the step (see the definition). Without it the counters
      * stay correct but there is no timing. */
@@ -413,6 +427,9 @@ public:
 
     /* plan_chunk's tail-checkpoint rule (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
+    /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
+     * request for the chunk split that takes it. */
+    static constexpr int64_t kSharedHeadMin = 256;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
@@ -465,16 +482,21 @@ private:
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group
-     * is not prefix-cached. prefix.cpp skips windowed groups, so a windowed drafter has K and V
-     * only from the hit position and must wait for its window to slide past it. A full-attention
-     * drafter's group is cached like the trunk's and its floor is 0; treating it as windowed
-     * would stop drafting for good, since it has no window to slide. Read off
-     * IPrefixCache::cached_groups() so prefix.cpp's rule lives in one place. */
+     * is neither prefix-cached nor restored from the window snapshot. prefix.cpp skips windowed
+     * groups, so a windowed drafter the snapshot does not carry has K and V only from the hit
+     * position and must wait for its window to slide past it. A full-attention drafter's group is
+     * cached like the trunk's and its floor is 0; treating it as windowed would stop drafting for
+     * good, since it has no window to slide. Read off IPrefixCache::cached_groups() and
+     * IKVManager::window_snapshot() so prefix.cpp's and the KV manager's rules live in one
+     * place. */
     bool          hit_holes_draft_ = true;
     /* Does a hit leave a hole in the trunk: a paged group with a trunk layer (bound below
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
      * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
     bool          hit_holes_trunk_ = false;
+    /* The end-of-generation ids, sorted and unique (set_eog), and a lookup in them. */
+    std::vector<int32_t> eog_;
+    bool          is_eog(int32_t id) const;
     /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
      * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
      * not declare one, in which case admission and commit are exactly as before. A sequence with
@@ -553,6 +575,10 @@ private:
     std::vector<int32_t> running_;
     std::vector<int32_t> waiting_;
     std::vector<uint64_t> completed_;
+    /* StepResult's counts for the step being committed: the ids whose prompt it completed, and the
+     * requests it ended. Reset at every commit. */
+    std::vector<uint64_t> last_prefill_ids_;
+    int                   step_finished_ = 0;
 
     /* Requests whose release waits on something that still refers to them (a deferred reap or a
      * deferred free). A count, so the sweeps cost nothing on the steps where there are none. */
@@ -577,6 +603,8 @@ private:
      * lives here). See add_locked. */
     int64_t     pool_tokens_ = -1;
     std::string pool_refusal_;
+    /* fail_prefilling()'s message; a sink keeps the pointer until the HTTP thread writes it. */
+    std::string stream_why_;
 
     /* Scratch for a prefix-cache hit's block ids, one row per cached group. Reserved at init so
      * an admission does not reach the allocator. */

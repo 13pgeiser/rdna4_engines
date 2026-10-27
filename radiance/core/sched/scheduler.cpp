@@ -84,19 +84,28 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "the prefix cache, checkpoints and speculation",
                  rswa_windows_.size(), (long long)rswa_windows_[0].tokens);
 
-    /* A hit can leave a drafter's own cache short only where a paged group is not prefix-cached
-     * (scheduler.h, hit_holes_draft_). With the cache off cached_groups() is empty and this is
-     * true, which costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
+    /* A hit can leave a drafter's own cache short only where a paged group is neither
+     * prefix-cached nor carried by the window snapshot a hit resumes from (scheduler.h,
+     * hit_holes_draft_). With the cache off cached_groups() is empty and this is true, which
+     * costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
     {
         /* Paged as the cache counts it (KVGroupPlan::paged(), via block_tokens()), not kvgeom_'s
          * `paged` flag, which is also true for an empty placeholder group and would pin this
          * predicate true. */
-        size_t n_paged = 0;
-        for (size_t i = 0; i < kvgeom_.g.size(); ++i)
-            if (kv->block_tokens((int32_t)i) > 0) ++n_paged;
-        hit_holes_draft_ = pc->cached_groups().size() < n_paged;
-        RAD_INFO("draft floor: %zu paged group(s), %zu prefix-cached -> a hit %s",
-                 n_paged, pc->cached_groups().size(),
+        size_t n_paged = 0, n_snap = 0;
+        for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
+            if (kv->block_tokens((int32_t)i) <= 0) continue;
+            ++n_paged;
+            const auto& cg = pc->cached_groups();
+            /* Snapshots are taken only where the trunk has a window to snapshot too
+             * (ChunkGeometry::window_ckpt); without them no drafter window rides in one. */
+            if (cfg.prefix_cache && geo_.window_ckpt && kv->window_snapshot((int32_t)i) &&
+                std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end())
+                ++n_snap;
+        }
+        hit_holes_draft_ = pc->cached_groups().size() + n_snap < n_paged;
+        RAD_INFO("draft floor: %zu paged group(s), %zu prefix-cached, %zu in the window snapshot "
+                 "-> a hit %s", n_paged, pc->cached_groups().size(), n_snap,
                  hit_holes_draft_ ? "leaves a hole in a drafter's own KV" : "leaves no hole");
     }
     /* The trunk's share: a paged group a trunk layer reads (a bound layer below the trunk's layer
@@ -474,6 +483,7 @@ void Scheduler::trim_prefix_cache() {
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
+    ++step_finished_;
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
      * and failed requests are published too; their prompts were computed, and a client that hangs
@@ -552,6 +562,44 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
     ++m_.checkpoints_written;
+}
+
+int Scheduler::fail_prefilling(const char* why) {
+    std::lock_guard<std::mutex> lk(mu_);
+    /* The sink keeps this pointer past the call (Sink::why_). */
+    stream_why_ = why ? why : "kv streaming overflow";
+    why = stream_why_.c_str();
+    int n = 0;
+    /* The prompts the step just committed completed; when it produced no row (a middle prefill
+     * chunk), every request still prefilling, whose next chunk would read the failed table. */
+    const bool by_step = !last_prefill_ids_.empty();
+    auto fail = [&](SchedReq& s) {
+        if (s.req->state != ReqState::Running && s.req->state != ReqState::Preempted &&
+            s.req->state != ReqState::Waiting)
+            return;
+        /* The next step may already be issued, so blocks it names stay until its commit, as for
+         * cancel(). */
+        const bool in_flight = in_step(s) || block_holds(s.req->id);
+        /* RAD_E_FULL: the ring ran out (RAD_E_STATE would read "called in the wrong phase"). */
+        close_request(s, ReqState::Failed, "kv_stream_overflow", in_flight,
+                      /*publish=*/false, RAD_E_FULL, why);
+        ++n;
+    };
+    if (by_step) {
+        for (uint64_t id : last_prefill_ids_) {
+            auto it = by_id_.find(id);
+            if (it != by_id_.end()) fail(*reqs_[(size_t)it->second]);
+        }
+    } else {
+        std::vector<int32_t> live(running_);
+        live.insert(live.end(), waiting_.begin(), waiting_.end());
+        for (int32_t slot : live) {
+            if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) continue;
+            SchedReq& s = *reqs_[(size_t)slot];
+            if ((int64_t)s.req->n_computed < (int64_t)s.req->prompt.size()) fail(s);
+        }
+    }
+    return n;
 }
 
 int Scheduler::cancel(uint64_t id) {
@@ -1159,6 +1207,17 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                 reuse = 0;
                 s.hit_cut = SchedReq::HitCut::Adopt;
             }
+        }
+
+        /* A head other prompts share (CacheHit::branch_at) that no snapshot lets this request
+         * skip: it takes one there on its way past (Request::checkpoint_at), and every later
+         * request with the same head skips it -- the same system prompt or instructions in front
+         * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
+         * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
+        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+            r.checkpoint_at = h.branch_at;
+            RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
+                      (unsigned long long)r.id, (long long)h.branch_at);
         }
 
         r.n_computed = reuse;
@@ -1823,6 +1882,39 @@ const RadBatch* Scheduler::step_next() {
     return b;
 }
 
+void Scheduler::set_eog(std::vector<int32_t> ids) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    eog_ = std::move(ids);
+}
+
+bool Scheduler::is_eog(int32_t id) const {
+    return std::binary_search(eog_.begin(), eog_.end(), id);
+}
+
+/* Whether the step just issued likely ends every request it carries: its token and accepted drafts
+ * can reach each request's max_tokens, or its drafts hold an end-of-generation id (unless
+ * ignore_eos). A step issued ahead behind it would verify nothing, yet the card would run its
+ * forward pass and drafter passes, and a request arriving as the reply ends (a client's next turn)
+ * would wait behind them, about a decode step of TTFT. A wrong guess costs one step built after
+ * the commit instead of before it. */
+bool Scheduler::ends_every_request() const {
+    for (const StepEntry& e : plan_.e) {
+        if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) return false;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (!s.req || s.req->state != ReqState::Running) return false;
+        const Request& r = *s.req;
+        const int32_t n_drafts = e.draft ? std::min(e.n_spec, e.n_draft) : 0;
+        if (r.max_tokens > 0 && (int64_t)r.output.size() + 1 + n_drafts >= r.max_tokens) continue;
+        if (r.ignore_eos || n_drafts == 0) return false;
+        bool end = false;
+        for (int32_t k = 0; k < n_drafts && !end; ++k) end = is_eog(e.draft[k]);
+        if (!end) return false;
+    }
+    return !plan_.e.empty();
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes. */
@@ -1830,6 +1922,8 @@ const RadBatch* Scheduler::step_next_locked() {
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* Before the loop below, which reserves the next step's KV. */
+    if (ends_every_request()) return nullptr;
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -1927,9 +2021,16 @@ void Scheduler::promote_next() {
 }
 
 /* ------------------------------------------------------------------ commit */
-int Scheduler::commit(const StepResult& res) {
+/* This may run while the card still runs the drafter's passes behind the step (Engine::StepOut::
+ * early). It therefore issues no device work and allocates nothing: what it releases (KV blocks,
+ * StepSlot cards, prefix-cache publications) may still be read by those passes, and is reused only
+ * by work the engine issues after waiting for step_end_. */
+int Scheduler::commit(StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
+    /* StepResult's counts describe this step only. */
+    step_finished_ = 0;
+    last_prefill_ids_.clear();
     if (res.n_seq != (int)plan_.e.size()) {
         RAD_ERR("commit of %d sequences against a step of %d", res.n_seq, (int)plan_.e.size());
         return RAD_E_INVAL;
@@ -1992,8 +2093,12 @@ int Scheduler::commit(const StepResult& res) {
                                          r.n_cached);
             /* Once, when the prompt is fully placed: the usage block's admission accounting.
              * `n_cached` is what the prefix cache supplied. */
-            if (r.n_computed >= (int64_t)r.prompt.size())
+            if (r.n_computed >= (int64_t)r.prompt.size()) {
                 server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+                /* From here a decode step reads the ring, and the engine checks the resolve's
+                 * overflow. */
+                last_prefill_ids_.push_back(r.id);
+            }
             if (e.produces_token && res.token && r.embed) {
                 /* The answer is the pooled vector the engine already put in the sink; there is
                  * no token to emit, and `eos` ends the request below. */
@@ -2119,6 +2224,20 @@ int Scheduler::commit(const StepResult& res) {
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
         }
+        /* -v: a request ended with a step issued ahead behind it, which ends_every_request did not
+         * predict. */
+        if (carried && r.state != ReqState::Running && (int)log_level() >= (int)Log::Debug) {
+            const int32_t acc = res.n_accepted ? res.n_accepted[i] : 0;
+            bool drafted_end = false;
+            for (int32_t k = 0; e.draft && k < std::min(e.n_spec, e.n_draft); ++k)
+                drafted_end = drafted_end || is_eog(e.draft[k]);
+            RAD_DEBUG("request %llu ended (%s) with a step issued ahead behind it: %d token(s) "
+                      "this step, %d of %d draft(s) accepted, %zu of max_tokens %d, %s",
+                      (unsigned long long)r.id, r.finish_reason.c_str(), (int)acc + 1, (int)acc,
+                      (int)e.n_spec, r.output.size(), (int)r.max_tokens,
+                      drafted_end ? "an end-of-generation id among the drafts"
+                                  : "no end-of-generation id among the drafts");
+        }
         committed_.push_back({e.seq, (uint64_t)r.output.size(), r.state == ReqState::Running});
     }
 
@@ -2128,8 +2247,11 @@ int Scheduler::commit(const StepResult& res) {
 
     /* Every entry is retired, so anything deferred on this step, or on a drafter snapshot that
      * block_end() / serial_end() has since cleared, can be released: every pass naming them was
-     * issued before this step's readback, which waited for the compute stream. */
+     * issued before this step's readback, and the engine waits for the drafter's passes behind it
+     * before issuing anything that could reuse what is released here. */
     sweep_deferred();
+    res.n_prefill_done = (int)last_prefill_ids_.size();
+    res.n_finished     = step_finished_;
     return RAD_OK;
 }
 
@@ -2344,6 +2466,9 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
 
     serial_plan_.reset();
     serial_plan_.phase      = RAD_PHASE_DECODE;
+    /* The deployment's window, though no draft-pass entry verifies: the pass's KV view is chosen
+     * from its row shape against 1 + n_spec (kv_pass_view). */
+    serial_plan_.n_spec     = cfg_.n_spec > 0 ? cfg_.n_spec : 0;
     /* Negative is the history pass; positive is draft round r. The sign is what the plugin reads
      * to decide whether the pass ends in the lm_head (rad_runtime.h). */
     serial_plan_.draft_pass = round == 0 ? -1 : round;
@@ -2778,6 +2903,10 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.kv[i].bytes_used   = kv_->pool_bytes_used(i);
         m.kv[i].bytes_carved = kv_->pool_bytes_carved(i);
     }
+    /* Zero on a server whose groups are all resident. */
+    m.kv_resident_blocks = kv_->stream_resident_blocks();
+    m.kv_stream_misses   = kv_->stream_misses();
+    m.kv_stream_bytes_in = kv_->stream_bytes_in();
 
     if (pc_) { m.prefix_evictions = pc_->evictions();
                m.prefix_ckpt_evictions = pc_->ckpt_evictions();

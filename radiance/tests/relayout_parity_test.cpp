@@ -3,16 +3,19 @@
  *
  * A container holds a quantiser's canonical planes; the kernel only arranges them at load
  * (spec.md §4.3). For every stored format, libquant's planes passed through the kernel's relayout
- * are pinned to a recorded FNV-1a hash of the stored bytes. The hashes match the containers in
- * service, so a recipe reconverts one without moving a served bit, and a relayout or quantiser
- * edit that changes a format fails here instead of as a quality drift no downstream test can
- * see. Where the kernel has an inverse, it must give the planes back exactly.
+ * are pinned to a recorded FNV-1a hash of the load-time bytes. A deliberate kernel packing change
+ * updates those hashes, not the container: its canonical codes must still round-trip exactly.
+ * Fragment-tiled MoE I4 also checks every nibble's address independently of the packing hooks,
+ * so updating a golden cannot hide a matching forward/inverse permutation error.
  *
  * libr4d needs a HIP toolchain to build but its layouts do not, so their host sources are compiled
- * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin.
+ * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin. One
+ * test here therefore reaches back into tools/opshapes.cpp: the fallback table sizes the packed
+ * weights these hooks own, and only this file can hold both sides of that claim.
  */
 #include "quant_fixture.h"
 #include "r4d_plugin.h"
+#include "opshapes.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -102,6 +105,24 @@ uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
             CHECK_EQ(nf.relayout(kp.data(), kp.n(), op.operand, &q.enc, s.sel.data(), s.t.data(),
                                  (int)s.t.size(), got.data(), L.bytes), RAD_OK);
         }
+        if (lrc == RAD_OK && L.tag && std::strstr(L.tag, ".w.t16k64.g128")) {
+            /* Kernel meaning, not the relayout algorithm: lane%16 owns output column n, the
+             * lane's half owns eight K values, byte j holds k+j low and k+j+4 high. */
+            CHECK_EQ(got.size(), (size_t)(R * C / 2));
+            if (got.size() != (size_t)(R * C / 2)) return 0;
+            const auto& codes = q.planes[(size_t)s.sel[0]];
+            int64_t bad = 0;
+            for (int64_t n = 0; n < R; ++n)
+                for (int64_t k = 0; k < C; ++k) {
+                    const int64_t lane = n % 16 + ((k % 16) / 8) * 16;
+                    const size_t at = (size_t)(((n / 16 * (C / 64) + k / 64) * 32 + lane)
+                                               * 16 + (k % 64 / 16) * 4 + k % 4);
+                    const int a = (got[at] >> ((k % 8 / 4) * 4)) & 15;
+                    const int b = (codes[(size_t)(n * (C / 2) + k / 2)] >> ((k % 2) * 4)) & 15;
+                    bad += a != b;
+                }
+            CHECK_EQ(bad, 0LL);
+        }
         h = fnv(got, h);
 
         /* ...and back, where the kernel can be read back at all */
@@ -119,7 +140,7 @@ uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
     return h;
 }
 
-/* A golden: the hash of the stored bytes as the containers in service hold them. */
+/* A golden of the kernel's load-time bytes, not the container's canonical planes. */
 void golden(const char* label, uint64_t got, uint64_t want) {
     if (got != want)
         std::fprintf(stderr, "    %s: stored hash 0x%016llxull, recorded 0x%016llxull\n", label,
@@ -346,6 +367,87 @@ TEST(mxfp4_codes_exponents_and_the_row_reference) {
            0xc35d26b146836d77ull);
 }
 
+/* tools/opshapes.cpp sizes a packed weight from the kernel's stored form, because no schema states
+ * an extent and libref declines every grid with a zero point (ref_planes.h joins scale and zero
+ * into one operand a description cannot state). A stale entry is not a failed check: rad-tune
+ * allocates what the table says and hands the kernel the short buffer, which is a read past the
+ * allocation on the card, not a refusal. So the table's byte total and the hook's `bytes` must
+ * agree. The table's shapes are the tool's own view -- mxfp4's exponents are [K/32][N] there and
+ * [N][K/32] in the store -- so the totals, not the shapes, are the contract. */
+TEST(the_tool_table_sizes_packed_weights_as_the_kernel_stores_them) {
+    NEED_LIBQUANT();
+    const int64_t N = 128, K = 512, M = 8;
+    auto check = [&](const char* dtype, int64_t group, const Hooks& hk,
+                     const std::vector<const char*>& bscale_roles, Opts qo) {
+        const std::vector<float> w = weight(N, K, 21, 1, group);
+        const Quantised q = quantise(quantizer("rtn"), qo, "output.weight", N, K, w);
+        if (q.status != RAD_OK) {
+            CHECK_EQ(q.status, RAD_OK);
+            return;
+        }
+        Opts kp;
+        kp.i("N", N).i("K", K);
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", N); g.set_i("K", K); g.set_i("group", group);
+        g.set_s("dtype", dtype);
+        std::vector<rad::OpdShape> tab;
+        if (rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab) != RAD_OK) {
+            std::fprintf(stderr, "    %s: the table refuses the geometry\n", dtype);
+            CHECK(false);
+            return;
+        }
+        CHECK_EQ((int)tab.size(), 7);
+        struct P { int operand; size_t opd; std::vector<const char*> roles; };
+        const std::vector<P> ops = { { B, 2, { "codes" } }, { BSCALE, 3, bscale_roles } };
+        for (const P& o : ops) {
+            const Selection s = select(q, N, K, o.roles);
+            RadLayout L{};
+            CHECK_EQ(hk.layout(kp.data(), kp.n(), o.operand, &q.enc, s.sel.data(), s.t.data(),
+                               (int)s.t.size(), &L), RAD_OK);
+            const rad::OpdShape& t = tab[o.opd];
+            const int64_t got = t.absent ? 0 : rad_dtype_bytes(t.dtype, rad::rad_numel(t.shape));
+            if (got != (int64_t)L.bytes)
+                std::fprintf(stderr, "    %s operand %d: the table sizes %lld byte(s), the kernel "
+                                     "stores %lld\n", dtype, o.operand, (long long)got,
+                             (long long)L.bytes);
+            CHECK_EQ(got, (int64_t)L.bytes);
+        }
+    };
+    {
+        Opts qo;
+        qo.s("codes", "u2").s("zero", "u8").i("group", 128).s("scale", "f16");
+        check("w2a8", 128, nW2, { "scale", "zero" }, qo);
+    }
+    {
+        Opts qo;
+        qo.s("codes", "fp4_e2m1").i("group", 32).s("scale", "e8m0");
+        check("mxfp4a8", 32, nMx, { "scale" }, qo);
+    }
+    /* The guards are the kernel's own: K a whole number of 128-column blocks
+     * (r4d_layout.cpp refuses a weight whose K is not), N a whole number of 16-row tiles (the
+     * row's constraint), and the group the stored form has. A geometry the kernel would refuse has
+     * to be refused here too, or rad-tune would size buffers for a launch that never happens. */
+    auto refuses = [&](int64_t n, int64_t k, int64_t group) {
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", n); g.set_i("K", k); g.set_i("group", group);
+        g.set_s("dtype", "w2a8");
+        std::vector<rad::OpdShape> tab;
+        CHECK_EQ(rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab), RAD_E_UNSUPPORTED);
+    };
+    refuses(128, 500, 128);      /* K leaves a partial block */
+    refuses(120, 512, 128);      /* N leaves a partial tile */
+    refuses(128, 512, 64);       /* a group the stored form does not have */
+    /* The shape the DFlash2 draft head tunes at on a two-rank serve, which the kernel takes. */
+    {
+        rad::Geometry g;
+        g.set_i("M", M); g.set_i("N", 124160); g.set_i("K", 2560); g.set_i("group", 128);
+        g.set_s("dtype", "w2a8");
+        std::vector<rad::OpdShape> tab;
+        CHECK_EQ(rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab), RAD_OK);
+        CHECK_EQ((int)tab.size(), 7);
+    }
+}
+
 TEST(moe_int4_experts_plain_and_rotated_both_classes) {
     NEED_LIBQUANT();
     const int64_t N = 64, K = 256, N1 = 48, K1 = 128;
@@ -362,7 +464,7 @@ TEST(moe_int4_experts_plain_and_rotated_both_classes) {
                    { { B, { "codes" } }, { BSCALE, { "scale" } } }),
             stored(dt, nMoeW4, kp, "rtn", g, "blk.0.ffn_down_exps.1.weight", N1, K1, w1,
                    { { 6, { "codes" } }, { 7, { "scale" } } }));
-        golden(dt, h, rot ? 0xcc329df22f1f6c40ull : 0x15a0093ea83a5a90ull);
+        golden(dt, h, rot ? 0x4acff22a616a9476ull : 0x565ae6cfe9b94a6aull);
     }
 }
 
@@ -383,12 +485,12 @@ TEST(moe_codebook_experts_both_classes) {
                { { B, { "codes", "table" } }, { BSCALE, { "scale" } } }),
         stored("w4nla8h", nMoeW4, kp, "rtn", g, "blk.0.ffn_down_exps.1.weight", N1, K1, w1,
                { { 6, { "codes", "table" } }, { 7, { "scale" } } }));
-    golden("w4nla8h", h, 0xbb9b202196aef720ull);
+    golden("w4nla8h", h, 0x874c1a30937ee1d3ull);
 }
 
 TEST(moe_codebook_experts_at_e4m3_scales_a_64) {
     NEED_LIBQUANT();
-    /* w4nl64a8h: the codebook's codes, stored as w4nla8h stores them, and an E4M3 scale per
+    /* w4nl64a8h: the codebook's codes keep their row-major nibble order, and an E4M3 scale per
      * (row, 64 of K) under one fixed f32. The scale view selects both; the relayout checks the
      * second is the kernel's constant and stores the E4M3 plane as is; the inverse gives back
      * both. A second level of any other value is refused when its bytes are relaid. */
@@ -685,7 +787,7 @@ TEST(moe_int4_gptq_against_a_calibration_hessian) {
         CHECK(qg.planes[0] != qr.planes[0]);           /* the Hessian moved codes */
         CHECK(qg.planes[1] == qr.planes[1]);           /* and not the scales: static groups */
         golden(rot ? "gptq w4a8h" : "gptq w4a8", hg,
-               rot ? 0x761cbdd0aff4adedull : 0x4a4db9378ca02303ull);
+               rot ? 0x2006e855d8d09225ull : 0x041995f37ab68a83ull);
     }
 }
 

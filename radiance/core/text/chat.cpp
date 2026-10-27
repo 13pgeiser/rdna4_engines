@@ -24,6 +24,14 @@ struct ChatTemplate::Impl {
     bool                      add_bos = false, add_eos = false;
 };
 
+static std::string template_words(const char* what) {
+    static const char kWrap[] = "Unable to generate parser for this template. Automatic parser "
+                                "generation failed: ";
+    std::string w = what ? what : "";
+    if (w.compare(0, sizeof kWrap - 1, kWrap) == 0) w.erase(0, sizeof kWrap - 1);
+    return w;
+}
+
 ChatTemplate::ChatTemplate() : impl_(std::make_unique<Impl>()) {}
 ChatTemplate::~ChatTemplate() = default;
 
@@ -90,11 +98,24 @@ int ChatTemplate::load(const std::string& jinja_source, const std::string& bos,
     impl_->caps.typed_content       = get("supports_typed_content", false);
     impl_->caps.object_arguments    = get("supports_object_arguments", false);
 
+    /* The thinking probe is the first full render, through the reply-format analysis every render
+     * runs. A template that compiles but cannot render a one-message conversation there (it calls
+     * a function this engine lacks, or the analysis cannot generate its parser) would fail every
+     * request the same way; it is refused here as a value, since the throw would end the
+     * process. */
+    bool thinking = false;
+    try {
+        thinking = common_chat_templates_support_enable_thinking(impl_->tmpls.get());
+    } catch (const std::exception& e) {
+        RAD_ERR("chat: the template compiles but does not render a conversation: %s",
+                template_words(e.what()).c_str());
+        impl_->tmpls.reset();
+        return RAD_E_FORMAT;
+    }
     RAD_INFO("chat: template loaded (%zu bytes)%s; tools=%d tool_calls=%d system=%d thinking=%d",
              src.size(), fallback ? " [ChatML fallback]" : "",
              (int)impl_->caps.tools, (int)impl_->caps.tool_calls,
-             (int)impl_->caps.system_role,
-             (int)common_chat_templates_support_enable_thinking(impl_->tmpls.get()));
+             (int)impl_->caps.system_role, (int)thinking);
     return RAD_OK;
 }
 
@@ -171,13 +192,6 @@ static bool lead_system(const ojson& messages, ojson* out) {
 
 /* The template's own words: the lifted autoparser wraps whatever the render threw in a sentence
  * about parser generation, which the render's failure is not. */
-static std::string template_words(const char* what) {
-    static const char kWrap[] = "Unable to generate parser for this template. Automatic parser "
-                                "generation failed: ";
-    std::string w = what ? what : "";
-    if (w.compare(0, sizeof kWrap - 1, kWrap) == 0) w.erase(0, sizeof kWrap - 1);
-    return w;
-}
 
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
                         ChatPrompt* out) const {

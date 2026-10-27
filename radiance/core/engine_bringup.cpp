@@ -21,6 +21,8 @@
 #include "format/table_copy.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "kvstream/bringup.h"
+#include "kvstream/plan.h"
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
@@ -329,14 +331,9 @@ static void memory_cgroups(const std::function<bool(const std::string&, int64_t)
     }
 }
 
-/* Whether `need` more bytes fit in host memory after `still` more this process will allocate
- * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
- * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by
- * the OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
- * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK
- * does not count. An unreadable limit is ignored, never guessed. */
-static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
-                          std::string* why) {
+/* See engine_hostmem.h. */
+bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                   std::string* why) {
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -906,6 +903,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
     bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
     bc.tp_attn_rows = cfg_.tp_attn_rows;
+    bc.weight_prefetch_off = cfg_.weight_prefetch ? 0 : 1;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
@@ -918,6 +916,15 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
+     * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
+     * the declared table. */
+    bc.kv_resident_blocks = cfg_.kv_resident > 0 && cfg_.kv_resident < kStreamFloorTokens
+                                ? kStreamFloorTokens
+                                : cfg_.kv_resident;
+    /* A streamed-only op is declared only when the architecture streams and the flag asks
+     * (kvstream_op_gated). */
+    bc.kv_stream_ok = arch_probe_.kv_stream_ok;
     /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
      * declare only (the direction table never changes); the per-request switch rides the derived
      * mask, not this struct. */
@@ -928,6 +935,15 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
+     * the flag is turned off here, with the decision named, before anything is planned for it. */
+    (void)rad_tools_probe(plugins_, meta_, &arch_probe_);
+    if (cfg_.kv_resident > 0 && arch_probe_.kv_stream_ok == 0) {
+        cfg_.kv_resident = 0;
+        decide("--kv-resident", "0",
+               std::string("architecture '") + (meta_.arch_id ? meta_.arch_id : "?") +
+                   "' has no streamed KV path");
+    }
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
@@ -990,7 +1006,14 @@ int Engine::declare() {
                 decide("--max-model-len", std::to_string(cfg_.max_ctx),
                        "a video generator: a step's rows");
             }
-            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            /* A video generator with a vision tower takes a pass of its patches, the size its
+             * plugin states. */
+            if (cfg_.mm_max_patches < 0 && pb.gen_patches > 0) {
+                cfg_.mm_max_patches = pb.gen_patches;
+                decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
+                       "a video generator: every reference media patch of one conditioning, "
+                       "the pass size the plugin states");
+            }
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0) {
@@ -1589,6 +1612,18 @@ int Engine::plan() {
             if (declare_ring_windows(probe, r->program) == RAD_OK &&
                 probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
+                /* The budget must see the streamed plan before it sizes the pool: a streamed group's
+                 * ceiling is max(ring, one layer of its context), not its whole cache
+                 * (docs/KV-STREAMING.md §4.1). */
+                RAD_TRY(kvstream_cap_probe(probe, cfg_, r->program, ctx));
+                /* No prefix-cache entry holding a streamed group can be demoted (its mirror is its only
+                 * cold copy), so the host tier would be pinned and never used: turned off before
+                 * the tables and the checkpoint store are sized. */
+                if (const int64_t off = kvstream_prefix_host_off(cfg_)) {
+                    RAD_INFO("a streamed KV group has no host cache: --prefix-cache-mib %lld is off, "
+                             "since no entry holding the group could be demoted",
+                             (long long)off);
+                }
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
                 /* One --max-model-len sequence's pool, as the inverse of the real plan: its
@@ -1873,10 +1908,10 @@ struct LoadRun {
 /* ================================================================== the relayout pool
  *
  * Weights the loader must rearrange (spec §4.3): the resolved kernel stores something other than
- * the canonical planes (a fragment order, a per-row scale tail), or the declaration widens bf16 to
- * f32. The sweep copies the weight's planes into a host input; once all bytes arrive, a worker
- * produces the stored form, directly into its host pool slot or, for VRAM, through the worker's
- * pinned bounce buffers.
+ * the canonical planes (a fragment order, a per-row scale tail), or the declaration converts bf16
+ * to f32, or f32 to bf16. The sweep copies the weight's planes into a host input; once all bytes
+ * arrive, a worker produces the stored form, directly into its host pool slot or, for VRAM,
+ * through the worker's pinned bounce buffers.
  *
  * It must keep pace with the disk (Qwen3.8-27B-FP8 rearranges 24 GiB of 29 per load; one thread
  * runs at a fraction of 7 GB/s), so it is a thread pool and the sweep only reads. The copies out
@@ -2213,8 +2248,8 @@ private:
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
-        /* Stored as read (only reached by a weight with no sweep). */
-        if (w.identity && !w.widen) {
+        /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
+        if (w.identity && !w.widen && !w.narrow) {
             const int64_t n = w.stored_bytes;
             if (!s.dev) { std::memcpy(s.dst, s.in, (size_t)n); return RAD_OK; }
             const int us = b.upload(s.dst, s.in, n, s.device);
@@ -2242,11 +2277,15 @@ private:
 
         int st = RAD_OK;
         const char* who = "the loader";
-        if (w.widen) {
-            /* Exact: every bf16 and f16 value is representable in f32. */
+        if (w.widen || w.narrow) {
+            /* Exact: every bf16 and f16 value is representable in f32, and f32 rounds to bf16 to
+             * nearest even. */
             const int64_t cnt = w.sel_rows[0] * w.sel_cols[0];
-            if (cnt * 4 != n) st = RAD_E_SHAPE;
-            else for (int64_t e = 0; e < cnt; ++e) ((float*)out)[e] = rad_load_f32(pt[0].data, pt[0].dtype, e);
+            const int64_t esz = (int64_t)rad_dtype_bytes(w.stored_dtype, 1);
+            if (cnt * esz != n) st = RAD_E_SHAPE;
+            else for (int64_t e = 0; e < cnt; ++e)
+                rad_store_f32(out, w.stored_dtype, e,
+                              rad_load_f32(pt[0].data, pt[0].dtype, e));
         } else {
             const Resolved& r = s.prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
             const RadKernelInfo* ki = r.row->info;
@@ -2709,8 +2748,10 @@ int Engine::load_weights() {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
-                        w.widen ? "widened at load" : w.identity ? "a shard of it"
-                                                                 : w.layout_tag.c_str());
+                        w.widen ? "widened at load"
+                                : w.narrow ? "narrowed at load"
+                                           : w.identity ? "a shard of it"
+                                                        : w.layout_tag.c_str());
                 return RAD_E_STATE;
             }
 
@@ -2827,7 +2868,8 @@ int Engine::load_weights() {
                     total += sh[k].dense_bytes();
                 }
                 sw.in_bytes = in_bytes;
-                if (w.identity && !w.widen && sh[0].dense_bytes() != w.stored_bytes) {
+                if (w.identity && !w.widen && !w.narrow &&
+                    sh[0].dense_bytes() != w.stored_bytes) {
                     RAD_ERR("rank %d: '%s': this rank's share is %lld bytes and the slot %lld",
                             r->index, w.name.c_str(), (long long)sh[0].dense_bytes(),
                             (long long)w.stored_bytes);
@@ -2849,7 +2891,7 @@ int Engine::load_weights() {
              * by plane for the relayout pool, which writes the slot. */
             int32_t stage = -1;
             int64_t in_bytes = 0;
-            if (!w.identity || w.widen) {
+            if (!w.identity || w.widen || w.narrow) {
                 stage = (int32_t)staged.size();
                 staged.emplace_back();
                 StagedWeight& sw = staged.back();
@@ -3054,6 +3096,14 @@ int Engine::configure_kv() {
                          "block and the linear-state chunk), so a checkpoint is a legal chunk split",
                          (long long)geo_.quantum)
                    : std::string("the model keeps no linear state to checkpoint"));
+    /* KV streaming's policy, refusals and ring (kvstream/bringup.h), decided once from rank 0's
+     * declarations: a streamed group must be the same group on every rank. */
+    KVStreamSetup stream;
+    if (!ranks_.empty())
+        RAD_TRY(kvstream_configure(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train,
+                                   ranks_[0]->program.kv_groups, ranks_[0]->program, &stream));
+    if (stream.group >= 0)
+        for (auto& r : ranks_) r->kv.cap_resident_tokens(stream.group, stream.ring_tokens);
     /* One block table serves every rank (serve() checks it), so every rank carves the same number
      * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
      * attention weights), so each rank is planned first and all are capped at the least before
@@ -3077,6 +3127,22 @@ int Engine::configure_kv() {
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
+    /* The mirrors are checked once, before any rank pins one, against the host tiers still to be
+     * pinned after them: the prefix cache's, the activation arenas and, when sized already, the
+     * checkpoint store. */
+    KVStreamHostUse stream_host;
+    for (auto& r : ranks_) kvstream_host_add(&stream_host, r->kv);
+    if (stream_host.sum.host_bytes > 0) {
+        const int64_t MiB = (int64_t)1 << 20;
+        int64_t still = cfg_.prefix_cache_mib * MiB;
+        for (auto& r : ranks_) still += arena_host_bytes(r->program);
+        if (cfg_.checkpoint_slots > 0) {
+            int64_t slot = 0;
+            for (auto& r : ranks_) slot += r->kv.checkpoint_bytes();
+            still += slot * cfg_.checkpoint_slots;
+        }
+        RAD_TRY(kvstream_host_gate(stream_host, (int)ranks_.size(), still, host_headroom_bytes()));
+    }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
@@ -3088,7 +3154,13 @@ int Engine::configure_kv() {
                          (long long)least);
             r->kv.cap_paged_tokens(least);
         }
+        /* Before the carve, which refuses a streamed plan with no mirror and maps. The maps come out
+         * of this rank's KV pool, so the paged split sees them taken. */
+        const KVManager::StreamCost sc = r->kv.stream_cost();
+        if (sc.groups > 0)
+            RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
         RAD_TRY(r->kv.carve(r->pools.kv()));
+        if (sc.groups > 0) RAD_TRY(kvstream_fill(r->kv));   /* the maps, after the elastic pool */
         /* Without virtual memory management the cache cannot lend: everything still works, but
          * the expert slab never grows, which no counter shows, so log it once. */
         if (r->index == 0 && !r->pools.kv().elastic())
@@ -3289,6 +3361,7 @@ int Engine::configure_kv() {
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
+    kvstream_report(stream, stream_host, (int)ranks_.size());
     /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
      * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
      * and a linear model with no checkpoint interval replays from zero. */
@@ -3571,8 +3644,8 @@ int Engine::start() {
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
-                st.top = (char*)p.base + L * stripe + p.n_blocks * lbpb;
-                st.bytes = p.n_blocks * lbpb;
+                st.top = (char*)p.base + L * stripe + p.pool_blocks() * lbpb;
+                st.bytes = p.pool_blocks() * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
                 strips.push_back(st);

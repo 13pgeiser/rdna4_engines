@@ -1052,6 +1052,33 @@ TEST(no_template_is_a_format_with_no_reasoning_and_no_calls) {
 static const char* const kBreaks[] = { "<tool_call>\n" };
 static const char* const kTriggers[] = { "<tool_call>\n" };
 
+static RadChatFormat hyv3_abi() {
+    static const char* const triggers[] = { "<tool_calls>" };
+    RadChatFormat c;
+    std::memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c;
+    c.name = "hyv3-native";
+    c.reasoning_open = "<think>";
+    c.reasoning_close = "</think>";
+    c.reasoning_breaks = triggers;
+    c.n_reasoning_breaks = 1;
+    c.reasoning_in_prompt = RAD_CHAT_THINK_FROM_PROMPT;
+    c.section_open = "<tool_calls>";
+    c.section_close = "</tool_calls>";
+    c.name_prefix = "<tool_call>";
+    c.name_suffix = "<tool_sep>";
+    c.call_end = "</tool_call>";
+    c.arg_prefix = "<arg_key>";
+    c.arg_name_suffix = "</arg_key>\n";
+    c.arg_value_prefix = "<arg_value>";
+    c.arg_value_suffix = "</arg_value>";
+    c.string_value = RAD_CHAT_VALUE_RAW;
+    c.other_value = RAD_CHAT_VALUE_JSON;
+    c.triggers = triggers;
+    c.n_triggers = 1;
+    return c;
+}
+
 static RadChatFormat qwen_abi() {
     RadChatFormat c;
     std::memset(&c, 0, sizeof c);
@@ -1268,7 +1295,7 @@ TEST(a_format_the_parser_cannot_read_is_refused_by_name) {
     CHECK(refused([](RadChatFormat& c) { c.arg_prefix = "</function>\n"; }, "told apart"));
     CHECK(refused([](RadChatFormat& c) { c.reasoning_close = ""; }, "reasoning_close"));
     static const char* const other[] = { "<call>" };
-    CHECK(refused([](RadChatFormat& c) { c.reasoning_breaks = other; }, "call opener"));
+    CHECK(refused([](RadChatFormat& c) { c.reasoning_breaks = other; }, "opener"));
     CHECK(refused([](RadChatFormat& c) { c.string_value = RAD_CHAT_VALUE_JSON; }, "string_value"));
 }
 
@@ -1446,6 +1473,68 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
     CHECK(why.find("a>b") != std::string::npos);
 }
 
+/* The declared format preserves HYV3's outer section and all of its argument markers. */
+TEST(hyv3_plugin_format_runs_through_the_chat_template_bridge) {
+    std::shared_ptr<Vocab> v = vocab_with(fixture("hyv3"));
+    REQUIRE(v != nullptr);
+    RadChatFormat c = hyv3_abi();
+    server::ChatTemplateBridge br;
+    CHECK_OK(br.init(*v, &c, "hyv3_bf16"));
+    CHECK(br.supports_tools());
+    CHECK_EQ(br.tool_refusal(), std::string());
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"lookup_weather",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+      "required":["city"]}}}])");
+    const server::ChatRender r = bridge_render(br, tools);
+    REQUIRE(!r.prompt.empty());
+    CHECK(!r.grammar.empty());
+    CHECK(r.grammar_lazy);
+    REQUIRE(r.grammar_triggers.size() == 1);
+    CHECK_EQ(r.grammar_triggers[0].value, std::string("<tool_calls>"));
+    for (const char* marker : { "<think>", "</think>", "<tool_calls>", "</tool_calls>",
+                                "<tool_call>", "<tool_sep>",
+                                "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>" })
+        CHECK(std::find(r.preserved_tokens.begin(), r.preserved_tokens.end(), marker) !=
+              r.preserved_tokens.end());
+    REQUIRE(r.parser != nullptr);
+    std::unique_ptr<server::IReplyReader> rd = r.parser->open();
+    rd->feed("Cloudy.\n<tool_calls><tool_call>lookup_weather<tool_sep>\n"
+             "<arg_key>city</arg_key>\n<arg_value>Toronto</arg_value>\n"
+             "</tool_call></tool_calls>", nullptr);
+    rd->finish(nullptr);
+    const server::ParsedMessage pm = rd->message();
+    CHECK_EQ(pm.content, std::string("Cloudy."));
+    REQUIRE(pm.tool_calls.size() == 1);
+    CHECK_EQ(pm.tool_calls[0].name, std::string("lookup_weather"));
+    CHECK_EQ(pm.tool_calls[0].arguments, std::string("{\"city\":\"Toronto\"}"));
+}
+
+TEST(hyv3_plugin_format_splits_requested_reasoning_before_native_tools) {
+    std::shared_ptr<Vocab> v = vocab_with(fixture("hyv3"));
+    REQUIRE(v != nullptr);
+    RadChatFormat c = hyv3_abi();
+    server::ChatTemplateBridge br;
+    CHECK_OK(br.init(*v, &c, "hyv3_bf16"));
+    const json msgs = json::array({ { {"role", "user"}, {"content", "List the files."} } });
+    server::ChatRenderOptions opt;
+    opt.template_kwargs["reasoning_effort"] = json("high").dump();
+    server::ChatRender out;
+    std::string why;
+    CHECK_OK(br.apply(msgs, agent_tools(), opt, &out, &why));
+    REQUIRE(out.parser != nullptr);
+    CHECK(out.generation_prompt.ends_with("<think>"));
+    auto rd = out.parser->open();
+    rd->feed("Plan.</think>Checking.<tool_calls><tool_call>bash<tool_sep>"
+             "<arg_key>command</arg_key>\n<arg_value>ls</arg_value>"
+             "</tool_call></tool_calls>", nullptr);
+    rd->finish(nullptr);
+    const server::ParsedMessage m = rd->message();
+    CHECK_EQ(m.reasoning, std::string("Plan."));
+    CHECK_EQ(m.content, std::string("Checking."));
+    REQUIRE(m.tool_calls.size() == 1);
+    CHECK_EQ(m.tool_calls[0].name, std::string("bash"));
+}
+
 /* GLM-5.3-Flash's template reads list items as `m.content.0.type`, jinja2's dotted index, and
  * writes calls as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`. The
  * capability probe renders with tools and tool calls, so a runtime that throws on the dotted index
@@ -1577,6 +1666,357 @@ static int object_admits(const std::string& gbnf, const std::string& text) {
     if (GbnfGrammar::create(gbnf, "root", &vocab, false, {}, {}, &gr, &err) < 0) return -1;
     if (gr->accept_str(text) < 0) return 0;
     return gr->complete() ? 1 : 0;
+}
+
+TEST(hyv3_sectioned_tagged_calls_parse_stream_and_constrain) {
+    RadChatFormat abi = hyv3_abi();
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&abi, &f, &why));
+    CHECK_OK(chat_format_check(f, &why));
+
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"lookup_weather",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},
+      {"type":"function","function":{"name":"add","parameters":{"type":"object",
+      "properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}])");
+    ReplyOptions ro;
+    ro.tools = &tools;
+    const std::shared_ptr<const ReplyParser> p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    const std::string reply =
+        "Checking both results.<tool_calls>\n"
+        "<tool_call>lookup_weather<tool_sep>\n"
+        "<arg_key>city</arg_key>\n<arg_value>Québec & Montréal</arg_value>\n"
+        "</tool_call>\n"
+        "<tool_call>add<tool_sep>\n"
+        "<arg_key>a</arg_key>\n<arg_value>20</arg_value>\n"
+        "<arg_key>b</arg_key>\n<arg_value>22</arg_value>\n"
+        "</tool_call>\n</tool_calls>";
+    bool strict = false;
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK(strict);
+    CHECK_EQ(m.content, std::string("Checking both results."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("lookup_weather"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"city\":\"Québec & Montréal\"}"));
+    CHECK(m.calls[0].closed);
+    CHECK_EQ(m.calls[1].name, std::string("add"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"a\":20,\"b\":22}"));
+    CHECK(m.calls[1].closed);
+    CHECK(m.content.find("<tool_calls>") == std::string::npos);
+    CHECK(m.content.find("</tool_calls>") == std::string::npos);
+    const std::string stream_error = stream_all(*p, reply);
+    if (!stream_error.empty()) ::radtest::fail(__FILE__, __LINE__, stream_error);
+
+    ChatGrammarRequest gq;
+    gq.tools = &tools;
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK(g.lazy);
+    CHECK(g.trigger_words == std::vector<std::string>{ "<tool_calls>" });
+    const size_t section = reply.find("<tool_calls>");
+    REQUIRE(section != std::string::npos);
+    CHECK_EQ(object_admits(g.text, reply.substr(section)), 1);
+    gq.parallel_tool_calls = false;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK_EQ(object_admits(g.text, reply.substr(section)), 0);
+
+    /* A quoted call tag outside the section remains user-visible content, not an invocation. */
+    const std::string outside = "Example: <tool_call>add<tool_sep>";
+    const ReplyMessage quoted = reply_parse(*p, outside, &strict);
+    CHECK_EQ(quoted.calls.size(), (size_t)0);
+    CHECK_EQ(quoted.content, outside);
+
+    /* A section close cannot turn a call missing its own close tag into an executable call. */
+    const std::string truncated =
+        "<tool_calls>\n<tool_call>add<tool_sep>\n"
+        "<arg_key>a</arg_key>\n<arg_value>20</arg_value>\n</tool_calls>";
+    const ReplyMessage incomplete = reply_parse(*p, truncated, &strict);
+    CHECK(!strict);
+    REQUIRE(incomplete.calls.size() == 1);
+    CHECK(!incomplete.calls[0].closed);
+    const std::string truncated_stream_error = stream_all(*p, truncated);
+    if (!truncated_stream_error.empty())
+        ::radtest::fail(__FILE__, __LINE__, truncated_stream_error);
+}
+
+TEST(section_wrapped_calls_do_not_cross_section_boundaries) {
+    ChatFormat f;
+    std::string why;
+    RadChatFormat abi = hyv3_abi();
+    CHECK_OK(chat_format_from_abi(&abi, &f, &why));
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    const auto p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    const std::string call = "<tool_call>bash<tool_sep>"
+        "<arg_key>command</arg_key>\n<arg_value>ls</arg_value></tool_call>";
+
+    ChatGrammarRequest gq;
+    gq.tools = &agent_tools();
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK_EQ(object_admits(g.text, "<tool_calls>" + call + call + "</tool_calls>"), 1);
+    /* The inter-call grammar must not swallow an earlier section close as prose. */
+    CHECK_EQ(object_admits(g.text, "<tool_calls>" + call + "</tool_calls>" +
+                                   call + "</tool_calls>"), 0);
+
+    /* A wrapped dialect whose call close duplicates call_end has no distinct close scanner.
+     * Its section close must still abandon a malformed call, not close it as executable. */
+    f.call_open = "<call>";
+    f.call_close = f.call_end;
+    const auto wrapped = parser_of(f, ro);
+    REQUIRE(wrapped != nullptr);
+    bool strict = true;
+    const std::string malformed = "<tool_calls><call><tool_call>bash<tool_sep>junk</tool_calls>";
+    const ReplyMessage m = reply_parse(*wrapped, malformed, &strict);
+    CHECK(!strict);
+    REQUIRE(m.calls.size() == 1);
+    CHECK(!m.calls[0].closed);
+    const std::string err = stream_all(*wrapped, malformed);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+}
+
+TEST(section_wrapped_calls_stream_consistently_at_every_truncation) {
+    ChatFormat f;
+    std::string why;
+    RadChatFormat abi = hyv3_abi();
+    CHECK_OK(chat_format_from_abi(&abi, &f, &why));
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    const auto p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    const std::string call = "<tool_call>bash<tool_sep>"
+        "<arg_key>command</arg_key>\n<arg_value>ls</arg_value></tool_call>";
+    const std::string reply = "<tool_calls>" + call + call + "</tool_calls>";
+    for (size_t n = 0; n <= reply.size(); ++n) {
+        const std::string err = stream_all(*p, reply.substr(0, n), 0);
+        if (!err.empty()) {
+            ::radtest::fail(__FILE__, __LINE__, "truncated at " + std::to_string(n) + ": " + err);
+            break;
+        }
+    }
+    const ReplyMessage incomplete = reply_parse(*p, "<tool_calls>" + call);
+    REQUIRE(incomplete.calls.size() == 1);
+    CHECK(!incomplete.calls[0].closed);
+}
+
+TEST(section_wrapped_calls_cannot_bypass_the_wrapper_in_reasoning) {
+    ChatFormat f;
+    std::string why;
+    RadChatFormat abi = hyv3_abi();
+    CHECK_OK(chat_format_from_abi(&abi, &f, &why));
+    f.reasoning_open = "<think>";
+    f.reasoning_close = "</think>";
+    f.reasoning_breaks = { f.section_open, f.name_prefix };
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    const auto p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    const std::string call = "<tool_call>bash<tool_sep>"
+        "<arg_key>command</arg_key>\n<arg_value>ls</arg_value></tool_call>";
+    const std::string text = "<think>Example: " + call + "</think>Answer.";
+    const ReplyMessage quoted = reply_parse(*p, text);
+    CHECK(quoted.calls.empty());
+    CHECK_EQ(quoted.reasoning, "Example: " + call);
+    CHECK_EQ(quoted.content, std::string("Answer."));
+    const std::string err = stream_all(*p, text);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+
+    const ReplyMessage actual = reply_parse(*p, "<think>Plan.<tool_calls>" + call +
+                                               "</tool_calls>");
+    REQUIRE(actual.calls.size() == 1);
+    CHECK(actual.calls[0].closed);
+}
+
+/* ================================================================== typed argument tags
+ *
+ * A format whose argument tag says the value's type (arg_json_value_prefix): the tag the reply
+ * writes decides JSON or string for any name, declared or not, and the grammar writes the tag the
+ * schema calls for. Shown on an ASCII dialect, so the grammar can be run over the reply, and on
+ * DeepSeek-V4.1's declaration with the bytes its own encoder writes. */
+
+static ChatFormat typed_tags_format() {
+    ChatFormat f;
+    f.name = "typed";
+    f.reasoning_open = "<think>";
+    f.reasoning_close = "</think>";
+    f.reasoning_breaks = { "<calls>" };
+    f.section_open = "<calls>";
+    f.section_close = "</calls>";
+    f.name_prefix = "<invoke name=\"";
+    f.name_suffix = "\">\n";
+    f.call_end = "</invoke>";
+    f.arg_prefix = "<arg name=\"";
+    f.arg_name_suffix = "\"";
+    f.arg_value_prefix = " type=\"text\">";
+    f.arg_json_value_prefix = " type=\"json\">";
+    f.arg_value_suffix = "</arg>";
+    f.string_value = ChatValue::Raw;
+    f.other_value = ChatValue::Json;
+    f.value_newlines = false;
+    f.triggers = { "<calls>" };
+    return f;
+}
+
+static const json& typed_tags_tools() {
+    static const json t = json::parse(R"([{"type":"function","function":{"name":"run",
+      "parameters":{"type":"object","properties":{"cmd":{"type":"string"},"timeout":{"type":"integer"},
+      "env":{"type":"object"}},"required":["cmd"]}}}])");
+    return t;
+}
+
+TEST(typed_argument_tags_say_how_each_value_is_read) {
+    const ChatFormat f = typed_tags_format();
+    std::string why;
+    CHECK_OK(chat_format_check(f, &why));
+    ReplyOptions ro;
+    ro.tools = &typed_tags_tools();
+    const auto p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+
+    const std::string reply =
+        "Running it.\n\n<calls>\n"
+        "<invoke name=\"run\">\n"
+        "<arg name=\"cmd\" type=\"text\">ls -la \"/tmp\"</arg>\n"
+        "<arg name=\"timeout\" type=\"json\">30</arg>\n"
+        "<arg name=\"env\" type=\"json\">{\"A\": [1, true]}</arg>\n"
+        "</invoke>\n"
+        "<invoke name=\"run\">\n"
+        "<arg name=\"cmd\" type=\"text\">pwd</arg>\n"
+        "</invoke>\n</calls>";
+    bool strict = false;
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK(strict);
+    CHECK_EQ(m.content, std::string("Running it."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("run"));
+    CHECK_EQ(m.calls[0].arguments,
+             std::string("{\"cmd\":\"ls -la \\\"/tmp\\\"\",\"timeout\":30,\"env\":{\"A\": [1, true]}}"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"cmd\":\"pwd\"}"));
+    CHECK(m.calls[0].closed && m.calls[1].closed);
+    std::string err = stream_all(*p, reply);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+    for (size_t n = 0; n <= reply.size(); ++n) {
+        err = stream_all(*p, reply.substr(0, n), 0);
+        if (!err.empty()) {
+            ::radtest::fail(__FILE__, __LINE__, "truncated at " + std::to_string(n) + ": " + err);
+            break;
+        }
+    }
+
+    /* The tag, not the schema: a number written as text is a string, a string written as JSON
+     * is that JSON, an undeclared name written as JSON is JSON, and JSON that does not parse is
+     * its text. */
+    const std::string other =
+        "<calls>\n<invoke name=\"run\">\n"
+        "<arg name=\"cmd\" type=\"json\">\"echo\"</arg>\n"
+        "<arg name=\"timeout\" type=\"text\">30</arg>\n"
+        "<arg name=\"extra\" type=\"json\">[1, 2]</arg>\n"
+        "<arg name=\"env\" type=\"json\">soon</arg>\n"
+        "</invoke>\n</calls>";
+    const ReplyMessage o = reply_parse(*p, other, &strict);
+    REQUIRE(o.calls.size() == 1);
+    CHECK_EQ(o.calls[0].arguments,
+             std::string("{\"cmd\":\"echo\",\"timeout\":\"30\",\"extra\":[1, 2],\"env\":\"soon\"}"));
+    CHECK(server::json_complete(o.calls[0].arguments));
+    err = stream_all(*p, other);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+
+    /* Without the JSON tag the same dialect is typed by the schema, as before. */
+    ChatFormat untyped = f;
+    untyped.arg_json_value_prefix.clear();
+    const auto u = parser_of(untyped, ro);
+    REQUIRE(u != nullptr);
+    const ReplyMessage um = reply_parse(*u,
+        "<calls>\n<invoke name=\"run\">\n<arg name=\"cmd\" type=\"text\">ls</arg>\n"
+        "<arg name=\"timeout\" type=\"text\">30</arg>\n</invoke>\n</calls>");
+    REQUIRE(um.calls.size() == 1);
+    CHECK_EQ(um.calls[0].arguments, std::string("{\"cmd\":\"ls\",\"timeout\":30}"));
+}
+
+TEST(typed_argument_tags_constrain_each_argument_to_its_schemas_tag) {
+    const ChatFormat f = typed_tags_format();
+    std::string why;
+    ChatGrammarRequest gq;
+    gq.tools = &typed_tags_tools();
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK(g.lazy);
+    CHECK(g.trigger_words == std::vector<std::string>{ "<calls>" });
+    const std::string call = "<calls>\n<invoke name=\"run\">\n"
+                             "<arg name=\"cmd\" type=\"text\">ls</arg>\n"
+                             "<arg name=\"timeout\" type=\"json\">30</arg>\n"
+                             "</invoke>\n</calls>";
+    CHECK_EQ(object_admits(g.text, call), 1);
+    /* A declared JSON argument is not written with the text tag, nor a string with the JSON tag:
+     * the grammar's arm for each name writes the tag its schema calls for. */
+    const size_t cmd_rule = g.text.find("tool-run-arg-cmd ::=");
+    const size_t timeout_rule = g.text.find("tool-run-arg-timeout ::=");
+    REQUIRE(cmd_rule != std::string::npos && timeout_rule != std::string::npos);
+    const std::string cmd_line = g.text.substr(cmd_rule, g.text.find('\n', cmd_rule) - cmd_rule);
+    const std::string timeout_line =
+        g.text.substr(timeout_rule, g.text.find('\n', timeout_rule) - timeout_rule);
+    CHECK(cmd_line.find("type=\\\"text\\\">") != std::string::npos);
+    CHECK(cmd_line.find("type=\\\"json\\\">") == std::string::npos);
+    CHECK(timeout_line.find("type=\\\"json\\\">") != std::string::npos);
+    CHECK(timeout_line.find("type=\\\"text\\\">") == std::string::npos);
+    /* An undeclared name takes either tag. */
+    CHECK_EQ(object_admits(g.text, "<calls>\n<invoke name=\"run\">\n"
+                                   "<arg name=\"cmd\" type=\"text\">ls</arg>\n"
+                                   "<arg name=\"x\" type=\"json\">1</arg>\n"
+                                   "<arg name=\"y\" type=\"text\">2</arg>\n"
+                                   "</invoke>\n</calls>"), 1);
+}
+
+TEST(typed_argument_tags_are_refused_where_they_cannot_be_read) {
+    auto refused = [](void (*edit)(ChatFormat&), const char* word) {
+        ChatFormat f = typed_tags_format();
+        edit(f);
+        std::string why;
+        CHECK(chat_format_check(f, &why) == RAD_E_UNSUPPORTED);
+        if (why.find(word) == std::string::npos)
+            ::radtest::fail(__FILE__, __LINE__, std::string("expected '") + word + "' in: " + why);
+    };
+    refused([](ChatFormat& f) { f.arg_value_prefix.clear(); }, "arg_value_prefix");
+    refused([](ChatFormat& f) { f.arg_json_value_prefix = f.arg_value_prefix; }, "told apart");
+    refused([](ChatFormat& f) { f.arg_json_value_prefix = " type=\"text\">x"; }, "told apart");
+    refused([](ChatFormat& f) { f.other_value = ChatValue::Raw; }, "other_value");
+    refused([](ChatFormat& f) {
+        f.name_prefix.clear(); f.name_suffix.clear(); f.call_end.clear(); f.arg_prefix.clear();
+        f.arg_name_suffix.clear(); f.arg_value_prefix.clear(); f.arg_value_suffix.clear();
+        f.section_open.clear(); f.section_close.clear(); f.reasoning_breaks.clear();
+        f.triggers.clear();
+    }, "name_prefix is empty");
+
+    /* A plugin declares it at the end of RadChatFormat; an older plugin's struct ends before the
+     * field, and it reads as unset. */
+    static const char* const kTrig[] = { "<calls>" };
+    RadChatFormat c{};
+    c.struct_size = (uint32_t)sizeof(RadChatFormat);
+    c.name = "plugin:typed";
+    c.section_open = "<calls>";
+    c.section_close = "</calls>";
+    c.name_prefix = "<invoke name=\"";
+    c.name_suffix = "\">\n";
+    c.call_end = "</invoke>";
+    c.arg_prefix = "<arg name=\"";
+    c.arg_name_suffix = "\"";
+    c.arg_value_prefix = " type=\"text\">";
+    c.arg_json_value_prefix = " type=\"json\">";
+    c.arg_value_suffix = "</arg>";
+    c.string_value = RAD_CHAT_VALUE_RAW;
+    c.other_value = RAD_CHAT_VALUE_JSON;
+    c.triggers = kTrig;
+    c.n_triggers = 1;
+    ChatFormat g;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &g, &why));
+    CHECK_EQ(g.arg_json_value_prefix, std::string(" type=\"json\">"));
+    CHECK_OK(chat_format_check(g, &why));
+    c.struct_size = (uint32_t)offsetof(RadChatFormat, arg_json_value_prefix);
+    CHECK_OK(chat_format_from_abi(&c, &g, &why));
+    CHECK(g.arg_json_value_prefix.empty());
 }
 
 TEST(json_arguments_behind_a_name_tag_read_as_one_object) {

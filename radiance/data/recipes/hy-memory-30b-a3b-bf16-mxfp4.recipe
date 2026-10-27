@@ -1,0 +1,18 @@
+# HYV3 from BF16 with OCP MXFP4 weights: e2m1 codes and one e8m0 scale per 32 values of K. Quantize
+# attention, dense/shared projections and routed experts; router, norms, embeddings and output head
+# stay BF16. Both the regular linears and MoeFP8's expert format-8 path consume this encoding.
+#
+#   rad-convert <Hy-Memory-30B-A3B-BF16> \
+#       --recipe data/recipes/hy-memory-30b-a3b-bf16-mxfp4.recipe -o hy-memory-30b-a3b-mxfp4.rad
+
+blk.*.attn_q.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+blk.0.ffn_gate_up.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.0.ffn_down.weight                rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down_shexp.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+blk.*.ffn_*_exps.*.weight            rtn  codes=fp4_e2m1 group=32 scale=e8m0

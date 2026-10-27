@@ -163,8 +163,8 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         for (const std::string* s : { &f.section_open, &f.section_close, &f.call_separator,
                                       &f.call_open, &f.call_close, &f.name_suffix, &f.call_end,
                                       &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
-                                      &f.arg_value_suffix, &f.object_string_open,
-                                      &f.object_string_close })
+                                      &f.arg_json_value_prefix, &f.arg_value_suffix,
+                                      &f.object_string_open, &f.object_string_close })
             if (!s->empty()) return no("tool-call delimiters are set but name_prefix is empty");
         if (f.object_args() || f.object_bare_keys)
             return no("an argument object is described but name_prefix is empty");
@@ -173,15 +173,34 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         return reasoning_anywhere_check(f, why);
     }
 
-    if (!f.section_open.empty() || !f.section_close.empty())
-        return no("a section around all calls (section_open/section_close) is not read by the "
-                  "streaming parser");
+    if (f.section_open.empty() != f.section_close.empty())
+        return no("section_open and section_close must be set together");
+    if (!f.section_open.empty()) {
+        const std::string so = trim_ws(f.section_open), sc = trim_ws(f.section_close);
+        if (so.empty() || sc.empty()) return no("section_open/section_close may not be whitespace");
+        if (so != f.section_open || sc != f.section_close)
+            return no("section_open/section_close must not have surrounding whitespace");
+        if (confusable(so, sc))
+            return no("section_open " + show(so) + " and section_close " + show(sc) +
+                      " cannot be told apart");
+        for (const std::string* d : { &f.reasoning_open, &f.reasoning_close, &f.call_open,
+                                      &f.call_close, &f.name_prefix, &f.name_suffix,
+                                      &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
+                                      &f.arg_value_prefix, &f.arg_value_suffix }) {
+            if (!d->empty() && confusable(so, trim_ws(*d)))
+                return no("section_open " + show(so) + " overlaps delimiter " + show(*d));
+            if (!d->empty() && confusable(sc, trim_ws(*d)))
+                return no("section_close " + show(sc) + " overlaps delimiter " + show(*d));
+        }
+    }
     if (!f.call_separator.empty())
         return no("a separator between calls (call_separator " + show(f.call_separator) +
                   ") is not read by the streaming parser; tagged calls separate on whitespace");
     if (f.call_open.empty() && !f.call_close.empty())
         return no("call_close without call_open");
     const bool object = f.object_args();
+    if (object && !f.section_open.empty())
+        return no("section-wrapped object arguments are not supported");
     /* Without a suffix the name ends at what follows it: the object's `{`, or a tagged call's
      * first argument or close. */
     if (!f.name_suffix.empty()) {
@@ -216,9 +235,24 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
             f.object_bare_keys)
             return no("the object_* fields describe an argument object, and args_form is "
                       "RAD_CHAT_ARGS_TAGGED");
+        if (f.typed_tags()) {
+            /* The two tags are told apart where the name ends: one may not begin the other. */
+            if (f.arg_value_prefix.empty())
+                return no("arg_json_value_prefix is set and arg_value_prefix, the string tag, is "
+                          "empty");
+            const std::string s = f.arg_name_suffix + f.arg_value_prefix;
+            const std::string j = f.arg_name_suffix + f.arg_json_value_prefix;
+            if (confusable(s, j))
+                return no("arg_value_prefix " + show(f.arg_value_prefix) +
+                          " and arg_json_value_prefix " + show(f.arg_json_value_prefix) +
+                          " cannot be told apart");
+            if (f.other_value != ChatValue::Json)
+                return no("arg_json_value_prefix opens a JSON value, and other_value is not "
+                          "RAD_CHAT_VALUE_JSON");
+        }
     } else {
         for (const std::string* s : { &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
-                                      &f.arg_value_suffix })
+                                      &f.arg_json_value_prefix, &f.arg_value_suffix })
             if (!s->empty())
                 return no("the arg_* fields describe tagged arguments, and args_form is "
                           "RAD_CHAT_ARGS_OBJECT");
@@ -238,9 +272,10 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
                       show(f.name_prefix) + " cannot be told apart");
     }
     const std::string opener = f.call_open.empty() ? f.name_prefix : f.call_open;
+    const std::string section_opener = trim_ws(f.section_open);
     for (const std::string& b : f.reasoning_breaks)
-        if (b != opener)
-            return no("reasoning break " + show(b) + " is not the call opener " + show(opener));
+        if (b != opener && (section_opener.empty() || b != section_opener))
+            return no("reasoning break " + show(b) + " is not a call or section opener");
     if (!f.reasoning_breaks.empty() && !f.has_reasoning())
         return no("reasoning_breaks without a reasoning block");
     for (const std::string& t : f.triggers)
@@ -317,6 +352,7 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.object_string_close = s(c.object_string_close);
     f.object_bare_keys    = c.object_bare_keys != 0;
     f.reasoning_anywhere  = c.reasoning_anywhere != 0;
+    f.arg_json_value_prefix = s(c.arg_json_value_prefix);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -432,6 +468,8 @@ std::string chat_format_describe(const ChatFormat& f) {
              (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
+    if (f.has_tools() && !f.section_open.empty())
+        s += "; section " + show(f.section_open) + ".." + show(f.section_close);
     if (f.has_tools() && f.object_args()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " {OBJECT";
@@ -442,6 +480,7 @@ std::string chat_format_describe(const ChatFormat& f) {
     } else if (f.has_tools()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " " + show(f.arg_prefix) + "ARG" + show(f.arg_name_suffix) + show(f.arg_value_prefix) +
+             (f.typed_tags() ? "|" + show(f.arg_json_value_prefix) : std::string()) +
              "VALUE" + show(f.arg_value_suffix) + " " + show(f.call_end) + show(f.call_close);
     }
     if (f.has_tools()) {
@@ -462,8 +501,9 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
     for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.section_open,
                                   &f.section_close, &f.call_open, &f.call_close, &f.name_prefix,
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
-                                  &f.arg_value_prefix, &f.arg_value_suffix,
-                                  &f.object_string_open, &f.object_string_close }) {
+                                  &f.arg_value_prefix, &f.arg_json_value_prefix,
+                                  &f.arg_value_suffix, &f.object_string_open,
+                                  &f.object_string_close }) {
         const std::string t = trim_ws(*s);
         if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
     }
@@ -856,6 +896,9 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                      * refused there by name. */
                     if (!required.count(pname) && info.unsatisfiable(pschema)) continue;
                     G value;
+                    /* A format whose tag types the value writes the JSON tag before a JSON
+                     * value; the string tag otherwise. */
+                    const std::string* vprefix = &f.arg_value_prefix;
                     if (f.other_value != ChatValue::Json || info.resolves_to_string(pschema)) {
                         value = wrap(rule_ref("until-suffix"));
                     } else {
@@ -863,10 +906,11 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                         const std::string sch = b.add_schema(
                             "tool-" + name + "-arg-" + pname + "-schema", pschema);
                         value = alt({ seq({ wrap(leaf(sch)), space() }), wrap(rule_ref("until-suffix")) });
+                        if (f.typed_tags()) vprefix = &f.arg_json_value_prefix;
                     }
                     G arm = wrap(seq({ wrap(seq({ lit(f.arg_prefix), wrap(lit(pname)),
                                                   lit(f.arg_name_suffix) })),
-                                       lit(f.arg_value_prefix), value,
+                                       lit(*vprefix), value,
                                        wrap(lit(f.arg_value_suffix)) }));
                     const std::string rule = rule_name("tool-" + name + "-arg-" + pname);
                     b.add_rule(rule, render(arm));
@@ -877,10 +921,13 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 /* The generic arm for an undeclared name; not emitted for a tool that declares
                  * no parameters, since it takes no arguments. */
                 if (!any.empty()) {
+                    G tag = f.typed_tags() ? alt({ lit(f.arg_value_prefix),
+                                                   lit(f.arg_json_value_prefix) })
+                                           : lit(f.arg_value_prefix);
                     G arm = wrap(seq({ wrap(seq({ lit(f.arg_prefix),
                                                   wrap(leaf(until_pattern({ name_end }))),
                                                   lit(f.arg_name_suffix) })),
-                                       lit(f.arg_value_prefix), wrap(rule_ref("until-suffix")),
+                                       tag, wrap(rule_ref("until-suffix")),
                                        wrap(lit(f.arg_value_suffix)) }));
                     const std::string rule = rule_name("tool-" + name + "-arg-undeclared");
                     b.add_rule(rule, render(arm));
@@ -912,11 +959,17 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                             ? seq({ wrapped, rep(seq({ space(), wrapped }), 0, -1), space() })
                             : seq({ wrapped, space() });
             } else {
-                G next = seq({ space(), opt(wrap(leaf(until_pattern({ opener })))), choice });
+                /* Section-wrapped dialects contain only calls and whitespace. In particular,
+                 * inter-call prose must not consume a section close and admit later calls. */
+                G next = f.section_open.empty()
+                             ? seq({ space(), opt(wrap(leaf(until_pattern({ opener })))), choice })
+                             : seq({ space(), choice });
                 calls = req.parallel_tool_calls
-                            ? seq({ lit(""), space(), choice, rep(next, 0, -1), space(), lit("") })
-                            : seq({ lit(""), space(), choice, space(), lit("") });
+                            ? seq({ choice, rep(next, 0, -1), space() })
+                            : seq({ choice, space() });
             }
+            if (!f.section_open.empty())
+                calls = seq({ lit(f.section_open), space(), calls, space(), lit(f.section_close) });
             b.add_rule("tool-call", render(calls));
             if (req.require_call) {
                 /* Nothing after the calls: a complete grammar admits only the end of the turn,

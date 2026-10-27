@@ -106,11 +106,24 @@ using Ffn    = MlpFP8;
 using MtpHead = MtpFP8;
 #endif
 
+/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h): a weight's first
+ * kPrefetchBytes, on decode steps of up to kPrefetchStepRows rows. Qwen3.8-27B MXFP4 + DFlash2, tp
+ * 2 on two R9700s, no speculation: 12 MB was best, +11 % at one stream, +9 % at eight, +3 % at
+ * sixteen; past ~12 MB the read outlasts the reduction and takes bandwidth from the GEMM it feeds.
+ * Up to 32 rows (a verify of four sequences at speculation 7): at 32 and 64 rows the reads are a
+ * wash. The drafter's reads (Dflash2::Config::prefetch) take the same size. */
+constexpr int64_t kPrefetchBytes    = (int64_t)12 << 20;
+constexpr int64_t kPrefetchStepRows = 32;
+
 struct Layer {
     int          full = 0;
     AttnGatedFP8 attn;
     GdnFP8       gdn;
     Ffn          mlp;
+    /* gate_up's leading bytes beside the mixer's reduction, the next layer's first projection's
+     * beside the feed-forward's; 0 where none is declared. */
+    rad_op       op_pf_gu = 0, op_pf_next = 0;
+    rad_weight   pf_gu_w = 0, pf_next_w = 0;
 };
 
 struct Model {
@@ -283,6 +296,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
 
     Dflash2::Config dc{};
     dc.short_block = 1;   /* rad_drafter_short_block below */
+    dc.prefetch    = kPrefetchBytes;   /* reads beside the drafter's all-reduces (at tp > 1) */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -406,6 +420,45 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     /* The proposal buffer (RadDrafterDecl::proposal): a DFlash2 pass proposes through the
      * selector, never through the sampler's token buffer. */
     dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
+
+    /* --draft-coupling (RadBuildCtx::draft_coupling): the walk samples each draft from Q, its
+     * scores' softmax over the best eight candidates, and the sampler couples the target's own draw
+     * to it (abi/rad_spechub.h). The planes are named as the MTP head's, which is how the engine
+     * finds them. RADIANCE_DFLASH_Q_TEMP sets Q's temperature; any value keeps the output exact
+     * and moves only acceptance. The default, 0.6, is where held-out acceptance peaked on
+     * Qwen3.8-27B MXFP4 + its DFlash2 drafter at request temperature 1 (tokens a step at x4, 32
+     * rows: ordinary rule 3.52; Q at 1.0 3.71, 0.7 3.88, 0.5 3.85, 0.35 3.77): the walk's scores
+     * are flatter than the target's law, and a sharper Q puts its mass where the target's is. */
+    if (ctx->draft_coupling) {
+        if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
+            dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
+            rad_note(b, "--draft-coupling on: DFlash2's coupled walk takes at most %d drafts, %d "
+                        "candidates and a selector rank that is a multiple of %d up to %d",
+                     RAD_MTP_COUPLE_MAX_ROUNDS, RAD_DFLASH_COUPLE_MAX_K, RAD_DFLASH_EDGE_PARTS,
+                     RAD_DFLASH_COUPLE_MAX_R);
+            return RAD_E_UNSUPPORTED;
+        }
+        dc.q_temp = 0.6;
+        if (const char* e = std::getenv("RADIANCE_DFLASH_Q_TEMP")) {
+            const double t = std::strtod(e, nullptr);
+            if (!(t > 0.0) || t > 100.0) {
+                fprintf(stderr, "radiance: RADIANCE_DFLASH_Q_TEMP=%s is not a temperature in "
+                                "(0, 100]\n", e);
+                return RAD_E_INVAL;
+            }
+            dc.q_temp = t;
+        }
+        dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                 {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+        dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                 {dc.steps(), dg.max_seqs, RAD_MTP_COUPLE_STATE_WORDS},
+                                 RAD_BUF_PERSIST);
+        if (!dw.couple_draws || !dw.couple_state) return RAD_E_INVAL;
+        rad_note(b, "DFlash2 coupled: the walk samples x~Q (FP64 softmax of its edge scores / %g "
+                    "over the best eight candidates) at each of %lld positions, and the sampler "
+                    "couples the target's own draw to it; fixed-seed tokens are NOT preserved",
+                 dc.q_temp, (long long)dc.steps());
+    }
 
     RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft",
                               nm.ckpt("lm_head.weight"), dw));
@@ -997,6 +1050,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             gs.out      = nm.ckpt("%s.%lld.linear_attn.out_proj.weight",      pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_state));
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
+            /* Lane 1 carries no collectives here (rad_block_gdn_fp8.h, ab_lane). */
+            lay.gdn.ab_lane = true;
             RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs,
                                          f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
         }
@@ -1024,6 +1079,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 #if QWEN35_MOE
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
     for (int64_t l = 0; l + 1 < m.n_main; ++l) m.layers[(size_t)l].mlp.xp_next = &m.layers[(size_t)l + 1].mlp;
+#endif
+
+#if !QWEN35_MOE
+    /* ---- the weight reads beside the decode all-reduces. A decode-height reduction leaves the
+     * card's memory idle for its round trip, so the next GEMM's leading weight bytes are read
+     * into the on-die cache then: gate_up behind the mixer's, the next layer's first projection
+     * behind the feed-forward's. At more than one rank; --weight-prefetch off declares none. */
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
+        for (int64_t l = 0; l < m.n_main; ++l) {
+            Layer& lay = m.layers[(size_t)l];
+            lay.pf_gu_w  = lay.mlp.gate_up.w;
+            lay.op_pf_gu = decl_prefetch(b, lay.pf_gu_w, kPrefetchBytes);
+            if (l + 1 < m.n_main) {
+                const Layer& nx = m.layers[(size_t)l + 1];
+                lay.pf_next_w  = nx.full ? nx.attn.qg.w : nx.gdn.in.w;
+                lay.op_pf_next = decl_prefetch(b, lay.pf_next_w, kPrefetchBytes);
+            }
+        }
+    }
 #endif
 
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -1497,12 +1571,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_rope_cs, batch->n_tok,
                     rope_pos1(batch, batch->n_tok), RAD_B(m.b_rope_cs));
 
+    /* Decode steps of up to kPrefetchStepRows rows only. This ceiling decides, not
+     * prefetch_beside's own (16): it is passed a height of 1 where the step qualifies. */
+    const int64_t pf_h =
+        batch->phase == RAD_PHASE_DECODE && batch->n_tok <= kPrefetchStepRows ? 1 : INT64_MAX;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         if (l.full) l.attn.step(c, batch);
         else        l.gdn.step(c, batch);
+        prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
         dbg_resid(c, (int)li, "mix", m.g.n_embd, m.b_x, m.a_h.x);
         l.mlp.step(c, batch);
+        prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
         dbg_resid(c, (int)li, "ffn", m.g.n_embd, m.b_x, m.a_h.x);
 
         /* The tap, after the layer: the drafter conditions on this layer's output, which the next

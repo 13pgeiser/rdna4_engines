@@ -187,6 +187,10 @@ struct Layer {
     rad_weight w_next = 0;
     /* the drafter's tap, on a layer the drafter reads (see declare) */
     rad_op op_tap = 0;
+    /* Calibration: the attention's input (q, k and v share it), its output (this rank's columns,
+     * o_proj's input), the dense arm's input and its gated product (this rank's columns, down's
+     * input). */
+    CalibTap tap_in{}, tap_o{}, tap_gu{}, tap_dn{};
 };
 
 struct Model {
@@ -226,6 +230,12 @@ struct Model {
     int     n_taps = 0;
     int     tap_layer[MAX_TAPS] = {};
     rad_buf b_dfsrc = 0;
+
+    /* The calibration tap: on while `tap_live`, over layers [calib_lo, calib_hi). Written by step,
+     * which owns the corpus count. */
+    bool       calib = false, tap_live = false;
+    int64_t    calib_lo = 0, calib_hi = 0;
+    long long  calib_rows = 0;
 
     Dflash1       df{};
     rad_kvgroup   kv_draft = 0;
@@ -1223,6 +1233,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * ~120 us per layer on 4x R9700), so it hides behind the experts' bandwidth. No collective
      * rides it, so the reductions stay on lane 0. Its buffers leave the arena's sharing. */
     m.arms = m.moe;
+    /* ---- the calibration tap. It reads each dense linear's bf16 input where trunk issues the
+     * linear, so a calibration runs every step whole and on one lane. The files are named after
+     * the weights the 31B's w4a8 container quantises (gemma4_bf16: blk.N.attn_qkv, attn_o,
+     * ffn_gate_up, ffn_down), which a GPTQ recipe reads with calib=DIR: the Hessians of the bf16
+     * model, whose activations a quantised container's own tap would see through its quantisers.
+     * The routed arm is not tapped. */
+    if (calib_dir()) {
+        m.overlap = false;
+        m.arms = false;
+        RAD_ARCH_TRY(calib_layers("gemma4", "RADIANCE_G4_CALIB_LAYERS", (int64_t)m.layers.size(),
+                                  &m.calib_lo, &m.calib_hi));
+        for (int64_t l = m.calib_lo; l < m.calib_hi; ++l) {
+            Layer& y = m.layers[(size_t)l];
+            const Kind& k = y.full ? m.kf : m.ks;
+            const int i = (int)l;
+            RAD_ARCH_TRY(y.tap_in.declare(b, nm, T, nm.f("blk.%d.attn_in", i), m.b_h, E));
+            RAD_ARCH_TRY(y.tap_o.declare(b, nm, T, nm.f("blk.%d.attn_o", i),
+                                         y.full ? m.b_attf : m.b_atts, k.q()));
+            RAD_ARCH_TRY(y.tap_gu.declare(b, nm, T, nm.f("blk.%d.ffn_gate_up", i), m.b_h, E));
+            RAD_ARCH_TRY(y.tap_dn.declare(b, nm, T, nm.f("blk.%d.ffn_down", i), m.b_act, m.n_ff));
+        }
+        m.calib = true;
+        m.tap_live = true;
+    }
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
     if (m.overlap || m.arms) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
     if (m.arms)
@@ -1464,8 +1498,10 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_q, brows(m.b_h, T), RAD_W(y.w_q), brows(m.b_qf, T));
             RAD_ISSUE(c, y.op_k, brows(m.b_h, T), RAD_W(y.w_k), brows(m.b_kf, T));
         }
+        y.tap_in.step(c, m.b_h, T, m.tap_live);
         attend(c, m, y, li, batch);
         RAD_ISSUE(c, y.op_o, brows(y.full ? m.b_attf : m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
+        y.tap_o.step(c, y.full ? m.b_attf : m.b_atts, T, m.tap_live);
         if (y.op_ar_o) RAD_ISSUE_N(c, y.op_ar_o, T * E, brows(m.b_o, T), RAD_NONE);
         if (y.op_join_r) {
             RAD_ISSUE(c, y.op_join_r, brows(m.b_o, T), RAD_W(y.w_apost), brows(m.b_x, T),
@@ -1485,9 +1521,11 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
         if (m.arms)
             lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
         RAD_ISSUE(c, y.op_gu, brows(m.b_h, T), RAD_W(y.w_gu), brows(m.b_gu, T));
+        y.tap_gu.step(c, m.b_h, T, m.tap_live);
         RAD_ISSUE(c, y.op_act, bcol(m.b_gu, 0, m.n_ff, T), bcol(m.b_gu, m.n_ff, m.n_ff, T),
                   brows(m.b_act, T));
         RAD_ISSUE(c, y.op_dn, brows(m.b_act, T), RAD_W(y.w_dn), brows(m.b_ff2, T));
+        y.tap_dn.step(c, m.b_act, T, m.tap_live);
         if (m.arms) lanes_ok = rad_lane(c, 0) == RAD_OK && lanes_ok;
         if (m.moe) {
             routed(c, m, y, T, 0, T, T);
@@ -1668,6 +1706,36 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
                          "the first");
 }
 
+/* The tap's rows, and its files once the corpus reached RADIANCE_CALIB_TOKENS. The input of q|k|v
+ * and of gate|up is whole on every rank, so rank 0 writes it, under the name of the linear that
+ * reads it. The column-split linears (o, down) see this rank's columns only: each rank writes its
+ * block as `<stem>.part`, which libquant's calib_sum places on the diagonal in rank order (the
+ * cross-rank products are never formed on one card). */
+static void calib_count(RadCtx* c, Model& m, int64_t T) {
+    m.calib_rows += T;
+    if (m.calib_rows < calib_target()) return;
+    const int rk = rad_rank(c);
+    bool ok = true;
+    for (int64_t l = m.calib_lo; l < m.calib_hi; ++l) {
+        const Layer& y = m.layers[(size_t)l];
+        char stem[96];
+        if (rk == 0) {
+            std::snprintf(stem, sizeof stem, "blk.%d.attn_qkv", (int)l);
+            ok = calib_write(c, y.tap_in.h, y.tap_in.K, m.calib_rows, stem, 0) && ok;
+            std::snprintf(stem, sizeof stem, "blk.%d.ffn_gate_up", (int)l);
+            ok = calib_write(c, y.tap_gu.h, y.tap_gu.K, m.calib_rows, stem, 0) && ok;
+        }
+        std::snprintf(stem, sizeof stem, "blk.%d.attn_o.part", (int)l);
+        ok = calib_write(c, y.tap_o.h, y.tap_o.K, m.calib_rows, stem, 0) && ok;
+        std::snprintf(stem, sizeof stem, "blk.%d.ffn_down.part", (int)l);
+        ok = calib_write(c, y.tap_dn.h, y.tap_dn.K, m.calib_rows, stem, 0) && ok;
+    }
+    m.tap_live = false;
+    std::fprintf(stderr, "radiance: gemma4: rank %d wrote the Hessians of layers %lld:%lld after "
+                         "%lld tokens to %s%s\n", rk, (long long)m.calib_lo, (long long)m.calib_hi,
+                 m.calib_rows, calib_dir(), ok ? "" : ", with errors");
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     const Model& m = g_model[rad_rank(c)];
     if (batch->draft_pass != 0) {
@@ -1695,6 +1763,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const int64_t cut = split_at(m, T);
     if (cut > 0) trunk_overlap(c, m, batch, cut);
     else         trunk(c, m, batch);
+    if (m.calib && m.tap_live) calib_count(c, g_model[rad_rank(c)], T);
 
     if (m.op_onorm) RAD_ISSUE(c, m.op_onorm, brows(m.b_x, T), RAD_W(m.w_onorm), brows(m.b_h, T));
     if (batch->n_out > 0) {

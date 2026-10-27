@@ -81,5 +81,6 @@ inline int64_t gather_units(const float* w, int64_t N, int64_t K, int64_t unit,
 const RadQuantizerInfo& awq_info();
 const RadQuantizerInfo& autoround_info();
 const RadQuantizerInfo& paroquant_info();
+const RadQuantizerInfo& m2xfp_info();
 
 }  /* namespace lq */

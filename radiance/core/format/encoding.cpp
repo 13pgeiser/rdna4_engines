@@ -434,6 +434,40 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
             return RAD_OK;
         }
     }
+    /* An m2xfp4 weight's codes with its meta plane, without the scale: the selected planes'
+     * canonical bytes concatenated, as stored (the codes rows, then the meta rows). Read by a
+     * kernel that decodes the scheme itself beside the E8M0 exponent plane its b_scale operand
+     * carries; there is nothing to decode here, because the scale is what the selection leaves
+     * out. */
+    if (rad_enc_is(&e, "m2xfp4") && dt == RAD_U8) {
+        int codes = -1;
+        bool meta = true;
+        for (int k = 0; k < n_sel && meta; ++k) {
+            const RadEncPlane& p = e.plane[sel[k]];
+            if (p.kind != RAD_PLANE_TILED || p.block[0] != 1 || p.block[1] < 1 ||
+                rad_enc_role_in_chain(p.role, "scale"))
+                meta = false;
+            else if (!std::strcmp(p.role, "codes")) {
+                if (codes >= 0 || p.block[1] != 1) meta = false;   /* one code a value */
+                else codes = k;
+            }
+        }
+        if (meta && codes >= 0) {
+            int64_t bytes = 0;
+            for (int k = 0; k < n_sel; ++k)
+                bytes += rows[k] * rad_enc_row_bytes(e.plane[sel[k]].dtype, cols[k]);
+            if (bytes != n)
+                return refuse("its planes hold " + std::to_string(bytes) +
+                              " bytes and the reader wants " + std::to_string(n));
+            uint8_t* dst = (uint8_t*)out;
+            for (int k = 0; k < n_sel; ++k) {
+                const int64_t rb = rad_enc_row_bytes(e.plane[sel[k]].dtype, cols[k]);
+                std::memcpy(dst, data[k], (size_t)(rows[k] * rb));
+                dst += rows[k] * rb;
+            }
+            return RAD_OK;
+        }
+    }
     if (n_sel != e.n_planes)
         return refuse("it takes " + std::to_string(n_sel) + " of its encoding's " +
                       std::to_string(e.n_planes) + " planes, which decode to nothing on their own");

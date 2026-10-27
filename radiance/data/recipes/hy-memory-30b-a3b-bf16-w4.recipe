@@ -1,0 +1,22 @@
+# Hy-Memory-30B-A3B from Tencent's BF16 safetensors checkpoint. Quantize attention projections,
+# the dense first MLP and routed experts to native INT4. Keep shared MLPs, routers, norms, embeddings
+# and the output head at BF16. Routed experts use signed INT4 with BF16 group scales; other linears
+# use asymmetric U4 with F16 scales and U8 zero points. The byte-sized zero points keep TP2 column
+# shards aligned even when a projection has an odd number of 128-value groups per rank.
+#
+#   rad-convert <Hy-Memory-30B-A3B-BF16> \
+#       --recipe data/recipes/hy-memory-30b-a3b-bf16-w4.recipe -o hy-memory-30b-a3b-w4.rad
+#
+# The W4 GEMMs consume dynamic INT8 activations. Routed/shared outputs are reduced independently at
+# TP2 then combined in FP32. Use --tp 2 at serve time if one device cannot hold the .rad weights and
+# KV cache.
+
+blk.*.attn_q.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_k.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_v.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_output.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+
+blk.0.ffn_gate_up.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.0.ffn_down.weight                rtn  codes=u4 zero=u8 group=128 scale=f16
+
+blk.*.ffn_*_exps.*.weight            rtn  codes=i4 group=128 scale=bf16

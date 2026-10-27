@@ -2,6 +2,7 @@
  * schedule, and the generator's sequence built from a conditioning prompt (gen.h). */
 #include "gen.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -394,6 +395,35 @@ int build_layout(const Branch& b, int64_t slot_rows,
         return RAD_E_STATE;
     }
     return RAD_OK;
+}
+
+StagedMedia stage_media(const mm::PromptMedia& pm, int64_t patch_dim, uint16_t* pixels,
+                        int32_t* coords, int32_t* cu, int32_t* rows) {
+    StagedMedia st;
+    int64_t total = 0;
+    for (const mm::Placed& p : pm.items) total += p.item->n_patch;
+    cu[0] = 0;
+    std::vector<int32_t> tmp;
+    for (const mm::Placed& p : pm.items) {
+        const mm::Item& it = *p.item;
+        std::memcpy(pixels + st.n_patch * patch_dim, it.pixels.data(),
+                    (size_t)(it.n_patch * patch_dim) * 2);
+        tmp.resize((size_t)(4 * it.n_patch));
+        it.coords(0, it.n_patch, tmp.data());
+        for (int cc = 0; cc < 4; ++cc)
+            std::memcpy(coords + cc * total + st.n_patch, tmp.data() + cc * it.n_patch,
+                        (size_t)it.n_patch * 4);
+        for (int32_t s = 0; s < it.n_seg; ++s) {
+            const int64_t a = it.patch_at(s), e = it.patch_at(s + 1);
+            cu[st.n_seg + 1] = (int32_t)(st.n_patch + e);
+            st.max_seg = std::max<int32_t>(st.max_seg, (int32_t)(e - a));
+            ++st.n_seg;
+        }
+        st.n_patch += it.n_patch;
+    }
+    for (const mm::RopeLayout::Run& run : pm.rope.runs)
+        for (int32_t k = 0; k < run.n; ++k) rows[st.n_rows++] = run.tok + k;
+    return st;
 }
 
 }  /* namespace gen */

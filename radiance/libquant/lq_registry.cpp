@@ -244,6 +244,7 @@ const std::vector<const RadQuantizerInfo*>& table() {
         v.push_back(&autoround_info());
         v.push_back(&paroquant_info());
         v.push_back(&ggml_quantizer);
+        v.push_back(&m2xfp_info());
         return v;
     }();
     return t;

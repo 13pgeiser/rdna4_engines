@@ -342,13 +342,18 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
     const bool once = p_int(a, "norm_once", 0) != 0;
     const char* nk = p_str(a, "norm", "rms");
     const bool layer = std::strcmp(nk, "layer") == 0, none = std::strcmp(nk, "none") == 0;
+    /* The optional trailing column map (slot 9 quantising, slot 7 plain): a sequence reads the
+     * modulation table at its mapped row, so `s` and `g` may hold fewer rows than there are
+     * sequences; the map's bound is the issuer's. */
+    const RadTensor* cm = rad_arg_in(a, quant ? 9 : 7);
     if ((!layer && !none && std::strcmp(nk, "rms") != 0) || (none && W)) return RAD_E_INVAL;
     if (n <= 0 || grp <= 0 || n % grp || (gated && (!Yv || !G))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(quant ? Q : Z, n), n_seq = numel(cu) - 1, ngrp = n / grp;
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
     if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || (W && numel(W) < n) ||
-        numel(S) < n_seq * 2 * n)
+        (!cm && numel(S) < n_seq * 2 * n))
         return RAD_E_SHAPE;
-    if (gated && (rows_of(Yv, n) < rows || numel(G) < n_seq * n)) return RAD_E_SHAPE;
+    if (gated && (rows_of(Yv, n) < rows || (!cm && numel(G) < n_seq * n))) return RAD_E_SHAPE;
     if (quant && (numel(SC) < rows * ngrp || (Z && rows_of(Z, n) < rows))) return RAD_E_SHAPE;
     const uint32_t dt = quant ? (uint32_t)RAD_BF16 : Z->dtype;
     /* The tables from one scratch_raw call, [gain | shift | gate] a sequence and the weight row:
@@ -358,13 +363,15 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
     {
         const int64_t s_rs = row_stride(S, 2 * n), s_cs = laststride(S);
         const int64_t g_rs = gated ? row_stride(G, n) : 0, g_cs = gated ? laststride(G) : 0;
-        for (int64_t e = 0; e < n_seq; ++e)
+        for (int64_t e = 0; e < n_seq; ++e) {
+            const int64_t col = cm ? (int64_t)ldt(cm, e) : e;  /* the sequence's table row */
             for (int64_t i = 0; i < n; ++i) {
                 float* row = tabs + e * tw;
-                row[i] = narrow1(dt, 1.0f + ldt(S, e * s_rs + (n + i) * s_cs));
-                row[n + i] = ldt(S, e * s_rs + i * s_cs);
-                if (gated) row[2 * n + i] = ldt(G, e * g_rs + i * g_cs);
+                row[i] = narrow1(dt, 1.0f + ldt(S, col * s_rs + (n + i) * s_cs));
+                row[n + i] = ldt(S, col * s_rs + i * s_cs);
+                if (gated) row[2 * n + i] = ldt(G, col * g_rs + i * g_cs);
             }
+        }
         for (int64_t i = 0; i < n; ++i)
             tabs[n_seq * tw + i] = W ? ldt(W, i * laststride(W)) + wadd : 1.0f;
     }
@@ -423,7 +430,10 @@ AVX_KERNEL(rms_mod_quant_fp8) { return rms_mod_run(a, true); }
 
 /* ------------------------------------------------------------------ timestep_embed */
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})] with libref's libm
- * calls: a pass embeds one row per entry, so this is a few thousand transcendentals. */
+ * calls: a pass embeds one row per entry, so this is a few thousand transcendentals. With
+ * `curve` = G > 0 and a [G, n] f32 `table`, y[m] instead interpolates linearly between the
+ * table's two rows around clamp01(max(t[m], clamp_min)) * (G - 1): a checkpoint's timestep
+ * embedding precomputed on a grid, in place of the sinusoid and its MLP. */
 AVX_KERNEL(timestep_embed) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *T = &a->t[0], *Y = &a->t[1];
@@ -431,16 +441,39 @@ AVX_KERNEL(timestep_embed) {
     const float scale = p_f32(a, "scale", 1000.0f);
     const double mp = p_f32(a, "max_period", 10000.0f);
     const int round = (int)p_int(a, "round", 0);
-    if (n <= 0 || (n & 1)) return RAD_E_SHAPE;
+    const float clamp = p_f32(a, "clamp_min", 0.0f);
+    const int64_t grid = p_int(a, "curve", 0);
+    if (n <= 0 || (!grid && (n & 1))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(T) < rows) return RAD_E_SHAPE;
+    if (grid > 0) {
+        const RadTensor* tab = rad_arg_in(a, 2);
+        if (!tab) return RAD_E_INVAL;
+        if (tab->dtype != (uint32_t)RAD_F32 || numel(tab) < grid * n) return RAD_E_SHAPE;
+        float* buf = scratch_f32((size_t)n + 16);
+        for (int64_t m = 0; m < rows; ++m) {
+            const float tv = std::fmax(ldt(T, offlin(T, m)), clamp);
+            const float pos = std::fmin(std::fmax(tv, 0.0f), 1.0f) * (float)(grid - 1);
+            float i0f = std::floor(pos);
+            if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);
+            const float fr = pos - i0f;
+            const int64_t i0 = (int64_t)i0f;
+            for (int64_t i = 0; i < n; ++i) {
+                const float a0 = ldt(tab, offlin(tab, i0 * n + i));
+                const float a1 = ldt(tab, offlin(tab, (i0 + 1) * n + i));
+                buf[i] = a0 + fr * (a1 - a0);
+            }
+            out_row(Y, rowoff(Y, m, n), n, buf);
+        }
+        return RAD_OK;
+    }
     const int64_t h = n / 2;
     const float coef = (float)(-std::log(mp));
     float* buf = scratch_f32((size_t)(2 * n + 16));
     float *f = buf, *row = buf + n;
     for (int64_t i = 0; i < h; ++i) f[i] = sc_exp(coef * (float)i / (float)h);
     for (int64_t m = 0; m < rows; ++m) {
-        const float tv = ldt(T, offlin(T, m));
+        const float tv = std::fmax(ldt(T, offlin(T, m)), clamp);   /* clamp_min: a floor */
         const float tt = round == 3 ? narrow1(RAD_BF16, scale * narrow1(RAD_BF16, tv))
                        : round == 2 ? scale * narrow1(RAD_BF16, tv)
                        : round ? scale * narrow1(RAD_BF16, narrow1(RAD_BF16, tv * scale) / scale)
@@ -908,6 +941,57 @@ AVX_KERNEL(flow_x0_step) {
             o[c] = keep(r * x[c]) + keep(omr * d);
         }
         out_row(X, rowoff(X, k, n), n, o);
+    }
+    return RAD_OK;
+}
+
+/* x' = f32(f32(r x) + f32(hb1 d) + f32(hb2 x0)) when order >= 2, else the Euler form
+ * f32(f32(r x) + f32((1 - r) d)), with d = f32(x + f32(sigma v)): libref's step bit for bit, `keep`
+ * holding each product to its own rounding. x0 is the previous estimate (read here, d written back). */
+AVX_KERNEL(flow_res_multistep) {
+    if (!rad_args_have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *V = &a->t[0], *X0 = &a->t[1], *SG = &a->t[2], *RR = &a->t[3];
+    const RadTensor *HB1 = &a->t[4], *HB2 = &a->t[5], *ORD = &a->t[6], *X = &a->t[7];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0 || rows_of(V, n) < rows || rows_of(X0, n) < rows || numel(SG) < 1 ||
+        numel(RR) < 1 || numel(HB1) < 1 || numel(HB2) < 1 || numel(ORD) < 1)
+        return RAD_E_SHAPE;
+    const float sg = ldt(SG, offlin(SG, 0));
+    const float r = ldt(RR, offlin(RR, 0));
+    const float b1 = ldt(HB1, offlin(HB1, 0));
+    const float b2 = ldt(HB2, offlin(HB2, 0));
+    const bool two = ldt(ORD, offlin(ORD, 0)) >= 1.5f;
+    const float omr = 1.0f - r;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(5 * n + 64));
+        float *vs = buf, *xs = buf + n + 16, *h0s = xs + n + 16, *o = h0s + n + 16, *o0 = o + n + 16;
+        const float* v = in_row(V, rowoff(V, k, n), n, vs);
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        const float* h0 = in_row(X0, rowoff(X0, k, n), n, h0s);
+        const vf vsg = vf_set1(sg), vr = vf_set1(r), vb1 = vf_set1(b1), vb2 = vf_set1(b2),
+                 vo = vf_set1(omr);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N) {
+            const vf xv = vf_loadu(x + c);
+            const vf d = vf_add(xv, keep(vf_mul(vsg, vf_loadu(v + c))));
+            const vf a = keep(vf_mul(vr, xv));
+            vf xo = two ? vf_add(vf_add(a, keep(vf_mul(vb1, d))), keep(vf_mul(vb2, vf_loadu(h0 + c))))
+                        : vf_add(a, keep(vf_mul(vo, d)));
+            vf_storeu(o + c, xo);
+            vf_storeu(o0 + c, d);
+        }
+        for (; c < n; ++c) {
+            const float d = x[c] + keep(sg * v[c]);
+            const float a = keep(r * x[c]);
+            o[c] = two ? (a + keep(b1 * d)) + keep(b2 * h0[c]) : a + keep(omr * d);
+            o0[c] = d;
+        }
+        out_row(X, rowoff(X, k, n), n, o);
+        out_row(X0, rowoff(X0, k, n), n, o0);
     }
     return RAD_OK;
 }

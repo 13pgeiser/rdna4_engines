@@ -14,11 +14,10 @@ extern "C" {
 
 /* Bumped whenever anything a plugin compiles against changes shape: this header, rad_types.h,
  * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h, rad_sample.h or
- * rad_spechub.h. Every
- * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
- * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
- * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 27u
+ * rad_spechub.h. Every kind of plugin reports it, and a plugin that does not report exactly this
+ * version is refused at load with both versions printed. A new optional export (e.g.
+ * rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
+#define RAD_ABI_VERSION 31u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

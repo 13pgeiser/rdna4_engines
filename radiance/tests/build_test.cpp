@@ -1826,6 +1826,38 @@ TEST(a_widened_weight_cannot_also_be_relayouted) {
     CHECK(any_error(b, "a widening and a relayout"));
 }
 
+/* The other direction, the d3 readout: an f32 checkpoint tensor declared bf16 (what the device
+ * logits kernel reads) is narrowed by the loader, and the stored form is one plain bf16 plane. */
+TEST(an_f32_source_declared_bf16_is_narrowed_at_load) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    b.set_sources([](const std::string& name, const Program&, WeightSource* out) -> int {
+        if (name != "w.readout") return RAD_E_NOTFOUND;
+        out->enc = rad_enc_plain(RAD_F32);
+        out->rank = 2;
+        out->shape[0] = 32;
+        out->shape[1] = 64;
+        return RAD_OK;
+    });
+    RadWeightDecl d{};
+    d.dtype = RAD_BF16;
+    d.rank = 2;
+    d.shape[0] = 32;
+    d.shape[1] = 64;
+    d.access = RAD_ACCESS_PER_TOKEN;
+    d.group = rad_group_layer(0);
+    const rad_weight w = b.decl_weight("w.readout", &d);
+    REQUIRE(w != 0);
+    CHECK_OK(b.finish());
+    CHECK(b.errors().empty());
+    const WeightInfo* wi = b.program().weight(w);
+    CHECK(wi->narrow);
+    CHECK(!wi->widen);
+    CHECK_EQ(wi->stored_dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ((long long)wi->stored_bytes, 32LL * 64LL * 2);
+    CHECK(!weight_file_direct(*wi, 1));
+}
+
 /* ================================================================== the sizing declare */
 
 /* A smaller arena level is declared again at a smaller max_tok and takes the real declare's bands,

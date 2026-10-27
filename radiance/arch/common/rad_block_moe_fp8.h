@@ -189,6 +189,13 @@ struct MoeFP8 {
         int     swiglu_quant = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
+        /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
+         * rather than each layer/pass filling the same plane again. */
+        int     shared_one_external = 0;
+        /* Add the already-rounded routed and shared BF16 outputs in FP32, then round to BF16.
+         * At TP1 the ungated gather preserves both roundings; TP>1 reduces each arm separately
+         * before combining, so its gather cannot fold the shared output. */
+        int     shared_fp32_combine = 0;
         /* 4-bit experts (`i4*bf16[1x128]`) rather than E4M3 (`fp8_e4m3*bf16[128x128]`); for
          * Qwen3.8-Flash-Next this decides whether the model fits two cards (see the `moe_gemm_w4a8`
          * registry row). It is the stored encoding: probe() reads it from the first expert's
@@ -278,7 +285,7 @@ struct MoeFP8 {
         ActFP8  eff{};         /* [rows * top_k, n_ff_exp] */
         rad_buf edn     = 0;   /* [rows * top_k, n_embd]       bf16, in sorted order */
         /* back in token order, and the shared expert, one row per token */
-        rad_buf moe     = 0;   /* [max_tok, n_embd]           bf16 */
+        rad_buf moe     = 0;   /* [max_tok, n_embd]           bf16; separate routed output if needed */
         rad_buf sgu     = 0;   /* [max_tok, 2 * n_ff_shared]  bf16 */
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
@@ -306,6 +313,13 @@ struct MoeFP8 {
          * already fused gate rows first, as this block wants. */
         const char* experts_gate_up = nullptr;
         const char* experts_down    = nullptr;
+        /* Some GGUF writers retain gate and up as separate stacked tensors. These three fields
+         * describe that layout; each expert's gate/up slices are fused at conversion. */
+        const char* experts_gate = nullptr;
+        const char* experts_up   = nullptr;
+        const char* shared_mlp_gate = nullptr;
+        const char* shared_mlp_up   = nullptr;
+        const char* shared_mlp_down = nullptr;
         const char* shared_gate = nullptr;   /* mlp.shared_expert_gate.weight, [1, n_embd] */
     };
 
@@ -413,6 +427,8 @@ struct MoeFP8 {
     mutable bool         calib_dne_failed = false;
     void calib_experts_pass(RadCtx* c_, int64_t slots) const;
     rad_op op_sgate = 0;
+    rad_op op_combine = 0; /* BF16 inputs, FP32 addition, one BF16 rounding */
+    rad_op op_moe_ar = 0, op_shared_ar = 0;
     rad_op op_ar = 0, op_add = 0;
     bool   ar_out = false;
     /* Which wires the consumer of this block's all-reduce takes. Set before declare; see
@@ -530,21 +546,30 @@ inline int moe_expert_sources(RadBuilder* b, Names& nm, const char* tag, const c
 
 /* The gate_up and down name maps of one expert: a dim-0 slice of the stacked tensors, or the
  * checkpoint's per-expert gate and up joined along rows. `gate_up` false maps down alone. */
+inline int moe_map_gate_up(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
+                           long long ge) {
+    if (src.experts_gate_up) return map_slice(b, guw, src.experts_gate_up, (int)ge);
+    if (src.experts_gate && src.experts_up)
+        return map_slice_concat(b, guw, {src.experts_gate, src.experts_up}, (int)ge);
+    return map_concat(b, guw, {nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge),
+                                nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge)});
+}
+
 inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
                           const char* dnw, long long ge, bool gate_up) {
-    if (src.experts_gate_up) {
-        /* The slice index is global: the checkpoint holds every expert. */
-        if (gate_up) RAD_ARCH_TRY(map_slice(b, guw, src.experts_gate_up, (int)ge));
+    if (gate_up) RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge));
+    if (src.experts_gate_up || src.experts_gate)
         return map_slice(b, dnw, src.experts_down, (int)ge);
-    }
-    const char* gate = nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge);
-    const char* up   = nm.ckpt("%s.%lld.up_proj.weight",   src.experts, ge);
-    if (gate_up) RAD_ARCH_TRY(map_concat(b, guw, { gate, up }));
     return map_copy(b, dnw, nm.ckpt("%s.%lld.down_proj.weight", src.experts, ge));
 }
 
 inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config* cfg) {
-    if (!cfg || (!src.experts && !src.experts_gate_up)) return RAD_E_INVAL;
+    if (!cfg || (!src.experts && !src.experts_gate_up && !src.experts_gate)) return RAD_E_INVAL;
+    const bool split_stack = src.experts_gate || src.experts_up;
+    if ((src.experts_gate_up && split_stack) ||
+        (split_stack && (!src.experts_gate || !src.experts_up || !src.experts_down ||
+                         src.experts)) ||
+        (src.experts_gate_up && (!src.experts_down || src.experts))) return RAD_E_INVAL;
     /* The caller names the expert in model numbering (the first this rank owns under expert
      * parallelism); declare() skips the ones mapped here.
      *
@@ -559,9 +584,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
     int f = 0;
     for (long long ge = g0; ge < gn && ge <= g0 + kMaxProtected; ++ge) {
         const char* guw = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge);
-        if (src.experts_gate_up) RAD_ARCH_TRY(map_slice(b, guw, src.experts_gate_up, (int)ge));
-        else RAD_ARCH_TRY(map_concat(b, guw, { nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge),
-                                               nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge) }));
+        RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge));
         cfg->probed_count = ge - g0 + 1;
         RadEncoding e{};
         f = 0;
@@ -604,8 +627,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (c.rows <= 0) c.rows = g.max_tok;
     /* A rank whose slice of the shared arm is empty (see Config) declares no arm, and the
      * all-reduce carries the others' share. */
-    const bool shared = c.n_ff_shared > 0 && src.shared;
+    const bool split_shared = src.shared_mlp_gate || src.shared_mlp_up || src.shared_mlp_down;
+    if (split_shared && (!src.shared_mlp_gate || !src.shared_mlp_up || !src.shared_mlp_down ||
+                         src.shared)) return RAD_E_INVAL;
+    const bool shared = c.n_ff_shared > 0 && (src.shared || src.shared_mlp_gate);
     if (shared && c.shared_ungated && src.shared_gate) return RAD_E_INVAL;
+    if (c.shared_one_external && (!shared || !c.shared_ungated || !w.sgate || g.world != 1))
+        return RAD_E_INVAL;
+    if (c.shared_fp32_combine && (!shared || !w.moe || std::strcmp(g.dtype, "bf16"))) {
+        fprintf(stderr, "radiance: layer %d requests an FP32 shared/routed combine without its "
+                        "BF16 shared arm and routed output\n", l);
+        return RAD_E_INVAL;
+    }
     /* Whether `w.sgate` is excluded from buffer sharing; set with the shared arm and required by
      * the fused router's gate write (see there). */
     bool sgate_concurrent = false;
@@ -793,12 +826,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                              {w.logits}, {w.ids, w.ew, w.sorted, w.eoff, w.ecnt});
     }
 
-    /* Exactly one of a prefix or the two stacked tensors. */
-    const bool stacked = src.experts_gate_up != nullptr;
-    if (stacked != (src.experts_down != nullptr) || (stacked == (src.experts != nullptr))) {
-        fprintf(stderr, "radiance: a routed feed-forward takes EITHER an `experts` prefix or "
-                        "both stacked tensors; got prefix %s, gate_up %s, down %s\n",
+    /* Exactly one of a per-expert prefix, fused stacked gate_up, or separate stacked gate/up. */
+    const bool split_stack = src.experts_gate || src.experts_up;
+    const bool stacked = src.experts_gate_up || split_stack;
+    if ((src.experts_gate_up && split_stack) ||
+        (split_stack && (!src.experts_gate || !src.experts_up)) ||
+        stacked != (src.experts_down != nullptr) || (stacked == (src.experts != nullptr))) {
+        fprintf(stderr, "radiance: a routed feed-forward needs a per-expert prefix or complete "
+                        "stacked expert tensors; prefix %s, gate_up %s, gate %s, up %s, down %s\n",
                 src.experts ? "yes" : "no", src.experts_gate_up ? "yes" : "no",
+                src.experts_gate ? "yes" : "no", src.experts_up ? "yes" : "no",
                 src.experts_down ? "yes" : "no");
         return RAD_E_INVAL;
     }
@@ -1287,12 +1324,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         if (!b_gram_dne || !op_gram_dne) return RAD_E_INVAL;
     }
 
-    /* The gather folds the shared arm in, so `w.moe` is never written; `scale_rows` plus a
-     * separate gather would be two dispatches per layer and a 160 KiB round trip. */
-    gfold = shared;
+    /* The gather rounds the routed sum to BF16 before adding the rounded shared product.
+     * At TP1 a unity gate therefore preserves HYV3's FP32 combine exactly. TP>1 must first
+     * reduce each arm independently, and cannot combine them inside the local gather. */
+    const bool separate_fp32_combine = shared && c.shared_fp32_combine &&
+                                       (g.world > 1 || !c.shared_ungated);
+    gfold = shared && !separate_fp32_combine;
     for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
         rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
-        rad_buf gwr[1] = { w.h.x };
+        rad_buf gwr[1] = { separate_fp32_combine ? w.moe : w.h.x };
         op_gather = RAD_OP(b, form ? "moe_gather" : "moe_gather_inv",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                       RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
@@ -1314,8 +1354,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* Probe the down projection first: what it reads (codes, or the bf16 plane for a plain
          * weight) decides what the gate writes. */
         const char* down_base = nm.f("blk.%d.ffn_down_shexp", l);
-        RAD_ARCH_TRY(sh_down.probe(b, nm, g, down_base,
-                                   { nm.ckpt("%s.down_proj.weight", src.shared) }));
+        const char* shared_down = src.shared_mlp_down
+                                      ? src.shared_mlp_down
+                                      : nm.ckpt("%s.down_proj.weight", src.shared);
+        const char* shared_gate = src.shared_mlp_gate
+                                      ? src.shared_mlp_gate
+                                      : nm.ckpt("%s.gate_proj.weight", src.shared);
+        const char* shared_up = src.shared_mlp_up
+                                    ? src.shared_mlp_up
+                                    : nm.ckpt("%s.up_proj.weight", src.shared);
+        RAD_ARCH_TRY(sh_down.probe(b, nm, g, down_base, { shared_down }));
         /* The code pair the gate writes, E4M3 or int8 (ActFP8::q8_fed); an int8 down projection
          * that quantises for itself also writes the int8 pair on this lane. */
         if (w.sff.cq()) {
@@ -1335,8 +1383,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * gate/up row parts stay, as a property of the stacked checkpoint tensor. */
         RAD_ARCH_TRY(sh_gate_up.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         2 * c.n_ff_shared, g.n_embd, RAD_SHARD_ROW, grp_layer(l),
-                                        { nm.ckpt("%s.gate_proj.weight", src.shared),
-                                          nm.ckpt("%s.up_proj.weight",   src.shared) },
+                                        { shared_gate, shared_up },
                                         w.h, w.sgu, c.rows,
                                         { c.n_ff_shared, c.n_ff_shared },
                                         c.shared_lo, c.shared_hi));
@@ -1347,7 +1394,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                    c.swiglu_limit));
         RAD_ARCH_TRY(sh_down.declare(b, nm, g, down_base,
                                      g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
-                                     { nm.ckpt("%s.down_proj.weight", src.shared) },
+                                     { shared_down },
                                      w.sff, w.sout, c.rows, {},
                                      c.shared_lo, c.shared_hi));
         /* The shared gate, replicated like the router so every rank computes the same gate. One
@@ -1369,6 +1416,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                          RAD_WEIGHTS(w_sgate)),
                      {w.h.x}, {w.sgate});
         }
+    }
+
+    if (separate_fp32_combine) {
+        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: exactly the
+         * former cast + cast + F32 add + cast chain. Keep the routed gather's BF16 rounding
+         * and the separate TP reductions; a local gather cannot fold those reductions. */
+        op_combine = rw(b, RAD_OP(b, "add",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                      RAD_STR("dtype", "bf16")),
+                           RAD_NOWEIGHTS),
+                       {w.moe, w.sout}, {w.h.x});
+        if (!op_combine) return RAD_E_INVAL;
     }
 
     /* ---- The router GEMM and `router_topk_scatter` as one op, plus the shared gate when the
@@ -1426,7 +1485,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         } else {
             sigmoid_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows
                                        ? c.rows : kMoeSortRows / c.top_k;
-            const bool gate = op_sgate != 0 && c.shared_ungated;
+            const bool gate = op_sgate != 0 && c.shared_ungated && !c.shared_fp32_combine;
             if (gate && !sgate_concurrent) {
                 fprintf(stderr, "radiance: layer %d: the fused selection writes the shared gate "
                                 "ahead of its declared writer, which needs `sgate` out of the "
@@ -1456,14 +1515,25 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
     }
 
-    if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h.x}, {w.h.x});
+    if (g.world > 1) {
+        const auto all_reduce = [&](const char* dtype, rad_buf buffer) {
+            return rw(b, RAD_OP(b, "all_reduce",
+                         RAD_PARAMS(RAD_INT("world_size", g.world),
+                                    RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                    RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
+                                    RAD_INT("min_bytes", g.wire_min_bytes)),
+                         RAD_NOWEIGHTS),
+                     {buffer}, {buffer});
+        };
+        if (separate_fp32_combine) {
+            /* Each arm is a tensor-parallel partial. Reduce the BF16 arm outputs independently,
+             * then perform HYV3's shared+routed addition in F32 before the final BF16 cast. */
+            op_moe_ar = all_reduce(g.dtype, w.moe);
+            op_shared_ar = all_reduce(g.dtype, w.sout);
+        } else {
+            op_ar = all_reduce(g.dtype, w.h.x);
+        }
+    }
     /* The same collective for a caller that runs it beside other work (issue_ar, a pipelined
      * prefill): at `overlap` 1 it gets the rows that hold fewer CUs while waiting on the link. */
     if (g.world > 1 && ar_overlap > 0)
@@ -1512,12 +1582,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * buffers are step-tall, so the pass offset applies as in an MlpFP8 slice. */
 inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
-    /* `gate_done`: the fused router already wrote this pass's gate. */
-    if (!gate_done && c.shared_ungated)
-        RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
-    else if (!gate_done)
+    /* `gate_done`: the fused router already wrote this pass's gate. A separate FP32 combine
+     * reads no ones plane. At TP1 an ungated folded gather does, unless the caller prepared the
+     * whole step's ones plane once (shared_one_external). */
+    if (!gate_done && c.shared_ungated) {
+        if (gfold && !c.shared_one_external)
+            RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
+    } else if (!gate_done) {
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
                     brow_slice(w.sgate, r0, rows, 1));
+    }
     sh_gate_up.step(c_, w.h, w.sgu, T, r0, rows);
 }
 
@@ -1717,11 +1791,21 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
 
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. */
-    if (!gather_taken(g, T, gather_out_rows, gather_out_rows6))
+    if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
                     gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
+    if (op_moe_ar)
+        RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd,
+                    brow_slice(w.moe, r0, rows, g.n_embd), RAD_NONE);
+    if (op_shared_ar)
+        RAD_ISSUE_N(c_, op_shared_ar, rows * g.n_embd,
+                    brow_slice(w.sout, r0, rows, g.n_embd), RAD_NONE);
+    if (op_combine)
+        RAD_ISSUE_N(c_, op_combine, rows, brow_slice(w.moe, r0, rows, g.n_embd),
+                    brow_slice(w.sout, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd));
 
     /* A write that takes the all-reduce does it once for the whole step, deciding on T, so this

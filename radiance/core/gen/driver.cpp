@@ -119,10 +119,11 @@ int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>&
     kv_     = kv;
     ranks_  = ranks;
     table_  = DiscreteTable{};
-    if (decl_.cond_opts & ~(uint32_t)RAD_GEN_COND_REBALANCE) {
+    if (decl_.cond_opts & ~(uint32_t)(RAD_GEN_COND_REBALANCE | RAD_GEN_COND_REBALANCE_PRESET)) {
         RAD_ERR("image generator: '%s' declares conditioning options 0x%x, and this engine knows "
-                "only RAD_GEN_COND_REBALANCE (0x%x)", decl_.name ? decl_.name : "",
-                (unsigned)decl_.cond_opts, (unsigned)RAD_GEN_COND_REBALANCE);
+                "only RAD_GEN_COND_REBALANCE (0x%x) and its preset (0x%x)",
+                decl_.name ? decl_.name : "", (unsigned)decl_.cond_opts, (unsigned)RAD_GEN_COND_REBALANCE,
+                (unsigned)RAD_GEN_COND_REBALANCE_PRESET);
         return RAD_E_UNSUPPORTED;
     }
     if (discrete()) {
@@ -643,40 +644,14 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
 
     /* Pictures for the conditioning network's encoder: every item's patches in prompt order, its
      * segments, and the prompt rows the encoder's output replaces. */
-    int64_t n_patch = 0, n_seg = 0, n_mm = 0;
-    int32_t max_seg = 0;
+    StagedMedia sm;
     if (br.media) {
-        uint16_t* pix = hptr<uint16_t>(R_ENCPIX);
-        int32_t* crd = hptr<int32_t>(R_ENCCRD);
-        int32_t* ecu = hptr<int32_t>(R_ENCCU);
-        int64_t total = 0;
-        for (const mm::Placed& p : br.media->items) total += p.item->n_patch;
-        ecu[0] = 0;
-        std::vector<int32_t> tmp;
-        for (const mm::Placed& p : br.media->items) {
-            const mm::Item& it = *p.item;
-            std::memcpy(pix + n_patch * patch_dim_, it.pixels.data(),
-                        (size_t)(it.n_patch * patch_dim_) * 2);
-            tmp.resize((size_t)(4 * it.n_patch));
-            it.coords(0, it.n_patch, tmp.data());
-            for (int cc = 0; cc < 4; ++cc)
-                std::memcpy(crd + cc * total + n_patch, tmp.data() + cc * it.n_patch,
-                            (size_t)it.n_patch * 4);
-            for (int32_t s = 0; s < it.n_seg; ++s) {
-                const int64_t a = it.patch_at(s), e = it.patch_at(s + 1);
-                ecu[n_seg + 1] = (int32_t)(n_patch + e);
-                max_seg = std::max<int32_t>(max_seg, (int32_t)(e - a));
-                ++n_seg;
-            }
-            n_patch += it.n_patch;
-        }
-        int32_t* mmr = hptr<int32_t>(R_MMROW);
-        for (const mm::RopeLayout::Run& run : br.media->rope.runs)
-            for (int32_t k = 0; k < run.n; ++k) mmr[n_mm++] = run.tok + k;
-        reg_[R_ENCPIX].used = n_patch * patch_dim_ * 2;
-        reg_[R_ENCCRD].used = 4 * total * 4;
-        reg_[R_ENCCU].used = (n_seg + 1) * 4;
-        reg_[R_MMROW].used = n_mm * 4;
+        sm = stage_media(*br.media, patch_dim_, hptr<uint16_t>(R_ENCPIX), hptr<int32_t>(R_ENCCRD),
+                         hptr<int32_t>(R_ENCCU), hptr<int32_t>(R_MMROW));
+        reg_[R_ENCPIX].used = sm.n_patch * patch_dim_ * 2;
+        reg_[R_ENCCRD].used = 4 * sm.n_patch * 4;
+        reg_[R_ENCCU].used = (sm.n_seg + 1) * 4;
+        reg_[R_MMROW].used = sm.n_rows * 4;
     }
 
     /* The generator's sequence, run by the plugin a segment at a time: per segment, its rotary
@@ -786,16 +761,16 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
         B.max_ctx_len = (int32_t)P;
         B.rope_pos = dptr<int32_t>(ri, R_ROPE);
         B.rope_mixed = br.media ? 1 : 0;
-        B.n_mm_rows = n_mm;
-        B.mm_rows = n_mm ? dptr<int32_t>(ri, R_MMROW) : nullptr;
+        B.n_mm_rows = sm.n_rows;
+        B.mm_rows = sm.n_rows ? dptr<int32_t>(ri, R_MMROW) : nullptr;
         B.mm_embd = nullptr;
         B.enc = 0;
-        B.enc_n_patch = n_patch;
-        B.enc_pixels = n_patch ? dptr<uint16_t>(ri, R_ENCPIX) : nullptr;
-        B.enc_coord = n_patch ? dptr<int32_t>(ri, R_ENCCRD) : nullptr;
-        B.enc_n_seg = n_seg;
-        B.enc_cu = n_seg ? dptr<int32_t>(ri, R_ENCCU) : nullptr;
-        B.enc_max_seg = max_seg;
+        B.enc_n_patch = sm.n_patch;
+        B.enc_pixels = sm.n_patch ? dptr<uint16_t>(ri, R_ENCPIX) : nullptr;
+        B.enc_coord = sm.n_patch ? dptr<int32_t>(ri, R_ENCCRD) : nullptr;
+        B.enc_n_seg = sm.n_seg;
+        B.enc_cu = sm.n_seg ? dptr<int32_t>(ri, R_ENCCU) : nullptr;
+        B.enc_max_seg = sm.max_seg;
         B.gen = RAD_GEN_PASS_COND;
         kout_[rr].block_table_pitch = (int64_t)bt.size();
         G = RadGenBatch{};

@@ -13,8 +13,10 @@
  *
  *   1. ADECODE, then each VDECODE chunk in order, of a lane whose denoising is done: they finish
  *      a request and free its lane.
- *   2. VCOND of an admitted request, so its steps can follow the current request's without a gap.
- *   3. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
+ *   2. VENCODE or AENCODE of an admitted request's reference media, one per reference, so the
+ *      video and audio VAE latents are in the lane's slots before its prompt runs.
+ *   3. VCOND of an admitted request, so its steps can follow the current request's without a gap.
+ *   4. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
  *      Requests are denoised one after another, not in turns: a pass is one request's whole
  *      sequence, so taking turns would only delay the first.
  */
@@ -35,9 +37,14 @@ public:
         RadStream stream = nullptr;
     };
     using PositionsFn = int64_t (*)(int, const RadVideoGeom*, float*, int64_t);
+    using PackFn = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int32_t*, int32_t*,
+                               int32_t*, float*, int64_t);
+    using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);
 
-    /* `positions` is the plugin's rad_arch_video_positions. */
-    int  init(const Program& prog, PositionsFn positions, const std::vector<RankIO>& ranks);
+    /* The plugin's rad_arch_video_positions, and its rad_arch_video_pack and rad_arch_encode_geom
+     * (null without reference conditioning, which then refuses every reference). */
+    int  init(const Program& prog, PositionsFn positions, const std::vector<RankIO>& ranks,
+              PackFn pack = nullptr, EncodeGeomFn enc_geom = nullptr);
     void fini();
     ~VideoDriver() override { fini(); }
 
@@ -61,6 +68,13 @@ public:
     int64_t running() const override;
 
 private:
+    /* A step's packed sequence with references in (rad_arch_video_pack). */
+    struct Pack {
+        int64_t              rows = 0;
+        std::vector<int32_t> seg;        /* segment boundaries */
+        std::vector<int32_t> mod;        /* modulation-group boundaries, then a cell a group */
+        std::vector<float>   pos;        /* [3, rows] */
+    };
     struct Job {
         uint64_t id = 0;
         std::unique_ptr<VideoRequest> req;
@@ -70,6 +84,14 @@ private:
         int64_t       n_samples = 0;     /* the soundtrack's samples a channel */
         VideoSchedule sched;
         std::vector<float> pos;          /* [3, rows] */
+        /* References and keyframes: their table (RadVideoGenBatch::ref_tab), the step's packed
+         * sequence at the full size and at an upscale's small one (rows 0 without references),
+         * and the encode passes, one a media in order, `enc_next` the next to run. */
+        std::vector<int32_t> ref_tab;
+        Pack                 pack, pack_small;
+        struct EncItem { int32_t kind, slot, ref; };   /* RAD_ENC_*, its number, its req->refs */
+        std::vector<EncItem> enc_q;
+        size_t               enc_next = 0;
         /* Latent upscaling: the evaluations at the small size (0: none), its geometry, rows and
          * positions, the factor the network is told, and whether the upscale has run. */
         int32_t       split = 0;
@@ -105,8 +127,12 @@ private:
 
     /* Staging regions: their offsets in the host span and every rank's slab. */
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
+    /* R_MMROW .. R_ENCCU are the prompt's pictures for the vision tower, as the image driver
+     * stages them (driver.cpp), and R_ROPE then their M-RoPE; R_ENCPX .. R_ENCG an encode pass's
+     * media and geometry. */
     enum { R_TOK, R_POS, R_CU, R_ROPE, R_GEOM, R_SCHED, R_TV, R_TA, R_SEED, R_LANE, R_FIRST,
-           R_SEG, R_LAT, R_UP, R_IMG, R_GUIDE, R_N };
+           R_SEG, R_MOD, R_LAT, R_UP, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU, R_ENCPX, R_ENCSM,
+           R_ENCG, R_IMG, R_GUIDE, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -116,9 +142,13 @@ private:
     /* The geometry and rows of the job's next step: the small ones before its upscale. */
     bool small_now(const Job& j) const { return j.split > 0 && !j.upscaled; }
     int  shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_t steps, std::string* why);
+    int  plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::string* why) const;
+    int  lay_out(const RadVideoGeom& g, const std::vector<int32_t>& tab, Pack* out,
+                 std::string* why) const;
     int32_t predicted_chunks(double log_seconds, std::string* note) const;
     void base_batches(const Job& j, const RadVideoGeom& g, int64_t n_tok, int step);
-    void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk);
+    void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk,
+                    const Pack* pack = nullptr);
     void stage_sched(const Job& j, int32_t i, bool to_clean);
     void stage_seed(const Job& j);
 
@@ -132,6 +162,7 @@ private:
     const RadBatch* build_upscale(Job& j, int step);
     const RadBatch* build_audio(Job& j, int step);
     const RadBatch* build_chunk(Job& j, int step);
+    const RadBatch* build_encode(Job& j, int step);
 
     RadVideoGenDecl     decl_{};
     std::vector<double> rungs_;        /* decl_.rungs points here */
@@ -141,7 +172,11 @@ private:
     std::vector<int64_t>     decoder_area_;    /* each one's largest frame */
     std::string         name_;
     PositionsFn         positions_ = nullptr;
+    PackFn              pack_ = nullptr;
+    EncodeGeomFn        enc_geom_ = nullptr;
     int64_t             max_tok_ = 0;
+    /* The vision tower's patch width and the patches a pass carries; 0 without a tower. */
+    int64_t             patch_dim_ = 0, max_enc_ = 0;
     std::vector<RankIO> ranks_;
 
     char*               host_ = nullptr;   /* pinned, same layout as each slab */

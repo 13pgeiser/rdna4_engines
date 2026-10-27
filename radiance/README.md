@@ -25,6 +25,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
+| Ornith-1.5-122B FP8, MTP, vision, four cards | `ornith-1.5-122b-fp8.rad` (118 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8) | `ornith-1.5-122b.yaml` |
+| Ornith-1.5-122B FP8, DFlash2 drafter, vision, four cards | `ornith-1.5-122b-fp8-dflash2.rad` (116 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8-dflash2) | `ornith-1.5-122b-df2.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), MTP, vision, four cards | `ornith-1.5-122b-w4a8.rad` (65 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8) | `ornith-1.5-122b-w4a8.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), DFlash2 drafter, vision, four cards | `ornith-1.5-122b-w4a8-dflash2.rad` (64 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8-dflash2) | `ornith-1.5-122b-w4a8-df2.yaml` |
 | Sage-A1.5 FP8, MTP, vision | `sage-a1.5-fp8.rad` (35 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8) | `sage-a1.5.yaml`, `sage-a1.5-tp1.yaml` |
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
@@ -34,8 +38,9 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (22 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash) | `gemma4-31b-w4a8-df.yaml` |
 | Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
-| NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-bf16.rad` (16 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
-| NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-i8g.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-bf16.rad` (17 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-i8g.rad` (13 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B 4-bit (int4 feed-forward, GPTQ, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-a4.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-a4) | `nemotron-3.5-bolt-e4b-a4.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
@@ -57,6 +62,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | `sdxl.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
+| nomic-embed-text-v2-moe bf16: text embeddings, one card | `nomic-embed-v2-moe-bf16.rad` (959 MB) | [convert](#convert-a-checkpoint) | - |
 | Anima Aesthetic FP8: anime and illustration, text to image, one card (Base and Turbo convert the same way) | `anima-aesthetic-fp8.rad` (3.0 GiB) | [convert](#convert-a-checkpoint) | `anima.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | — |
 
@@ -114,8 +120,9 @@ soundtrack from a prompt, 5 to 14 s, up to 1344x768. On two R9700s a 5.17 s clip
 about 68 s with FastH3 and 8.8 minutes at MiniMax-H3's 50 steps; both read about 39 GiB of pinned
 host memory. With LBH-123-AI's latent upscaler in the container, `"latent_upscale": 2` runs the first
 steps at half the size and refines at the full size: MiniMax-H3's clip then takes 3.4 minutes
-(docs/GUIDE.md §5.16). MiniMax-H3's license, which FastH3 carries, does not cover the EU, the UK,
-the Republic of Korea or the USA.
+(docs/GUIDE.md §5.16). A ComfyUI node, `integrations/comfyui/ComfyUI-Radiance-MiniMax`, renders
+through `/v1/videos` from a ComfyUI graph as a client of the server. MiniMax-H3's license, which
+FastH3 carries, does not cover the EU, the UK, the Republic of Korea or the USA.
 
 MiniMax-Music3 and Breeze-TTS-2 answer `/v1/audio/speech`, whole or streamed as they are made: a song
 from lyrics and a description, 44.1 kHz stereo, made at about the speed it plays on two cards; and
@@ -323,6 +330,7 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 | [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
 | [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
+| [`docs/PREPARING_YOUR_RIG.md`](docs/PREPARING_YOUR_RIG.md) | a two-R9700 machine from firmware setup to a serving model |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |
 | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |
 | [`docs/TP3.md`](docs/TP3.md) | any world size: the attention world and uneven delta-net heads; three ranks |

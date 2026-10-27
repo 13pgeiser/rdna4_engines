@@ -11,12 +11,16 @@ plugin claims.
 | `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made block fp8 by a recipe or kept bf16. MiniCPM5-2B |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
+| `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4, W8A8, block-FP8 or MXFP4 weights by recipe; TP1/2, BF16 KV |
+| `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8; imported per-tensor E4M3 weights, one dense layer then sigmoid-routed MoE; TP1/2, BF16 or static-scaled E4M3 KV |
+| `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
+| `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
@@ -30,7 +34,7 @@ plugin claims.
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
 | `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
-| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
+| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`), or the DiT's per-token linears int8, served w8a8 (`minimax-h3-w8a8.recipe`); a curve-form checkpoint, whose timestep embeddings ship as a table, by the `minimax-h3-curve-*` recipes |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
 The traps below are readings that are wrong without any error: the model produces fluent output.
@@ -285,6 +289,64 @@ depth 7 it accepts ~49% of the proposals and decodes 1.40x faster than the same 
 head (393 against 282 tok/s on two R9700s). `sage-a1.5-mxfp4-df2.rad` is the same with the trunk,
 the experts and the drafter's linears at MXFP4. `--num-speculative-tokens auto` takes the depth the
 drafter states.
+
+## `hyv3`
+
+`arch/hyv3_bf16` supports the Tencent BF16 safetensors checkpoint, and `arch/hyv3_fp8` supports
+Tencent's FP8 checkpoint. Both use the same graph: 48 layers, with a dense first
+MLP followed by 47 layers routing top-8 of 128 experts. The routed and shared MLP widths are both
+768 in the checkpoint tensors. Attention applies per-head Q/K RMSNorm before NeoX RoPE. Routing selects
+with sigmoid scores plus the correction bias, but normalizes the selected unbiased scores and
+multiplies them by 2.826. Routed and shared BF16 outputs are reduced independently at TP2, then added
+in FP32 and rounded once to BF16 before the residual add. At TP1 the existing ungated gather
+preserves those two arm roundings and folds their addition; the plugin prepares one shared ones
+plane for the whole step. Each residual add except the final one folds into the following norm,
+which normalizes the BF16-rounded sum. The final norm still reads a materialized residual stream.
+
+Convert the public FP8 checkpoint with
+`data/recipes/hy-memory-30b-a3b-fp8.recipe`; it preserves the E4M3 codes and expands the checkpoint's
+scalar F32 scales to the 128x128 F32 scale planes the GEMMs read. Norms and the router projection
+are widened to F32. Linear activations use Radiance's dynamic FP8 quantization; the checkpoint's
+static `.input_scale` calibration scalars are ignored, so numerical parity with vendor quantization
+is not established. The checkpoint index includes scalar per-layer K/V descales from
+`kv_cache_scales.safetensors`; conversion carries them into metadata for `kv_store` and paged
+attention. Use `--kv-cache-dtype fp8` for the checkpoint's static-scaled E4M3 cache, or `bf16` for a
+higher-precision cache. The plugin refuses the unrelated `fp8_v4` and `k6_v4` cache layouts.
+The vendor FP8-source import and static-scaled FP8 KV path have structural/unit coverage only;
+an end-to-end conversion and serving run of Tencent's FP8 checkpoint is not yet validated.
+This is distinct from the BF16-derived block-FP8 artifact tested below.
+
+The BF16 checkpoint can be converted without quantizing any weights, or with
+`data/recipes/hy-memory-30b-a3b-bf16-w4.recipe`, which quantizes attention projections, the first
+dense MLP and routed experts to INT4. Shared MLPs, router, norms, embeddings and the output head stay
+BF16. At decode the asymmetric linear W4 kernel narrows BF16 activations to F16 on load;
+above 64 rows its tiled path uses dynamic INT8 activations. The signed-I4 expert path uses
+block-scaled E4M3 activations. BF16-source block-FP8 and MXFP4 recipes quantize experts and regular
+linears; the W8 recipe quantizes regular linears and the output head while routed experts remain
+BF16. Use TP2 at serve time if one device cannot hold the model and cache.
+
+The local llama.cpp Q4_K_M source is supported by `arch/hyv3_gguf` and
+`data/recipes/hy-memory-30b-a3b-gguf-q4k-to-w4.recipe`. It decodes Q4_K/Q6_K source tensors and
+re-quantizes them to native Radiance encodings; this adds loss to an already-quantized checkpoint.
+The GGUF's `hunyuan-dense` pre-tokenizer name is not in Radiance's tokenizer table, so pass the
+matching BF16 repository's `tokenizer.json` with `--tokenizer`. Prefer the BF16 source recipe when
+available. Both the BF16 W4 and GGUF-to-W4 artifacts passed a short TP2 generation smoke test; the
+BF16-source W8, block-FP8 and MXFP4 variants did too. These checks establish basic loading and
+inference only, not numerical parity or broad quality.
+
+The plugins declare the native OpenAI tool-call format: an outer `<tool_calls>` section,
+`<tool_call>NAME<tool_sep>` calls, and tagged `<arg_key>`/`<arg_value>` arguments. The parser and
+grammar preserve that section in non-streaming and streaming responses and accept replayed
+OpenAI tool results through the checkpoint's chat template. When `reasoning_effort` is `low` or
+`high`, the template opens `<think>` in the generation prompt and the parser returns that block
+as reasoning rather than answer text. The default template effort is `no_think`.
+
+Architecture tests cover geometry, GGUF tensor maps, dense-to-MoE scheduling, TP1/TP2 graph lint,
+and FP32 combine order; checkpoint tests cover Q4_K/Q6_K block decoding. Numerical parity against Tencent/llama.cpp
+remains untested.
+
+See [HYV3 W4 decode optimizations](benchmarks/hyv3-w4-decode.md) for affected paths,
+historical measurements, validation limits and the remaining benchmark/quality gates.
 
 ## `qwen35_w8a8`
 
@@ -791,6 +853,79 @@ Traps:
 
 ---
 
+# `nomicbert`: an embedding model
+
+`arch/nomicbert` declares a pooled output (`rad_declare_pooled`) and no logits, so it is an
+embedding program like `embgemma2`: no sampler, no KV cache, one step per input, and the pooled
+row on `/v1/embeddings` ([GUIDE §5.6](GUIDE.md)). One card (`--tp 1`).
+
+```
+text      12 layers, hidden 768, ffn 3072, vocab 250048, 12 heads of 64, type vocab 1
+          trained to 2048 positions; 475M parameters
+          post-norm block: a = out_proj(attn(rope(Wqkv h + b))) + b_out; h = LN1(h + a)
+          even layers: dense MLP, fc2(gelu(fc1 h + b1)) + b2, exact gelu
+          odd layers (1, 3, 5, 7, 9, 11): 8 experts at top 2, softmax weights,
+          no renormalisation, no shared expert
+          fused Wqkv [q|k|v], no GQA, non-causal, scale 1/sqrt(64) = 0.125
+          NeoX rotary over all 64 dimensions, theta 1e4, on q and k only, no position table
+          embeddings: word + token_type, then emb_ln; no final norm
+          mean over every real token, cast to the f32 pooled buffer; the server L2-normalises
+```
+
+The block order is the one the verified variant uses: attention on the raw stream, then LN1, the
+feed-forward on LN1's output, then LN2 over that output plus the feed-forward's. The checkpoint's
+shared `experts.bias` is not applied, and the plugin does not map it. A container that sets
+`prenorm`, `causal`, interleaved, partial or scaled rotary, a gelu variant, renormalised routing
+or a shared expert is refused at declare.
+
+**Tensor names.** `N` is a layer; even layers are dense and odd layers are routed. `E` is an
+expert. Norms and biases stay f32; the token-type table is bf16 because `table_add`'s device row
+reads a bf16 table. The token embedding, linears, router and expert tables are bf16.
+
+| container | checkpoint | shape | map |
+|---|---|---|---|
+| `token_embd.weight` | `embeddings.word_embeddings.weight` | [250048, 768] | copy |
+| `token_type.weight` | `embeddings.token_type_embeddings.weight` | [1, 768] | copy |
+| `emb_ln.*` | `emb_ln.*` | [768] | copy |
+| `blk.N.attn_norm.*`, `blk.N.ffn_norm.*` | `encoder.layers.N.norm1.*`, `encoder.layers.N.norm2.*` | [768] | copy |
+| `blk.N.attn_qkv.*`, `blk.N.attn_out.*` | `encoder.layers.N.attn.Wqkv.*`, `encoder.layers.N.attn.out_proj.*` | [2304, 768]/[2304], [768, 768]/[768] | copy |
+| `blk.N.ffn_fc1.*`, `blk.N.ffn_fc2.*` (even N) | `encoder.layers.N.mlp.fc1.*`, `encoder.layers.N.mlp.fc2.*` | [3072, 768]/[3072], [768, 3072]/[768] | copy |
+| `blk.N.ffn_router.weight` (odd N) | `encoder.layers.N.mlp.router.layer.weight` | [8, 768] | copy |
+| `blk.N.ffn_exp_w1.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w1` | [3072, 768] | slice E |
+| `blk.N.ffn_exp_w2.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w2` | [768, 3072] | slice E, transpose |
+| not declared (odd N) | `encoder.layers.N.mlp.experts.bias` | [768] | not mapped |
+
+The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; `E` takes the
+expert's dim-0 slice, and `w2` is transposed to `[768, 3072]` for the grouped GEMM. Every expert
+has two group slots, one for each projection. Nothing else is mapped: there is no final norm, no
+pooler, no position table and no output head.
+
+**The recipe.** The checkpoint is f32 (1.9 GB).
+
+```sh
+rad-convert <checkpoint dir> --recipe data/recipes/nomic-embed-v2-moe-bf16.recipe \
+    -o nomic-embed-v2-moe-bf16.rad
+```
+
+It takes 3.5 s and writes a 959 MB container (907 MiB of weights). The checkpoint directory must
+contain `tokenizer.json`. The recipe casts the token embedding, the token-type table, the
+attention, dense MLP and expert weights to bf16 and leaves the norms and biases f32.
+
+**Verified.** 20 texts against a pure-float32 reference: mean cosine 0.99995, min 0.99983 on a
+gfx1201 card, with libavx and libref the same to 4 decimals. Against a Q6_K quantisation of the
+same model the mean is 0.9944 (min 0.990); the Q8_0 one agrees with the reference at 0.9994, so
+the Q6_K quantisation is the outlier, about 0.006 off the true model, and stored vectors from a
+Q6_K server drift by about that much.
+
+**Measured.** On one gfx1201 card, short texts take 2 ms a request at one client, 3854 requests/s
+at 64 concurrent clients and 4400 texts/s for a batch of 32 in one request; a 1354-character text
+takes 3 ms; about 1.2 GB of VRAM. On 24 CPU cores libavx has a median 18 ms a text.
+
+**Not verified.** Inputs above 512 tokens against a device reference, other precisions, and tensor
+parallel (the model is served on one card).
+
+---
+
 # `gemma4`: Gemma 4 text and its DFlash drafter
 
 `arch/gemma4` serves a container converted from Google's bf16 checkpoint
@@ -972,6 +1107,17 @@ the whole 128-row scale blocks that cover its share of the columns and an `all_g
 them, with `gemm_nt_q`'s `split_n` keeping every output the unsplit fc's to the bit. The recipe is
 `gemma4-31b-dense-bf16-w4a8-df2.recipe`.
 
+**The 31B by GPTQ.** `arch/gemma4_bf16`'s linears read int8 activations, which the Gram tap
+(`gram_accum`) does not take, so the 31B's Hessians come from this plugin serving the bf16
+checkpoint. With `RADIANCE_CALIB_DIR` set it taps each layer's dense linears, the routed arm aside:
+rank 0 writes q|k|v's and gate|up's inputs whole, and each rank writes its columns of o's and
+down's inputs as `<stem>.part`, all under the names `gemma4_bf16`'s container gives those weights
+(`blk.N.attn_qkv`, `ffn_gate_up`, `attn_o`, `ffn_down`), so
+`data/recipes/gemma4-31b-dense-bf16-w4a8g-df2.recipe` reads them as written. The prefill overlap
+and the fused arms are off while it runs. `RADIANCE_G4_CALIB_LAYERS=lo:hi` takes a slice of layers:
+the 31B's four taps a layer are ~364 MiB a rank at four ranks, and its 60 layers do not fit beside
+the weights in one pass. docs/GEMMA4-31B-GPTQ.md has the corpus, the run and what it changes.
+
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
 of it (`ar_rmsnorm_quant_i8`). At four it does too, in steps of up to 16 rows (decode, and a DFlash
 or DFlash2 verify), on libr4d's `ar_rmsnorm_quant_i8_4rank`, in a form chosen by height. Every form
@@ -1006,10 +1152,14 @@ reads change no value; on 4x R9700 the 31B with DFlash2 decoded 15% faster with 
 a drafter about 2%.
 
 **The E2B/E4B form.** `arch/gemma4_bf16` serves Gemma 4's small dense form (tested on
-NVIDIA-Nemotron-3.5-Bolt-E4B, `deploy/compose/nemotron-3.5-bolt-e4b-bf16.yaml`) at one rank:
+NVIDIA-Nemotron-3.5-Bolt-E4B, `deploy/compose/nemotron-3.5-bolt-e4b-bf16.yaml`, and on Google's
+gemma-4-E2B-it) at one rank:
 - KV-shared layers: from layer `n_layer - num_kv_shared_layers` on, a layer projects q only and
   attends over the cache of the last earlier layer of its class that keeps one (E4B: sliding layers
   read 22, full layers 23). Shared layers are not bound to a KV group, so their pages hold nothing.
+- Double-wide MLP (`use_double_wide_mlp`, E2B): those same layers have 2 * `intermediate_size` in
+  both projections. Each layer declares its own weight shapes and op widths, and the two widths keep
+  a pair of activation buffers each.
 - Per-layer embeddings (`hidden_size_per_layer_input`): a token table scaled by sqrt(width), plus
   the normed projection of the scaled embedding, mixed at 2^-0.5. Each layer runs a branch after
   its feed-forward: gate, gelu times its slice, projection, norm, add. On a w4a8 or w8a8 trunk
@@ -1803,13 +1953,14 @@ a frame with the codec), a paragraph at 0.29 (11.6 s in 3.34 s); a stream's firs
 # `minimaxh3`: MiniMax-H3, video with sound
 
 `arch/minimaxh3` declares a video generator (`rad_declare_video_generator`), which makes the
-program a four-pass one the engine drives through `core/gen/video_driver.h`: VCOND runs the text
-encoder and the refiner over the prompt and computes every step's modulation, VSTEP is one
-denoising step of one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes
-one temporal chunk of frames. A request is a lane; two hold state at once (one denoising, one
-conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 on two
-cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline directory,
-read as one; only workflow t2va is served.
+program one the engine drives through `core/gen/video_driver.h`: VCOND runs the text encoder and
+the refiner over the prompt and computes every step's modulation, VSTEP is one denoising step of
+one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes one temporal chunk of
+frames; with keyframes or reference media, VENCODE and AENCODE first run each through the video or
+the audio VAE's encoder into the lane. A request is a lane; two hold state at once (one denoising,
+one conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 or
+int8 on two cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline
+directory, read as one; the workflows t2va, i2va, l2va, fl2va and ref2va are served.
 
 ```
 text      Qwen3-VL-32B's language model: 64 layers of 5120 (64 q / 8 kv heads of 128, ff 25600,
@@ -1842,6 +1993,16 @@ VAE       2 2 2), each followed by the mean of three AMP blocks (k 3/7/11, dilat
           channel, clamped. 800 samples a latent, 32 kHz, each stereo channel its own sequence
 length    24 fps; a video of n chunks is 17 n + 5 frames over 5 n + 2 latent frames, n 7..20
           (5.17 to 14.4 s); the soundtrack is round-half-even(frames x 40 / 24) latents a channel
+encoders  the video VAE's: six levels of two causal 3x3x3 residual blocks (GroupNorm 32), four
+          strided downsamplers, 17-frame clips to 5 latent frames, reflect padding; the audio
+          VAE's: a DAC encoder (strides 2 4 4 5 5) and a causal attention block, 800 samples a
+          latent, a channel at a time. Latents normalised as the decoders read them
+pack      with references the sequence is [text | keyframes | references | soundtrack | video]
+          (arch/minimaxh3/rad_ref2va_pack.h, ComfyUI's PackedLayout): a reference in its own
+          latent grid on a clock before the video's, a keyframe at its frame of the video. Their
+          rows take a timestep pinned at max(t, 0.999) (1.0 for sound), and the sampler steps only
+          the last two segments. Each segment is its own attention sink; a run of segments with
+          the same modulation is one group of the modulation table, eight at most
 ```
 
 Traps:
@@ -1853,10 +2014,14 @@ Traps:
   embedding reads t in [0, 1] as it is, not scaled to 1000.
 - **The grid's second half is linspace's from the end**: torch computes `linspace(1, 0, N)` half
   from each end in f32, which `gen::video_schedule` reproduces.
-- **The packed rows' positions are f64 rounded to f32**: a latent frame spans 5/3 x (1, 4, 4, 4,
+- **The packed rows' positions are f64 rounded to f32** (ComfyUI's arithmetic, tested against its
+  own numbers in tests/data/ref2va): a latent frame spans 5/3 x (1, 4, 4, 4,
   4)[i mod 5] time units from `n_text`, the spatial axes are each side's latents over the square
   root of the frame's area, centred on the unit interval, times 32, and the soundtrack's two
   channels sit at the two ends of the width axis.
+- **The video encoder's shortcut convolves the block's raw input**, before norm1 normalises it in
+  place; and the audio encoder's attention block feeds its qkv from norm1 but its projection
+  from norm3. Either swapped shrinks every latent after it.
 - **A tile is blended with its neighbours as they were decoded**: the vertical blend reads the
   original tile above, and the horizontal blend the original tile to the left, not the blended
   ones. Chunks keep frames [3, 20) of their 28 and blend their last 5 linearly into the next

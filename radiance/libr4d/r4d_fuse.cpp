@@ -511,6 +511,66 @@ extern "C" int r4d_fuse_gemm_nt_q_gated(const RadParam* p, int n_p, uint64_t pre
 }
 
 /* ==========================================================================================
+ * gemm_nt_q_gated_mx -- the same fold over an OCP-MXFP4 weight.
+ * (rows: gemm_mxfp4a8_gated_gemv, M <= 8, and gemm_mxfp4a8_gated_gemv_wide, 9..64; kernels:
+ * libr4d/r4d_gemm_mxfp4a8_gemv.hip, the gated forms. The chain's gemm_nt_q resolves to gemv and
+ * gemv_wide in those bands, the rows each form is byte-identical to.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] b_ref  [5] q  [6] scale  [7] out_bf16
+ *
+ * The GEMM step is gemm_nt_q at dtype mxfp4a8 with `b_ref` in its last operand. `group` is the
+ * weight's 32 on the GEMM and the activation's 128 on the quantiser, so the quantiser's is set, not
+ * mirrored. At act gelu_tanh the chain is three steps, gelu_mul into a second temporary and
+ * quant_act_fp8 over it; that form refuses `out_bf16` (the shim), so operand 7 is not wired.
+ */
+extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t present, int step,
+                                           RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", 32) != 32) return RAD_E_UNSUPPORTED;
+    if (!dt || std::strcmp(dt, "mxfp4a8")) return RAD_E_UNSUPPORTED;
+    const bool gelu = act_is(p, n_p, "silu", "gelu_tanh");
+    if (!gelu && !act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
+    /* The GeGLU chain leaves its bf16 plane in a temporary, so a caller asking for out_bf16 there
+     * has no chain (the shim refuses the operand too). */
+    if (gelu && RAD_FUSE_HAS(present, 7)) return RAD_E_UNSUPPORTED;
+
+    if (step == 0) {
+        Step s(out, "gemm_nt_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
+        return s.wire({ 0, 1, 2, 3, RAD_FUSE_TMP(0), RAD_FUSE_NONE, 4 });
+    }
+    if (gelu) {
+        if (step == 1) {
+            Step s(out, "gelu_mul");
+            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pstr("dtype", "bf16");
+            return s.wire({ RAD_FUSE_TMP(0), RAD_FUSE_TMP(1) });   /* gate_up, y */
+        }
+        if (step == 2) {
+            Step s(out, "quant_act_fp8");
+            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)
+             .pstr("dtype", "bf16");
+            return s.wire({ RAD_FUSE_TMP(1), 5, 6 });               /* x, q, scale */
+        }
+        return RAD_E_NOTFOUND;
+    }
+    switch (step) {
+    case 1: {
+        Step s(out, "gated_quant_fp8");
+        s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)
+         .pstr("dtype", "bf16").mirror(p, n_p, "act");
+        return s.wire({ RAD_FUSE_TMP(0), 5, 6, 7 });   /* gate_up, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)
@@ -580,6 +640,43 @@ extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, u
          .mirror_opt(p, n_p, "k_scale").mirror_opt(p, n_p, "v_scale");
         /* k, v, slot_mapping, kv_cache */
         return s.wire({ 7, 9, 10, 11 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * qk_norm_rope_gate_kv_store_streamed -- the same prologue with the streamed store folded on.
+ * (rows: qk_norm_rope_gate_kv_store_streamed_{fp8,bf16}; kernel: r4d_qk_norm_rope_gate.hip under
+ * QK_KV_STREAMED)
+ *
+ * Operands: [0] q_gate?  [1] k  [2] cos_sin  [3] positions  [4] q_w?  [5] k_w  [6] q_out?
+ *           [7] k_out  [8] gate_out?  [9] v  [10] slot_mapping  [11] kv_cache
+ *           [12] res  [13] host
+ *
+ * The store is `kv_store_streamed`, whose `k` is the prologue's own `k_out`. */
+extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam* p, int n_p,
+                                                            uint64_t present, int step,
+                                                            RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    auto opt = [present](int i) { return opt_opd(present, i); };
+    switch (step) {
+    case 0: {
+        Step s(out, "qk_norm_rope_gate");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head")
+         .mirror(p, n_p, "n_head_kv").mirror(p, n_p, "rot").mirror(p, n_p, "q_dtype")
+         .mirror_opt(p, n_p, "eps").mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "cs_f32")
+         .mirror_opt(p, n_p, "pos_i64");
+        return s.wire({ opt(0), 1, 2, 3, opt(4), 5, opt(6), 7, opt(8) });
+    }
+    case 1: {
+        Step s(out, "kv_store_streamed");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head_kv")
+         .mirror(p, n_p, "block_size").mirror(p, n_p, "kv_dtype")
+         .mirror_opt(p, n_p, "k_scale").mirror_opt(p, n_p, "v_scale");
+        /* k_out, v, slot_mapping, kv_cache, res, host */
+        return s.wire({ 7, 9, 10, 11, 12, 13 });
     }
     default:
         return RAD_E_NOTFOUND;

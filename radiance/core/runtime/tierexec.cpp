@@ -31,12 +31,14 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     for (int32_t g : groups) {
         const KVGroupPlan* p = kv->plan(g);
         if (!p || !p->paged()) continue;
+        /* A streamed group's host mirror is its tier (docs/KV-STREAMING.md §4.1). */
+        if (p->streamed()) continue;
         GroupInfo gi;
         gi.g = g;
         gi.n_layers = p->n_layers;
         gi.frag = p->layer_bytes_per_block();
         gi.layer_stride = p->layer_stride();
-        gi.n_blocks = p->n_blocks;
+        gi.n_blocks = p->pool_blocks();
         gi.base = p->base;
         gi.replicated = p->replicated;
         if (p->zero) {
@@ -109,6 +111,8 @@ int TierExec::slot_layout(const std::vector<const KVManager*>& ranks,
     for (int32_t g : groups) {
         const KVGroupPlan* p0 = ranks[0]->plan(g);
         if (!p0 || !p0->paged()) continue;
+        /* Skipped as in configure(), so the slot layout and the gather offsets agree. */
+        if (p0->streamed()) continue;
         bool replicated = false;
         for (size_t i = 0; i < ranks.size(); ++i) {
             const KVGroupPlan* p = ranks[i]->plan(g);

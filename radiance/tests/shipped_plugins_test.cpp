@@ -93,8 +93,10 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "anima", "" }, { "breeze", "" }, { "embeddinggemma2", "" },
         { "fishomni", "bsgemm-moe" }, { "flux3", "" }, { "flux3distilled", "" },
         { "gemma3", "" }, { "gemma4", "" },
-        { "gemma4", "compressed-tensors" }, { "glm5next", "" }, { "lfm2", "" }, { "llama", "" },
-        { "llama", "fp8_e4m3" }, { "qwen35", "" },
+        { "gemma4", "compressed-tensors" }, { "glm5next", "" },
+        { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
+        { "lfm2", "" }, { "llama", "" },
+        { "llama", "fp8_e4m3" }, { "nomicbert", "" }, { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
         { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" }, { "sdxl", "" },
@@ -106,6 +108,38 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
             fprintf(stderr, "    %s claims (%s, '%s')\n", name.c_str(), k.first.c_str(),
                     k.second.c_str());
     CHECK(got == want);
+}
+
+TEST(hyv3_plugins_declare_the_checkpoint_native_tool_format) {
+    Registry r;
+    const int st = r.load_dir(dir_of("architectures"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the architecture plugins under " + dir_of("architectures"));
+    CHECK_OK(st);
+    for (const char* name : { "hyv3_bf16", "hyv3_fp8", "hyv3_gguf" }) {
+        const Plugin* p = r.plugin(name);
+        REQUIRE(p != nullptr);
+        REQUIRE(p->arch_chat_format != nullptr);
+        const RadChatFormat* f = p->arch_chat_format(nullptr);
+        REQUIRE(f != nullptr);
+        CHECK_EQ(std::string(f->reasoning_open), std::string("<think>"));
+        CHECK_EQ(std::string(f->reasoning_close), std::string("</think>"));
+        CHECK_EQ(f->reasoning_in_prompt, (uint32_t)RAD_CHAT_THINK_FROM_PROMPT);
+        REQUIRE(f->reasoning_breaks != nullptr && f->n_reasoning_breaks == 1);
+        CHECK_EQ(std::string(f->reasoning_breaks[0]), std::string("<tool_calls>"));
+        CHECK_EQ(std::string(f->section_open), std::string("<tool_calls>"));
+        CHECK_EQ(std::string(f->section_close), std::string("</tool_calls>"));
+        CHECK_EQ(std::string(f->name_prefix), std::string("<tool_call>"));
+        CHECK_EQ(std::string(f->name_suffix), std::string("<tool_sep>"));
+        CHECK_EQ(std::string(f->arg_prefix), std::string("<arg_key>"));
+        CHECK_EQ(std::string(f->arg_name_suffix), std::string("</arg_key>\n"));
+        CHECK_EQ(std::string(f->arg_value_prefix), std::string("<arg_value>"));
+        CHECK_EQ(std::string(f->arg_value_suffix), std::string("</arg_value>"));
+        REQUIRE(f->n_triggers == 1 && f->triggers != nullptr);
+        CHECK_EQ(std::string(f->triggers[0]), std::string("<tool_calls>"));
+        CHECK_EQ(f->string_value, (uint32_t)RAD_CHAT_VALUE_RAW);
+        CHECK_EQ(f->other_value, (uint32_t)RAD_CHAT_VALUE_JSON);
+    }
 }
 
 /* A checkpoint whose quantisation was imported weight by weight (Quark, ParoQuant, GPTQ, NVFP4)

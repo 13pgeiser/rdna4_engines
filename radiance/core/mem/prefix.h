@@ -88,6 +88,11 @@ struct CacheHit {
     int32_t n_linear_tokens = 0;   /* linear state reused; <= n_attn_tokens, a checkpoint multiple */
     int32_t checkpoint_slot = -1;  /* the snapshot holding that state, -1 if none */
     int32_t given_back      = 0;   /* reusable tokens a HitCap took off the whole hit */
+    /* Where the prompt leaves a head at least two cached prompts already left differently (the
+     * same instructions in front of different texts), or 0. One cached prompt past it is not
+     * enough: the next could be the same conversation going on. A snapshot there serves every
+     * request that starts with that head (Scheduler::admit_one). Uncapped by a HitCap. */
+    int32_t branch_at       = 0;
 };
 
 /* Ends a hit early on purpose: at or below `tokens`, on a block and (with recurrent state) on the
@@ -205,6 +210,10 @@ public:
     int64_t block_size() const { return block_size_; }
     int64_t checkpoint_interval() const { return interval_; }
     const std::vector<int32_t>& cached_groups() const { return groups_; }
+    /* Whether the host tier can hold this cache's entries. False when a cached group streams: its
+     * rows are addressed by the sequence's block ids, so entries stay in VRAM and are evicted
+     * whole (docs/KV-STREAMING.md §4.1). */
+    bool demotable() const { return demotable_; }
     std::string report() const;
 
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
@@ -401,6 +410,9 @@ private:
          * off-device entry owns no block, so eviction must not reach it. */
         bool in_lru = false;
         bool drop_wait = false;         /* in drop_wait_: clean, but a sequence still reads it */
+        /* Blocks ever published right after this one, saturating: the ways prompts went on from
+         * this head (CacheHit::branch_at). An evicted child still counts. */
+        uint8_t n_children = 0;
         /* Last hit or publish, monotonic clock. Every path that moves an entry to the LRU's back
          * stamps it, so the list is in this order and expiry stops at the first entry it keeps. */
         uint64_t used_ns = 0;
@@ -461,6 +473,7 @@ private:
     int64_t     block_size_ = 0;
     int64_t     interval_ = 0;
     std::vector<int32_t> groups_;         /* paged groups this cache indexes */
+    bool demotable_ = false;              /* the host tier can hold every group in an entry */
     bool        has_linear_ = false;
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;

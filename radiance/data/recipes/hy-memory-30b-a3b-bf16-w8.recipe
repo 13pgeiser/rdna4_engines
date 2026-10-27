@@ -1,0 +1,17 @@
+# HYV3 from BF16 with signed INT8 W8A8 linears. Attention, the dense first MLP, shared MLPs and
+# output head are quantized on the 128-value K grid. Routed experts stay BF16: the current MoE block
+# has no INT8 expert kernel, so this recipe does not pretend the expert weights are W8.
+#
+#   rad-convert <Hy-Memory-30B-A3B-BF16> \
+#       --recipe data/recipes/hy-memory-30b-a3b-bf16-w8.recipe -o hy-memory-30b-a3b-w8.rad
+
+blk.*.attn_q.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_k.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_v.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+blk.0.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.0.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=128 scale=bf16 clamp=sym
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym

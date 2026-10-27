@@ -1,4 +1,5 @@
-/* rad_spechub.h -- the linear-MTP coupling: wire rows and the shared arithmetic.
+/* rad_spechub.h -- the speculative coupling (linear MTP and DFlash2's block walk): wire rows and
+ * the shared arithmetic.
  *
  * The core writes these rows and a kernel plugin reads them, so their layout is ABI. The helpers
  * are header-only and stateless, so the host reference, the device kernel and the sampler share
@@ -260,6 +261,151 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_decide(const RadMtpCoupleState&
     }
     *out = last;
     return true;
+}
+
+/* ================================================================== DFlash2's coupled walk
+ *
+ * The block drafter's counterpart of mtp_couple_propose (`dflash_couple_propose`). DFlash2 proposes
+ * a block in one pass and `dflash_select` walks its candidate lattice greedily: at draft position l
+ * every candidate c of that position scores
+ *
+ *     score[l, c] = unary[l, c] + sum_r pred[pid][r] * hp[l][r] * succ[cand[l, c]][r]
+ *
+ * with pid the anchor at l = 0 and the walk's own previous token after it. The coupled walk scores
+ * the same lattice but SAMPLES each position instead of taking its argmax:
+ *
+ *     Q_l = the FP64 softmax of score[l, c] / q_temp over the eight best-scoring candidates whose
+ *           ids are in the vocabulary (rad_mtp_couple_build_q), x_l ~ Q_l at the draw's
+ *           (seed, base, KEY_DRAFT + l + 1), and pid = x_l for position l + 1.
+ *
+ * Q_l depends on the committed text (through the drafter's pass and the anchor) and on x_0..x_{l-1},
+ * never on the target's verification, and it is stored exactly in the state row the verify reads,
+ * which is all the maximal coupling needs to be exact (rad_mtp_couple_decide). The pairwise term is
+ * what makes Q_l follow the walk's own earlier samples rather than the drafter's marginal.
+ *
+ * Bit-identical on host and device: each candidate's edge is RAD_DFLASH_EDGE_PARTS partial sums,
+ * each a serial fmaf chain over a contiguous slice of the rank, added in order and then to the unary
+ * score. The plugin builds with -ffp-contract=off, so nothing else is fused. */
+#define RAD_DFLASH_EDGE_PARTS 8
+#define RAD_DFLASH_COUPLE_MAX_K 32
+#define RAD_DFLASH_COUPLE_MAX_R 512
+
+static inline RAD_SPECHUB_HD float rad_dflash_bf2f(uint16_t h) {
+    union { uint32_t u; float f; } c;
+    c.u = (uint32_t)h << 16;
+    return c.f;
+}
+
+/* Part `j` of one candidate's edge: a[r] * succ_row[r] over r in [j*R/P, (j+1)*R/P), fmaf in order.
+ * `a` is the candidate-independent half, pred[pid][r] * hp[r] (or pred[pid][r] with no hp, 0 for a
+ * predecessor outside the vocabulary). */
+static inline RAD_SPECHUB_HD float rad_dflash_edge_part(const float* a, const uint16_t* succ_row,
+                                                        int64_t R, int j) {
+    const int64_t w = R / RAD_DFLASH_EDGE_PARTS;
+    float acc = 0.0f;
+    for (int64_t r = (int64_t)j * w; r < (int64_t)(j + 1) * w; ++r)
+        acc = fmaf(a[r], rad_dflash_bf2f(succ_row[r]), acc);
+    return acc;
+}
+
+/* One position of the walk, given its K scores and ids (the ids as the candidate plane holds them).
+ * Fills `*s` as mtp_couple_propose fills a round's state and returns the proposed token:
+ *
+ *   mode 0 (a greedy request): status 0, x = `greedy_x`, the token dflash_select already wrote;
+ *   mode 1, its card's draw and a Q that builds: status 1, x ~ Q;
+ *   mode 1 otherwise: status -1, x = the walk's argmax (ties to the lower index, dflash_select's
+ *   rule over these scores), and the ordinary verify applies to it.
+ *
+ * The eight are taken in descending score, ties to the lower index, among candidates with an id
+ * in [0, vocab); a NaN score is never taken (build_q would refuse it). */
+static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(const float* sc, const int32_t* id,
+                                                            int K, float q_temp,
+                                                            const RadMtpCoupleDraw& d, bool card_ok,
+                                                            int round, int64_t vocab,
+                                                            int32_t greedy_x, RadMtpCoupleState* s) {
+    s->draw = d;
+    s->pos = 0;
+    s->round = round;
+    s->count = 0;
+    for (int i = 0; i < 8; ++i) { s->ids[i] = -1; s->q[i] = 0; }
+    if (d.mode != 1) {
+        s->status = 0;
+        s->x = greedy_x;
+        return greedy_x;
+    }
+    s->status = -1;
+    if (card_ok) {
+        int32_t kid[8];
+        float   kv[8];
+        unsigned taken = 0;
+        int n = 0;
+        for (; n < 8; ++n) {
+            int best = -1;
+            for (int c = 0; c < K; ++c) {
+                if ((taken >> c) & 1u) continue;
+                if (id[c] < 0 || id[c] >= vocab || sc[c] != sc[c]) continue;
+                if (best < 0 || sc[c] > sc[best]) best = c;
+            }
+            if (best < 0) break;
+            taken |= 1u << best;
+            kid[n] = id[best];
+            kv[n] = sc[best] / q_temp;
+        }
+        for (int i = n; i < 8; ++i) { kid[i] = -1; kv[i] = -INFINITY; }
+        if (n > 0 && rad_mtp_couple_build_q(kid, kv, vocab, s)) {
+            const double u = rad_spechub_uniform(d.seed, d.base,
+                                                 RAD_MTP_COUPLE_KEY_DRAFT + (uint64_t)round);
+            s->x = s->ids[rad_mtp_couple_pick(*s, u)];
+            s->status = 1;
+            return s->x;
+        }
+        s->count = 0;
+        for (int i = 0; i < 8; ++i) { s->ids[i] = -1; s->q[i] = 0; }
+    }
+    int   best = 0;
+    float bv = -INFINITY;
+    for (int c = 0; c < K; ++c)
+        if (sc[c] > bv) { bv = sc[c]; best = c; }
+    s->x = id[best];
+    return s->x;
+}
+
+/* One sequence's whole walk on the host: the reference the device kernel is checked against, and
+ * what the tests drive. `cand`/`unary` are `steps` rows at pitches `ld_cand`/`ld_unary`, `hp`
+ * `steps` rows at `ld_hp` (null: ones), `tokens` the `steps` tokens dflash_select wrote (rewritten
+ * for a sampled row), `state` round 1's row with `st_round` u32 words between rounds. K <= 32, R a
+ * multiple of RAD_DFLASH_EDGE_PARTS and at most RAD_DFLASH_COUPLE_MAX_R (the plugin's validation).
+ * `pred`/`succ` are [vocab, R]. */
+static inline void rad_dflash_couple_walk(const int32_t* cand, const float* unary, int64_t ld_cand,
+                                          int64_t ld_unary, const uint16_t* hp, int64_t ld_hp,
+                                          int32_t anchor, const uint16_t* pred,
+                                          const uint16_t* succ, int K,
+                                          int64_t R, int64_t vocab, int64_t steps, float q_temp,
+                                          const RadMtpCoupleDraw& d, bool card_ok, int32_t* tokens,
+                                          uint32_t* state, int64_t st_round) {
+    float   a[RAD_DFLASH_COUPLE_MAX_R], sc[RAD_DFLASH_COUPLE_MAX_K] = {};
+    int32_t pid = anchor;
+    for (int64_t l = 0; l < steps; ++l) {
+        RadMtpCoupleState* s = reinterpret_cast<RadMtpCoupleState*>(state + l * st_round);
+        const int32_t* id = cand + l * ld_cand;
+        if (d.mode == 1) {
+            const float* un = unary + l * ld_unary;
+            const bool ok = pid >= 0 && pid < vocab;
+            for (int64_t r = 0; r < R; ++r)
+                a[r] = ok ? rad_dflash_bf2f(pred[(int64_t)pid * R + r]) *
+                                (hp ? rad_dflash_bf2f(hp[l * ld_hp + r]) : 1.0f)
+                          : 0.0f;
+            for (int c = 0; c < K; ++c) {
+                float acc = 0.0f;
+                if (id[c] >= 0 && id[c] < vocab)
+                    for (int j = 0; j < RAD_DFLASH_EDGE_PARTS; ++j)
+                        acc += rad_dflash_edge_part(a, succ + (int64_t)id[c] * R, R, j);
+                sc[c] = un[c] + acc;
+            }
+        }
+        pid = rad_dflash_couple_step(sc, id, K, q_temp, d, card_ok, (int)l + 1, vocab, tokens[l], s);
+        tokens[l] = pid;
+    }
 }
 
 #undef RAD_SPECHUB_HD

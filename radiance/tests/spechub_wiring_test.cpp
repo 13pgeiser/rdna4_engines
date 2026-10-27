@@ -94,21 +94,21 @@ TEST(spechub_wiring_the_device_rows_are_production_and_the_oracle_rows_are_refer
     }
     CHECK_EQ(dev + host, p.count());
 #ifdef RAD_SPECHUB_WITH_DEVICE
-    CHECK_EQ(dev, 2);
-    CHECK_EQ(host, 2);
+    CHECK_EQ(dev, 3);
+    CHECK_EQ(host, 3);
 #else
     CHECK_EQ(dev, 0);
-    CHECK_EQ(host, 2);
+    CHECK_EQ(host, 3);
 #endif
 
-    /* Both ops must have at least one production row on a device build. This is the property the
+    /* Every op must have at least one production row on a device build. This is the property the
      * gate reads: with it, the coupling is servable without --debug-accept-reference-kernels. */
     const std::vector<std::string> refonly = reference_only_ops(p, is_ref);
 #ifdef RAD_SPECHUB_WITH_DEVICE
     CHECK_EQ(refonly.size(), (size_t)0);
 #else
-    /* No card: both ops are oracle-only, and the gate must still see them as such. */
-    CHECK_EQ(refonly.size(), (size_t)2);
+    /* No card: every op is oracle-only, and the gate must still see them as such. */
+    CHECK_EQ(refonly.size(), (size_t)3);
 #endif
 }
 

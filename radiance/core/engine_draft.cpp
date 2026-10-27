@@ -30,6 +30,8 @@ int Engine::step_state_init() {
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+    /* Scheduler::ends_every_request reads the same ids. */
+    sched_.set_eog(eog);
     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
     for (auto& rk : ranks_) {
@@ -58,12 +60,15 @@ int Engine::step_state_init() {
      * uncoupled. */
     mtp_couple_ = cfg_.draft_coupling;
     if (mtp_couple_) {
-        /* Coupling is defined on a linear serial chain. A block drafter proposes a whole block
-         * from one pass, so it has no per-round draw to couple and no per-round state. */
-        if (drafter_.kind != RAD_DRAFT_SERIAL || drafter_.depth <= 0) {
-            RAD_ERR("--draft-coupling on requires the linear serial draft chain (RAD_DRAFT_SERIAL "
-                    "with depth > 0); this model declares drafter '%s' kind %d depth %d, which has "
-                    "no per-round draw to couple",
+        /* Coupling is defined on a linear chain of drafts: a serial head's rounds, or a block
+         * drafter whose walk samples each position in turn (DFlash2, dflash_couple_propose), its
+         * position l standing for round l + 1. Either way one draw a drafting row and one state a
+         * (round, row). */
+        if ((drafter_.kind != RAD_DRAFT_SERIAL && drafter_.kind != RAD_DRAFT_BLOCK) ||
+            drafter_.depth <= 0) {
+            RAD_ERR("--draft-coupling on requires a linear draft chain (a serial head or a block "
+                    "drafter with a coupled walk, depth > 0); this model declares drafter '%s' "
+                    "kind %d depth %d, which has no per-round draw to couple",
                     drafter_.name ? drafter_.name : "(none)", drafter_.kind, drafter_.depth);
             return RAD_E_UNSUPPORTED;
         }
@@ -83,7 +88,8 @@ int Engine::step_state_init() {
             return RAD_E_STATE;
         }
         const RadBufDecl& sd = prog.buffers[couple_state_buf_].decl;
-        if (sd.rank != 3 || sd.shape[2] != (int64_t)RAD_MTP_COUPLE_STATE_WORDS) {
+        if (sd.rank != 3 || sd.shape[2] != (int64_t)RAD_MTP_COUPLE_STATE_WORDS ||
+            sd.shape[0] < (int64_t)drafter_.depth) {
             RAD_ERR("--draft-coupling: 'mtp_couple_state' is not the [rounds, rows, %d]-word "
                     "plane the coupling reads", (int)RAD_MTP_COUPLE_STATE_WORDS);
             return RAD_E_STATE;
@@ -97,11 +103,17 @@ int Engine::step_state_init() {
             (int64_t)drafter_.depth * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
         if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
-        RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, maximal "
-                 "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
+        if (drafter_.kind == RAD_DRAFT_BLOCK)
+            RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
+                     "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
+        else
+            RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
+                     "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
+                     drafter_.depth);
     }
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
 
@@ -121,6 +133,8 @@ void Engine::step_state_fini() {
     couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
+    if (tok_end_) rad_event_destroy(tok_end_);
+    tok_end_ = nullptr;
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -177,7 +191,8 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
  * history pass and every round, then the final proposal into the slots and their readback.
- * Nothing synchronises here; collect_step has the step's one wait. */
+ * Nothing synchronises here: collect_step waits for the ids alone, and the step loop for the
+ * passes after the commit, before finish_serial_drafter reads the slots. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -189,7 +204,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     }
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
-    RAD_TRY(collect_issue(so));
+    RAD_TRY(collect_issue(so, /*fence=*/true));
 
     int rounds = drafter_.depth;
     serial_row_.resize((size_t)cfg_.max_seqs);
@@ -200,7 +215,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = rounds;
     serial_rows_   = n;
     /* Before any serial pass reads a draw; round 1 is the history pass below. */
-    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(n));
+    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(serial_row_.data(), n));
 
     /* RADIANCE_DEBUG_STAGE: running means of a draft pass's host time: batch + advance, greedy
      * sampler chain, barrier release and issue. They cost the step nothing until their sum exceeds
@@ -323,38 +338,45 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
-        if (!mtp_couple_) continue;
-        /* Bound only for a request still running: one this commit finished, or whose draft the
-         * scheduler refused, binds nothing, and set_mtp_couple(..., 0) clears an earlier step's
-         * states (RAD_E_NOTFOUND for a request the sampler already dropped).
-         *
-         * The position is the committed output length after this commit, the n_out the next
-         * build_step reads. It comes from the scheduler's commit snapshot, not the plan's Request
-         * pointer, which reap() may already have freed (sched/mtp_couple_bind.h). */
-        MtpCoupleBindPoint bp;
-        bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
-        if (!bp.found)
-            RAD_WARN("MTP coupled: serial row for sequence %llu is not in the committed step; "
-                     "clearing its coupling", (unsigned long long)seq);
-        int n_bound = 0, n_malformed = 0;
-        std::string why;
-        const int bs = mtp_couple_bind_rounds(
-            bp, couple_draw_stage_[(size_t)i], &couple_readback_[(size_t)i], (int)couple_rows_,
-            done, slots_host_[serial_row_[(size_t)i].card], meta_.n_vocab, couple_bound_,
-            &n_bound, &why, &n_malformed);
-        if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
-        if (n_malformed > 0 && !couple_malformed_note_) {
-            couple_malformed_note_ = true;
-            RAD_WARN("MTP coupled: sequence %llu: %d draft round(s) had a shortlist with no valid "
-                     "Q (non-finite score, duplicate id or no live entry); those rounds keep the "
-                     "greedy proposal and the ordinary verify (logged once)",
-                     (unsigned long long)seq, n_malformed);
-        }
-        for (auto& rk : ranks_) {
-            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_,
-                                                      rc == RAD_OK ? n_bound : 0);
-            if (st < 0 && st != RAD_E_NOTFOUND) return st;
-        }
+        if (mtp_couple_)
+            RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
+    }
+    return RAD_OK;
+}
+
+/* --draft-coupling, after the commit: bind drafting row `i`'s `done` states (its readback column)
+ * to the positions the next build samples, and hand them to every rank's sampler.
+ *
+ * Bound only for a request still running: one this commit finished, or whose draft the scheduler
+ * refused (`drafted` false), binds nothing, and set_mtp_couple(..., 0) clears an earlier step's
+ * states (RAD_E_NOTFOUND for a request the sampler already dropped).
+ *
+ * The position is the committed output length after this commit, the n_out the next build_step
+ * reads. It comes from the scheduler's commit snapshot, not the plan's Request pointer, which
+ * reap() may already have freed (sched/mtp_couple_bind.h). */
+int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card) {
+    MtpCoupleBindPoint bp;
+    bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
+    if (!bp.found)
+        RAD_WARN("coupled draft: row for sequence %llu is not in the committed step; clearing its "
+                 "coupling", (unsigned long long)seq);
+    int n_bound = 0, n_malformed = 0;
+    std::string why;
+    const int bs = mtp_couple_bind_rounds(bp, couple_draw_stage_[(size_t)i],
+                                          &couple_readback_[(size_t)i], (int)couple_rows_, done,
+                                          slots_host_[card], meta_.n_vocab, couple_bound_,
+                                          &n_bound, &why, &n_malformed);
+    if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
+    if (n_malformed > 0 && !couple_malformed_note_) {
+        couple_malformed_note_ = true;
+        RAD_WARN("coupled draft: sequence %llu: %d draft position(s) had a shortlist with no valid "
+                 "Q (non-finite score, duplicate id or no live entry); those keep the greedy "
+                 "proposal and the ordinary verify (logged once)",
+                 (unsigned long long)seq, n_malformed);
+    }
+    for (auto& rk : ranks_) {
+        const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, drafted ? n_bound : 0);
+        if (st < 0 && st != RAD_E_NOTFOUND) return st;
     }
     return RAD_OK;
 }
@@ -385,18 +407,18 @@ void Engine::couple_verify_evidence(int step) {
     }
 }
 
-/* --draft-coupling: the draw for every drafting row, before any serial pass reads it.
+/* --draft-coupling: the draw for every drafting row, before any draft pass reads it.
  *
  * The coordinate is the pre-commit output size, which strictly grows between two steps that draft
  * one request, so (base, round) never repeats a draft stream. The card is the slot the advance
  * writes; the propose op keeps the greedy proposal for a row whose draw names another card. The
  * rule is sched/mtp_couple_plan.h. */
-int Engine::stage_couple_draws(int n) {
+template <class Row>
+int Engine::stage_couple_draws(const Row* rows, int n) {
     std::string why;
     const int stg = mtp_couple_plan_stage(sched_.plan(),
                                           (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
-                                          serial_row_.data(), n, &couple_by_card_,
-                                          couple_draw_stage_, &why);
+                                          rows, n, &couple_by_card_, couple_draw_stage_, &why);
     if (stg < 0) {
         RAD_ERR("MTP coupled: %s", why.c_str());
         return stg;
@@ -463,7 +485,9 @@ bool Engine::block_drafting() const {
  * The query pass's rows are device rows that the card positions at the committed end (ADV_BLOCK),
  * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
  * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
- * collect_step's wait covers both passes and the slots' readback. */
+ * collect_step waits for the sampled ids alone, so the commit streams the tokens while the card
+ * runs both passes; the step loop waits for them (step_end_) before finish_block_drafter reads the
+ * slots. */
 void Engine::block_shape(int* block, int* steps) {
     *steps = drafter_.depth;
     /* The row count is the drafter's (defaulted and checked by declare_drafter). */
@@ -485,7 +509,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* The sampled ids before either pass, as the serial driver reads them. */
-    RAD_TRY(collect_issue(so));
+    RAD_TRY(collect_issue(so, /*fence=*/true));
 
     /* The short block too (block_shape): its query pass is a shorter batch the card positions
      * the same way, its proposals the front of each row at the drafter's pitch (ADV_BTAKE), and
@@ -497,6 +521,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
+    /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
+    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
+
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. */
     if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
@@ -507,6 +534,15 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     RAD_TRY(block_pass(qb, "query", step));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     Rank& r0 = *ranks_[0];
+    if (mtp_couple_) {
+        /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
+        const void* state = r0.ctx.buf_ptr(couple_state_buf_);
+        if (!state || steps > (int)drafter_.depth) return RAD_E_STATE;
+        const int64_t pitch = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
+        RAD_TRY(rad_memcpy_2d_async(couple_readback_, pitch, state, pitch,
+                                    (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), steps,
+                                    r0.ctx.stream()));
+    }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
     block_rows_ = n;
@@ -549,7 +585,10 @@ int Engine::finish_block_drafter(const StepOut& so) {
         /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
          * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. */
         if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
-        sched_.set_draft(block_row_[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        const uint64_t seq = block_row_[(size_t)i].seq;
+        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        if (mtp_couple_)
+            RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }
     return RAD_OK;
 }

@@ -105,6 +105,13 @@ public:
         int       device = 0;
         RadStream stream = nullptr;
         Program*  prog   = nullptr;
+        /* This rank's KV pool base, for rebasing rank 0's map pointers when no per-rank views are
+         * given (kvstream_step_view). */
+        void*     kv_base = nullptr;
+        /* Per group, this rank's stream view or null, owned by the engine. Each rank's view names its
+         * own maps and its own mirror. Pointers rather than the manager, so a test that drives the
+         * builder without a device does not link the manager. */
+        const RadKVStream* const* kv_streams = nullptr;
     };
 
     /* `prog` is non-const because derived buffers are written into its arena, whose pointer lands
@@ -242,6 +249,8 @@ private:
     static constexpr int kOut = RAD_SCHED_MAX_SPEC + 4;
     struct Out {
         std::vector<std::vector<RadKVGroupBatch>> kv;
+        /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
+        std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
     };
 

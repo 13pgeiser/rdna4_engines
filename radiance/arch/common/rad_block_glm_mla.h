@@ -29,6 +29,9 @@ struct MlaLatent {
     };
     struct Wire {
         rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0, selected = 0, length = 0;
+        /* qsa_select's entry count (selected_count), one int a row: the streamed resolve's `nsel`.
+         * Never `length`, which is a token count. */
+        rad_buf nsel = 0;
     };
     Geom g{};
     Config c{};
@@ -128,7 +131,7 @@ struct GlmMla {
     QuantFP8 attn_quant{};
     MlaLatent core{};
     rad_weight q_gain = 0, kv_gain = 0;
-    rad_op op_kv_norm = 0, op_store = 0, op_ar = 0;
+    rad_op op_kv_norm = 0, op_store = 0, op_store_stream = 0, op_resolve = 0, op_ar = 0;
     LinearFP8 rows_q_b{}, rows_output{};
     QuantFP8 rows_quant{};
     rad_weight rows_kv_b = 0;
@@ -189,6 +192,20 @@ struct GlmMla {
         RAD_ARCH_TRY(output.declare(b, nm, g, nm.f("blk.%d.attn_output", layer), 4096,
                                     GlmTp::mla_width(g.world), RAD_SHARD_COL, grp_layer(layer),
                                     { nm.ckpt("%s.o_proj.weight", prefix) }, w.attn, w.out));
+        /* The streamed store: kv_store's operands plus the residency map and the layer's mirror row,
+         * added at issue (prepare). */
+        if (rad_op_declared(b, "kv_store_streamed") && rad_kv_block_size(b, kv) == 4)
+            op_store_stream = rw(b,
+                                RAD_OP(b, "kv_store_streamed",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                                  RAD_INT("head_dim", 256), RAD_INT("n_head_kv", 1),
+                                                  RAD_INT("block_size", 4),
+                                                  RAD_STR("kv_dtype", "bf16")),
+                                       RAD_NOWEIGHTS),
+                                { w.latent }, {});
+        /* Issued in finish, after this layer's indexer selects and before the attention reads
+         * `selected`. `sel_pitch` is the row pitch MlaLatent declares its attention with. */
+        op_resolve = kv_resolve_declare(b, g, kv, w.core.selected, w.core.nsel, core.c.blocks);
         if (reduce) op_ar = GlmTp::reduce(b, g, w.out);
         if (!op_store || ((reduce && g.world > 1) && !op_ar)) return RAD_E_INVAL;
         return reduce ? declare_rows(b, nm, prefix) : RAD_OK;
@@ -265,20 +282,59 @@ struct GlmMla {
         kv_a.step(ctx, w.input, w.kv_raw, T);
         q_norm.step(ctx, T);
         RAD_ISSUE_N(ctx, op_kv_norm, T, brows(w.kv_raw, T), RAD_W(kv_gain), brows(w.latent, T));
+        /* The row form splits the query projection into finish_rows (per rank), so q_b runs here
+         * only in the head form; the latent store below is full length either way. */
         if (!rows_take(T)) q_b.step(ctx, w.q_low, w.core.q, T);
-        RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
-                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        if (!kb->stream) {
+            RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+            return;
+        }
+        /* A streamed group writes its host mirror, and the ring slot only where the block is
+         * resident; the stage wait goes immediately before the store (core/kvstream/stage.h). A
+         * staged pass also stores at block-id identity, which is how the stage view is read. */
+        const bool staged = kv_stage_wait(ctx, kv, kb, layer);
+        const KVStreamLayer L = kv_stream_layer(ctx, kv, layer, kb);
+        if (!op_store_stream || !L.host || L.blocks <= 0) {
+            rad_step_fail(ctx, "GLM MLA: this layer's KV group streams but the build has no "
+                              "kv_store_streamed row to write its host mirror with");
+            return;
+        }
+        RAD_ISSUE_N(ctx, op_store_stream, T, bcol(w.latent, 0, 256, T),
+                    bcol(w.latent, 256, 256, T), praw(kb->slot_mapping, RAD_I32, T),
+                    kv_cache(kv, layer), praw(L.res, RAD_I32, L.blocks),
+                    praw2(L.host, RAD_U8, L.blocks, L.bbytes));
+        if (staged)
+            RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
     }
     void finish(RadCtx* ctx, const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
+        const auto* kb = kv_batch(batch, kv);
+        /* A streamed group's selection is resolved here, after this layer's indexer wrote fresh
+         * block ids into the one `selected` buffer every layer shares and before either form of
+         * the attention reads it. A pass on the stage view reads block ids and never resolves. */
+        if (kb && kb->stream && !kv_stage_layer(ctx, kv, kb, layer) && T > 0) {
+            const KVStreamLayer L = kv_stream_layer(ctx, kv, layer, kb);
+            if (!op_resolve || !w.core.nsel || !L.host || L.blocks <= 0 || L.slots <= 0) {
+                rad_step_fail(ctx, "GLM MLA: this layer's KV group streams but the build has no "
+                                  "kv_resolve for its selection");
+                return;
+            }
+            /* The count is qsa_select's entry count, never `length` (a token count). */
+            kv_resolve_issue(ctx, op_resolve, L, brow_slice(w.core.selected, 0, T, core.c.blocks),
+                             brow_slice(w.core.nsel, 0, T, 1), kv, layer, T);
+        }
         if (rows_take(T)) {
             finish_rows(ctx, T);
-            return;
+        } else {
+            core.step(ctx, T);
+            attn_quant.step(ctx, T);
+            output.step(ctx, w.attn, w.out, T);
+            if (op_ar) RAD_ISSUE_N(ctx, op_ar, T * 4096, brows(w.out, T), RAD_NONE);
         }
-        core.step(ctx, T);
-        attn_quant.step(ctx, T);
-        output.step(ctx, w.attn, w.out, T);
-        if (op_ar) RAD_ISSUE_N(ctx, op_ar, T * 4096, brows(w.out, T), RAD_NONE);
+        /* After every attention launch of this layer (core/kvstream/stage.h). */
+        if (kb && kb->stream) kv_stage_next(ctx, kv, layer);
     }
     /* This rank's rows [first, first + n) end to end; the last rank's run may be short, and the
      * gather sends its unwritten tail rows, which land past T. */

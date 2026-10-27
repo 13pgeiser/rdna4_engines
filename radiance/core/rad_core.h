@@ -189,11 +189,13 @@ struct WeightInfo {
     /* Filled by the layout pass: what the resolved kernel stores. `identity` is the selected
      * plane's bytes unchanged, the only form the file and mapped tiers can serve since they read
      * the container in place; `widen` is identity plus an exact widening (a bf16 norm read as
-     * f32) done by the loader. Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
+     * f32) done by the loader, and `narrow` an exact narrowing (an f32 readout head served as
+     * bf16). Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
      * load, as operand `lay_operand`. */
     std::string    layout_tag;
     bool           identity = true;
     bool           widen = false;
+    bool           narrow = false;
     int32_t        lay_op = -1, lay_band = -1, lay_dom = -1, lay_operand = -1;
     uint32_t       stored_dtype = RAD_DT_INVALID;
     uint32_t       stored_rank = 0;
@@ -238,7 +240,8 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
  * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
  * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
-    return w.identity && !w.widen && (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+    return w.identity && !w.widen && !w.narrow &&
+           (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
 
 struct BufferInfo {
@@ -289,6 +292,9 @@ struct KVGroupInfo {
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
     bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+    /* rad_kv_group_dense_read: read over the whole history every step (an indexer's block keys), so
+     * it cannot stream and must hold every sequence's context while a sibling streams. */
+    bool            dense_read = false;
     bool            replicated = false; /* rad_kv_group_replicated: the same bytes on every rank */
     /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
      * Set at declare (Builder::finish_kv_groups). */
@@ -504,6 +510,11 @@ public:
         Geometry             geom;
         std::string          geom_key;
         const RadKernelInfo* info = nullptr;
+        /* The instance init() made for this instantiation, null for a kernel with no init. A
+         * collective's launch reaches its peer bundle (scratch, flags, sequence counters) only
+         * through it. It belongs to the rank this Program was declared for, and the Registry that
+         * made it must outlive the launch (spec §1, §15). */
+        void*                instance = nullptr;
     };
     std::vector<TuneRequest> tune_requests;
 
@@ -768,6 +779,10 @@ struct Config {
     /* --tp-attn-split heads|rows: 1 runs a prefill-sized step's attention by rows over the ranks
      * (RadBuildCtx::tp_attn_rows). Not bit-identical to the head split, so heads is the default. */
     int   tp_attn_rows = 0;
+    /* --weight-prefetch on|off: off declares none of the plugin's weight reads beside the
+     * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
+     * another server, where the second lane's read costs a queue switch every decode step. */
+    bool  weight_prefetch = true;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -819,6 +834,13 @@ struct Config {
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */
     int attn_prefill_fp8 = 0;
+    /* --kv-resident N: tokens of the sparse attention group's context its VRAM ring holds
+     * (docs/KV-STREAMING.md). 0 is off; a ring that covers `max_seqs x max_ctx` streams nothing; a
+     * ring below kStreamFloorTokens or one decode step's selection is raised to it. */
+    int64_t kv_resident = 0;
+    /* Derived: whether a group streams, set by kvstream_cap_probe before the pool is sized (a
+     * streamed group's ceiling is its ring and stage, not its cache); the KV MiB rounding reads it. */
+    bool kv_streams = false;
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
@@ -917,8 +939,9 @@ struct Config {
      * the step just run; 0 never. Ignored without a drafter that declares one. */
     int64_t draft_short_from = 0;       /* --draft-short-from */
 
-    /* --draft-coupling off|on: a linear serial drafter samples its proposals and the sampler
-     * applies the maximal coupling at the verify (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
+    /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
+     * proposals and the sampler applies the maximal coupling at the verify
+     * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
 
@@ -1044,6 +1067,9 @@ struct Config {
     bool    debug_selection = false;
     bool    debug_placement = false;
     bool    profile_ops = false;
+    /* --expert-stats FILE: count the routed experts every layer selects, by step kind, and write
+     * the counts to FILE as JSON every 30 s and at shutdown (place/xstats.h). Empty is off. */
+    std::string expert_stats;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 

@@ -1,4 +1,5 @@
-/* minimaxh3 -- MiniMax-H3: a video and its stereo soundtrack from text.
+/* minimaxh3 -- MiniMax-H3: a video and its stereo soundtrack from text, between keyframes or from
+ * reference media.
  *
  * ============================== THE MODEL ==============================
  *
@@ -27,6 +28,15 @@
  *
  * The passes, their batches and the lanes a request's state lives in are the core's video
  * generator (abi/rad_builder.h, rad_declare_video_generator; core/gen/video_driver.h).
+ *
+ * ============================== KEYFRAMES AND REFERENCES ==============================
+ *
+ * The workflows i2va, l2va, fl2va and ref2va (ComfyUI's MiniMax-H3 nodes) add rows to the packed
+ * sequence: a keyframe's latents, pinned at its frame of the video, or a reference picture's,
+ * video's or soundtrack's in its own grid (rad_ref2va_pack.h). The VAEs' encoders make them, one
+ * Vencode or Aencode pass a media into the lane before the prompt pass. Their rows take a
+ * near-clean timestep, so the modulation table has a cell for every run of segments that share
+ * one. A reference picture is also shown to the text encoder, through Qwen3-VL's vision tower.
  *
  * ============================== A DISTILLED RELEASE ==============================
  *
@@ -65,7 +75,9 @@
  * ============================== WHAT IS QUANTISED ==============================
  *
  * Every linear of the text encoder, of the refiner and of the DiT's blocks, and the modulation
- * projections, are block fp8 (LinearFP8 / DenseFP8 read what the container holds). The small
+ * projections, are block fp8, or the DiT's int8 at int8 activations (LinearFP8 / DenseFP8 read what
+ * the container holds). A curve-form checkpoint reads its timestep embeddings off a table it
+ * ships, and its modulation projections, eight wide, are bf16. The small
  * linears around them keep the checkpoint's precision: the timestep MLP and the four patch
  * projections in f32, `context_embedder` and `norm_out` in bf16. The DiT's dense attention takes
  * its scores in int8 (keys per row and head, the query inside the op; P.V in bf16), which runs the
@@ -81,7 +93,11 @@
  * tiles; the audio decoder runs whole on every rank.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_vit.h>
 #include <arch/rad_fp8.h>
+
+#include "rad_ref2va_pack.h"
+#include "rad_vae_geom.h"
 
 #include <algorithm>
 #include <cctype>
@@ -99,8 +115,9 @@ using namespace rad::arch;
 /* ================================================================== the model's constants */
 /* The text encoder's layer the conditioning is read after. */
 enum { kTextLayers = 50 };
-/* The longest prompt, in tokens; a structured prompt in the model's own style is about 1500. */
-enum { kMaxText = 2048 };
+/* The longest prompt, in tokens. A structured prompt in the model's own style is about 1500; one
+ * that shows reference pictures carries their vision tokens too, about 3000 for a few. */
+enum { kMaxText = 8192 };
 /* Requests holding state at once: one denoising, one conditioned and waiting. */
 enum { kMaxLanes = 2 };
 /* Model evaluations a request may take (kMaxSteps), and the default sigma grid points (the
@@ -143,6 +160,11 @@ static const char* kPixStd = "0.229 0.224 0.225";
  * the video's timestep with modality 1, the soundtrack its own with 2, the video its own with 0. */
 enum { kSegText = 0, kSegAudio = 1, kSegVideo = 2, kSegs = 3 };
 static const int kSegMod[kSegs] = { 1, 2, 0 };
+
+/* The modulation groups a step's sequence may change through (rad_ref2va_pack.h): the plain
+ * sequence's three, or with references at most the prompt, keyframes or pictures, each video's
+ * soundtrack and video, standalone soundtracks and the two latents in their runs. */
+enum { kMaxSegs = 8 };
 
 /* ================================================================== geometry, on the host */
 /* diffusers' AutoencoderKLMiniMaxH3._split_tiles in latents: the first latent of each tile across
@@ -212,59 +234,19 @@ static void vsa_bounds(double sparsity, int64_t* tiles, int64_t* keep) {
     *keep = vsa_keep(sparsity, best);
 }
 
-/* The packed sequence's rotary positions (diffusers' MiniMaxH3PrepareLayoutStep), in f64 as the
- * reference builds them, f32 as its rope reads them. Text rows count up on the time axis; the
- * media's clock starts after them. A latent frame spans 5/3 (1, 4, 4, 4, 4)[i % 5] units of time,
- * a soundtrack latent one; the spatial axes are each side's latents over the square root of the
- * frame's area, centred on the unit interval and scaled by 32 (numpy's linspace without its
- * endpoint), and a soundtrack's two channels sit at the two ends of the width axis. */
+/* The packed sequence's rotary positions (diffusers' MiniMaxH3PrepareLayoutStep), the pack's
+ * with no references (rad_ref2va_pack.h). */
 static int64_t positions(const RadVideoGeom* g, float* pos, int64_t cap) {
     if (!g || g->n_text < 1 || g->lat_frames < 1 || g->lat_h < kPatch || g->lat_w < kPatch ||
         g->n_audio < 1)
         return RAD_E_INVAL;
-    const int64_t nt = g->n_text, na = g->n_audio, F = g->lat_frames;
-    const int64_t ph = g->lat_h / kPatch, pw = g->lat_w / kPatch;
-    const int64_t rows = nt + kAudioCh * na + F * ph * pw;
-    if (!pos) return rows;
-    if (cap < rows) return RAD_E_INVAL;
-    float* P0 = pos;
-    float* P1 = pos + rows;
-    float* P2 = pos + 2 * rows;
-    const double sq = std::sqrt((double)g->lat_h * (double)g->lat_w);
-    auto grid = [&](int64_t dim, std::vector<double>* out) {
-        const int64_t n = dim / kPatch;
-        const double ratio = (double)dim / sq, left = (1.0 - ratio) / 2.0;
-        const double step = ((left + ratio) - left) / (double)n;
-        out->resize((size_t)n);
-        for (int64_t i = 0; i < n; ++i) (*out)[(size_t)i] = ((double)i * step + left) * 32.0;
-    };
-    std::vector<double> hg, wg;
-    grid(g->lat_h, &hg);
-    grid(g->lat_w, &wg);
-    int64_t r = 0;
-    for (int64_t i = 0; i < nt; ++i, ++r) {
-        P0[r] = (float)(double)i;
-        P1[r] = 0.0f;
-        P2[r] = 0.0f;
-    }
-    for (int64_t c = 0; c < kAudioCh; ++c)
-        for (int64_t k = 0; k < na; ++k, ++r) {
-            P0[r] = (float)((double)nt + (double)k);
-            P1[r] = 0.0f;
-            P2[r] = (float)(c == 0 ? wg.front() : wg.back());
-        }
-    static const int kPattern[5] = { 1, 4, 4, 4, 4 };
-    double t = (double)nt;
-    for (int64_t f = 0; f < F; ++f) {
-        for (int64_t y = 0; y < ph; ++y)
-            for (int64_t x = 0; x < pw; ++x, ++r) {
-                P0[r] = (float)t;
-                P1[r] = (float)hg[(size_t)y];
-                P2[r] = (float)wg[(size_t)x];
-            }
-        t += 5.0 / 3.0 * (double)kPattern[f % 5];
-    }
-    return rows;
+    const Ref2VAGeom pg{ (int)g->lat_frames, (int)g->lat_h, (int)g->lat_w, (int)g->n_audio };
+    Ref2VAPack p;
+    if (ref2va_build((int)g->n_text, pg, {}, {}, &p, pos != nullptr) != 0) return RAD_E_INVAL;
+    if (!pos) return p.rows;
+    if (cap < p.rows) return RAD_E_INVAL;
+    std::copy(p.pos.begin(), p.pos.end(), pos);
+    return p.rows;
 }
 
 /* A decode pass's rows: every tile of the frame, each kPeriod rows. */
@@ -281,6 +263,7 @@ struct TeLayer {
     GateQuantFP8 gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0;
+    rad_op     op_qkr_m = 0;  /* `op_qkr` at interleaved M-RoPE, for a prompt with pictures */
 };
 
 /* A token refiner block: a plain pre-norm transformer block, no rotary, no modulation. */
@@ -304,9 +287,10 @@ struct DitBlock {
     rad_op     op_sel = 0;         /* video sparse attention's tile selection */
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
     rad_op     op_vq = 0;          /* the values to E4M3 codes for the attention's P.V */
-    /* The three modulation projections, one a modality, this rank's share of their rows. */
+    /* The three modulation projections, one a modality, this rank's share of their rows; a
+     * curve-form checkpoint's are bf16 (ada_w). */
     DenseFP8   ada[3];
-    rad_weight ada_b[3] = {};
+    rad_weight ada_w[3] = {}, ada_b[3] = {};
     rad_op     op_ada[3] = {};
 };
 
@@ -368,7 +352,29 @@ enum : int {
     kGrpVae     = 3000,
     kGrpAudio   = 3100,
     kGrpUps     = 3200,
+    kGrpTower   = 3300,
+    kGrpVenc    = 3400,
+    kGrpAenc    = 3500,
+    /* The encoders' weights only a host kernel reads (conv_in, the k=1 convs, the snake alphas):
+     * placement keeps a group with a host-only reader in host memory whole, so they are a group
+     * of their own. */
+    kGrpVencH   = 3450,
+    kGrpAencH   = 3550,
 };
+
+/* ---- the VAE encoders. A reference frame is at most 256 x 256 (ComfyUI's tile), a video at
+ * most 289 frames (17 clips), a soundtrack 500 000 samples (625 latents). The lane keeps a slot a
+ * media: a video's 82 latent frames at 256 x 256 are 82 x 8 x 8 patch rows, a soundtrack's two
+ * channels 2 x 625 rows. */
+enum { kEncMaxSide = 256, kEncMaxFrames = 289, kEncMaxSamples = 500000 };
+/* A keyframe is encoded at the video's size, up to the whole canvas, as one frame, which the
+ * temporal downsamplers do not shrink: every level holds at least this many frames at 256 x 256,
+ * the canvas's area. */
+enum { kEncOneFrames = ((int64_t)kDefW * kDefH + (int64_t)kEncMaxSide * kEncMaxSide - 1) /
+                       ((int64_t)kEncMaxSide * kEncMaxSide) };
+enum { kEncSlotsV = 12, kEncSlotsA = 6 };
+enum { kEncSlotRowsV = 82 * (kEncMaxSide / 32) * (kEncMaxSide / 32),
+       kEncSlotRowsA = kAudioCh * (kEncMaxSamples / kAudioHop) };
 
 /* The evaluations a request runs at the full size after a latent upscale, by default: of a
  * distilled release's eight, and of the base model's 49. */
@@ -389,6 +395,13 @@ struct Model {
     ActFP8  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
+    /* ---- the text encoder's Qwen3-VL vision tower, for the pictures a prompt shows, when the
+     * container carries it (every config names one). Its rows replace the pictures' placeholder
+     * tokens and its deepstack taps join the first layers. */
+    VisionTower tv{};
+    bool   media = false;
+    rad_op op_mm = 0, op_ds[VisionTower::MAX_DS] = {};
+
     /* ---- context_embedder and the refiner, over the prompt's rows */
     rad_weight w_ce = 0, b_ce = 0, w_fn = 0;
     rad_op  op_ce = 0, op_fn = 0;
@@ -396,9 +409,13 @@ struct Model {
     ActFP8  a_rh{}, a_rattn{}, a_rffn{};
     RefBlock rb[2];
 
-    /* ---- the timestep MLP and the per-step tables */
-    rad_weight w_t1 = 0, b_t1 = 0, w_t2 = 0, b_t2 = 0, w_no = 0, b_no = 0;
-    rad_op  op_temb = 0, op_t1 = 0, op_ts = 0, op_t2 = 0, op_ts2 = 0, op_no = 0;
+    /* ---- the timestep MLP and the per-step tables. A curve-form checkpoint has a table of
+     * embeddings in place of the sinusoid and the MLP: `curve` rows of it (0 without), and
+     * `temb_w` is the embedding's width either way. */
+    int64_t curve = 0, temb_w = 2688;
+    rad_weight w_t1 = 0, b_t1 = 0, w_t2 = 0, b_t2 = 0, w_no = 0, b_no = 0, w_ttable = 0;
+    rad_op  op_temb = 0, op_temb_pv = 0, op_temb_pa = 0, op_t1 = 0, op_ts = 0, op_t2 = 0,
+            op_ts2 = 0, op_no = 0;
     QuantFP8 q_temb{};
     rad_buf b_tproj = 0, b_te1 = 0, b_te1s = 0, b_temb = 0;
     ActFP8  a_temb{};
@@ -409,6 +426,8 @@ struct Model {
     rad_buf b_nout = 0;          /* [lanes * S, 3 * 2D] bf16: norm_out's, by segment */
     rad_buf b_vstate = 0;        /* [lanes * maxV, 96] f32 */
     rad_buf b_astate = 0;        /* [lanes * maxA, 32] f32 */
+    rad_buf b_vx0 = 0;           /* [lanes * maxV, 96] f32: res_multistep's last estimate */
+    rad_buf b_ax0 = 0;           /* [lanes * maxA, 32] f32 */
     rad_buf b_prev = 0;          /* [lanes * 5 * area, 3] bf16: the decoder's frames across chunks */
 
     /* ---- the DiT */
@@ -426,11 +445,15 @@ struct Model {
     rad_buf b_v8 = 0, b_vs = 0;  /* its values at E4M3 codes and their column scales */
     /* The trained schedule's base times (a few-step checkpoint's), or none. */
     std::vector<double> rungs;
-    rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_gu = 0, b_hn = 0, b_hf = 0, b_vel = 0, b_avel = 0;
+    rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_gu = 0, b_hn = 0, b_hf = 0, b_vel = 0,
+            b_avel = 0;
     ActFP8  a_hm{}, a_attn{}, a_ffn{};
+    /* The DiT's linears are int8 (W8A8): their activations are int8 codes as well. */
+    bool    dit_i8 = false;
     std::vector<DitBlock> dit;
     rad_weight w_no_n = 0, w_vout = 0, b_vout = 0, w_aout = 0, b_aout = 0;
     rad_op  op_nout = 0, op_hcast = 0, op_vout = 0, op_aout = 0, op_ev = 0, op_ea = 0;
+    rad_op  op_rmv = 0, op_rma = 0;   /* res_multistep, video and soundtrack */
 
     /* ---- the audio decoder */
     std::string a_mean, a_std;
@@ -469,6 +492,73 @@ struct Model {
     rad_buf b_uin32 = 0, b_uin = 0, b_ua = 0, b_ub = 0, b_uc = 0, b_uout = 0, b_ust = 0;
     rad_buf b_ufac = 0, b_ue0 = 0, b_ue0s = 0, b_ue1 = 0, b_ue1s = 0, b_uemb = 0;
     std::vector<UpsBlock> u_in, u_out;
+
+    /* ---- the video VAE's encoder, when the container carries it: bf16 voxel rows, causal
+     * reflect-padded convolutions, six levels of two residual blocks and four strided
+     * downsamplers. A level's stream is `a`, `b` and `c` are a block's temporaries, and `in` the
+     * input of a level whose first block changes the width (it has a 1x1x1 shortcut). */
+    struct VEncBlock {
+        rad_weight n1w = 0, n1b = 0, c1w = 0, c1b = 0, n2w = 0, n2b = 0, c2w = 0, c2b = 0;
+        rad_op     op_n1 = 0, op_c1 = 0, op_n2 = 0, op_c2 = 0;
+    };
+    struct VEncLevel {
+        int64_t    cin = 0, cout = 0, rows = 0, pf = 0, frames = 0;   /* pf: rows a frame */
+        rad_buf    in = 0, a = 0, b = 0, c = 0;
+        rad_weight scw = 0, scb = 0, dnw = 0, dnb = 0;
+        rad_op     op_sc = 0, op_dn = 0;
+        VEncBlock  blk[2];
+    };
+    std::vector<VEncLevel> v_lv;
+    bool    venc = false;
+    rad_weight ve_cinw = 0, ve_cinb = 0, ve_now = 0, ve_nob = 0, ve_coutw = 0, ve_coutb = 0;
+    rad_weight ve_qw = 0, ve_qb = 0;
+    rad_op  op_ve_pix = 0, op_ve_pcast = 0, op_ve_cin = 0, op_ve_nout = 0, op_ve_cout = 0;
+    rad_op  op_ve_q = 0, op_ve_fold = 0, op_eaug = 0;
+    std::string ve_pix_mul, ve_pix_add, ve_fold_mul, ve_fold_add;   /* pixel and latent norms */
+    rad_buf b_epix32 = 0, b_epix = 0, b_eq48 = 0, b_eq2 = 0, b_egn = 0;
+    rad_buf b_evc = 0;               /* [kEncSlotsV * kEncSlotRowsV, kPatchVals] f32 PERSIST */
+    /* The tiled encode of a picture too big for one volume (step_venc_tiled): the tiles' geometry
+     * rows (read back through raw pointers, so PERSIST), the pixels and the moments tile-major. */
+    rad_buf b_tplan = 0, b_vtile = 0, b_eqt = 0;
+    rad_op  op_vt_plan = 0, op_vt_crop = 0, op_vt_join = 0;
+
+    /* ---- the audio VAE's encoder, when the container carries it: f32 like its decoder, a
+     * channel a sequence, conv_in and five strided blocks of three units [snake, conv k7, snake,
+     * conv k1 + residual]. The strided convolutions and the attention block run in bf16, the
+     * only dtype those ops take for every operand. Every convolution but mean_proj is
+     * weight-normalised. */
+    struct AEncUnit {
+        rad_weight a1 = 0, c1w = 0, c1b = 0, a2 = 0, c2w = 0, c2b = 0;
+        rad_op     op_a1 = 0, op_c1 = 0, op_a2 = 0, op_c2 = 0;
+    };
+    struct AEncBlk {
+        AEncUnit u[3];
+        rad_weight al = 0, dnw = 0, dnb = 0;      /* the block's last snake, its downsampler */
+        rad_op   op_al = 0, op_dn = 0;
+        /* The strided convolution's bf16 input and output. */
+        rad_buf  bi = 0, bo = 0;
+        rad_op   op_ci = 0, op_co = 0;
+    };
+    bool    aenc = false;
+    AEncBlk ae_blk[5];
+    rad_weight ae_cinw = 0, ae_cinb = 0, ae_al6 = 0, ae_finw = 0, ae_finb = 0;
+    rad_op  op_ae_cin = 0, op_ae_snk6 = 0, op_ae_fin = 0;
+    /* The attention block (causal attention, then a GeGLU MLP at 32 channels), bf16. */
+    rad_weight p_ln1w = 0, p_ln1b = 0, p_qkvw = 0, p_qkvb = 0, p_apw = 0, p_apb = 0;
+    rad_weight p_ln3w = 0, p_ln3b = 0, p_prw = 0, p_prb = 0, p_ln2w = 0, p_ln2b = 0;
+    rad_weight p_mlw = 0, p_mlb = 0, p_guw = 0, p_gub = 0, p_w2w = 0, p_w2b = 0;
+    rad_op  p_op_ln3 = 0, p_op_qkv = 0, p_op_attn = 0, p_op_pool = 0, p_op_aproj = 0;
+    rad_op  p_op_ln1 = 0, p_op_proj = 0, p_op_hadd = 0, p_op_ln2 = 0, p_op_mln = 0;
+    rad_op  p_op_gu = 0, p_op_act = 0, p_op_w2 = 0, p_op_xadd = 0;
+    rad_op  p_op_hs = 0, p_op_hsd = 0;   /* the heads' mean: six adds, then an add over eight */
+    rad_weight ae_mpw = 0, ae_mpb = 0;            /* mean_proj, f32 */
+    rad_op  op_ae_mp = 0, op_ae_norm = 0, op_ae_cast6 = 0, op_ae_castx = 0;
+    std::string ae_norm_mul, ae_norm_add;         /* the latents' normalisation */
+    rad_buf b_ax[6] = {}, b_et1[5] = {}, b_et2[5] = {}, b_a6t = 0, b_ax6 = 0;
+    rad_buf b_apb = 0, b_aln3 = 0, b_aqkv = 0, b_aatt = 0, b_ahsum = 0, b_apool = 0;
+    rad_buf b_eh = 0, b_a32a = 0, b_a32b = 0, b_a32c = 0, b_a32d = 0, b_agu = 0, b_agu64 = 0;
+    rad_buf b_ax2 = 0, b_amb = 0, b_amb2 = 0;
+    rad_buf b_enca = 0;              /* [kEncSlotsA * kEncSlotRowsA, kAudioC] f32 PERSIST */
 };
 
 static Model g_model[MAX_RANKS];
@@ -631,6 +721,28 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                          RAD_INT("vocab_offset", 0)),
                               RAD_WEIGHTS(m.w_tok)),
                     {}, { m.b_tx });
+    if (m.media) {
+        m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
+                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", g.n_embd),
+                                          RAD_STR("dtype", "bf16")),
+                               RAD_NOWEIGHTS),
+                     { m.tv.b_out, m.b_tx }, { m.b_tx });
+        for (int t = 0; t < m.tv.n_ds; ++t)
+            m.op_ds[t] = rw(b, RAD_OP(b, "scatter_add_rows",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", g.n_embd),
+                                                 RAD_STR("dtype", "bf16")),
+                                      RAD_NOWEIGHTS),
+                            { m.tv.b_ds[t], m.b_tx }, { m.b_tx });
+    }
+
+    /* With the tower every layer also has its rotary at interleaved M-RoPE, Qwen3-VL's sections,
+     * for a prompt with pictures; text alone is the same rotation at NeoX. */
+    const std::vector<double> sec = meta_list(meta, "text_config.rope_scaling.mrope_section");
+    char sections[48];
+    if (sec.size() == 3)
+        std::snprintf(sections, sizeof sections, "%d %d %d", (int)sec[0], (int)sec[1], (int)sec[2]);
+    else
+        std::snprintf(sections, sizeof sections, "24 20 20");
 
     m.te.resize((size_t)g.n_layer);
     for (int64_t l = 0; l < g.n_layer; ++l) {
@@ -667,6 +779,18 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                            RAD_INT("rotary_dim", g.head_dim)),
                                 RAD_WEIGHTS(L.w_qn, L.w_kn)),
                       { m.b_tkv }, { m.b_tkv });
+        if (m.media)
+            L.op_qkr_m = rw(b, RAD_OP(b, "qk_norm_rope",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, T),
+                                                 RAD_INT("head_dim", g.head_dim),
+                                                 RAD_INT("n_head", g.n_head),
+                                                 RAD_INT("n_head_kv", g.n_head_kv),
+                                                 RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                                 RAD_STR("mode", "imrope"),
+                                                 RAD_INT("rotary_dim", g.head_dim),
+                                                 RAD_STR("sections", nm.f("%s", sections))),
+                                      RAD_WEIGHTS(L.w_qn, L.w_kn)),
+                            { m.b_tkv }, { m.b_tkv });
         L.op_attn = rw(b, RAD_OP(b, "attn_dense",
                                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", g.head_dim),
                                             RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
@@ -860,41 +984,100 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t fd = rad_meta_geti(meta, "transformer.freq_dim", 256);
     const int64_t hd1 = rad_meta_geti(meta, "transformer.time_embed_hidden_dim", 5376);
     const int64_t td = rad_meta_geti(meta, "transformer.time_embed_dim", 2688);
+    const int64_t G = rad_meta_geti(meta, "transformer.adaln_curve_grid", 0);
+    m.curve = G;
+    m.temb_w = td;
     const int acc = RAD_ACCESS_PER_REQUEST;
     const int gx = kGrpTemb;
-    if (td % RAD_FP8_BLOCK) {
+    if (!G && td % RAD_FP8_BLOCK) {
         fprintf(stderr, "radiance: minimaxh3: the timestep embedding is %lld wide, not whole "
                         "%d-column blocks\n", (long long)td, RAD_FP8_BLOCK);
         return RAD_E_INVAL;
     }
-    m.b_tproj = decl_b(b, nm.f("tmb.proj"), RAD_F32, { 2 * S, fd });
-    m.b_te1 = decl_b(b, nm.f("tmb.h1"), RAD_F32, { 2 * S, hd1 });
-    m.b_te1s = decl_b(b, nm.f("tmb.h1s"), RAD_F32, { 2 * S, hd1 });
-    m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_F32, { 2 * S, td });
-    m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
-                             RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
-                                        RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
-                                        RAD_STR("dtype", "f32")),
-                             RAD_NOWEIGHTS),
-                   {}, { m.b_tproj });
-    m.op_t1 = dense_bias(b, nm, "tmb.l1", "transformer.time_embedder.linear_1", RAD_F32, "f32", hd1,
-                         fd, 2 * S, m.b_tproj, m.b_te1, &m.w_t1, &m.b_t1, acc, gx);
-    m.op_ts = unary(b, "silu", 2 * S, hd1, "f32", m.b_te1, m.b_te1s);
-    m.op_t2 = dense_bias(b, nm, "tmb.l2", "transformer.time_embedder.linear_2", RAD_F32, "f32", td,
-                         hd1, 2 * S, m.b_te1s, m.b_temb, &m.w_t2, &m.b_t2, acc, gx);
-    /* silu(temb) in f32, rounded once to the bf16 the projections take. */
-    Geom gs = g;
-    gs.max_tok = 2 * S;
-    m.a_temb.x = decl_b(b, nm.f("tmb.act"), RAD_BF16, { 2 * S, td });
-    m.op_ts2 = unary(b, "silu", 2 * S, td, "f32", m.b_temb, m.a_temb.x);
-    RAD_ARCH_TRY(m.a_temb.declare_qs(b, nm, gs, "tmb.act", td, 2 * S));
-    RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
-    if (!m.op_temb || !m.op_t1 || !m.op_ts || !m.op_t2 || !m.op_ts2) return RAD_E_INVAL;
+    /* Every step's embeddings in four blocks of S: the video's schedule, the soundtrack's, then
+     * each again at max(t, pin) for the keyframes and references (`clamp_min`), which a request
+     * without them does not read. */
+    const int64_t TT = 4 * S;
+    if (G > 0) {
+        /* A curve-form checkpoint reads each embedding off its table, between the two rows
+         * around the timestep, in bf16: that is the projections' input itself, with no MLP, SiLU
+         * or codes. */
+        m.w_ttable = wcopy(b, nm.f("tmb.table"), nm.ckpt("transformer.adaln_t_table"),
+                           RAD_F32, { G, td }, acc, gx);
+        m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_BF16, { TT, td });
+        m.a_temb.x = m.b_temb;
+        if (!m.w_ttable || !m.b_temb) return RAD_E_INVAL;
+        /* `scale` and `max_period` are required and unused with a curve. */
+        m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                            RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                            RAD_INT("curve", G), RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(m.w_ttable)),
+                       {}, { m.b_temb });
+        m.op_temb_pv = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                               RAD_F64("scale", 1.0),
+                                               RAD_F64("max_period", 10000.0),
+                                               RAD_INT("curve", G),
+                                               RAD_F64("clamp_min", kR2VVisualPin),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_WEIGHTS(m.w_ttable)),
+                          {}, { m.b_temb });
+        m.op_temb_pa = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                               RAD_F64("scale", 1.0),
+                                               RAD_F64("max_period", 10000.0),
+                                               RAD_INT("curve", G),
+                                               RAD_F64("clamp_min", kR2VAudioPin),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_WEIGHTS(m.w_ttable)),
+                          {}, { m.b_temb });
+        if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa) return RAD_E_INVAL;
+    } else {
+        m.b_tproj = decl_b(b, nm.f("tmb.proj"), RAD_F32, { TT, fd });
+        m.b_te1 = decl_b(b, nm.f("tmb.h1"), RAD_F32, { TT, hd1 });
+        m.b_te1s = decl_b(b, nm.f("tmb.h1s"), RAD_F32, { TT, hd1 });
+        m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_F32, { TT, td });
+        m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                            RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                            RAD_STR("dtype", "f32")),
+                                 RAD_NOWEIGHTS),
+                       {}, { m.b_tproj });
+        m.op_temb_pv = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                               RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                               RAD_F64("clamp_min", kR2VVisualPin),
+                                               RAD_STR("dtype", "f32")),
+                                    RAD_NOWEIGHTS),
+                          {}, { m.b_tproj });
+        m.op_temb_pa = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                               RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                               RAD_F64("clamp_min", kR2VAudioPin),
+                                               RAD_STR("dtype", "f32")),
+                                    RAD_NOWEIGHTS),
+                          {}, { m.b_tproj });
+        m.op_t1 = dense_bias(b, nm, "tmb.l1", "transformer.time_embedder.linear_1", RAD_F32, "f32",
+                             hd1, fd, TT, m.b_tproj, m.b_te1, &m.w_t1, &m.b_t1, acc, gx);
+        m.op_ts = unary(b, "silu", TT, hd1, "f32", m.b_te1, m.b_te1s);
+        m.op_t2 = dense_bias(b, nm, "tmb.l2", "transformer.time_embedder.linear_2", RAD_F32, "f32",
+                             td, hd1, TT, m.b_te1s, m.b_temb, &m.w_t2, &m.b_t2, acc, gx);
+        /* silu(temb) in f32, rounded once to the bf16 the projections take. */
+        Geom gs = g;
+        gs.max_tok = TT;
+        m.a_temb.x = decl_b(b, nm.f("tmb.act"), RAD_BF16, { TT, td });
+        m.op_ts2 = unary(b, "silu", TT, td, "f32", m.b_temb, m.a_temb.x);
+        RAD_ARCH_TRY(m.a_temb.declare_qs(b, nm, gs, "tmb.act", td, TT));
+        RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
+        if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa || !m.op_t1 || !m.op_ts || !m.op_t2
+            || !m.op_ts2) return RAD_E_INVAL;
+    }
 
-    /* The lane's tables. */
-    m.b_ada = decl_b(b, nm.f("lane.ada"), RAD_BF16, { (int64_t)kMaxLanes * S, L * kSegs * m.Ws },
+    /* The lane's tables, a cell a modulation group, kMaxSegs of them. */
+    m.b_ada = decl_b(b, nm.f("lane.ada"), RAD_BF16, { (int64_t)kMaxLanes * S, L * kMaxSegs * m.Ws },
                      RAD_BUF_PERSIST);
-    m.b_nout = decl_b(b, nm.f("lane.nout"), RAD_BF16, { (int64_t)kMaxLanes * S, kSegs * 2 * D },
+    m.b_nout = decl_b(b, nm.f("lane.nout"), RAD_BF16, { (int64_t)kMaxLanes * S, kMaxSegs * 2 * D },
                       RAD_BUF_PERSIST);
     const int64_t ada_rows = 6 * D;   /* one modality's six vectors */
     m.dit.resize((size_t)L);
@@ -910,17 +1093,30 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             const char* bn = nm.f("%s.bias", base);
             RAD_ARCH_TRY(map_rows(b, wn, { { src_w, (int)(md * ada_rows), ada_rows } }));
             RAD_ARCH_TRY(map_rows(b, bn, { { src_b, (int)(md * ada_rows), ada_rows } }));
-            B.ada[md].mapped = true;
-            RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
-                                           grp_layer(grp), { src_w }));
             B.ada_b[md] = decl_w(b, bn, RAD_BF16, { m.Ws }, acc, RAD_SHARD_ROW, grp_layer(grp));
             if (!B.ada_b[md]) return RAD_E_INVAL;
-            B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
-                                        RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
-                                                   RAD_INT("K", td), RAD_INT("group", RAD_FP8_BLOCK),
-                                                   RAD_STR("dtype", "fp8a8")),
-                                        RAD_WEIGHTS(B.ada[md].w, B.ada[md].s, B.ada_b[md])),
-                              { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+            if (G > 0) {
+                /* A curve's embedding is 8 wide, too narrow for E4M3 blocks: bf16 throughout. */
+                B.ada_w[md] = decl_w(b, wn, RAD_BF16, { m.Ws, td }, acc, RAD_SHARD_ROW,
+                                     grp_layer(grp));
+                if (!B.ada_w[md]) return RAD_E_INVAL;
+                B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_bias",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
+                                                       RAD_INT("K", td), RAD_STR("dtype", "bf16")),
+                                            RAD_WEIGHTS(B.ada_w[md], B.ada_b[md])),
+                                  { m.a_temb.x }, { m.b_ada });
+            } else {
+                /* The row slice is mapped above (DenseFP8 takes that as its argument). */
+                RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
+                                               grp_layer(grp), { src_w }, {}, true));
+                B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
+                                                       RAD_INT("K", td),
+                                                       RAD_INT("group", RAD_FP8_BLOCK),
+                                                       RAD_STR("dtype", "fp8a8")),
+                                            RAD_WEIGHTS(B.ada[md].w, B.ada[md].s, B.ada_b[md])),
+                                  { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+            }
             if (!B.op_ada[md]) return RAD_E_INVAL;
         }
     }
@@ -944,6 +1140,8 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the lanes' latents, and the first step's noise */
     m.b_vstate = decl_b(b, nm.f("lane.video"), RAD_F32, { La * m.maxV, kPatchVals }, RAD_BUF_PERSIST);
     m.b_astate = decl_b(b, nm.f("lane.audio"), RAD_F32, { La * m.maxA, kAudioC }, RAD_BUF_PERSIST);
+    m.b_vx0 = decl_b(b, nm.f("lane.video.x0"), RAD_F32, { La * m.maxV, kPatchVals }, RAD_BUF_PERSIST);
+    m.b_ax0 = decl_b(b, nm.f("lane.audio.x0"), RAD_F32, { La * m.maxA, kAudioC }, RAD_BUF_PERSIST);
     m.op_rnd_v = rw(b, RAD_OP(b, "randn_lanes",
                               RAD_PARAMS(RAD_RANGE("M", 1, m.maxV), RAD_INT("n", kPatchVals),
                                          RAD_INT("stride", m.maxV), RAD_STR("dtype", "f32")),
@@ -956,8 +1154,8 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                     { m.b_astate }, { m.b_astate });
 
     /* ---- this step's modulation, every rank's share of it */
-    const int64_t row = L * kSegs * m.Ws;
-    m.b_modg = decl_b(b, nm.f("dit.mod"), RAD_BF16, { (int64_t)g.world * L * kSegs, m.Ws });
+    const int64_t row = L * kMaxSegs * m.Ws;
+    m.b_modg = decl_b(b, nm.f("dit.mod"), RAD_BF16, { (int64_t)g.world * L * kMaxSegs, m.Ws });
     if (g.world > 1)
         m.op_modg = rw(b, RAD_OP(b, "all_gather",
                                  RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -974,6 +1172,12 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the packed sequence: the lane's prompt rows, the soundtrack's and the video's latents
      * through their f32 projections, rounded to bf16 as the reference packs them */
     m.b_h = decl_b(b, nm.f("dit.h"), RAD_BF16, { T, D });
+    /* The linears' format, from block 0's down projection (one source, so declare() does not map
+     * it again), before the activations' codes are declared. An int8 DiT takes int8 activations,
+     * from the same producers as the E4M3 one. */
+    RAD_ARCH_TRY(m.dit[0].down.probe(b, nm, g, nm.f("dit.blk.0.ffn_down"),
+                                     { nm.ckpt("transformer.transformer_blocks.0.ff.net.2.weight") }));
+    m.dit_i8 = m.dit[0].down.probed_i8;
     m.op_text = rw(b, RAD_OP(b, "lane_gather",
                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxText), RAD_INT("n", D),
                                         RAD_INT("stride", (int64_t)kMaxText),
@@ -990,7 +1194,9 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         return RAD_E_INVAL;
 
     /* ---- the blocks */
-    RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D));
+    RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D, 0, m.dit_i8, !m.dit_i8));
+    /* rms_mod_quant_i8 writes a_hm's int8 codes, as rms_mod_quant_fp8 writes its E4M3 ones. */
+    m.a_hm.q8_fed = m.dit_i8;
     /* With video sparse attention a fourth projection beside q, k and v gates the pooled-tile
      * attention into each row's output. */
     const int64_t nparts = m.vsa ? 4 : 3;
@@ -1004,26 +1210,30 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.b_v8 = decl_b(b, nm.f("dit.v8"), RAD_F8E4M3, { T, qd });
     m.b_vs = decl_b(b, nm.f("dit.vs"), RAD_F32, { qd });
     m.a_attn.x = decl_b(b, nm.f("dit.attn"), RAD_BF16, { T, qd });
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd, 0, m.dit_i8, !m.dit_i8));
+    /* q_attn writes the int8 codes the output projection reads. */
+    m.a_attn.q8_fed = m.dit_i8;
     m.b_ao = decl_b(b, nm.f("dit.ao"), RAD_BF16, { T, D });
     /* More than one rank: the all-reduces of b_ao's halves run on the second lane (step_dit). */
     if (g.world > 1) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ao));
     m.b_gu = decl_b(b, nm.f("dit.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_ffn.x = decl_b(b, nm.f("dit.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "dit.ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "dit.ffn", g.n_ff, 0, m.dit_i8, !m.dit_i8));
     const char* sections = nm.f("%lld %lld %lld", (long long)rf, (long long)rf, (long long)rf);
     const int64_t ff_all = g.n_ff_all;
 
+    /* A block's modulated norm: the previous block's delta added to `b_h`, the norm, and `a_hm`'s
+     * codes, int8 or E4M3, in one op. */
     auto mod_q = [&](rad_weight w, bool gated) {
-        rad_op op = RAD_OP(b, "rms_mod_quant_fp8",
+        rad_op op = RAD_OP(b, m.dit_i8 ? "rms_mod_quant_i8" : "rms_mod_quant_fp8",
                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
-                                      RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("gated", gated ? 1 : 0),
-                                      RAD_STR("dtype", "bf16")),
+                                      RAD_INT("group", RAD_FP8_BLOCK),
+                                      RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16")),
                            RAD_WEIGHTS(w));
         if (!op) return op;
         rad_buf rd[3] = { m.b_modg, m.b_h, m.b_ao };
-        rad_buf wr[3] = { m.a_hm.q, m.a_hm.s, m.b_h };
         rad_op_reads(b, op, rd, gated ? 3 : 2);
+        rad_buf wr[3] = { m.a_hm.cq(), m.a_hm.cs(), m.b_h };
         rad_op_writes(b, op, wr, 3);
         return op;
     };
@@ -1131,11 +1341,17 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         B.op_mq2 = mod_q(B.w_n2, true);
         const char* fw = nm.f("%s.ffn_gate_up.weight", dn);
         const char* fsrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
+        /* The gate half first, as in the refiner. diffusers' SwiGLU (`ff.net.0.proj`) takes
+         * `value, gate = chunk(2)` and computes value * silu(gate), so the checkpoint stores the
+         * gate second, while silu_mul and gated_quant_fp8 gate with the first half. Left in
+         * checkpoint order, every frame renders as scrambled colour tiles. The int8 path's group
+         * scales are quantised from the mapped rows, so they follow the swap. */
         RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, (int)ff_all, ff_all }, { fsrc, 0, ff_all } }));
         B.gate_up.mapped = true;
         RAD_ARCH_TRY(B.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
                                        RAD_SHARD_ROW, grp_layer(grp), { fsrc }, m.a_hm, m.b_gu, 0,
                                        { g.n_ff, g.n_ff }));
+        B.gq.silu_only = m.dit_i8;
         RAD_ARCH_TRY(B.gq.declare(b, g, m.b_gu, m.a_ffn, g.n_ff, "silu", 0, false));
         RAD_ARCH_TRY(B.down.declare(b, nm, g, nm.f("%s.ffn_down", dn), D, g.n_ff, RAD_SHARD_COL,
                                     grp_layer(grp), { nm.ckpt("%s.ff.net.2.weight", pre) },
@@ -1195,7 +1411,19 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                       RAD_STR("dtype", "f32")),
                            RAD_NOWEIGHTS),
                  { m.b_avel, m.b_astate }, { m.b_astate });
-    return m.op_hcast && m.op_vout && m.op_aout && m.op_ev && m.op_ea ? RAD_OK : RAD_E_INVAL;
+    /* res_multistep reads and rewrites the last estimate as well as the latent. */
+    m.op_rmv = rw(b, RAD_OP(b, "flow_res_multistep",
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.maxV), RAD_INT("n", kPatchVals),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                  { m.b_vel, m.b_vx0, m.b_vstate }, { m.b_vx0, m.b_vstate });
+    m.op_rma = rw(b, RAD_OP(b, "flow_res_multistep",
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.maxA), RAD_INT("n", kAudioC),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                  { m.b_avel, m.b_ax0, m.b_astate }, { m.b_ax0, m.b_astate });
+    return m.op_hcast && m.op_vout && m.op_aout && m.op_ev && m.op_ea && m.op_rmv && m.op_rma
+               ? RAD_OK : RAD_E_INVAL;
 }
 
 /* ================================================================== the audio decoder */
@@ -1847,6 +2075,726 @@ static int declare_ups(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return RAD_OK;
 }
 
+/* ================================================================== the VAE encoders */
+/* An encode pass's geometry (rad_arch_encode_geom). Vencode, 25 int32s: the five volumes (T, H, W)
+ * of the clip and after each downsampler, the fold's (frames, h, w) for a full and for the last
+ * clip, then the clip's frames, the clips, the padded frames and the latent frames. Aencode, 13:
+ * the padded samples, then each of the six stages' length as a {0, n} cu. */
+const int kVEncGeomN = 25, kAEncGeomN = 13;
+
+static bool venc_geom(int64_t frames, int64_t h, int64_t w, int32_t* out) {
+    if (frames < 1 || frames > kEncMaxFrames || h < kVaeRatio || w < kVaeRatio ||
+        h % kVaeRatio || w % kVaeRatio)
+        return false;
+    const int64_t clip = frames == 1 ? 1 : kVaeClipLength;
+    const int64_t n_clips = frames == 1 ? 1 : (frames + kVaeClipLength - 1) / kVaeClipLength;
+    const int64_t t1 = (clip + 1) / 2, t2 = (t1 + 1) / 2;
+    /* Every level's volume fits its buffers (declare_venc's R): a video's clip at most 256 x 256,
+     * a single frame up to the canvas. The spatial divisors cancel, leaving the frames. */
+    {
+        const int64_t tv[5] = { clip, clip, t1, t2, t2 };
+        const int64_t tf5[5] = { kVaeClipLength, kVaeClipLength, (kVaeClipLength + 1) / 2,
+                                 ((kVaeClipLength + 1) / 2 + 1) / 2,
+                                 ((kVaeClipLength + 1) / 2 + 1) / 2 };
+        for (int i = 0; i < 5; ++i)
+            if (tv[i] * h * w > std::max(tf5[i], (int64_t)kEncOneFrames) *
+                                    (int64_t)kEncMaxSide * kEncMaxSide)
+                return false;
+    }
+    const int64_t lat = vae_latent_frames(frames);
+    const int64_t full = vae_clip_latents(clip);
+    const int64_t last = lat - full * (n_clips - 1);
+    if (lat < 1 || full < 1 || last < 1 || last > full) return false;
+    if (!out) return true;
+    const int64_t g[5][3] = { { clip, h, w }, { clip, h / 2, w / 2 }, { t1, h / 4, w / 4 },
+                              { t2, h / 8, w / 8 }, { t2, h / 16, w / 16 } };
+    int32_t* o = out;
+    for (const auto& v : g)
+        for (int64_t x : v) *o++ = (int32_t)x;
+    const int64_t f[2][3] = { { full, h / (kVaeRatio * kPatch), w / (kVaeRatio * kPatch) },
+                              { last, h / (kVaeRatio * kPatch), w / (kVaeRatio * kPatch) } };
+    for (const auto& v : f)
+        for (int64_t x : v) *o++ = (int32_t)x;
+    *o++ = (int32_t)clip;
+    *o++ = (int32_t)n_clips;
+    *o++ = (int32_t)(n_clips * clip);
+    *o++ = (int32_t)lat;
+    return o - out == kVEncGeomN;
+}
+
+static bool aenc_geom(int64_t samples, int64_t ch, int32_t* out) {
+    if (samples < 1 || samples > kEncMaxSamples || ch < 1 || ch > kAudioCh) return false;
+    const int64_t n0 = vae_audio_latents(samples) * kAudioHop;
+    if (n0 > kEncMaxSamples) return false;
+    if (!out) return true;
+    static const int64_t kStr[5] = { 2, 4, 4, 5, 5 };
+    out[0] = (int32_t)n0;
+    int64_t n = n0;
+    for (int i = 0; i <= 5; ++i) {
+        out[1 + 2 * i] = 0;
+        out[2 + 2 * i] = (int32_t)n;
+        if (i < 5) n /= kStr[i];
+    }
+    return true;
+}
+
+/* A media's first row in b_evc / b_enca: nine pictures then three videos, three videos'
+ * soundtracks then three standalone ones. A request with keyframes carries no references, so
+ * its two keyframes take the first two pictures' rows. -1 for no slot. */
+static int64_t venc_slot_row(int32_t kind, int32_t slot) {
+    int64_t idx = -1;
+    if (kind == RAD_ENC_IMAGE && slot >= 1 && slot <= 9) idx = slot - 1;
+    else if (kind == RAD_ENC_KEYFRAME && slot >= 1 && slot <= 2) idx = slot - 1;
+    else if (kind == RAD_ENC_VIDEO && slot >= 1 && slot <= 3) idx = 9 + slot - 1;
+    return idx < 0 ? -1 : idx * (int64_t)kEncSlotRowsV;
+}
+static int64_t aenc_slot_row(int32_t kind, int32_t slot) {
+    int64_t idx = -1;
+    if (kind == RAD_ENC_VAUDIO && slot >= 1 && slot <= 3) idx = slot - 1;
+    else if (kind == RAD_ENC_AUDIO && slot >= 1 && slot <= 3) idx = 3 + slot - 1;
+    return idx < 0 ? -1 : idx * (int64_t)kEncSlotRowsA;
+}
+
+/* The encoder's CausalConv3d: causal in time, reflect-padded in space, on bf16 rows. */
+static rad_op venc_conv(RadBuilder* b, int64_t M, int64_t cin, int64_t cout, int64_t k,
+                        rad_weight w, rad_weight bias, rad_buf x, rad_buf res, rad_buf y) {
+    if (!w || !bias) return 0;
+    const rad_op op = RAD_OP(b, "conv3d_ndhwc",
+                             RAD_PARAMS(RAD_RANGE("M", 1, M), RAD_INT("cin", cin),
+                                        RAD_INT("cout", cout), RAD_INT("k", k), RAD_INT("kt", k),
+                                        RAD_INT("causal", 1), RAD_INT("reflect", 1),
+                                        RAD_STR("dtype", "bf16")),
+                             RAD_WEIGHTS(w, bias));
+    return res ? rw(b, op, { x, res }, { y }) : rw(b, op, { x }, { y });
+}
+
+/* GroupNorm over a level's whole clip volume, then SiLU. */
+static rad_op venc_gn(RadBuilder* b, int64_t M, int64_t n, int64_t G, double eps, rad_weight w,
+                      rad_weight bias, rad_buf x, rad_buf y, rad_buf st) {
+    if (!w || !bias) return 0;
+    const rad_op op = RAD_OP(b, "group_norm",
+                             RAD_PARAMS(RAD_RANGE("M", 1, M), RAD_INT("n", n),
+                                        RAD_INT("groups", G), RAD_F64("eps", eps),
+                                        RAD_STR("act", "silu"), RAD_STR("dtype", "bf16")),
+                             RAD_WEIGHTS(w, bias));
+    return rw(b, op, { x, st }, { y, st });
+}
+
+/* The video VAE's encoder (AutoencoderKLMiniMaxH3), when the container carries it: pixels in
+ * 0..255 normalised to bf16, then the levels a clip at a time, at the geometry `enc_geom_d` gives
+ * each pass. */
+static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    Names& nm = m.nm;
+    /* Whether the container has it, as the vision tower asks (rad_block_vit.h). */
+    if (map_copy(b, nm.f("venc.cin.weight"), nm.ckpt("vae.encoder.conv_in.weight")) < 0)
+        return RAD_E_INVAL;
+    {
+        RadEncoding enc;
+        if (rad_weight_encoding(b, nm.f("venc.cin.weight"), &enc, nullptr, nullptr) != RAD_OK) {
+            fprintf(stderr, "radiance: minimaxh3: the container ships no video VAE encoder; "
+                            "declaring without it\n");
+            return RAD_OK;
+        }
+    }
+    const std::vector<double> dims = meta_list(meta, "vae.block_out_channels");
+    const std::vector<double> sds = meta_list(meta, "vae.spatial_downsample_factors");
+    const std::vector<double> tds = meta_list(meta, "vae.temporal_downsample_factors");
+    const double eps = rad_meta_getf(meta, "vae.norm_eps", 1e-6);
+    const int64_t G = rad_meta_geti(meta, "vae.norm_num_groups", 32);
+    if (dims.size() != 6 || sds.size() != 6 || tds.size() != 6 ||
+        rad_meta_geti(meta, "vae.layers_per_block", 2) != 2 ||
+        rad_meta_geti(meta, "vae.clip_length", kVaeClipLength) != kVaeClipLength ||
+        rad_meta_geti(meta, "vae.in_channels", 3) != 3 ||
+        rad_meta_geti(meta, "vae.latent_channels", kC) != kC ||
+        std::strcmp(rad_meta_gets(meta, "vae.spatial_padding_mode", "reflect"), "reflect") ||
+        G < 1 || eps <= 0.0) {
+        fprintf(stderr, "radiance: minimaxh3: the video VAE is not the released encoder (six "
+                        "levels of two blocks, 17-frame clips, reflect padding)\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    for (size_t i = 0; i < 6; ++i)
+        if ((int64_t)dims[i] % G || ((int64_t)sds[i] != 1 && (int64_t)sds[i] != 2) ||
+            ((int64_t)tds[i] != 1 && (int64_t)tds[i] != 2))
+            return RAD_E_UNSUPPORTED;
+    m.venc = true;
+    /* Read once a media, so they live in pinned host memory like the text encoder. */
+    const int acc = RAD_ACCESS_PER_REQUEST;
+    const int gv = kGrpVenc;
+    auto wt = [&](const char* dn, const char* src, std::initializer_list<int64_t> shape) {
+        return wcopy(b, dn, src, RAD_F32, shape, acc, gv);
+    };
+    /* The 3x3x3 convolutions' weights, bf16 as the implicit-GEMM kernel stores them. */
+    auto wb = [&](const char* dn, const char* src, std::initializer_list<int64_t> shape) {
+        return wcopy(b, dn, src, RAD_BF16, shape, acc, gv);
+    };
+    /* conv_in's and the k=1 convolutions', f32, read by a host kernel (kGrpVencH). */
+    auto wh = [&](const char* dn, const char* src, std::initializer_list<int64_t> shape) {
+        return wcopy(b, dn, src, RAD_F32, shape, acc, kGrpVencH);
+    };
+
+    /* Each level's frames, rows and rows a frame: a full clip at 256 x 256, or a frame of the
+     * canvas, whichever is more. */
+    int64_t tf[6], sd[6] = { 1, 1, 1, 1, 1, 1 }, R[6], PF[6];
+    tf[0] = kVaeClipLength;
+    for (int i = 1; i < 6; ++i) {
+        tf[i] = (tf[i - 1] + (int64_t)tds[i - 1] - 1) / (int64_t)tds[i - 1];
+        sd[i] = sd[i - 1] * (int64_t)sds[i - 1];
+    }
+    const int64_t HW = kEncMaxSide * kEncMaxSide;
+    for (int i = 0; i < 6; ++i) {
+        PF[i] = HW / (sd[i] * sd[i]);
+        R[i] = std::max(tf[i], (int64_t)kEncOneFrames) * PF[i];
+    }
+    const int64_t Rmax = R[0];
+
+    /* Pixels: f32 normalised, then bf16; the statistics every GroupNorm shares. */
+    std::vector<double> pm(3), pa(3);
+    for (int c = 0; c < 3; ++c) {
+        pm[(size_t)c] = 1.0 / (255.0 * kVaePixelStd[c]);
+        pa[(size_t)c] = -kVaePixelMean[c] / kVaePixelStd[c];
+    }
+    m.ve_pix_mul = join_list(pm);
+    m.ve_pix_add = join_list(pa);
+    std::vector<double> fm(kC), fa(kC);
+    for (int64_t c = 0; c < kC; ++c) {
+        fm[(size_t)c] = 1.0 / kVaeLatentsStd[c];
+        fa[(size_t)c] = -kVaeLatentsMean[c] / kVaeLatentsStd[c];
+    }
+    m.ve_fold_mul = join_list(fm);
+    m.ve_fold_add = join_list(fa);
+    m.b_epix32 = decl_b(b, nm.f("venc.pix32"), RAD_F32, { Rmax, 3 });
+    m.b_epix = decl_b(b, nm.f("venc.pix"), RAD_BF16, { Rmax, 3 });
+    m.b_egn = decl_b(b, nm.f("venc.gn"), RAD_F32, { G * (2 + 3 * 1024) });
+    const rad_buf st = m.b_egn;
+    /* The tiled encode's two planes and the quant_conv are declared ahead of the trunk, and the
+     * tiled ops last. The arena packs by declared lifetime (core/build/rad_bufplan.cpp), and the
+     * tiled pass reruns the whole trunk once a tile while `b_vtile` holds every tile's pixels and
+     * `b_eqt` the finished tiles' moments, so both lifetimes must span the trunk's ops (from
+     * op_ve_pix's and op_ve_q's use to op_vt_crop and op_vt_join). */
+    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.tiles, 22 }, RAD_BUF_PERSIST);
+    m.b_vtile = decl_b(b, nm.f("venc.vtile"), RAD_F32,
+                       { m.tiles * (int64_t)kEncMaxSide * kEncMaxSide, 3 });
+    m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 });
+    m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 });
+    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.tiles * (int64_t)kTile * kTile, 48 });
+    m.ve_qw = wh(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
+    m.ve_qb = wh(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
+    /* The whole-canvas pass writes b_eq2; the tiled pass writes a tile's slice of b_eqt, which
+     * op_vt_join blends into b_eq2. */
+    m.op_ve_q = rw(b, RAD_OP(b, "conv3d_ndhwc",
+                             RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("cin", 48),
+                                        RAD_INT("cout", 48), RAD_INT("k", 1), RAD_INT("kt", 1),
+                                        RAD_STR("dtype", "bf16")),
+                             RAD_WEIGHTS(m.ve_qw, m.ve_qb)),
+                   { m.b_eq48 }, { m.b_eq2, m.b_eqt });
+    if (!m.op_ve_q) return RAD_E_INVAL;
+    m.op_ve_pix = rw(b, RAD_OP(b, "chan_affine",
+                               RAD_PARAMS(RAD_RANGE("M", 1, Rmax), RAD_INT("n", 3),
+                                          RAD_STR("mul", m.ve_pix_mul.c_str()),
+                                          RAD_STR("add", m.ve_pix_add.c_str()),
+                                          RAD_STR("mode", "fma"), RAD_INT("round", 0),
+                                          RAD_STR("dtype", "f32")),
+                               RAD_NOWEIGHTS),
+                     { m.b_vtile }, { m.b_epix32 });
+    m.op_ve_pcast = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, Rmax), RAD_INT("n", 3),
+                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                                 RAD_NOWEIGHTS),
+                       { m.b_epix32 }, { m.b_epix });
+    /* Mapped by the presence check above. */
+    m.ve_cinw = decl_w(b, nm.f("venc.cin.weight"), RAD_F32, { (int64_t)dims[0], 3, 3, 3, 3 },
+                       acc, RAD_SHARD_NONE, grp_layer(kGrpVencH));
+    m.ve_cinb = wh(nm.f("venc.cin.bias"), nm.ckpt("vae.encoder.conv_in.bias"), { (int64_t)dims[0] });
+    if (!m.op_ve_pix || !m.op_ve_pcast) return RAD_E_INVAL;
+    m.v_lv.reserve(6);
+    for (int L = 0; L < 6; ++L) {
+        m.v_lv.emplace_back();
+        Model::VEncLevel& E = m.v_lv.back();
+        const int64_t cout = (int64_t)dims[L], cin = L == 0 ? cout : (int64_t)dims[L - 1];
+        const bool sc = L > 0 && cout != cin;
+        E.cin = cin, E.cout = cout, E.rows = R[L], E.pf = PF[L], E.frames = tf[L];
+        E.a = decl_b(b, nm.f("venc.l%d.a", L), RAD_BF16, { R[L], cout });
+        E.b = decl_b(b, nm.f("venc.l%d.b", L), RAD_BF16, { R[L], cout });
+        E.c = decl_b(b, nm.f("venc.l%d.c", L), RAD_BF16, { R[L], cout });
+        /* A level that changes the width takes its input in a buffer of that width, which the
+         * downsampler before it writes, or which is the level before's stream where there is
+         * none. */
+        if (sc) {
+            const bool dn_in = (int64_t)sds[L - 1] == 2 || (int64_t)tds[L - 1] == 2;
+            E.in = dn_in ? decl_b(b, nm.f("venc.l%d.in", L), RAD_BF16, { R[L], cin })
+                         : m.v_lv[(size_t)L - 1].a;
+            const char* sc_src = nm.ckpt("vae.encoder.down_blocks.%d.resnets.0.conv_shortcut", L);
+            E.scw = wh(nm.f("venc.l%d.sc.weight", L), nm.ckpt("%s.weight", sc_src),
+                       { cout, cin, 1, 1, 1 });
+            E.scb = wh(nm.f("venc.l%d.sc.bias", L), nm.ckpt("%s.bias", sc_src), { cout });
+            if (!E.scw || !E.scb) return RAD_E_INVAL;
+            E.op_sc = rw(b, RAD_OP(b, "conv3d_ndhwc",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R[L]), RAD_INT("cin", cin),
+                                              RAD_INT("cout", cout), RAD_INT("k", 1),
+                                              RAD_INT("kt", 1), RAD_STR("dtype", "bf16")),
+                                   RAD_WEIGHTS(E.scw, E.scb)),
+                         { E.in }, { E.a });
+            if (!E.op_sc) return RAD_E_INVAL;
+        }
+        for (int blk = 0; blk < 2; ++blk) {
+            Model::VEncBlock& B = E.blk[blk];
+            const char* bs = nm.ckpt("vae.encoder.down_blocks.%d.resnets.%d", L, blk);
+            /* norm1 at the block's input width: a widening level's first block normalises `in`
+             * in place. */
+            const int64_t w1 = blk == 0 && sc ? cin : cout;
+            const rad_buf xa = blk == 0 && sc ? E.in : E.a;
+            const rad_buf nb = blk == 0 && sc ? E.in : E.b;
+            B.n1w = wt(nm.f("venc.l%d.b%d.n1w", L, blk), nm.ckpt("%s.norm1.weight", bs), { w1 });
+            B.n1b = wt(nm.f("venc.l%d.b%d.n1b", L, blk), nm.ckpt("%s.norm1.bias", bs), { w1 });
+            B.c1w = wb(nm.f("venc.l%d.b%d.c1w", L, blk), nm.ckpt("%s.conv1.weight", bs), { cout, w1, 3, 3, 3 });
+            B.c1b = wt(nm.f("venc.l%d.b%d.c1b", L, blk), nm.ckpt("%s.conv1.bias", bs), { cout });
+            B.n2w = wt(nm.f("venc.l%d.b%d.n2w", L, blk), nm.ckpt("%s.norm2.weight", bs), { cout });
+            B.n2b = wt(nm.f("venc.l%d.b%d.n2b", L, blk), nm.ckpt("%s.norm2.bias", bs), { cout });
+            B.c2w = wb(nm.f("venc.l%d.b%d.c2w", L, blk), nm.ckpt("%s.conv2.weight", bs), { cout, cout, 3, 3, 3 });
+            B.c2b = wt(nm.f("venc.l%d.b%d.c2b", L, blk), nm.ckpt("%s.conv2.bias", bs), { cout });
+            if (!B.n1w || !B.n1b || !B.c1w || !B.c1b || !B.n2w || !B.n2b || !B.c2w || !B.c2b)
+                return RAD_E_INVAL;
+            B.op_n1 = venc_gn(b, R[L], w1, G, eps, B.n1w, B.n1b, xa, nb, st);
+            B.op_c1 = venc_conv(b, R[L], w1, cout, 3, B.c1w, B.c1b, nb, 0, E.c);
+            B.op_n2 = venc_gn(b, R[L], cout, G, eps, B.n2w, B.n2b, E.c, E.b, st);
+            B.op_c2 = venc_conv(b, R[L], cout, cout, 3, B.c2w, B.c2b, E.b, E.a, E.a);
+            if (!B.op_n1 || !B.op_c1 || !B.op_n2 || !B.op_c2) return RAD_E_INVAL;
+        }
+    }
+    /* conv_in, into level 0. */
+    m.op_ve_cin = venc_conv(b, Rmax, 3, (int64_t)dims[0], 3, m.ve_cinw, m.ve_cinb, m.b_epix, 0,
+                            m.v_lv[0].a);
+    if (!m.op_ve_cin) return RAD_E_INVAL;
+
+    /* The downsamplers after the first four levels (Downsample3D): padded below and right,
+     * strided in space and, where the config says, in time. */
+    for (int L = 0; L < 4; ++L) {
+        Model::VEncLevel& E = m.v_lv[(size_t)L];
+        Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
+        const char* bs = nm.ckpt("vae.encoder.down_blocks.%d.downsamplers.0.conv", L);
+        E.dnw = wb(nm.f("venc.l%d.dnw", L), nm.ckpt("%s.weight", bs), { E.cout, E.cout, 3, 3, 3 });
+        E.dnb = wt(nm.f("venc.l%d.dnb", L), nm.ckpt("%s.bias", bs), { E.cout });
+        if (!E.dnw || !E.dnb) return RAD_E_INVAL;
+        const rad_op op = RAD_OP(b, "conv3d_ndhwc",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, E.rows), RAD_INT("cin", E.cout),
+                                            RAD_INT("cout", E.cout), RAD_INT("k", 3),
+                                            RAD_INT("kt", 3), RAD_INT("stride", (int64_t)sds[L]),
+                                            RAD_INT("stride_t", (int64_t)tds[L]),
+                                            RAD_INT("causal", 1), RAD_STR("pad", "down"),
+                                            RAD_INT("reflect", 1), RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(E.dnw, E.dnb));
+        rad_buf y = X.op_sc ? X.in : X.a;
+        E.op_dn = rw(b, op, { E.a }, { y });
+        if (!E.op_dn) return RAD_E_INVAL;
+    }
+
+    /* norm_out, conv_out and quant_conv, then the fold of the means, the first 24 of the 48
+     * columns, normalised into patch rows of 96. */
+    m.ve_now = wt(nm.f("venc.nout.weight"), nm.ckpt("vae.encoder.norm_out.weight"),
+                  { (int64_t)dims[5] });
+    m.ve_nob = wt(nm.f("venc.nout.bias"), nm.ckpt("vae.encoder.norm_out.bias"), { (int64_t)dims[5] });
+    m.op_ve_nout = venc_gn(b, R[5], (int64_t)dims[5], G, eps, m.ve_now, m.ve_nob, m.v_lv[5].a,
+                           m.v_lv[5].b, st);
+    m.ve_coutw = wb(nm.f("venc.cout.weight"), nm.ckpt("vae.encoder.conv_out.weight"),
+                    { 48, (int64_t)dims[5], 3, 3, 3 });
+    m.ve_coutb = wt(nm.f("venc.cout.bias"), nm.ckpt("vae.encoder.conv_out.bias"), { 48 });
+    m.op_ve_cout = venc_conv(b, R[5], (int64_t)dims[5], 48, 3, m.ve_coutw, m.ve_coutb,
+                             m.v_lv[5].b, 0, m.b_eq48);
+    m.b_evc = decl_b(b, nm.f("lane.evc"), RAD_F32,
+                     { (int64_t)kEncSlotsV * kEncSlotRowsV, kPatchVals }, RAD_BUF_PERSIST);
+    m.op_ve_fold = rw(b, RAD_OP(b, "patch_fold",
+                                RAD_PARAMS(RAD_RANGE("M", 1, kEncSlotRowsV), RAD_INT("C", kC),
+                                           RAD_INT("pt", 1), RAD_INT("ph", kPatch),
+                                           RAD_INT("pw", kPatch),
+                                           RAD_STR("mul", m.ve_fold_mul.c_str()),
+                                           RAD_STR("add", m.ve_fold_add.c_str()),
+                                           RAD_STR("dtype", "f32")),
+                                RAD_NOWEIGHTS),
+                      { m.b_eq2 }, { m.b_evc });
+    /* ComfyUI blends every visual condition's latents with noise, a r + (1 - a) z at a = 0.999
+     * (_cond_video_rows); its audio conditions take none. z is stream 2 of the request's seed,
+     * restarted at each item, as ComfyUI reseeds each. */
+    m.op_eaug = rw(b, RAD_OP(b, "cond_aug",
+                             RAD_PARAMS(RAD_RANGE("M", 1, kEncSlotRowsV), RAD_INT("n", kPatchVals),
+                                        RAD_INT("stream", 2), RAD_F64("aug", 0.999),
+                                        RAD_STR("dtype", "f32")),
+                             RAD_NOWEIGHTS),
+                   { m.b_evc }, { m.b_evc });
+    if (!m.op_ve_nout || !m.op_ve_cout || !m.op_ve_q || !m.op_ve_fold || !m.op_eaug)
+        return RAD_E_INVAL;
+    /* The tiled encode's ops, declared last: b_vtile and b_eqt then live across the whole trunk,
+     * which the tiled pass runs once a tile, so no trunk buffer shares their bytes. */
+    m.op_vt_plan = rw(b, RAD_OP(b, "vtile_plan",
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles), RAD_INT("tile", kTile),
+                                           RAD_INT("overlap", kOverlap),
+                                           RAD_INT("ratio", kVaeRatio)),
+                                RAD_NOWEIGHTS),
+                     {}, { m.b_tplan });
+    m.op_vt_crop = rw(b, RAD_OP(b, "vtile_crop",
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles * (int64_t)kEncMaxSide * kEncMaxSide),
+                                           RAD_INT("tile", kTile), RAD_INT("overlap", kOverlap),
+                                           RAD_INT("ratio", kVaeRatio), RAD_STR("dtype", "f32")),
+                                RAD_NOWEIGHTS),
+                     {}, { m.b_vtile });
+    m.op_vt_join = rw(b, RAD_OP(b, "vtile_join",
+                                RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("tile", kTile),
+                                           RAD_INT("overlap", kOverlap), RAD_INT("n", 48),
+                                           RAD_STR("dtype", "bf16")),
+                                RAD_NOWEIGHTS),
+                     { m.b_eqt }, { m.b_eq2 });
+    if (!m.op_vt_plan || !m.op_vt_crop || !m.op_vt_join) return RAD_E_INVAL;
+    return RAD_OK;
+}
+
+/* The audio VAE's encoder (audio_vae.py's Encoder and AttnProjection), when the container
+ * carries it, a channel at a time; the weight norms are folded at convert. */
+static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    Names& nm = m.nm;
+    if (map_copy(b, nm.f("aenc.mp.weight"), nm.ckpt("audio_vae.mean_proj.weight")) < 0)
+        return RAD_E_INVAL;
+    {
+        RadEncoding enc;
+        if (rad_weight_encoding(b, nm.f("aenc.mp.weight"), &enc, nullptr, nullptr) != RAD_OK) {
+            fprintf(stderr, "radiance: minimaxh3: the container ships no audio VAE encoder; "
+                            "declaring without it\n");
+            return RAD_OK;
+        }
+    }
+    const std::vector<double> rates = meta_list(meta, "audio_vae.encoder_rates");
+    const int64_t ld = rad_meta_geti(meta, "audio_vae.latent_dim", 2048);
+    const std::vector<double> mean = meta_list(meta, "audio_vae.latents_mean");
+    const std::vector<double> sd = meta_list(meta, "audio_vae.latents_std");
+    const int64_t heads = rad_meta_geti(meta, "audio_vae.num_attention_heads", 8);
+    if (rates.size() != 5 || ld != 2048 || (int64_t)mean.size() != kAudioC ||
+        (int64_t)sd.size() != kAudioC || heads != 8 ||
+        rad_meta_geti(meta, "audio_vae.encoder_dim", 64) != 64 ||
+        rad_meta_geti(meta, "audio_vae.latent_channels", kAudioC) != kAudioC) {
+        fprintf(stderr, "radiance: minimaxh3: the audio VAE is not the released encoder (five "
+                        "strides to 800 samples a latent, eight attention heads)\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    m.aenc = true;
+    /* Read once a media, as the video encoder's. */
+    const int acc = RAD_ACCESS_PER_REQUEST;
+    const int ga = kGrpAenc;
+    /* The snake alphas: `snake` in f32 is a host kernel (kGrpVencH). */
+    const int gh = kGrpAencH;
+    static const int64_t kStr[5] = { 2, 4, 4, 5, 5 };
+    for (int i = 0; i < 5; ++i)
+        if ((int64_t)rates[(size_t)i] != kStr[i]) return RAD_E_UNSUPPORTED;
+    int64_t nn[6], uu[5];
+    nn[0] = kEncMaxSamples;
+    for (int i = 0; i < 5; ++i) nn[i + 1] = nn[i] / kStr[i];
+    for (int i = 0; i < 5; ++i) uu[i] = 64 << i;
+    const int64_t hd = ld / 8;                 /* a head's width */
+
+    /* The latents' normalisation, the chain's last op. */
+    std::vector<double> nm_(kAudioC), na(kAudioC);
+    for (int64_t c = 0; c < kAudioC; ++c) {
+        nm_[(size_t)c] = 1.0 / sd[(size_t)c];
+        na[(size_t)c] = -mean[(size_t)c] / sd[(size_t)c];
+    }
+    m.ae_norm_mul = join_list(nm_);
+    m.ae_norm_add = join_list(na);
+
+    /* conv_in: a sample a row. */
+    const char* bs = nm.ckpt("audio_vae.encoder.block.0");
+    RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.cin.weight"), nm.ckpt("%s.weight_g", bs),
+                           nm.ckpt("%s.weight_v", bs)));
+    m.ae_cinw = decl_w(b, nm.f("aenc.cin.weight"), RAD_F32, { 64, 1, 7 }, acc, RAD_SHARD_NONE,
+                       grp_layer(ga));
+    m.ae_cinb = wcopy(b, nm.f("aenc.cin.bias"), nm.ckpt("%s.bias", bs), RAD_F32, { 64 }, acc, ga);
+    m.b_ax[0] = decl_b(b, nm.f("aenc.x0"), RAD_F32, { nn[0], 64 });
+    if (!m.ae_cinw || !m.ae_cinb || !m.b_ax[0]) return RAD_E_INVAL;
+    m.op_ae_cin = rw(b, RAD_OP(b, "conv1d",
+                               RAD_PARAMS(RAD_RANGE("M", 1, nn[0]), RAD_INT("cin", 1),
+                                          RAD_INT("cout", 64), RAD_INT("k", 7), RAD_INT("dil", 1),
+                                          RAD_STR("act", "none"), RAD_STR("dtype", "f32")),
+                               RAD_WEIGHTS(m.ae_cinw, m.ae_cinb)),
+                     {}, { m.b_ax[0] });
+    if (!m.op_ae_cin) return RAD_E_INVAL;
+
+    for (int blk = 0; blk < 5; ++blk) {
+        Model::AEncBlk& A = m.ae_blk[blk];
+        const int64_t u = uu[blk], d = u * 2, np = nn[blk], no = nn[blk + 1];
+        const int64_t s = kStr[blk];
+        m.b_et1[blk] = decl_b(b, nm.f("aenc.t1_%d", blk), RAD_F32, { np, u });
+        m.b_et2[blk] = decl_b(b, nm.f("aenc.t2_%d", blk), RAD_F32, { np, u });
+        m.b_ax[blk + 1] = decl_b(b, nm.f("aenc.x%d", blk + 1), RAD_F32, { no, d });
+        A.bi = decl_b(b, nm.f("aenc.bf1_%d", blk), RAD_BF16, { np, u });
+        A.bo = decl_b(b, nm.f("aenc.bf2_%d", blk), RAD_BF16, { no, d });
+        if (!m.b_et1[blk] || !m.b_et2[blk] || !m.b_ax[blk + 1] || !A.bi || !A.bo)
+            return RAD_E_INVAL;
+        const int64_t R = np;
+        /* Three units: snake, conv k7, snake, conv k1 with the residual. */
+        for (int r = 0; r < 3; ++r) {
+            Model::AEncUnit& U = A.u[r];
+            const char* us = nm.ckpt("audio_vae.encoder.block.%d.block.%d.block", blk + 1, r);
+            U.a1 = wcopy(b, nm.f("aenc.b%d.u%d.a1", blk, r), nm.ckpt("%s.0.alpha", us), RAD_F32,
+                         { u }, acc, gh);
+            if (!U.a1) return RAD_E_INVAL;
+            U.op_a1 = rw(b, RAD_OP(b, "snake",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", u),
+                                              RAD_STR("dtype", "f32")),
+                                   RAD_WEIGHTS(U.a1)),
+                         { m.b_ax[blk] }, { m.b_et1[blk] });
+            RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.b%d.u%d.c1.weight", blk, r),
+                                   nm.ckpt("%s.1.weight_g", us), nm.ckpt("%s.1.weight_v", us)));
+            U.c1w = decl_w(b, nm.f("aenc.b%d.u%d.c1.weight", blk, r), RAD_F32, { u, u, 7 }, acc,
+                           RAD_SHARD_NONE, grp_layer(ga));
+            U.c1b = wcopy(b, nm.f("aenc.b%d.u%d.c1.bias", blk, r), nm.ckpt("%s.1.bias", us),
+                          RAD_F32, { u }, acc, ga);
+            if (!U.c1w || !U.c1b) return RAD_E_INVAL;
+            U.op_c1 = rw(b, RAD_OP(b, "conv1d",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("cin", u),
+                                              RAD_INT("cout", u), RAD_INT("k", 7),
+                                              RAD_INT("dil", 2 * r + 1), RAD_STR("act", "none"),
+                                              RAD_STR("dtype", "f32")),
+                                   RAD_WEIGHTS(U.c1w, U.c1b)),
+                         { m.b_et1[blk] }, { m.b_et2[blk] });
+            U.a2 = wcopy(b, nm.f("aenc.b%d.u%d.a2", blk, r), nm.ckpt("%s.2.alpha", us), RAD_F32,
+                         { u }, acc, gh);
+            if (!U.a2) return RAD_E_INVAL;
+            U.op_a2 = rw(b, RAD_OP(b, "snake",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", u),
+                                              RAD_STR("dtype", "f32")),
+                                   RAD_WEIGHTS(U.a2)),
+                         { m.b_et2[blk] }, { m.b_et1[blk] });
+            RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.b%d.u%d.c2.weight", blk, r),
+                                   nm.ckpt("%s.3.weight_g", us), nm.ckpt("%s.3.weight_v", us)));
+            U.c2w = decl_w(b, nm.f("aenc.b%d.u%d.c2.weight", blk, r), RAD_F32, { u, u, 1 }, acc,
+                           RAD_SHARD_NONE, grp_layer(ga));
+            U.c2b = wcopy(b, nm.f("aenc.b%d.u%d.c2.bias", blk, r), nm.ckpt("%s.3.bias", us),
+                          RAD_F32, { u }, acc, ga);
+            if (!U.c2w || !U.c2b) return RAD_E_INVAL;
+            U.op_c2 = rw(b, RAD_OP(b, "conv1d",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("cin", u),
+                                              RAD_INT("cout", u), RAD_INT("k", 1),
+                                              RAD_INT("dil", 1), RAD_STR("act", "none"),
+                                              RAD_STR("dtype", "f32")),
+                                   RAD_WEIGHTS(U.c2w, U.c2b)),
+                         { m.b_et1[blk], m.b_ax[blk] }, { m.b_ax[blk] });
+            if (!U.op_a1 || !U.op_c1 || !U.op_a2 || !U.op_c2) return RAD_E_INVAL;
+        }
+        /* The block's last snake, then the strided convolution in bf16. */
+        const char* ds = nm.ckpt("audio_vae.encoder.block.%d.block", blk + 1);
+        A.al = wcopy(b, nm.f("aenc.b%d.al", blk), nm.ckpt("%s.3.alpha", ds), RAD_F32, { u }, acc,
+                     gh);
+        if (!A.al) return RAD_E_INVAL;
+        A.op_al = rw(b, RAD_OP(b, "snake",
+                               RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", u),
+                                          RAD_STR("dtype", "f32")),
+                               RAD_WEIGHTS(A.al)),
+                     { m.b_ax[blk] }, { m.b_et1[blk] });
+        A.op_ci = rw(b, RAD_OP(b, "cast",
+                               RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", u),
+                                          RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                               RAD_NOWEIGHTS),
+                     { m.b_et1[blk] }, { A.bi });
+        RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.d%d.w", blk), nm.ckpt("%s.4.weight_g", ds),
+                               nm.ckpt("%s.4.weight_v", ds)));
+        A.dnw = decl_w(b, nm.f("aenc.d%d.w", blk), RAD_BF16, { d, u, 2 * s }, acc, RAD_SHARD_NONE,
+                       grp_layer(ga));
+        RAD_ARCH_TRY(map_copy(b, nm.f("aenc.d%d.b", blk), nm.ckpt("%s.4.bias", ds)));
+        A.dnb = decl_w(b, nm.f("aenc.d%d.b", blk), RAD_BF16, { d }, acc, RAD_SHARD_NONE,
+                       grp_layer(ga));
+        if (!A.dnw || !A.dnb) return RAD_E_INVAL;
+        A.op_dn = rw(b, RAD_OP(b, "conv1d",
+                               RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("cin", u),
+                                          RAD_INT("cout", d), RAD_INT("k", 2 * s),
+                                          RAD_INT("dil", 1), RAD_INT("stride", s),
+                                          RAD_INT("pad", (s + 1) / 2), RAD_STR("act", "none"),
+                                          RAD_STR("dtype", "bf16")),
+                               RAD_WEIGHTS(A.dnw, A.dnb)),
+                     { A.bi }, { A.bo });
+        A.op_co = rw(b, RAD_OP(b, "cast",
+                               RAD_PARAMS(RAD_RANGE("M", 1, no), RAD_INT("n", d),
+                                          RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                               RAD_NOWEIGHTS),
+                     { A.bo }, { m.b_ax[blk + 1] });
+        if (!A.op_al || !A.op_ci || !A.op_dn || !A.op_co) return RAD_E_INVAL;
+    }
+
+    /* The last snake and convolution, then the attention block. */
+    const int64_t T = nn[5];
+    const char* f6 = nm.ckpt("audio_vae.encoder.block.6");
+    const char* f7 = nm.ckpt("audio_vae.encoder.block.7");
+    m.ae_al6 = wcopy(b, nm.f("aenc.al6"), nm.ckpt("%s.alpha", f6), RAD_F32, { ld }, acc, gh);
+    RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.fin.weight"), nm.ckpt("%s.weight_g", f7),
+                           nm.ckpt("%s.weight_v", f7)));
+    m.ae_finw = decl_w(b, nm.f("aenc.fin.weight"), RAD_F32, { ld, ld, 3 }, acc, RAD_SHARD_NONE,
+                       grp_layer(ga));
+    m.ae_finb = wcopy(b, nm.f("aenc.fin.bias"), nm.ckpt("%s.bias", f7), RAD_F32, { ld }, acc, ga);
+    m.b_a6t = decl_b(b, nm.f("aenc.snk6"), RAD_F32, { T, ld });
+    m.b_ax6 = decl_b(b, nm.f("aenc.x6"), RAD_F32, { T, ld });
+    if (!m.ae_al6 || !m.ae_finw || !m.ae_finb || !m.b_a6t || !m.b_ax6) return RAD_E_INVAL;
+    m.op_ae_snk6 = rw(b, RAD_OP(b, "snake",
+                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", ld),
+                                           RAD_STR("dtype", "f32")),
+                                RAD_WEIGHTS(m.ae_al6)),
+                      { m.b_ax[5] }, { m.b_a6t });
+    m.op_ae_fin = rw(b, RAD_OP(b, "conv1d",
+                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("cin", ld),
+                                          RAD_INT("cout", ld), RAD_INT("k", 3), RAD_INT("dil", 1),
+                                          RAD_STR("act", "none"), RAD_STR("dtype", "f32")),
+                               RAD_WEIGHTS(m.ae_finw, m.ae_finb)),
+                     { m.b_a6t }, { m.b_ax6 });
+    if (!m.op_ae_snk6 || !m.op_ae_fin) return RAD_E_INVAL;
+
+    /* The attention block, bf16: LayerNorms over the 2048-wide stream, qkv (the checkpoint's q,
+     * zero k and v biases joined), eight causal heads averaged, pooled to 32 and projected; then
+     * the gated MLP. */
+    const char* pb = nm.ckpt("audio_vae.pre_block");
+    auto pw_ = [&](const char* dn, const char* src, uint32_t dt,
+                   std::initializer_list<int64_t> shape) {
+        return wcopy(b, nm.f("aenc.pb.%s", dn), nm.ckpt("%s.%s", pb, src), dt, shape, acc, ga);
+    };
+    m.p_ln1w = pw_("ln1w", "norm1.weight", RAD_BF16, { ld });
+    m.p_ln1b = pw_("ln1b", "norm1.bias", RAD_BF16, { ld });
+    m.p_ln3w = pw_("ln3w", "norm3.weight", RAD_BF16, { ld });
+    m.p_ln3b = pw_("ln3b", "norm3.bias", RAD_BF16, { ld });
+    m.p_ln2w = pw_("ln2w", "norm2.weight", RAD_BF16, { kAudioC });
+    m.p_ln2b = pw_("ln2b", "norm2.bias", RAD_BF16, { kAudioC });
+    m.p_mlw = pw_("mlnw", "mlp.norm.weight", RAD_BF16, { kAudioC });
+    m.p_mlb = pw_("mlnb", "mlp.norm.bias", RAD_BF16, { kAudioC });
+    m.p_prw = pw_("prw", "proj.weight", RAD_BF16, { kAudioC, ld });
+    m.p_prb = pw_("prb", "proj.bias", RAD_BF16, { kAudioC });
+    m.p_apw = pw_("apw", "attn.proj.weight", RAD_BF16, { kAudioC, kAudioC });
+    m.p_apb = pw_("apb", "attn.proj.bias", RAD_BF16, { kAudioC });
+    m.p_w2w = pw_("w2w", "mlp.w2.weight", RAD_BF16, { kAudioC, 2 * kAudioC });
+    m.p_w2b = pw_("w2b", "mlp.w2.bias", RAD_BF16, { kAudioC });
+    if (!m.p_ln1w || !m.p_ln1b || !m.p_ln3w || !m.p_ln3b || !m.p_ln2w || !m.p_ln2b ||
+        !m.p_mlw || !m.p_mlb || !m.p_prw || !m.p_prb || !m.p_apw || !m.p_apb || !m.p_w2w ||
+        !m.p_w2b)
+        return RAD_E_INVAL;
+    RAD_ARCH_TRY(map_copy(b, nm.f("aenc.pb.qkvw"), nm.ckpt("%s.attn.qkv.weight", pb)));
+    m.p_qkvw = decl_w(b, nm.f("aenc.pb.qkvw"), RAD_BF16, { 3 * ld, ld }, acc, RAD_SHARD_NONE,
+                      grp_layer(ga));
+    RAD_ARCH_TRY(map_concat(b, nm.f("aenc.pb.qkvb"),
+                            { nm.ckpt("%s.attn.q_bias", pb), nm.ckpt("%s.attn.zero_k_bias", pb),
+                              nm.ckpt("%s.attn.v_bias", pb) }));
+    m.p_qkvb = decl_w(b, nm.f("aenc.pb.qkvb"), RAD_BF16, { 3 * ld }, acc, RAD_SHARD_NONE,
+                      grp_layer(ga));
+    /* w0 (the gate) then w1, as gelu_mul splits them. */
+    RAD_ARCH_TRY(map_concat(b, nm.f("aenc.pb.guw"),
+                            { nm.ckpt("%s.mlp.w0.weight", pb), nm.ckpt("%s.mlp.w1.weight", pb) }));
+    m.p_guw = decl_w(b, nm.f("aenc.pb.guw"), RAD_BF16, { 2 * kAudioC * 2, kAudioC }, acc,
+                     RAD_SHARD_NONE, grp_layer(ga));
+    RAD_ARCH_TRY(map_concat(b, nm.f("aenc.pb.gub"),
+                            { nm.ckpt("%s.mlp.w0.bias", pb), nm.ckpt("%s.mlp.w1.bias", pb) }));
+    m.p_gub = decl_w(b, nm.f("aenc.pb.gub"), RAD_BF16, { 2 * kAudioC * 2 }, acc, RAD_SHARD_NONE,
+                     grp_layer(ga));
+    if (!m.p_qkvw || !m.p_qkvb || !m.p_guw || !m.p_gub) return RAD_E_INVAL;
+
+    m.b_apb = decl_b(b, nm.f("aenc.pb"), RAD_BF16, { T, ld });
+    m.b_aln3 = decl_b(b, nm.f("aenc.ln3"), RAD_BF16, { T, ld });
+    m.b_aqkv = decl_b(b, nm.f("aenc.qkv"), RAD_BF16, { T, 3 * ld });
+    m.b_aatt = decl_b(b, nm.f("aenc.att"), RAD_BF16, { T, hd });
+    m.b_ahsum = decl_b(b, nm.f("aenc.hsum"), RAD_BF16, { T, hd });
+    m.b_apool = decl_b(b, nm.f("aenc.pool"), RAD_BF16, { T, kAudioC });
+    m.b_eh = decl_b(b, nm.f("aenc.h"), RAD_BF16, { T, kAudioC });
+    m.b_a32a = decl_b(b, nm.f("aenc.r32a"), RAD_BF16, { T, kAudioC });
+    m.b_a32b = decl_b(b, nm.f("aenc.r32b"), RAD_BF16, { T, kAudioC });
+    m.b_a32c = decl_b(b, nm.f("aenc.r32c"), RAD_BF16, { T, kAudioC });
+    m.b_a32d = decl_b(b, nm.f("aenc.r32d"), RAD_BF16, { T, kAudioC });
+    m.b_agu = decl_b(b, nm.f("aenc.gu"), RAD_BF16, { T, 4 * kAudioC });
+    m.b_agu64 = decl_b(b, nm.f("aenc.gu64"), RAD_BF16, { T, 2 * kAudioC });
+    m.b_ax2 = decl_b(b, nm.f("aenc.xfin"), RAD_BF16, { T, kAudioC });
+    m.b_amb = decl_b(b, nm.f("aenc.mono"), RAD_F32, { T, kAudioC });
+    m.b_amb2 = decl_b(b, nm.f("aenc.mp"), RAD_F32, { T, kAudioC });
+    m.op_ae_cast6 = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", ld),
+                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                                 RAD_NOWEIGHTS),
+                       { m.b_ax6 }, { m.b_apb });
+    if (!m.op_ae_cast6) return RAD_E_INVAL;
+    auto ln = [&](rad_weight w, rad_weight b2, int64_t n, rad_buf x, rad_buf y) -> rad_op {
+        if (!w || !b2) return 0;
+        return rw(b, RAD_OP(b, "layernorm",
+                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", n),
+                                       RAD_F64("eps", 1e-5), RAD_STR("dtype", "bf16")),
+                            RAD_WEIGHTS(w, b2)),
+                  { x }, { y });
+    };
+    auto gemm = [&](rad_weight w, rad_weight b2, int64_t N, int64_t K, rad_buf x,
+                    rad_buf y) -> rad_op {
+        if (!w || !b2) return 0;
+        return rw(b, RAD_OP(b, "gemm_nt_bias",
+                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("N", N), RAD_INT("K", K),
+                                       RAD_STR("dtype", "bf16")),
+                            RAD_WEIGHTS(w, b2)),
+                  { x }, { y });
+    };
+    m.p_op_ln3 = ln(m.p_ln3w, m.p_ln3b, ld, m.b_apb, m.b_aln3);
+    m.p_op_qkv = gemm(m.p_qkvw, m.p_qkvb, 3 * ld, ld, m.b_aln3, m.b_aqkv);
+    m.p_op_attn = rw(b, RAD_OP(b, "attn_dense",
+                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
+                                          RAD_INT("gqa", 1), RAD_INT("causal", 1),
+                                          RAD_STR("dtype", "bf16"),
+                                          RAD_F64("scale", 1.0 / std::sqrt((double)hd)),
+                                          RAD_INT("max_seqlen", T)),
+                               RAD_NOWEIGHTS),
+                     /* The first head writes b_ahsum, the others b_aatt: both are outputs. */
+                     { m.b_aqkv }, { m.b_aatt, m.b_ahsum });
+    m.p_op_pool = rw(b, RAD_OP(b, "pool_cols",
+                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", hd),
+                                          RAD_INT("k", hd / kAudioC), RAD_STR("dtype", "bf16")),
+                               RAD_NOWEIGHTS),
+                     { m.b_ahsum }, { m.b_apool });
+    m.p_op_aproj = gemm(m.p_apw, m.p_apb, kAudioC, kAudioC, m.b_apool, m.b_a32a);
+    m.p_op_ln1 = ln(m.p_ln1w, m.p_ln1b, ld, m.b_apb, m.b_aln3);
+    m.p_op_proj = gemm(m.p_prw, m.p_prb, kAudioC, ld, m.b_aln3, m.b_eh);
+    m.p_op_hadd = add_op(b, T, kAudioC, "bf16", m.b_eh, m.b_a32a, m.b_a32b);
+    m.p_op_ln2 = ln(m.p_ln2w, m.p_ln2b, kAudioC, m.b_a32b, m.b_a32c);
+    m.p_op_mln = ln(m.p_mlw, m.p_mlb, kAudioC, m.b_a32c, m.b_a32d);
+    m.p_op_gu = gemm(m.p_guw, m.p_gub, 4 * kAudioC, kAudioC, m.b_a32d, m.b_agu);
+    m.p_op_act = rw(b, RAD_OP(b, "gelu_mul",
+                              RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", 2 * kAudioC),
+                                         RAD_STR("dtype", "bf16")),
+                              RAD_NOWEIGHTS),
+                    { m.b_agu }, { m.b_agu64 });
+    m.p_op_w2 = gemm(m.p_w2w, m.p_w2b, kAudioC, 2 * kAudioC, m.b_agu64, m.b_a32c);
+    m.p_op_xadd = add_op(b, T, kAudioC, "bf16", m.b_a32b, m.b_a32c, m.b_ax2);
+    /* The heads' mean: six adds into b_ahsum, and the seventh divides by eight. */
+    m.p_op_hs = add_op(b, T, hd, "bf16", m.b_ahsum, m.b_aatt, m.b_ahsum);
+    m.p_op_hsd = add_div_op(b, T, hd, "bf16", m.b_ahsum, m.b_aatt, m.b_ahsum, 8.0);
+    if (!m.p_op_ln3 || !m.p_op_qkv || !m.p_op_attn || !m.p_op_pool || !m.p_op_aproj ||
+        !m.p_op_ln1 || !m.p_op_proj || !m.p_op_hadd || !m.p_op_ln2 || !m.p_op_mln || !m.p_op_gu ||
+        !m.p_op_act || !m.p_op_w2 || !m.p_op_xadd || !m.p_op_hs || !m.p_op_hsd)
+        return RAD_E_INVAL;
+    m.op_ae_castx = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", kAudioC),
+                                            RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                 RAD_NOWEIGHTS),
+                       { m.b_ax2 }, { m.b_amb });
+    if (!m.op_ae_castx) return RAD_E_INVAL;
+    /* Mapped by the presence check above. */
+    m.ae_mpw = decl_w(b, nm.f("aenc.mp.weight"), RAD_F32, { kAudioC, kAudioC, 1 }, acc,
+                      RAD_SHARD_NONE, grp_layer(ga));
+    m.ae_mpb = wcopy(b, nm.f("aenc.mp.bias"), nm.ckpt("audio_vae.mean_proj.bias"), RAD_F32,
+                     { kAudioC }, acc, ga);
+    if (!m.ae_mpw || !m.ae_mpb) return RAD_E_INVAL;
+    m.op_ae_mp = rw(b, RAD_OP(b, "conv1d",
+                              RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("cin", kAudioC),
+                                         RAD_INT("cout", kAudioC), RAD_INT("k", 1),
+                                         RAD_INT("dil", 1), RAD_STR("act", "none"),
+                                         RAD_STR("dtype", "f32")),
+                              RAD_WEIGHTS(m.ae_mpw, m.ae_mpb)),
+                    { m.b_amb }, { m.b_amb2 });
+    m.b_enca = decl_b(b, nm.f("lane.enca"), RAD_F32,
+                      { (int64_t)kEncSlotsA * kEncSlotRowsA, kAudioC }, RAD_BUF_PERSIST);
+    m.op_ae_norm = rw(b, RAD_OP(b, "chan_affine",
+                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", kAudioC),
+                                           RAD_STR("mul", m.ae_norm_mul.c_str()),
+                                           RAD_STR("add", m.ae_norm_add.c_str()),
+                                           RAD_STR("mode", "fma"), RAD_INT("round", 0),
+                                           RAD_STR("dtype", "f32")),
+                                RAD_NOWEIGHTS),
+                      { m.b_amb2 }, { m.b_enca });
+    if (!m.op_ae_mp || !m.op_ae_norm || !m.b_enca) return RAD_E_INVAL;
+    return RAD_OK;
+}
+
 /* ================================================================== declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
@@ -1956,6 +2904,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
+    /* The vision tower, when the checkpoint or container has its weights: every MiniMax-H3 config
+     * names one. */
+    m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
+    if (m.media) {
+        if (m.tv.declare(b, meta, ctx, nm, m.gt.n_embd, kGrpTower, true, true) != RAD_OK)
+            return RAD_E_UNSUPPORTED;
+        m.media = m.tv.on;
+    }
+
     /* ---- in issue order: the conditioning pass, the step, the soundtrack, the frames */
     m.b_text = decl_b(b, nm.f("lane.text"), RAD_BF16, { (int64_t)kMaxLanes * kMaxText, m.D },
                       RAD_BUF_PERSIST);
@@ -1966,12 +2923,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(declare_dit(b, meta, m));
     if (m.dit[0].qkv.bf16) {
         fprintf(stderr, "radiance: minimaxh3: the DiT's linears are bf16; this plugin serves the "
-                        "block-fp8 container (data/recipes/minimax-h3-fp8.recipe)\n");
+                        "block-fp8 container (data/recipes/minimax-h3-fp8.recipe) or the int8 one "
+                        "(data/recipes/minimax-h3-w8a8.recipe)\n");
         return RAD_E_UNSUPPORTED;
     }
     RAD_ARCH_TRY(declare_ups(b, meta, m));
     RAD_ARCH_TRY(declare_audio(b, meta, m));
     RAD_ARCH_TRY(declare_video(b, meta, m));
+    RAD_ARCH_TRY(declare_venc(b, meta, m));
+    RAD_ARCH_TRY(declare_aenc(b, meta, m));
 
     if (!ctx->shape_probe) {
         RadVideoGenDecl d{};
@@ -2024,6 +2984,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.upscale_max = m.ups_max;
             d.upscale_refine = m.rungs.empty() ? kUpsRefineBase : kUpsRefineDistilled;
         }
+        /* Keyframes and reference media as far as the container has the encoders, and the
+         * vision tower for pictures. The counts are ComfyUI's ref2va workflow's. */
+        if (m.venc) {
+            d.max_ref_images = m.media ? 9 : 0;
+            d.max_ref_videos = 3;
+            d.max_enc_frames = kEncMaxFrames;
+            d.max_enc_side = kEncMaxSide;
+            d.enc_ratio = kVaeRatio;
+        }
+        if (m.aenc) {
+            d.max_ref_audios = 3;
+            d.max_enc_samples = kEncMaxSamples;
+        }
+        if (m.venc || m.aenc) d.max_mod_cells = kMaxSegs;
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
 
@@ -2041,6 +3015,64 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 /* ================================================================== step */
+/* RadVideoGenBatch::ref_tab's reference kinds are the pack's. */
+static_assert((int)RAD_VREF_PICTURE == (int)kR2VRefImage &&
+              (int)RAD_VREF_AUDIO == (int)kR2VRefAudioOnly &&
+              (int)RAD_VREF_VIDEO == (int)kR2VRefVideo, "ref_tab kinds");
+
+/* The packed sequence of a request with references (RadVideoGenBatch::ref_tab), as
+ * rad_arch_video_pack laid it out for the driver; false for a table the pack refuses. */
+static bool ref_pack_of(const RadVideoGeom* g, const int32_t* ref_tab, Ref2VAPack* p,
+                        bool positions) {
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
+    if (nr < 0 || nk < 0 || nr > 64 || nk > 2) return false;
+    std::vector<Ref2VARef> refs;
+    std::vector<Ref2VAKeyframe> keys;
+    const int32_t* w = ref_tab + 2;
+    for (int32_t i = 0; i < nr; ++i, w += 6) {
+        if (w[0] < RAD_VREF_PICTURE || w[0] > RAD_VREF_VIDEO || w[1] < 1) return false;
+        refs.push_back(Ref2VARef{ w[0], w[2], w[3], w[4], w[5] });
+    }
+    /* A keyframe is a picture: its soundtrack has no slot to be encoded into. */
+    for (int32_t i = 0; i < nk; ++i, w += 3) {
+        if (w[2] != 0) return false;
+        keys.push_back(Ref2VAKeyframe{ w[0], w[1], w[2] });
+    }
+    const Ref2VAGeom pg{ (int)g->lat_frames, (int)g->lat_h, (int)g->lat_w, (int)g->n_audio };
+    return ref2va_build((int)g->n_text, pg, keys, refs, p, positions) == 0;
+}
+
+/* The prompt's vision pads, the table's tail after the keyframes: a count, then {start, length}
+ * of each picture's tokens. They read the video's projection, as ComfyUI tags them. */
+static std::vector<Ref2VATagRun> ref_pads_of(const int32_t* ref_tab) {
+    const int32_t* w = ref_tab + 2 + 6 * (int64_t)ref_tab[0] + 3 * (int64_t)ref_tab[1];
+    std::vector<Ref2VATagRun> runs;
+    for (int32_t i = 0, n = w[0]; i < n; ++i)
+        runs.push_back({ w[1 + 2 * i], (int64_t)w[1 + 2 * i] + w[2 + 2 * i], 0 });
+    return runs;
+}
+
+/* Where each reference block's latents are, in the order the pack lays the blocks down: the
+ * keyframes, then the references, a video's soundtrack before the video. `audio` picks b_enca
+ * over b_evc; `row` is -1 for a slot no encode pass wrote. */
+struct RefPart { int audio; int64_t row; };
+static void ref_parts(const int32_t* ref_tab, std::vector<RefPart>* out) {
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
+    for (int32_t i = 0; i < nk; ++i) out->push_back({ 0, venc_slot_row(RAD_ENC_KEYFRAME, i + 1) });
+    const int32_t* w = ref_tab + 2;
+    for (int32_t i = 0; i < nr; ++i, w += 6) {
+        const int32_t kind = w[0], slot = w[1];
+        if (kind == RAD_VREF_AUDIO) {
+            out->push_back({ 1, aenc_slot_row(RAD_ENC_AUDIO, slot) });
+        } else if (kind == RAD_VREF_PICTURE) {
+            out->push_back({ 0, venc_slot_row(RAD_ENC_IMAGE, slot) });
+        } else {
+            if (w[5] > 0) out->push_back({ 1, aenc_slot_row(RAD_ENC_VAUDIO, slot) });
+            out->push_back({ 0, venc_slot_row(RAD_ENC_VIDEO, slot) });
+        }
+    }
+}
+
 /* The conditioning pass: the text encoder, context_embedder and the refiner into the lane's prompt
  * rows, then every step's modulation into the lane's tables. */
 static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
@@ -2048,14 +3080,23 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     const Geom& g = m.gt;
     const int64_t T = batch->n_tok, lane = V->lane, S = V->n_steps;
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
+    const int64_t nmm = batch->n_mm_rows;
+    if (m.media && batch->enc_n_patch > 0) m.tv.step(c, batch);
     RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_tx, T));
-    const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    if (m.media && nmm > 0)
+        RAD_ISSUE_N(c, m.op_mm, nmm, brows(m.tv.b_out, nmm), praw(batch->mm_rows, RAD_I32, nmm),
+                    brows(m.b_tx, T));
+    /* A prompt with pictures has M-RoPE positions. */
+    const RadOperand pos = batch->rope_pos ? praw2(batch->rope_pos, RAD_I32, 3, T)
+                                           : praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
-    for (const TeLayer& L : m.te) {
+    for (size_t li = 0; li < m.te.size(); ++li) {
+        const TeLayer& L = m.te[li];
         RAD_ISSUE(c, L.op_n1, brows(m.b_tx, T), RAD_W(L.w_n1), brows(m.a_th.x, T));
         L.q_h.step(c, T);
         L.qkv.step(c, m.a_th, m.b_tkv, T);
-        RAD_ISSUE(c, L.op_qkr, brows(m.b_tkv, T), pos, RAD_W(L.w_qn), RAD_W(L.w_kn));
+        RAD_ISSUE(c, batch->rope_pos ? L.op_qkr_m : L.op_qkr, brows(m.b_tkv, T), pos,
+                  RAD_W(L.w_qn), RAD_W(L.w_kn));
         RAD_ISSUE_N(c, L.op_attn, T, bcol(m.b_tkv, 0, q_dim, T), bcol(m.b_tkv, q_dim, kv_dim, T),
                     bcol(m.b_tkv, q_dim + kv_dim, kv_dim, T), cu, brows(m.a_tattn.x, T));
         L.q_attn.step(c, T);
@@ -2069,6 +3110,10 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
         L.down.step(c, m.a_tffn, m.b_th2, T);
         if (L.op_ar2) RAD_ISSUE_N(c, L.op_ar2, T * g.n_embd, brows(m.b_th2, T), RAD_NONE);
         RAD_ISSUE(c, L.op_add2, brows(m.b_tx, T), brows(m.b_th2, T), brows(m.b_tx, T));
+        /* Deepstack: tap l joins the pictures' rows after layer l. */
+        if (m.media && nmm > 0 && (int)li < m.tv.n_ds)
+            RAD_ISSUE_N(c, m.op_ds[li], nmm, brows(m.tv.b_ds[li], nmm),
+                        praw(batch->mm_rows, RAD_I32, nmm), brows(m.b_tx, T));
     }
 
     const Geom& r = m.gr;
@@ -2097,39 +3142,80 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     RAD_ISSUE_N(c, m.op_fn, T, brows(m.b_rh, T), RAD_W(m.w_fn),
                 brow_slice(m.b_text, lane * kMaxText, T, D));
 
-    /* ---- every step's timestep embedding, video rows then soundtrack rows */
-    const int64_t fd = 256, td = 2688, S2 = 2 * S;
-    RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S), brow_slice(m.b_tproj, 0, S, fd));
-    RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S), brow_slice(m.b_tproj, S, S, fd));
-    RAD_ISSUE_N(c, m.op_t1, S2, brows(m.b_tproj, S2), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
-                brows(m.b_te1, S2));
-    RAD_ISSUE_N(c, m.op_ts, S2, brows(m.b_te1, S2), brows(m.b_te1s, S2));
-    RAD_ISSUE_N(c, m.op_t2, S2, brows(m.b_te1s, S2), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
-                brows(m.b_temb, S2));
-    RAD_ISSUE_N(c, m.op_ts2, S2, brows(m.b_temb, S2), brows(m.a_temb.x, S2));
-    /* At its own rows: QuantFP8::step bands by the batch's tokens, which here are the prompt's,
-     * and the quantiser is declared for the 2 S rows of the steps' embeddings. */
-    RAD_ISSUE_N(c, m.q_temb.op, S2, brows(m.a_temb.x, S2), brows(m.a_temb.cq(), S2),
-                brows(m.a_temb.cs(), S2));
+    /* ---- every step's timestep embedding, the four blocks of declare_tables. At its own rows:
+     * QuantFP8::step bands by the rows it is issued for. */
+    const int64_t fd = 256, td = m.temb_w, TT = 4 * S;
+    if (m.curve > 0) {
+        /* The table is operand 2, after the output. */
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_temb, 0, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_temb, S, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb_pv, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_temb, 2 * S, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb_pa, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_temb, 3 * S, S, td), RAD_W(m.w_ttable));
+    } else {
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S), brow_slice(m.b_tproj, 0, S, fd));
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S), brow_slice(m.b_tproj, S, S, fd));
+        RAD_ISSUE_N(c, m.op_temb_pv, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_tproj, 2 * S, S, fd));
+        RAD_ISSUE_N(c, m.op_temb_pa, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_tproj, 3 * S, S, fd));
+        RAD_ISSUE_N(c, m.op_t1, TT, brows(m.b_tproj, TT), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
+                    brows(m.b_te1, TT));
+        RAD_ISSUE_N(c, m.op_ts, TT, brows(m.b_te1, TT), brows(m.b_te1s, TT));
+        RAD_ISSUE_N(c, m.op_t2, TT, brows(m.b_te1s, TT), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
+                    brows(m.b_temb, TT));
+        RAD_ISSUE_N(c, m.op_ts2, TT, brows(m.b_temb, TT), brows(m.a_temb.x, TT));
+        RAD_ISSUE_N(c, m.q_temb.op, TT, brows(m.a_temb.x, TT), brows(m.a_temb.cq(), TT),
+                    brows(m.a_temb.cs(), TT));
+    }
 
-    /* ---- the modulation table: block l, segment e from its modality's projection of its
-     * timestep's rows, at the table's column block (l, e) */
-    const int64_t L = m.gd.n_layer, row = L * kSegs * m.Ws, base = lane * m.S;
+    /* ---- the modulation table: block l, cell e from its modality's projection of its
+     * timestep's rows, at the table's column block (l, e). A request with references has a cell
+     * for each distinct modulation its groups read (rad_ref2va_pack.h); every step's row is laid
+     * at the table's full width, kMaxSegs cells a block. */
+    const int64_t L = m.gd.n_layer, base = lane * m.S;
+    std::vector<std::pair<int, int64_t>> cell;
+    if (V->ref_tab) {
+        Ref2VAPack p;
+        Ref2VAModGroups grp;
+        if (!ref_pack_of(&V->geom, V->ref_tab, &p, false)) {
+            rad_step_fail(c, "minimaxh3: a reference table the pack refuses");
+            return;
+        }
+        ref2va_mod_groups(p, S, ref_pads_of(V->ref_tab), &grp);
+        for (size_t i = 0; i < grp.md.size(); ++i) cell.emplace_back(grp.md[i], grp.r0[i]);
+    } else {
+        for (int e = 0; e < kSegs; ++e)
+            cell.emplace_back(kSegMod[e], e == kSegAudio ? S : 0);
+    }
+    const int64_t ncell = (int64_t)cell.size();
+    if (ncell > kMaxSegs) {
+        rad_step_fail(c, "minimaxh3: the references read more modulations than the table holds");
+        return;
+    }
     for (int64_t l = 0; l < L; ++l) {
         const DitBlock& B = m.dit[(size_t)l];
-        for (int e = 0; e < kSegs; ++e) {
-            const int md = kSegMod[e];
-            const int64_t r0 = e == kSegAudio ? S : 0;
-            RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
-                        brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
-                        RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]),
-                        bcol_at(m.b_ada, base, row, (l * kSegs + e) * m.Ws, m.Ws, S));
+        for (int64_t e = 0; e < ncell; ++e) {
+            const int md = cell[(size_t)e].first;
+            const int64_t r0 = cell[(size_t)e].second;
+            const RadOperand out =
+                bcol_at(m.b_ada, base, L * kMaxSegs * m.Ws, (l * kMaxSegs + e) * m.Ws, m.Ws, S);
+            if (m.curve > 0)
+                RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.x, r0, S, td),
+                            RAD_W(B.ada_w[md]), RAD_W(B.ada_b[md]), RAD_NONE, out);
+            else
+                RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
+                            brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
+                            RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]), out);
         }
     }
-    for (int e = 0; e < kSegs; ++e) {
-        const int64_t r0 = e == kSegAudio ? S : 0;
+    for (int64_t e = 0; e < ncell; ++e) {
+        const int64_t r0 = cell[(size_t)e].second;
         RAD_ISSUE_N(c, m.op_no, S, brow_slice(m.a_temb.x, r0, S, td), RAD_W(m.w_no), RAD_W(m.b_no),
-                    RAD_NONE, bcol_at(m.b_nout, base, kSegs * 2 * D, e * 2 * D, 2 * D, S));
+                    RAD_NONE, bcol_at(m.b_nout, base, (int64_t)kMaxSegs * 2 * D, e * 2 * D, 2 * D, S));
     }
 }
 
@@ -2139,9 +3225,34 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadVideoGenBatch* V = batch->vgen_b;
     const Geom& g = m.gd;
     const int64_t R = batch->n_tok, lane = V->lane, nt = V->geom.n_text;
-    const int64_t arows = (int64_t)kAudioCh * V->geom.n_audio, vrows = R - nt - arows;
+    const int64_t arows = (int64_t)kAudioCh * V->geom.n_audio;
     const int64_t D = m.D, qd = g.q_dim(), L = g.n_layer, La = kMaxLanes;
     const RadOperand lane_d = praw(V->lane_d, RAD_I32, 1);
+
+    /* With references the sequence is the pack's: the reference blocks between the prompt and
+     * the two latents, which stay last, and the modulation in groups (rad_ref2va_pack.h). */
+    Ref2VAPack pk;
+    Ref2VAModGroups grp;
+    int64_t ng = kSegs, ncell = kSegs, nfine = kSegs;
+    int64_t vrows = R - nt - arows, aseg = nt, vseg = nt + arows;
+    if (V->ref_tab) {
+        if (!ref_pack_of(&V->geom, V->ref_tab, &pk, false) || pk.rows != R) {
+            rad_step_fail(c, "minimaxh3: a step whose reference table is not its sequence");
+            return;
+        }
+        ref2va_mod_groups(pk, m.S, ref_pads_of(V->ref_tab), &grp);
+        ng = (int64_t)grp.col.size();
+        ncell = (int64_t)grp.md.size();
+        if (ncell > kMaxSegs) {
+            rad_step_fail(c, "minimaxh3: the references read more modulations than the table holds");
+            return;
+        }
+        nfine = (int64_t)pk.segs.size();
+        const Ref2VASeg& vid = pk.segs.back();
+        vrows = vid.end - vid.start;
+        aseg = pk.segs[pk.segs.size() - 2].start;
+        vseg = vid.start;
+    }
 
     if (V->step == 0) {
         RAD_ISSUE_N(c, m.op_rnd_v, vrows, praw(V->first_d, RAD_I32, 1), praw(V->seed, RAD_U32, 2),
@@ -2150,47 +3261,80 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                     praw(V->seed + 2, RAD_U32, 2), lane_d, praw(V->lat_cu + 2, RAD_I32, 2),
                     brows(m.b_astate, La * m.maxA));
     }
-    const int64_t row = L * kSegs * m.Ws, ti = lane * m.S + V->step;
+    /* The whole row whatever the groups: the gather's kernel is specialised to the width it was
+     * declared at. */
+    const int64_t row = L * kMaxSegs * m.Ws, ti = lane * m.S + V->step;
     if (g.world > 1)
         RAD_ISSUE_N(c, m.op_modg, row, brow_slice(m.b_ada, ti, 1, row),
-                    brows(m.b_modg, (int64_t)g.world * L * kSegs));
+                    brows(m.b_modg, (int64_t)g.world * L * kMaxSegs));
     else
         RAD_ISSUE_N(c, m.op_modg, 1, brow_slice(m.b_ada, ti, 1, row),
                     RAD_P_T2(rad_buf_ptr(c, m.b_modg), RAD_BF16, 1, row));
 
     RAD_ISSUE_N(c, m.op_text, nt, brows(m.b_text, La * kMaxText), lane_d,
                 praw(V->seg_cu, RAD_I32, 2), brows(m.b_h, nt));
+    /* The two latents, through their input projections. */
     RAD_ISSUE_N(c, m.op_ain, arows, brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC),
-                RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE, brow_slice(m.b_h, nt, arows, D));
+                RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE, brow_slice(m.b_h, aseg, arows, D));
     RAD_ISSUE_N(c, m.op_vin, vrows, brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals),
-                RAD_W(m.w_vin), RAD_W(m.b_vin), RAD_NONE, brow_slice(m.b_h, nt + arows, vrows, D));
+                RAD_W(m.w_vin), RAD_W(m.b_vin), RAD_NONE, brow_slice(m.b_h, vseg, vrows, D));
+    /* Then each keyframe's and reference's block, through the same projection from the rows its
+     * encode pass wrote. */
+    if (V->ref_tab) {
+        std::vector<RefPart> parts;
+        ref_parts(V->ref_tab, &parts);
+        size_t pi = 0;
+        for (const Ref2VASeg& s : pk.segs) {
+            if (s.update || s.kind == kR2VText) continue;
+            const bool aud = ref2va_is_audio(s.kind) != 0;
+            const int64_t n = s.end - s.start;
+            if (pi >= parts.size() || parts[pi].row < 0 || (parts[pi].audio == 1) != aud) {
+                rad_step_fail(c, "minimaxh3: a reference block with no encoded latents");
+                return;
+            }
+            const int64_t row = parts[pi++].row;
+            if (aud)
+                RAD_ISSUE_N(c, m.op_ain, n, brow_slice(m.b_enca, row, n, kAudioC), RAD_W(m.w_ain),
+                            RAD_W(m.b_ain), RAD_NONE, brow_slice(m.b_h, s.start, n, D));
+            else
+                RAD_ISSUE_N(c, m.op_vin, n, brow_slice(m.b_evc, row, n, kPatchVals),
+                            RAD_W(m.w_vin), RAD_W(m.b_vin), RAD_NONE,
+                            brow_slice(m.b_h, s.start, n, D));
+        }
+    }
 
-    const RadOperand segs = praw(V->seg_cu, RAD_I32, kSegs + 1);
+    const RadOperand segs = praw(V->seg_cu, RAD_I32, nfine + 1);
+    /* The attention takes the segments, the modulated norms the modulation groups and, with
+     * references, the cell each group reads (mod_cu's tail). */
+    const RadOperand mod_segs = praw(V->mod_cu, RAD_I32, ng + 1);
+    const RadOperand mod_col = V->ref_tab ? praw(V->mod_cu + ng + 1, RAD_I32, ng) : RAD_NONE;
+    const int64_t vcell = V->ref_tab ? grp.col.back() : kSegs - 1;
     const RadOperand geom = praw(V->geom_d, RAD_I32, RAD_VGEOM_N);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
     const RadOperand pos = praw2(V->pos, RAD_F32, 3, R);
-    /* Chunk k of block l's six, for the three segments: on rank k / (6 / world), at its column. */
+    /* Chunk k of block l's six, for every group: on rank k / (6 / world), at its column. */
     const int64_t per = 6 / g.world, nD = D / RAD_FP8_BLOCK;
     auto mod = [&](int64_t l, int k, int chunks) {
         const int64_t r = k / per;
-        return bcol_at(m.b_modg, r * L * kSegs + l * kSegs, m.Ws, (k % per) * D, chunks * D, kSegs);
+        return bcol_at(m.b_modg, r * L * kMaxSegs + l * kMaxSegs, m.Ws, (k % per) * D, chunks * D,
+                       ncell);
     };
     /* Two halves of the rows with more than one rank. Everything between two attentions is
      * row-local, so a half computes exactly the bits the whole would, and each half's all-reduces
      * run on lane 1 while lane 0 computes the other half; the attention stays whole. The second
      * half starts at the video's middle row, so it is video alone: the batch's one-sequence
-     * cu_seqlens and the video's modulation row stand for the segment table. Lane 0 waits for a
-     * half's all-reduce before its first reader, issued before the next all-reduce goes to lane 1
-     * (a join orders a lane behind everything issued on the other). */
+     * cu_seqlens and the video's modulation (its cell alone) stand for the tables. Lane 0 waits
+     * for a half's all-reduce before its first reader, issued before the next all-reduce goes to
+     * lane 1 (a join orders a lane behind everything issued on the other). */
     const bool split = g.world > 1;
-    const int64_t cut = split ? nt + arows + vrows / 2 : R;
+    const int64_t cut = split ? vseg + vrows / 2 : R;
     const int64_t hr0[2] = { 0, cut }, hn[2] = { cut, R - cut };
     const int nh = split ? 2 : 1;
-    const RadOperand segh[2] = { segs, cu };
+    const RadOperand segh[2] = { mod_segs, cu }, colh[2] = { mod_col, RAD_NONE };
     auto modh = [&](int h, int64_t l, int k, int chunks) {
         if (h == 0) return mod(l, k, chunks);
         const int64_t r = k / per;
-        return bcol_at(m.b_modg, r * L * kSegs + l * kSegs + kSegVideo, m.Ws, (k % per) * D,
+        return bcol_at(m.b_modg, r * L * kMaxSegs + l * kMaxSegs + vcell, m.Ws, (k % per) * D,
                        chunks * D, 1);
     };
     /* A half's partial sums across the ranks, kArRows rows a message, on lane 1 when split. */
@@ -2215,9 +3359,10 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
             const int64_t r0 = hr0[h], n = hn[h];
             if (h > 0 && l > 0) wait_ar();
             RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
-                        l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2), RAD_W(B.w_n1),
-                        segh[h], brow_slice(m.b_h, r0, n, D), brow_slice(m.a_hm.q, r0, n, D),
-                        brow_slice(m.a_hm.s, r0, n, nD), RAD_NONE);
+                        l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
+                        RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
+                        brow_slice(m.a_hm.cq(), r0, n, D), brow_slice(m.a_hm.cs(), r0, n, nD),
+                        RAD_NONE, colh[h]);
             B.qkv.step(c, m.a_hm, m.b_qkv, R, r0, n);
         }
         RAD_ISSUE_N(c, B.op_qkr, R, bcol(m.b_qkv, 0, 3 * qd, R), pos, RAD_W(B.w_qn),
@@ -2250,7 +3395,8 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
             const int64_t r0 = hr0[h], n = hn[h];
             RAD_ISSUE_N(c, B.op_mq2, n, brow_slice(m.b_ao, r0, n, D), modh(h, l, 2, 1),
                         modh(h, l, 3, 2), RAD_W(B.w_n2), segh[h], brow_slice(m.b_h, r0, n, D),
-                        brow_slice(m.a_hm.q, r0, n, D), brow_slice(m.a_hm.s, r0, n, nD), RAD_NONE);
+                        brow_slice(m.a_hm.cq(), r0, n, D), brow_slice(m.a_hm.cs(), r0, n, nD),
+                        RAD_NONE, colh[h]);
             B.gate_up.step(c, m.a_hm, m.b_gu, R, r0, n);
             B.gq.step(c, m.b_gu, R, r0, n);
             B.down.step(c, m.a_ffn, m.b_ao, R, r0, n);
@@ -2259,11 +3405,12 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         }
     }
     wait_ar();
+    /* Row (lane, step) of the table, kMaxSegs cells of 2 D. */
     const char* nout = (const char*)rad_buf_ptr(c, m.b_nout) +
-                       (lane * m.S + V->step) * kSegs * 2 * D * (int64_t)sizeof(uint16_t);
+                       (lane * m.S + V->step) * (int64_t)kMaxSegs * 2 * D * (int64_t)sizeof(uint16_t);
     RAD_ISSUE_N(c, m.op_nout, R, brows(m.b_ao, R), mod(L - 1, 5, 1),
-                RAD_P_T2(nout, RAD_BF16, kSegs, 2 * D), RAD_W(m.w_no_n), segs, brows(m.b_h, R),
-                brows(m.b_hn, R));
+                RAD_P_T2(nout, RAD_BF16, ncell, 2 * D), RAD_W(m.w_no_n), mod_segs, brows(m.b_h, R),
+                brows(m.b_hn, R), mod_col);
 
     /* The heads, in f32 over parts of the rows. */
     auto heads = [&](rad_op op, rad_weight w, rad_weight bias, int64_t first, int64_t n, int64_t nout_c,
@@ -2275,14 +3422,30 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                         brow_slice(y, r0, k, nout_c));
         }
     };
-    heads(m.op_aout, m.w_aout, m.b_aout, nt, arows, kAudioC, m.b_avel);
-    heads(m.op_vout, m.w_vout, m.b_vout, nt + arows, vrows, kPatchVals, m.b_vel);
-    RAD_ISSUE_N(c, m.op_ev, vrows, brows(m.b_vel, vrows), praw(V->sched, RAD_F32, 1),
-                praw(V->sched + 1, RAD_F32, 1), praw(V->sched + 2, RAD_F32, 1),
-                brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
-    RAD_ISSUE_N(c, m.op_ea, arows, brows(m.b_avel, arows), praw(V->sched + 3, RAD_F32, 1),
-                praw(V->sched + 4, RAD_F32, 1), praw(V->sched + 5, RAD_F32, 1),
-                brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    heads(m.op_aout, m.w_aout, m.b_aout, aseg, arows, kAudioC, m.b_avel);
+    heads(m.op_vout, m.w_vout, m.b_vout, vseg, vrows, kPatchVals, m.b_vel);
+    /* The sampler's step (RadVideoGenBatch::sched and sampler). */
+    if (V->sampler == RAD_SAMPLER_RES_MULTISTEP) {
+        RAD_ISSUE_N(c, m.op_rmv, vrows, brows(m.b_vel, vrows),
+                    brow_slice(m.b_vx0, lane * m.maxV, vrows, kPatchVals),
+                    praw(V->sched + 6, RAD_F32, 1), praw(V->sched + 7, RAD_F32, 1),
+                    praw(V->sched + 8, RAD_F32, 1), praw(V->sched + 9, RAD_F32, 1),
+                    praw(V->sched + 10, RAD_F32, 1),
+                    brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
+        RAD_ISSUE_N(c, m.op_rma, arows, brows(m.b_avel, arows),
+                    brow_slice(m.b_ax0, lane * m.maxA, arows, kAudioC),
+                    praw(V->sched + 11, RAD_F32, 1), praw(V->sched + 12, RAD_F32, 1),
+                    praw(V->sched + 13, RAD_F32, 1), praw(V->sched + 14, RAD_F32, 1),
+                    praw(V->sched + 15, RAD_F32, 1),
+                    brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    } else {
+        RAD_ISSUE_N(c, m.op_ev, vrows, brows(m.b_vel, vrows), praw(V->sched, RAD_F32, 1),
+                    praw(V->sched + 1, RAD_F32, 1), praw(V->sched + 2, RAD_F32, 1),
+                    brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
+        RAD_ISSUE_N(c, m.op_ea, arows, brows(m.b_avel, arows), praw(V->sched + 3, RAD_F32, 1),
+                    praw(V->sched + 4, RAD_F32, 1), praw(V->sched + 5, RAD_F32, 1),
+                    brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    }
 }
 
 /* The soundtrack: both channels, each a sequence, through the audio decoder, then interleaved. */
@@ -2466,6 +3629,310 @@ static void step_upscale(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
 }
 
+/* A picture larger than a tile, encoded as ComfyUI's vae.py tiled_encode does: overlapping tiles,
+ * each through the trunk alone (GroupNorm sees only its tile), and each tile's moments blended
+ * with its unblended top and left neighbours into the canvas (vtile_join). A tile's geometries are
+ * its row of b_tplan, which vtile_plan writes as vae.py splits. Returns the slot row past the
+ * media's latents. */
+static int64_t step_venc_tiled(RadCtx* c, const RadVideoGenBatch* V, const Model& m,
+                               const int32_t* gd, int64_t H, int64_t W, int64_t ppc,
+                               const RadOperand st, int64_t row0) {
+    const int64_t lat_h = H / kVaeRatio, lat_w = W / kVaeRatio;
+    const std::vector<int64_t> ty = tile_starts(lat_h), tx = tile_starts(lat_w);
+    const int64_t nh = (int64_t)ty.size(), nw = (int64_t)tx.size(), nt = nh * nw;
+    if (nt > m.tiles) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass whose picture splits into more tiles than "
+                         "the encoder declares room for");
+        return row0;
+    }
+    /* vtile_plan's split on the host: each tile's side in latents and its first row in the two
+     * tile-major planes. */
+    struct Tile { int64_t prow, mrow, ny, nx; };
+    std::vector<Tile> tl;
+    tl.reserve((size_t)nt);
+    int64_t spx = 0, smom = 0;
+    for (int64_t i = 0; i < nh; ++i)
+        for (int64_t j = 0; j < nw; ++j) {
+            const int64_t ny = std::min((int64_t)kTile, lat_h - ty[(size_t)i]),
+                          nx = std::min((int64_t)kTile, lat_w - tx[(size_t)j]);
+            tl.push_back({ spx, smom, ny, nx });
+            spx += ny * nx * (int64_t)kVaeRatio * kVaeRatio;
+            smom += ny * nx;
+        }
+    RAD_ISSUE_N(c, m.op_vt_plan, nt, praw(gd, RAD_I32, 3), brows(m.b_tplan, nt));
+    RAD_ISSUE_N(c, m.op_vt_crop, spx, praw2(V->enc_pixels, RAD_F32, H * W, 3),
+                praw(gd, RAD_I32, 3), brows(m.b_vtile, spx));
+    const int32_t* tp = static_cast<const int32_t*>(rad_buf_ptr(c, m.b_tplan));
+    for (size_t t = 0; t < tl.size(); ++t) {
+        const Tile& T = tl[t];
+        const int64_t th = T.ny * kVaeRatio, tw = T.nx * kVaeRatio;   /* the tile, in pixels */
+        const int64_t Rpix = th * tw, R5 = T.ny * T.nx;
+        int64_t R[6];
+        for (int L = 0; L < 6; ++L) {
+            const int64_t d = 1 << std::min(L, 4);   /* the level's spatial divisor */
+            R[L] = (th / d) * (tw / d);
+        }
+        /* The tile's plan row: its six {1, side, side} geometry entries, one frame deep. */
+        const int32_t* tr = tp + 22 * (int64_t)t;
+        const RadOperand gg[6] = { praw(tr + 4, RAD_I32, 3), praw(tr + 7, RAD_I32, 3),
+                                   praw(tr + 10, RAD_I32, 3), praw(tr + 13, RAD_I32, 3),
+                                   praw(tr + 16, RAD_I32, 3), praw(tr + 19, RAD_I32, 3) };
+        RAD_ISSUE_N(c, m.op_ve_pix, Rpix, brow_slice(m.b_vtile, T.prow, Rpix, 3),
+                    brows(m.b_epix32, Rpix));
+        RAD_ISSUE_N(c, m.op_ve_pcast, Rpix, brows(m.b_epix32, Rpix), brows(m.b_epix, Rpix));
+        RAD_ISSUE_N(c, m.op_ve_cin, Rpix, brows(m.b_epix, Rpix), RAD_W(m.ve_cinw),
+                    RAD_W(m.ve_cinb), gg[0], RAD_NONE, brows(m.v_lv[0].a, Rpix));
+        for (int L = 0; L < 6; ++L) {
+            const Model::VEncLevel& E = m.v_lv[(size_t)L];
+            const bool sc = E.op_sc;
+            for (int blk = 0; blk < 2; ++blk) {
+                const Model::VEncBlock& B = E.blk[blk];
+                const bool f0 = blk == 0 && sc;
+                const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
+                /* The shortcut convolves the raw input, before norm1 (as in the plain loop). */
+                if (f0)
+                    RAD_ISSUE_N(c, E.op_sc, R[L], brows(E.in, R[L]), RAD_W(E.scw), RAD_W(E.scb),
+                                gg[L], RAD_NONE, brows(E.a, R[L]));
+                RAD_ISSUE_N(c, B.op_n1, R[L], brows(xa, R[L]), RAD_W(B.n1w), RAD_W(B.n1b),
+                            RAD_NONE, st, brows(nb, R[L]));
+                RAD_ISSUE_N(c, B.op_c1, R[L], brows(nb, R[L]), RAD_W(B.c1w), RAD_W(B.c1b),
+                            gg[L], RAD_NONE, brows(E.c, R[L]));
+                RAD_ISSUE_N(c, B.op_n2, R[L], brows(E.c, R[L]), RAD_W(B.n2w), RAD_W(B.n2b),
+                            RAD_NONE, st, brows(E.b, R[L]));
+                RAD_ISSUE_N(c, B.op_c2, R[L], brows(E.b, R[L]), RAD_W(B.c2w), RAD_W(B.c2b),
+                            gg[L], brows(E.a, R[L]), brows(E.a, R[L]));
+            }
+            if (L < 4) {
+                const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
+                const rad_buf y = X.op_sc ? X.in : X.a;
+                RAD_ISSUE_N(c, E.op_dn, R[L + 1], brows(E.a, R[L]), RAD_W(E.dnw), RAD_W(E.dnb),
+                            gg[L], RAD_NONE, brows(y, R[L + 1]));
+            }
+        }
+        RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
+                    RAD_NONE, st, brows(m.v_lv[5].b, R5));
+        RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
+                    RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
+        RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
+                    RAD_NONE, brow_slice(m.b_eqt, T.mrow, R5, 48));
+    }
+    /* The blend over the canvas (gd's level-4/5 entry, in latents), then the plain path's fold:
+     * the canvas has a one-clip encode's b_eq2 layout. */
+    RAD_ISSUE_N(c, m.op_vt_join, lat_h * lat_w, brows(m.b_eqt, smom), praw(gd + 12, RAD_I32, 3),
+                brows(m.b_eq2, lat_h * lat_w));
+    RAD_ISSUE_N(c, m.op_ve_fold, ppc, bcol(m.b_eq2, 0, kC, lat_h * lat_w),
+                praw(gd + 18, RAD_I32, 3), brow_slice(m.b_evc, row0, ppc, kPatchVals));
+    return row0 + ppc;
+}
+
+
+/* A Vencode pass: each clip of `enc_pixels` through the levels, its latents folded into the
+ * media's slot of b_evc. The geometry is derived again from the batch, which checks it. */
+static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
+    const RadVideoGenBatch* V = batch->vgen_b;
+    int32_t g[25];
+    if (!V->enc_pixels ||
+        !venc_geom(V->enc_frames, V->enc_height, V->enc_width, g)) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass with no pixels, or frames, height or width "
+                         "the video encoder does not take");
+        return;
+    }
+    const int64_t row0 = venc_slot_row(V->enc_kind, V->enc_slot);
+    if (row0 < 0) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass naming an encode kind or slot this plugin "
+                         "does not know");
+        return;
+    }
+    if ((int64_t)V->enc_frames != g[23]) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass whose frames are not the clip-padded count "
+                         "rad_arch_encode_geom reports");
+        return;
+    }
+    const int32_t* gd = V->enc_geom_d;
+    const int64_t H = V->enc_height, W = V->enc_width;
+    const int64_t ppc = (H / (kVaeRatio * kPatch)) * (W / (kVaeRatio * kPatch));
+    const int64_t n_clips = g[22], full = g[15], short_last = g[18];
+    if ((full * (n_clips - 1) + short_last) * ppc > kEncSlotRowsV) {
+        rad_step_fail(c, "minimaxh3: a Vencode pass whose latents overflow the lane's slot");
+        return;
+    }
+    const RadOperand st = RAD_B(m.b_egn);
+    /* Each level's volume in the geometry; the last two levels have no downsampler between
+     * them. */
+    static const int kVOrg[6] = { 0, 3, 6, 9, 12, 12 };
+    int64_t frow = row0;
+    /* A one-frame media larger than a tile goes through the tiled path, as vae.py tiles its image
+     * encodes; a clip never does, since venc_geom bounds its sides to kEncMaxSide. */
+    const bool tiled = V->enc_frames == 1 && (H / kVaeRatio > kTile || W / kVaeRatio > kTile);
+    if (tiled)
+        frow = step_venc_tiled(c, V, m, gd, H, W, ppc, st, row0);
+    else
+    for (int64_t cc = 0; cc < n_clips; ++cc) {
+        const bool last = cc == n_clips - 1;
+        const int64_t R0 = (int64_t)g[0] * H * W;
+        const RadOperand gg[6] = { praw(gd + kVOrg[0], RAD_I32, 3), praw(gd + kVOrg[1], RAD_I32, 3),
+                                   praw(gd + kVOrg[2], RAD_I32, 3), praw(gd + kVOrg[3], RAD_I32, 3),
+                                   praw(gd + kVOrg[4], RAD_I32, 3), praw(gd + kVOrg[5], RAD_I32, 3) };
+        RAD_ISSUE_N(c, m.op_ve_pix, R0, praw2(V->enc_pixels + cc * R0 * 3, RAD_F32, R0, 3),
+                    brows(m.b_epix32, R0));
+        RAD_ISSUE_N(c, m.op_ve_pcast, R0, brows(m.b_epix32, R0), brows(m.b_epix, R0));
+        RAD_ISSUE_N(c, m.op_ve_cin, R0, brows(m.b_epix, R0), RAD_W(m.ve_cinw), RAD_W(m.ve_cinb),
+                    gg[0], RAD_NONE, brows(m.v_lv[0].a, R0));
+        for (int L = 0; L < 6; ++L) {
+            const Model::VEncLevel& E = m.v_lv[(size_t)L];
+            const int64_t R = (int64_t)g[kVOrg[L]] * g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
+            const bool sc = E.op_sc;
+            for (int blk = 0; blk < 2; ++blk) {
+                const Model::VEncBlock& B = E.blk[blk];
+                const bool f0 = blk == 0 && sc;
+                const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
+                /* The shortcut convolves the raw input, so it runs before norm1 normalises `in` in
+                 * place. */
+                if (f0)
+                    RAD_ISSUE_N(c, E.op_sc, R, brows(E.in, R), RAD_W(E.scw), RAD_W(E.scb), gg[L],
+                                RAD_NONE, brows(E.a, R));
+                RAD_ISSUE_N(c, B.op_n1, R, brows(xa, R), RAD_W(B.n1w), RAD_W(B.n1b), RAD_NONE, st,
+                            brows(nb, R));
+                RAD_ISSUE_N(c, B.op_c1, R, brows(nb, R), RAD_W(B.c1w), RAD_W(B.c1b), gg[L],
+                            RAD_NONE, brows(E.c, R));
+                RAD_ISSUE_N(c, B.op_n2, R, brows(E.c, R), RAD_W(B.n2w), RAD_W(B.n2b), RAD_NONE, st,
+                            brows(E.b, R));
+                RAD_ISSUE_N(c, B.op_c2, R, brows(E.b, R), RAD_W(B.c2w), RAD_W(B.c2b), gg[L],
+                            brows(E.a, R), brows(E.a, R));
+            }
+            if (L < 4) {
+                const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
+                const int64_t RX = (int64_t)g[3 * (L + 1)] * g[3 * (L + 1) + 1] * g[3 * (L + 1) + 2];
+                const rad_buf y = X.op_sc ? X.in : X.a;
+                RAD_ISSUE_N(c, E.op_dn, RX, brows(E.a, R), RAD_W(E.dnw), RAD_W(E.dnb), gg[L],
+                            RAD_NONE, brows(y, RX));
+            }
+        }
+        const int64_t R5 = (int64_t)g[12] * g[13] * g[14];
+        RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
+                    RAD_NONE, st, brows(m.v_lv[5].b, R5));
+        RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
+                    RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
+        RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
+                    RAD_NONE, brows(m.b_eq2, R5));
+        const int64_t flat = last ? short_last : full;
+        RAD_ISSUE_N(c, m.op_ve_fold, flat * ppc,
+                    bcol(m.b_eq2, 0, kC, flat * (H / kVaeRatio) * (W / kVaeRatio)),
+                    praw(gd + (last ? 18 : 15), RAD_I32, 3),
+                    brow_slice(m.b_evc, frow, flat * ppc, kPatchVals));
+        frow += flat * ppc;
+    }
+    /* The condition noise over the item's rows, numbered from its first row (ComfyUI reseeds each
+     * item). b_evc persists, so once an encode is the blend every step reads. */
+    if (frow > row0)
+        RAD_ISSUE_N(c, m.op_eaug, frow - row0, praw(V->seed, RAD_U32, 2),
+                    brow_slice(m.b_evc, row0, frow - row0, kPatchVals));
+}
+
+/* An Aencode pass: each channel of `enc_samples` through the encoder, its latents into the media's
+ * slot of b_enca. The stages' lengths are the staged geometry's cus. */
+static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
+    const RadVideoGenBatch* V = batch->vgen_b;
+    int32_t g[13];
+    if (!V->enc_samples || !aenc_geom(V->enc_n_samples, V->enc_channels, g)) {
+        rad_step_fail(c, "minimaxh3: an Aencode pass with no samples, or a length and channel "
+                         "count the audio encoder does not take");
+        return;
+    }
+    const int64_t row0 = aenc_slot_row(V->enc_kind, V->enc_slot);
+    if (row0 < 0) {
+        rad_step_fail(c, "minimaxh3: an Aencode pass naming an encode kind or slot this plugin "
+                         "does not know");
+        return;
+    }
+    const int64_t n_pad = g[0];
+    if ((int64_t)V->enc_n_samples != n_pad) {
+        rad_step_fail(c, "minimaxh3: an Aencode pass whose samples are not padded to the length "
+                         "rad_arch_encode_geom reports");
+        return;
+    }
+    const int32_t* gd = V->enc_geom_d;
+    const int64_t ld = 2048, hd = ld / 8;
+    const RadOperand cu6 = praw(gd + 11, RAD_I32, 2);
+    for (int32_t ch = 0; ch < V->enc_channels; ++ch) {
+        RAD_ISSUE_N(c, m.op_ae_cin, n_pad, praw2(V->enc_samples + ch * n_pad, RAD_F32, n_pad, 1),
+                    RAD_W(m.ae_cinw), praw(gd + 1, RAD_I32, 2), RAD_NONE,
+                    brows(m.b_ax[0], n_pad), RAD_W(m.ae_cinb));
+        int64_t rows = n_pad;
+        for (int blk = 0; blk < 5; ++blk) {
+            const Model::AEncBlk& A = m.ae_blk[blk];
+            const RadOperand cu = praw(gd + 1 + 2 * blk, RAD_I32, 2);
+            const int64_t R = rows, no = g[2 + 2 * (blk + 1)];
+            const rad_buf S = m.b_ax[blk];
+            for (int r = 0; r < 3; ++r) {
+                const Model::AEncUnit& U = A.u[r];
+                RAD_ISSUE_N(c, U.op_a1, R, brows(S, R), RAD_W(U.a1), brows(m.b_et1[blk], R),
+                            RAD_NONE);
+                RAD_ISSUE_N(c, U.op_c1, R, brows(m.b_et1[blk], R), RAD_W(U.c1w), cu,
+                            RAD_NONE, brows(m.b_et2[blk], R), RAD_W(U.c1b));
+                RAD_ISSUE_N(c, U.op_a2, R, brows(m.b_et2[blk], R), RAD_W(U.a2),
+                            brows(m.b_et1[blk], R), RAD_NONE);
+                RAD_ISSUE_N(c, U.op_c2, R, brows(m.b_et1[blk], R), RAD_W(U.c2w), cu,
+                            brows(S, R), brows(S, R), RAD_W(U.c2b));
+            }
+            RAD_ISSUE_N(c, A.op_al, R, brows(S, R), RAD_W(A.al), brows(m.b_et1[blk], R),
+                        RAD_NONE);
+            RAD_ISSUE_N(c, A.op_ci, R, brows(m.b_et1[blk], R), brows(A.bi, R));
+            RAD_ISSUE_N(c, A.op_dn, no, brows(A.bi, R), RAD_W(A.dnw), cu, RAD_NONE,
+                        brows(A.bo, no), RAD_W(A.dnb));
+            RAD_ISSUE_N(c, A.op_co, no, brows(A.bo, no), brows(m.b_ax[blk + 1], no));
+            rows = no;
+        }
+        RAD_ISSUE_N(c, m.op_ae_snk6, rows, brows(m.b_ax[5], rows), RAD_W(m.ae_al6),
+                    brows(m.b_a6t, rows), RAD_NONE);
+        RAD_ISSUE_N(c, m.op_ae_fin, rows, brows(m.b_a6t, rows), RAD_W(m.ae_finw), cu6,
+                    RAD_NONE, brows(m.b_ax6, rows), RAD_W(m.ae_finb));
+        RAD_ISSUE_N(c, m.op_ae_cast6, rows, brows(m.b_ax6, rows), brows(m.b_apb, rows));
+        /* The attention block. AttnProjection.forward feeds the attention from norm1 and the
+         * projection from norm3, and the two differ: each reads its own through b_aln3. */
+        RAD_ISSUE_N(c, m.p_op_ln1, rows, brows(m.b_apb, rows), RAD_W(m.p_ln1w), RAD_W(m.p_ln1b),
+                    brows(m.b_aln3, rows));
+        RAD_ISSUE_N(c, m.p_op_qkv, rows, brows(m.b_aln3, rows), RAD_W(m.p_qkvw), RAD_W(m.p_qkvb),
+                    RAD_NONE, brows(m.b_aqkv, rows));
+        for (int h = 0; h < 8; ++h) {
+            /* The first head writes the sum, the next six add to it and the last divides it. */
+            const rad_buf y = h == 0 ? m.b_ahsum : m.b_aatt;
+            RAD_ISSUE_N(c, m.p_op_attn, rows, bcol(m.b_aqkv, h * hd, hd, rows),
+                        bcol(m.b_aqkv, ld + h * hd, hd, rows),
+                        bcol(m.b_aqkv, 2 * ld + h * hd, hd, rows), cu6, brows(y, rows));
+            if (h > 0)
+                RAD_ISSUE_N(c, h == 7 ? m.p_op_hsd : m.p_op_hs, rows, brows(m.b_ahsum, rows),
+                            brows(m.b_aatt, rows), brows(m.b_ahsum, rows));
+        }
+        RAD_ISSUE_N(c, m.p_op_pool, rows, brows(m.b_ahsum, rows), brows(m.b_apool, rows));
+        RAD_ISSUE_N(c, m.p_op_aproj, rows, brows(m.b_apool, rows), RAD_W(m.p_apw), RAD_W(m.p_apb),
+                    RAD_NONE, brows(m.b_a32a, rows));
+        RAD_ISSUE_N(c, m.p_op_ln3, rows, brows(m.b_apb, rows), RAD_W(m.p_ln3w), RAD_W(m.p_ln3b),
+                    brows(m.b_aln3, rows));
+        RAD_ISSUE_N(c, m.p_op_proj, rows, brows(m.b_aln3, rows), RAD_W(m.p_prw), RAD_W(m.p_prb),
+                    RAD_NONE, brows(m.b_eh, rows));
+        RAD_ISSUE_N(c, m.p_op_hadd, rows, brows(m.b_eh, rows), brows(m.b_a32a, rows),
+                    brows(m.b_a32b, rows));
+        RAD_ISSUE_N(c, m.p_op_ln2, rows, brows(m.b_a32b, rows), RAD_W(m.p_ln2w), RAD_W(m.p_ln2b),
+                    brows(m.b_a32c, rows));
+        RAD_ISSUE_N(c, m.p_op_mln, rows, brows(m.b_a32c, rows), RAD_W(m.p_mlw), RAD_W(m.p_mlb),
+                    brows(m.b_a32d, rows));
+        RAD_ISSUE_N(c, m.p_op_gu, rows, brows(m.b_a32d, rows), RAD_W(m.p_guw), RAD_W(m.p_gub),
+                    RAD_NONE, brows(m.b_agu, rows));
+        RAD_ISSUE_N(c, m.p_op_act, rows, brows(m.b_agu, rows), brows(m.b_agu64, rows));
+        RAD_ISSUE_N(c, m.p_op_w2, rows, brows(m.b_agu64, rows), RAD_W(m.p_w2w), RAD_W(m.p_w2b),
+                    RAD_NONE, brows(m.b_a32c, rows));
+        RAD_ISSUE_N(c, m.p_op_xadd, rows, brows(m.b_a32b, rows), brows(m.b_a32c, rows),
+                    brows(m.b_ax2, rows));
+        RAD_ISSUE_N(c, m.op_ae_castx, rows, brows(m.b_ax2, rows), brows(m.b_amb, rows));
+        RAD_ISSUE_N(c, m.op_ae_mp, rows, brows(m.b_amb, rows), RAD_W(m.ae_mpw), cu6,
+                    RAD_NONE, brows(m.b_amb2, rows), RAD_W(m.ae_mpb));
+        RAD_ISSUE_N(c, m.op_ae_norm, rows, brows(m.b_amb2, rows),
+                    brow_slice(m.b_enca, row0 + (int64_t)ch * (kEncSlotRowsA / (int64_t)kAudioCh),
+                               rows, kAudioC));
+    }
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     const Model& m = g_model[rad_rank(c)];
     if (!batch->gen || !batch->vgen_b) {
@@ -2484,6 +3951,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
             return;
         }
         step_upscale(c, batch, m);
+        return;
+    case RAD_GEN_PASS_VENCODE:
+        if (!m.venc) {
+            rad_step_fail(c, "minimaxh3: a Vencode pass, and this container has no video VAE "
+                             "encoder");
+            return;
+        }
+        step_venc(c, batch, m);
+        return;
+    case RAD_GEN_PASS_AENCODE:
+        if (!m.aenc) {
+            rad_step_fail(c, "minimaxh3: an Aencode pass, and this container has no audio VAE "
+                             "encoder");
+            return;
+        }
+        step_aenc(c, batch, m);
         return;
     default:
         rad_step_fail(c, "minimaxh3: a generator pass of a kind this plugin does not know");
@@ -2505,9 +3988,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(minimaxh3)
 RAD_ARCH_PLUGIN(minimaxh3, "minimaxh3", "", "0.1.0",
-                "MiniMax-H3 (t2va): Qwen3-VL-32B conditioning, a 33B single-stream diffusion "
-                "transformer over text, soundtrack and video, a tiled ViT video decoder and a "
-                "BigVGAN audio decoder; block-fp8 linears")
+                "MiniMax-H3 (t2va, i2va, l2va, fl2va, ref2va): Qwen3-VL-32B conditioning, a 33B "
+                "single-stream diffusion transformer over text, soundtrack and video, a tiled ViT "
+                "video decoder, a BigVGAN audio decoder and the VAEs' encoders; block-fp8 or "
+                "int8 linears")
 
 extern "C" int64_t rad_arch_video_positions(int which, const RadVideoGeom* g, float* pos,
                                             int64_t cap) {
@@ -2515,5 +3999,49 @@ extern "C" int64_t rad_arch_video_positions(int which, const RadVideoGeom* g, fl
     if (which == RAD_VPOS_STEP) return minimaxh3::positions(g, pos, cap);
     if (which == RAD_VPOS_DECODE) return minimaxh3::decode_rows(g);
     return RAD_E_INVAL;
+}
+
+/* The encode passes' geometry (kVEncGeomN, kAEncGeomN above); the steps derive it again from the
+ * batch's own fields. */
+extern "C" int64_t rad_arch_encode_geom(int32_t kind, const int64_t* in, int32_t* out,
+                                        int64_t cap) {
+    using namespace minimaxh3;
+    if (!in) return RAD_E_INVAL;
+    const bool video = kind == RAD_GEN_PASS_VENCODE;
+    if (!video && kind != RAD_GEN_PASS_AENCODE) return RAD_E_INVAL;
+    const int64_t n = video ? kVEncGeomN : kAEncGeomN;
+    if (out && cap < n) return RAD_E_INVAL;
+    const bool ok = video ? venc_geom(in[0], in[1], in[2], out) : aenc_geom(in[0], in[3], out);
+    return ok ? n : (int64_t)RAD_E_INVAL;
+}
+
+extern "C" int64_t rad_arch_video_pack(const RadVideoGeom* g, const int32_t* ref_tab,
+                                       int32_t* seg, int32_t* n_seg, int32_t* mod,
+                                       int32_t* n_mod, float* pos, int64_t cap_pos) {
+    using namespace minimaxh3;
+    if (!g || !ref_tab || g->n_text < 1 || g->n_text > kMaxText || g->lat_frames < 1 ||
+        g->lat_h < kPatch || g->lat_w < kPatch || g->n_audio < 1)
+        return RAD_E_INVAL;
+    Ref2VAPack p;
+    if (!ref_pack_of(g, ref_tab, &p, pos != nullptr)) return RAD_E_INVAL;
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, 1, ref_pads_of(ref_tab), &grp);
+    const int32_t ns = (int32_t)p.segs.size() + 1, nb = (int32_t)grp.bound.size();
+    const int32_t nm = nb + (int32_t)grp.col.size();
+    if ((seg && (!n_seg || *n_seg < ns)) || (mod && (!n_mod || *n_mod < nm)) ||
+        (pos && cap_pos < 3 * p.rows))
+        return RAD_E_INVAL;
+    if (seg) {
+        for (int32_t k = 0; k + 1 < ns; ++k) seg[k] = (int32_t)p.segs[(size_t)k].start;
+        seg[ns - 1] = (int32_t)p.rows;
+    }
+    if (mod) {
+        for (int32_t k = 0; k < nb; ++k) mod[k] = (int32_t)grp.bound[(size_t)k];
+        for (size_t k = 0; k < grp.col.size(); ++k) mod[nb + k] = grp.col[k];
+    }
+    if (pos) std::copy(p.pos.begin(), p.pos.end(), pos);
+    if (n_seg) *n_seg = ns;
+    if (n_mod) *n_mod = nm;
+    return p.rows;
 }
 #endif

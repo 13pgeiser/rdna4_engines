@@ -720,18 +720,23 @@ struct ReplyFormat::Impl {
     ChatFormat  f;
     /* Each tag split into its core and the whitespace around it that is optional to match. */
     std::string open_core, open_trail, close_core, close_trail, ns_core, ns_trail, end_core,
-                end_trail, co_core, co_trail;
+                end_trail, co_core, co_trail, section_open_core, section_close_core;
     /* What begins a call in content. First the format's own opener: call_open's core, or
      * name_prefix when calls are not wrapped. A wrapped format also takes name_prefix alone,
      * second, since models often write a call without its wrapper; a wrapper written without
      * its trailing whitespace is read too. */
-    std::vector<std::string> openers;
-    /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. */
-    std::string name_end;
-    /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so it was
+    std::vector<std::string> openers, text_markers;
+    size_t section_open_hit = (size_t)-1, section_close_hit = (size_t)-1;
+    size_t think_open_hit = (size_t)-1, think_close_hit = (size_t)-1;
+    size_t body_section_close_hit = (size_t)-1;
+    /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. With
+     * typed tags (arg_json_value_prefix) also `name_end_json`, which opens a JSON value; the
+     * arg_name automata report it as pattern 1. */
+    std::string name_end, name_end_json;
+    /* The same, whitespace-trimmed. A loose call is one the grammar never opened, so it was
      * written unconstrained; its argument tags, like its name and close, are read with their
      * surrounding whitespace optional. */
-    std::string name_end_core, value_core;
+    std::string name_end_core, name_end_json_core, value_core;
     /* call_close's core, when distinct from what else may follow inside a call, so a wrapped
      * call missing its own close is ended by its wrapper's. */
     std::string cc_core;
@@ -792,7 +797,18 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     split_ws(f.call_open, &m.co_core, &m.co_trail);
     if (f.call_open.empty()) m.openers = { f.name_prefix };
     else m.openers = { m.co_core, f.name_prefix };
+    m.text_markers = m.openers;
+    if (!f.section_open.empty()) {
+        std::string section_trail;
+        split_ws(f.section_open, &m.section_open_core, &section_trail);
+        split_ws(f.section_close, &m.section_close_core, &section_trail);
+        m.section_open_hit = m.text_markers.size();
+        m.text_markers.push_back(m.section_open_core);
+        m.section_close_hit = m.text_markers.size();
+        m.text_markers.push_back(m.section_close_core);
+    }
     m.name_end = f.arg_name_suffix + f.arg_value_prefix;
+    if (f.typed_tags()) m.name_end_json = f.arg_name_suffix + f.arg_json_value_prefix;
     m.object = f.has_tools() && f.object_args();
     m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
     if (m.object && f.name_suffix.empty()) {
@@ -808,15 +824,16 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.think_breaks.build(b);
     }
     if (f.reasoning_anywhere && f.has_reasoning()) {
-        std::vector<std::string> t;
-        if (f.has_tools()) t = m.openers;
+        std::vector<std::string> t = m.text_markers;
+        m.think_open_hit = t.size();
         t.push_back(m.open_core);
+        m.think_close_hit = t.size();
         t.push_back(m.close_core);
         m.text_think.build(t);
         m.think_only.build({ m.open_core, m.close_core });
     }
     if (m.object) {
-        m.text.build(m.openers);
+        m.text.build(m.text_markers);
         std::string trail;
         split_ws(f.call_close, &m.cc_core, &trail);
         std::vector<std::string> bare{ ",", "}", "]" }, key{ ":", ",", "}" };
@@ -851,26 +868,39 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         m.obj_bare.build(bare);
         m.obj_key.build(key);
     } else if (f.has_tools()) {
-        m.text.build(m.openers);
-        m.arg_name.build({ m.name_end });
-        m.value.build({ f.arg_value_suffix });
+        m.text.build(m.text_markers);
         std::string trail;
         split_ws(m.name_end, &m.name_end_core, &trail);
+        split_ws(m.name_end_json, &m.name_end_json_core, &trail);
         split_ws(f.arg_value_suffix, &m.value_core, &trail);
-        m.arg_name_loose.build({ m.name_end_core });
+        if (f.typed_tags()) {
+            m.arg_name.build({ m.name_end, m.name_end_json });
+            m.arg_name_loose.build({ m.name_end_core, m.name_end_json_core });
+        } else {
+            m.arg_name.build({ m.name_end });
+            m.arg_name_loose.build({ m.name_end_core });
+        }
+        m.value.build({ f.arg_value_suffix });
         m.value_loose.build({ m.value_core });
         split_ws(f.call_close, &m.cc_core, &trail);
         auto apart = [](const std::string& a, const std::string& b) {
             return a.find(b) == std::string::npos && b.find(a) == std::string::npos;
         };
         if (!apart(m.cc_core, f.arg_prefix) || !apart(m.cc_core, m.end_core)) m.cc_core.clear();
-        if (m.cc_core.empty()) m.junk.build({ f.arg_prefix, m.end_core });
-        else m.junk.build({ f.arg_prefix, m.end_core, m.cc_core });
+        std::vector<std::string> junk{ f.arg_prefix, m.end_core };
+        if (!m.cc_core.empty()) junk.push_back(m.cc_core);
+        if (!m.section_close_core.empty()) {
+            m.body_section_close_hit = junk.size();
+            junk.push_back(m.section_close_core);
+        }
+        m.junk.build(junk);
     }
-    const std::string* const delims[] = { &f.reasoning_open, &f.reasoning_close, &f.call_open,
-                                          &f.call_close, &f.name_prefix, &f.name_suffix,
+    const std::string* const delims[] = { &f.reasoning_open, &f.reasoning_close, &f.section_open,
+                                          &f.section_close, &f.call_open, &f.call_close,
+                                          &f.name_prefix, &f.name_suffix,
                                           &f.call_end, &f.arg_prefix, &m.name_end,
-                                          &f.arg_value_suffix, &f.object_string_open,
+                                          &m.name_end_json, &f.arg_value_suffix,
+                                          &f.object_string_open,
                                           &f.object_string_close };
     for (const std::string* s : delims) m.longest = std::max(m.longest, s->size());
     for (const std::string& s : f.reasoning_breaks) m.longest = std::max(m.longest, s.size());
@@ -971,12 +1001,15 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
                 /* A name its own delimiter could end early would be read as a different name.
                  * Object keys are delimited by the object's punctuation instead, and a key
                  * containing it is written as a string. */
-                const std::string probe = pname + F.name_end;
-                if (!F.object && probe.find(F.name_end) != pname.size()) {
-                    *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
-                           F.name_end + "', which this model's tool-call format uses to end an "
-                           "argument name";
-                    return RAD_E_INVAL;
+                for (const std::string* ne : { &F.name_end, &F.name_end_json }) {
+                    if (ne->empty()) continue;
+                    const std::string probe = pname + *ne;
+                    if (!F.object && probe.find(*ne) != pname.size()) {
+                        *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
+                               *ne + "', which this model's tool-call format uses to end an "
+                               "argument name";
+                        return RAD_E_INVAL;
+                    }
                 }
                 t.params.emplace(pname, p);
             }
@@ -1139,6 +1172,11 @@ struct ReplyStream::Impl {
     St   st;
     bool strict = true, finished = false, fed_tail = false;
     bool post_call = false;             /* content after a call */
+    bool section_active = false;
+    size_t section_calls_at_open = 0;
+    /* The last completed inner call is not executable until another call starts or the outer
+     * section closes. Deferring CallEnd keeps truncation consistent with the one-shot parse. */
+    size_t pending_section_call = (size_t)-1;
 
     /* delimiter scan */
     uint16_t    ds = 0;
@@ -1164,6 +1202,8 @@ struct ReplyStream::Impl {
     int         depth = 0;              /* unclosed braces in the arguments so far */
     bool        in_str = false, esc = false;
     const Param* param = nullptr;
+    /* The argument's tag was the JSON one (typed tags): its value is read as JSON. */
+    bool        json_tag = false;
     /* a value */
     ValueOut    val;
     ValueOut::Mode vmode = ValueOut::String;
@@ -1413,6 +1453,40 @@ struct ReplyStream::Impl {
         return p + 1;
     }
 
+    void complete_section_call() {
+        if (pending_section_call == (size_t)-1) return;
+        msg.calls[pending_section_call].closed = true;
+        event(ReplyEvent::CallEnd, (uint32_t)pending_section_call, {});
+        pending_section_call = (size_t)-1;
+    }
+
+    void open_section() {
+        if (section_active) { lenient(); return; }
+        section_active = true;
+        section_calls_at_open = calls;
+    }
+
+    void close_section() {
+        if (!section_active) { lenient(); return; }
+        if (calls == section_calls_at_open) lenient();
+        complete_section_call();
+        section_active = false;
+    }
+
+    /* A section close before call_end leaves the last call incomplete: it must never be exposed
+     * as an executable tool call. Keep its bytes available to content_with_open_call(). */
+    void abandon_call_at_section_close() {
+        lenient();
+        if (cur == 2) publish(2, true);
+        cur = -1;
+        section_active = false;
+        post_call = false;
+        ds = 0;
+        hold.clear();
+        lhold.clear();
+        st = St::Text;
+    }
+
     /* The call opener has matched at `att`; whether a call follows is decided below. */
     void begin_attempt(St from) {
         origin = from;
@@ -1472,6 +1546,7 @@ struct ReplyStream::Impl {
     }
 
     void begin_call(bool exact) {
+        complete_section_call();
         if (!exact || tool < 0) lenient();
         if (!P.opt.parallel_tool_calls && calls > 0) lenient();
         if (cur >= 0) publish(cur, false);
@@ -1810,8 +1885,12 @@ struct ReplyStream::Impl {
             args_out(close);
         }
         publish(2, true);
-        msg.calls.back().closed = true;
-        event(ReplyEvent::CallEnd, (uint32_t)msg.calls.size() - 1, {});
+        if (section_active) {
+            pending_section_call = msg.calls.size() - 1;
+        } else {
+            msg.calls.back().closed = true;
+            event(ReplyEvent::CallEnd, (uint32_t)msg.calls.size() - 1, {});
+        }
         cur = -1;
         lpos = 0;
         lhold.clear();
@@ -1893,7 +1972,9 @@ struct ReplyStream::Impl {
         args_out(key);
         ++argc;
         name.clear();
-        if (param && param->typed) {
+        /* With typed tags the reply's own tag says JSON or string, for any name; else the
+         * declared schema does. */
+        if (F.f.typed_tags() ? json_tag : (param && param->typed)) {
             js.reset();
             vheld.clear();
             st = St::ValJson;
@@ -1904,7 +1985,10 @@ struct ReplyStream::Impl {
 
     /* What ends an argument name and a value in the call being read: the tags as the format
      * writes them, or their cores in a loose call. */
-    const std::string& name_end() const { return loose ? F.name_end_core : F.name_end; }
+    const std::string& name_end() const {
+        if (json_tag) return loose ? F.name_end_json_core : F.name_end_json;
+        return loose ? F.name_end_core : F.name_end;
+    }
     const std::string& value_suffix() const { return loose ? F.value_core : F.f.arg_value_suffix; }
 
     /* A CDATA section is punctuation around any value the format lets carry one, typed or not. */
@@ -1984,9 +2068,19 @@ struct ReplyStream::Impl {
             p = scan(d, p, e, &hit, [this](const char* q, size_t n) { think_out(q, n); });
             if (hit == 0) { trail = 0; st = St::ThinkCloseWs; }
             else if (hit > 0) {
-                att = d.pattern(hit);
-                att_at = here(p) - att.size();
-                begin_attempt(St::Think);
+                const std::string& marker = d.pattern(hit);
+                if (!F.section_open_core.empty() && marker == F.section_open_core) {
+                    open_section();
+                    st = St::Text;
+                } else if (!F.section_open_core.empty() && !section_active) {
+                    /* A call-looking tag cannot bypass the required outer section, including
+                     * when it appears in an unclosed reasoning block. */
+                    think_out(marker.data(), marker.size());
+                } else {
+                    att = marker;
+                    att_at = here(p) - att.size();
+                    begin_attempt(St::Think);
+                }
             }
             return p;
         }
@@ -2004,14 +2098,35 @@ struct ReplyStream::Impl {
             }
             p = scan(*text_dfa, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
             if (hit < 0) return p;
+            if (P.anywhere && !P.calls) {
+                if (hit == 0) { trail = 0; st = St::ThinkOpenWs; }
+                else lenient();  /* A reasoning close with no block open. */
+                return p;
+            }
             if ((size_t)hit < n_open) {
-                att_at = here(p) - F.openers[(size_t)hit].size();
-                begin_text_attempt(hit);
-            } else if ((size_t)hit == n_open) {
+                if (!F.section_open_core.empty() && !section_active) {
+                    /* The call-looking tag is ordinary content outside the required wrapper. */
+                    const std::string& marker = F.text_markers[(size_t)hit];
+                    text_out(marker.data(), marker.size());
+                } else {
+                    att_at = here(p) - F.openers[(size_t)hit].size();
+                    begin_text_attempt(hit);
+                }
+            } else if ((size_t)hit == F.section_open_hit) {
+                open_section();
+            } else if ((size_t)hit == F.section_close_hit) {
+                if (!section_active) {
+                    lenient();
+                    const std::string& marker = F.text_markers[(size_t)hit];
+                    text_out(marker.data(), marker.size());
+                } else {
+                    close_section();
+                }
+            } else if ((size_t)hit == F.think_open_hit) {
                 /* A reasoning block opens again, later in the reply. */
                 trail = 0;
                 st = St::ThinkOpenWs;
-            } else {
+            } else if ((size_t)hit == F.think_close_hit) {
                 /* Its close with no block open: not part of the answer. */
                 lenient();
             }
@@ -2126,11 +2241,15 @@ struct ReplyStream::Impl {
             const char c = *p;
             att.push_back(c);
             lhold.push_back(c);
-            const std::string& ne = F.name_end_core;
             if (lhold.size() > kMaxLooseName) { fail_attempt(); return p + 1; }
-            if (lhold.size() >= ne.size() &&
-                lhold.compare(lhold.size() - ne.size(), ne.size(), ne) == 0) {
-                const std::string_view nm(lhold.data(), lhold.size() - ne.size());
+            const std::string* ne = &F.name_end_core;
+            auto ends = [&](const std::string& s) {
+                return !s.empty() && lhold.size() >= s.size() &&
+                       lhold.compare(lhold.size() - s.size(), s.size(), s) == 0;
+            };
+            if (!ends(*ne) && ends(F.name_end_json_core)) ne = &F.name_end_json_core;
+            if (ends(*ne)) {
+                const std::string_view nm(lhold.data(), lhold.size() - ne->size());
                 if (nm.empty() || nm.find('<') != std::string_view::npos) {
                     fail_attempt();
                     return p + 1;
@@ -2153,10 +2272,12 @@ struct ReplyStream::Impl {
             const std::string& ap = F.f.arg_prefix;
             const std::string& fc = F.end_core;
             const std::string& cc = F.cc_core;
+            const std::string& sc = F.section_close_core;
             const bool a_ok = extends(ap, c);
             const bool f_ok = extends(fc, c);
             const bool c_ok = wrapped && extends(cc, c);
-            if (!a_ok && !f_ok && !c_ok) {
+            const bool s_ok = !sc.empty() && extends(sc, c);
+            if (!a_ok && !f_ok && !c_ok && !s_ok) {
                 lenient();
                 st = St::Junk;
                 ds = 0;
@@ -2171,6 +2292,7 @@ struct ReplyStream::Impl {
             if (a_ok && lpos == ap.size()) { start_arg(); return p + 1; }
             if (f_ok && lpos == fc.size()) { finish_call_strictness(); end_core_done(); return p + 1; }
             if (c_ok && lpos == cc.size()) { end_call_at_close(); return p + 1; }
+            if (s_ok && lpos == sc.size()) { abandon_call_at_section_close(); return p + 1; }
             return p + 1;
         }
 
@@ -2180,6 +2302,7 @@ struct ReplyStream::Impl {
                          name.append(q, n);
                          if (loose && std::memchr(q, '<', n)) name_lt = true;
                      });
+            json_tag = hit == 1;
             if (name_lt) { end_loose_call_at_arg(hit >= 0); return p; }
             if (hit >= 0) { name += name_end(); begin_value(); }
             return p;
@@ -2251,6 +2374,8 @@ struct ReplyStream::Impl {
             p = scan(F.junk, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
             if (hit == 0) start_arg();
             else if (hit == 1) end_core_done();
+            else if (hit >= 0 && (size_t)hit == F.body_section_close_hit)
+                abandon_call_at_section_close();
             else if (hit == 2 && wrapped) end_call_at_close();
             else if (hit == 2) text_out(F.cc_core.data(), F.cc_core.size());
             return p;
@@ -2803,6 +2928,10 @@ struct ReplyStream::Impl {
             break;
         default:
             break;
+        }
+        if (section_active) {
+            lenient();
+            section_active = false;
         }
         hold.clear();
         ds = 0;

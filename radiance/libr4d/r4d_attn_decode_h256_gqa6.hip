@@ -132,13 +132,25 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr float PGROW  = D::GROW;
 
     __shared__ uint16_t sK[KLDS ? TILE * KSTR : 1];
-    __shared__ uint16_t sV16[V8 ? 1 : HEAD_DIM * VSTR];
+    // V4 at TILE 16: dim octet o's 8 rows start S(o) = 16 (o & 3) + 8 ((o >> 2) & 1) + 128 (o >> 2)
+    // halfwords later, so the 4 (8) octets of a storeV4 store land on distinct banks (unskewed they
+    // share them: 8 rows = 96 dwords = 0 mod 32). The 128 (o >> 2) term (64 dwords, unseen by the
+    // banks) keeps octet o's last row clear of octet o + 1's first; multiples of 8 halfwords keep the
+    // b128 PV read aligned. NWARPS 1 keeps the plain tile: its 10 workgroups a WGP would not fit.
+    constexpr int VSK  = (V4 && TILE == 16 && CTG && NWARPS >= 2) ? 1 : 0;
+    constexpr int VSKN = HEAD_DIM / 8 - 1;
+    constexpr int VSKX = VSK ? 16 * (VSKN & 3) + 8 * ((VSKN >> 2) & 1) + 128 * (VSKN >> 2) : 0;
+    __shared__ uint16_t sV16[V8 ? 1 : HEAD_DIM * VSTR + VSKX];
     /* A code-tile row is 16 keys + 8 padding = 24 bytes (six dwords): the sixteen lanes of a
      * fragment read hit distinct banks, and a lane's eight codes are one aligned 8-byte load. */
     constexpr int VSTR8 = TILE + 8;
     __shared__ uint8_t sV8[V8 ? HEAD_DIM * VSTR8 : 1];
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // The launch is NTHR threads. Stated (k6_v4), so the V4 rounds wholly below NP4 lose their range
+    // test: as exec-masked blocks, each round's loads issued only after the previous round's returned.
+    // fp8_v4 keeps the tested rounds: batched there, its 4-row steps ran 6 % slower.
+    if constexpr (K6) __builtin_assume(tid < NTHR);
     const int c = lane & 15, h = lane >> 4;
 
     const int sp = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
@@ -219,12 +231,19 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // scale, widened with packed f16 into one dword a dim), fetched in the tile: no prefetch.
     constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
-    uint32_t v4c[U4][2], v4s[U4];
+    // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited on
+    // right after it is issued. fp8_v4 packs here, as the prefill kernel does.
+    constexpr int OLDV4 = V4 && !K6;
+    uint32_t v4c[U4][2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
             const int u = tid + r * NTHR;
-            if (NP4 % NTHR == 0 || u < NP4) {
+            // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
+            // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
+            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
+                || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
+                                  : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
                 uint32_t sc[2];
                 #pragma unroll
@@ -237,7 +256,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
-                v4s[r] = sc[0] | (sc[1] << 16);
+                if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
+                else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
             }
         }
     };
@@ -246,16 +266,21 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
             const int u = tid + r * NTHR;
-            if (NP4 % NTHR == 0 || u < NP4) {
+            // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
+            // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
+            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
+                || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
+                                  : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
                 // Two's complement nibbles; ^ 8 makes them offset binary (value + 8).
                 const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
+                const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
                 const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
-                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
+                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
+                                      + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
                 #pragma unroll
                 for (int b = 0; b < 4; ++b) {
                     const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
@@ -507,13 +532,18 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     const uint2 y = swap16_u2p((h == 0) ? hi2 : lo);
                     p16 = (h == 0) ? D::mk(lo, y) : D::mk(y, hi2);
                 }
-                const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0);
+                // Skewed tile: row 16 G + c is in octet 2 G + (c >> 3), so its S is 16 (c >> 3) here
+                // plus 32 (G & 1) + 8 ((G >> 1) & 1) + 128 (G >> 1), a compile-time offset below.
+                const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0)
+                                      + (VSK ? 16 * (c >> 3) : 0);
                 #pragma unroll
                 for (int g = 0; g < NKS; g += PF) {
                     frag16 vb[PF];
                     #pragma unroll
                     for (int j = 0; j < PF; ++j) {
-                        const uint16_t* vp = vbase + (g + j) * 16 * VSTR;
+                        const uint16_t* vp = vbase + (g + j) * 16 * VSTR
+                            + (VSK ? 32 * ((g + j) & 1) + 8 * (((g + j) >> 1) & 1) + 128 * ((g + j) >> 1)
+                                   : 0);
                         if (V8) {
                             uint32_t w4[4];
                             fp8x8_to_16x4w<D>(*(const uint2*)&sV8[(c + (g + j) * 16) * VSTR8 +
@@ -620,7 +650,12 @@ void r4dchain_attn_decode(const R4DArgs a, int splits)
 // to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
 // each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
 // No barrier and no LDS, so rows in one block may have different contexts and segment counts.
-template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ>
+//
+// SPAN: merge only rows [cu_q[0], cu_q[num_seqs]). A launch over part of a step (ArPieces' pieces,
+// a mixed step's prefill half) gets q and out whole with cu_q at its own first row; r4d_q_seq
+// would map any other row onto this launch's first or last sequence and overwrite it. The decode
+// launchers never offset cu_q and do not instantiate it.
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
@@ -629,6 +664,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     const int job  = blockIdx.x * JPB + (int)(threadIdx.x >> 5);
     if (job >= r4d_q_total(a) * a.q_heads) return;
     const int tok = job / a.q_heads;
+    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
     const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
     const int ctx = a.seqused_k[seq];
     uint16_t* outp = (uint16_t*)a.out + (size_t)job * HEAD_DIM + lane * DPL;
@@ -778,12 +814,12 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     finish(ob);
 }
 
-template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
 {
-    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
-                                                                   R4DGateQuant{});
+    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0, SPAN>(a, splits, tile,
+                                                                         R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
 __global__ __launch_bounds__(32 * JPB)
@@ -804,8 +840,9 @@ void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int til
 
 // Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 reads
 // unnormalised f32 partials with l summed separately. Both walk segments in fixed index order so
-// rounding never depends on workgroup scheduling.
-template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ>
+// rounding never depends on workgroup scheduling. SPAN as in the vectorised form (the return is
+// block-uniform, ahead of every barrier).
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
@@ -813,6 +850,7 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     __shared__ float red[HEAD_DIM];
     const int job = blockIdx.x, d = threadIdx.x;
     const int tok = job / a.q_heads;
+    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
     const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
     const int ctx = a.seqused_k[seq];
 
@@ -922,11 +960,11 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     finish(f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f));
 }
 
-template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int SPAN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
 {
-    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
+    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0, SPAN>(a, splits, tile, R4DGateQuant{});
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
@@ -958,11 +996,20 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // head_dim f16, written once and read once): at eight requests 12.8 MB at splits 32 vs 3.2 MB at
 // 8, 19% of a 16K step's KV but 1.2% at 128K. The effect fades with depth, never enough to need a
 // context term.
+//
+// The target is 256 workgroups where a workgroup has one or two waves (q_len * gqa <= 32: a plain
+// decode, or a 4-row verify of the DFlash2 short block), 128 otherwise: a one- or two-wave
+// workgroup keeps too few KV bytes in flight to load the card's DRAM at 128 (Qwen3.8-27B TP2,
+// k6_v4: one row over 100k 264 -> 175 us, a decode step at speculation 7 -4.5 %; 4x and 8x the
+// target were worse than 2x). At three waves (an 8-row verify) more workgroups only add
+// contention (+9 %). The split count already moves with the batch, so the merge sees no new
+// partition.
 static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
     if (a->splits > 0) return a->splits;
     const int tiles = (a->max_ctx + tile - 1) / tile;
     const int units = std::max(1, a->kv_heads * a->num_seqs);
-    int s = 128 / units;
+    const int gqa = a->kv_heads > 0 ? std::max(1, a->q_heads / a->kv_heads) : 1;
+    int s = (a->q_len * gqa <= 32 ? 256 : 128) / units;
     const int cap = tiles / 2;
     if (s > cap) s = cap;
     if (s > tiles) s = tiles;

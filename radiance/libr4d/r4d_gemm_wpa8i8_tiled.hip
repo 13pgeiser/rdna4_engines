@@ -22,6 +22,13 @@
 // nearly every element (perplexity equals the f16 path's). Accumulators are exact int32: a slab is 128
 // products of at most 31 * 127.
 //
+// The weight words a thread stages (the nibbles, the fifth bits, the zero word) are loaded a slab ahead,
+// into registers, right after the staging barrier, so their DRAM round trip runs under the slab's WMMAs
+// instead of in front of the next unpack (as r4d_gemm_mxfp4a8_tiled.hip does). The slab's weight scales
+// are loaded after the WMMAs, just before the fold: held from the top of the slab next to the words they
+// need 240+ VGPRs (spills, and 5 waves a SIMD instead of 6); loaded late the kernel is 224 (4-bit) / 227
+// (5-bit) VGPRs, no spills. Same fold, same WMMA order: bit for bit.
+//
 // Staging: for a code byte c (0..31) and zero z (0..31), (c | 0x80) - z = 128 + (c - z) never drops
 // below 97 or borrows across bytes, and XOR 0x80 gives the two's complement byte of (c - z). Three ALU
 // ops per dword of four weights.
@@ -125,6 +132,20 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
 #pragma unroll
       for (int e = 0; e < 8; ++e) tot[i][j][e] = 0.f;
 
+  // The slab's weight words, loaded a slab ahead (the first one here).
+  wpt_u4 wvn[NW];
+  unsigned hbn[NW], szn[NW];
+  auto wload = [&](int k0_, int g_) {
+#pragma unroll
+    for (int it = 0; it < NW; ++it) {
+      const size_t blk = (size_t)wt[it] * kpb + k0_ / 64 + wkb[it];
+      wvn[it] = *(const wpt_u4*)&Wq[blk * 128 + wlane[it] * 4];
+      if constexpr (BITS == 5) hbn[it] = Whi[blk * 32 + wlane[it]];   // byte s: the fifth bits of k step s
+      szn[it] = Wsz[((size_t)wt[it] * nsz + g_) * 16 + (wlane[it] & 15)];
+    }
+  };
+  wload(0, 0);
+
   for (int k0 = 0, g = 0; k0 < K; k0 += LBK, ++g) {
     // A fragments for the slab, one clause, consumed only at the WMMAs.
     wpt_v2i af[TM][NS];
@@ -134,34 +155,18 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
       for (int st = 0; st < NS; ++st)
         af[i][st] = *(const wpt_v2i*)(abase[i] +
                                       (aoff + (unsigned int)(k0 * 16) + (unsigned int)(st * 256)));
-    // The scales of this slab, issued ahead of the staging that hides their latency.
+    // The activation scales of this slab, issued ahead of the staging that hides their latency.
     float sa[TM];
 #pragma unroll
     for (int i = 0; i < TM; ++i) sa[i] = arow[i][g];
-    float ws[TN][8];
-#pragma unroll
-    for (int j = 0; j < TN; ++j) {
-      int t = (n0 + wn * TN * 16 + j * 16) >> 4;
-      t = t < ntile_last ? t : ntile_last;
-      const wpt_u4* p = (const wpt_u4*)(Wsz + ((size_t)t * nsz + g) * 16 + kb8);
-      const wpt_u4 v0 = p[0], v1 = p[1];
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        ws[j][e]     = __half2float(__ushort_as_half((unsigned short)(v0[e] & 0xFFFFu)));
-        ws[j][4 + e] = __half2float(__ushort_as_half((unsigned short)(v1[e] & 0xFFFFu)));
-      }
-    }
     // W slab -> LDS as int8 (code - zero), by true k.  A dword's element e is nibble 2e (e < 4) or
     // 2(e-4)+1, and k = 8*(e>>2) + 4*(lane>>4) + (e&3): a lane writes its elements 0..3 at
     // k = 4*(lane>>4) and 4..7 at +8, and the WMMA reads eight consecutive bytes.
 #pragma unroll
     for (int it = 0; it < NW; ++it) {
-      const size_t blk = (size_t)wt[it] * kpb + k0 / 64 + wkb[it];
-      const wpt_u4 wv = *(const wpt_u4*)&Wq[blk * 128 + wlane[it] * 4];
-      unsigned hb4 = 0;
-      if constexpr (BITS == 5) hb4 = Whi[blk * 32 + wlane[it]];   // byte s: the fifth bits of k step s
-      const unsigned sz = Wsz[((size_t)wt[it] * nsz + g) * 16 + (wlane[it] & 15)];
-      const unsigned zz = ((sz >> 16) & 0x1Fu) * 0x01010101u;     // high half is -(1024 + zero) in f16
+      const wpt_u4 wv = wvn[it];
+      const unsigned hb4 = BITS == 5 ? hbn[it] : 0u;
+      const unsigned zz = ((szn[it] >> 16) & 0x1Fu) * 0x01010101u;   // high half is -(1024 + zero) in f16
 #pragma unroll
       for (int s_ = 0; s_ < 4; ++s_) {
         const unsigned w = wv[s_];
@@ -177,6 +182,7 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
       }
     }
     lds_barrier();
+    if (k0 + LBK < K) wload(k0 + LBK, g + 1);   // the next slab's weight flies across this slab's WMMAs
 
     wpt_v8i gacc[TM][TN];
 #pragma unroll
@@ -196,6 +202,21 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
           gacc[i][j] = step == 0
               ? __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, wf[j], true, af[i][step], (wpt_v8i)(0), false)
               : __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, wf[j], true, af[i][step], gacc[i][j], false);
+    }
+    // The weight scales of this slab, loaded only now: held from the top of the slab they would not fit
+    // next to the words held ahead.
+    float ws[TN][8];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      int t = (n0 + wn * TN * 16 + j * 16) >> 4;
+      t = t < ntile_last ? t : ntile_last;
+      const wpt_u4* p = (const wpt_u4*)(Wsz + ((size_t)t * nsz + g) * 16 + kb8);
+      const wpt_u4 v0 = p[0], v1 = p[1];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        ws[j][e]     = __half2float(__ushort_as_half((unsigned short)(v0[e] & 0xFFFFu)));
+        ws[j][4 + e] = __half2float(__ushort_as_half((unsigned short)(v1[e] & 0xFFFFu)));
+      }
     }
 #pragma unroll
     for (int i = 0; i < TM; ++i)

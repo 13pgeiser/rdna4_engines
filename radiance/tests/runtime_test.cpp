@@ -18,6 +18,9 @@
 #include "runtime/ctx.h"
 #include "runtime/kvbind.h"
 #include "mem/kv.h"
+#include "kvstream/bind.h"
+#include "kvstream/plan.h"
+#include "kvstream/stage.h"
 #include "runtime/rank_barrier.h"
 #include "runtime/residency.h"
 #include "runtime/wtab.h"
@@ -993,6 +996,26 @@ TEST(an_op_outside_the_window_on_lane_0_joins_the_second_lane_first) {
     }));
 }
 
+/* An op that names no buffer -- a weight read into the cache (prefetch_beside) -- touches nothing the
+ * window keeps live, so on lane 1 it runs outside the window too (a drafter's reads beside its
+ * all-reduces come after the trunk's window). */
+TEST(an_op_naming_no_buffer_runs_on_the_second_lane_outside_its_window) {
+    Fixture f;
+    f.P.scratch_regions = 2;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    rad_op a1 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" }, nullptr, { w });
+    f.P.lane1_w0 = f.P.lane1_w1 = (int32_t)a0;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_W(w) };
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(a1, opd, 1, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+    }));
+}
+
 /* Operands are positional (spec §2.3), so a miscount is silent numerical garbage at the kernel,
  * not a diagnosable failure. The runtime checks the given arity against the schema. */
 TEST(operand_arity_is_checked_against_the_schema) {
@@ -1676,6 +1699,9 @@ TEST(too_many_operands_or_an_unknown_handle_is_refused) {
 /* ================================================================== KV operands */
 namespace {
 alignas(64) uint16_t g_kv_pool[4 * 2048];
+/* One layer of a 13-layer group's context: [8 blocks, 2 heads, 4 tokens, 2*4] fp8 = 512 B. A
+ * prefill pool for a streamed group is this deep, not 13 of these. */
+alignas(64) uint8_t g_alias_pool[8 * 2 * 4 * 2 * 4];
 
 /* Group 1: full attention over layers 3, 7 and 11, rank 4. Group 2: a conv state, rank 3, over
  * layer 0. Group 0 is the sentinel every handle table carries, with no pool. */
@@ -1780,6 +1806,132 @@ TEST(kv_pools_bind_each_layer_to_its_place_in_the_group) {
     CHECK_EQ(b[3].shape[0], (int64_t)5); CHECK_EQ(b[3].shape[1], (int64_t)32);
     CHECK_EQ(b[3].shape[2], (int64_t)7);
     CHECK_EQ(b[3].layer_slot[2], 0);
+}
+
+/* A streamed group's prefill pool is ONE layer deep and every layer of the group addresses it.
+ *
+ * Above `qsa_exact_to` one prefill launch selects 70-100% of the live history (docs/KV-STREAMING.md
+ * §3.5), so a decode-sized ring overflows and the prefill path stages one layer's history into an
+ * identity-layout buffer instead. Layer L is staged into that buffer, read, and then overwritten by
+ * layer L+1, so the buffer is one layer deep rather than `n_layers` deep: 128 MiB at 262K fp8 on
+ * two ranks, against 1.66 GiB.
+ *
+ * The operand resolution accepts it, and the depth is the whole arithmetic: `layer_slot` is a
+ * lookup and the only bound is `off + layer_stride <= bytes` (runtime/issue.cpp:781-789), which a
+ * one-layer-deep pool satisfies at `off == 0` for every layer. This case pins that, pins that an
+ * identity table over the same pool is refused (so the depth is not silently tolerated), and pins
+ * the two facts that make aliasing a *binding* change rather than a hand-built layer table: the
+ * same table is the host mirror's row (`rad_kv_layer_index`, arch/common/rad_arch.h:1028-1032), so
+ * mapping every layer to 0 collapses the mirror; and bind_kv_pools derives the table from each
+ * layer's position in the group, so an aliased table cannot come from it. */
+TEST(a_streamed_groups_layers_may_all_alias_one_pool_slot) {
+    const int64_t n_blocks = 8, heads = 2, block = 4, hd = 4;
+    const int64_t lbpb = heads * block * 2 * hd;   /* one block of ONE layer */
+    const int64_t stride = n_blocks * lbpb;        /* one whole layer: the stage's depth */
+    const int64_t shape[4] = { n_blocks, heads, block, 2 * hd };
+    const int64_t st[4] = { heads * block * 2 * hd, block * 2 * hd, 2 * hd, 1 };
+
+    Fixture f;
+    f.kv.assign(2, rad::KVPoolBinding{});
+    rad::KVPoolBinding& alias = f.kv[1];
+    alias.base = g_alias_pool;
+    alias.layer_stride = stride;
+    alias.bytes = stride;                 /* 13 layers share these bytes */
+    alias.depth = 1;                      /* every layer resolves to offset 0 */
+    alias.dtype = RAD_F8E4M3;
+    alias.layer_slot.assign(13, 0);
+    for (int l = 0; l < 13; ++l) alias.layer_slot[(size_t)l] = l;   /* the MIRROR row */
+    alias.rank = 4;
+    for (int d = 0; d < 4; ++d) alias.shape[d] = shape[d];
+    rad_op op = loose_op(f, "attn_paged");
+    CHECK_OK(f.start());
+
+    /* The recorder keeps eight operands, so the 13 layers go in two issues. Every layer reads the
+     * same pool base because `depth` is 1, and the operand's shape follows the stage view. */
+    for (int first = 0; first < 13; first += 8) {
+        const int last = first + 8 < 13 ? first + 8 : 13;
+        std::vector<RadOperand> some;
+        for (int l = first; l < last; ++l) some.push_back(RAD_KV(1, l));
+        CHECK_OK(issue_once(f, first, op, some));
+        REQUIRE_EQ(g_rec.size(), (size_t)1);
+        REQUIRE_EQ(g_rec[0].n_t, last - first);
+        for (int l = first; l < last; ++l) {
+            const RadTensor& t = g_rec[0].t[l - first];
+            CHECK(t.data == (void*)g_alias_pool);
+            CHECK_EQ((int)t.rank, 4);
+            CHECK_EQ((int)t.dtype, (int)RAD_F8E4M3);
+            for (int d = 0; d < 4; ++d) {
+                CHECK_EQ(t.shape[d], shape[d]);
+                CHECK_EQ(t.stride[d], st[d]);
+            }
+        }
+    }
+
+    /* The mirror's row comes from the same lookup, which is why aliasing has to be a depth of the
+     * binding and not a rewritten layer_slot: with depth 1 every layer would read layer 0's mirror
+     * row. The lookup itself is untouched and still positional. */
+    for (int l = 0; l < 13; ++l) CHECK_EQ(f.ctx.kv_layer_index(1, l), (int64_t)l);
+
+    /* The same one-layer-deep pool with depth 0 is a positional table, and `bytes` is the only
+     * bound: it serves exactly layer 0 and refuses the rest. This is what makes the aliasing a
+     * deliberate depth rather than something issue.cpp silently tolerates. */
+    Fixture g;
+    g.kv.assign(2, rad::KVPoolBinding{});
+    g.kv[1] = alias;
+    g.kv[1].depth = 0;
+    for (int l = 0; l < 13; ++l) g.kv[1].layer_slot[(size_t)l] = l;
+    rad_op op_g = loose_op(g, "attn_paged");
+    CHECK_OK(g.start());
+    refused(g, issue_once(g, 0, op_g, { RAD_KV(1, 1) }), RAD_E_INVAL, "outside the");
+    next_step_clean(g, 1, op_g, { RAD_KV(1, 0) });
+
+    /* The plan's arithmetic: the ring is n_slots blocks of every layer, the stage is the context
+     * one layer deep, and the carve is their maximum, never their sum. */
+    rad::KVGroupPlan p;
+    p.kind = RAD_KV_FULL;
+    p.n_layers = 13;
+    p.n_blocks = n_blocks;
+    p.n_slots = 2;                        /* a decode-sized ring, smaller than the context */
+    p.depth = 1;
+    p.block_size = block;
+    p.bytes_per_block = 13 * lbpb;
+    CHECK_EQ(p.layer_stride(), 2 * lbpb);
+    CHECK_EQ(p.streamed(), true);
+    CHECK_EQ(p.n_blocks * p.layer_bytes_per_block(), stride);  /* one layer, not 13 */
+    CHECK_EQ(rad::kv_ring_bytes(p, 2), 2 * 13 * lbpb);
+    CHECK_EQ(rad::kv_pool_bytes(p), 2 * 13 * lbpb);           /* ring wins here */
+    CHECK_EQ(rad::kv_ceiling_bytes(p, 200, 2), 200 * lbpb);   /* stage wins at context */
+
+    /* The engine's own builder places each bound layer at its position in the group and keeps the
+     * pool alias a view, so both views are fixed from bring-up and the ring is active first. */
+    Program P;
+    P.kv_groups.resize(2);
+    P.kv_groups[1].decl.kind = RAD_KV_FULL;
+    P.kv_groups[1].decl.n_head_kv = heads;
+    P.kv_groups[1].decl.head_dim = hd;
+    for (int l = 0; l < 13; ++l) P.kv_groups[1].layers.push_back(l);
+    std::vector<rad::KVGroupPlan> plans(2);
+    plans[1] = p;
+    plans[1].base = g_alias_pool;
+    plans[1].pool_bytes = rad::kv_pool_bytes(p);
+    std::vector<rad::KVPoolBinding> b;
+    rad::bind_kv_pools(P, [&](int32_t x) -> const rad::KVGroupPlan* {
+        return x == 0 ? nullptr : &plans[(size_t)x];
+    }, &b);
+    REQUIRE_EQ(b.size(), (size_t)2);
+    REQUIRE_EQ(b[1].layer_slot.size(), (size_t)13);
+    for (int l = 0; l < 13; ++l) CHECK_EQ(b[1].layer_slot[(size_t)l], l);
+    REQUIRE(b[1].has_stage);
+    CHECK_EQ(b[1].depth, 0);                       /* the ring is the active view */
+    CHECK_EQ(b[1].layer_stride, 2 * lbpb);
+    CHECK_EQ(b[1].shape[0], 2);
+    CHECK_EQ(b[1].stage.layer_stride, stride);
+    CHECK_EQ(b[1].stage.shape0, n_blocks);
+    rad::kv_binding_enter(b[1], rad::KVView::Stage);
+    CHECK_EQ(b[1].depth, 1);
+    CHECK_EQ(b[1].layer_stride, stride);
+    CHECK_EQ(b[1].shape[0], n_blocks);
+    for (int l = 0; l < 13; ++l) CHECK_EQ(rad::kv_binding_offset(b[1], l), 0);
 }
 
 /* ================================================================== arena levels */
@@ -2197,6 +2349,65 @@ TEST(the_pass_key_changes_with_the_arena_level) {
     CHECK(f.ctx.pass_key(&b) != k0);
     CHECK_OK(f.ctx.set_level(0));
     CHECK_EQ(f.ctx.pass_key(&b), k0);
+}
+
+/* A streamed pass's key names the memory its view reads, not the address of the struct that
+ * carries it, which rotates through the builder's Out slots: keyed on that, no streamed decode pass
+ * would ever replay. Two views with the same bytes must agree, a view that hands a kernel different
+ * memory must not, and on a card the same streamed pass twice must play. The host backend records
+ * no tape, so only the key is checked there. */
+TEST(a_streamed_pass_is_keyed_by_its_view_and_replays) {
+    Fixture f;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+
+    std::vector<int32_t> res(64, -1), sblk(64, -1), sst(128, 0), ctl(16, 0);
+    std::vector<uint8_t> host(1024, 0);
+    RadKVStream view{};
+    view.host = host.data(); view.res = res.data(); view.slot_block = sblk.data();
+    view.slot_state = sst.data(); view.ctl = ctl.data();
+    view.block_bytes = 16; view.host_layer_stride = 1024; view.slots = 64;
+    view.host_bytes = 2048;
+
+    RadKVGroupBatch kg[1]{};
+    f.batch.kv = kg;
+    f.batch.n_kv_groups = 1;
+    f.batch.phase = RAD_PHASE_DECODE;
+    f.batch.n_tok = 1; f.batch.n_seq = 1;
+
+    kg[0].stream = &view;
+    const uint64_t k0 = f.ctx.pass_key(&f.batch);
+    CHECK(k0 != 0);
+    /* The Out slot moves; the bytes a kernel reads do not. */
+    RadKVStream copy = view;
+    kg[0].stream = &copy;
+    CHECK_EQ(f.ctx.pass_key(&f.batch), k0);
+    /* A different ring or a different map is a different pass. */
+    copy.slots = view.slots + 1;
+    CHECK(f.ctx.pass_key(&f.batch) != k0);
+    copy = view;
+    copy.res = res.data() + 1;
+    CHECK(f.ctx.pass_key(&f.batch) != k0);
+
+    kg[0].stream = &view;
+    const auto body = [&](Ctx& c) {
+        const RadOperand o[1] = { RAD_B(x) };
+        CHECK_OK(c.issue(op, o, 1, RAD_N_BATCH));
+    };
+    /* First sighting records, the second is the audit every recording gets before its first play,
+     * the third is the play. A key that moved each step would never get past the first. */
+    /* The first pass settles the runtime state the key also names (the host-touch and scratch
+     * flags a pass leaves behind), then: one sighting records, the next is the audit every
+     * recording gets before its first play, the third is the play. A key that moved with the view
+     * slot would never get past the first. */
+    for (int i = 0; i < 4; ++i) CHECK_OK(f.step(1, i, body));
+    if (f.ctx.records_passes()) {
+        const Ctx::PassCounts pc = f.ctx.pass_counts();
+        CHECK(pc.recorded > 0);
+        CHECK(pc.audited > 0);
+        CHECK(pc.played > 0);              /* the streamed pass replayed, not reissued */
+    }
 }
 
 /* ================================================================== the op oracle */

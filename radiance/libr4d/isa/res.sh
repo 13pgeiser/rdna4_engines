@@ -7,33 +7,36 @@
 # SPILL IS THE LOUD COLUMN, and SCRATCH after it: spilled registers are a memory round trip the
 # source does not show, and scratch without spills is a private array the compiler could not keep
 # in registers. WAVES is the other one: on gfx1201 a SIMD has 1536 VGPRs in wave32 allocated in
-# groups of 8, so 256 VGPRs is 6 waves and 128 is 12 -- and LDS can cut it further, which this
-# column does NOT model.
+# groups of 24, so 96 VGPRs is 16 waves, 97 is 12 and 256 is 5 -- and LDS can cut it further, which
+# this column does NOT model.
 #
-# The metadata is msgpack printed as YAML and its keys are ALPHABETICAL, so .vgpr_count comes after
-# .symbol and .sgpr_count before it. Emitting a row at .symbol prints the previous kernel's VGPR
-# count. The row is flushed at .wavefront_size, which is last.
+# It fails rather than printing an empty table: no .hip.o under BUILD, a code object that will not
+# extract, a note read that fails, or not one kernel in the whole tree all exit 1. An instrument
+# that reports "nothing to see" and exits 0 reads like a clean tree.
 : "${ROCM:=/opt/rocm}"
 : "${BUILD:=build}"
 : "${ISA_OUT:=/tmp/r4disa}"
-D="$ISA_OUT/res"; rm -rf "$D"; mkdir -p "$D"
 here=$(cd "$(dirname "$0")" && pwd)
-for o in $(find "$BUILD" -name '*.hip.o'); do
+D="$ISA_OUT/res"; rm -rf "$D"; mkdir -p "$D"
+objs=$(find "$BUILD" -name '*.hip.o' 2>/dev/null | sort)
+[ -n "$objs" ] || {
+  echo "res.sh: no .hip.o under $BUILD" >&2
+  echo "res.sh: BUILD wants a configured build tree with device kernels (RAD_WITH_HIP=ON)" >&2
+  exit 1
+}
+for o in $objs; do
   n=$(basename "$o" .hip.o)
-  ISA_OUT="$D" "$here/co.sh" "$o" >/dev/null 2>&1 || continue
-  "$ROCM/llvm/bin/llvm-readelf" --notes "$D/$n.co" 2>/dev/null > "$D/$n.md"
+  # A HIP translation unit with no kernels carries no .hip_fatbin; that is not a broken object.
+  "$ROCM/llvm/bin/llvm-readelf" -S "$o" 2>/dev/null | grep -q '\.hip_fatbin' || continue
+  ISA_OUT="$D" "$here/co.sh" "$o" >/dev/null || {
+    echo "res.sh: no gfx1201 code object in $o" >&2; exit 1; }
+  "$ROCM/llvm/bin/llvm-readelf" --notes "$D/$n.co" > "$D/$n.md" || {
+    echo "res.sh: llvm-readelf failed on $D/$n.co" >&2; exit 1; }
 done
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' vgpr sgpr lds scratch spill waves wg kernel
-awk -v OFS='\t' '
-  /^ *\.group_segment_fixed_size:/   { lds = $2 }
-  /^ *\.private_segment_fixed_size:/ { sc  = $2 }
-  /^ *\.sgpr_count:/                 { s   = $2 }
-  /^ *\.sgpr_spill_count:/           { ss  = $2 }
-  /^ *\.vgpr_count:/                 { v   = $2 }
-  /^ *\.vgpr_spill_count:/           { vs  = $2 }
-  /^ *\.max_flat_workgroup_size:/    { wg  = $2 }
-  /^ *\.name:/                       { nm  = $2 }
-  /^ *\.wavefront_size:/ { if (nm != "") { g = int((v + 7) / 8) * 8; w = (g > 0) ? int(1536 / g) : 16
-                                           if (w > 16) w = 16
-                                           print v, s, lds, sc, vs + ss, w, wg, nm; nm = "" } }
-' "$D"/*.md | sort -k5,5nr -k4,4nr -k1,1nr
+rows=$(awk -f "$here/rows.awk" "$D"/*.md | sort -k5,5nr -k4,4nr -k1,1nr) || exit 1
+[ -n "$rows" ] || {
+  echo "res.sh: no kernel metadata in $D (every object was host-only, or the ISA_ARCH is absent)" >&2
+  exit 1
+}
+printf '%s\n' "$rows"

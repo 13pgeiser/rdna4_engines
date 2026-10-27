@@ -87,3 +87,113 @@ __device__ __forceinline__ void r4d_ar_link_landed(long long* gate, long long wo
 __device__ __forceinline__ bool r4d_ar_seq_behind(unsigned int flag, unsigned int want) {
   return (int)(flag - want) < 0;
 }
+
+// ---- The push check. A peer's push over PCIe P2P can land after its release flag (measured on 2x
+// R9700: the reader sometimes found the slot's previous contents right after the handshake, and
+// the new bytes ~1 us later), so the flag alone does not say the bytes are there. The pushed bytes
+// wait in the writer's L2 for the release's writeback, and that writeback and the flag store reach
+// the peer by different paths. The writer sums mix(dword, index) over what it pushes and stores the
+// block's sum, salted with its handshake value, into the peer's check word for (slot, block):
+// fine-grained words after the flags (r4d_ar_entry.hip sizes the allocation). The reader sums the
+// same over the bytes it is about to read and reads again until the two agree. A stale element and
+// a stale check word (an older handshake value) both disagree, so only the landed push passes; the
+// order the two land in does not matter. The sum is order-free, so writer and reader may split the
+// bytes differently.
+#define R4D_ARCHK_SALT 0x6C8E9CF5u
+// wall_clock64 ticks (100 MHz): 2 s. A push that never lands is a lockstep fault, so the reader traps.
+#define R4D_ARCHK_DEADLINE 200000000ull
+#define R4D_ARCHK_U16 0x80000000u    // index space of 16-bit fields (wire scales), apart from dwords
+
+// MurmurHash3's finalizer over (value, index): every bit of the value reaches every bit of the term,
+// so a sum of terms changes when any value does. A linear mix is not enough: (v ^ c_e) summed over
+// a run of indices can lose v entirely, and a message of one repeated value (a test pattern, a
+// zero-filled row) would then pass whatever the slot held.
+__device__ __forceinline__ unsigned int r4d_archk_mix(unsigned int v, unsigned int e) {
+  unsigned int x = v ^ (e * 0x9E3779B9u);
+  x ^= x >> 16; x *= 0x85EBCA6Bu;
+  x ^= x >> 13; x *= 0xC2B2AE35u;
+  x ^= x >> 16;
+  return x;
+}
+// A 16B word at dword index `e`.
+__device__ __forceinline__ unsigned int r4d_archk_u4(int4 v, unsigned int e) {
+  return r4d_archk_mix((unsigned int)v.x, e) + r4d_archk_mix((unsigned int)v.y, e + 1u) +
+         r4d_archk_mix((unsigned int)v.z, e + 2u) + r4d_archk_mix((unsigned int)v.w, e + 3u);
+}
+__device__ __forceinline__ unsigned int r4d_archk_u4(uint4 v, unsigned int e) {
+  return r4d_archk_mix(v.x, e) + r4d_archk_mix(v.y, e + 1u) + r4d_archk_mix(v.z, e + 2u) +
+         r4d_archk_mix(v.w, e + 3u);
+}
+// The check word of (slot, block) in a flags allocation: two parity slots of nbw words after the
+// nbw flags.
+__device__ __forceinline__ unsigned int* r4d_archk_word(unsigned int* flags, unsigned int nbw,
+                                                        unsigned int slot, unsigned int b) {
+  return flags + nbw + slot * nbw + b;
+}
+__device__ __forceinline__ unsigned int r4d_archk_wave_sum(unsigned int h) {
+  for (int o = 16; o > 0; o >>= 1) h += __shfl_xor(h, o, 32);
+  return h;
+}
+
+// Writer: every thread of the block calls this after its pushes, before the handshake's barrier.
+// Thread 0 stores the block's sum into the peer's check word.
+__device__ __forceinline__ void r4d_archk_put(unsigned int h, unsigned int* peer_flags,
+                                              unsigned int nbw, unsigned int slot,
+                                              unsigned int b, unsigned int seq,
+                                              bool release = false) {
+  __shared__ unsigned int s_ckp[32];
+  const unsigned int tid = threadIdx.x, nt = blockDim.x;
+  h = r4d_archk_wave_sum(h);
+  if ((tid & 31u) == 0u) s_ckp[tid >> 5] = h;
+  __syncthreads();
+  if (tid == 0) {
+    unsigned int t = 0u;
+    for (unsigned int w = 0; w < (nt + 31u) / 32u; ++w) t += s_ckp[w];
+    /* The pushed bytes sit in this card's L2 until a system-scope release writes them back. The
+     * flag's release, right after this, does that, so the word itself can be relaxed (the reader
+     * re-reads until the bytes agree with it). Where the flag went out before the push (the test
+     * mode, drain 4) nothing else would write them back before the kernel ends: a release. */
+    unsigned int* const cw = r4d_archk_word(peer_flags, nbw, slot, b);
+    if (release)
+      __hip_atomic_store(cw, t + seq * R4D_ARCHK_SALT, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    else
+      __hip_atomic_store(cw, t + seq * R4D_ARCHK_SALT, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+// Reader: every thread of the block calls this after the handshake; `rehash(h)` adds the thread's
+// share of the bytes the block is about to read, with the same loads the kernel then makes.
+template <typename F>
+__device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned int nbw,
+                                               unsigned int slot, unsigned int b,
+                                               unsigned int seq, const F& rehash) {
+  __shared__ unsigned int s_ckw[32];
+  __shared__ unsigned int s_ckok;
+  const unsigned int tid = threadIdx.x, nt = blockDim.x;
+  const unsigned long long t0 = tid == 0 ? wall_clock64() : 0ull;
+  for (;;) {
+    /* The check word first, so its round trip overlaps the re-hash's loads. Read before the bytes
+     * it is compared with, it can only be older than them, and an older word just fails this try. */
+    const unsigned int want = tid == 0 ? __hip_atomic_load(r4d_archk_word(my_flags, nbw, slot, b),
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                                       : 0u;
+    unsigned int h = 0u;
+    rehash(h);
+    h = r4d_archk_wave_sum(h);
+    if ((tid & 31u) == 0u) s_ckw[tid >> 5] = h;
+    __syncthreads();
+    if (tid == 0) {
+      unsigned int t = 0u;
+      for (unsigned int w = 0; w < (nt + 31u) / 32u; ++w) t += s_ckw[w];
+      const bool ok = t + seq * R4D_ARCHK_SALT == want;
+      if (!ok && wall_clock64() - t0 > R4D_ARCHK_DEADLINE) __builtin_trap();
+      s_ckok = ok ? 1u : 0u;
+    }
+    __syncthreads();
+    if (s_ckok) return;
+    __syncthreads();   // s_ckw and s_ckok are rewritten by the next try
+    /* Drop the vector caches, so the next try reads the bytes from where the push lands. */
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __builtin_amdgcn_s_sleep(2);
+  }
+}

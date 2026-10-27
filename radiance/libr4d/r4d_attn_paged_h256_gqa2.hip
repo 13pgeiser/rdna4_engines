@@ -15,6 +15,7 @@ using std::max;
 // are instantiated here with WIN = 1.
 #include "r4d_attn_prefill_h256_gqa6.hip"
 #include "r4d_attn_decode_h256_gqa6.hip"
+#include "r4d_attn_prefill_split.h"
 
 #define CHK4() do { hipError_t e_ = hipGetLastError(); if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
@@ -53,17 +54,60 @@ extern "C" int r4d_attn_decode_h256_gqa2_qld_bf16kv(const R4DArgs* a, hipStream_
 #define P_TILE   48
 #define P_OPT    3955211
 
+#define P_BQ ((P_NWARPS * 16) / B_GQA)
+
+// ---- the prefill KV split (r4d_attn_prefill_split.h) -------------------------------------------
+// Full-attention launches only (window <= 0). The split's partition has no window floor, so the
+// split instance is the WIN = 0 form, which computes what WIN = 1 does at window <= 0. A windowed
+// launch stays unsplit: its walk is bounded by the window (Gemma 4's 1024 keys: at most
+// (1024 + 192) / 48 = 26 tiles a workgroup, whatever the context), so few workgroups cost little.
+static bool prefill_h256_gqa2_can_split(const R4DArgs* r) { return r->window <= 0; }
+
+// Test hooks (r4d_selftest), not plugin entries: the law at this unit's geometry and this card's
+// WGP count, and the split count this unit's last prefill launch used.
+extern "C" int r4d_attn_prefill_h256_gqa2_splits(int q_len, int total_q, int num_seqs,
+                                                 int kv_heads, int max_ctx) {
+    return r4d_prefill_splits_law(P_BQ, P_TILE, q_len, total_q, num_seqs, kv_heads, max_ctx,
+                                  r4d_prefill_wgps());
+}
+extern "C" int r4d_attn_prefill_h256_gqa2_last_splits(void) { return g_prefill_last_splits; }
+
+// a->splits > 1 with a->scratch set and no window is the split form: segments in the scratch, then
+// the merge. Anything else is the plain (windowed) form, unchanged.
 template <int KVP>
 static int prefill_launch_h256_gqa2(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != B_HEAD_DIM || a->block_size != B_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != B_GQA) return -2;
-    constexpr int BQ = (P_NWARPS * 16) / B_GQA;
-    dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
+    constexpr int BQ = P_BQ;
+    const int splits =
+        (a->scratch && a->splits > 1 && prefill_h256_gqa2_can_split(a)) ? a->splits : 1;
+    g_prefill_last_splits = splits;
+    dim3 grid((a->q_len + BQ - 1) / BQ * splits, a->kv_heads, a->num_seqs);
+    if (splits > 1) {
+        hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, B_HEAD_DIM, B_GQA,
+                                                    B_BLOCK_SIZE, KVP, P_OPT | O_PSPLIT, 0>),
+                           grid, dim3(P_NWARPS * 32), 0, s, *a);
+        CHK4();
+        // The full-attention legs' merge constants, as r4d_decode_launch_win takes them: two rows
+        // a block, the wave form from 256 rows.
+        return r4d_prefill_combine<B_HEAD_DIM, 2, 256>(a, splits, P_TILE, s);
+    }
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, B_HEAD_DIM, B_GQA,
                                                 B_BLOCK_SIZE, KVP, P_OPT, 1>),
                        grid, dim3(P_NWARPS * 32), 0, s, *a);
     CHK4();
     return 0;
+}
+
+/* The split's f32 partials at declare (r4d_prefill_scratch). None for a windowed layer: `window`
+ * is the op's parameter, the same at declare and at every launch, and a windowed launch never
+ * splits. */
+static int64_t prefill_scratch_h256_gqa2(const RadArgs* a) {
+    if (r4d_geti_or(a, "window", 0) > 0) return 0;
+    return r4d_prefill_scratch(a, B_HEAD_DIM, 2LL * B_HEAD_DIM, P_BQ, P_TILE);
+}
+extern "C" int64_t r4d_rad_attn_prefill_h256_gqa2_scratch(const RadArgs* a) {
+    return prefill_scratch_h256_gqa2(a);
 }
 
 extern "C" int r4d_attn_prefill_h256_gqa2_fp8kv(const R4DArgs* a, hipStream_t s) {
@@ -79,11 +123,13 @@ extern "C" int r4d_rad_attn_prefill_h256_gqa2_fp8(const RadArgs* a, RadStream s)
     R4DArgs r;
     int rc = fill_paged(a, &r, B_HEAD_DIM);
     if (rc != RAD_OK) return rc;
+    if (prefill_h256_gqa2_can_split(&r)) r.splits = r4d_prefill_splits(a, &r, P_BQ, P_TILE);
     return r4d_attn_prefill_h256_gqa2_fp8kv(&r, (hipStream_t)s);
 }
 extern "C" int r4d_rad_attn_prefill_h256_gqa2_bf16(const RadArgs* a, RadStream s) {
     R4DArgs r;
     int rc = fill_paged(a, &r, B_HEAD_DIM);
     if (rc != RAD_OK) return rc;
+    if (prefill_h256_gqa2_can_split(&r)) r.splits = r4d_prefill_splits(a, &r, P_BQ, P_TILE);
     return r4d_attn_prefill_h256_gqa2_bf16kv(&r, (hipStream_t)s);
 }
