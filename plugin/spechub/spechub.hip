@@ -199,6 +199,20 @@ __global__ __launch_bounds__(kDfThreads) void dflash_couple(
     const int c = tid / RAD_DFLASH_EDGE_PARTS, j = tid % RAD_DFLASH_EDGE_PARTS;
     for (int64_t l = 0; l < steps; ++l) {
         const int64_t row = s * steps + l;
+        /* What does not depend on the predecessor is loaded first, so its latency overlaps the
+         * predecessor's codebook row: the candidate, its successor slice and its unary score. */
+        const int32_t id = c < K ? cand[row * ld_cand + c] : -1;
+        const bool    id_ok = id >= 0 && id < vocab;
+        const bool    wide = R == 32 * RAD_DFLASH_EDGE_PARTS;
+        uint4 v[4] = {};
+        if (id_ok && wide) {
+            /* DFlash2's rank 256: the slice's 32 values in four 16-byte loads issued together. A
+             * load inside the fmaf chain would wait out one memory latency per element. */
+            const uint4* src = reinterpret_cast<const uint4*>(succ + (int64_t)id * R + j * 32);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = src[i];
+        }
+        const float un = tid < K ? unary[row * ld_unary + tid] : 0.0f;
         const int32_t pid = spid;
         const bool ok = pid >= 0 && pid < vocab;
         for (int64_t r = tid; r < R; r += kDfThreads)
@@ -207,24 +221,16 @@ __global__ __launch_bounds__(kDfThreads) void dflash_couple(
                        : 0.0f;
         __syncthreads();
         if (c < K) {
-            const int32_t id = cand[row * ld_cand + c];
             float pv = 0.0f;
-            if (id >= 0 && id < vocab) {
-                const uint16_t* srow = succ + (int64_t)id * R;
-                if (R == 32 * RAD_DFLASH_EDGE_PARTS) {
-                    /* DFlash2's rank 256: the slice's 32 values in four 16-byte loads issued
-                     * together, then rad_dflash_edge_part's fmaf chain over them in its order. A
-                     * load inside the chain would wait out one memory latency per element. */
-                    const uint4* src = reinterpret_cast<const uint4*>(srow + j * 32);
-                    uint4 v[4];
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) v[i] = src[i];
+            if (id_ok) {
+                if (wide) {
+                    /* rad_dflash_edge_part's fmaf chain over the slice, in its order. */
                     const uint16_t* h = reinterpret_cast<const uint16_t*>(v);
                     const float* a = sa + j * 32;
 #pragma unroll
                     for (int r = 0; r < 32; ++r) pv = fmaf(a[r], rad_dflash_bf2f(h[r]), pv);
                 } else {
-                    pv = rad_dflash_edge_part(sa, srow, R, j);
+                    pv = rad_dflash_edge_part(sa, succ + (int64_t)id * R, R, j);
                 }
             }
             part[tid] = pv;
@@ -237,7 +243,7 @@ __global__ __launch_bounds__(kDfThreads) void dflash_couple(
             if (sid[tid] >= 0 && sid[tid] < vocab)
                 for (int q = 0; q < RAD_DFLASH_EDGE_PARTS; ++q)
                     acc += part[tid * RAD_DFLASH_EDGE_PARTS + q];
-            sc[tid] = unary[row * ld_unary + tid] + acc;
+            sc[tid] = un + acc;
         }
         if (tid < 8) slot_id[tid] = -2;
         __syncthreads();
