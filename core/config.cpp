@@ -298,6 +298,18 @@ static const Flag g_flags[] = {
     "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
     "                                    JSON every 30 s and at shutdown. From the routing histograms the core\n"
     "                                    already copies back: no device work, no synchronisation" },
+    { "--expert-profile",     "FILE",   "rank the expert plane by this radiance-expert-stats JSON's `decode`\n"
+    "                                    counts instead of the container's activation profile, which is\n"
+    "                                    prefill-heavy: decode-hot experts differ. The planner keeps the\n"
+    "                                    hottest resident; --expert-pin-top makes a chosen slice unmovable" },
+    { "--expert-pin-top",     "F",      "pin the hottest fraction F of the routed experts (0 < F <= 1) by\n"
+    "                                    --expert-profile's share: heat never demotes them, so the decode-hot\n"
+    "                                    set stays resident while the rest streams. 0 is off" },
+    { "--draft-expert-placement", "auto|host", "where a draft head's (MTP/DSpark) routed experts live.\n"
+    "                                    `host` pins them in the host pool before any strategy runs, read in\n"
+    "                                    place like a pooled expert: the drafter's experts fit beside a trunk\n"
+    "                                    that already fills the card, instead of the strategy having to make\n"
+    "                                    room on the card. `auto` (the default) leaves them to the strategy" },
     { "--live",               nullptr,  "the live view: cards, throughput, draft acceptance, the expert plane.\n"
     "                                    Redirected it prints one greppable key=value line instead" },
     { "-v",                   nullptr,  "verbose" },
@@ -914,6 +926,27 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
+        else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; c->expert_profile_given = true; }
+        else if (S("--expert-pin-top"))        {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* e = nullptr;
+            const double d = strtod(v, &e);
+            if (e == v || *e != '\0' || d < 0.0 || d > 1.0) {
+                RAD_ERR("--expert-pin-top: '%s' is not a fraction in [0, 1]", v);
+                return RAD_E_INVAL;
+            }
+            c->expert_pin_top = (float)d;
+            c->expert_pin_top_given = true;
+        }
+        else if (S("--draft-expert-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "auto") != 0 && std::strcmp(v, "host") != 0) {
+                RAD_ERR("--draft-expert-placement: '%s' is not auto or host", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_expert_placement = v;
+            c->draft_expert_placement_given = true;
+        }
         else if (S("--live"))                  c->live_view = true;
         else {
             RAD_ERR("unknown option '%s'", a.c_str());
@@ -1235,6 +1268,9 @@ const ShowRow kShow[] = {
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
+    { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },
+    { "--expert-pin-top",     [](const Config& c) { return fmt("%.4g", c.expert_pin_top); } },
+    { "--draft-expert-placement", [](const Config& c) { return c.draft_expert_placement; } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },
     { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
     { "-vv",                  [](const Config& c) { return onoff(c.given.count("-vv") > 0); } },
