@@ -1,5 +1,5 @@
 #!/bin/bash
-# qwen3.8 in 4 bits: radiance .rad containers (27b MXFP4 + DFlash2 drafter, or flash-next fp8 trunk + 4-bit codebook MoE).
+# radiance .rad containers: 27b MXFP4 + DFlash2 drafter, flash-next fp8 trunk + 4-bit codebook MoE, or a 35B-A3B MoE (qwen3.6 / ornith).
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_DIR="/models/rad"
 
@@ -13,14 +13,34 @@ MODEL_DIR="/models/rad"
 FILES=(
       "qwen3.8-27b-mxfp4.rad"
       "qwen3.8-next-flash-fp8-iq4r-moe.rad"
+      "qwen3.6-35b-a3b-fp8.rad"
+      "ornith-1.5-35b-a3b-fp8.rad"
 )
 REPOS=(
       "StillDeadcode/qwen3.8-27b-mxfp4"
       "StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe"
+      "StillDeadcode/qwen3.6-35b-a3b-fp8"
+      "keptn/ornith-1.5-35b-a3b-fp8"
 )
 EXTRAS=(
       "--max-num-seqs 1 --max-model-len 262144"
-      "--max-num-seqs 1 --max-model-len 132144 --weights-disk-tier  --host-pool-mib 115000 --embedding-placement ram --kv-cache-dtype fp8"
+      "--max-num-seqs 1 --max-model-len 132144 --weights-disk-tier --host-pool-mib 115000 --embedding-placement ram --kv-cache-dtype fp8"
+      "--max-num-seqs 1 --max-model-len 200000 --host-pool-mib 16384 --embedding-placement ram --kv-cache-dtype fp8"
+      "--max-num-seqs 1 --max-model-len 262144 --num-speculative-tokens 3 --max-num-batched-tokens 2048 --host-pool-mib 16384 --embedding-placement ram --kv-cache-dtype fp8"
+)
+# Per-model docker -e args. The two 35B-A3B models (16 query heads over 2 KV heads, head_dim
+# 256, gqa 8) abort at a 3-4 row speculative verify: the attn_paged band q_len<=5 (its edge is
+# the gqa-12 rows' q_len*gqa<=64 bound) sizes its split-KV scratch at the band top, where the
+# split law (q_len*gqa 40 > 32 rows) picks 64 segments, but a 4-row verify (32 rows) picks 128
+# and the kernel refuses the undersized buffer (RAD_E_SCRATCH). Pinning splits to 64 keeps the
+# declare-time sizing and the launch in agreement. Workaround until the radiance scratch hook
+# (g8_decode_scratch) takes the band's q_len worst case instead of its top; costs some decode
+# speed while the law would use 128 segments (256 vs 128 workgroups at q_len <= 4).
+ENV=(
+      ""
+      ""
+      "RADIANCE_TUNE=attn_paged:splits=64"
+      "RADIANCE_TUNE=attn_paged:splits=64"
 )
 
 resolve_model() {    # $1 -> model index on stdout; rc!=0 if no unique match
@@ -57,7 +77,10 @@ fi
 MODEL_FILE="${FILES[$IDX]}"
 REPO="${REPOS[$IDX]}"
 EXTRA_FLAGS="${EXTRAS[$IDX]}"
+EXTRA_ENV=()
+[ -n "${ENV[$IDX]}" ] && EXTRA_ENV=(-e "${ENV[$IDX]}")
 echo "serving $MODEL_FILE with EXTRA_FLAGS=$EXTRA_FLAGS"
+[ -n "${ENV[$IDX]}" ] && echo "with ${ENV[$IDX]}"
 
 # -------------------------------
 # docker image (build only if missing)
@@ -68,9 +91,14 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # tokenizer_test 20 -> 25 s, give the gbnf_test shards and glm5next_test 15 s (default 10 s),
     # and give the upgraded arch_test 20 s (it spends ~11 s of CPU here, over the 10 s default)
     # for the build.
+    # Upstream 6c33ee4e (DFlash2 block coupling) reworded the engine's --draft-coupling refusal
+    # without updating the expected string in engine_e2e_test, so
+    # the_coupling_flag_refuses_what_it_cannot_serve_at_startup fails on every build, not just
+    # slow machines: make it expect a prefix of the new message until the test is fixed upstream.
     # Budgets are looked up by binary name, so gbnf_test covers all four shards. Revert on a
     # successful build to keep the subtree clean; a failed build leaves the edits in place.
     cmake="$CURDIR/radiance/tests/CMakeLists.txt"
+    e2e="$CURDIR/radiance/tests/engine_e2e_test.cpp"
     sed -i 's/^set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)/set(RAD_TEST_CPU_BUDGET_tokenizer_test 25)/' "$cmake"
     grep -q '^set(RAD_TEST_CPU_BUDGET_gbnf_test 15)$' "$cmake" || \
 	sed -i '/^set(RAD_TEST_CPU_BUDGET_tokenizer_test 25)/a set(RAD_TEST_CPU_BUDGET_gbnf_test 15)' "$cmake"
@@ -78,11 +106,13 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 	sed -i '/^set(RAD_TEST_CPU_BUDGET_gbnf_test 15)/a set(RAD_TEST_CPU_BUDGET_arch_test 20)' "$cmake"
     grep -q '^set(RAD_TEST_CPU_BUDGET_glm5next_test 15)$' "$cmake" || \
 	sed -i '/^set(RAD_TEST_CPU_BUDGET_arch_test 20)/a set(RAD_TEST_CPU_BUDGET_glm5next_test 15)' "$cmake"
+    sed -i 's/"--draft-coupling on requires the linear serial draft chain "/"--draft-coupling on requires a linear draft chain (a serial head or a block drafter with a coupled walk, depth > 0)";/' "$e2e"
+    sed -i '/"(RAD_DRAFT_SERIAL with depth > 0)";$/d' "$e2e"
     (
 	cd "$CURDIR/radiance" || exit
 	docker build --progress=plain -t "$IMAGE" --build-arg GPU_TARGETS=gfx1201 .
-    ) || { echo "image build failed; $cmake left modified" >&2; exit 1; }
-    git -C "$CURDIR/radiance" checkout -- tests/CMakeLists.txt
+    ) || { echo "image build failed; $cmake and $e2e left modified" >&2; exit 1; }
+    git -C "$CURDIR/radiance" checkout -- tests/CMakeLists.txt tests/engine_e2e_test.cpp
 else
     echo "image $IMAGE already present, skipping build"
 fi
@@ -198,6 +228,7 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     --group-add "$(getent group video | cut -d: -f3)" \
     -v "$MODEL_DIR":/models:ro \
     -e RADIANCE_LOG=info \
+    "${EXTRA_ENV[@]}" \
     "${PRELOAD[@]}" \
     "$IMAGE" --model /models/"$MODEL_FILE" \
     --host :: --port 9931 --tp 1 $EXTRA_FLAGS --kv-cache-dtype fp8 --debug-selection --debug-placement

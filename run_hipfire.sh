@@ -11,14 +11,21 @@ CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAGS=(
       "qwen3.8:27b-mq4-xts"
       "qwen3.8:flash-next-mq4-xts"
+      "qwen3.6:35b-a3b"
+      "ornith-1.5:35b-a3b"
 )
 FILES=(
       "qwen3.8-27b.mq4-xts"
       "qwen3.8-flash-next.mq4-xts"
+      "qwen3.6-35b-a3b.mq4p"
+      "ornith-1.5-35b-a3b.mq4"
 )
 EXTRAS=(
-      ""
-      "--max-seq 262144"
+      ""                   # dense 27B: omitted max_seq auto-sizes to card capacity (free VRAM after
+                           # weights / K+V stride), so it always fits - no flag needed
+      "--max-seq 262144"   # MoE models on a discrete GPU (gfx1201) get NO auto-sizing: it is not
+      "--max-seq 262144"   # validated against expert placement, so an omitted max_seq falls back
+      "--max-seq 262144"   # to a fixed 32768 default and can OOM - pin 262144 explicitly
 )
 
 resolve_tag() {    # $1 -> model index on stdout; rc!=0 if no unique match
@@ -77,7 +84,7 @@ fi
 # model (pulled into host /models)
 # -------------------------------
 if [ ! -f "$MODELS_DIR/$FILE" ]; then
-    docker run --rm -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" "$IMAGE" pull "$TAG"
+    docker run --rm --device /dev/kfd --device /dev/dri -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" "$IMAGE" pull "$TAG"
 fi
 
 # -------------------------------
@@ -86,16 +93,15 @@ fi
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 HOME_VOLUME=hipfire-home
 echo "setting reasoning_effort=$REASONING_EFFORT in $HOME_VOLUME"
-docker run --rm -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT"
+docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT"
 
 # -------------------------------
 # run
 # -------------------------------
 sudo bash -c "echo "210000000" > $(echo /sys/class/drm/card0/device/hwmon/hwmon*/)power1_cap"
 docker rm -f hipfire_server
-docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931 $EXTRA_FLAGS
+docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931 $EXTRA_FLAGS
 # docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/home/hipfire/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" run qwen3.8:27b-mq4-xts "Explain FFT in one line"
-
 
 # qwen3.8:27b-mq4-xts
 #
