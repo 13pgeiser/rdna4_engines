@@ -77,12 +77,67 @@ fn publish_after_forward<E>(forward: Result<(), E>, publish: impl FnOnce()) -> R
 /// single-GPU handler's request>rec_*>arch-default resolution (computed at the
 /// `generate` call site) into `ep_serve_ds4` / `ep_serve_minimax`, which apply
 /// it host-side over the downloaded f32 logits via `llama::sample_full_dist`.
+/// The penalty fields are applied only by the Qwen3.5 dense-TP and MoE-EP
+/// servers ([`qwen_ep_sample`]); the daemon refuses a non-neutral penalty for
+/// every other EP arch (`request_guards::ep_refusal`).
 #[derive(Clone, Copy)]
 pub struct EpSampling {
     pub temp: f32,
     pub top_p: f32,
     pub top_k: Option<u32>,
     pub min_p: Option<f32>,
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+}
+
+impl EpSampling {
+    /// The request's sampler policy as a [`SamplerConfig`], so EP penalizes
+    /// with the single-GPU Qwen AR producer's arithmetic
+    /// ([`sampler::apply_logit_policy_cpu`], the penalty stage of
+    /// `sampler::sample_cpu`). The window is the single-GPU one: the request's
+    /// `repeat_window` (at least 1) bounded by the 2048-token repeat buffer.
+    fn policy(&self) -> SamplerConfig {
+        SamplerConfig {
+            temperature: self.temp,
+            top_p: self.top_p,
+            repeat_penalty: self.repeat_penalty,
+            repeat_window: self
+                .repeat_window
+                .max(1)
+                .min(hipfire_arch_qwen35::mtp_spec::PENALTY_REPEAT_CAP),
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            blocked_tokens: Vec::new(),
+            top_k: self.top_k,
+            min_p: self.min_p,
+        }
+    }
+
+    fn penalties_active(&self) -> bool {
+        self.repeat_penalty != 1.0 || self.presence_penalty != 0.0 || self.frequency_penalty != 0.0
+    }
+}
+
+/// Qwen3.5 EP (dense-TP and MoE) next token: rank 0's downloaded logits get
+/// the request's repeat/presence/frequency penalties over `generated` (the
+/// tokens this request has committed so far, never the prompt: the single-GPU
+/// Qwen AR producer's `ngram_scope`) through
+/// [`sampler::apply_logit_policy_cpu`], then the EP sampler runs. Sampling is
+/// host-side over rank 0's logits (the LM head runs on rank 0 only), so this
+/// is the one place EP can penalize.
+fn qwen_ep_sample(logits: &mut [f32], generated: &[u32], sampling: &EpSampling) -> u32 {
+    if sampling.penalties_active() {
+        sampler::apply_logit_policy_cpu(logits, generated, &sampling.policy());
+    }
+    llama::sample_full_dist(
+        logits,
+        sampling.temp,
+        sampling.top_p,
+        sampling.top_k,
+        sampling.min_p,
+    )
 }
 
 /// Which EP serve body owns a loaded EP model. Pure so the dispatch contract
@@ -908,13 +963,7 @@ pub fn ep_serve_qwen35_dense_tp(
             );
             return;
         }
-        let next = llama::sample_full_dist(
-            &logits,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-        );
+        let next = qwen_ep_sample(&mut logits, &m.conversation_tokens[prompt_n..], &sampling);
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
@@ -1254,13 +1303,7 @@ pub fn ep_serve_qwen35_moe(
             );
             return;
         }
-        let next = llama::sample_full_dist(
-            &logits,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-        );
+        let next = qwen_ep_sample(&mut logits, &m.conversation_tokens[prompt_n..], &sampling);
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
@@ -11319,5 +11362,98 @@ mod qwen4_session_target_tests {
             qwen4_session_target(true, false),
             Qwen4SessionTarget::Unreachable
         );
+    }
+}
+
+#[cfg(test)]
+mod qwen_ep_sample_tests {
+    use super::{qwen_ep_sample, EpSampling};
+    use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
+
+    fn greedy(repeat_penalty: f32, presence_penalty: f32, frequency_penalty: f32) -> EpSampling {
+        EpSampling {
+            temp: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            min_p: None,
+            repeat_penalty,
+            repeat_window: 128,
+            presence_penalty,
+            frequency_penalty,
+        }
+    }
+
+    /// Greedy + penalty over the same history picks the token the single-GPU
+    /// host producer (`sample_cpu`) picks, for every penalty kind.
+    #[test]
+    fn greedy_penalized_sample_matches_sample_cpu() {
+        let history = [3u32, 3, 3, 7, 9, 3, 7];
+        let base: Vec<f32> = (0..16)
+            .map(|i| match i {
+                3 => 5.0,
+                7 => 4.6,
+                9 => 4.4,
+                _ => (i as f32) * 0.1,
+            })
+            .collect();
+        for (rp, pp, fp) in [
+            (1.0, 0.0, 0.0),
+            (1.3, 0.0, 0.0),
+            (1.0, 1.5, 0.0),
+            (1.0, 0.0, 0.4),
+            (1.1, 1.5, 0.2),
+        ] {
+            let sampling = greedy(rp, pp, fp);
+            let cfg = SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                repeat_penalty: rp,
+                repeat_window: 128,
+                presence_penalty: pp,
+                frequency_penalty: fp,
+                blocked_tokens: Vec::new(),
+                top_k: None,
+                min_p: None,
+            };
+            let mut a = base.clone();
+            let mut b = base.clone();
+            assert_eq!(
+                qwen_ep_sample(&mut a, &history, &sampling),
+                sample_cpu(&mut b, &history, &cfg),
+                "rp={rp} pp={pp} fp={fp}"
+            );
+            assert_eq!(a, b, "penalized logits differ for rp={rp} pp={pp} fp={fp}");
+        }
+    }
+
+    /// The penalty window is the single-GPU one: `repeat_window` of at least 1,
+    /// bounded by the 2048-token repeat buffer.
+    #[test]
+    fn policy_window_matches_the_single_gpu_repeat_buffer_bound() {
+        for (asked, effective) in [
+            (0usize, 1usize),
+            (1, 1),
+            (128, 128),
+            (2048, 2048),
+            (5000, 2048),
+        ] {
+            let mut sampling = greedy(1.0, 1.5, 0.0);
+            sampling.repeat_window = asked;
+            assert_eq!(sampling.policy().repeat_window, effective, "asked {asked}");
+        }
+    }
+
+    /// The penalty is not a no-op: a presence penalty flips the argmax off a
+    /// token seen in the window.
+    #[test]
+    fn presence_penalty_moves_the_argmax() {
+        let mut logits = vec![0.0f32; 8];
+        logits[2] = 1.0;
+        logits[5] = 0.5;
+        assert_eq!(
+            qwen_ep_sample(&mut logits.clone(), &[2], &greedy(1.0, 0.0, 0.0)),
+            2
+        );
+        assert_eq!(qwen_ep_sample(&mut logits, &[2], &greedy(1.0, 1.0, 0.0)), 5);
     }
 }

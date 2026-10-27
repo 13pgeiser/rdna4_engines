@@ -2797,6 +2797,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
@@ -2824,6 +2828,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
@@ -3419,6 +3427,24 @@ pub fn generate(
                 };
                 eprintln!(
                     "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
+                );
+            }
+            // Greedy + non-neutral penalty: DFlash verify implements no token
+            // penalties (`select_generation_route`: `qwen_greedy_route`), so the
+            // request is AR. A registry default (qwen3.5:9b general
+            // presence_penalty 1.5, injected by `serve` at tp<=1) triggers this
+            // on every request without the client ever sending a penalty.
+            else if m.speculator.is_some()
+                && route_inputs.nonneutral_penalties
+                && hipfire_loader::carrier_for(m.arch_id)
+                    .map(|c| c.caps().supports_dflash())
+                    .unwrap_or(false)
+                && !route_inputs.force_ar_chat
+            {
+                eprintln!(
+                    "[hipfire] id={id}: DFlash spec disabled -> AR (non-neutral repeat/presence/frequency penalty \
+                     repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty}; DFlash verify applies no penalties; \
+                     the registry default or config generation.presence_penalty may set it, 0 re-enables DFlash). Penalties honored; spec speedup off."
                 );
             }
         }
