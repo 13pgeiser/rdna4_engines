@@ -30,6 +30,61 @@ __global__ void propose(RadMtpCoupleProposeCall c) {
 constexpr int kThreads = 128;
 constexpr int64_t kMaxCand = 1024;
 
+/* The row's live candidates (id >= 0, value != -inf), compacted in ascending index order into `lj`, with
+ * the validity flag (no id >= vocab, NaN or +inf among the ids >= 0) and the maximum value over the
+ * ids >= 0: what the serial scans of the host reference read, in its order. The sampler's plane is
+ * kSampleCandidates wide and mostly holes (top_k 20 leaves about 20 live), so the serial part afterwards
+ * walks that many entries, not n_cand. Every thread of the workgroup calls it. */
+__device__ void couple_live(const int32_t* ids, const float* val, int64_t n, int64_t vocab,
+                            short* lj, int* n_live, int* valid, float* top) {
+    __shared__ int wcnt[kThreads / 32], wbad[kThreads / 32], sbase;
+    __shared__ float wmax[kThreads / 32];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    if (tid == 0) sbase = 0;
+    int bad = 0;
+    float mx = -INFINITY;
+    for (int64_t c0 = 0; c0 < n; c0 += kThreads) {
+        const int64_t j = c0 + tid;
+        bool live = false;
+        if (j < n) {
+            const int32_t id = ids[j];
+            const float v = val[j];
+            if (id >= 0) {
+                if (id >= vocab || v != v || v == INFINITY) bad = 1;
+                else if (v > mx) mx = v;
+                live = v != -INFINITY;
+            }
+        }
+        const uint64_t ball = __ballot(live);
+        const int below = __popcll(ball & ((1ull << lane) - 1ull));
+        if (lane == 0) wcnt[wave] = __popcll(ball);
+        __syncthreads();
+        int off = sbase, tot = 0;
+        for (int w = 0; w < kThreads / 32; ++w) {
+            if (w < wave) off += wcnt[w];
+            tot += wcnt[w];
+        }
+        if (live) lj[off + below] = (short)j;
+        __syncthreads();
+        if (tid == 0) sbase += tot;
+    }
+    for (int d = 16; d > 0; d >>= 1) {
+        bad |= __shfl_xor(bad, d);
+        mx = fmaxf(mx, __shfl_xor(mx, d));
+    }
+    if (lane == 0) { wbad[wave] = bad; wmax[wave] = mx; }
+    __syncthreads();
+    if (tid == 0) {
+        int b = 0;
+        float m = -INFINITY;
+        for (int w = 0; w < kThreads / 32; ++w) { b |= wbad[w]; m = fmaxf(m, wmax[w]); }
+        *valid = !b;
+        *top = m;
+        *n_live = sbase;
+    }
+    __syncthreads();
+}
+
 __global__ void couple_verify(const int32_t* idx, const float* values, const uint32_t* params,
                               const uint32_t* state, int32_t* token, int64_t M, int64_t n_cand,
                               int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2, int64_t ld3,
@@ -43,51 +98,38 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
         if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
         return;
     }
-    /* `weight` is P's unnormalised FP64 mass per candidate and `mass` its residual (P-Q)+. The
-     * workgroup writes them; one thread reads them in ascending candidate order. */
+    /* `weight` is P's unnormalised FP64 mass per live candidate and `mass` its residual (P-Q)+,
+     * both indexed by the candidate's place in `lj`. */
     __shared__ double weight[kMaxCand], mass[kMaxCand], pq[8], sum;
+    __shared__ short  lj[kMaxCand];
     __shared__ float  top;
-    __shared__ int    eligible, first[8], ix, dominated;
+    __shared__ int    eligible, nl, valid, first[8], ix, dominated;
     const auto& s = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
     const auto& p = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
     const int32_t* ids = c.idx + row * c.ld[0];
     const float*   val = c.val + row * c.ld[1];
     /* The same eligibility gate as rad_mtp_couple_verify_row: an unbound row keeps the ordinary
      * token. */
-    if (threadIdx.x == 0) {
-        eligible = 0;
-        if (s.status == 1 && !(p.flags & RAD_SP_GREEDY) && s.draw.seed == p.seed &&
-            s.pos == p.pos && rad_mtp_couple_state_valid(s, c.vocab)) {
-            float maximum = -INFINITY;
-            bool  valid   = true;
-            for (int64_t j = 0; j < c.n_cand; ++j) {
-                if (ids[j] < 0) continue;
-                if (ids[j] >= c.vocab || val[j] != val[j] || val[j] == INFINITY) {
-                    valid = false;
-                    break;
-                }
-                if (val[j] > maximum) maximum = val[j];
-            }
-            if (valid && maximum != -INFINITY) { top = maximum; eligible = 1; }
-        }
-    }
+    if (threadIdx.x == 0)
+        eligible = s.status == 1 && !(p.flags & RAD_SP_GREEDY) && s.draw.seed == p.seed &&
+                   s.pos == p.pos && rad_mtp_couple_state_valid(s, c.vocab);
     __syncthreads();
     if (!eligible) return;
-    /* Each thread writes exp(v - max) for a strided slice; no cross-thread reduction, so the sum
-     * below matches the serial order bit for bit. */
-    for (int64_t j = threadIdx.x; j < c.n_cand; j += blockDim.x)
-        if (ids[j] >= 0 && val[j] != -INFINITY) weight[j] = ::exp((double)val[j] - top);
+    couple_live(ids, val, c.n_cand, c.vocab, lj, &nl, &valid, &top);
+    if (!valid || top == -INFINITY) return;
+    const int L = nl;
+    for (int i = threadIdx.x; i < L; i += blockDim.x) weight[i] = ::exp((double)val[lj[i]] - top);
     __syncthreads();
     if (threadIdx.x == 0) {
         sum = 0;
         for (int k = 0; k < s.count; ++k) { pq[k] = 0; first[k] = -1; }
-        for (int64_t j = 0; j < c.n_cand; ++j) {
-            if (ids[j] < 0 || val[j] == -INFINITY) continue;
-            const double w = weight[j];
+        for (int i = 0; i < L; ++i) {
+            const int32_t id = ids[lj[i]];
+            const double w = weight[i];
             sum += w;
             for (int k = 0; k < s.count; ++k)
-                if (ids[j] == s.ids[k]) {
-                    if (first[k] < 0) first[k] = (int)j;
+                if (id == s.ids[k]) {
+                    if (first[k] < 0) first[k] = i;
                     pq[k] += w;
                     break;
                 }
@@ -106,47 +148,46 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     }
     __syncthreads();
     if (!eligible) return;
-    /* Residual per slot: a Q token contributes max(0, P-Q) once, at its first occurrence
-     * (`first[k]`); every other candidate contributes its own P. */
-    for (int64_t j = threadIdx.x; j < c.n_cand; j += blockDim.x) {
+    /* Residual per live slot: a Q token contributes max(0, P-Q) once, at its first occurrence;
+     * every other candidate contributes its own P. */
+    for (int i = threadIdx.x; i < L; i += blockDim.x) {
+        const int32_t id = ids[lj[i]];
         double m = 0;
-        if (ids[j] >= 0 && val[j] != -INFINITY) {
-            bool in_q = false;
-            for (int k = 0; k < s.count; ++k)
-                if (s.ids[k] == ids[j]) {
-                    in_q = true;
-                    if (first[k] == (int)j) m = rad_spechub_positive(pq[k] - s.q[k]);
-                    break;
-                }
-            if (!in_q) m = weight[j] / sum;
-        }
-        mass[j] = m;
+        bool in_q = false;
+        for (int k = 0; k < s.count; ++k)
+            if (s.ids[k] == id) {
+                in_q = true;
+                if (first[k] == i) m = rad_spechub_positive(pq[k] - s.q[k]);
+                break;
+            }
+        if (!in_q) m = weight[i] / sum;
+        mass[i] = m;
     }
     __syncthreads();
     if (threadIdx.x != 0) return;
 
-    /* One thread, ascending candidate index: parallelising these sums would reorder them and
+    /* One thread, ascending candidate order: parallelising these sums would reorder them and
      * break bit-exactness with the host reference. */
     double resid = 0;
-    for (int64_t j = 0; j < c.n_cand; ++j) resid += mass[j];
+    for (int i = 0; i < L; ++i) resid += mass[i];
     int32_t out = -1;
     const double u_resid = rad_spechub_uniform(p.seed, p.pos, RAD_SAMPLE_KEY_RESID);
     if (!dominated && !(resid > 0 && rad_spechub_finite(resid))) {
         double cdf = u_resid * sum;
-        for (int64_t j = 0; j < c.n_cand; ++j)
-            if (ids[j] >= 0 && val[j] != -INFINITY) {
-                const double w = weight[j];
-                if (w > 0) { out = ids[j]; cdf -= w; if (cdf < 0) break; }
-            }
+        for (int i = 0; i < L; ++i) {
+            const double w = weight[i];
+            if (w > 0) { out = ids[lj[i]]; cdf -= w; if (cdf < 0) break; }
+        }
     } else if (pq[ix] >= s.q[ix] ||
                rad_spechub_uniform(p.seed, p.pos, RAD_SAMPLE_KEY_ACCEPT) * s.q[ix] < pq[ix]) {
         out = s.x;
     } else {
         double cdf = u_resid * resid;
-        for (int64_t j = 0; j < c.n_cand; ++j) {
-            if (ids[j] == s.x) continue;
-            const double m = mass[j];
-            if (m > 0) { out = ids[j]; cdf -= m; if (cdf < 0) break; }
+        for (int i = 0; i < L; ++i) {
+            const int32_t id = ids[lj[i]];
+            if (id == s.x) continue;
+            const double m = mass[i];
+            if (m > 0) { out = id; cdf -= m; if (cdf < 0) break; }
         }
     }
     c.token[row * c.ld[4]] = out;
