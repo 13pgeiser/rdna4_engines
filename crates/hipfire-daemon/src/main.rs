@@ -3487,7 +3487,17 @@ fn main() {
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
                 let tp = m.ep.is_some();
-                if request_guards::refuse_ep_request(&mut stdout, id, &msg, tp, has_image) {
+                let tp_penalties =
+                    m.ep.as_ref()
+                        .is_some_and(|ep| ep.inner.applies_request_penalties());
+                if request_guards::refuse_ep_request(
+                    &mut stdout,
+                    id,
+                    &msg,
+                    tp,
+                    tp_penalties,
+                    has_image,
+                ) {
                     continue;
                 }
 

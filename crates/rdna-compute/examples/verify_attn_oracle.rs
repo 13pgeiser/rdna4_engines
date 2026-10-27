@@ -559,6 +559,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     None,
                     0,
                     0,
+                    None,
                 )
                 .expect("reference fp8"),
             VerifyKv::Q8 => gpu
@@ -1707,6 +1708,11 @@ fn main() {
         v
     });
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
+    // The fp8 reference is the VerifyAttn tile + reduce. The native-fp8
+    // split-KV verifier (default on from 8,192 tokens on gfx1201) would
+    // replace it at long contexts, so pin it off before the process config
+    // snapshot is first read.
+    std::env::set_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8", "0");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
         matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100" | "gfx1151"),

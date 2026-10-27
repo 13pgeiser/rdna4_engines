@@ -147,6 +147,39 @@ bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
 runs the same download and checks on an existing install, for example to
 restore kernels on a machine without hipcc.
 
+#### Hosts outside the pack's ROCm range (Ubuntu amdrocm 10.0)
+
+Ubuntu's `amdrocm` 10.0 packages are the common host a pack's `[10.1, 11.0)`
+range excludes. Nothing about the model runtime differs on such a host: the
+same kernels compile locally through its own hipcc.
+
+- On `beta` and from 0.4.4, `install.sh --tag <tag>` (and
+  `hipfire update --tag <tag>`) handles this on its own. When the pack is
+  skipped for the range, setup selects the umbrella `/opt/rocm` root
+  automatically (the amdrocm packaging installs it alongside versioned
+  children like `/opt/rocm/core-10.0` and a compiler-only `/usr`), finds
+  `bin/hipcc` there, and compiles.
+- On v0.4.3.x the automatic selection is absent (#967), and the amdrocm layout
+  makes the roots ambiguous enough that naming them explicitly is the reliable
+  path: run the installer once to fetch the source (it stops at the pack
+  check), then complete with setup directly:
+
+```bash
+curl -fsSL https://hipfire.dev/install.sh | bash -s -- --tag v0.4.3.1 --yes   # stops at the pack check
+export PATH="$HOME/.cargo/bin:$PATH"                                          # cargo is required
+hipfire setup --source ~/.hipfire/src \
+  --rocm-root /opt/rocm --hipcc /opt/rocm/bin/hipcc \
+  --yes --compile-kernels
+```
+
+`~/.cargo/bin` must be on PATH for non-interactive shells (`rustup` installs
+it; the bootstrap checks cargo up front, a direct `hipfire setup` reaches the
+daemon build without checking). Verified on a live amdrocm `10.0.0-4` host
+(gfx1151, issues #967 and #966): every kernel compiles through the host hipcc
+in a few minutes, the runtime verifies all indexes at load, and the Flash-Next
+NPU trunk JIT-compiles its object when the certified pack does not match the
+local toolchain.
+
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
 attaches the assets to the release. The default image is
