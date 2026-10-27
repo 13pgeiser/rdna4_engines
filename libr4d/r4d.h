@@ -220,11 +220,27 @@ int r4d_gdn_conv_prep_w4_h128_bf16(
         const void* A_log, const void* dt_bias, void* q, void* k, void* v, void* g, void* beta,
         const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
         void* stream);
+// The same with an f32 `wgt`, as a GGUF stores ssm_conv1d. Every other operand is as above, and
+// a bf16-representable weight gives the same bytes.
+int r4d_gdn_conv_prep_w4_h128_bf16_f32wgt(
+        const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+        long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
+        const void* has_init, int hi_i32,
+        const void* a, const void* b, long ab_stride, int ab_is_bf16,
+        const void* A_log, const void* dt_bias, void* q, void* k, void* v, void* g, void* beta,
+        const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
+        void* stream);
 
 // The same convolution for a decode step over a speculative window. The state cache is a rolling
 // buffer of width-1 + num_spec entries read at the slot the last accepted token left; q / k / v
 // are written straight into their own layouts. Replaces causal_conv1d_update and its cat.
 int r4d_gdn_conv_update_w4_h128_bf16(
+        const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+        long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+        long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
+        int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream);
+// The same with an f32 `wgt`, as for the prefill convolution.
+int r4d_gdn_conv_update_w4_h128_bf16_f32wgt(
         const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
         long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
         long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,

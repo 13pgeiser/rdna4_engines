@@ -7262,7 +7262,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "gdn prefill preamble: causal conv + qkv split + qk l2norm + gating + per-chunk cumsum "
   "[UNVALIDATED: DPP row_xmask rewrite never correctness-gated]",
   "conv width 4, head_k/head_v 128, chunk 64, varlen, conv state read and rewritten in place",
-  "bf16 x / weights / conv state / q,k,v out, fp32 a,b and gate/beta out",
+  "bf16 x / conv state / q,k,v out, bf16 or f32 weights, fp32 a,b and gate/beta out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvPrep), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_conv_prep },
@@ -7272,7 +7272,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "gdn decode conv: rolling speculative window over the conv state cache, writes q/k/v "
   "[UNVALIDATED: DPP row_xmask rewrite never correctness-gated]",
   "conv width 4, head_k/head_v 128, state cache width-1 + num_spec, read at accepted offset",
-  "bf16 x / weights / conv state / q,k,v out",
+  "bf16 x / conv state / q,k,v out, bf16 or f32 weights",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvUpdate), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_conv_update },
@@ -7301,7 +7301,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "workgroup convolves its key head's q and k and its value head's v into LDS, and the last "
   "workgroup of a key head to arrive rewrites that head's conv state",
   "head_k/head_v 128, conv width 4, a sequence's window at most 8 tokens, the fused row norm",
-  "bf16 x / conv weights / conv state / a,b / out; the state cache is f32 or f16. "
+  "bf16 x / conv state / a,b / out, bf16 or f32 conv weights; the state cache is f32 or f16. "
   "Byte-identical to gdn_conv_update followed by gdn_recurrent_update",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvRecurrentUpdate), NOTUNE,
