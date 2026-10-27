@@ -248,8 +248,6 @@ fn publish_pair(
     Ok(())
 }
 
-/// Publish only a nonempty blob into `dest_dir`, removing any orphan hash so
-/// it cannot certify the copied content. Used for hashless cold seed fallback.
 /// Ordered candidates for the read-only pre-compiled kernel directory:
 /// beside the running executable, then `kernels/compiled` under the CWD, then
 /// `bin/kernels/compiled` under the hipfire home.
@@ -285,6 +283,8 @@ fn precompiled_dir_choice(
         .or_else(|| home.filter(|p| p.is_dir()))
 }
 
+/// Publish only a nonempty blob into `dest_dir`, removing any orphan hash so
+/// it cannot certify the copied content. Used for hashless cold seed fallback.
 fn publish_blob_only(dest_dir: &Path, name: &str, src_blob: &Path) -> Result<(), String> {
     let dest_hsaco = dest_dir.join(format!("{name}.hsaco"));
     let dest_hash = dest_dir.join(format!("{name}.hash"));
