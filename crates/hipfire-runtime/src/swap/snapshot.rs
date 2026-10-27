@@ -13,14 +13,20 @@
 // `cap`. A session 4K tokens into a 128K slab is ~45 MB of KV, not 1.39 GB.
 // That is what makes a large session pool practical.
 
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
 use crate::swap::SwapError;
 
 /// Magic for the serialised form: "HIPF_SW1" as big-endian ASCII.
 const MAGIC: u64 = 0x484950465F535731;
 /// v2: added `per_pos_v_bytes` — the rotated-K tiers (asym{2,3,4}/fwht{2,3,4})
-/// store K and V at different per-position strides, so one stride field can no
-/// longer size both spans of the payload.
-const VERSION: u32 = 2;
+// store K and V at different per-position strides, so one stride field can no
+// longer size both spans of the payload.
+// v3: added `instance_id` — a per-engine nonce, so a snapshot can only be
+// restored by the engine that captured it even if a stale file survives a
+// directory mix-up.
+const VERSION: u32 = 3;
 
 /// FNV-1a over the payload. Same construction `replay.rs::capture_summary`
 /// uses, kept identical so there is one hash idiom in the codebase.
@@ -33,6 +39,47 @@ pub fn checksum_of(bytes: &[u8]) -> u64 {
     h
 }
 
+/// FNV-1a with an explicit state (same constants as [`checksum_of`]).
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Stable, cheap identity of a model file: its length plus 64 KiB samples
+/// (start, quartiles, end). A full-content hash would add seconds to every
+/// multi-GB load; a sampled fingerprint plus the KV-geometry stamp makes a
+/// cross-model restore vanishingly unlikely.
+pub fn model_fingerprint(path: &Path) -> std::io::Result<u64> {
+    const SAMPLE: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut h = fnv1a(0xcbf29ce484222325, b"hipfire-model-fingerprint-v1");
+    h = fnv1a(h, &len.to_le_bytes());
+    let mut offsets = vec![0u64];
+    for frac in [1u64, 2, 3] {
+        offsets.push(len.saturating_mul(frac) / 4);
+    }
+    if len > SAMPLE {
+        offsets.push(len - SAMPLE);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut buf = vec![0u8; SAMPLE as usize];
+    for off in offsets {
+        if off >= len {
+            continue;
+        }
+        file.seek(SeekFrom::Start(off))?;
+        let want = usize::try_from((len - off).min(SAMPLE)).unwrap_or(buf.len());
+        file.read_exact(&mut buf[..want])?;
+        h = fnv1a(h, &buf[..want]);
+    }
+    Ok(h)
+}
+
 /// Everything that must match for a snapshot to be restorable.
 ///
 /// Carries more than the current scratch-only lifetime needs, on purpose: it
@@ -40,7 +87,13 @@ pub fn checksum_of(bytes: &[u8]) -> u64 {
 /// enabling that later is a policy change rather than a format change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotStamp {
+    /// Fingerprint of the model file (length + sampled bytes); see
+    /// [`model_fingerprint`]. Not a full-content hash: load time must stay
+    /// flat for multi-GB models.
     pub model_hash: u64,
+    /// Per-engine nonce. A snapshot is only restorable by the process that
+    /// captured it, even if its file outlives the store that wrote it.
+    pub instance_id: u64,
     pub kv_dtype_tag: u32,
     /// K-arena per-position stride in bytes.
     pub per_pos_bytes: u32,
@@ -106,26 +159,45 @@ impl SlotSnapshot {
         Ok(())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(96 + self.tokens.len() * 4 + self.payload.len());
-        out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&self.stamp.model_hash.to_le_bytes());
-        out.extend_from_slice(&self.stamp.kv_dtype_tag.to_le_bytes());
-        out.extend_from_slice(&self.stamp.per_pos_bytes.to_le_bytes());
-        out.extend_from_slice(&self.stamp.per_pos_v_bytes.to_le_bytes());
-        out.extend_from_slice(&self.stamp.n_fa_layers.to_le_bytes());
-        out.extend_from_slice(&self.stamp.dn_layout_version.to_le_bytes());
-        out.extend_from_slice(&self.stamp.cap.to_le_bytes());
-        out.extend_from_slice(&self.stamp.dn_bytes.to_le_bytes());
-        out.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
-        out.extend_from_slice(&(self.tokens.len() as u64).to_le_bytes());
-        out.extend_from_slice(&self.checksum.to_le_bytes());
-        out.extend_from_slice(&(self.payload.len() as u64).to_le_bytes());
+    /// Exact serialised length: header, then one `u32` per token, then the
+    /// payload. The disk tier budgets this figure and checks it *before*
+    /// encoding, so an oversized snapshot never allocates its own spill file.
+    pub fn encoded_len(&self) -> usize {
+        const HEADER: usize = 8 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8;
+        HEADER
+            .saturating_add(self.tokens.len().saturating_mul(4))
+            .saturating_add(self.payload.len())
+    }
+
+    /// Stream the serialised form into `w` without materialising a second
+    /// copy of the payload. This is the disk tier's writer; `to_bytes` keeps
+    /// the owned-buffer form for tests and callers that need it.
+    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&MAGIC.to_le_bytes())?;
+        w.write_all(&VERSION.to_le_bytes())?;
+        w.write_all(&self.stamp.model_hash.to_le_bytes())?;
+        w.write_all(&self.stamp.instance_id.to_le_bytes())?;
+        w.write_all(&self.stamp.kv_dtype_tag.to_le_bytes())?;
+        w.write_all(&self.stamp.per_pos_bytes.to_le_bytes())?;
+        w.write_all(&self.stamp.per_pos_v_bytes.to_le_bytes())?;
+        w.write_all(&self.stamp.n_fa_layers.to_le_bytes())?;
+        w.write_all(&self.stamp.dn_layout_version.to_le_bytes())?;
+        w.write_all(&self.stamp.cap.to_le_bytes())?;
+        w.write_all(&self.stamp.dn_bytes.to_le_bytes())?;
+        w.write_all(&(self.seq_len as u64).to_le_bytes())?;
+        w.write_all(&(self.tokens.len() as u64).to_le_bytes())?;
+        w.write_all(&self.checksum.to_le_bytes())?;
+        w.write_all(&(self.payload.len() as u64).to_le_bytes())?;
         for t in &self.tokens {
-            out.extend_from_slice(&t.to_le_bytes());
+            w.write_all(&t.to_le_bytes())?;
         }
-        out.extend_from_slice(&self.payload);
+        w.write_all(&self.payload)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        self.write_to(&mut out)
+            .expect("writing to a Vec cannot fail");
         out
     }
 
@@ -133,7 +205,7 @@ impl SlotSnapshot {
     /// buffer too short for what its own header claims, *before* indexing —
     /// a truncated spill file must be an error, never a panic.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SwapError> {
-        const HEADER: usize = 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8;
+        const HEADER: usize = 8 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8;
         if bytes.len() < HEADER {
             return Err(SwapError::Corrupt(format!(
                 "buffer is {} bytes, shorter than the {HEADER}-byte header",
@@ -160,8 +232,8 @@ impl SlotSnapshot {
                 "snapshot version {version} != {VERSION}"
             )));
         }
-        let model_hash = u64::from_le_bytes(bytes[o..o + 8].try_into().expect("bounds"));
-        o += 8;
+        let model_hash = u64_at(&mut o);
+        let instance_id = u64_at(&mut o);
         let kv_dtype_tag = u32_at(&mut o);
         let per_pos_bytes = u32_at(&mut o);
         let per_pos_v_bytes = u32_at(&mut o);
@@ -200,6 +272,7 @@ impl SlotSnapshot {
         Ok(SlotSnapshot {
             stamp: SnapshotStamp {
                 model_hash,
+                instance_id,
                 kv_dtype_tag,
                 per_pos_bytes,
                 per_pos_v_bytes,
@@ -463,6 +536,7 @@ mod tests {
     fn stamp() -> SnapshotStamp {
         SnapshotStamp {
             model_hash: 0xABCD,
+            instance_id: 7,
             kv_dtype_tag: 1,
             per_pos_bytes: 4,
             per_pos_v_bytes: 4,
@@ -499,6 +573,13 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatched_instance_id_is_refused() {
+        let mut other = stamp();
+        other.instance_id = 8;
+        assert!(matches!(snap().validate(other), Err(SwapError::Stamp(_))));
+    }
+
+    #[test]
     fn a_mismatched_kv_dtype_tag_is_refused_even_when_strides_match() {
         for kv_dtype_tag in [11, 12, 13] {
             let mut other = stamp();
@@ -529,6 +610,7 @@ mod tests {
         assert_eq!(back.seq_len, s.seq_len);
         assert_eq!(back.tokens, s.tokens);
         assert_eq!(back.payload, s.payload);
+        assert_eq!(back.stamp, s.stamp);
         assert!(back.validate(stamp()).is_ok());
     }
 
@@ -546,5 +628,33 @@ mod tests {
                 "truncation at {cut} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_encoded_length_matches_the_serialised_form() {
+        let s = snap();
+        assert_eq!(s.encoded_len(), s.to_bytes().len());
+    }
+
+    #[test]
+    fn the_model_fingerprint_is_stable_and_tracks_sampled_bytes() {
+        let path = std::env::temp_dir().join("hipfire-model-fingerprint-test.hfq");
+        let mut bytes = vec![0u8; 200 * 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let first = model_fingerprint(&path).unwrap();
+        assert_eq!(first, model_fingerprint(&path).unwrap());
+
+        bytes[16] ^= 0xFF; // inside the first 64 KiB sample
+        std::fs::write(&path, &bytes).unwrap();
+        let changed = model_fingerprint(&path).unwrap();
+        assert_ne!(first, changed);
+
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_ne!(changed, model_fingerprint(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
     }
 }

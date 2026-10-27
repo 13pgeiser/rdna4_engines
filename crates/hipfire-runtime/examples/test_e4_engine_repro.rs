@@ -61,8 +61,10 @@ fn main() {
         prefill_chunk: 256,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-e4-repro-swap"),
+        swap_disk_bytes: 1 << 30,
         is_vl: false,
         vl_path: None,
+        vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::Streamed,
         mtp_k: 0, // isolate from MTP entirely
         mtp_mode: hipfire_config::MtpMode::Off,
         kv_mode_raw: String::new(),

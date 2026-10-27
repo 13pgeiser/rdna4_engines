@@ -15,10 +15,10 @@ use crate::{
 };
 use peacemaker_author::End;
 
-struct Epilogue {
-    tok: u8,
-    row: u8,
-    off: u8,
+pub(crate) struct Epilogue {
+    pub(crate) tok: u8,
+    pub(crate) row: u8,
+    pub(crate) off: u8,
     lim: u8,
     lim_off: [u8; 4],
     ntok: [u8; 4],
@@ -28,7 +28,7 @@ struct Epilogue {
     fin: u8,
 }
 
-fn layout(g: &Gen) -> Epilogue {
+pub(crate) fn layout(g: &Gen) -> Epilogue {
     let e = g.epi_s;
     Epilogue {
         tok: g.f[0],
@@ -66,10 +66,20 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, _end: &End) -> Result<(), String> {
 /// Everything after the [`EPI`] label: the tile-relative output descriptor, the lane masks and the
 /// masked stores.
 pub(crate) fn body(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    if g.spec.epi == Epi::SetNr {
+        return Err("set_nr is emitted by nr_epilogue".into());
+    }
     // Below the K-loop's priority 1: co-resident K-loops issue first.
     if g.spec.raster == Raster::Banded {
         op(b, "s_setprio 0", &[], &[])?;
     }
+    let e = setup(b, g)?;
+    stores(b, g, &e)
+}
+
+/// The tile-relative output descriptor, the lane's token and row (`e.tok`, `e.row`), its store
+/// offset and the row / token masks.
+pub(crate) fn setup(b: &mut Builder, g: &Gen) -> Result<Epilogue, String> {
     let a = g.args;
     let bf16 = g.spec.epi == Epi::SetBf16;
     let e = layout(g);
@@ -268,7 +278,14 @@ pub(crate) fn body(b: &mut Builder, g: &Gen) -> Result<(), String> {
         &[e.nbo[2], e.nbo[1]],
     )?;
     op(b, "s_wait_alu depctr_va_sdst(0)", &[], &[])?;
+    Ok(e)
+}
 
+/// The masked stores of the eight accumulator fragments (F32 `buffer_store_b128` per row quad, or
+/// packed BF16).
+pub(crate) fn stores(b: &mut Builder, g: &Gen, e: &Epilogue) -> Result<(), String> {
+    let bf16 = g.spec.epi == Epi::SetBf16;
+    let y = g.srd_y;
     let acc = |nb: usize, rg: usize, c: usize| g.acc + (8 * (nb * 2 + rg) + 4 * c) as u8;
     for nb in 0..4usize {
         for rg in 0..2usize {

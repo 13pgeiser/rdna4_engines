@@ -42,9 +42,12 @@
 
 use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
-use crate::families::moe::{MoePrefillParams, MoeRouteCapability, MoeTileExchangeParams};
+use crate::families::moe::{
+    MoePrefillParams, MoeRouteCapability, MoeSharedPrefill, MoeTileExchangeParams,
+};
 use crate::types::DispatchError;
 use rdna_compute::moe::SharedExpertActivation;
+use rdna_compute::shared_i8::SharedI8Weights;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -472,19 +475,24 @@ pub(crate) fn input_basis(
 pub(crate) struct MoeFront {
     xq: rdna_compute::scratch::Int4MmqPrepared,
     x16: GpuTensor,
+    /// The shared gate/up INT8 GEMM's A8 blocks of the same rotated rows, when the producer
+    /// also emitted them ([`shared_int8`]).
+    x8: Option<rdna_compute::scratch::Int8MmqPrepared>,
 }
 
-/// Whether the symmetric IU4 route (exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
+/// Whether the symmetric IU4 route (exact gfx1201 or exact gfx1151,
+/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
 /// `x_norm_batch` once in one producer instead of the chain's `mq_rotate_x` (whose F32 output
 /// nothing on this route reads: the symmetric gate/up consumes only the IU4 sidecar, and the
 /// router and shared projections are BF16 on the natural activation),
-/// `convert_f32_to_f16` (inside the router + shared F16 WMMA group launch) and the gate/up
-/// stage's `mq_rotate_x_i4`. The producer feeds exactly those three consumers, so it applies
-/// only where the router stage defers to the shared group's launch ([`router_shares_f16`]:
-/// the stages between the producer and that launch convert nothing and reserve no IU4
-/// scratch), the fused shared gate/up PM route is not taken, and the symmetric arm is the
-/// gate/up that runs ([`sym_iu4`], not the slab or FP8 routes). The caller adds the
-/// per-invocation conditions (plain program, no CPU split / deferral).
+/// `convert_f32_to_f16` (inside the router + shared F16 WMMA group launch, or on gfx1151 the
+/// fused shared gate/up PeaceMaker launch's own router + selector groups, [`shared_gu_pm`])
+/// and the gate/up stage's `mq_rotate_x_i4`. The producer feeds exactly those three
+/// consumers, so it applies only where the router stage defers to the shared group's launch
+/// ([`router_shares_f16`]: the stages between the producer and that launch convert nothing and
+/// reserve no IU4 scratch), and the symmetric arm is the gate/up that runs ([`sym_iu4`], not
+/// the slab or FP8 routes). The caller adds the per-invocation conditions (plain program, no
+/// CPU split / deferral).
 pub(crate) fn front_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     let use_path2 = grouped_path(gpu, p, use_path2);
     gpu.qwen4_moe_front_fuse_applies()
@@ -496,7 +504,6 @@ pub(crate) fn front_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool
         && p.gate_up_k == p.prelude.router.k
         && sym_iu4(gpu, p, use_path2)
         && router_shares_f16(gpu, p)
-        && !shared_gu_pm(gpu, p, use_path2)
 }
 
 /// The fused input-basis stage: one launch writes the IU4 sidecar and the F16 X. The F32
@@ -506,8 +513,18 @@ pub(crate) fn input_basis_front(
     p: &MoePrefillParams<'_>,
 ) -> Result<MoeFront, DispatchError> {
     require_geometry(p)?;
+    // The front only runs on path 2 (`front_applies`).
+    if shared_int8(gpu, p, true) {
+        let (xq, x16, x8) =
+            hip(gpu.qwen4_moe_front_producer_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        return Ok(MoeFront {
+            xq,
+            x16,
+            x8: Some(x8),
+        });
+    }
     let (xq, x16) = hip(gpu.qwen4_moe_front_producer(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
-    Ok(MoeFront { xq, x16 })
+    Ok(MoeFront { xq, x16, x8: None })
 }
 
 /// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
@@ -713,6 +730,49 @@ fn shared_down_input(
     }
 }
 
+/// The shared expert's weights as the INT8 route reads them
+/// ([`Gpu::qwen4_shared_i8_applies`]).
+fn shared_i8_weights<'a>(shared: &MoeSharedPrefill<'a>) -> SharedI8Weights<'a> {
+    let w = &shared.weights;
+    SharedI8Weights {
+        gate: w.gate.buf,
+        up: w.up.buf,
+        down: w.down.buf,
+        intermediate: shared.intermediate,
+        hidden: w.gate.k,
+        down_rows: w.down.m,
+    }
+}
+
+/// Whether this call's shared expert runs the INT8 route
+/// (`HIPFIRE_QWEN4_SHARED_INT8`, exact gfx1201, [`Gpu::qwen4_shared_i8_applies`]): the
+/// router and selector on the F16 WMMA group ([`router_shares_f16`], off the one F16
+/// conversion), the BF16 recipe, all-BF16 shared gate/up/down with the router's K, and not
+/// path 2's fused unscatter activation (which reads the F32 gate/up outputs this route does
+/// not produce).  The gate/up GEMM leaves the BF16 SwiGLU hidden in `gate_out`'s bytes,
+/// the activation stage turns it into rotated A8 blocks in `rotated`'s bytes (and applies the
+/// selector sigmoid), and the shared down GEMM reads those blocks into its F32 rows.  The one
+/// decision of the gate/up, activation and down stages: it depends only on the call's
+/// operands and the device.  Never true with the fused gate/up PeaceMaker launch
+/// ([`shared_gu_pm`], gfx1151 only).
+fn shared_int8(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    router_shares_f16(gpu, p)
+        && p.recipe.bf16_round_trip()
+        && !(use_path2 && shared_in_unscatter(gpu, p))
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            let w = &shared.weights;
+            w.gate.m == shared.intermediate
+                && w.up.m == shared.intermediate
+                && w.up.k == w.gate.k
+                && w.down.dtype == DType::BF16
+                && w.down.k == shared.intermediate
+                && w.down.m == p.down_m
+                && w.down.rotation.is_none()
+                && w.down.awq_scale.is_none()
+                && gpu.qwen4_shared_i8_applies(&shared_i8_weights(shared), p.batch_size)
+        })
+}
+
 /// Shared selector and gate/up are ordinary batched projections.  This is the
 /// typed route's BF16 exception to the generic MoE prefill table: the common
 /// family remains fail-closed for QT53 while this exact route uses the native
@@ -721,7 +781,8 @@ fn shared_down_input(
 /// BF16 MFMA, all row counts); the router is projected by its own stage.
 ///
 /// `front`: the F16 X the fused front already left in the shared F16 scratch
-/// ([`input_basis_front`]); the router + shared WMMA group launch then skips its own
+/// ([`input_basis_front`]); the router + shared WMMA group launch (or the fused shared gate/up
+/// PeaceMaker launch's router + selector groups, [`shared_gu_pm`]) then skips its own
 /// `convert_f32_to_f16` of `x_norm_batch`.
 pub(crate) fn shared_gate_up_front(
     gpu: &mut Gpu,
@@ -729,7 +790,7 @@ pub(crate) fn shared_gate_up_front(
     use_path2: bool,
     front: Option<&MoeFront>,
 ) -> Result<(), DispatchError> {
-    if front.is_some() && !(router_shares_f16(gpu, p) && !shared_gu_pm(gpu, p, use_path2)) {
+    if front.is_some() && !router_shares_f16(gpu, p) {
         // The fused producer fed exactly the router + shared F16 group launch.
         return Err(DispatchError::Hip(
             "qt44/qt53 fused MoE front: the F16 X has no consumer on this route".into(),
@@ -776,6 +837,7 @@ pub(crate) fn shared_gate_up_front(
                 weights.up.buf,
                 &hidden,
                 p.x_norm_batch,
+                front.map(|f| &f.x16),
                 weights.gate.m,
                 router.k,
                 p.batch_size,
@@ -786,6 +848,39 @@ pub(crate) fn shared_gate_up_front(
                 ));
             }
             return Ok(());
+        }
+        if shared_int8(gpu, p, use_path2) {
+            // The router and selector groups off the one F16 conversion (the shared
+            // gate/up never read it), then the INT8 gate/up GEMM and its SwiGLU hidden.
+            let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(
+                &[
+                    &[(router.buf, p.prelude.router_logits, router.m)],
+                    &[(weights.selector.buf, shared.scalar, weights.selector.m)],
+                ],
+                p.x_norm_batch,
+                front.map(|f| &f.x16),
+                router.k,
+                p.batch_size,
+            ))?;
+            if !launched {
+                return Err(DispatchError::Hip(
+                    "qt44/qt53 router + selector F16 WMMA route did not apply".into(),
+                ));
+            }
+            let w = shared_i8_weights(shared);
+            return match front.and_then(|f| f.x8.as_ref()) {
+                // The front's one pass already left the A8 blocks of this call's rows.
+                Some(x8) => {
+                    let xq = hip(gpu.int8_mmq_prepared_ptr(x8, w.hidden, p.batch_size))?;
+                    hip(gpu.qwen4_shared_i8_gate_up_prequant(&w, xq, shared.gate_out, p.batch_size))
+                }
+                None => hip(gpu.qwen4_shared_i8_gate_up(
+                    &w,
+                    p.x_norm_batch,
+                    shared.gate_out,
+                    p.batch_size,
+                )),
+            };
         }
         // The router group first (its own launches, as `router_projection`
         // would issue them), then the shared group, off one F16 conversion.
@@ -925,6 +1020,17 @@ pub(crate) fn shared_activation(
         .shared
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
+    if shared_int8(gpu, p, use_path2) {
+        // The INT8 gate/up GEMM left the BF16 SwiGLU hidden in `gate_out`: FWHT-128 + A8
+        // blocks into `rotated`, the selector sigmoid in place.
+        return hip(gpu.qwen4_shared_i8_hidden(
+            &shared_i8_weights(shared),
+            shared.gate_out,
+            shared.rotated,
+            shared.scalar,
+            p.batch_size,
+        ));
+    }
     // The live rows only: the shared buffers are sized for the chunk cap.
     let live = p.batch_size * shared.intermediate;
     let (gate, up, rotated) = (
@@ -986,6 +1092,7 @@ pub(crate) fn shared_down(
     if !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
         && down.dtype == DType::BF16
         && p.recipe.bf16_round_trip()
+        && !shared_int8(gpu, p, use_path2)
         && hip(gpu.qwen4_shared_down_bf16_epi(
             down.buf,
             &hidden,
@@ -1027,7 +1134,7 @@ pub(crate) fn shared_down(
         0,
         p.batch_size * p.down_m,
     );
-    shared_down_gemm(gpu, p, down, &hidden, &out)?;
+    shared_down_gemm(gpu, p, use_path2, down, &hidden, &out)?;
     if p.recipe.bf16_round_trip() {
         // The scaled add rounds `out`, the scalar and the residual to BF16
         // itself and stores a BF16 value, so no round trip brackets it.
@@ -1060,10 +1167,22 @@ pub(crate) fn shared_down(
 fn shared_down_gemm(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
+    use_path2: bool,
     down: &WeightRef<'_>,
     hidden: &GpuTensor,
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
+    if let Some(shared) = p.prelude.shared.as_ref() {
+        if shared_int8(gpu, p, use_path2) {
+            // `hidden` is `rotated`: the A8 blocks the INT8 activation stage left there.
+            return hip(gpu.qwen4_shared_i8_down(
+                &shared_i8_weights(shared),
+                hidden,
+                out,
+                p.batch_size,
+            ));
+        }
+    }
     match down.dtype {
         DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
             // The shared activation is already in the basis consumed by this
@@ -1424,7 +1543,7 @@ fn shared_down_row_fold_gfx1201(
     // nothing reallocates under the GEMM.
     let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * 4 * hc.hidden))?;
     let rows = f32_view(target, 0, p.batch_size * p.down_m);
-    shared_down_gemm(gpu, p, down, &hidden, &rows)?;
+    shared_down_gemm(gpu, p, use_path2, down, &hidden, &rows)?;
     hip(
         gpu.hc_row_fold_moe_gfx1201(&rdna_compute::hc_row_fold::HcRowFoldMoeGfx1201 {
             grouped_down: p.y_down_grouped,
@@ -1752,6 +1871,26 @@ pub(crate) fn gate_up_front(
             p.batch_size,
         ))
     } else if use_path2 {
+        if gpu.arch_caps.is_gfx1151()
+            && p.mi == 640
+            && p.gate_up_k == 2560
+            && p.k_top == 10
+            && (1..=8).contains(&p.batch_size)
+        {
+            return hip(gpu.gemm_mq4g256v2_moe_grouped_top10_inverse(
+                gate_up_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.inverse_perm,
+                p.x_rot_batch,
+                p.y_gate_up_grouped,
+                2 * p.mi,
+                p.gate_up_k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ));
+        }
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10(
             gate_up_ptrs,
             p.expert_tile_ids,

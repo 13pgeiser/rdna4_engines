@@ -2295,7 +2295,14 @@ pub(crate) fn complete_request_attempt(
                  left after the prompt"
             );
         }
-        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1;
+        // Configured penalty defaults ride along at tp>1 only where the daemon's
+        // tp>1 loop applies penalties (the Qwen family); DeepSeek4/MiniMax
+        // refuse any non-neutral penalty, so their defaults are not forwarded.
+        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1
+            || runtime
+                .current_arch
+                .as_deref()
+                .is_some_and(|arch| arch.to_ascii_lowercase().contains("qwen"));
         let normalized_messages = contract.messages;
         let conversation_messages = contract.conversation_messages;
         let tool_choice_policy = contract.tool_choice_policy;
@@ -2717,6 +2724,11 @@ pub(crate) fn complete_request_attempt(
         .unwrap_or_else(|error| error.into_inner());
     meta.requests_served = meta.requests_served.saturating_add(1);
     meta.recent_tok_s = done.get("tok_s").and_then(serde_json::Value::as_f64);
+    // Multi-slot `done` events carry the live swap-tier snapshot; publish it
+    // here (meta, not runtime) so `/health` stays lock-free.
+    if let Some(swap) = done.get("swap") {
+        meta.loaded.swap = swap.clone();
+    }
     // Same payload the gateway already had; previously only `tok_s` survived, as a
     // scalar overwritten by the next request. Distributions are what make a stall
     // visible.
@@ -4689,7 +4701,7 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_high["reasoning_effort"], "medium");
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
         assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),

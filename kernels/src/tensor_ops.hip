@@ -1943,6 +1943,7 @@ extern "C" __global__ void hyper_write_bf16x2(
 // [256, 1, 1], LDS 0.  The host launcher fails closed unless the stream/mixed
 // pointers are 16-byte aligned for the uint4/float4 transactions; unaligned
 // subviews stay on the x2 production path.
+#if defined(__GFX12__)
 extern "C" __global__ void hyper_write_bf16x8_gfx1201(
     const unsigned int* input,
     const float* mixed,
@@ -1981,6 +1982,7 @@ extern "C" __global__ void hyper_write_bf16x8_gfx1201(
     *(uint4*)(output + ((row * wide + column) >> 1)) =
         make_uint4(out[0], out[1], out[2], out[3]);
 }
+#endif
 
 // `normalized16`, when non-null, also receives each normalized value rounded
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
@@ -3730,6 +3732,31 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     const float value = qsa_norm_rope_head(values + start, norm, head_dim, position_start + row,
                                            rotary_dim, yarn, input_row, &row_sum);
     if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
+}
+
+// RoPE angle table of `rows` consecutive positions for the fused QSA q/k
+// norm+RoPE GEMM epilogue: row r holds the cosines of bases 0..rotary_dim/2
+// then their sines (yarn mscale applied by rope_yarn_sincos) at
+// `table[r * rotary_dim ...]`, from the exact expression of
+// qsa_norm_rope_head. One thread per (row, base).
+extern "C" __global__ void indexed_attention_rope_table_f32(
+    float* table,
+    int rows,
+    int position_start,
+    int rotary_dim,
+    RopeYarn yarn) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half = rotary_dim / 2;
+    int row = idx / half;
+    int base = idx - row * half;
+    if (row >= rows) return;
+    int position = position_start + row;
+    float angle = (float)position
+        * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
+    float sine, cosine;
+    rope_yarn_sincos(angle, base, yarn, &sine, &cosine);
+    table[row * rotary_dim + base] = cosine;
+    table[row * rotary_dim + half + base] = sine;
 }
 
 // QSA prologue of `rows` consecutive rows in one launch (block 256, one block

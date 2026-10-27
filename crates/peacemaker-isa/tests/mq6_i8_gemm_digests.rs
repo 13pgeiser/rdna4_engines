@@ -50,6 +50,14 @@ const PINNED_TILES: &[(&str, &str)] = &[
         "24976b03a0cb7543664849043bb533121e582c8cb69608f9a60fe2b3528ab853",
     ),
     (
+        "256x128x16-set_nr",
+        "75c4f0a9a6efe60d749316dfa0176b65b83a756db769dc0b2bdfc870dfc05a09",
+    ),
+    (
+        "256x128x16-set_nr-linear",
+        "d8a6e33915bb02752c7c26d422c14db586e538749ff0d3cefe247985160a1eee",
+    ),
+    (
         "128x256x16-set",
         "432d787f344855239aec302e06f73d5d30d4a8ce9f9f1a75a53321a44e4c9acf",
     ),
@@ -67,9 +75,10 @@ const PINNED_TILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// sha256 of the `emit_module` text (the four banded product symbols: both epilogues on the
-/// shipped 128x128 tile, whose entries are `PINNED`, and on 128x256, `PINNED_TILES`).
-const PINNED_MODULE: &str = "c434cfe36914155c09097d5b3ff85b1d15d42f183cf9da1f5ca14e2befeb3aca";
+/// sha256 of the `emit_module` text (the five banded product symbols: both epilogues on the
+/// shipped 128x128 tile, whose entries are `PINNED`, on 128x256, and the QSA norm+RoPE `set_nr`
+/// on 256x128, `PINNED_TILES`).
+const PINNED_MODULE: &str = "9872922f88767ef7c938aee929ce66d4f2b207e6bba4904e0ffe7397b3d86c07";
 
 fn sha(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -78,7 +87,7 @@ fn sha(text: &str) -> String {
 fn digests(tiles: &[Tile]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for &tile in tiles {
-        for epi in [Epi::Set, Epi::SetBf16] {
+        for epi in [Epi::Set, Epi::SetBf16, Epi::SetNr] {
             for raster in [Raster::Banded, Raster::Linear] {
                 let spec = Spec {
                     epi,

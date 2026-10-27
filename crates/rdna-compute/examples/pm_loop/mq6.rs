@@ -705,10 +705,16 @@ impl Workload for Mq6 {
             });
         }
         let bytes = rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201;
-        let symbol = match self.cand.epi {
-            Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
-            Epi::SetBf16 => "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
-        };
+        let symbol =
+            match self.cand.epi {
+                Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
+                Epi::SetBf16 => "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
+                Epi::SetNr => return Err(
+                    "epi set_nr takes the QSA norm and RoPE-table kernel arguments, which this \
+                     harness does not pass: tests/qsa_norm_epi_oracle.rs checks and times it"
+                        .into(),
+                ),
+            };
         if !contains(bytes, symbol.as_bytes()) {
             return Err(format!(
                 "symbol {symbol} is not in the shipped object {OBJECT}"

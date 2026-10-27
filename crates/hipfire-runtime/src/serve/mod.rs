@@ -206,6 +206,7 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;
 /// the serve gateway exports it on `/metrics`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EngineStats {
     pub admitted: usize,
     pub rejected: usize,
@@ -231,6 +232,15 @@ pub struct EngineStats {
     /// terminal event, so a `done` snapshot counts only the slots still busy.
     pub active_slots: usize,
     pub total_slots: usize,
+    /// Swap-tier failures (park or restore) since start.
+    pub swap_failures: usize,
+    /// Live swap-tier usage and effective budgets, refreshed by the engine
+    /// each step. `/health` publishes these from the daemon's `done` event
+    /// (and from the load ack before the first request).
+    pub swap_host_used: u64,
+    pub swap_disk_used: u64,
+    pub swap_host_budget: u64,
+    pub swap_disk_budget: u64,
 }
 
 impl EngineStats {
@@ -263,6 +273,17 @@ impl EngineStats {
     }
     pub fn note_slot_released(&mut self) {
         self.active_slots = self.active_slots.saturating_sub(1);
+    }
+
+    /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
+    /// counters and three integers, no allocation.
+    pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {
+        let (_, _, failures) = swap.stats();
+        self.swap_failures = failures;
+        self.swap_host_used = swap.store().host_used();
+        self.swap_disk_used = swap.store().disk_used();
+        self.swap_host_budget = swap.store().host_budget();
+        self.swap_disk_budget = swap.store().disk_budget();
     }
 }
 
@@ -298,6 +319,8 @@ pub struct SlotEngineConfig {
     pub host_budget_bytes: u64,
     /// Directory the swap manager writes cold slot snapshots to.
     pub swap_dir: PathBuf,
+    /// Disk-tier ceiling for swap spill files. 0 disables the disk tier.
+    pub swap_disk_bytes: u64,
     /// The checkpoint is a VL model (vision tower present in the HFQ or in a
     /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing. On the
     /// carrier-delegated slot route this is the load's ladder-gated answer
@@ -307,6 +330,10 @@ pub struct SlotEngineConfig {
     /// the text HFQ. Ladder-gated like [`Self::is_vl`]: `off` leaves it
     /// `None`, so an engine must not rediscover a sibling on its own.
     pub vl_path: Option<PathBuf>,
+    /// The load's resolved `vision.mode` (`off`/`auto`/`resident`/`on`). An
+    /// engine that loads a tower derives its residency from it (`resident`
+    /// uploads the whole tower; every other mode streams it).
+    pub vision_mode: String,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
@@ -449,6 +476,12 @@ pub trait SlotEngineHandle: Send + Sync {
     fn reset(&self) -> Result<(), String>;
     /// Snapshot of engine-level counters (submitted/rejected/completed/…).
     fn stats(&self) -> EngineStats;
+    /// Drain ids of sessions the engine closed on its own (the idle sweep).
+    /// The daemon prunes its pending-tool broker from this list; engines
+    /// without an internal sweep return an empty vec.
+    fn take_closed_sessions(&self) -> Vec<u64> {
+        Vec::new()
+    }
 
     /// Serve one batch of embedding encodes synchronously, one result per
     /// request in order.

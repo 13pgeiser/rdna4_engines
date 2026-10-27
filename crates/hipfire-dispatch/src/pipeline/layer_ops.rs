@@ -45,9 +45,11 @@ use rdna_compute::tensor_ops::{
     gated_delta_core_lanes, gated_delta_gate_batched_arena, gated_delta_gate_batched_rotate_arena,
     gated_delta_step_gate_wmma_arena, gated_delta_step_gate_wmma_qknormed_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
-    indexed_attention_norm_rope_batch_arena, Bf16Arena, GdnCoreLane,
+    indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, Bf16Arena, GdnCoreLane,
 };
-use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
+use rdna_compute::{
+    DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
+};
 use smallvec::SmallVec;
 use std::sync::LazyLock;
 
@@ -170,6 +172,20 @@ pub fn project_weights(
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
 ) -> Result<(), DispatchError> {
+    project_weights_with_epilogues(gpu, input, rows, rotation, projections, &[])
+}
+
+/// [`project_weights`] whose MQ6 int8 GEMMs may run the fused QSA norm+RoPE
+/// epilogue: `epilogues` is empty or parallel to `projections`, and a member
+/// that took the fused entry sets its [`NormRopeEpi::fused`].
+fn project_weights_with_epilogues(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
+) -> Result<(), DispatchError> {
     // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
     let members = [false, true, true, true];
     let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
@@ -180,7 +196,20 @@ pub fn project_weights(
         rotation,
         projections,
         gdn_regions.then_some(&members[..]),
+        epilogues,
     )
+}
+
+/// A QSA q / k projection's fused RMSNorm + RoPE epilogue request
+/// ([`Gpu::gemm_mq6g256v2_i8_prequant_norm_rope`]): the layer's `norm` weight,
+/// the head pitch in output rows (`512` for the interleaved q-gate rows,
+/// `256` for plain k rows) and the RoPE `table`. `fused` records whether the
+/// projection ran fused.
+struct NormRopeEpi<'a> {
+    norm: &'a GpuTensor,
+    head_stride_rows: usize,
+    table: &'a GpuTensor,
+    fused: std::cell::Cell<bool>,
 }
 
 /// Whether `weight`'s prefill GEMM of `rows` runs the gfx1201 native-FP8 MQ6
@@ -235,7 +264,9 @@ fn project_weights_inner(
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
     region_members: Option<&[bool]>,
+    epilogues: &[Option<&NormRopeEpi<'_>>],
 ) -> Result<(), DispatchError> {
+    debug_assert!(epilogues.is_empty() || epilogues.len() == projections.len());
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
     let route = gpu.route_rows(rows);
     // A verify forward row-exact past the historic few-row limit keeps the
@@ -274,7 +305,27 @@ fn project_weights_inner(
             for j in i..projections.len() {
                 let (w, out) = projections[j];
                 if !done[j] && w.k == weight.k && mq6_i8_route(gpu, w, rows) {
-                    hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    let epilogue = epilogues.get(j).copied().flatten();
+                    let fused = match epilogue {
+                        Some(e) => hip(gpu.gemm_mq6g256v2_i8_prequant_norm_rope(
+                            w.buf,
+                            xq,
+                            out,
+                            w.m,
+                            w.k,
+                            rows,
+                            e.head_stride_rows,
+                            e.norm,
+                            e.table,
+                        ))?,
+                        None => false,
+                    };
+                    if let Some(e) = epilogue {
+                        e.fused.set(fused);
+                    }
+                    if !fused {
+                        hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    }
                     done[j] = true;
                 }
             }
@@ -574,6 +625,7 @@ fn project_trunk(
         zba,
         gdn_in_proj,
         &[],
+        &[],
     )
 }
 
@@ -588,7 +640,9 @@ fn project_trunk_masked(
     zba: Option<ZbaFold<'_>>,
     gdn_in_proj: bool,
     covered: &[bool],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
 ) -> Result<(), DispatchError> {
+    debug_assert!(epilogues.is_empty() || epilogues.len() == projections.len());
     debug_assert_eq!(a4.len(), projections.len());
     debug_assert!(covered.is_empty() || covered.len() == projections.len());
     // Decode's MQ6 qkv and MQ4 a/b/z already share one aligned-256 FWHT.
@@ -717,7 +771,14 @@ fn project_trunk_masked(
         }
     }
     if done.iter().all(|d| !d) {
-        return project_weights(gpu, input, rows, Some(rotation), projections);
+        return project_weights_with_epilogues(
+            gpu,
+            input,
+            rows,
+            Some(rotation),
+            projections,
+            epilogues,
+        );
     }
     debug_assert!(
         covered.is_empty() || (0..projections.len()).all(|j| !covered[j] || done[j]),
@@ -736,6 +797,14 @@ fn project_trunk_masked(
         .filter(|&j| !done[j])
         .map(|j| gdn_in_proj && j != 0)
         .collect();
+    let epilogues_rest: SmallVec<[Option<&NormRopeEpi<'_>>; 4]> = if epilogues.is_empty() {
+        SmallVec::new()
+    } else {
+        (0..projections.len())
+            .filter(|&j| !done[j])
+            .map(|j| epilogues[j])
+            .collect()
+    };
     project_weights_inner(
         gpu,
         input,
@@ -743,6 +812,7 @@ fn project_trunk_masked(
         Some(rotation),
         &rest,
         gdn_in_proj.then_some(&members[..]),
+        &epilogues_rest,
     )
 }
 
@@ -1316,9 +1386,10 @@ fn execute_hyper_read_inner(
             }
             None => hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?,
         }
-        // gfx1201 HC-down + activation as one launch (byte-identical to the
-        // F16 WMMA GEMM + `hc_activation_fused_f32` chain): the packed BF16
-        // `low_bf16` is the only output the WMMA read consumes.
+        // gfx1201 / gfx1151 HC-down + activation as one launch (byte-identical to the
+        // F16 WMMA GEMM + `hc_activation_fused_f32` chain on the same arch): the packed BF16
+        // `low_bf16` is the only output the WMMA read consumes.  The NPU trunk pair route
+        // (`HcFusionCursor` windows) reaches this same call through `execute_hyper_read_inner`.
         match low_bf16.as_ref().filter(|_| {
             wmma_read
                 && op.low_rank == op.input_mix_down.m
@@ -2981,6 +3052,7 @@ fn execute_gated_delta_net_hc_impl(
             }),
             true,
             projection_only.as_ref().map_or(&[][..], |m| &m[..]),
+            &[],
         )?;
     }
     if phase == MixerPhase::InProj {
@@ -4015,6 +4087,68 @@ fn execute_indexed_attention_hc_impl(
         IndexedAttentionMode::AppendOnly => &a4_without_q,
         _ => &a4_all,
     };
+    // Fused q/k RMSNorm + RoPE in the int8 PM GEMM epilogue (QSA prefill's
+    // batched-launch branch, byte-identical to its two `norm_rope` launches).
+    // Only a whole-phase eager call with no NPU arena source and no
+    // projection hook (which reads the raw projections) takes it; the
+    // projection records which of q / k actually ran fused.
+    let yarn = op.rope.yarn(op.rotary_dim);
+    let table_floats = rows * QSA_NORM_EPI_ROTARY_DIM;
+    let fuse_candidate = phase == MixerPhase::Whole
+        && arenas.is_none()
+        && projection_only.is_none()
+        && !qsa_projection_hook_installed()
+        && gpu.route_rows(rows) > gpu.few_row_limit()
+        && op.head_dim == QSA_NORM_EPI_HEAD_DIM
+        && op.rotary_dim == QSA_NORM_EPI_ROTARY_DIM
+        && op.input.dtype == DType::F32
+        && op.qsa_output.dtype == DType::F32
+        && op.qsa_output.numel() >= table_floats;
+    let q_candidate = fuse_candidate
+        && !matches!(op.mode, IndexedAttentionMode::AppendOnly)
+        && op.q.m == 2 * q_width
+        && mq6_i8_route(gpu, &op.q, rows)
+        && gpu.gemm_mq6g256v2_i8_norm_rope_applies(op.q.m, op.q.k, rows, &qgate_batch, 512);
+    let k_candidate = fuse_candidate
+        && op.k.m == kv_width
+        && mq6_i8_route(gpu, &op.k, rows)
+        && gpu.gemm_mq6g256v2_i8_norm_rope_applies(op.k.m, op.k.k, rows, &k_batch, 256);
+    // The rope table lives in `qsa_output`: it is first written by the
+    // attention launch, after both fused GEMMs have consumed the table.
+    let rope_table = view(op.qsa_output, 0, table_floats);
+    if q_candidate || k_candidate {
+        hip(indexed_attention_rope_table(
+            gpu,
+            &rope_table,
+            rows,
+            initial_position,
+            op.rotary_dim,
+            yarn,
+        ))?;
+    }
+    let q_epi = NormRopeEpi {
+        norm: op.q_norm,
+        head_stride_rows: 512,
+        table: &rope_table,
+        fused: std::cell::Cell::new(false),
+    };
+    let k_epi = NormRopeEpi {
+        norm: op.k_norm,
+        head_stride_rows: 256,
+        table: &rope_table,
+        fused: std::cell::Cell::new(false),
+    };
+    let epi_all = [
+        None,
+        q_candidate.then_some(&q_epi),
+        k_candidate.then_some(&k_epi),
+        None,
+    ];
+    let epi_without_q = [epi_all[0], epi_all[2], epi_all[3]];
+    let epi: &[Option<&NormRopeEpi<'_>>] = match op.mode {
+        IndexedAttentionMode::AppendOnly => &epi_without_q,
+        _ => &epi_all,
+    };
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
         project_trunk_masked(
             gpu,
@@ -4026,11 +4160,13 @@ fn execute_indexed_attention_hc_impl(
             None,
             false,
             projection_only.as_ref().map_or(&[][..], |m| &m[..]),
+            epi,
         )?;
         if projection_only.is_none() {
             qsa_projection_hook_run(gpu, op)?;
         }
     }
+    let (q_fused, k_fused) = (q_epi.fused.get(), k_epi.fused.get());
     if phase == MixerPhase::InProj {
         return Ok(());
     }
@@ -4052,7 +4188,6 @@ fn execute_indexed_attention_hc_impl(
     if let Some(mirror) = &op.state.pooled_bf16 {
         mirror.valid_blocks.clamp(initial_position / op.compress);
     }
-    let yarn = op.rope.yarn(op.rotary_dim);
     if let Some(src) = arenas {
         qsa_norm_source(
             gpu,
@@ -4249,36 +4384,40 @@ fn execute_indexed_attention_hc_impl(
                 Some(index_kv_width),
             ))?;
         }
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &qgate_batch,
-                norm: op.q_norm,
-                rows,
-                row_stride: 2 * q_width,
-                heads: op.heads,
-                head_dim: op.head_dim,
-                head_stride: 2 * op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.rotary_dim,
-                yarn,
-            },
-        ))?;
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &k_batch,
-                norm: op.k_norm,
-                rows,
-                row_stride: kv_width,
-                heads: op.kv_heads,
-                head_dim: op.head_dim,
-                head_stride: op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.rotary_dim,
-                yarn,
-            },
-        ))?;
+        if !q_fused {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &qgate_batch,
+                    norm: op.q_norm,
+                    rows,
+                    row_stride: 2 * q_width,
+                    heads: op.heads,
+                    head_dim: op.head_dim,
+                    head_stride: 2 * op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.rotary_dim,
+                    yarn,
+                },
+            ))?;
+        }
+        if !k_fused {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &k_batch,
+                    norm: op.k_norm,
+                    rows,
+                    row_stride: kv_width,
+                    heads: op.kv_heads,
+                    head_dim: op.head_dim,
+                    head_stride: op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.rotary_dim,
+                    yarn,
+                },
+            ))?;
+        }
         hip(indexed_attention_cache_append_batch(
             gpu,
             &IndexedAttentionCacheAppendBatch {
@@ -4879,7 +5018,27 @@ pub fn execute_hyper_norm(gpu: &mut Gpu, op: &HyperNormOp<'_>) -> Result<(), Dis
     ))
 }
 
-/// One [`project_weight`] over `rows` row-major input rows.
+/// The kernel ladder a [`ProjectOp`] runs on. The ladders give different bits
+/// for the same payload (Q8: scalar F32 vs WMMA), so the binding family names
+/// the one it was validated on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectLadder {
+    /// [`project_weights`]: shared F16 rotation, few-row verify GEMVs, gfx942
+    /// BF16 MFMA. Qwen4.
+    Trunk,
+    /// The dispatcher-entry batched GEMMs, each keeping its own arch routing:
+    /// `gemm_q8_0_batched_chunked`, `gemm_hfq4g256` (MQ4G256 after its batched
+    /// FWHT), `gemm_f32_batched`, gfx942 BF16 MFMA. LFM2 decode lanes.
+    Gemm,
+    /// [`Self::Gemm`] for an LM head: the `*_batched_lmhead` GEMMs (HFQ4 /
+    /// HFQ6 / HFQ3 payloads and their MQ rotations). Q8, F32 and BF16 keep
+    /// the `Gemm` arms. No calibration tap, except the BF16 MFMA arm's.
+    GemmLmHead,
+}
+
+/// One projection over `rows` row-major input rows on its [`ProjectLadder`],
+/// optionally followed by `residual += output` (a separate add, not a fused
+/// residual GEMM).
 pub struct ProjectOp<'a> {
     pub weight: WeightRef<'a>,
     pub input: &'a GpuTensor,
@@ -4887,6 +5046,9 @@ pub struct ProjectOp<'a> {
     pub rows: usize,
     /// FWHT basis scratch (`rows * k`), required by the rotated payloads.
     pub rotation: Option<&'a GpuTensor>,
+    pub ladder: ProjectLadder,
+    /// F32 `[rows, m]`, distinct from `output`.
+    pub residual: Option<&'a GpuTensor>,
 }
 
 impl ProjectOp<'_> {
@@ -4895,12 +5057,22 @@ impl ProjectOp<'_> {
         if self.rows == 0 {
             return Err(DispatchError::Hip("projection has no rows".into()));
         }
-        require_weight(&self.weight, m, k, "projection")?;
+        // The `Gemm` ladders admit their payloads in `gemm_ladder_rotation` below.
+        if self.ladder == ProjectLadder::Trunk {
+            require_weight(&self.weight, m, k, "projection")?;
+        }
         let input = checked_mul(self.rows, k, "projection input")?;
         require_tensor(self.input, input, DType::F32, "projection input")?;
         let output = checked_mul(self.rows, m, "projection output")?;
         require_tensor(self.output, output, DType::F32, "projection output")?;
-        if !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0) {
+        if let Some(residual) = self.residual {
+            require_tensor(residual, output, DType::F32, "projection residual")?;
+        }
+        let rotated = match self.ladder {
+            ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
+            ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
+        };
+        if rotated {
             let rotation = self.rotation.ok_or_else(|| {
                 DispatchError::Hip("rotated projection payload needs rotation scratch".into())
             })?;
@@ -4911,7 +5083,76 @@ impl ProjectOp<'_> {
 }
 
 pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
-    project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
+    match op.ladder {
+        ProjectLadder::Trunk => {
+            project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
+        }
+        ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
+    }
+    match op.residual {
+        Some(residual) => hip(gpu.add_inplace_f32(residual, op.output)),
+        None => Ok(()),
+    }
+}
+
+/// Whether the `Gemm` / `GemmLmHead` ladder admits `dtype` and reads it in an
+/// FWHT basis.
+fn gemm_ladder_rotation(dtype: DType, lm_head: bool) -> Result<bool, DispatchError> {
+    match (dtype, lm_head) {
+        (DType::F32 | DType::BF16 | DType::Q8_0 | DType::HFQ4G256, _) => Ok(false),
+        (DType::HFQ6G256, true) => Ok(false),
+        (DType::MQ4G256, _) | (DType::MQ6G256 | DType::MQ3G256, true) => Ok(true),
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "gemm-ladder-payload",
+            arch: "",
+            quant: "unsupported",
+        }),
+    }
+}
+
+/// The `Gemm` / `GemmLmHead` arms of [`execute_project`]. The calibration tap
+/// sees the pre-rotation activation (the AWQ / Hessian basis).
+fn project_gemm(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
+    let (w, rows, y) = (&op.weight, op.rows, op.output);
+    let (m, k) = (w.m, w.k);
+    let lm_head = op.ladder == ProjectLadder::GemmLmHead;
+    let rotated = gemm_ladder_rotation(w.dtype, lm_head)?;
+    if w.dtype == DType::BF16 {
+        return project_g942_mfma(gpu, op.input, rows, op.rotation, &[(w, y)], &[0], k);
+    }
+    if !lm_head {
+        gpu.maybe_capture_activation(w.buf, op.input, rows, k);
+    }
+    let scratch = if rotated {
+        let rotation = op.rotation.ok_or(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "rotation-scratch-absent",
+            arch: "",
+            quant: "quantized",
+        })?;
+        let scratch = view(rotation, 0, checked_mul(rows, k, "rotation scratch")?);
+        hip(crate::pipeline::batched::rotate_x_mq_batched_for(
+            gpu, w, op.input, &scratch, k, rows,
+        ))?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let x = scratch.as_ref().unwrap_or(op.input);
+    hip(match (w.dtype, lm_head) {
+        (DType::F32, _) => gpu.gemm_f32_batched(w.buf, x, y, m, k, rows),
+        (DType::Q8_0, _) => gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, rows),
+        (DType::HFQ4G256 | DType::MQ4G256, false) => gpu.gemm_hfq4g256(w.buf, x, y, m, k, rows),
+        (DType::HFQ4G256 | DType::MQ4G256, true) => {
+            gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, rows)
+        }
+        (DType::HFQ6G256 | DType::MQ6G256, true) => {
+            gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, rows)
+        }
+        (DType::MQ3G256, true) => gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, rows),
+        _ => unreachable!("gemm_ladder_rotation admits only the arms above"),
+    })
 }
 
 /// Largest causal window the gated short-convolution kernel holds per thread.
@@ -4981,6 +5222,88 @@ pub fn execute_gated_short_conv(
         op.rows,
         op.channels,
         op.kernel_size,
+    ))
+}
+
+/// Lane-isolated Q8 attention for `rows` independent decode lanes: row `r`
+/// writes its K/V at `positions[r]` into lane `r`'s slice
+/// (`[r * lane_capacity, (r + 1) * lane_capacity)` positions) of the Q8 caches,
+/// then attends over that slice only.
+pub struct LaneAttentionOp<'a> {
+    /// F32 `[rows, n_heads * head_dim]`, RoPE'd.
+    pub q: &'a GpuTensor,
+    /// F32 `[rows, n_kv_heads * head_dim]` each, RoPE'd K.
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub k_cache: &'a GpuTensor,
+    pub v_cache: &'a GpuTensor,
+    /// `rows` I32 positions.
+    pub positions: &'a GpuTensor,
+    /// F32 `[rows, n_heads * head_dim]`.
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub lane_capacity: usize,
+    pub max_ctx_len: usize,
+}
+
+impl LaneAttentionOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.lane_capacity == 0 || self.head_dim == 0 {
+            return Err(DispatchError::Hip(
+                "lane attention has empty geometry".into(),
+            ));
+        }
+        let q = checked_mul(self.rows, self.n_heads * self.head_dim, "lane attention q")?;
+        let kv = checked_mul(
+            self.rows,
+            self.n_kv_heads * self.head_dim,
+            "lane attention kv",
+        )?;
+        require_tensor(self.q, q, DType::F32, "lane attention q")?;
+        require_tensor(self.k, kv, DType::F32, "lane attention k")?;
+        require_tensor(self.v, kv, DType::F32, "lane attention v")?;
+        require_tensor(self.output, q, DType::F32, "lane attention output")?;
+        if self.positions.numel() < self.rows {
+            return Err(DispatchError::Hip(format!(
+                "lane attention: {} positions for {} rows",
+                self.positions.numel(),
+                self.rows
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_lane_attention(
+    gpu: &mut Gpu,
+    op: &LaneAttentionOp<'_>,
+) -> Result<(), DispatchError> {
+    for (cache, src) in [(op.k_cache, op.k), (op.v_cache, op.v)] {
+        hip(gpu.kv_cache_write_q8_0_independent(
+            cache,
+            src,
+            op.positions,
+            op.n_kv_heads,
+            op.head_dim,
+            op.rows,
+            op.lane_capacity,
+        ))?;
+    }
+    hip(gpu.attention_q8_0_kv_independent(
+        op.q,
+        op.k_cache,
+        op.v_cache,
+        op.output,
+        op.positions,
+        op.n_heads,
+        op.n_kv_heads,
+        op.head_dim,
+        op.lane_capacity,
+        op.max_ctx_len,
+        op.rows,
     ))
 }
 
