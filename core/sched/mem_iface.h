@@ -94,6 +94,8 @@ struct IKVManager {
     /* Blocks held by anything, as opposed to free_blocks (what can be handed out now). On an
      * elastic pool they differ by what the cache released (KVManager::held_blocks). */
     virtual int64_t held_blocks(int32_t group) const = 0;
+    /* KVManager::held_top_blocks; a manager that cannot answer says the whole row. */
+    virtual int64_t held_top_blocks(int32_t group) const { (void)group; return INT64_MAX; }
 
     /* The pool in bytes, the only unit that sums across groups. Asked of the manager because its
      * plan knows whether a group counts blocks or states. */
@@ -101,6 +103,15 @@ struct IKVManager {
     virtual int64_t pool_bytes_used(int32_t group) const = 0;
     /* What the carve gave the group; an elastic pool may have released part of it. */
     virtual int64_t pool_bytes_carved(int32_t group) const = 0;
+
+    /* A streamed group's RadKVStream for the step batch, or null for a resident group; its addresses
+     * are fixed from bring-up. */
+    virtual const RadKVStream* stream_view(int32_t group) const { (void)group; return nullptr; }
+    /* The resolve's cumulative traffic and the rings' depth, for the metrics; zero without
+     * streaming. */
+    virtual int64_t  stream_misses() const { return 0; }
+    virtual int64_t  stream_bytes_in() const { return 0; }
+    virtual int64_t  stream_resident_blocks() const { return 0; }
 
     /* Tokens one block covers, or 0 for a stateful group. */
     virtual int64_t block_tokens(int32_t group) const = 0;
@@ -329,9 +340,16 @@ struct KVBinding final : IKVManager {
     int64_t free_blocks(int32_t g) const override   { return m->free_blocks(g); }
     int64_t total_blocks(int32_t g) const override  { return m->total_blocks(g); }
     int64_t held_blocks(int32_t g) const override   { return m->held_blocks(g); }
+    int64_t held_top_blocks(int32_t g) const override { return m->held_top_blocks(g); }
     int64_t pool_bytes(int32_t g) const override      { return m->pool_bytes(g); }
     int64_t pool_bytes_used(int32_t g) const override { return m->pool_bytes_used(g); }
     int64_t pool_bytes_carved(int32_t g) const override { return m->pool_bytes_carved(g); }
+    const RadKVStream* stream_view(int32_t g) const override { return m->stream_view(g); }
+    int64_t stream_misses() const override { return (int64_t)m->stream_stats().misses; }
+    int64_t stream_bytes_in() const override { return (int64_t)m->stream_stats().bytes_in; }
+    int64_t stream_resident_blocks() const override {
+        return m->stream_stats().resident_blocks;
+    }
     int64_t block_tokens(int32_t g) const override {
         const KVGroupPlan* p = m->plan(g);
         return p && p->paged() ? p->block_size : 0;

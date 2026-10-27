@@ -291,9 +291,8 @@ static const RadOperandSpec oQkNormRopeGateKv[] = {
     { "slot_mapping", RAD_OPD_IN,     0 },
     { "kv_cache",     RAD_OPD_INOUT,  0 },
 };
-/* The prologue with a streamed group's store folded in: the same parameters and operands, then the
- * residency map and the layer's host mirror, which the store needs and the ring does not. The cache
- * is E4M3 only (streaming ships for the fp8 QSA family). */
+/* The prologue with a streamed group's store folded in: the same parameters and operands, then
+ * the residency map and the layer's host mirror. */
 static const RadOperandSpec oQkNormRopeGateKvStreamed[] = {
     { "q_gate",       RAD_OPD_IN,     1 },
     { "k",            RAD_OPD_IN,     0 },
@@ -1351,13 +1350,10 @@ static const RadOperandSpec oQsaSelect[] = {
     { "seqused", RAD_OPD_OUT, 0 },
 };
 
-/* `kv_resolve`, a new op whose schema this plugin fixes: the residency map of a streamed KV
- * group, between `qsa_select` and the attention. `sel` is block ids in and ring slots out;
- * `res`, `slot_block`, `slot_state` and `ctl` are the state it keeps between calls, so its row is
- * not concurrent. The miss list is the row's scratch, not an operand: nothing outside the launch
- * reads it. `block_bytes` is a byte extent, not `block_size`: the op only moves bytes, and a
- * `block_size` key would make it the KV group's consumer, taking the block size the resolved
- * attention kernel must read. */
+/* `kv_resolve`: the residency map of a streamed KV group, between `qsa_select` and the attention
+ * (docs/OPS.md). `sel` is block ids in, ring slots out; the maps and `ctl` are state kept between
+ * calls, so the row is not concurrent. The miss list is the row's scratch. `block_bytes`, not
+ * `block_size`, so the op does not become the KV group's consumer (libref/ref_kvstream.cpp). */
 static const RadParamSpec pKvResolve[] = {
     { "M",           RAD_P_INT, RAD_REQUIRED },
     { "blocks",      RAD_P_INT, RAD_REQUIRED },
@@ -1628,9 +1624,8 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 /* The same fold over an OCP-MXFP4 gate_up weight, which gemm_nt_q reads with a per-row reference
- * exponent (`b_ref`) beside its scale plane. A schema of its own rather than an optional operand on
- * gemm_nt_q_gated: an op's operand count is part of its contract with the plugins already built
- * against it. */
+ * exponent (`b_ref`). A schema of its own, since an op's operand count is fixed for the plugins
+ * built against it. */
 static const RadOperandSpec oGemmNtQGatedMx[] = {
     { "a",        RAD_OPD_IN,     0 },
     { "a_scale",  RAD_OPD_IN,     0 },
@@ -2100,10 +2095,8 @@ static const RadOperandSpec oKvStore[] = {
     { "slot_mapping", RAD_OPD_IN,    0 },
     { "kv_cache",     RAD_OPD_INOUT, 0 },
 };
-/* `kv_store` for a streamed group. `host` is the group's authoritative mirror and is always
- * written, `res` is the residency map that says whether the block is in the ring (the ring slot is
- * written only when `res[block] >= 0`). The parameters are kv_store's: the layout and the E4M3
- * conversion are the same, only the destination set differs. */
+/* `kv_store` for a streamed group: `host`, the authoritative mirror, always written; the ring slot
+ * only when `res[block] >= 0`. kv_store's parameters, layout and conversion. */
 static const RadParamSpec pKvStoreStreamed[] = {
     { "M",          RAD_P_INT, RAD_REQUIRED },
     { "head_dim",   RAD_P_INT, RAD_REQUIRED },
@@ -2498,9 +2491,11 @@ static const RadOperandSpec oGateAdd[] = {
     { "y", RAD_OPD_IN, 0 }, { "g", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "x", RAD_OPD_INOUT, 0 },
 };
-static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"),
-                                          P_F64("max_period"), P_INTO("round"), P_STR("dtype") };
-static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
+                                          P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+                                            { "table", RAD_OPD_WEIGHT, 1 } };
 static const RadOperandSpec oGather2[] = {
     { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
 };
@@ -2577,7 +2572,7 @@ static const RadOperandSpec oAttnPS[] = {
 /* ---- audio generation (r4d_audio.hip); the same specs as libref's (ref_registry.cpp). */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad"),
                                         P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
@@ -2698,7 +2693,7 @@ static const RadParamSpec pRmsMod[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_
 static const RadOperandSpec oRmsMod[] = {
     { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
     { "w", RAD_OPD_WEIGHT, 1 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
-    { "z", RAD_OPD_OUT, 0 },
+    { "z", RAD_OPD_OUT, 0 }, { "colmap", RAD_OPD_IN, 1 },
 };
 static const RadParamSpec pRmsModQ[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                          P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
@@ -2707,10 +2702,16 @@ static const RadOperandSpec oRmsModQ[] = {
     { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
     { "w", RAD_OPD_WEIGHT, 1 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
     { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 }, { "z", RAD_OPD_OUT, 1 },
+    { "colmap", RAD_OPD_IN, 1 },
 };
 static const RadOperandSpec oFlowX0[] = {
     { "v", RAD_OPD_IN, 0 }, { "t", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 },
     { "sigma_next", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
+static const RadOperandSpec oFlowRM[] = {
+    { "v", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_INOUT, 0 }, { "sigma", RAD_OPD_IN, 0 },
+    { "r", RAD_OPD_IN, 0 }, { "hb1", RAD_OPD_IN, 0 }, { "hb2", RAD_OPD_IN, 0 },
+    { "order", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
 static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
                                              P_INT("pw"), P_STR("mul"), P_STR("add"),
@@ -2733,6 +2734,23 @@ static const RadOperandSpec oVtileStitch[] = {
     { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "prev", RAD_OPD_INOUT, 0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+/* The tiled encoder (r4d_video.hip): the plan, the cut and the blend. `geom` is the request's
+ * (clip, H, W); plan and crop take it in pixels, join in latent units. */
+static const RadParamSpec pVtilePlan[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio") };
+static const RadOperandSpec oVtilePlan[] = {
+    { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileCrop[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oVtileCrop[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileJoin[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oVtileJoin[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
@@ -2740,8 +2758,9 @@ static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
 /* ---- a video latent upscaler (r4d_upscaler.hip); the same specs as libref's. `geom` is the
  * request's volume, i32 on the device; patch_fold takes patch_unfold's specs. */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype"), P_STRO("tpad"),
-                                        P_INTO("tpre") };
+                                        P_INT("kt"), P_STR("dtype"), P_INTO("stride"),
+                                        P_INTO("stride_t"), P_INTO("causal"), P_STRO("pad"),
+                                        P_INTO("reflect"), P_STRO("tpad"), P_INTO("tpre") };
 static const RadOperandSpec oConv3d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
     { "geom", RAD_OPD_IN, 0 }, { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 },
@@ -2764,6 +2783,11 @@ static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stre
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = {
     { "sigma", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pCondAug[] = { P_INT("M"), P_INT("n"), P_INT("stream"), P_F64("aug"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oCondAug[] = {
+    { "seed", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
 
 /* ---- LTX-2 (r4d_ltx.hip); the same specs as libref's. */
@@ -2915,6 +2939,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("pool_rows", pPoolRows, oUnary,
            "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded, then "
            "times `mult` and rounded again."),
+    SCHEMA("pool_cols", pPoolRows, oUnary,
+           "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and "
+           "rounded, then times `mult` and rounded again. n, the input width, is a multiple of k; "
+           "y has n / k columns."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
     SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
@@ -3574,7 +3602,10 @@ static const RadOpSchema kSchemas[] = {
            "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual through its sequence's gate; "
            "with `act` none the gate is g itself, x = bf16(x + bf16(g[seq] * y))."),
     SCHEMA("timestep_embed", pTimestep, oTimestep,
-           "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2))."),
+           "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2)). "
+           "With `curve` > 0 and a `table` [curve, n] f32 operand instead: y[m] is `table` sampled at "
+           "pos = clamp01(max(t[m], clamp_min)) * (curve - 1), linearly between the two rows around "
+           "pos -- an adaln time-embedding curve precomputed at convert."),
     SCHEMA("gather_rows2", pGenMn, oGather2,
            "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]."),
     SCHEMA("lane_gather", pLane, oLaneGather, "y[cu[e] + k] = src[lane[e] * stride + k]."),
@@ -3619,7 +3650,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("conv1d", pConv1d, oConv1d,
            "a 1-D convolution over the sequences cu_seqlens bounds, channels innermost, zeros outside "
            "each; dilation `dil`, padding dil (k - 1) / 2 a side or, with `causal`, dil (k - 1) on "
-           "the left; `res` added after the bias, then `act`."),
+           "the left; `res` added after the bias, then `act`. bf16 only with `stride` > 1: one "
+           "sequence [0, rows of x], an explicit `pad` and any k, output row m reading "
+           "x[m * stride + tap * dil - pad], the output rows (rows + 2 pad - dil (k - 1) - 1) / "
+           "stride + 1."),
     SCHEMA("conv_t1d", pConvT1d, oConvT1d,
            "a transposed 1-D convolution of kernel `k` (2 stride by default, or stride), padding "
            "`pad` ((k - stride) / 2 by default, 0 the causal form): each sequence grows `stride` "
@@ -3672,9 +3706,15 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rms_mod_quant_fp8", pRmsModQ, oRmsModQ,
            "rms_mod with the chain in bf16, then (q, scale) = quant_act_fp8(z, group); z written "
            "when bound."),
+    SCHEMA("rms_mod_quant_i8", pRmsModQ, oRmsModQ,
+           "rms_mod with the chain in bf16, then (q, scale) = quant_act_i8g(z, group) -- int8 codes "
+           "a quarter of E4M3's error on the same byte; z written when bound."),
     SCHEMA("flow_x0_step", pGenMn, oFlowX0,
            "x = r x + (1 - r) (x + (1 - t) v), r = sigma_next / sigma, each step one f32 "
            "rounding."),
+    SCHEMA("flow_res_multistep", pGenMn, oFlowRM,
+           "x = r x + hb1 (x + sigma v) + hb2 x0, r = sigma_next / sigma, x0 the previous estimate; "
+           "order<2 is Euler."),
     SCHEMA("patch_unfold", pPatchUnfold, oPatchUnfold,
            "patch rows unfolded to voxel rows and denormalised with f32 lists."),
     SCHEMA("vtile_gather", pVtileGather, oVtileGather,
@@ -3683,12 +3723,29 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("vtile_stitch", pVtileStitch, oVtileStitch,
            "a decoded chunk's tiles stitched into RGB bytes, blended with the previous chunk's "
            "tail."),
+    SCHEMA("vtile_plan", pVtilePlan, oVtilePlan,
+           "the tiled encoder's plan for one frame of geom = (clip, H, W) pixels: the encoder's "
+           "tile split over the spatial axes in latent units, tiles row-major; row t of the "
+           "i32 [M, 22] y is the tile's first pixel, its pixel extent and the six level "
+           "volumes (1, th / 2^min(L, 4), tw / 2^min(L, 4)); M is the tile count."),
+    SCHEMA("vtile_crop", pVtileCrop, oVtileCrop,
+           "one frame's pixel plane [>= H W, 3] (geom = (clip, H, W) pixels) cut into "
+           "vtile_plan's tiles: y [M, 3] the tiles' pixels tile-major, M the tiles' pixel "
+           "count."),
+    SCHEMA("vtile_join", pVtileJoin, oVtileJoin,
+           "the tiled encoder's per-tile moments blended into the canvas y [M, n] of "
+           "geom = (clip, lat_h, lat_w): each position blended with the tile above and then "
+           "the tile to the left, both RAW, the products and sums rounding to x's dtype."),
     SCHEMA("grid_pos3", pGridPos3, oGridPos3,
            "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
     SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
-           "a stride-1 `same` 3D convolution over NDHWC voxel rows of the device volume geom = "
-           "(T, H, W), PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; with `res`, "
-           "y = rd(rd(acc + b) + res), res may alias y."),
+           "a 3D convolution over NDHWC voxel rows of the device volume geom = (T, H, W), "
+           "PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; default stride 1 with "
+           "`same` zero padding; `stride`/`stride_t` > 1 (3x3x3 only) pad first then stride, "
+           "`causal` 1 takes the temporal padding front-only (kt - 1 zeros, none behind), `pad` "
+           "`down` pads none above and left and one below and right, `reflect` 1 mirrors the "
+           "spatial padding instead of zeroing it; with `res`, y = rd(rd(acc + b) + res), res "
+           "may alias y."),
     SCHEMA("group_norm", pGroupNorm, oGroupNorm,
            "nn.GroupNorm over all of y's rows (biased variance, rstd in f32), then the optional "
            "modulation v (1 + mod[0:n]) + mod[n:2n] and `act` (none or silu), one rounding; "
@@ -3704,6 +3761,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_renoise", pFlowRenoise, oFlowRenoise,
            "x = (1 - sigma) x + sigma z, z the (seed, stream) normal stream at element k n + c, "
            "each step one f32 rounding."),
+    SCHEMA("cond_aug", pCondAug, oCondAug,
+           "x = a x + oma z, a the `aug` parameter, oma the f32 of the f64 1 - aug, z the "
+           "(seed, stream) normal stream at element k n + c, each step one f32 rounding: the "
+           "reference's condition-noise augmentation."),
     SCHEMA("rope_split", pRopeSplit, oRopeSplit,
            "LTX-2's split rotary over fractional coordinates: the pairs of all heads on one "
            "ladder, the first `pad` unrotated, the axes interleaved; each head's halves turned "
@@ -4203,6 +4264,10 @@ static const RadConstraint cCastNarrow[] = {
  * predicate -- "bf16, and nothing else" -- is unchanged. */
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
+};
+/* head_dim 256 without GQA, sequences past the small kernel's. */
+static const RadConstraint cAttnDenseH256G1[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 1), C_GE("max_seqlen", 33), C_IN("dtype", "bf16"),
 };
 /* Unlimited-OCR's SAM tower (r4d_sam_attn_bf16.hip): one block per (segment, tile, head), a thread
  * a query row, q and the output accumulator in registers; only head_dim 64 is instantiated and a
@@ -4827,8 +4892,8 @@ static const RadConstraint cGemmNtQGatedFp8[] = {
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"), C_IN("act", "silu"),
 };
 /* r4d_gemm_mxfp4a8_gated_gemv: the gemv row's WMMA form (K a multiple of 128, M <= 8) with a block
- * per 16-column tile pair of the gated output; N/2 a multiple of 128, so each 128-column group's eight
- * blocks meet at its last arriver, which quantises the group. */
+ * per 16-column tile pair of the gated output. N/2 is a multiple of 128, so each 128-column
+ * group's eight blocks meet at its last arriver, which quantises the group. */
 static const RadConstraint cGemmNtQGatedMx[] = {
     C_LE("M", 8), C_DIV("K", 128), C_DIV("N", 256), C_EQ("group", 32), C_IN("dtype", "mxfp4a8"),
     C_IN("act", "silu gelu_tanh"),
@@ -5380,8 +5445,9 @@ static const RadConstraint cGeluQuick[] = { C_IN("dtype", "bf16 f32") };
 /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
 static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
 static const RadConstraint cGenAffineF32[] = { C_IN("dtype", "f32"), C_LE("n", 64) };
-static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
-static const RadConstraint cGenTimestepF32[] = { C_IN("dtype", "f32"), C_DIV("n", 2) };
+/* No parity on `n`, which a curve table's need not have: the shim checks the sinusoid's. */
+static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cGenTimestepF32[] = { C_IN("dtype", "f32") };
 /* The paged prefix at libr4d's block of 16, both caches bf16, up to eight query heads a KV head
  * (the shim takes 1, 2, 4 and 8). */
 static const RadConstraint cAttnPrefixSelf[] = {
@@ -5694,6 +5760,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_pool_rows },
+
+{ "pool_cols_bf16", "pool_cols", "elem",
+  "mean of every k consecutive columns within a row, then a multiplier: an encoder posterior's "
+  "adaptive-average pooling over the feature axis",
+  "any n and k with n % k == 0; a thread an output column",
+  "bf16 in and out, f32 sum, two roundings",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_pool_cols },
 
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
@@ -7089,6 +7164,16 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cAttnDenseH64), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
+{ "attn_dense_h256_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
+  "head_dim 256, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed), sequences past the small kernel's 32-row LDS bound",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH256G1), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
 { "attn_dense_h256_gqa2_bf16", "attn_dense", "attn",
   "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
   "causal with an optional window behind",
@@ -8297,9 +8382,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
 
-/* The residency map of a streamed KV group. One workgroup: the CLOCK hand is serial state, and the
- * phases are barriers over the entries, the block-id space and the ring. The copy is the same
- * launch, so one step is one dispatch rather than one per claim. */
+/* The residency map of a streamed KV group, in one workgroup: the CLOCK hand is serial state and
+ * the phases are barriers. The copies run in the same launch. */
 { "kv_resolve_i32", "kv_resolve", "attn",
   "turn selected KV block ids into ring slots, evict by CLOCK and copy misses in from the host",
   "any block count, ring depth and block byte extent; the mirror and the ring are read by byte "
@@ -8785,9 +8869,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store, nullptr, nullptr, nullptr,
   r4d_shape_qk_norm_rope_gate_kv_store, nullptr, r4d_fuse_qk_norm_rope_gate_kv_store },
 
-/* The prologue and the STREAMED cache store in one launch: the mirror for every token, the ring
- * only where the residency map says the block is resident. The operands are the pair's, plus the
- * map and the mirror. */
+/* The prologue and the streamed store in one launch: the mirror for every token, the ring only
+ * where the block is resident. The pair's operands, plus the map and the mirror. */
 { "qk_norm_rope_gate_kv_store_streamed_fp8", "qk_norm_rope_gate_kv_store_streamed", "attn",
   "qk_norm_rope_gate, and kv_store_streamed (host mirror always, resident ring slot too) from the "
   "same launch",
@@ -9527,12 +9610,27 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cRmsModQ), NOTUNE,
   nullptr, nullptr, r4d_rad_rms_mod_quant_fp8 },
 
+{ "rms_mod_quant_i8_bf16", "rms_mod_quant_i8", "norm",
+  "gated residual, modulated RMS norm and quant_act_i8g in one pass: a workgroup a row",
+  "n % 128 == 0, n <= 8192, group 128; s a column slice at its own pitch",
+  "bf16 rows, gain and table, int8 codes and f32 scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsModQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_rms_mod_quant_i8 },
+
 { "flow_x0_step_f32", "flow_x0_step", "elem",
   "a sampler step toward the clean estimate", "any M, row pitches honoured",
   "f32 state, f32 or bf16 velocity",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenF32), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_x0_step },
+
+{ "flow_res_multistep_f32", "flow_res_multistep", "elem",
+  "a second-order sampler step on the clean estimate", "any M, row pitches honoured",
+  "f32 state and estimate history, f32 or bf16 velocity",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_res_multistep },
 
 { "patch_unfold_f32", "patch_unfold", "elem",
   "patch rows to denormalised voxel rows, the geometry read on the device",
@@ -9556,6 +9654,27 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_vtile_stitch },
+
+{ "vtile_plan", "vtile_plan", "elem",
+  "the tiled encoder's per-tile geometry table: a thread a (tile, entry)",
+  "any M; the split reads geom on the device", "i32 table, i32 geom",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_plan },
+
+{ "vtile_crop", "vtile_crop", "elem",
+  "a frame's pixel plane cut into the encode tiles: a thread a tile pixel row",
+  "row pitches honoured", "f32 or bf16 plane and tiles",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_crop },
+
+{ "vtile_join", "vtile_join", "elem",
+  "the encode tiles' moments blended into the latent canvas: a thread a canvas row",
+  "row pitches honoured", "f32 or bf16 moments and canvas",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_join },
 
 { "grid_pos3", "grid_pos3", "elem",
   "a video decoder's rotary positions over its tiles", "a [3, M] view at its own pitch", "f32",
@@ -9620,6 +9739,13 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenF32), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_renoise },
+
+{ "cond_aug_f32", "cond_aug", "elem",
+  "condition rows blended with fresh noise at the declared aug: a thread a value",
+  "any M and n, row pitches honoured", "f32 rows, u32 seed words",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_cond_aug },
 
 { "rope_split", "rope_split", "elem",
   "LTX-2's rotary: a workgroup a (head, 64 rows), the head's ladder in LDS, sincosf a pair",

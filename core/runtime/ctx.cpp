@@ -329,6 +329,14 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
+        p.n_opd_required = -1;
+        if (oi.schema) {
+            /* One past the last required operand: an issue may leave out the optional ones after
+             * it. */
+            for (int o = 0; o < oi.schema->n_operands; ++o)
+                if (!oi.schema->operands[o].optional) p.n_opd_required = o + 1;
+            if (p.n_opd_required < 0) p.n_opd_required = 0;
+        }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
@@ -959,10 +967,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);
         mix((uint64_t)k.block_table_pitch); ptr(k.seqused); ptr(k.state_index);
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
-        /* Null on a fully resident group, a fixed set of addresses on a streamed one. Two groups
-         * that differ here hand a kernel different memory, so they are different passes -- and the
-         * view's *address* must not enter the key: the builder's Out slot rotates every step, which
-         * would make every streamed pass a new one (kvstream/bind.h, kvstream_view_key). */
+        /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
         mix(kvstream_view_key(k.stream));
     }
     mix((uint64_t)level_);
@@ -1267,8 +1272,7 @@ int Ctx::run_pass(const RadBatch* b) {
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
     if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     const uint64_t key = pass_key(b);
-    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b);
-        return RAD_OK; }
+    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
         bump(pc_refused_);
         arch_step_(this, b);

@@ -1898,7 +1898,7 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
 
 /* The step that emits a request's last token issues nothing behind it: a step issued ahead for a
  * request the commit then finishes verifies nothing, and the next request would wait out its
- * forward pass (#225). A reply of 32 tokens is the prefill's token and 31 decode steps, each
+ * forward pass. A reply of 32 tokens is the prefill's token and 31 decode steps, each
  * issued ahead of the one before it, and no 32nd. Twice, so the second request starts behind the
  * first's last step. */
 TEST(a_requests_last_step_issues_no_step_ahead) {

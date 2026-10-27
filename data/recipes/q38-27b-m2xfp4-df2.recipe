@@ -10,7 +10,7 @@
 # serves the Quark, ParoQuant and NVFP4 releases; without them a bf16 checkpoint selects
 # qwen35_bf16, which has no 4-bit GEMM.
 #
-# q38-27b-mxfp4-df2.recipe with its 4-bit rules at M2XFP4 (`m2xfp4`, docs/TOOLS.md): the MXFP4
+# q38-27b-mxfp4-df2.recipe with its 4-bit rules at M2XFP4 (`m2xfp4`, spec.md): the MXFP4
 # codes and e8m0 exponent per 32 of K plus one metadata byte a group, whose four 2-bit extra
 # mantissas refine the exponent per 8 columns, chosen by least squared error from the bf16 source,
 # once. The delta net's a/b projections, the norms, the embedding and the vision tower stay bf16;

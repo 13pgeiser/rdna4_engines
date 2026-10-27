@@ -928,6 +928,7 @@ utilisation fraction:
 | `--host-headroom-mib` | host RAM left free for the system at startup (default 4096) |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
+| `--kv-resident` | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card; off by default. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing; ignored with a warning on an architecture that cannot stream (docs/KV-STREAMING.md) |
 
 Nothing is inferred from the free VRAM at startup, which would size pools differently depending on
 what else is open. Each term is a fixed property, a computed quantity, or a measurement printed on

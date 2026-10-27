@@ -339,11 +339,18 @@ struct FakeKV : IKVManager {
         const KVGeom::G& gg = geom.g[(size_t)g];
         return gg.paged ? gg.block_size : 0;
     }
+    /* A streamed group's view, as KVManager::stream_view returns it. Tests install fake
+     * addresses to check that the builder rebases them into each rank's pool; with `streams`
+     * false the fake has none, which is every other scheduler test. */
+    RadKVStream stream{};
+    bool        streams = false;
+    const RadKVStream* stream_view(int32_t g) const override {
+        return streams && g == 0 ? &stream : nullptr;
+    }
     /* Groups a test says the window snapshot carries (KVGroupPlan::win_snap): a checkpoint slot
      * then holds their window, and a hit at a snapshot seeds them (nothing to copy here). */
     std::vector<int32_t> snap;
-    /* False: the snapshot is taken but its groups are not reported, as before
-     * IKVManager::window_snapshot existed. */
+    /* False: the snapshot is taken but window_snapshot() does not report its groups. */
     bool snap_reported = true;
     bool window_snapshot(int32_t g) const override {
         return snap_reported && std::find(snap.begin(), snap.end(), g) != snap.end();

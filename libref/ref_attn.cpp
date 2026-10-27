@@ -566,34 +566,14 @@ int ref_kv_store(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ kv_store_streamed */
-/* The store of a streamed group: the host mirror is the truth, the device pool is a cache of it.
- *
- * A streamed group's ring is `slots` blocks deep while the block-id space is `blocks`, and a block
- * may be absent from it. This op is `kv_store` with the two copies the group keeps:
- *
- *   host[b]          is written ALWAYS, at the block's identity row, whatever the map says;
- *   kv_cache[res[b]] is written only when `res[b] >= 0`, i.e. the block is resident now.
- *
- * The residency test belongs in the writer rather than in the resolve, and this is the case that
- * decides it: at decode the block this step's tokens land in is the block the last step already
- * made resident (a block is `ratio` tokens of one sequence), so a writer that only wrote the
- * mirror would leave the ring holding that block's first tokens and every later token missing -
- * and the resolve, seeing the block resident, would not copy it. Writing the ring when resident
- * and the mirror always means a host block is never stale and a slot never holds a block the
- * mirror disagrees with, which is the property the resolve's copy relies on.
- *
- * The order the caller must keep is store, then resolve, then attention (arch/common/
- * rad_block_attn_gated_fp8.h): the block the current step writes may be absent from the ring, and
- * the resolve then copies whole blocks out of the mirror, so it must see this step's bytes.
- *
- * The two planes are the same bytes in the same paged layout
- * (`[notional block, kv_heads, block_size, 2 * head_dim]`, K then V in a slot), so one conversion
- * writes both: the mirror is described as an E4M3 plane over the same row pitch and the loop
- * stores into `host` and, when resident, `kv_cache`.
- *
- * `res` is read, not written: residency is the resolve's decision (libref/ref_kvstream.cpp). A
- * `res` entry outside [-1, slots) for a block this call touches, or a slot naming a block past the
- * id space, is a state fault and is refused before anything is written. */
+/* The store of a streamed group (docs/OPS.md "kv_store_streamed"): `kv_store` into both of the
+ * group's copies. host[b], the authoritative mirror, is written always; kv_cache[res[b]] only when
+ * the block is resident. The writer must test residency: at decode the block a step writes is
+ * usually the one the previous step made resident, so a mirror-only writer would leave the ring's
+ * copy missing this step's tokens, and the resolve, seeing it resident, would not copy it. The
+ * caller's order is store, resolve, attention. The planes are the same paged layout at the same
+ * pitch, so one conversion writes both. `res` is read, never written; an entry outside
+ * [-1, slots) for a touched block, or a slot past the id space, is refused before any write. */
 int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     if (!have(a, 6)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
@@ -606,10 +586,8 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (sm->dtype != RAD_I32 || res->dtype != RAD_I32) return RAD_E_DTYPE;
     if (host->dtype != RAD_U8) return RAD_E_DTYPE;
-    /* E4M3 (the fp8 QSA family) or bf16 (the default cache dtype). Streaming is dtype-agnostic
-     * beyond the writer: both planes are byte planes of the same paged layout whose pitch is one
-     * block, so a bf16 group doubles every offset and stores the value itself, as kv_store_bf16
-     * does. A packed fp8_v4/k6_v4 group has no streamed row and is refused. */
+    /* E4M3 or bf16: a bf16 group doubles every offset and stores the value itself, as
+     * kv_store_bf16 does. A packed fp8_v4/k6_v4 group has no streamed row. */
     const bool fp8 = kv->dtype == RAD_F8E4M3;
     if (!fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
     if (kv->rank != 4) return RAD_E_SHAPE;
@@ -617,8 +595,8 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         kv->shape[3] != 2 * head_dim) return RAD_E_SHAPE;
     if (host->rank != 2) return RAD_E_SHAPE;
 
-    /* One block of one layer. Both planes are dense rows of it: a padded mirror row would copy a
-     * block's bytes over its neighbour's, and the two copies must address the same offsets. */
+    /* Both planes are dense rows of one block of one layer: a padded mirror row would copy over its
+     * neighbour, and the two copies must share offsets. */
     const int64_t EB = fp8 ? 1 : 2;
     const int64_t row = kv_heads * block_size * 2 * head_dim * EB;
     const int64_t slots = kv->shape[0], blocks = host->shape[0];
@@ -643,7 +621,7 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
 
     /* Everything that can refuse is checked before the first write: a half-written mirror would
-     * make the next step's copies plausible and wrong. */
+     * make later copies plausible and wrong. */
     const int32_t* const R = (int32_t*)res->data;
     for (int64_t t = 0; t < M; ++t) {
         const int64_t s = ld_int(sm->dtype, sm->data, offlin(sm, t));
@@ -653,8 +631,7 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         if (R[blk] < -1 || R[blk] >= slots) return RAD_E_INVAL;
     }
 
-    /* The mirror, seen as the plane it holds (E4M3 or bf16): same bytes, same writer, so the two
-     * copies cannot round differently. */
+    /* The mirror seen as the plane it holds, so both copies round the same. */
     RadTensor hkv = *host;
     hkv.dtype = kv->dtype;
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
@@ -666,8 +643,7 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         if (s < 0) continue;
         const int64_t blk = s / block_size, off = s % block_size;
         const int64_t hb = blk * hv.sb + off * hv.so;
-        /* A resident block keeps its slot current; a non-resident one is written to the mirror
-         * alone and the resolve copies the whole block in when it selects it. */
+        /* A non-resident block is written to the mirror alone; the resolve copies it in whole. */
         const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
         for (int64_t h = 0; h < kv_heads; ++h) {
             for (int64_t d = 0; d < head_dim; ++d) {

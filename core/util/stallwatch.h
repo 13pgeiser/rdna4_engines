@@ -15,12 +15,14 @@
  *     early;
  *   - the process's other threads that are inside an ioctl, since a lock in a runtime library is
  *     usually held by one of them.
- * It reports again each time the silence doubles, showing whether the thread moved. The watch
- * reads only its own process's /proc entries and wakes every quarter of the quiet interval, at most
- * once a second, while held.
+ * It reports again each time the silence doubles, showing whether the thread moved. A phase whose
+ * progress is not logged (a loop of steps) marks it with progress(). The watch reads only its own
+ * process's /proc entries and wakes every quarter of the quiet interval, at most once a second,
+ * while held.
  */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -36,10 +38,14 @@ public:
     StallWatch(const StallWatch&) = delete;
     StallWatch& operator=(const StallWatch&) = delete;
 
+    /* Progress the log does not show: the silence restarts as if a line had been logged. */
+    void progress();
+
     struct Impl;
 
 private:
     std::unique_ptr<Impl> p_;
+    std::atomic<uint64_t> beat_{0};   /* rad_mono_ns of the last progress() */
 };
 
 /* What thread `tid` of this process is doing, as the report words it: state, wait channel, system

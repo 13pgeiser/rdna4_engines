@@ -212,6 +212,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
+| `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
 | `relu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` `t_last`/opt `act`/opt | `x`, `w`w, `cu_seqlens`, `valid`? → `y`; `b`w? |
@@ -291,6 +292,12 @@ op; the segment count is `cu_seqlens`' length less one. An empty segment is a ze
 **`pool_rows`** is a vision pooler over windows laid out consecutively: row `r` of `y` is the mean
 of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times `mult` and
 rounded again (the unfused pair stores the mean). `M` is the input row count, a multiple of `k`.
+
+**`pool_cols`** pools along a row instead: column `c` of row `m` of `y` is the mean of `x[m]`'s
+columns `[c*k, c*k + k)`, with the same f32 sum, the same two roundings and the same optional
+`mult`. `n` is the input width, a multiple of `k`; `y` has `n / k` columns. MiniMax-H3's audio
+encoder pools its attention block's features this way (an `adaptive_avg_pool1d` over the feature
+axis).
 
 **`fill`** writes `y = value` over the extent (`value` 0 when absent). A rank issues it where it
 computes nothing but a downstream reader still expects a defined buffer: an attention-zero rank's
@@ -1049,77 +1056,33 @@ declares bound it lower.
 `RadKVGroupBatch` carries the slot mapping, the block table and the sequence lengths, but the pool
 base belongs to the block manager, not the batch.
 
-**When the group streams, the pool is a ring and the operand is its layer.** The device pool then
-holds `slots` blocks and the sequence's block table still names up to `blocks` ids, so the sparse
-path needs one indirection: `kv_resolve` (in "Sparse attention (QSA)") rewrites the selected ids as
-ring slots and copies a block in from the pinned host mirror on a miss. Every other op reads the
-cache exactly as before, because it is handed a resolved table.
-
-Such a group is written by `kv_store_streamed` instead of `kv_store`: the token's k and v go into
-the host mirror ALWAYS and into the ring slot only when the residency map says the block is
-resident. The mirror is the truth; the ring is a cache of it. The order a layer keeps is **store,
-then resolve, then attention**, because a block this step writes may not be in the ring yet and the
-resolve copies such a block whole out of the mirror. The residency test belongs in the writer, not
-only in the resolve: at decode the block a step writes is usually the block the previous step made
-resident, so a mirror-only writer would leave the ring's copy of it missing this step's tokens and
-the resolve, seeing the block resident, would not copy it.
-
-**`kv_dtype` `fp8_v4` and `k6_v4`** (device-only) are the quantised layouts of
-`--kv-cache-dtype` (`RadBuildCtx::kv_quant`). A head's dims are grouped by 32, each group with an
-f16 scale (its absmax over the largest code, clamped so every code decodes finite in f16),
-codes two's complement. A token's row in a head, at
-head_dim HD:
-
-| bytes | `fp8_v4` (25 HD / 16) | `k6_v4` (22 HD / 16) |
-|---|---|---|
-| K | [0, HD): E4M3, as `fp8_e4m3` | [0, HD/2): the codes' low four bits; [HD/2, 3HD/4): their high two bits, a word per 16 dims whose byte j holds dims 2j, 2j+1 in bits 0-3 and 8+2j, 9+2j in bits 4-7 |
-| V | [HD, 3HD/2): int4 codes, dim d in the nibble at bit 4 (d mod 2) of byte d/2 | [3HD/4, 5HD/4): the same |
-| scales | [3HD/2, 25HD/16): V's (absmax / 7) | [5HD/4, 21HD/16): K's (absmax / 31); [21HD/16, 22HD/16): V's |
-
-The group is declared at `RAD_F8E4M3` with head_dim the row's bytes / 2, so the core sizes pages
-as it does for fp8, and the cache operand's last extent is the row. The ops take the model's
-head_dim. libr4d's rows are `kv_store_fp8v4` / `kv_store_k6v4`,
-`qk_norm_rope_gate_kv_store_fp8v4` / `_k6v4` (byte-identical to the prologue and the store, as at
-the other widths), `attn_prefill_h256_gqa6_{fp8v4,k6v4}` and `attn_decode_h256_gqa6_{fp8v4,k6v4}`,
-which widen the codes to f16 in a tile's staging, and the same kernels at Qwen3.8-Flash-Next's
-ratios over 4-token pages: `attn_{prefill,decode,decode_gq}_h256_gqa12_{fp8v4,k6v4}` and
-`attn_{prefill,decode,decode_gq}_h256_gqa6_bs4_{fp8v4,k6v4}`, the `decode_gq` rows with the output
-gate and quantiser in the split-KV merge. `r4d_selftest` holds the stores to an exactly
-representable set and the attention rows to its inline oracle.
+**A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
+table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
+(`kv_resolve`, under "Sparse attention (QSA)"), and every other op reads the cache as before.
+Such a group is written by `kv_store_streamed`. A layer's order is store, then resolve, then
+attention, so a block the resolve copies in from the mirror carries this step's tokens.
 
 ### `kv_store_streamed`
 
-`kv_store` for a group whose KV streams: one scatter into the group's two copies instead of one.
+`kv_store` for a streamed group, into both of its copies.
 
-- **`k`, `v`, `slot_mapping`** — as `kv_store`: bf16 activations, an i32 flat slot per token, a
-  negative slot skipped. `slot / block_size` is the block and `slot % block_size` the position in
-  it.
-- **`host`** — bytes, `[blocks, row]`, inout. The layer's authoritative mirror, one block a row,
-  the identity layout the design note gives it (`[block, kv_heads, block_size, 2 * head_dim]`,
-  K then V in a slot). **Written for every token with a slot, always.**
-- **`kv_cache`** — the ring, the same `RAD_KV(group, layer)` operand `attn_paged`, `kv_store` and
-  `kv_resolve` take. **Written at `res[block]` only when that is >= 0.**
-- **`res`** — `i32 [blocks]`, in. The residency map `kv_resolve` maintains. Read, never written:
-  residency is the resolve's decision, so the store cannot move the map under a selection that has
-  already been resolved.
+- **`k`, `v`, `slot_mapping`** — as `kv_store`; a negative slot is skipped. `slot / block_size` is
+  the block and `slot % block_size` the position in it.
+- **`host`** — bytes `[blocks, row]`, inout: the layer's authoritative mirror, one block a row in the
+  cache's layout (`[block, kv_heads, block_size, 2 * head_dim]`, K then V in a slot). Written for every
+  token with a slot.
+- **`kv_cache`** — the ring, `RAD_KV(group, layer)`. Written at `res[block]` only when that is `>= 0`.
+- **`res`** — `i32 [blocks]`, in: the residency map. Read, never written; residency is
+  `kv_resolve`'s decision.
 
-Both planes are dense rows of the same byte pitch, so one offset addresses the same element of the
-same block in either and the two copies cannot disagree. The conversion follows the cache's dtype:
-`kv_store_fp8`'s for E4M3 (divided by the reader's descales) and `kv_store_bf16`'s for bf16 (the
-value itself, no descales; every offset is two bytes wide). The rows are `kv_store_streamed_fp8`
-and `kv_store_streamed_bf16`, so the default `--kv-cache-dtype bf16` streams as well as fp8; a
-packed fp8_v4/k6_v4 group has no streamed row and the engine refuses to stream it rather than leave
-it without a writer.
-
-The caller's order, per layer, is **store → resolve → attention**. A block the current step writes
-may not be in the ring at all (a block's first tokens, or a block a previous resolve evicted); the
-resolve then copies the whole block out of the mirror, so the store must have written it. A block
-that is resident takes the token in both copies, so the ring never holds a stale block and the
-resolve never needs to re-copy a resident one. A map entry outside `[-1, slots)` is a state fault
-that libref refuses; the device kernel treats it as not resident, which writes the mirror and lets
-the resolve refuse the step.
-
-
+The residency test is in the writer because at decode the block a step writes is usually the one
+the previous step made resident: a mirror-only writer would leave the ring's copy short of this
+step's tokens, and the resolve, seeing the block resident, would not copy it. Both planes share one
+byte pitch, so one offset addresses the same element in either. The rows are
+`kv_store_streamed_fp8` (`kv_store_fp8`'s conversion) and `kv_store_streamed_bf16` (the value
+itself); a packed `fp8_v4`/`k6_v4` cache has none. A map entry outside `[-1, slots)` is a state
+fault libref refuses; the device kernel treats it as absent, writes the mirror, and the resolve
+refuses the step.
 
 | op | params | operands |
 |---|---|---|
@@ -1158,24 +1121,13 @@ accepts, but a rotated element is a difference of two products, so where those n
 ULP becomes a few percent and the transcript moves within a few dozen steps. The kernel reproduces
 the reference's fold exactly: widths above the head dim contribute zeros, and adding 0.0f is exact.
 
-**`qk_norm_rope_gate_kv_store_streamed`** is that fold for a group whose KV streams: the store is
-`kv_store_streamed` instead of `kv_store`, so it takes the residency map and the group's host
-mirror as its last two operands. The token's rotated k and its v go into the mirror's block row for
-every token with a slot, and into `kv_cache[res[block]]` only where the map calls the block
-resident; a negative or out-of-range slot stores nothing, and a map entry outside `[-1, slots)` is
-treated as not resident (libref refuses it as a state fault, and the resolve then refuses the
-step). Both planes are the same dense row of the same paged layout, and the rotated k is the value
-`k_out` receives, so the bytes are exactly `qk_norm_rope_gate` then `kv_store_streamed`'s. It has
-an E4M3 row (`_fp8`) and a bf16 row (`_bf16`, the default cache dtype; the two planes hold the
-rotated k and v themselves, two bytes wide). It
-exists because the pair costs a launch a layer on the decode path: one launch where the unfused
-prologue and the store were two, and one fewer hop between store, resolve and attention.
-
-The caller's order is unchanged -- **store, then resolve, then attention** -- and a staged pass
-keeps the stage-copy wait before the store, which is now the prologue's own write. The folded path
-takes the same guards as the hosted one: `T` at or below the fused rows and a pass at one rotary
-component per token (no mixed media positions). Where the row is absent, or a pass declines it, the
-layer runs `qk_norm_rope_gate` plus a separate store exactly as before.
+**`qk_norm_rope_gate_kv_store_streamed`** is that fold with `kv_store_streamed` as the store, taking
+the residency map and the host mirror as its last two operands: the rotated k and the v go to the
+mirror for every token with a slot and to `kv_cache[res[block]]` only where the block is resident.
+The bytes are exactly `qk_norm_rope_gate` then `kv_store_streamed`'s. Rows `_fp8` and `_bf16`. It
+saves a launch a layer on the decode path. A staged pass waits for its stage copy before this op,
+which is the store; a pass the row declines (more than the fused rows, or mixed media positions)
+runs the prologue and a separate store.
 
 ## Image generation
 
@@ -1191,7 +1143,7 @@ says which (`libref/ref_gen.cpp`).
 | `ln_mod` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `s`, `cu_seqlens` → `y` |
 | `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
-| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `dtype` | `t` → `y` |
+| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `curve`/opt `dtype` | `t` → `y`, `table`w? |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
 | `table_add` | `M`(range) `n` `L` `dtype` | `x`, `t`w → `y` |
 | `mix_rows` | `M`(range) `n` `k` `dtype` | `x`, `w`w → `y` |
@@ -1232,7 +1184,13 @@ source into every listed lane (a repainted picture's latent into each of its ima
   `t' = scale * t`; with `round` 1, `t' = scale * bf16(bf16(t * scale) / scale)`, the value
   diffusers' pipeline hands its transformer; with `round` 2, `t' = scale * bf16(t)` (a pipeline
   that hands the transformer `t` in bf16 and scales it inside, Krea 2's); with `round` 3,
-  `t' = bf16(scale * bf16(t))` (the scaling also in bf16, FLUX's). `t` is f32 `[M]`.
+  `t' = bf16(scale * bf16(t))` (the scaling also in bf16, FLUX's). `t` is f32 `[M]`. With
+  `clamp_min`, each `t` is first raised to it, `t = max(t, clamp_min)`: MiniMax-H3's pinned
+  references take a near-clean timestep whatever the step's. With `curve` = G > 0 and the `table`
+  weight (f32 `[G, n]`), `y[m]` is instead interpolated linearly between the table's two rows
+  around `clamp01(max(t[m], clamp_min)) * (G - 1)` (the lower row at most `G - 2`): the timestep
+  embedding a curve-form checkpoint ships precomputed, in place of the sinusoid and its MLP.
+  `scale`, `max_period` and `round` do not apply there, and `n` need not be even.
 - `gather_rows2`: `y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]`, zeros past either source.
 - `table_add`: `y[r, l n + c] = x[r, c] + t[l, c]` for each of `L` rows of the weight `t` `[L, n]`,
   the sum f32 and rounded once: a modulation shared by every block plus each block's own learned
@@ -1346,7 +1304,7 @@ libref function says which (`libref/ref_audio.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt `stride`/opt `cu_div`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
+| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt `stride`/opt `pad`/opt `cu_div`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
 | `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
@@ -1450,14 +1408,20 @@ input reads zero outside it.
 - `conv1d`: PyTorch's `[cout, cin, k]` weight, `k` odd, dilation `dil` and padding
   `dil (k - 1) / 2` a side, or with `causal` 1 (any `k`) `dil (k - 1)` on the left; `res` is added
   after the bias, then `act` `none`, `tanh` or `clamp`, `min(max(y, -1), 1)` (BigVGAN's output
-  clamp; a NaN stays NaN). f32 accumulation, one rounding. `stride` s > 1 (causal only, the reach
-  `dil (k - 1) + 1` at least s) pads `dil (k - 1) + 1 - s` on the left and keeps every s-th row:
-  output row `o` of a sequence reads input rows `o s - pad + t dil`, and sequence `e`'s rows
-  `[cu[e], cu[e+1])` become `[cu[e] / s, cu[e+1] / s)`, so every bound is a multiple of s; `res`
-  and `y` have the output's rows (a causal codec encoder's downsampling, as Fish Audio's).
-  `cu_div` reads the bounds in units that many input rows apart, as the other encoder ops do:
-  sequence `e` is input rows `[cu[e] / cu_div, cu[e+1] / cu_div)`, each bound a multiple of
-  `cu_div` times the stride, so one bounds array in samples serves every rate of an encoder.
+  clamp; a NaN stays NaN). f32 accumulation, one rounding. A `stride` s > 1 comes in two forms.
+  A causal one (the reach `dil (k - 1) + 1` at least s) pads `dil (k - 1) + 1 - s` on the left
+  and keeps every s-th row: output row `o` of a sequence reads input rows `o s - pad + t dil`,
+  and sequence `e`'s rows `[cu[e], cu[e+1])` become `[cu[e] / s, cu[e+1] / s)`, so every bound is
+  a multiple of s; `res` and `y` have the output's rows (a causal codec encoder's downsampling,
+  as Fish Audio's). `cu_div` reads the bounds in units that many input rows apart, as the other
+  encoder ops do: sequence `e` is input rows `[cu[e] / cu_div, cu[e+1] / cu_div)`, each bound a
+  multiple of `cu_div` times the stride, so one bounds array in samples serves every rate of an
+  encoder. A non-causal one takes an explicit `pad` (bf16 rows only, the audio encoder's
+  downsample): `k` is any size, the op is one sequence `cu_seqlens` = `[0, rows of x]`, output
+  row `m` reads `x[m s + tap dil - pad]` with zeros outside, PyTorch's zero-padded strided conv
+  exactly (`k = 2 s`, `pad = ceil(s / 2)` gives `M / s` rows), and `y` has
+  `(rows + 2 pad - dil (k - 1) - 1) / s + 1` rows exactly. An explicit `pad` without a stride,
+  and an even `k` with neither a causal nor a stride, are refused.
 - `conv_t1d`: PyTorch's `[cin, cout, k]` transposed weight, any `k` of at least a stride (two
   strides by default), padding `pad` (`(k - stride) / 2` by default, which needs `k - stride` even;
   0 is the causal form, whose full output's last `k - stride` rows are dropped; it may exceed a
@@ -1504,12 +1468,17 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 
 | op | params | operands |
 |---|---|---|
-| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `z` |
-| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `z`, `colmap`? |
+| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
+| `rms_mod_quant_i8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
+| `flow_res_multistep` | `M`(range) `n` `dtype` | `v`, `x0`:inout, `sigma`, `r`, `hb1`, `hb2`, `order`, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
 | `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
+| `vtile_plan` | `M`(range) `tile` `overlap` `ratio` | `geom` → `y` |
+| `vtile_crop` | `M`(range) `tile` `overlap` `ratio` `dtype` | `x`, `geom` → `y` |
+| `vtile_join` | `M`(range) `tile` `overlap` `n` `dtype` | `x`, `geom` → `y` |
 | `grid_pos3` | `M`(range) `T` `H` `W` `period` `scale`:f64 | → `y` |
 
 **The transformer.** `cu_seqlens` partitions the rows into entries as for `ln_mod`, and each row
@@ -1529,14 +1498,26 @@ reads its entry's rows of `s` and `g`.
   `eps`. Without `w` the norm has no gain and rounds once, `n2 = bf16((x - mean) rsqrt(var +
   eps))` (FLUX.3's LayerNorm without an affine). `norm` `none` takes no norm and no gain,
   `n2 = x`, and refuses `w` (LTX-2's text keys and values, modulated as they are).
+  `colmap` (optional, trailing, i32 one a sequence) maps a sequence to its table row: every `[e]`
+  above becomes `[colmap[e]]`, so groups that share a modulation cell read one row. With it, `s`
+  and `g` may hold fewer rows than there are sequences; the map's bound is the issuer's.
 - `rms_mod_quant_fp8` is `rms_mod` with the norm chain in bf16, then `quant_act_fp8` of that bf16
   row per `group` as `ln_mod_quant_fp8` takes it; `z` written when bound.
+- `rms_mod_quant_i8` is the same with `quant_act_i8g` in place of `quant_act_fp8`: symmetric int8
+  codes with a scale per `group` columns of a row, for the int8 GEMMs. `z` written when bound.
 - `flow_x0_step` is MiniMax-H3's sampler step over a lane's rows, all f32, each product and sum
   one rounding: the velocity points at the data, so the clean estimate is `d = x + (1 - t) v` and
   the step blends toward it, `st = f32(1 - t)`, `d = f32(x + f32(st v))`,
   `r = f32(sigma_next / sigma)`, `x = f32(f32(r x) + f32(f32(1 - r) d))`. `t` (the timestep the
   transformer was conditioned on), `sigma` and `sigma_next` (the schedule's entries) are one f32
   value each; `v` is f32 or bf16, `x` f32.
+- `flow_res_multistep` is the same sampler's second-order form (k-diffusion's `res_multistep` at
+  eta 0, DPM-Solver++ 2M): with the clean estimate `d = f32(x + f32(sigma v))`, the step also
+  takes the previous step's estimate `x0`, `x = f32(f32(f32(r x) + f32(hb1 d)) + f32(hb2 x0))`,
+  then writes `d` to `x0` for the next step (`x` and `x0` f32). With `order` below 1.5 it is the
+  Euler step `x = f32(f32(r x) + f32(f32(1 - r) d))`, which a step with no previous estimate on its
+  grid takes (core/gen/video_driver.cpp's `stage_sched` has the coefficients, `hb1 + hb2 = 1 - r`).
+  `sigma`, `r`, `hb1`, `hb2` and `order` are one f32 value each; `v` f32 or bf16.
 
 **The decoder** runs over a request's latent geometry, which `geom`, i32 on the device, carries
 (the parameters are fixed at declare). `mul`, `add`, `mean` and `std` are space-separated lists
@@ -1595,6 +1576,38 @@ written.
   component-major, at its own row pitch: a `[3, M]` view of a wider plane, which `qk_norm_rope`
   `axial` then reads as f32 positions. MiniMax-H3: `T` 7, `H` 16, `W` 16, `period` 1797,
   `scale` `2 pi`.
+
+**The tiled encoder** encodes a one-frame media larger than a tile as vae.py's `tiled_encode` does
+(`comfy/ldm/minimax/vae.py`): the pixel plane is cut into tiles, each goes through the encoder
+alone (the per-level ops, issued per tile), and the tiles' moments are blended into one latent
+plane. These three ops are the plan, the cut and the blend. Their axis split is the decoder's rule
+above, except that an axis no longer than a tile is one tile `[0, L)`, short if need be.
+MiniMax-H3: `tile` 16 latents, `overlap` 4, `ratio` 16. An `M` in a shape below is that operand's
+row count, read from the operand; the ranged `M` argument is a ceiling only.
+
+- `vtile_plan`: the plan for one frame of `geom` = `(clip, H, W)` pixels, split in latent units
+  over the spatial axes and numbered row-major over (row band, column band). Row `t` of the i32
+  `y [M, 22]`: the tile's first pixel `(y0, x0)` at [0] [1], its pixel extent `(th, tw)` at
+  [2] [3] (`tile ratio`, except a lone short tile), and level `L`'s volume
+  `(1, th / 2^min(L, 4), tw / 2^min(L, 4))` at `3 L + 4` for `L = 0..5` (levels 4 and 5 share a
+  size).
+- `vtile_crop`: the frame's pixel plane `x [>= H W, 3]` (pixel `(Y, X)` at row `Y W + X`) cut into
+  the plan's tiles: `y [M, 3]` holds the tiles' pixels tile-major, each tile's rows in plane
+  order; `M` is the tiles' pixel count, more than the plane's since the tiles overlap.
+- `vtile_join`: the tiles' `n`-channel moments (`vtile_crop`'s row layout at latent extent)
+  blended into the canvas `y [M, n]` of `geom` = `(clip, lat_h, lat_w)` in latent units, `M`
+  `lat_h lat_w`. As in the stitch, position `(Y, X)` belongs to the tile `(i, j)` whose range
+  `[start_i, start_{i+1})` holds it, at `(ly, lx)` within it, `T(i, j, ly, lx)` that tile's
+  value; unlike the stitch, the neighbours are read unblended. `rd`, `wa` and `wb` are the
+  stitch's, rounding to `x`'s dtype:
+
+      V = rd(rd(T(i-1, j, ly + tile - ev, lx) wa(ly, ev)) + rd(T(i, j, ly, lx) wb(ly, ev)))
+          when i > 0 and ly < ev = ov_y[i-1], else T(i, j, ly, lx)
+      y[(Y, X)] = rd(rd(T(i, j-1, ly, lx + tile - eh) wa(lx, eh)) + rd(V wb(lx, eh)))
+          when j > 0 and lx < eh = ov_x[j-1], else V
+
+  Only a lone tile is short, and it has no neighbour, so a neighbour is always `tile` long on the
+  blended axis.
 
 ### Video sparse attention
 
@@ -1693,7 +1706,7 @@ pass starts from. Each op rounds once into its output (`libref/ref_video.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` `tpad`/opt `tpre`/opt | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
+| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` `stride`/opt `stride_t`/opt `causal`/opt `pad`/opt `reflect`/opt `tpad`/opt `tpre`/opt | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
 | `group_norm` | `M`(range) `n` `groups` `eps`:f64 `act` `dtype` | `x`, `w`w, `b`w, `mod`?, `stats`:inout → `y` |
 | `tconv_dw` | `M`(range) `n` `k` `dtype` | `x`, `w`w, `b`w, `geom` → `y` |
 | `resize_bilinear` | `M`(range) `n` `dtype` | `x`, `geom` → `y` |
@@ -1705,10 +1718,10 @@ innermost (NDHWC). `geom` is the request's volume, i32 on the device (the parame
 declare). An output holds at least the rows the volume writes; rows past them are not written.
 Every op honours its activation operands' row pitches. `rd` is a rounding into the output's dtype.
 
-- `conv3d_ndhwc`: `x [>= T H W, cin]`, `y` and `res` `[>= T H W, cout]`, `geom = (T, H, W)`; `w` is
-  PyTorch's Conv3d weight `[cout, cin, kt, k, k]` (a kernel may relayout it at load, as
-  `conv2d_nhwc`'s layout hook does) and `b [cout]`. Stride 1, zero padding `kt/2` frames and `k/2`
-  rows and columns on each side (`same`; `k` and `kt` odd):
+- `conv3d_ndhwc`: `x [>= T H W, cin]`, `y` and `res` `[>= rows out, cout]`, `geom = (T, H, W)`;
+  `w` is PyTorch's Conv3d weight `[cout, cin, kt, k, k]` (a kernel may relayout it at load, as
+  `conv2d_nhwc`'s layout hook does) and `b [cout]`. The defaults are stride 1 with zero padding
+  `kt/2` frames and `k/2` rows and columns on each side (`pad` `same`; `k` and `kt` odd):
   `y[(t,i,j), o] = rd(f32(sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw]
   x[(t+dt-kt/2, i+kh-k/2, j+kw-k/2), ci]) + b[o])`, terms outside the volume zero, f32 accumulation
   in an order of the implementation's (libref: the taps in `(dt, kh, kw)` order, each tap's
@@ -1720,6 +1733,22 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   memory as `y` (the residual added in place); `x` never aliases `y`. x, y, res and w bf16 (also
   f32), b bf16 or f32. MiniMax-H3: `k` = `kt` = 3, `(cin, cout)` `(24, 512)`, `(512, 512)`,
   `(512, 24)`.
+  The optional `stride` (rows and columns), `stride_t` (frames), `causal`, `pad` and `reflect`
+  give a causal video VAE's convolutions (MiniMax-H3's `CausalConv3d`), for `k = kt = 3` only. The
+  input is padded first, `ft` and `bk` frames in front and behind, `pt`, `pb`, `pl` and `pr` rows
+  and columns above, below, left and right, then strided: output `(t, i, j)` reads
+  `x[(t stride_t + dt - ft, i stride + kh - pt, j stride + kw - pl), ci]` (the same tap order),
+  and `y` holds `((T + ft + bk - kt) / stride_t + 1) ((H + pt + pb - k) / stride + 1)
+  ((W + pl + pr - k) / stride + 1)` rows, PyTorch's output length (the divisions rounding
+  toward negative infinity). The defaults are `ft = bk = kt/2` and `pt = pb = pl = pr = k/2`.
+  `causal` 1 puts `ft = kt - 1` zero frames in front and none behind, so one frame in gives one
+  frame out at any temporal stride, as the reference's dropped taps do. `pad` `down` pads one row
+  below and one column right only (`pt = pl = 0`, `pb = pr = 1`), as `conv2d_nhwc`'s does.
+  `reflect` 1 mirrors the spatial padding instead of zeroing it, as PyTorch's `F.pad` mode
+  `reflect` does, without repeating the edge (`x[-n] = x[n]`, `x[D - 1 + n] = x[D - 1 - n]`), so
+  a padded axis must be longer than its pad (`H, W >= 2`); the frame padding is always zeros.
+  MiniMax-H3's encoder takes `reflect` 1 and `causal` 1 throughout, and `pad` `down` with
+  `stride` 2 in its downsamplers.
 - `group_norm` is PyTorch's `nn.GroupNorm(groups, n)` on `[1, n, T, H, W]`: `x` and `y`
   `[>= M, n]` (`M` is `y`'s rows), group `g` the channels `[g n/groups, (g+1) n/groups)` of all
   `M` rows. `mean_g` and the biased `var_g` are over the group's `M n/groups` values, accumulated in
@@ -1758,6 +1787,25 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   `z(e) = rad_philox_normal_s(seed, stream, e)` (`abi/rad_philox.h`), `seed` u32 `[2]` low word
   first, `stream` the parameter. `x` f32 `[M, n]` at its row pitch. MiniMax-H3: `n` 96 (the video's
   patch rows) and 32 (the soundtrack's), `stream` 1.
+
+### Condition-noise augmentation
+
+MiniMax-H3 blends every visual condition's patchified latents with noise before they condition
+the transformer (`_cond_video_rows`, `comfy/ldm/minimax/model.py`: weight `VISUAL_COND_TIMESTEP`
+0.999, the generator restarted for every condition). The arch applies the blend once a media item,
+over its encoded rows after the VAE encoder's fold. The weight is a declared constant, where
+`flow_renoise` stages its `sigma`. Audio conditions take no blend.
+
+| op | params | operands |
+|---|---|---|
+| `cond_aug` | `M`(range) `n` `stream` `aug`:f64 `dtype` | `seed`, `x`:inout |
+
+- `cond_aug` blends condition rows with fresh noise, over `x`'s rows:
+  `x[k, c] = f32(f32(a x[k, c]) + f32(oma z(k n + c)))`, `a` = `aug` in `[0, 1)`, `oma` the f32 of
+  the f64 `1 - aug`, `z(e) = rad_philox_normal_s(seed, stream, e)` (`abi/rad_philox.h`), `seed`
+  u32 `[2]` low word first. `x` f32 `[M, n]` at its row pitch. The caller issues one media item's
+  rows at a time, so each item's draws start at `e = 0`. MiniMax-H3: `n` 96, `stream` 2, `aug`
+  0.999.
 
 ## LTX-2
 
@@ -2895,121 +2943,62 @@ associative. Without scratch, or above 32 rows, one workgroup per query walks th
 
 ### `kv_resolve`
 
-Turns `qsa_select`'s block ids into the ring slots that hold them, and copies a block in when it is
-not resident. It is the one op a streamed KV group needs: `sel` is the only place the sparse path
-names KV storage, because `qsa_select` already writes `tb[b]`, the group's pool page id, and
-`attn_paged` uses each entry as a raw pool index. When the group streams, the device pool is
-`slots` blocks deep and the id space is `blocks`, so an id is no longer an address; after this op
-every entry is a slot of `kv_cache` and the attention is unchanged.
+Turns `qsa_select`'s block ids into the ring slots that hold them, copying a block in from the host
+mirror when it is not resident. `qsa_select` writes pool page ids and `attn_paged` reads each entry
+as a raw pool index, so when a group streams (its pool is `slots` blocks deep over a `blocks`-wide id
+space) this op, between them, is all the sparse path needs; the attention is unchanged. The design
+is docs/KV-STREAMING.md §3.4.
 
-The layouts, which the schema cannot state (the maps are one format, and the two block planes are
-bytes, so the op is the same code at every cache layout). The shape given is the operand's extent:
+The layouts, which the schema cannot state (the op is the same code at every cache layout):
 
-- **`sel`** — `i32 [M, sel_pitch]`, inout. In: block ids. Out: the ring slot holding each block, for
-  the entries below `nsel[q]`; the -1 padding of `qsa_select` past them is untouched.
-- **`nsel`** — `i32 [M]`, in. The valid entries of each row, as `qsa_select` wrote them.
-- **`res`** — `i32 [blocks]`, inout. Block id -> slot, or -1 absent; -2 is a claim this call has made
-  and never leaves it behind.
-- **`slot_block`** — `i32 [slots]`, inout. Slot -> block id, or -1 free.
-- **`slot_state`** — `i32 [slots, 2]`, inout. Column 0 is the epoch that last used the slot, column 1
-  a two-bit **heat counter** in `[0, 3]`: bumped by one, clamped at 3, on every use (a hit or a
-  placement, once a slot a call), and halved when the sweep passes the slot. 31 bits of the i32 are
-  unused, so the policy needs no new field and no ABI change.
-- **`ctl`** — `i32 [16]`, inout. `[0]` epoch, `[1]` clock hand, `[2]` blocks placed by the last call,
-  `[3]` overflow (latched), then `u64` misses, lookups and calls from `[4]`, 8-byte aligned, then
-  `[10]` the largest selection union one call has seen (distinct blocks, hits plus misses), `[11]`
-  the largest number of blocks one call has placed, and `[12]` the largest number of distinct
-  blocks one call has claimed — the depth its miss list had to hold. The maxima are the measurement
-  a ring and a claim list are sized from: `[10]` against the ring's depth says whether one launch
-  can overflow it, `[12]` against `max_seqs * sel_pitch` says whether a claim list is wide enough.
-- **`host`** — bytes, `[blocks, block_bytes]`, in. The layer's authoritative mirror, identity block
-  layout: block `b` at `b * block_bytes`, exactly as the design note lays it out.
-- **`kv_cache`** — bytes, `[slots, block_bytes]`, inout. The layer's ring, the same operand
-  `attn_paged` and `kv_store` take as `RAD_KV(group, layer)`.
+- **`sel`** — `i32 [M, sel_pitch]`, inout: block ids in, ring slots out, below `nsel[q]`; the `-1`
+  padding past it is untouched.
+- **`nsel`** — `i32 [M]`, in: the valid entries of each row. Above `sel_pitch` is refused.
+- **`res`** — `i32 [blocks]`, inout: block -> slot, or `-1` absent (`-2` is a claim within a call).
+- **`slot_block`** — `i32 [slots]`, inout: slot -> block, or `-1` free. Its extent is the ring the
+  call may address; the declared `slots` (the carved ring, `RadBuildCtx::kv_resident_blocks` in
+  blocks) is the ceiling it may not pass.
+- **`slot_state`** — `i32 [slots, 2]`, inout: the epoch of the slot's last use, and a two-bit heat
+  counter in `[0, 3]`, bumped on a use (once a slot a call) and halved when the sweep passes.
+- **`ctl`** — `i32 [16]`, inout: `[0]` epoch, `[1]` clock hand, `[2]` blocks placed by the last call,
+  `[3]` overflow (latched), u64 misses, lookups and calls from `[4]` (8-byte aligned), and the
+  largest union `[10]`, placement `[11]` and claim count `[12]` of one call: the measurements a ring
+  and a claim list are sized from.
+- **`host`** — bytes `[blocks, block_bytes]`, in: the layer's mirror, block `b` at `b * block_bytes`.
+- **`kv_cache`** — bytes `[slots, block_bytes]`, inout: the layer's ring, `RAD_KV(group, layer)`.
 
-One call, in order: bump the epoch, one lookup per distinct block, one victim per miss, re-point
-both maps, copy each missed block, rewrite every valid selection entry. What each step owes:
+One call:
 
-- **One call is one epoch.** The epoch is bumped first; a resident block takes the new epoch and
-  bumps its heat counter, so the sweep can tell what this call has already touched from what it may
-  take.
-- **One lookup per distinct block, and the map is its own set.** A miss is claimed once, `-1` to
-  `-2`, so a block named by several rows is claimed by the first of them. `sel` entries past
-  `nsel[q]` are `-1` padding and are not touched; `nsel[q]` above `sel_pitch` is refused rather than
-  steered into the neighbouring row.
-- **The miss list is in ascending block id, and that is part of the contract.** First-appearance
-  order would let the row that claimed a block first decide which slot it lands in, so two
-  implementations of one contract would produce different tables. Ascending is a fact about the
-  claim set, not about the map: a device launch sorts the claims it made, or — above the shared
-  claim list — collects the smallest `slots` of them a window of the id space at a time, both over
-  the selection's entries. `blocks` is the id space (`max_seqs * ceil(max_ctx / block_size)`, 102 400
-  at the parity shape) and never the size of one launch, so nothing here walks it.
-- **The claim list's depth is derived, not a constant.** One claim is one distinct absent block a
-  selection entry names, so a launch makes at most `M * sel_pitch` of them (and at most `lookups`,
-  which is `sum_q nsel[q]`). The device kernel sizes its shared list at
-  `next_pow2(min(M * sel_pitch, the workgroup's LDS room))`, so any `--max-num-seqs` follows from the
-  operands: `max_seqs * 513` is 2052 at four sequences, 4104 at eight. There is no cap to raise and
-  none to fall off, and `ctl[12]` reports the largest count a launch has made.
-- **The victim rule is the block's own slot if it is free, then a free slot, then CLOCK, from a hand
-  that ends just past the last slot taken, with second chance.** A miss whose id is inside the ring
-  and whose own slot is free goes to slot `b`, so while the context is shorter than the ring the map
-  is `res[b] = b` and adjacent block ids land in adjacent slots of one layer's stripe, which is the
-  order the attention's gather reads them in. That is placement only: it takes a slot only when
-  that slot is free and it does not move the hand, so it never evicts, and a miss it cannot place
-  falls through to the walk below from the hand it would always have seen -- at depth, where most ids
-  are past `slots`, the same blocks land in the same slots as before. A free slot holds no block, so
-  taking it costs nothing and it is claimed before any resident block is considered; the ring's empty
-  region fills before an eviction.
-  A slot this call already used (a hit's, or a miss's already claimed) is passed and keeps its
-  heat counter, free or not; when a whole turn finds no free slot, the sweep halves the counter of a
-  warm slot (`old >> 1`) and passes it, and takes a cold one (counter 0). The hand still **picks**
-  the victim -- a per-visit decision, not a search -- so the policy costs no reduction, no barrier
-  and no extra traffic: an add-and-clamp in place of a constant store and a shift in place of a
-  zero. That is why it is affordable where an exact LRU is not: the epoch-ordered minimum needs a
-  collective reduction per miss, which costs more than the choice is worth. The free scan halves no
-  counter and leaves the hand alone when it finds nothing, so a ring with no free slot takes exactly
-  the victim the sweep names. Every write clamps the counter to 3,
-  so two passes halve any value to 0 and the third places the miss: a sweep visits at most
-  `3 * slots` slots. The counter is the same decayed-use-count mechanism the streamed experts
-  already replace by (`core/place/heat.*`), at ring granularity.
-- **The ring must hold the union of one call's selection.** A hit holds a slot and a miss needs
-  another, so `hits + misses <= slots` is the sizing rule. What that union is depends on the launch:
-  a decode step takes the ring and a prefill step takes the one-layer stage, and a decode step issues
-  one row a sequence (`1 + n_spec` rows a sequence under speculation), so at most
-  `max_seqs * (1 + n_spec) * (topk + 1)` blocks -- which is the ceiling `--kv-resident` is held to at
-  startup, and `ctl[10]` is what says at run time that the bound held. Overflow is not silent: an unplaced miss reverts to `-1` (so a later call may claim it)
-  and its selection entries are rewritten to slot 0 -- a defined address inside the ring, because a
-  block id is an address past it that the attention dereferences unchecked -- with `ctl[3]` latched.
-  A caller that finds `ctl[3]` set must discard the step: those entries do not name their blocks, so
-  the launch's output is wrong by construction and is never served.
-- **The copied bytes are the mirror's bytes.** One `memcpy` per placed miss, `block_bytes` long,
-  nothing converted, so a streamed block is bit-identical to what the writer put in the mirror.
-  That is why `block_size` is not a parameter and `block_bytes` is: the op never reads an element,
-  and a `block_size` key would make it a KV group's consumer, taking the block size the block
-  manager reads away from the resolved attention kernel.
-- **`slots` is the operand's, not only the parameter's.** `slot_block`'s extent is the ring a call
-  may address, exactly as `sel`'s extent states `M` and its row pitch states `sel_pitch`; the declared
-  parameter is the ceiling a call may not pass. The pool is planned after the program is built, so a
-  ring the engine sized smaller (`--kv-resident`, when it streams at all) reaches the op as a
-  shorter operand. The declared ceiling is the ring the deployment carves -- `--kv-resident` in
-  tokens rounded up to whole blocks, clamped to the group's context (`RadBuildCtx::
-  kv_resident_blocks`) -- and not the block-id space `blocks`, so the geometry an engine reports for
-  this op is the ring it is issued with; with nothing streaming the two are equal. The ceiling also
-  sizes the row's scratch.
-- **The miss list is scratch, not an operand.** It is one launch's temporary; a device row declares
-  `next_pow2(slots) + slots` i32s through its scratch hook (the miss list, then the slots it pairs
-  with) and the reference needs none. The claim list before the sort is dynamic LDS, not scratch,
-  while it fits: the sort reads every element from every thread, so it belongs in the workgroup, and
-  the row sizes that launch's LDS from the bound above. A launch too wide for that room sorts the
-  list in the scratch's first plane, which is why it is padded to a power of two.
-- **The op is stateful, and therefore not concurrent.** epoch, hand, heat counters and counters
-  live between launches, so the row must not carry `rad_kernel_concurrent`
-  (`abi/rad_abi.h:493`); without the promise the engine orders the launch behind everything before
-  it, which is what the map needs. It is still recordable: the maps, the ring and the mirror are
-  fixed-size from the group's declaration, so addresses and pitches never move and a replay is
-  valid.
-- **The caller brings the state up.** `res` and `slot_block` filled with `-1`, `slot_state` and
-  `ctl` zeroed. There is no reset op: a residency map lives as long as its pool.
+1. **Bump the epoch.** A hit stamps its slot with it and bumps its heat, so the sweep knows what
+   this call already uses.
+2. **One lookup per distinct block.** A miss is claimed once (`-1` -> `-2`), so the map is its own
+   set.
+3. **The miss list in ascending block id.** First-appearance order would let thread timing decide
+   placement. A device launch sorts the claims it made; nothing walks the id space `blocks`, so a
+   launch costs its selection. A claim list holds at most `M * sel_pitch` ids (at most
+   `sum_q nsel[q]`); the device kernel sizes it from those operands.
+4. **One victim per miss.** The block's own slot if it is free (a context shorter than the ring
+   stays at identity, and adjacent ids read adjacent slots), else a free slot, else CLOCK from the
+   hand: a slot this call used is passed, a warm slot's counter is halved and passed, a cold one is
+   taken. The hand picks the victim per visit, so the policy needs no reduction, unlike an exact
+   LRU. A 3 survives two passes, so a sweep visits at most `3 * slots` slots.
+5. **Re-point both maps**, a placement counting as a use.
+6. **Copy** `block_bytes` per placed block, nothing converted. Hence `block_bytes` rather than
+   `block_size`: the op never reads an element, and a `block_size` key would make it the KV group's
+   consumer in place of the attention.
+7. **Rewrite** every valid entry as its slot.
+
+- **The ring must hold one call's selection union** (`hits + misses <= slots`): a decode step's is at
+  most `max_seqs * (1 + n_spec) * (topk + 1)` blocks, the floor `--kv-resident` is raised to, and
+  prefill takes the stage instead. An unplaced miss reverts to `-1`, its entries become slot 0 (a
+  defined address; a block id would be read past the ring) and `ctl[3]` latches; the caller must
+  discard the step.
+- **The miss list is the row's scratch**: `next_pow2(slots) + slots` i32s on the device (a launch
+  too wide for the LDS claim list sorts there); the reference needs none.
+- **Stateful, so not concurrent**: the row carries no `rad_kernel_concurrent` promise. It is
+  recordable, since its addresses and pitches never move.
+- **The caller brings the state up**: `res` and `slot_block` filled with `-1`, `slot_state` and `ctl`
+  zeroed. There is no reset op.
 
 ### `qsa_tail_store`
 

@@ -130,6 +130,23 @@ public:
      * text encoder's repository describes such a release). */
     void set_meta_dir(const std::string& dir) { meta_dir_ = dir; }
 
+    /* Merge PEFT adapters into the tensors they name: `path` is a .safetensors file or a
+     * directory of them, of `<module>.lora_A.weight` [r, K] and `<module>.lora_B.weight` [N, r]
+     * pairs (or ComfyUI's `.lora_down` / `.lora_up`) and an optional `<module>.alpha`. The target
+     * is `<module>.weight`, or that with a wrapper prefix ("diffusion_model.", "transformer.",
+     * "unet.") stripped; a module the checkpoint does not have is refused by name. In f32,
+     * W += strength (alpha / r, or 1 without alpha) B A, stored in the target's dtype, a plain
+     * bf16, f16 or f32 matrix. Call right after open(): a merged tensor's bytes move, and views
+     * taken before read the old ones. `merged` receives the targets' names.
+     *
+     * `map_json` names a file of rules for adapters trained on other module names (a fused qkv,
+     * renamed blocks): `{"strip": ["prefix."], "modules": {"<pattern>": ["<target>", ...]}}`,
+     * a `*` in a pattern matching one run (the block index) that fills each target's `*`. With
+     * several targets the module is their concatenation, B's rows split along them in order. A
+     * rule's target the checkpoint lacks is refused. */
+    int add_lora(const std::string& path, double strength, std::vector<std::string>* merged,
+                 const std::string* map_json = nullptr);
+
     const SrcTensor* find(const std::string& n) const;
     const std::vector<SrcTensor>& tensors() const { return tensors_; }
     bool               is_gguf() const { return kind_ == Gguf; }

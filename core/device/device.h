@@ -113,23 +113,20 @@ extern "C" void* rad_link_gate(RadStream s);
  * counts lists handed over and not yet finished. The prefetch ring is uncached device memory
  * (rad_dev_alloc_uncached): the engine writes it and kernels read it, so no cache may hold a
  * slot's previous contents. */
-/* An event the DMA engine completes instead of a dispatch: it is recorded on `s` (a write of 1 to
- * its completion word, in stream order) and `*word` returns that word for `rad_xp_list` to write 0
- * to as the list's `done`, once the list's bytes have landed. `rad_event_wait(s, ev)` then stops `s`
- * until the copy is done, device-side: no host round trip on the step path. The caller waits for
- * the group's previous copy before arming the next, so the word's older 0 cannot release a later
- * wait. RAD_E_STATE while a tape is recording: a list is not a queue packet, so a recorded pass
- * must re-run the call with the tape paused (core/kvstream/stage.cpp). */
+/* An event a DMA list completes instead of a dispatch. `*word` is its completion word, for
+ * rad_xp_list to write 0 to as the list's `done`; the caller arms it with a 1 in stream order (the
+ * weight table's patch dispatch). `rad_event_wait(s, ev)` then holds `s` on the device until the
+ * copy has landed. The caller waits for the previous copy before arming the next, so an older 0
+ * cannot release a later wait. RAD_E_STATE while a tape records: the caller re-runs it with the
+ * tape paused (core/kvstream/stage.cpp). */
 extern "C" int     rad_event_dma(RadEvent ev, RadStream s, uint32_t** word);
 extern "C" int     rad_xp_supported(int device);
 extern "C" int     rad_xp_stream_create(RadStream* out);
 extern "C" int     rad_ride(RadStream s, void** token);
 extern "C" int     rad_ride_wait(RadStream s, void* token);
 extern "C" void    rad_ride_release(void* token, RadStream after, int64_t packets);
-/* `flags` RAD_XP_NO_YIELD: the list does not give way to a link a stream of this card holds. A copy
- * the compute stream itself waits on must set it -- a yield it cannot outlast is a deadlock (the
- * hold's release is behind the wait) -- at the cost of taking its share of the link in one piece
- * (core/kvstream/stage.cpp). The expert prefetch passes 0: nothing waits for it. */
+/* `flags` RAD_XP_NO_YIELD: the list does not yield the link to a hold by a stream of this card. A
+ * copy the compute stream waits on must set it, since the hold's release is behind that wait. */
 #define RAD_XP_NO_YIELD 1u
 extern "C" int     rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
                                const uint64_t* bytes, uint32_t* done, uint32_t done_val,
@@ -340,8 +337,7 @@ struct DeviceBackend {
     int     (*gate_open)(void* gate);
     int64_t (*gate_room)(RadStream s);
 
-    /* ---- an event a DMA list completes: see rad_event_dma. Null (unsupported) on a backend with
-     * no DMA queue that writes a completion word. */
+    /* ---- rad_event_dma; null on a backend with no DMA queue. */
     int     (*event_dma)(RadEvent e, RadStream s, uint32_t** word);
 };
 

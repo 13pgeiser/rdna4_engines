@@ -188,11 +188,12 @@ also matches a norm leaves the norm as it is.
 | `awq` | each input column scaled by its activation magnitude to a searched power, then a per-block clip search, both against the Hessian; the column scales are the encoding's last scale level |
 | `autoround` | sign-gradient descent on a rounding offset per value and a range factor per block, against the Hessian; `iters` steps of N·K² multiply-adds each |
 | `paroquant` | a channel scaling and `stages` rounds of Givens pair rotations, learned against the Hessian, then AutoRound on the rotated weight; the encoding's `givens` transform |
+| `m2xfp4` | M2XFP's weight-side Sg-EM (arXiv 2601.19213): MXFP4 plus one metadata byte a group of 32, each subgroup of 8's extra mantissa k and the exponent's bias chosen by least squared error; its own scheme `m2xfp4` (spec.md), served by `gemm_nt_q` at dtype m2xfp4. `adaptive=0` pins the bias, `wide=1` widens it to {-2..2} |
 | `ggml` | `type=` one of llama.cpp's formats (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K..q6_K, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m), chosen by llama.cpp's own search, imatrix-weighted; the codes are byte for byte llama.cpp's, stored as each type's affine planes. iq2_xxs, iq2_xs and iq1_s need `--imatrix` |
 | `cast` | a float weight in another float dtype (`dtype=` f32, bf16, f16, fp8_e4m3, fp8_e5m2), no scale |
 | `import` | rad-convert's own, not a plugin: the numbers a quantised release ships, in the spelling the kernels read, instead of quantising again. `codes=uN` makes a symmetric grid's signed codes unsigned under a zero point of 2^(N-1); `zero=` is the zero plane's dtype (u4, u8); `scale=` the scale's (f16, bf16, f32), each shipped scale rounded to nearest; `block=RxC` repeats an FP8 scale shipped per row or per tensor over that block grid. It reads an imported integer grid (GPTQ, CT-INT4) or an FP8 weight with a scale per row or per tensor, refuses any other quantised form by name, and keeps a plain float weight as it is. The run reports per rule how many weights it re-expressed and how many scales the new dtype rounded |
 
-Every quantiser except `ggml`, `cast` and `import` takes the grid options:
+Every quantiser except `m2xfp4`, `ggml`, `cast` and `import` takes the grid options:
 
 | option | |
 |---|---|
@@ -658,15 +659,12 @@ Declare at the shapes you serve:
 At `--tp > 1` every rank declares at once, each on its own thread and device, as the engine does:
 a collective's `init` is a rendezvous, so declaring rank 0 alone at world size 2 hangs.
 
-A collective is then measured as the exchange, not as one rank's copy of it. Each rank gets its own
-operands -- drawn with its own seed, so a fold of two identical halves cannot pass a correctness
-check -- its own scratch, its own stream, and the instance its own declare made: `init` is what
-publishes the peer bundle (scratch, flags, sequence counters) and a launch with no instance is
-refused before it starts. The candidate's launches are fired on every rank at once and the clock
-stops when the last stream drains, so the reported time is the round trip through the peer, which
-is what the served step pays; timing rank 0 alone would time a local copy. Candidates are still
-judged against the defaults on rank 0's output. A row that is not collective runs on rank 0 alone,
-as it always did.
+A collective is measured as the exchange. Each rank gets its own operands (drawn with its own seed,
+so a fold of two identical halves cannot pass), its own scratch and stream, and the instance its
+own declare made, since `init` publishes the peer bundle a launch needs. Every rank fires the
+candidate's launches at once and the clock stops when the last stream drains, so the time is the
+round trip through the peer, as a served step pays it. Candidates are judged against the defaults
+on rank 0's output. A row that is not collective runs on rank 0 alone.
 
 Before trusting a cache, check that the tuned variants beat the defaults. `RADIANCE_TUNE` pins a
 kernel's axes for such a comparison; it is a measurement aid, not a deployment setting.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS [VOPD_REPEATABLE]]
+# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS [VOPD_REPEATABLE [CXX_COMPILER]]]
 #
 # THE PLUGINS RADIANCE SHIPS, BUILT THE WAY A THIRD PARTY BUILDS THEIRS. The tree's build is
 # installed into a prefix; then every plugin directory -- the kernel libraries, the quantisers,
@@ -26,7 +26,11 @@
 #      has already checked what the out-of-tree build produced.
 set -eu
 B=$1; S=$2; W=$3
-HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}
+HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}; CXXC=${7:-}
+# The tree's own C++ compiler, so the out-of-tree build does not depend on the host's default
+# (`c++` may be a different GCC than the one the installed ABI headers require).
+CCXX=""
+[ -n "$CXXC" ] && CCXX="-DCMAKE_CXX_COMPILER=$CXXC"
 GEN=${CMAKE_GENERATOR:-Ninja}
 J=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc 2>/dev/null || echo 4)}
 
@@ -64,8 +68,8 @@ is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
 for d in $dirs; do
   n=$(basename "$d")
   say "building $d against the installed package"
-  extra=""
-  is_dev "$n" && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT
+  extra="$CCXX"
+  is_dev "$n" && extra="$extra -DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT
                         -DRAD_HIP_VOPD_REPEATABLE=$VOPD"
   # A bundled plugin under plugin/ may carry device rows beside its host ones; it gets the tree's
   # HIP compiler as a third party would pass theirs.
@@ -74,7 +78,12 @@ for d in $dirs; do
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
       -DCMAKE_PREFIX_PATH="$P" -DCMAKE_INSTALL_PREFIX="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
   run "$W/logs/$n.build.log" cmake --build "$W/b/$n" -j "$J"
-  run "$W/logs/$n.install.log" cmake --install "$W/b/$n"
+  # --prefix for the same reason as the tree install above: a plugin's own CMakeLists may install
+  # companions (libr4d ships r4d_selftest) to relative destinations under CMAKE_INSTALL_PREFIX, and
+  # the test must not need root. The plugins themselves ignore the prefix -- rad_add_plugin installs
+  # them under the absolute RAD_PLUGIN_INSTALL_HOME given at configure time -- so the checks below,
+  # which look in $H, are unaffected.
+  run "$W/logs/$n.install.log" cmake --install "$W/b/$n" --prefix "$W/i"
 done
 
 # 1. The same plugins, file for file.

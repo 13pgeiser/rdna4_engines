@@ -228,6 +228,12 @@ int Registry::commit_(Staged& s, int order) {
         /* A video generator's rotary positions; the driver refuses to start without it. */
         p.arch_video_positions = dl_fn<int64_t (*)(int, const RadVideoGeom*, float*, int64_t)>(
             s.handle, "rad_arch_video_positions");
+        /* Its reference conditioning, which the video driver refuses to serve without. */
+        p.arch_video_pack = dl_fn<int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*,
+                                              int32_t*, int32_t*, int32_t*, float*, int64_t)>(
+            s.handle, "rad_arch_video_pack");
+        p.arch_encode_geom = dl_fn<int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t)>(
+            s.handle, "rad_arch_encode_geom");
 
         /* The (architecture id, quantisation) pair selects the plugin, so no two plugins may claim
          * the same pair (§2.4). Sharing an id at different quantisations is normal (qwen35_bf16

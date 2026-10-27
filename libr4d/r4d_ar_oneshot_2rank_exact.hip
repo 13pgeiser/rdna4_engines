@@ -18,7 +18,6 @@
 //  * Fine-grained memory (hipDeviceMallocFinegrained) is uncached and posted straight to the
 //    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
 //    selectable (default drain=1/acq=0 on fine-grained).
-#include <cstdlib>
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
@@ -79,7 +78,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   int end = start + w; if (end > n16) end = n16;
   unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
 
-  // drain 4, tests only (R4D_AR_TEST_LATE_PUSH, r4d_selftest): the flag goes out before the push
+  // drain 4, tests only (r4d_ar_late_push_pin, r4d_selftest): the flag goes out before the push
   // and the push ~20 us after it, so the peer sees a flag whose bytes have not landed -- what a
   // push over PCIe P2P now and then does on its own -- on every launch.
   if (drain == 4) {
@@ -536,6 +535,11 @@ void r4d_ar_ipc_enable_peer(long peer) {
     throw std::runtime_error(std::string("enable_peer: ") + hipGetErrorString(e));
 }
 
+/* r4d_ar_late_push_pin: 1 makes every 2-rank exact all-reduce send its flags before its pushes
+ * (drain 4). A test hook (r4d_selftest); nothing else sets it. */
+static int g_ar_late_push = 0;
+extern "C" void r4d_ar_late_push_pin(int on) { g_ar_late_push = on; }
+
 void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags,
                             long my_flags, long seq_ctrs, long slot_stride16,
                             long inp, long out, long n_elem, long dtype,
@@ -561,7 +565,7 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
   // Tests only: every push lands after its flag (drain 4 above). Not in the tuning table, so no
   // tuner can pick it.
-  if (const char* e = std::getenv("R4D_AR_TEST_LATE_PUSH"); e && *e == '1') drain = 4;
+  if (g_ar_late_push) drain = 4;
 #define L(T, LN) r4d_ar_oneshot_2rank_exact_kernel<T, LN><<<nb, nt, 0, st>>>(              \
     (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,        \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,              \

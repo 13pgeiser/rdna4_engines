@@ -124,6 +124,8 @@ template <class T>
 inline T atomicMax(T* p, T v) { const T o = *p; if (v > o) *p = v; return o; }
 template <class T>
 inline T atomicCAS(T* p, T expect, T v) { const T o = *p; if (o == expect) *p = v; return o; }
+template <class T>
+inline T atomicExch(T* p, T v) { const T o = *p; *p = v; return o; }
 /* v_wmma_f32_16x16x16_bf16 (gfx12, wave32): A[M][K] lane M + 16 * (K / 8) element K % 8; B[K][N]
  * lane N + 16 * (K / 8) element K % 8; D[M][N] lane N + 16 * (M / 8) element M % 8 */
 typedef short emu_v8s __attribute__((ext_vector_type(8)));

@@ -433,6 +433,63 @@ struct FakeMultimodal : IMultimodal {
         *out = std::move(it);
         return RAD_OK;
     }
+    /* The keyframe path shows the tower the canvas frame itself, not the file: counted, with each
+     * frame's side, so a test can confirm the tower saw the very pixels the VAE was handed. */
+    int n_pframe = 0;
+    std::vector<std::pair<int32_t, int32_t>> pframe_wh;
+    int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string*) override {
+        ++n_pframe;
+        pframe_wh.emplace_back(f.w, f.h);
+        auto it = std::make_shared<mm::Item>();
+        it->expand = expand;
+        *out = std::move(it);
+        return RAD_OK;
+    }
+    /* The VAE encoders' form, which the server fills for a generator that declares the encoders.
+     * Synthetic frames and a mono tone of a fixed length, each call counted, so a test can watch the
+     * server decode each reference, spread the mono tone across the encoder's channels and hand it
+     * to the generator. The sides are the encoder grid; the counts are the media's own (a short
+     * clip, a sample count that is not a whole hop), since padding is the driver's. */
+    int32_t enc_frames = 5, enc_side = 16;
+    int64_t enc_n = 850;
+    int n_ienc = 0, n_venc = 0, n_aenc = 0, n_cenc = 0;
+    /* The canvas a keyframe was resized to and the centre-crop flags: cenc_cover is the last
+     * call's, cenc_covers every call's in order (first frame, then last). */
+    int32_t cenc_w = 0, cenc_h = 0;
+    bool cenc_cover = false;
+    std::vector<bool> cenc_covers;
+    int encoder_image(const uint8_t*, size_t, int32_t, int32_t, mm::Frame* out,
+                      std::string*) override {
+        ++n_ienc;
+        out->w = out->h = enc_side;
+        out->rgb.assign((size_t)enc_side * enc_side * 3, 128);
+        return RAD_OK;
+    }
+    int encoder_image_canvas(const uint8_t*, size_t, int32_t w, int32_t h, bool cover,
+                             mm::Frame* out, std::string*) override {
+        ++n_cenc;
+        cenc_w = w; cenc_h = h; cenc_cover = cover;
+        cenc_covers.push_back(cover);
+        out->w = w; out->h = h;
+        out->rgb.assign((size_t)w * h * 3, 100);
+        return RAD_OK;
+    }
+    int encoder_video(const uint8_t*, size_t, int32_t, int32_t, int32_t, std::vector<mm::Frame>* out,
+                      std::string*) override {
+        ++n_venc;
+        out->assign((size_t)enc_frames, mm::Frame{});
+        for (mm::Frame& f : *out) {
+            f.w = f.h = enc_side;
+            f.rgb.assign((size_t)enc_side * enc_side * 3, 64);
+        }
+        return RAD_OK;
+    }
+    int encoder_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>* out,
+                      std::string*) override {
+        ++n_aenc;
+        out->assign((size_t)enc_n, 0.5f);
+        return RAD_OK;
+    }
 };
 
 /* An embedding model's vector width, input bound and named prompts. */

@@ -608,18 +608,8 @@ constexpr int64_t kPrefetchRows = 16;
  * would read in series on lane 0, so elsewhere the read goes on lane 1, behind a join from lane
  * 0. */
 inline bool prefetch_lane0() { return rad_chain_on() != 0; }
-/* RADIANCE_PREFETCH_BESIDE=0 issues none of these reads. Beside another server on the same card
- * the lane-1 form costs more than it gains: the card has fewer hardware queue slots than the two
- * servers have queues, and the join puts a queue switch into every decode step. */
-inline bool prefetch_beside_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("RADIANCE_PREFETCH_BESIDE");
-        return !(e && e[0] == '0' && e[1] == 0);
-    }();
-    return on;
-}
 inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
-    if (!op || T > kPrefetchRows || !prefetch_beside_on()) return;
+    if (!op || T > kPrefetchRows) return;
     if (prefetch_lane0()) {
         RAD_ISSUE(c, op, RAD_W(w));
         return;
@@ -627,7 +617,8 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
     if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK) RAD_ISSUE(c, op, RAD_W(w));
     rad_lane(c, 0);
 }
-/* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. */
+/* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. A plugin declares
+ * none where the deployment turns the reads off (RadBuildCtx::weight_prefetch_off). */
 inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
     if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
     return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
@@ -673,6 +664,9 @@ struct Geom {
     int64_t max_tok    = 0;
     int64_t max_seqs   = 0;
     int64_t max_ctx    = 0;
+    /* --kv-resident in tokens (RadBuildCtx::kv_resident_blocks), 0 when nothing streams: what
+     * kv_resolve_declare states as the ring's depth. */
+    int64_t kv_resident = 0;
     int     max_spec   = 0;
     /* Most rows the sampler can want in one step: one per sequence, or one per draft position per
      * sequence at a speculative verify. Bounds the logits buffer (at a 248K vocab, 63 MiB rather
@@ -949,6 +943,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.max_tok   = c->max_tok;
     g.max_seqs  = c->max_seqs;
     g.max_ctx   = c->max_ctx;
+    g.kv_resident = c->kv_resident_blocks;
     g.max_spec  = c->max_spec;
     g.max_logit_rows = c->max_seqs * (c->max_spec > 0 ? c->max_spec + 1 : 1);
     if (g.max_logit_rows > c->max_tok) g.max_logit_rows = c->max_tok;
@@ -1069,6 +1064,95 @@ inline int64_t vocab_head_rows(const Geom& g) {
  * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
 
+/* One layer of a streamed group (RadKVStream): its rows of the host mirror and the ring's maps.
+ * The mirror is layer-major over the group's bound layers in KVPoolBinding::layer_slot order, not
+ * over model layers (Flash-Next's full-attention layers are every other layer, plus the MTP head),
+ * so the row comes from rad_kv_layer_index. `host` is null when the group does not stream on this
+ * rank or has no row for the layer. */
+struct KVStreamLayer {
+    const RadKVStream* st = nullptr;
+    const uint8_t* host = nullptr;   /* [blocks, bbytes] mirror row */
+    int32_t* res = nullptr;          /* [blocks] block -> ring slot, -1 when absent */
+    int32_t* slot_block = nullptr;   /* [slots] ring slot -> block */
+    int32_t* slot_state = nullptr;   /* [slots, 2] */
+    int64_t  blocks = 0, bbytes = 0, slots = 0;
+};
+inline KVStreamLayer kv_stream_layer(RadCtx* c, rad_kvgroup group, int layer,
+                                     const RadKVGroupBatch* kvb) {
+    KVStreamLayer L;
+    const RadKVStream* st = kvb ? kvb->stream : nullptr;
+    if (!st || !st->host || st->block_bytes <= 0) return L;
+    const int64_t li = rad_kv_layer_index(c, group, layer);
+    if (li < 0) return L;
+    L.st         = st;
+    L.bbytes     = st->block_bytes;
+    L.blocks     = st->host_layer_stride / L.bbytes;
+    L.slots      = st->slots;
+    L.host       = st->host + li * st->host_layer_stride;
+    L.res        = st->res + li * L.blocks;
+    L.slot_block = st->slot_block + li * L.slots;
+    L.slot_state = st->slot_state + li * L.slots * 2;
+    return L;
+}
+
+/* The prefill stage of a streamed group (the ordering rule is in core/kvstream/stage.h):
+ *
+ *   kv_stage_wait  -- immediately before the layer's store: the copy from the mirror must land
+ *                     before the store writes this chunk's newer bytes into the stage;
+ *   kv_stage_layer -- before the attention: true when the pass uses the stage, so the caller
+ *                     reads block ids directly and must not resolve;
+ *   kv_stage_next  -- after every attention launch of the layer: the next layer's copy starts
+ *                     once the last read of the aliased stage is behind it.
+ *
+ * Both of the first two are rad_kv_stage_layer, which stages a layer once per pass. */
+inline bool kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
+    return rad_kv_stage_layer(c, group, kvb, layer) != 0;
+}
+inline bool kv_stage_wait(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
+    return rad_kv_stage_layer(c, group, kvb, layer) != 0;
+}
+inline void kv_stage_next(RadCtx* c, rad_kvgroup group, int layer) {
+    (void)rad_kv_stage_next(c, group, layer);
+}
+
+/* The `kv_resolve` a streamed group's block declares. None of its geometry is free:
+ *
+ *   blocks      the block-id space a selection can name: max_seqs sequences of the context;
+ *   slots       the ring --kv-resident carves, in whole blocks, raised to one decode step's
+ *               selection (max_seqs x (1 + n_spec) x sel_pitch) as kvstream_ring raises it, and
+ *               at most `blocks`; the resolve is issued with the pool's depth, so declaring the
+ *               context would size its scratch for slots it cannot reach;
+ *   sel_pitch   the selection row's pitch, which the attention declares its rows with
+ *               (`qsa_topk + 1` on the sparse path, the indexer's count on GLM).
+ *
+ * The kernel sizes its claim list from these (`M * sel_pitch`, r4d_kv_resolve.hip's
+ * kv_claim_cap); ctl[12] reports the largest claim count a launch made, so a wrong declaration
+ * shows in the engine's stream report. `sel` is read as well as written, so the arena keeps it
+ * live from its producer to the attention. Returns 0 when the op is not declared or the group has
+ * nothing to address. */
+inline rad_op kv_resolve_declare(RadBuilder* b, const Geom& g, rad_kvgroup kv, rad_buf sel,
+                                 rad_buf nsel, int64_t sel_pitch) {
+    if (!rad_op_declared(b, "kv_resolve") || !sel || !nsel || sel_pitch <= 0) return 0;
+    const int64_t bs     = rad_kv_block_size(b, kv);
+    const int64_t bbytes = rad_kv_layer_bytes(b, kv);
+    const int64_t blocks = bs > 0 ? g.max_seqs * ((g.max_ctx + bs - 1) / bs) : 0;
+    if (bs <= 0 || bbytes <= 0 || blocks <= 0) return 0;
+    const int64_t ring  = g.kv_resident > 0 ? (g.kv_resident + bs - 1) / bs : 0;
+    const int64_t step  = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0)) * sel_pitch;
+    const int64_t want  = ring > 0 && step > ring ? step : ring;
+    const int64_t slots = want > 0 && want < blocks ? want : blocks;
+    const rad_op op = RAD_OP(b, "kv_resolve",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("blocks", blocks),
+                                        RAD_INT("slots", slots), RAD_INT("sel_pitch", sel_pitch),
+                                        RAD_INT("block_bytes", bbytes)),
+                             RAD_NOWEIGHTS);
+    if (!op) return 0;
+    const rad_buf rd[2] = { sel, nsel };
+    rad_op_reads(b, op, rd, 2);
+    rad_op_writes(b, op, &sel, 1);
+    return op;
+}
+
 /* ================================================================== step-sized operands */
 /* Every operand a step issues carries the step's row count, not the buffer's.
  *
@@ -1132,6 +1216,16 @@ inline RadOperand praw(const void* p, uint32_t dtype, int64_t rows) {
     RadOperand o = RAD_P_T(p, dtype);
     o.rows = rows;
     return o;
+}
+
+/* kv_resolve over `rows` selection rows (kv_resolve_declare): makes the blocks they name resident
+ * in the ring and rewrites `sel` from block ids to ring slots. */
+inline void kv_resolve_issue(RadCtx* c, rad_op op, const KVStreamLayer& L, RadOperand sel,
+                             RadOperand nsel, rad_kvgroup group, int layer, int64_t rows) {
+    RAD_ISSUE_N(c, op, rows, sel, nsel, praw(L.res, RAD_I32, L.blocks),
+                praw(L.slot_block, RAD_I32, L.slots), praw2(L.slot_state, RAD_I32, L.slots, 2),
+                praw(L.st->ctl, RAD_I32, 16), praw2(L.host, RAD_U8, L.blocks, L.bbytes),
+                kv_cache(group, layer));
 }
 
 /* Rotary positions of a pass, in the two forms consumers take.
@@ -1315,6 +1409,28 @@ inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
     for (int i = 0; i < b->n_kv_groups; ++i)
         if (b->kv[i].group == group) return &b->kv[i];
     return nullptr;
+}
+
+/* ================================================================== calibration in slices */
+/* The layers [lo, hi) of n a calibration taps: the environment variable `var` as "lo:hi", else
+ * all of them. A large model's Grams do not fit beside its weights at once, so it is calibrated
+ * in slices of layers, the corpus pushed through once a slice. */
+inline int calib_layers(const char* who, const char* var, int64_t n, int64_t* lo, int64_t* hi) {
+    *lo = 0;
+    *hi = n;
+    const char* s = std::getenv(var);
+    if (!s) return RAD_OK;
+    long long l = 0, h = 0;
+    int used = 0;
+    if (std::sscanf(s, "%lld:%lld%n", &l, &h, &used) != 2 || s[used] != '\0' || l < 0 || h > n ||
+        l >= h) {
+        fprintf(stderr, "radiance: %s: %s '%s' is not lo:hi within 0:%lld\n", who, var, s,
+                (long long)n);
+        return RAD_E_INVAL;
+    }
+    *lo = l;
+    *hi = h;
+    return RAD_OK;
 }
 
 /* ================================================================== a block drafter */

@@ -42,10 +42,9 @@ int  rad_dev_count(void);
 int  rad_dev_set(int device);
 int  rad_dev_props(int device, RadDeviceProps* out);
 int  rad_dev_enable_peer(int self, int peer);
-/* Whether the driver reports that `self` can reach `peer`'s memory, 1 or 0, asked before anything
- * is enabled: this is the fact collectives constrain (rad_types.h's RAD_FACT_P2P), so a tool that
- * declares a multi-rank graph must measure it and set the fact as Engine does. Negative on a
- * device error. */
+/* 1 when the driver reports that `self` can reach `peer`'s memory, 0 when not, negative on a
+ * device error. A tool that declares a multi-rank graph sets the device.p2p fact from it, as the
+ * engine does (RAD_FACT_P2P). */
 int  rad_dev_peer_access(int self, int peer);
 
 void* rad_dev_alloc(int64_t bytes, int kind);

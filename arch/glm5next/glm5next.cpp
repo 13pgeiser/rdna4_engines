@@ -214,6 +214,8 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });
+    /* The MLA block's resolve count: qsa_select's second output, never `length`. */
+    m.aw.core.nsel = c.nsel;
     if (g.world > 1) {
         c.cu_part = decl_b(b, nm.f("index_part_bounds"), RAD_I32, { g.max_seqs + 1 });
         c.sel_part = decl_b(b, nm.f("selected_part"), RAD_I32, { part, 513 });
@@ -396,6 +398,9 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     g.max_ctx = ctx->max_ctx;
     g.max_seqs = ctx->max_seqs;
     g.max_spec = ctx->max_spec;
+    /* Filled by hand here, not by geom_from: without it kv_resolve would declare the whole context as
+     * the ring. */
+    g.kv_resident = ctx->kv_resident_blocks;
     g.max_logit_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (g.max_spec + 1));
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
@@ -593,6 +598,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* The MLA block declares the streamed store and the resolve (rad_block_glm_mla.h). */
+    out->kv_stream_ok = 1;
     if (cfg(meta, "num_nextn_predict_layers", 0) == 1) out->draft_depth = GlmMtp::kDepth;
     // The tower's merged block, so a pass size the core picks itself is whole output rows.
     if (GlmVision::present(meta)) {

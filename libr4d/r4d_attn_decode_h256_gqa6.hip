@@ -232,7 +232,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
     // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited on
-    // right after it is issued. fp8_v4 packs here as before, as the prefill kernel keeps it.
+    // right after it is issued. fp8_v4 packs here, as the prefill kernel does.
     constexpr int OLDV4 = V4 && !K6;
     uint32_t v4c[U4][2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
@@ -651,11 +651,10 @@ void r4dchain_attn_decode(const R4DArgs a, int splits)
 // each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
 // No barrier and no LDS, so rows in one block may have different contexts and segment counts.
 //
-// SPAN: merge only rows [cu_q[0], cu_q[num_seqs]). A launch over part of a step (the prefill
-// kernel's split under ArPieces, or a band-split step's prefill half) gets q and out whole with
-// cu_q at its own first row; every other row belongs to another launch, and r4d_q_seq would map it
-// onto this launch's first or last sequence and overwrite it. The decode launchers never offset
-// cu_q and do not instantiate it.
+// SPAN: merge only rows [cu_q[0], cu_q[num_seqs]). A launch over part of a step (ArPieces' pieces,
+// a mixed step's prefill half) gets q and out whole with cu_q at its own first row; r4d_q_seq
+// would map any other row onto this launch's first or last sequence and overwrite it. The decode
+// launchers never offset cu_q and do not instantiate it.
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
@@ -998,16 +997,13 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // 8, 19% of a 16K step's KV but 1.2% at 128K. The effect fades with depth, never enough to need a
 // context term.
 //
-// The target is 256 workgroups where a workgroup has one or two waves (q_len * gqa <= 32: a plain decode,
-// or a 4-row verify of the DFlash2 short block), 128 otherwise. A one- or two-wave workgroup keeps too
-// few KV bytes in flight for the card's DRAM at 128 (about one a CU); twice as many reach it. Qwen3.8-27B
-// at TP2 on the R9700, k6_v4: r4d_selftest --perfdecattn (2 rounds) 4 x 1 row over 100k 582 -> 464 us,
-// 1 x 1 row over 100k 264 -> 175, 16 x 4 rows over 41k 985 -> 801 (x4 and x8 the target were worse
-// than x2); the server's decode step at speculation 7 (three rounds, medians, the steps carrying every
-// sequence) 8 x 41k 34.01 -> 32.48 ms, 16 x 25k 44.65 -> 43.19. At three waves (an 8-row verify) more
-// workgroups only add contention: 4 x 8 rows over 100k +9 % at x2, so those keep 128. The split
-// count already moves with the batch (8 sequences at 256 split like 4 at 128), so this adds no
-// partition the merge did not already see.
+// The target is 256 workgroups where a workgroup has one or two waves (q_len * gqa <= 32: a plain
+// decode, or a 4-row verify of the DFlash2 short block), 128 otherwise: a one- or two-wave
+// workgroup keeps too few KV bytes in flight to load the card's DRAM at 128 (Qwen3.8-27B TP2,
+// k6_v4: one row over 100k 264 -> 175 us, a decode step at speculation 7 -4.5 %; 4x and 8x the
+// target were worse than 2x). At three waves (an 8-row verify) more workgroups only add
+// contention (+9 %). The split count already moves with the batch, so the merge sees no new
+// partition.
 static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
     if (a->splits > 0) return a->splits;
     const int tiles = (a->max_ctx + tile - 1) / tile;

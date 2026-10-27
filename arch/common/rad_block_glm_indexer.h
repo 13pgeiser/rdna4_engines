@@ -90,6 +90,9 @@ struct DsaCache {
             d.n_head_kv = 1;
             d.head_dim = 17;
             *index_group = rad_decl_kv_group(b, nm.f("kv_dsa_index"), &d);
+            /* dsa_score reads this group over the whole history every step, so it stays resident and
+             * holds every sequence's context while a sibling streams (kvstream/carve.cpp). */
+            RAD_ARCH_TRY(rad_kv_group_dense_read(b, *index_group));
         }
         index = *index_group;
         if (!index) return RAD_E_INVAL;

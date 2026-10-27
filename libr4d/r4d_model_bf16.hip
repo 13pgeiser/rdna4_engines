@@ -688,28 +688,13 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
     }
 }
 
-// The store of a streamed KV group: `kv_store_fp8` into the group's two copies.
-//
-// A streamed group's ring is `slots` blocks deep while its block-id space is `blocks`, so a block's
-// id is not an address. Its host mirror is:
-//
-//     host[blocks, kv_heads, block_size, 2 * head_dim]      one block a row, identity layout
-//
-// and this kernel writes a token's k and v into the mirror's block `slot / block_size` ALWAYS, and
-// into the ring at `res[block]` only when the map says the block is resident. Both planes have the
-// same row pitch, so one offset serves both and the two copies cannot disagree.
-//
-// The residency test is here, not in the resolve, because the block a decode step writes is
-// usually the one the previous step already made resident: a mirror-only writer would leave the
-// ring's copy of that block short of this step's tokens, and the resolve does not re-copy a
-// resident block. The caller orders store, then resolve, then attention, so a block that is NOT
-// resident yet gets this step's bytes through the mirror and is copied in whole by the resolve.
-//
-// STATE FAULTS. libref refuses a slot naming a block past the id space and a map entry outside
-// [-1, slots) before writing anything. A device launch cannot return a host status, so this kernel
-// guards: a token whose block is out of range stores nothing, and a map entry outside its domain
-// reads as not resident (the mirror is still written, and the resolve refuses the step). A legal
-// call never takes either path and is bit-identical to the reference.
+// The store of a streamed KV group (docs/OPS.md "kv_store_streamed"): kv_store into the group's
+// two copies. A token's k and v go to its block's row of the host mirror always, and to the ring at
+// `res[block]` only when that block is resident; both planes have the same row pitch, so one offset
+// serves both. libref refuses a slot past the id space or a map entry outside [-1, slots); a kernel
+// cannot return a status, so here such a token stores nothing and such an entry reads as absent
+// (the mirror is still written and the resolve refuses the step). A legal call is bit-identical to
+// the reference.
 template <int BF16>
 __global__ __launch_bounds__(kThreads) void kv_store_streamed_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
@@ -2308,19 +2293,10 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
 extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
 extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
 
-/* The store of a streamed group: `kv_store`'s geometry and E4M3 conversion, plus the group's
- * residency map (`res`) and its host mirror (`host`). The mirror is the truth and is written for
- * every token with a slot; the ring is written only when `res[block] >= 0`. Both are one block a
- * row of the same byte pitch, so the row arithmetic is the cache's, unchanged.
- *
- * `res` is read, never written: residency is the resolve's decision, and this op must not move the
- * map under a selection the indexer already resolved. A block id past the mirror's extent or a map
- * entry outside [-1, slots) is a state fault that libref refuses; the kernel guards instead (see
- * kv_store_streamed_kernel), since a device launch cannot return a host status.
- *
- * The cache is E4M3 or bf16. Streaming is dtype-agnostic beyond the two writers: the mirror and the
- * ring are byte planes of one paged layout whose pitch is `block_bytes`, so a bf16 group doubles
- * every offset and stores the values kv_store_bf16 stores. */
+/* The store of a streamed group: kv_store's geometry and conversion (E4M3, or bf16 with no
+ * descales), plus the residency map `res` (read, never written: residency is the resolve's) and the
+ * host mirror `host`. Both are one block a row of the same byte pitch. State faults are guarded,
+ * not refused (see kv_store_streamed_kernel). */
 extern "C" int r4d_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g);

@@ -1,7 +1,9 @@
 /* avx_video.cpp -- the video generator's ops around its decoder (docs/OPS.md, "Video
  * generation"): the latent's patch rows unfolded to voxels, the tiles a video decoder runs over,
  * gathered from the latent and stitched back into frames, and the rotary positions of a tile's
- * tokens; and its latent upscaler's (docs/OPS.md, "The latent upscaler"): the 3-D convolution,
+ * tokens; the encoder's plan, cut and blend for a picture too big for one volume (docs/OPS.md,
+ * "Video generation"); and its latent upscaler's (docs/OPS.md, "The latent upscaler"): the 3-D
+ * convolution,
  * the group norm, the temporal depthwise convolution, the per-frame resize, the fold back into
  * patch rows and the re-noising.
  *
@@ -121,6 +123,19 @@ bool split_tiles(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t
     start->push_back(0);
     for (int64_t i = 0; i + 1 < nt; ++i) start->push_back(start->back() + tile - (*ov)[(size_t)i]);
     return true;
+}
+
+/* libref's split_tiles_axis: the decoder's split, except that an axis no longer than a tile is one
+ * tile, short if need be. */
+bool split_tiles_axis(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t>* start,
+                      std::vector<int64_t>* ov) {
+    if (tile >= len) {
+        start->clear();
+        ov->clear();
+        start->push_back(0);
+        return len > 0 && tile > 0 && overlap >= 0 && overlap < tile;
+    }
+    return split_tiles(len, tile, overlap, start, ov);
 }
 
 /* A row copied between operands, converted through f32 as libref's element loop is. Whole-byte
@@ -440,19 +455,178 @@ AVX_KERNEL(vtile_stitch) {
     return RAD_OK;
 }
 
+/* ================================================================== the tiled encoder
+ * The plan, the cut and the blend of vae.py's `tiled_encode` (libref's section comment). */
+
+/* ------------------------------------------------------------------ vtile_plan */
+/* The plan one frame's encode runs over (libref): geom = (clip, H, W) the frame's extent in
+ * pixels, split by split_tiles_axis over the spatial axes in latent units; row t of y (i32
+ * [M, 22]) the tile's first pixel, its pixel extent, and the six level volumes. */
+/* The tile count comes from G; the ranged `M` is a ceiling only (band_rows). */
+AVX_KERNEL(vtile_plan) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *G = &a->t[0], *Y = &a->t[1];
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
+    if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(G) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = at(G, 1), W = at(G, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
+        !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W / ratio, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    const int64_t M = band_rows(nh * nw, band);
+    if (M <= 0 || rows_of(Y, 22) < M) return RAD_E_SHAPE;
+    const int64_t* psy = sy.data(), *psx = sx.data();
+    AVX_PARALLEL_FOR_IF(M >= AVX_PAR_MIN)
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t i = t / nw, j = t % nw;
+        const int64_t th = std::min(tile, H / ratio - psy[(size_t)i]) * ratio;
+        const int64_t tw = std::min(tile, W / ratio - psx[(size_t)j]) * ratio;
+        const int64_t yb = rowoff(Y, t, 22), ys = laststride(Y);
+        const int64_t v[22] = { psy[(size_t)i] * ratio, psx[(size_t)j] * ratio, th, tw,
+                                1, th, tw,   1, th / 2, tw / 2,   1, th / 4, tw / 4,
+                                1, th / 8, tw / 8,   1, th / 16, tw / 16,   1, th / 16, tw / 16 };
+        for (int64_t c = 0; c < 22; ++c) st_int_dt(Y->dtype, Y->data, yb + c * ys, v[c]);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vtile_crop */
+/* One frame's pixel plane cut into the plan's tiles (libref): y f32 [M, 3] holds the tiles'
+ * pixels tile-major, M the tiles' pixel count. Only the row the tile stands on is read. */
+AVX_KERNEL(vtile_crop) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
+    if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(G) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = at(G, 1), W = at(G, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
+        !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W / ratio, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
+    for (int64_t i = 0; i < nh; ++i) {
+        const int64_t th = std::min(tile, H / ratio - sy[(size_t)i]) * ratio;
+        for (int64_t j = 0; j < nw; ++j)
+            off[(size_t)(i * nw + j + 1)] =
+                off[(size_t)(i * nw + j)] +
+                th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
+    }
+    const int64_t M = band_rows(off.back(), band);
+    if (M <= 0 || rows_of(X, 3) < H * W || rows_of(Y, 3) < M) return RAD_E_SHAPE;
+    const int64_t* psy = sy.data(), *psx = sx.data(), *poff = off.data();
+    AVX_PARALLEL_FOR_IF(M * 3 >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t t =
+            (int64_t)(std::upper_bound(poff, poff + nh * nw + 1, r) - poff) - 1;
+        const int64_t i = t / nw, j = t % nw;
+        const int64_t tw = std::min(tile, W / ratio - psx[(size_t)j]) * ratio;
+        const int64_t k = r - poff[t];
+        const int64_t src = (psy[(size_t)i] * ratio + k / tw) * W + psx[(size_t)j] * ratio + k % tw;
+        const int64_t xb = rowoff(X, src, 3), yb = rowoff(Y, r, 3), xs = laststride(X);
+        const int64_t ys = laststride(Y);
+        for (int64_t c = 0; c < 3; ++c) stt(Y, yb + c * ys, ldt(X, xb + c * xs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vtile_join */
+/* The tiles' moments blended into one latent plane (libref): unblended neighbours, the top blend
+ * before the left one, every product and sum rounded to x's dtype. */
+AVX_KERNEL(vtile_join) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
+    const int64_t band = p_int(a, "M", 0), tile = p_int(a, "tile", 0);
+    const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
+    if (tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(G) < 3)
+        return RAD_E_SHAPE;
+    const int64_t H = at(G, 1), W = at(G, 2);
+    std::vector<int64_t> sy, sx, oy, ox;
+    if (H <= 0 || W <= 0 || !split_tiles_axis(H, tile, overlap, &sy, &oy) ||
+        !split_tiles_axis(W, tile, overlap, &sx, &ox))
+        return RAD_E_SHAPE;
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
+    const int64_t M = band_rows(H * W, band);
+    std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
+    for (int64_t i = 0; i < nh; ++i) {
+        const int64_t th = std::min(tile, H - sy[(size_t)i]);
+        for (int64_t j = 0; j < nw; ++j)
+            off[(size_t)(i * nw + j + 1)] =
+                off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
+    }
+    if (M <= 0 || rows_of(X, n) < off.back() || rows_of(Y, n) < M) return RAD_E_SHAPE;
+    /* The owner tile of every canvas row and column. */
+    std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
+    for (int64_t Yp = 0, i = 0; Yp < H; ++Yp) {
+        while (i + 1 < nh && Yp >= sy[(size_t)(i + 1)]) ++i;
+        own_y[(size_t)Yp] = i;
+    }
+    for (int64_t X0 = 0, j = 0; X0 < W; ++X0) {
+        while (j + 1 < nw && X0 >= sx[(size_t)(j + 1)]) ++j;
+        own_x[(size_t)X0] = j;
+    }
+    const uint32_t dt = X->dtype;
+    auto rd = [dt](float v) { return narrow1(dt, v); };
+    auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
+    auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
+    const int64_t* psy = sy.data(), *psx = sx.data(), *poff = off.data();
+    const int64_t* pown_y = own_y.data(), *pown_x = own_x.data();
+    const int64_t xs = laststride(X), ys = laststride(Y);
+    auto T = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+        const int64_t row = poff[i * nw + j] + ly * std::min(tile, W - psx[(size_t)j]) + lx;
+        return ldt(X, rowoff(X, row, n) + c * xs);
+    };
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t Yp = r / W, X0 = r % W;
+        const int64_t i = pown_y[Yp], j = pown_x[X0];
+        const int64_t ly = Yp - psy[(size_t)i], lx = X0 - psx[(size_t)j];
+        const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0, eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
+        const int64_t yb = rowoff(Y, r, n);
+        for (int64_t c = 0; c < n; ++c) {
+            float v = T(i, j, ly, lx, c);
+            if (ly < ev)
+                v = rd(rd(T(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                       rd(v * wb(ly, ev)));
+            if (lx < eh)
+                v = rd(rd(T(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                       rd(v * wb(lx, eh)));
+            stt(Y, yb + c * ys, v);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== the latent upscaler
  * Voxel rows (t, i, j) of a T x H x W volume, channels innermost, the volume in `geom`. */
+
+/* Division rounding toward negative infinity, as PyTorch's output-length formula takes it. */
+static int64_t idiv_floor(int64_t x, int64_t d) {
+    const int64_t q = x / d;
+    return (x % d && (x < 0) != (d < 0)) ? q - 1 : q;
+}
 
 /* ------------------------------------------------------------------ conv3d_ndhwc */
 /* A 3-D convolution as GEMMs over bands of patch rows, as conv2d_nhwc and conv1d take theirs. The
  * weight [cout, cin, kt, k, k] is re-laid once a launch as [cout][dt][kh][kw][cin] (bf16 copies
  * when it is bf16, f32 otherwise), so an output voxel's patch row is its kt k k input voxels'
- * channel runs back to back, zeros outside the volume: bf16 copies when x is bf16 with dense
- * rows, f32 otherwise. A band is one gemm_nt_into into f32 rows, the bias added there; each row
- * is then rounded once into y, or with `res` rounded to y's dtype, its residual row added and
- * rounded again. A band's residual rows are read before its rows of y are written, row by row,
- * so `res` may be y. The patches and the weight live in thread_local vectors that keep their
- * high-water size, leaving the GEMM's scratch arenas to it. */
+ * channel runs back to back, zeros outside the volume (or `reflect`'s mirror): bf16 copies when x
+ * is bf16 with dense rows, f32 otherwise. A band is one gemm_nt_into into f32 rows, the bias
+ * added there; each row is then rounded once into y, or with `res` rounded to y's dtype, its
+ * residual row added and rounded again. A band's residual rows are read before its rows of y are
+ * written, row by row, so `res` may be y. The patches and the weight live in thread_local vectors
+ * that keep their high-water size, leaving the GEMM's scratch arenas to it.
+ *
+ * The optional `stride`, `stride_t`, `causal`, `pad` and `reflect` are a causal video VAE's
+ * convolution forms (libref's ref_conv3d_ndhwc, docs/OPS.md): output voxel (t, i, j) of the
+ * T2 x H2 x W2 grid reads the input voxels from (t sz - pz0, i sy - py0, j sy - px0). */
 AVX_KERNEL(conv3d_ndhwc) {
     if (a->n_t < 6 || !rad_args_have(a, 4) || !rad_arg_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3];
@@ -468,11 +642,33 @@ AVX_KERNEL(conv3d_ndhwc) {
     if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || tpre < 0 ||
         numel(G) < 3)
         return RAD_E_SHAPE;
+    const int64_t sy = p_int(a, "stride", 1), sz = p_int(a, "stride_t", 1);
+    const int64_t causal = p_int(a, "causal", 0), reflect = p_int(a, "reflect", 0);
+    const char* pads = p_str(a, "pad", "same");
+    const bool down = pads && !std::strcmp(pads, "down");
+    if (sy <= 0 || sz <= 0 || (causal && causal != 1) || (reflect && reflect != 1) ||
+        (causal && tpad) /* `causal` pads with zeros, `tpad` with copies */ ||
+        !(!pads || !std::strcmp(pads, "same") || down))
+        return RAD_E_SHAPE;
+    const bool gen = sy != 1 || sz != 1 || causal || down || reflect;
+    if (gen && (k != 3 || kt != 3)) return RAD_E_SHAPE;
     const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
     if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
-    const int64_t rows = (T + tpre) * H * Wd, taps = kt * k * k, KK = taps * cin;
-    if (rows_of(Y, cout) < rows || rows_of(X, cin) < T * H * Wd ||
-        (R && rows_of(R, cout) < rows) || numel(W) < cout * KK || numel(B) < cout)
+    /* The pads before (0) and after (1) each axis. `tpad` replicate centres the window as `zero`
+     * does and clamps the reads to the volume; `tpad` causal puts kt - 1 + tpre copies of the
+     * first frame in front, T + tpre frames out, the grid `causal` takes with zeros. */
+    const int64_t pz0 = causal ? kt - 1 : tpad == 2 ? kt - 1 + tpre : kt / 2;
+    const int64_t pz1 = (causal || tpad == 2) ? 0 : kt / 2;
+    const int64_t py0 = down ? 0 : k / 2, py1 = down ? 1 : k / 2;
+    const int64_t px0 = down ? 0 : k / 2, px1 = down ? 1 : k / 2;
+    if (reflect && (std::max(py0, py1) >= H || std::max(px0, px1) >= Wd)) return RAD_E_SHAPE;
+    const int64_t T2 = idiv_floor(T + pz0 + pz1 - kt, sz) + 1;
+    const int64_t H2 = idiv_floor(H + py0 + py1 - k, sy) + 1;
+    const int64_t W2 = idiv_floor(Wd + px0 + px1 - k, sy) + 1;
+    if (T2 <= 0 || H2 <= 0 || W2 <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * Wd, orows = T2 * H2 * W2, taps = kt * k * k, KK = taps * cin;
+    if (rows_of(Y, cout) < orows || rows_of(X, cin) < rows || (R && rows_of(R, cout) < orows) ||
+        numel(W) < cout * KK || numel(B) < cout)
         return RAD_E_SHAPE;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
     static thread_local std::vector<float> ybuf;
@@ -497,25 +693,29 @@ AVX_KERNEL(conv3d_ndhwc) {
     const size_t ael = x16 ? 2 : 4;
     const int64_t want = std::min<int64_t>((int64_t)1 << 25,
                                            std::max<int64_t>((int64_t)1 << 23, 8 * cout * KK));
-    const int64_t band = std::max<int64_t>(1, std::min(rows, want / KK));
+    const int64_t band = std::max<int64_t>(1, std::min(orows, want / KK));
     pbuf.resize((size_t)(band * KK) * ael + 64);
     ybuf.resize((size_t)(band * cout) + 16);
     char* pp = (char*)pbuf.data();
     float* yp = ybuf.data();
-    const int64_t pz = kt / 2, ps = k / 2;
-    for (int64_t r0 = 0; r0 < rows; r0 += band) {
-        const int64_t nb = std::min(band, rows - r0);
+    for (int64_t r0 = 0; r0 < orows; r0 += band) {
+        const int64_t nb = std::min(band, orows - r0);
         AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
-        for (int64_t pr = 0; pr < nb; ++pr) {
-            const int64_t r = r0 + pr, t = r / (H * Wd), i = (r / Wd) % H, j = r % Wd;
-            char* d = pp + (size_t)(pr * KK) * ael;
+        for (int64_t br = 0; br < nb; ++br) {
+            const int64_t r = r0 + br, t = r / (H2 * W2), i = (r / W2) % H2, j = r % W2;
+            char* d = pp + (size_t)(br * KK) * ael;
             for (int64_t dz = 0; dz < kt; ++dz)
                 for (int64_t kh = 0; kh < k; ++kh)
                     for (int64_t kw = 0; kw < k; ++kw, d += (size_t)cin * ael) {
-                        int64_t tz = t + dz - pz;
-                        if (tpad == 1) tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
-                        else if (tpad == 2) tz = std::max<int64_t>(t + dz - (kt - 1) - tpre, 0);
-                        const int64_t iy = i + kh - ps, ix = j + kw - ps;
+                        int64_t tz = t * sz + dz - pz0;
+                        if (tpad)   /* copies of the edge frame; `zero` and `causal` read zeros */
+                            tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
+                        int64_t iy = i * sy + kh - py0;
+                        int64_t ix = j * sy + kw - px0;
+                        if (reflect) {   /* PyTorch's reflect: the edge itself is not repeated */
+                            if (iy < 0) iy = -iy; else if (iy >= H) iy = 2 * H - 2 - iy;
+                            if (ix < 0) ix = -ix; else if (ix >= Wd) ix = 2 * Wd - 2 - ix;
+                        }
                         if (tz < 0 || tz >= T || iy < 0 || iy >= H || ix < 0 || ix >= Wd) {
                             std::memset(d, 0, (size_t)cin * ael);
                             continue;
@@ -534,16 +734,16 @@ AVX_KERNEL(conv3d_ndhwc) {
         const int st = gemm_nt_into(&pt, &wt, B, &yt, nb, cout, KK);
         if (st < 0) return st;
         AVX_PARALLEL_FOR_IF(nb * cout >= AVX_PAR_MIN)
-        for (int64_t pr = 0; pr < nb; ++pr) {
-            float* row = yp + pr * cout;
+        for (int64_t br = 0; br < nb; ++br) {
+            float* row = yp + br * cout;
             if (R) {
                 float* buf = scratch_f32((size_t)(2 * cout + 32));
                 float *tmp = buf, *rs = buf + cout + 16;
                 narrow_row(Y->dtype, row, cout, tmp);
-                const float* rr = in_row(R, rowoff(R, r0 + pr, cout), cout, rs);
+                const float* rr = in_row(R, rowoff(R, r0 + br, cout), cout, rs);
                 for (int64_t c = 0; c < cout; ++c) row[c] += rr[c];
             }
-            out_row(Y, rowoff(Y, r0 + pr, cout), cout, row);
+            out_row(Y, rowoff(Y, r0 + br, cout), cout, row);
         }
     }
     return RAD_OK;
@@ -793,6 +993,40 @@ AVX_KERNEL(flow_renoise) {
             vf_storeu(o + c, vf_add(keep(vf_mul(vo, vf_loadu(x + c))),
                                     keep(vf_mul(vs, vf_loadu(z + c)))));
         for (; c < n; ++c) o[c] = keep(oms * x[c]) + keep(s * z[c]);
+        out_row(X, rowoff(X, k, n), n, o);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ cond_aug */
+/* A visual condition's rows blended with noise (libref's ref_cond_aug, bit for bit):
+ * x = f32(f32(a x) + f32(oma z)), oma the f32 of the f64 1 - aug, z the (seed, stream) normal
+ * stream at k n + c. */
+AVX_KERNEL(cond_aug) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *SD = &a->t[0], *X = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), sm = p_int(a, "stream", 0);
+    const RadParam* ap = p_find(a, "aug");
+    if (!ap || ap->kind != RAD_P_F64) return RAD_E_SHAPE;
+    const double aug = ap->dval;
+    if (n <= 0 || sm < 0 || !(aug >= 0.0 && aug < 1.0) || numel(SD) < 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float av = (float)aug, omv = (float)(1.0 - aug);
+    const uint64_t sd = (uint64_t)(uint32_t)at(SD, 0) | ((uint64_t)(uint32_t)at(SD, 1) << 32);
+
+    AVX_PARALLEL_FOR_IF(rows * n * 8 >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(3 * n + 48));
+        float *xs = buf, *z = xs + n + 16, *o = z + n + 16;
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        philox_normals_s(sd, (uint64_t)sm, (uint64_t)(k * n), n, z);
+        const vf va = vf_set1(av), vo = vf_set1(omv);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N)
+            vf_storeu(o + c, vf_add(keep(vf_mul(va, vf_loadu(x + c))),
+                                    keep(vf_mul(vo, vf_loadu(z + c)))));
+        for (; c < n; ++c) o[c] = keep(av * x[c]) + keep(omv * z[c]);
         out_row(X, rowoff(X, k, n), n, o);
     }
     return RAD_OK;

@@ -92,17 +92,16 @@ __device__ __forceinline__ bool r4d_ar_seq_behind(unsigned int flag, unsigned in
 // R9700: the reader sometimes found the slot's previous contents right after the handshake, and
 // the new bytes ~1 us later), so the flag alone does not say the bytes are there. The pushed bytes
 // wait in the writer's L2 for the release's writeback, and that writeback and the flag store reach
-// the peer by different paths. The writer sums
-// mix(dword, index) over what it pushes and stores the block's sum, salted with its handshake
-// value, into the peer's check word for (slot, block): fine-grained words after the flags
-// (r4d_ar_entry.hip sizes the allocation). The reader sums the same over the bytes it is about to
-// read and reads again until the two agree. A stale element and a stale check word (an older
-// handshake value) both disagree, so only the landed push passes; the order the two land in does
-// not matter. The sum is order-free, so writer and reader may split the bytes differently.
+// the peer by different paths. The writer sums mix(dword, index) over what it pushes and stores the
+// block's sum, salted with its handshake value, into the peer's check word for (slot, block):
+// fine-grained words after the flags (r4d_ar_entry.hip sizes the allocation). The reader sums the
+// same over the bytes it is about to read and reads again until the two agree. A stale element and
+// a stale check word (an older handshake value) both disagree, so only the landed push passes; the
+// order the two land in does not matter. The sum is order-free, so writer and reader may split the
+// bytes differently.
 #define R4D_ARCHK_SALT 0x6C8E9CF5u
-#ifndef R4D_ARCHK_DEADLINE
-#define R4D_ARCHK_DEADLINE 200000000ull   // wall_clock64 ticks (100 MHz): 2 s; a push that never lands is a lockstep fault
-#endif
+// wall_clock64 ticks (100 MHz): 2 s. A push that never lands is a lockstep fault, so the reader traps.
+#define R4D_ARCHK_DEADLINE 200000000ull
 #define R4D_ARCHK_U16 0x80000000u    // index space of 16-bit fields (wire scales), apart from dwords
 
 // MurmurHash3's finalizer over (value, index): every bit of the value reaches every bit of the term,

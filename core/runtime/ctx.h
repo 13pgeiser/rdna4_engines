@@ -75,9 +75,11 @@ struct OpPlan {
     int32_t       band_off = 0;      /* into Ctx::band_table_ */
     int32_t       n_bands  = 0;
     int32_t       plan_off = 0;      /* into Ctx::issue_table_, band * RAD_N_DOMAINS + domain */
-    /* The schema's operand count, cached so the arity check avoids a cold OpInfo. -1 when the op
-     * has no schema. */
-    int32_t       n_opd_schema = -1;
+    /* The schema's operand count, cached so the arity check avoids a cold OpInfo, -1 when the op
+     * has no schema; and the count without its trailing optional operands, which an issue may
+     * leave out. */
+    int32_t       n_opd_schema   = -1;
+    int32_t       n_opd_required = -1;
     bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
     /* Whether issuing it puts bytes on the interconnect. Set at bind from the resolved rows
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share
@@ -141,11 +143,9 @@ struct RouteSlot {
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
-/* One of the two views a streamed group's allocation is addressed through. `depth` is the number
- * of layer stripes the view presents: the ring keeps the group's `n_layers`, the stage presents
- * one and every layer aliases offset 0. The field is a depth and NOT a rewritten `layer_slot`:
- * that table is also the host mirror's row (rad_kv_layer_index), so collapsing it would write all
- * layers into one mirror row (docs/KV-STREAMING.md §3.5.1). */
+/* One of a streamed group's two views of its allocation (kvstream/bind.h). `depth` is the stripe
+ * count it presents: 0 for the ring's `n_layers`, 1 for the stage, where every layer aliases
+ * offset 0. */
 struct KVViewState {
     int64_t layer_stride = 0;
     int64_t bytes = 0;
@@ -164,24 +164,19 @@ struct KVPoolBinding {
     std::vector<int32_t> layer_slot;
     uint32_t rank = 0;              /* 0 when the group has no plan: the operand stays a flat span */
     int64_t  shape[RAD_MAX_RANK] = {0};
-    /* The active view's stripe count: 0 is n_layers, 1 is the one-layer prefill stage. */
+    /* The active view's stripe count, as KVViewState::depth. */
     int64_t  depth = 0;
-    /* Both fixed views over the group's one allocation. The ring is always present; the stage only
-     * for a group whose plan depth is 1 (its ring is smaller than its context). The active fields
-     * above are set from one of these before each pass (kvstream_enter), so a recorded pass that
-     * used a view replays against it: the pass key already carries the phase, which selects it. */
+    /* Both views of a streamed group's allocation; the stage only when the plan's depth is 1. The
+     * active fields above are set from one of them before each pass (kvstream_enter). */
     KVViewState ring;
     KVViewState stage;
     bool        has_stage = false;
-    /* Bytes of one layer's mirror row a staged pass must copy, from the block manager's highest
-     * held block (kvstream/stage.h). 0 copies the whole row, which is always correct and is what a
-     * caller with no manager (a test, a harness) leaves it at. Set once per step, before the pass,
-     * because the bound grows as a prefill appends blocks. */
+    /* Bytes of a layer's mirror row a staged pass copies, from the held bound (kvstream/stage.h,
+     * "Volume"), set each step. 0 copies the whole row. */
     int64_t     stage_live_bytes = 0;
 };
 
-/* The KV stage's driver, run again where a recorded pass made it (kvstream/stage.cpp). `after` is
- * the call the architecture makes after a layer's attention instead of before it. */
+/* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */
 int kvstage_run(Ctx* c, int group, int layer, bool after);
 
 struct CtxDesc {
@@ -243,19 +238,18 @@ public:
     int             rank()       const { return rank_; }
     /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
     bool            records_passes() const { return tape_on_; }
-    /* Whether the pass being issued is being recorded. Work a tape cannot record -- a DMA
-     * submission -- must be re-run where the pass made it instead (tape_kv_stage). */
+    /* Whether the pass being issued is being recorded. */
     bool            recording()  const { return rec_ != nullptr; }
-    /* While recording: a KV stage call becomes a host step that re-runs at every play, because the
-     * DMA list it hands the engine and the stream wait on the list's completion word are neither of
-     * them queue packets (kvstream/stage.cpp; xprefetch.cpp does the same for the prefetch). */
+    /* A KV stage call while recording: a host step that re-runs at every play, because its DMA
+     * list is not a queue packet (kvstream/stage.cpp; xprefetch.cpp does the same). */
     int tape_kv_stage(bool after, int group, int layer) {
         TapeStep st;
         st.kind = (uint8_t)(after ? kTapeKvStageAfter : kTapeKvStage);
         st.a = group;
         st.b = layer;
         return tape_host(st, [&] { return kvstage_run(this, group, layer, after); });
-    }    /* This rank's device ordinal, for the calls that name a card rather than a stream. */
+    }
+    /* This rank's device ordinal, for the calls that name a card rather than a stream. */
     int             device()     const { return device_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
@@ -274,11 +268,10 @@ public:
 
     void* weight_ptr(rad_weight w);
     void* buf_ptr(rad_buf b);
-    /* The group-local position of absolute model layer `layer` in the binding's layer_slot, or -1.
-     * rad_kv_layer_index (rad_runtime.h) exposes it to a plugin, which needs it for the host
-     * mirror: that is laid out by the group's layers, not by model layer numbers. */
+    /* The group-local position of model layer `layer` in the binding's layer_slot, or -1: the
+     * index of its host mirror row (rad_kv_layer_index). */
     int64_t kv_layer_index(rad_kvgroup g, int layer) const;
-    /* The group's pool binding, for the view switch and the stage copy. */
+    /* The group's pool binding, for the view switch and the stage. */
     const KVPoolBinding* kv_binding(rad_kvgroup g) const {
         return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
     }

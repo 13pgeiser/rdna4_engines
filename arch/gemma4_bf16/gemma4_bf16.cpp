@@ -1867,7 +1867,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dc.group    = df2_geti(meta, "conv_group_size", 16);
     dc.sel_rank = df2_geti(meta, "selector_rank", 0);
     dc.sel_topk = df2_geti(meta, "selector_top_k", 0);
-    dc.prefetch = gemma4::kPrefetchBytes;
+    dc.prefetch = ctx->weight_prefetch_off ? 0 : gemma4::kPrefetchBytes;
     if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
         fprintf(stderr, "radiance: gemma4: the DFlash2 drafter states no selector geometry (rank "
                         "%lld, top_k %lld)\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
@@ -2454,8 +2454,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
      * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
      * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
-     * where there are reductions to sit beside. */
-    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+     * where there are reductions to sit beside, and not under --weight-prefetch off. */
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
         for (size_t l = 0; l < m.layers.size(); ++l) {
             Layer& lay = m.layers[l];
             lay.attn.pf_w  = lay.mlp.ln_gu.w;

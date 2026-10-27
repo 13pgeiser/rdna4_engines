@@ -74,6 +74,62 @@ int64_t fake_positions(int which, const RadVideoGeom* g, float* pos, int64_t cap
     return rows;
 }
 
+/* A reference pack for this fake's layout: [text | 2 rows a keyframe | 4 a reference | the
+ * soundtrack | the video], its modulation groups the segments themselves, each its own cell, and
+ * the positions 1000 c + i in channel c. Not the real arithmetic: the shape the driver stages. */
+int64_t fake_pack(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg, int32_t* n_seg,
+                  int32_t* mod, int32_t* n_mod, float* pos, int64_t cap_pos) {
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
+    const int64_t audio = 2 * (int64_t)g->n_audio;
+    const int64_t video = (int64_t)g->lat_frames * (g->lat_h / 2) * (g->lat_w / 2);
+    const int64_t rows = g->n_text + 2 * (int64_t)nk + 4 * (int64_t)nr + audio + video;
+    const int32_t ns = nk + nr + 4;
+    std::vector<int32_t> b = { 0 };
+    int64_t cur = g->n_text;
+    for (int32_t k = 0; k < nk; ++k, cur += 2) b.push_back((int32_t)cur);
+    for (int32_t r = 0; r < nr; ++r, cur += 4) b.push_back((int32_t)cur);
+    b.push_back((int32_t)cur);
+    b.push_back((int32_t)(cur + audio));
+    b.push_back((int32_t)rows);
+    if (seg && *n_seg < ns) return RAD_E_INVAL;
+    if (seg) std::copy(b.begin(), b.end(), seg);
+    if (n_seg) *n_seg = ns;
+    const int32_t nm = 2 * ns - 1;
+    if (mod && *n_mod < nm) return RAD_E_INVAL;
+    if (mod) {
+        std::copy(b.begin(), b.end(), mod);
+        for (int32_t k = 0; k + 1 < ns; ++k) mod[ns + k] = k;
+    }
+    if (n_mod) *n_mod = nm;
+    if (pos) {
+        if (cap_pos < 3 * rows) return RAD_E_INVAL;
+        for (int64_t c = 0; c < 3; ++c)
+            for (int64_t i = 0; i < rows; ++i) pos[c * rows + i] = (float)(c * 1000 + i);
+    }
+    return rows;
+}
+
+/* The real encoders' geometry where the driver reads it: a video of T frames pads to whole
+ * 17-frame clips (entry 23) of 5 latents less 3 (entry 24), a picture stays one frame; a
+ * soundtrack pads to whole 800-sample hops (entry 0) of a latent each (entry 12). */
+int64_t fake_encode_geom(int32_t kind, const int64_t* in, int32_t* gd, int64_t cap) {
+    const int64_t need = kind == RAD_GEN_PASS_AENCODE ? 13 : 25;
+    if (!gd) return need;
+    if (cap < need) return RAD_E_INVAL;
+    for (int64_t i = 0; i < need; ++i) gd[i] = 0;
+    if (kind == RAD_GEN_PASS_AENCODE) {
+        const int64_t lat = (in[0] + 799) / 800;
+        gd[0] = (int32_t)(lat * 800);
+        gd[12] = (int32_t)lat;
+    } else {
+        const int64_t clips = (in[0] + 16) / 17;
+        gd[22] = (int32_t)clips;
+        gd[23] = in[0] == 1 ? 1 : (int32_t)(clips * 17);
+        gd[24] = in[0] == 1 ? 1 : (int32_t)(clips * 5 - 3);
+    }
+    return need;
+}
+
 struct VideoFixture {
     Program prog;
     gen::VideoDriver drv;
@@ -85,6 +141,21 @@ struct VideoFixture {
         prog.ctx.max_seqs = 1;
     }
     int start() { return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }); }
+    /* With the reference conditioning of a container with the video VAE's encoder, and the audio
+     * VAE's too when `audio`. */
+    int start_refs(bool audio = true) {
+        RadVideoGenDecl& d = prog.video_gen;
+        d.max_ref_images = 9;
+        d.max_ref_videos = 3;
+        d.max_ref_audios = audio ? 3 : 0;
+        d.max_enc_frames = 289;
+        d.max_enc_side = 256;
+        d.max_enc_samples = audio ? 500000 : 0;
+        d.enc_ratio = 16;
+        d.max_mod_cells = 8;
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, fake_pack,
+                        fake_encode_geom);
+    }
     std::unique_ptr<gen::VideoRequest> req(int32_t chunks = 2, int32_t steps = 0) {
         auto r = std::make_unique<gen::VideoRequest>();
         r->tokens = { 1, 2, 3 };
@@ -169,6 +240,21 @@ TEST(the_schedule_counts_grid_points_and_shifts_each_modality) {
     CHECK(std::fabs(s.sig_v[30] - 12.0 * b / (1.0 + 11.0 * b)) < 1e-6);
     CHECK(std::fabs(s.sig_a[30] - 3.0 * b / (1.0 + 2.0 * b)) < 1e-6);
     CHECK_EQ(gen::video_schedule(d, 2).steps, 1);
+}
+
+/* A request's shift re-shapes ONLY the stream it names; the stream it leaves at 0 keeps the
+ * declaration's trained shift (decl_small is video 12, audio 3). */
+TEST(a_request_shift_overrides_the_declaration_per_stream) {
+    const RadVideoGenDecl d = decl_small();
+    const gen::VideoSchedule base = gen::video_schedule(d, 50);
+    const gen::VideoSchedule s = gen::video_schedule(d, 50, 0, false, 6.0, 0.0);   /* video -> 6, audio keep 3 */
+    REQUIRE_EQ(s.sig_v.size(), base.sig_v.size());
+    REQUIRE_EQ(s.sig_a.size(), base.sig_a.size());
+    const double b = 1.0 - 30.0 / 49.0;
+    CHECK(std::fabs(s.sig_v[30] - 6.0 * b / (1.0 + 5.0 * b)) < 1e-6);    /* re-shifted by 6 */
+    CHECK(std::fabs(s.sig_a[30] - 3.0 * b / (1.0 + 2.0 * b)) < 1e-6);    /* still the decl's 3 */
+    CHECK(s.sig_v[30] != base.sig_v[30]);                                /* video actually moved */
+    CHECK(std::fabs(s.sig_a[30] - base.sig_a[30]) < 1e-9);               /* audio untouched */
 }
 
 /* A trained schedule (a distilled checkpoint's): its rungs in f32, each modality's shift applied
@@ -833,6 +919,318 @@ TEST(left_padded_prompts_one_audio_stream_and_an_exact_upscaler) {
     CHECK_EQ(f.drv.submit(std::move(v), &why), (int)RAD_E_INVAL);
     CHECK(has(why, "exactly 2"));
     g_audio_streams = 2;
+}
+
+namespace {
+
+/* A picture as the processor hands one to the vision tower: eight patches merged into two rows,
+ * on the two placeholder tokens 700 and 701. */
+std::shared_ptr<mm::Item> synthetic_picture(int64_t patch_dim) {
+    auto it = std::make_shared<mm::Item>();
+    it->kind = mm::Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = 2;
+    it->grid_w = 4;
+    it->n_patch = 8;
+    it->patch_dim = patch_dim;
+    it->pixels.resize((size_t)(it->n_patch * patch_dim));
+    for (size_t i = 0; i < it->pixels.size(); ++i) it->pixels[i] = (uint16_t)i;
+    it->n_seg = 1;
+    it->seg_rows = 2;
+    it->rows_h = 1;
+    it->rows_w = 2;
+    it->expand = { 700, 701 };
+    it->seg_at = { 0 };
+    return it;
+}
+
+/* The picture placed at prompt token `tok`. */
+std::shared_ptr<mm::PromptMedia> picture_media(int64_t patch_dim, int32_t tok) {
+    auto pm = std::make_shared<mm::PromptMedia>();
+    mm::Placed pl;
+    pl.item = synthetic_picture(patch_dim);
+    pl.tok = tok;
+    pm->items.push_back(std::move(pl));
+    pm->layout();
+    return pm;
+}
+
+void with_tower(VideoFixture& f, int64_t max_enc) {
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 6;
+    f.prog.ctx.max_enc_patches = max_enc;
+}
+
+/* A reference picture or keyframe of w x h, or a video of `frames` frames, in the encoder's form;
+ * a soundtrack of `samples` samples a channel. */
+gen::VideoRefMedia picture(gen::VideoRefMedia::Kind kind, const char* name, int32_t index,
+                           int32_t w = 16, int32_t h = 16, int32_t frames = 1) {
+    gen::VideoRefMedia m;
+    m.kind = kind;
+    m.index = index;
+    m.name = name;
+    m.enc_frames = frames;
+    m.enc_w = w;
+    m.enc_h = h;
+    m.enc_pixels.assign((size_t)frames * w * h * 3, 1.0f);
+    return m;
+}
+gen::VideoRefMedia sound(gen::VideoRefMedia::Kind kind, const char* name, int32_t index,
+                         int64_t samples) {
+    gen::VideoRefMedia m;
+    m.kind = kind;
+    m.index = index;
+    m.name = name;
+    m.enc_n = samples;
+    m.enc_channels = 2;
+    m.enc_samples.assign((size_t)(2 * samples), 0.5f);
+    return m;
+}
+
+}  /* namespace */
+
+/* A reference picture: encoded first, then shown to the tower in the prompt pass, then laid by the
+ * plugin between the prompt and the latents of every step; the sampler steps the latents alone. */
+TEST(a_reference_picture_is_encoded_shown_and_laid_into_the_step) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 700, 701, 2, 3 };
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    std::string kinds;
+    for (int i = 0; i < 12; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        REQUIRE(V != nullptr);
+        kinds += b->gen == RAD_GEN_PASS_VENCODE ? 'E' : kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VENCODE) {
+            CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_IMAGE);
+            CHECK_EQ(V->enc_slot, 1);
+            CHECK_EQ(V->enc_frames, 1);
+            /* {references, keyframes}, then the picture: its kind, slot, 1 x 1 latent grid, one
+             * latent frame and no soundtrack. */
+            const int32_t want[8] = { 1, 0, RAD_VREF_PICTURE, 1, 1, 1, 1, 0 };
+            for (int k = 0; k < 8; ++k) CHECK_EQ(V->ref_tab[k], want[k]);
+        } else if (b->gen == RAD_GEN_PASS_VCOND) {
+            CHECK_EQ(b->rope_mixed, 1);
+            CHECK_EQ(b->n_mm_rows, (int64_t)2);
+            CHECK_EQ(b->enc_n_patch, (int64_t)8);
+            CHECK_EQ(b->enc_n_seg, 1);
+            CHECK_EQ(b->enc_max_seg, 8);
+        } else if (b->gen == RAD_GEN_PASS_VSTEP) {
+            CHECK_EQ(b->enc_n_patch, (int64_t)0);
+            CHECK_EQ(b->n_tok, (int64_t)(5 + 4 + 100 + 6));
+            const int32_t seg[5] = { 0, 5, 9, 109, 115 };
+            for (int k = 0; k < 5; ++k) {
+                CHECK_EQ(V->seg_cu[k], seg[k]);
+                CHECK_EQ(V->mod_cu[k], seg[k]);
+            }
+            CHECK_EQ(V->lat_cu[1], 6);
+            CHECK_EQ(V->lat_cu[3], 100);
+            CHECK_EQ(V->pos[3 * 115 - 1], (float)(2000 + 114));
+        }
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("ECSSADD"));
+}
+
+/* A first and a last frame at the video's size: one Vencode pass each, the keyframe table pinning
+ * frame 0 and the last frame, and their blocks ahead of the latents. */
+TEST(a_keyframe_pair_is_encoded_and_pins_both_ends) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(2);
+    r->refs.push_back(picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 32));
+    r->refs.push_back(picture(gen::VideoRefMedia::LAST_FRAME, "last_frame", 2, 64, 32));
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+    const int32_t frames = gen::video_shape(f.prog.video_gen, 64, 32, 2).frames;
+
+    int encodes = 0;
+    bool stepped = false;
+    for (int i = 0; i < 12; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        if (b->gen == RAD_GEN_PASS_VENCODE) {
+            CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_KEYFRAME);
+            CHECK_EQ(V->enc_slot, ++encodes);
+        } else if (b->gen == RAD_GEN_PASS_VSTEP) {
+            stepped = true;
+            CHECK_EQ(b->n_tok, (int64_t)(3 + 2 * 2 + 100 + 6));
+            const int32_t seg[6] = { 0, 3, 5, 7, 107, 113 };
+            for (int k = 0; k < 6; ++k) CHECK_EQ(V->seg_cu[k], seg[k]);
+            const int32_t want[8] = { 0, 2, 0, 1, 0, frames - 1, 1, 0 };
+            for (int k = 0; k < 8; ++k) CHECK_EQ(V->ref_tab[k], want[k]);
+        }
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(encodes, 2);
+    CHECK(stepped);
+}
+
+/* References ride a latent upscale, laid out again at the small size for the steps before it; a
+ * keyframe, pinned on the video's own grid, does not. */
+TEST(references_are_laid_out_again_at_an_upscales_small_size) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    with_tower(f, 16);
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(1, 4);
+    r->tokens = { 1, 700, 701, 2, 3 };
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    /* 5 prompt rows, 4 reference rows, 60 soundtrack rows, then a video of 2 rows small, 8 full. */
+    std::string kinds;
+    int steps = 0;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        kinds += b->gen == RAD_GEN_PASS_VENCODE ? 'E' : kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            const int64_t rows = 5 + 4 + 60 + (steps++ < 2 ? 2 : 8);
+            CHECK_EQ(b->n_tok, rows);
+            CHECK_EQ(V->seg_cu[3], 69);
+            CHECK_EQ(V->seg_cu[4], (int32_t)rows);
+            CHECK_EQ(V->pos[3 * rows - 1], (float)(2000 + rows - 1));
+        } else if (b->gen == RAD_GEN_PASS_VUPSCALE) {
+            CHECK_EQ(V->seg_cu[3], 5 + 60 + 8);
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("ECSSUSAD"));
+
+    VideoFixture g;
+    g.build();
+    g.prog.video_gen.upscale_max = 4.0;
+    g.prog.video_gen.upscale_refine = 1;
+    CHECK_OK(g.start_refs());
+    r = g.req(1, 4);
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    r->refs.push_back(picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 64));
+    CHECK_EQ(g.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "latent_upscale"));
+}
+
+/* A reference video with its soundtrack and a standalone soundtrack: one encode pass each, the
+ * soundtrack first and under the video's number, each media padded to the encoder's clips and
+ * hops; the video and its soundtrack are one row of the table. */
+TEST(reference_videos_and_soundtracks_are_encoded_into_the_table) {
+    VideoFixture f;
+    f.build();
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(2, 2);
+    r->refs.push_back(picture(gen::VideoRefMedia::VIDEO, "ref_video_1", 1, 16, 16, 5));
+    r->refs.push_back(sound(gen::VideoRefMedia::VIDEO_AUDIO, "ref_video_audio_1", 1, 1600));
+    r->refs.push_back(sound(gen::VideoRefMedia::AUDIO, "ref_audio_2", 2, 850));
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    std::string passes;
+    std::vector<int32_t> tab;
+    for (int i = 0; i < 3; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        REQUIRE(b != nullptr);
+        const RadVideoGenBatch* V = b->vgen_b;
+        if (b->gen == RAD_GEN_PASS_VENCODE) {
+            passes += "V";
+            CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_VIDEO);
+            CHECK_EQ(V->enc_frames, 17);
+        } else {
+            REQUIRE_EQ(b->gen, (int)RAD_GEN_PASS_AENCODE);
+            passes += V->enc_kind == RAD_ENC_VAUDIO ? "s" : "a";
+            CHECK_EQ(V->enc_slot, V->enc_kind == RAD_ENC_VAUDIO ? 1 : 2);
+            CHECK_EQ(V->enc_n_samples, (int64_t)1600);
+        }
+        tab.assign(V->ref_tab, V->ref_tab + 14);
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(passes, std::string("sVa"));
+    /* The video: 1 x 1 grid, 5 frames to 2 latent frames, a soundtrack of 2 latents; the
+     * standalone soundtrack: 850 samples to 2 latents. */
+    const std::vector<int32_t> want = { 2, 0, RAD_VREF_VIDEO, 1, 1, 1, 2, 2,
+                                        RAD_VREF_AUDIO, 2, 0, 0, 0, 2 };
+    CHECK(tab == want);
+}
+
+/* Media the model cannot condition on are refused at submit, by name. */
+TEST(references_the_model_cannot_take_are_refused) {
+    std::string why;
+    auto refused = [&](VideoFixture& f, std::unique_ptr<gen::VideoRequest> r, const char* what) {
+        why.clear();
+        CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+        CHECK(has(why, what));
+    };
+    VideoFixture plain;
+    plain.build();
+    CHECK_OK(plain.start());
+    auto r = plain.req();
+    r->refs.push_back(picture(gen::VideoRefMedia::VIDEO, "ref_video_1", 1));
+    refused(plain, std::move(r), "conditions on no reference media");
+
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    CHECK_OK(f.start_refs());
+    r = f.req();
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    refused(f, std::move(r), "does not show it");
+    r = f.req();
+    r->tokens = { 1, 2, 3 };
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 3);
+    refused(f, std::move(r), "past the end");
+    r = f.req();
+    r->refs.push_back(picture(gen::VideoRefMedia::VIDEO, "ref_video_4", 4));
+    refused(f, std::move(r), "takes 3");
+    r = f.req();
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1, 24, 16));
+    r->media = picture_media(6, 0);
+    refused(f, std::move(r), "ref_image_1");
+    r = f.req(2);
+    r->refs.push_back(picture(gen::VideoRefMedia::LAST_FRAME, "last_frame", 2));
+    refused(f, std::move(r), "not the video's size");
+
+    VideoFixture g;
+    g.build();
+    CHECK_OK(g.start_refs(false));
+    r = g.req();
+    r->refs.push_back(sound(gen::VideoRefMedia::AUDIO, "ref_audio_1", 1, 800));
+    refused(g, std::move(r), "ref_audio_1");
+
+    VideoFixture h;
+    h.build();
+    with_tower(h, 4);
+    CHECK_OK(h.start_refs());
+    r = h.req();
+    r->tokens = { 1, 700, 701, 2, 3 };
+    r->refs.push_back(picture(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 1);
+    refused(h, std::move(r), "at most 4");
 }
 
 RAD_TEST_MAIN()

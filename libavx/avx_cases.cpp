@@ -97,6 +97,10 @@ std::vector<Case> build_cases() {
                               HS("dtype", dt) });
         add("pool_rows",   { HI("M", 27), HI("n", 645), HI("k", 9), HF("mult", 27.712812921102035),
                              HS("dtype", dt) }, EB(27, 645, w, 1));
+        add("pool_cols",   { HI("M", 27), HI("n", 648), HI("k", 9), HF("mult", 27.712812921102035),
+                             HS("dtype", dt) }, EB(27, 648, w, 1));
+        add("pool_cols",   { HI("M", 40), HI("n", 256), HI("k", 8), HS("dtype", dt) },
+            EB(40, 256, w, 1));
         add("scatter_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("scale_rows",  { HI("M", 6), HI("n", 645), HS("act", "sigmoid"), HS("dtype", dt) },
                            EB(6, 645, w, 2));
@@ -367,6 +371,11 @@ std::vector<Case> build_cases() {
         add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 1), HI("causal", 0),
                             HS("dtype", dt), HF("scale", 0.125), HI("max_seqlen", 24),
                             HI("block", 7) });
+    /* An audio encoder's attention: head_dim 256, no GQA, causal within a window. */
+    for (const char* dt : { "f32", "bf16" })
+        add("attn_dense", { HI("M", 24), HI("head_dim", 256), HI("gqa", 1), HI("causal", 1),
+                            HS("dtype", dt), HF("scale", 0.125), HI("max_seqlen", 24),
+                            HI("window", 8) });
     /* Cross attention: each entry's keys a run of their own, both sides of `causal`. */
     for (const char* dt : { "f32", "bf16" })
         for (int causal : { 0, 1 })
@@ -429,9 +438,8 @@ std::vector<Case> build_cases() {
         add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                           HI("block_size", 16), HS("kv_dtype", "fp8_e4m3"), HF("k_scale", ks),
                           HF("v_scale", 1.0 / ks) });
-    /* The streamed store, on one block and one ring slot (see ref_shapes.cpp: a described map
-     * cannot be an injective permutation, so a multi-block call could draw two blocks one slot).
-     * The resident/mirror-only split is built by hand in avx_check_hand.cpp. */
+    /* The streamed store, on one block and one ring slot (ref_shapes.cpp says why); the resident and
+     * mirror-only split is built by hand in avx_check_hand.cpp. */
     for (double ks : { 1.0, 0.5 })
         add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                                    HI("block_size", 32), HS("kv_dtype", "fp8_e4m3"),
@@ -544,14 +552,10 @@ std::vector<Case> build_cases() {
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
                       HI("work", 3), HS("dtype", "f32") });
-    /* The streamed group's residency map at a decode step's geometry and at the edges a check can
-     * describe: a ring shallower than the id space and deeper than it, one query row, a pitch of
-     * one, and a `block_bytes` that is not a multiple of a vector (a block is a whole number of
-     * 16-byte lanes in practice, but nothing in the schema says so and the copy's tail must still
-     * be right). libref describes the map as every block resident (ref_shapes.cpp), so these cases
-     * exercise the epoch, the hit stamp, the rewrite and the bookkeeping; a miss, an eviction, a
-     * second chance and an overflow need a cold map, which no description draws, and are built by
-     * hand in avx_check_hand.cpp. */
+    /* The residency map at a decode step's geometry and at the edges a description can reach: a ring
+     * shallower and deeper than the id space, one query row, a pitch of one, and a `block_bytes`
+     * that is not a whole vector (the copy's tail). The described map is all-resident, so misses,
+     * evictions, second chances and overflow are built by hand in avx_check_hand.cpp. */
     add("kv_resolve", { HI("M", 4), HI("blocks", 300), HI("slots", 96), HI("sel_pitch", 33),
                         HI("block_bytes", 256) });
     add("kv_resolve", { HI("M", 6), HI("blocks", 64), HI("slots", 128), HI("sel_pitch", 17),
@@ -799,6 +803,8 @@ std::vector<Case> build_cases() {
             add("timestep_embed", { HI("M", 3), HI("n", 256), HF("scale", 1000.0),
                                     HF("max_period", 10000.0), HI("round", round),
                                     HS("dtype", dt) });
+        for (int g : { 5, 1025 })
+            add("timestep_embed", { HI("M", 3), HI("n", 8), HI("curve", g), HS("dtype", dt) });
         add("lane_gather", { HI("M", 24), HI("n", 64), HI("stride", 16), HI("n_seq", 2),
                              HS("dtype", dt) });
         add("lane_store",  { HI("M", 12), HI("n", 64), HI("stride", 16), HS("dtype", dt) });
@@ -918,6 +924,22 @@ std::vector<Case> build_cases() {
     add("grid_pos3", { HI("M", 40), HI("T", 2), HI("H", 3), HI("W", 4), HI("period", 27),
                        HF("scale", 6.283185307179586) });
 
+    /* The tiled encoder over the shape functions' 20 x 20 latent plane: the encoder's tile 16
+     * with its 4 overlap (two tiles an axis), and a 3-overlap-1 split (ten tiles an axis, one of
+     * slack round-robin) that puts a live blend on every interior row and column. crop is drawn
+     * at ratio 1 -- the plane is 20 x 20 pixels, its tiles' sum 30 x 30 either way; join reads
+     * the moments' 30 x 30 rows into the 400-row canvas. */
+    add("vtile_plan", { HI("M", 4), HI("tile", 16), HI("overlap", 4), HI("ratio", 16) });
+    add("vtile_plan", { HI("M", 100), HI("tile", 3), HI("overlap", 1), HI("ratio", 1) });
+    add("vtile_crop", { HI("M", 1024), HI("tile", 16), HI("overlap", 4), HI("ratio", 1),
+                        HS("dtype", "f32") });
+    add("vtile_crop", { HI("M", 900), HI("tile", 3), HI("overlap", 1), HI("ratio", 1),
+                        HS("dtype", "bf16") });
+    add("vtile_join", { HI("M", 400), HI("tile", 16), HI("overlap", 4), HI("n", 48),
+                        HS("dtype", "bf16") });
+    add("vtile_join", { HI("M", 400), HI("tile", 3), HI("overlap", 1), HI("n", 5),
+                        HS("dtype", "f32") });
+
     /* The latent upscaler over libref's cube volumes (c x c x c, the largest M holds; every geom
      * entry c, so the resize is the identity here): the 3-D convolution at odd channel counts,
      * kernels 3 x 3 x 3 and 3 x 1 x 1, with the residual (a separate buffer), and at MiniMax-H3's
@@ -938,6 +960,9 @@ std::vector<Case> build_cases() {
                                 HS("act", act), HS("dtype", dt) });
         add("group_norm", { HI("M", 150), HI("n", 96), HI("groups", 4), HF("eps", 1e-5),
                             HS("act", "silu"), HS("dtype", dt) });
+        /* The video encoder's first level: four channels a group, eps 1e-6. */
+        add("group_norm", { HI("M", 130), HI("n", 128), HI("groups", 32), HF("eps", 1e-6),
+                            HS("act", "silu"), HS("dtype", dt) });
         add("tconv_dw", { HI("M", 27), HI("n", 645), HI("k", 5), HS("dtype", dt) });
         add("tconv_dw", { HI("M", 64), HI("n", 37), HI("k", 3), HS("dtype", dt) });
         add("resize_bilinear", { HI("M", 27), HI("n", 645), HS("dtype", dt) });
@@ -953,6 +978,10 @@ std::vector<Case> build_cases() {
             0, 2.0 * 27 * v.cin * v.cout * 27);
     add("flow_renoise", { HI("M", 9), HI("n", 96), HI("stream", 1), HS("dtype", "f32") });
     add("flow_renoise", { HI("M", 5), HI("n", 645), HI("stream", 7), HS("dtype", "f32") });
+    add("cond_aug", { HI("M", 9), HI("n", 96), HI("stream", 2), HF("aug", 0.999),
+                      HS("dtype", "f32") });
+    add("cond_aug", { HI("M", 5), HI("n", 645), HI("stream", 7), HF("aug", 0.5),
+                      HS("dtype", "f32") });
 
     /* LTX-2: the video's 3-axis rotary (two padded pairs, a rank's second head), the cross
      * attentions' 1-axis one, the per-head gate and the guided step. */
@@ -1029,6 +1058,13 @@ std::vector<Case> build_cases() {
         for (int dil : { 1, 3 })
             add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 7),
                             HI("dil", dil), HI("causal", 1), HS("dtype", dt) });
+        /* The zero-padded strided form, a DAC encoder block's downsample: kernel 2 stride, pad
+         * ceil(stride / 2), one sequence. The form is bf16 only. */
+        if (std::strcmp(dt, "bf16") == 0)
+            for (int s : { 2, 4, 5 })
+                add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 2 * s),
+                                HI("dil", 1), HI("stride", s), HI("pad", (s + 1) / 2),
+                                HS("dtype", dt) });
         /* Strided, causal: Fish Audio's codec encoder downsamples with kernels of two strides
          * (2, 4, 8) and its quantiser with a kernel of one (k 2, stride 2). */
         for (int s : { 2, 4, 8 })
@@ -1264,11 +1300,9 @@ std::vector<Case> build_cases() {
                   (double)M * blocks * 8, 0);
     speed("qsa_select", { HI("M", 2048), HI("blocks", 16384), HI("topk", 512), HI("ratio", 4),
                           HI("seqs", 1) }, 2048.0 * 16384 * 8, 0);
-    /* The residency map at a decode step: an 8K-block id space over a 2048-slot ring (a group at
-     * depth 3 with 256-token blocks), one query row and a four-row verify window, 512 selected
-     * blocks a row. libref describes the map all-resident, so this times the two selection passes,
-     * the compaction of the claim list, the rewrite and the bookkeeping; the block copies are one
-     * per miss, and which blocks miss is a cache state the geometry does not carry. */
+    /* The residency map at a decode step: an 8K-block id space over a 2048-slot ring, one query row
+     * and a four-row verify, 512 blocks a row. All-resident, so this times the selection passes,
+     * the claim compaction, the rewrite and the bookkeeping, not the copies. */
     for (const int64_t M : { 1, 4 })
         speed("kv_resolve", { HI("M", M), HI("blocks", 8192), HI("slots", 2048),
                               HI("sel_pitch", 513), HI("block_bytes", 2048) },

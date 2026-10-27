@@ -1061,17 +1061,10 @@ AVX_KERNEL(kv_store) {
 }
 
 /* ------------------------------------------------------------------ kv_store_streamed */
-/* kv_store for a group whose KV streams: the host mirror is authoritative and the ring is a cache
- * of it. `host` is written ALWAYS, at the block's identity row; `kv_cache[res[block]]` only when
- * the residency map says the block is resident. libref/ref_attn.cpp (ref_kv_store_streamed) states
- * why the residency test belongs in the writer and not in the resolve: at decode the block a step
- * writes is usually already resident, so a mirror-only writer would leave the ring's copy of it
- * short of this step's tokens and the resolve would not re-copy a resident block.
- *
- * The two planes are the same bytes in the same paged layout, so one conversion writes both: the
- * mirror is a view of the same `[block, kv_heads, block_size, 2 * head_dim]` shape whose dtype is
- * the cache's, so the two copies cannot round differently. E4M3 converts as kv_store_fp8 does;
- * bf16 stores the value itself, as kv_store_bf16 does. `res` is read, never written. */
+/* kv_store for a streamed group (libref/ref_attn.cpp, ref_kv_store_streamed): `host` written
+ * always, `kv_cache[res[block]]` only where the block is resident. Both planes are the same paged
+ * layout seen as the cache's dtype, so one conversion writes both: E4M3 as kv_store_fp8, bf16 the
+ * value itself. `res` is read, never written. */
 AVX_KERNEL(kv_store_streamed) {
     if (!rad_args_have(a, 6)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
@@ -1084,16 +1077,14 @@ AVX_KERNEL(kv_store_streamed) {
     if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (sm->dtype != RAD_I32 || res->dtype != RAD_I32) return RAD_E_DTYPE;
     if (host->dtype != RAD_U8) return RAD_E_DTYPE;
-    /* E4M3 (the fp8 QSA family) or bf16 (the default cache dtype); a packed fp8_v4/k6_v4 group has
-     * no streamed row. */
+    /* E4M3 or bf16; a packed fp8_v4/k6_v4 group has no streamed row. */
     const bool fp8 = kv->dtype == RAD_F8E4M3;
     if (!fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
     if (kv->rank != 4 || kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
         kv->shape[3] != 2 * head_dim) return RAD_E_SHAPE;
     if (host->rank != 2) return RAD_E_SHAPE;
 
-    /* One block of one layer: both planes are dense rows of it, so the same offsets address the
-     * same element of the same block in either. */
+    /* Both planes are dense rows of one block of one layer, so one offset addresses both. */
     const int64_t EB = fp8 ? 1 : 2;
     const int64_t row = kv_heads * block_size * 2 * head_dim * EB;
     const int64_t slots = kv->shape[0], blocks = host->shape[0];
@@ -1116,9 +1107,8 @@ AVX_KERNEL(kv_store_streamed) {
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
 
-    /* Refused before the first write, exactly as libref refuses it: a half-written mirror makes
-     * the next step's copies plausible and wrong. (The device row cannot return a host status from
-     * inside its kernel and guards these instead; a legal call never takes either path.) */
+    /* Refused before the first write, as libref refuses it (the device row, which cannot return a
+     * status from its kernel, guards these instead). */
     const int32_t* const R = (const int32_t*)res->data;
     for (int64_t t = 0; t < M; ++t) {
         const int64_t slot = ldi(sm, offlin(sm, t));

@@ -87,9 +87,9 @@ int         avx_par_force(int threads);
     X(scatter_rows)         X(ngram_ids)                                                          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
     X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
-    X(seg_mean)             X(mul_weight)           X(pool_rows)            X(relu)               \
-    X(clamp)                X(conv2d)               X(conv1d_dw)            X(rel_sinusoid)       \
-    X(seg_sinusoid)         X(conv2d_unfold)                                                      \
+    X(seg_mean)             X(mul_weight)           X(pool_rows)            X(pool_cols)          \
+    X(relu)                 X(clamp)                X(conv2d)               X(conv1d_dw)          \
+    X(rel_sinusoid)         X(seg_sinusoid)         X(conv2d_unfold)                              \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
     X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
@@ -125,7 +125,8 @@ int         avx_par_force(int threads);
     X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
-    X(resize_bilinear)      X(patch_fold)           X(flow_renoise)                               \
+    X(resize_bilinear)      X(patch_fold)           X(flow_renoise)         X(flow_res_multistep) \
+    X(cond_aug)             X(vtile_plan)           X(vtile_crop)           X(vtile_join)         \
     /* ---- LTX-2 */                                                                              \
     X(rope_split)           X(head_gate)            X(ltx_guide)            X(pixel_norm)         \
     X(d2s3d)                X(s2d3d)                X(pix_patch)                                  \

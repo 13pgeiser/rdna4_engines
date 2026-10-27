@@ -168,14 +168,11 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         ctx[i] = base;
         /* The context ends at the last committed position, not at the run's end. Attention places
          * row j of a q_len-row run at seqused - q_len + j and reads keys up to there (attn_paged's
-         * contract, libref/ref_attn.cpp). The rows past `last` sit at the last committed position
-         * but are counted as if at base + j, so with the run's whole length the last row -- round
-         * 1, the one row whose output goes on -- would also read the n_spec - acc positions after
-         * it, which the head has not written for this sequence: last step's speculative rounds, or
-         * whatever the block held before it was handed out (another request's K and V, or bytes
-         * the expert slab left on a recalled loan). Ending it there puts the last row where it
-         * is; earlier rows count lower than their positions, but nothing reads their output, and
-         * every row's K and V still store at the slot of its own position. */
+         * contract). With the run's whole length the last row, the only one whose output is used,
+         * would also read the n_spec - acc positions after it, which the head has not written for
+         * this sequence (stale rounds, or another request's K and V). Earlier rows then count
+         * lower than their positions, but nothing reads their output, and every row's K and V
+         * still store at its own position's slot. */
         adv_groups(a, i, k, base, n, last + 1);
         return;
     }

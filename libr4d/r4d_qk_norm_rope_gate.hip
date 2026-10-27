@@ -58,8 +58,8 @@ struct QkKvStore {
   int                   blocks;
 };
 
-/* The cache forms KV selects. The two STREAMED forms are the same store with two destination
- * planes: E4M3 (the fp8 QSA family) and bf16 (the default cache dtype). */
+/* The cache forms KV selects. The two streamed forms are the same store into two planes, E4M3
+ * and bf16. */
 enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4,
        QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6 };
 
@@ -443,17 +443,11 @@ extern "C" int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStream
                                : qk_body<QK_KV_FP8>(args, stream, kvs);
 }
 
-/* The prologue with the STREAMED store folded in: a streamed group's cache is a ring of
- * `n_blocks` slots over a `blocks`-wide block-id space, and its truth is the pinned host mirror.
- * Each token's rotated k and its v go to the mirror's block row ALWAYS and to `kv_cache[res[block]]`
- * only when the residency map calls the block resident (docs/OPS.md "kv_store_streamed"), so this
- * row replaces `qk_norm_rope_gate` + `kv_store_streamed` with one launch a layer and one chain
- * between store, resolve and attention.
- *
- * The bytes are the pair's exactly: `k_out`'s bf16 value is the one the E4M3 conversion reads, and
- * both planes are the same dense rows of the same paged layout, so the folded write and the split
- * write are the same arithmetic. The cache is E4M3 (the fp8 QSA family) or bf16 (the default
- * `--kv-cache-dtype`, where both planes are the value itself, as kv_store_bf16 writes it). */
+/* The prologue with the streamed store folded in (docs/OPS.md "kv_store_streamed"): each token's
+ * rotated k and its v go to the mirror's block row always and to `kv_cache[res[block]]` only where
+ * the block is resident, one launch where qk_norm_rope_gate + kv_store_streamed were two. The bytes
+ * are the pair's: `k_out`'s bf16 value is what the conversion reads, and both planes share one
+ * layout. E4M3, or bf16 storing the values themselves. */
 extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args, RadStream stream) {
   const RadTensor* k   = r4d_opt(args, QK_K);
   const RadTensor* qg  = r4d_opt(args, QK_QGATE);

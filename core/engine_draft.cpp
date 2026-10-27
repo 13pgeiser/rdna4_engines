@@ -30,7 +30,7 @@ int Engine::step_state_init() {
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
-    /* The scheduler's rule for a step that ends its requests reads the same ids (step_next). */
+    /* Scheduler::ends_every_request reads the same ids. */
     sched_.set_eog(eog);
     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
@@ -182,9 +182,8 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
  * history pass and every round, then the final proposal into the slots and their readback.
- * Nothing synchronises here. collect_step waits for the ids alone (their copy is fenced ahead of
- * the passes), and the step loop for the passes after the commit, before finish_serial_drafter
- * reads the slots. */
+ * Nothing synchronises here: collect_step waits for the ids alone, and the step loop for the
+ * passes after the commit, before finish_serial_drafter reads the slots. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -470,9 +469,9 @@ bool Engine::block_drafting() const {
  * The query pass's rows are device rows that the card positions at the committed end (ADV_BLOCK),
  * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
  * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
- * collect_step waits for the sampled ids alone, whose copy is fenced ahead of both passes, so the
- * commit streams the step's tokens while the card runs them; the step loop waits for the passes
- * and the slots' readback (step_end_) before finish_block_drafter reads the slots. */
+ * collect_step waits for the sampled ids alone, so the commit streams the tokens while the card
+ * runs both passes; the step loop waits for them (step_end_) before finish_block_drafter reads the
+ * slots. */
 void Engine::block_shape(int* block, int* steps) {
     *steps = drafter_.depth;
     /* The row count is the drafter's (defaulted and checked by declare_drafter). */

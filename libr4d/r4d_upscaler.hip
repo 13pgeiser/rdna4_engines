@@ -95,7 +95,6 @@ template <int CW> __device__ __forceinline__ void ldcw(const void* p, bool f32, 
     if (f32) ldc<CW>((const float*)p + c, f);
     else     ldc<CW>((const uint16_t*)p + c, f);
 }
-
 // The volume a request runs at: (T, H, W) and its row count, or false for a geometry the operands
 // cannot hold (`rows` rows of the input).
 __device__ __forceinline__ bool volume_of(const int* geom, long long rows, int* T, int* H, int* W,
@@ -175,15 +174,25 @@ __device__ __forceinline__ unsigned short conv_finish(float acc, float bv, unsig
     return t;
 }
 
+/* Floor division by b > 0 of a possibly negative a. */
+__device__ __forceinline__ int idiv_dev(int a, int b) {
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
 /* `vec` (host-checked): y, res and the bias take 16-byte accesses at every eight-column boundary.
  * `xrows` bounds the volume the device geometry may name, `xbytes` is x's extent (at most kOob)
- * and `Mcap` bounds the rows written; `tpad` and `tpre` as above. */
-template <bool C64, bool RES, bool BF32>
+ * and `Mcap` bounds the rows written; `tpad` and `tpre` as above.
+ *
+ * `GEN`, for any stride, `causal`, `down` or reflect (the encoder's forms): a staged voxel is one
+ * of the (T2, H2, W2) output, its base source coordinate the stride less the pad, and with `refl`
+ * a tap is mirrored into the volume (torch's reflect, the volume checked by the launcher). */
+template <bool C64, bool RES, bool BF32, bool GEN>
 __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
     const unsigned short* __restrict__ X, const unsigned short* __restrict__ Wt,
     const void* __restrict__ bias, const unsigned short* R, unsigned short* C,
     const int* __restrict__ geom, unsigned ldx, unsigned ldr, unsigned ldc, int Mcap, int xrows,
-    unsigned xbytes, int cin, int N, unsigned vec, int tpad, int tpre) {
+    unsigned xbytes, int cin, int N, unsigned vec, int st, int sp, int ft, int bk, int pt,
+    int pb, int pl, int pr, int refl, int tpad, int tpre) {
     typedef r4d_u32x4 U4;
     __shared__ __attribute__((aligned(16))) unsigned char s_a[2][kCBM * kCPB];
 
@@ -191,8 +200,17 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
     long long vol;
     if (!volume_of(geom, xrows, &gT, &gH, &gW, &vol)) return;
     const int HW = gH * gW;
-    const long long ovol = vol + (long long)tpre * HW;
-    const int Mv = ovol < (long long)Mcap ? (int)ovol : Mcap;
+    int H2 = gH, W2 = gW;
+    long long Mv64 = vol + (long long)tpre * HW;
+    if constexpr (GEN) {
+        const int T2 = idiv_dev(gT + ft + bk - 3, st) + 1;
+        H2 = idiv_dev(gH + pt + pb - 3, sp) + 1;
+        W2 = idiv_dev(gW + pl + pr - 3, sp) + 1;
+        if (T2 <= 0 || H2 <= 0 || W2 <= 0) return;
+        Mv64 = (long long)T2 * H2 * W2;
+    }
+    const int OHW = H2 * W2;
+    const int Mv = Mv64 < (long long)Mcap ? (int)Mv64 : Mcap;
 
     const uint32_t tid = threadIdx.x, lane = tid & 31u;
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid >> 5);
@@ -213,6 +231,7 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
     if (m0 >= (uint32_t)Mv) return;
 
     // This thread's staged rows and their voxels; a row past the volume sits outside every frame.
+    // The voxel's row, or with GEN its base source coordinate.
     const uint32_t ch = tid % kCCPR;
     int vm[kCSPT], vt[kCSPT], vy[kCSPT], vx[kCSPT];
     uint32_t adst[kCSPT];
@@ -221,15 +240,27 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
         const uint32_t r = tid / kCCPR + kCRS * i;
         const int m = (int)(m0 + r);
         adst[i] = r * kCPB + ch * 16u;
-        vm[i] = m;
-        vt[i] = -4;
-        vy[i] = 0;
-        vx[i] = 0;
-        if (m < Mv) {
-            vt[i] = m / HW;
-            const int rem = m - vt[i] * HW;
-            vy[i] = rem / gW;
-            vx[i] = rem - vy[i] * gW;
+        if constexpr (GEN) {
+            vm[i] = -4;   // frame: fails every tap's bounds
+            vt[i] = 0;    // row
+            vy[i] = 0;    // column
+            if (m < Mv) {
+                const int t = m / OHW, rem = m - t * OHW, yy = rem / W2;
+                vm[i] = t * st - ft;
+                vt[i] = yy * sp - pt;
+                vy[i] = (rem - yy * W2) * sp - pl;
+            }
+        } else {
+            vm[i] = m;
+            vt[i] = -4;
+            vy[i] = 0;
+            vx[i] = 0;
+            if (m < Mv) {
+                vt[i] = m / HW;
+                const int rem = m - vt[i] * HW;
+                vy[i] = rem / gW;
+                vx[i] = rem - vy[i] * gW;
+            }
         }
     }
     // The four neighbours' byte offsets at a tap, kOob outside the volume; with C64 they include
@@ -238,18 +269,38 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
         __builtin_amdgcn_make_buffer_rsrc(const_cast<unsigned short*>(X), 0, (int)xbytes, kBufWord3);
     uint32_t off[kCSPT];
     auto at_tap = [&](int tap) {
-        const int dt = tap / 9 - 1, dy = (tap / 3) % 3 - 1, dx = tap % 3 - 1;
-        const int delta = dt * HW + dy * gW + dx;
+        if constexpr (GEN) {
+            const int dt = tap / 9, dy = (tap / 3) % 3, dx = tap % 3;   // the base has the pads
 #pragma unroll
-        for (uint32_t i = 0; i < kCSPT; ++i) {
-            int ft = vt[i] + dt;
-            if (tpad == 1) ft = min(max(ft, 0), gT - 1);
-            else if (tpad == 2) ft = max(ft - 1 - tpre, 0);
-            const bool ok = tap < kTaps && vt[i] >= 0 && (unsigned)ft < (unsigned)gT &&
-                            (unsigned)(vy[i] + dy) < (unsigned)gH &&
-                            (unsigned)(vx[i] + dx) < (unsigned)gW;
-            const int src = tpad ? (ft * gH + vy[i] + dy) * gW + vx[i] + dx : vm[i] + delta;
-            off[i] = ok ? (uint32_t)src * ldx * 2u + (C64 ? ch * 16u : 0u) : kOob;
+            for (uint32_t i = 0; i < kCSPT; ++i) {
+                int tz = vm[i] + dt;
+                int sy = vt[i] + dy, sx = vy[i] + dx;
+                if (tpad) tz = min(max(tz, 0), gT - 1);
+                if (refl) {   // a mirror with no repeated edge
+                    if (sy < 0) sy = -sy; else if (sy >= gH) sy = 2 * gH - 2 - sy;
+                    if (sx < 0) sx = -sx; else if (sx >= gW) sx = 2 * gW - 2 - sx;
+                }
+                const bool ok = tap < kTaps && (unsigned)tz < (unsigned)gT &&
+                                (unsigned)sy < (unsigned)gH && (unsigned)sx < (unsigned)gW;
+                off[i] = ok
+                    ? (uint32_t)(((long long)tz * gH + sy) * gW + sx) * ldx * 2u +
+                          (C64 ? ch * 16u : 0u)
+                    : kOob;
+            }
+        } else {
+            const int dt = tap / 9 - 1, dy = (tap / 3) % 3 - 1, dx = tap % 3 - 1;
+            const int delta = dt * HW + dy * gW + dx;
+#pragma unroll
+            for (uint32_t i = 0; i < kCSPT; ++i) {
+                int ft = vt[i] + dt;
+                if (tpad == 1) ft = min(max(ft, 0), gT - 1);
+                else if (tpad == 2) ft = max(ft - 1 - tpre, 0);
+                const bool ok = tap < kTaps && vt[i] >= 0 && (unsigned)ft < (unsigned)gT &&
+                                (unsigned)(vy[i] + dy) < (unsigned)gH &&
+                                (unsigned)(vx[i] + dx) < (unsigned)gW;
+                const int src = tpad ? (ft * gH + vy[i] + dy) * gW + vx[i] + dx : vm[i] + delta;
+                off[i] = ok ? (uint32_t)src * ldx * 2u + (C64 ? ch * 16u : 0u) : kOob;
+            }
         }
     };
 
@@ -421,7 +472,7 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
 //   2. final: block g merges group g's parts, 256 strided runs then a fixed tree, and writes
 //      stats[2g] = mean and stats[2g + 1] = rstd = 1 / sqrt(M2 / count + eps), the count the
 //      group's exact M n / groups.
-//   3. apply: a thread an 8-channel chunk, v = (x - mean) rstd w + b, the modulation and SiLU in
+//   3. apply: a thread a CW-channel chunk, v = (x - mean) rstd w + b, the modulation and SiLU in
 //      f32, one rounding.
 //
 // The scratch beyond the 2 groups leading values holds part p of group g at 3 (g kGnParts + p).
@@ -720,6 +771,24 @@ __global__ __launch_bounds__(kT) void flow_renoise_kernel(
     *p = a + bz;
 }
 
+// ---------------------------------------------------------------------------- cond_aug
+// x = a x + oma z, a the aug parameter, oma the f32 of the f64 1 - a, z element k n + c of the
+// (seed, stream) normal stream: a thread a value, each product and the sum one f32 rounding.
+__global__ __launch_bounds__(kT) void cond_aug_kernel(
+    const uint32_t* __restrict__ seed, float* __restrict__ x, float a, float oma,
+    int n, int ldx, long long total, unsigned long long stream) {
+    const long long id = (long long)blockIdx.x * kT + threadIdx.x;
+    if (id >= total) return;
+    const long long k = id / n;
+    const int c = (int)(id % n);
+    const uint64_t sd = (uint64_t)seed[0] | ((uint64_t)seed[1] << 32);
+    const float z = rad_philox_normal_s(sd, stream, (uint64_t)id);
+    float* p = x + k * ldx + c;
+    const float av = a * *p;
+    const float bz = oma * z;
+    *p = av + bz;
+}
+
 inline bool is_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
 inline bool is_f32(const RadTensor* t) { return t && t->dtype == RAD_F32; }
 inline bool is_i32(const RadTensor* t) { return t && t->dtype == RAD_I32; }
@@ -764,6 +833,18 @@ extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
     /* 3 x 3 x 3 only: the tap decode is the kernel's constant. */
     if (r4d_geti_or(a, "k", 3) != 3 || r4d_geti_or(a, "kt", 3) != 3) return R4D_NO(RAD_E_SHAPE);
     if (cin <= 0 || cout <= 0 || (cin & 7)) return R4D_NO(RAD_E_SHAPE);
+    /* The encoder's CausalConv3d forms (GEN above); the pads are k / 2 = 1, or kt - 1 = 2 in
+     * front with `causal`. */
+    const long long sp = r4d_geti_or(a, "stride", 1), st = r4d_geti_or(a, "stride_t", 1);
+    const long long causal = r4d_geti_or(a, "causal", 0), reflect = r4d_geti_or(a, "reflect", 0);
+    const char* pads = r4d_gets(a, "pad");
+    if (pads && std::strcmp(pads, "same") && std::strcmp(pads, "down")) return R4D_NO(RAD_E_SHAPE);
+    const bool down = pads && !std::strcmp(pads, "down");
+    if (sp <= 0 || st <= 0 || sp > (1ll << 30) || st > (1ll << 30) || (causal && causal != 1) ||
+        (reflect && reflect != 1))
+        return R4D_NO(RAD_E_SHAPE);
+    const bool gen = sp != 1 || st != 1 || causal || down || reflect;
+    const int pt = down ? 0 : 1, pl = down ? 0 : 1, pb = 1, pr = 1;
     const long long K = (long long)kTaps * cin;
     if (r4d_numel(w) < cout * K || r4d_numel(b) < cout || r4d_numel(geom) < 3)
         return R4D_NO(RAD_E_SHAPE);
@@ -776,7 +857,11 @@ extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
         else if (std::strcmp(tp, "zero")) return R4D_NO(RAD_E_INVAL);
     }
     const long long tpre = r4d_geti_or(a, "tpre", 0);
-    if (tpre < 0 || tpre > 64 || (tpre && tpad != 2)) return R4D_NO(RAD_E_INVAL);
+    if (tpre < 0 || tpre > 64 || (tpre && tpad != 2) || (causal && tpad))
+        return R4D_NO(RAD_E_INVAL);
+    /* GEN's time pads: `causal` and `tpad` causal pad the front only, `tpre` frames more. */
+    const int ft = causal ? 2 : tpad == 2 ? 2 + (int)tpre : 1;
+    const int bk = causal || tpad == 2 ? 0 : 1;
     long long rx = 0, ldx = 0, ry = 0, rr = 0;
     if (!rows8(x, cin, &rx, &ldx) || !r4d_aligned(r4d_p(w), 16)) return R4D_NO(RAD_E_STRIDE);
     const long long ldy = r4d_rows_pitch(y, cout, &ry);
@@ -801,15 +886,18 @@ extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
                          (!res || ((ldr % 8) == 0 && r4d_aligned(Rp, 16)));
     const dim3 grid((unsigned)((Mcap + kCBM - 1) / kCBM), (unsigned)((cout + kCBN - 1) / kCBN));
     const bool c64 = cin % kCFK == 0, bf32 = is_f32(b);
-#define C3_L(C6, RS, BF)                                                                          \
-    return R4D_EMIT(stream, (conv3d_kernel<C6, RS, BF>), grid, dim3(kCThreads), 0, Xp, Wp, Bp, Rp, \
-                    Cp, (const int*)r4d_p(geom), (unsigned)ldx, (unsigned)ldr, (unsigned)ldy,      \
-                    (int)Mcap, (int)rx, (unsigned)xbytes, (int)cin, (int)cout, vec, tpad,         \
+#define C3_L(G, C6, RS, BF)                                                                       \
+    return R4D_EMIT(stream, (conv3d_kernel<C6, RS, BF, G>), grid, dim3(kCThreads), 0, Xp, Wp,     \
+                    Bp, Rp, Cp, (const int*)r4d_p(geom), (unsigned)ldx, (unsigned)ldr,            \
+                    (unsigned)ldy, (int)Mcap, (int)rx, (unsigned)xbytes, (int)cin, (int)cout,     \
+                    vec, (int)st, (int)sp, ft, bk, pt, pb, pl, pr, (int)reflect, tpad,            \
                     (int)tpre)
-#define C3_RES(C6, BF) do { if (res) C3_L(C6, true, BF); C3_L(C6, false, BF); } while (0)
-#define C3_BF(C6) do { if (bf32) C3_RES(C6, true); C3_RES(C6, false); } while (0)
-    if (c64) C3_BF(true);
-    C3_BF(false);
+#define C3_RES(G, C6, BF) do { if (res) C3_L(G, C6, true, BF); C3_L(G, C6, false, BF); } while (0)
+#define C3_BF(G, C6) do { if (bf32) C3_RES(G, C6, true); C3_RES(G, C6, false); } while (0)
+#define C3_C6(G) do { if (c64) C3_BF(G, true); C3_BF(G, false); } while (0)
+    if (gen) C3_C6(true);
+    C3_C6(false);
+#undef C3_C6
 #undef C3_BF
 #undef C3_RES
 #undef C3_L
@@ -1010,5 +1098,30 @@ extern "C" int r4d_rad_flow_renoise(const RadArgs* a, RadStream stream) {
     const long long total = M * n;
     return R4D_EMIT(stream, flow_renoise_kernel, dim3((unsigned)((total + kT - 1) / kT)), dim3(kT),
                     0, (const float*)r4d_p(sg), (const uint32_t*)r4d_p(seed), (float*)r4d_wp(x),
+                    (int)n, (int)ldx, total, (unsigned long long)sm);
+}
+
+/* ------------------------------------------------------------------ cond_aug */
+enum { CA_SEED = 0, CA_X };
+
+extern "C" int r4d_rad_cond_aug(const RadArgs* a, RadStream stream) {
+    const RadTensor *seed = r4d_opt(a, CA_SEED), *x = r4d_opt(a, CA_X);
+    if (!seed || !x) return R4D_NO(RAD_E_INVAL);
+    if (!is_f32(x) || (seed->dtype != RAD_U32 && seed->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), sm = r4d_geti_or(a, "stream", 0);
+    const double aug = r4d_getf(a, "aug", -1.0);
+    if (n <= 0 || sm < 0 || !(aug >= 0.0 && aug < 1.0) || r4d_numel(seed) < 2)
+        return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0;
+    const long long ldx = r4d_rows_pitch(x, n, &rx);
+    if (ldx < 0 || !r4d_contig(seed)) return R4D_NO(RAD_E_STRIDE);
+    /* Every row of x, as libref's; M is not read. */
+    const long long M = rx;
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const long long total = M * n;
+    const float av = (float)aug, omv = (float)(1.0 - aug);
+    return R4D_EMIT(stream, cond_aug_kernel, dim3((unsigned)((total + kT - 1) / kT)), dim3(kT),
+                    0, (const uint32_t*)r4d_p(seed), (float*)r4d_wp(x), av, omv,
                     (int)n, (int)ldx, total, (unsigned long long)sm);
 }

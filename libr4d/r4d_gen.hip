@@ -261,9 +261,9 @@ __device__ __forceinline__ void st1(float* p, float v) { *p = v; }
 template <typename TY>
 __global__ __launch_bounds__(kT) void timestep_kernel(
     const float* __restrict__ t, TY* __restrict__ y, int h, float scale, float coef,
-    int round, int y_ld) {
+    int round, float clamp_min, int y_ld) {
     const int m = blockIdx.x;
-    const float tv = t[m];
+    const float tv = fmaxf(t[m], clamp_min);
     const float tt = round == 3 ? bfr(scale * bfr(tv)) : round == 2 ? scale * bfr(tv)
                    : round ? scale * bfr(bfr(tv * scale) / scale) : scale * tv;
     for (int i = threadIdx.x; i < h; i += kT) {
@@ -271,6 +271,26 @@ __global__ __launch_bounds__(kT) void timestep_kernel(
         const float arg = tt * f;
         st1(y + (size_t)m * y_ld + i, cosf(arg));
         st1(y + (size_t)m * y_ld + h + i, sinf(arg));
+    }
+}
+
+// The curve form: y[m] is the table [grid, n] f32 at clamp01(max(t[m], clamp_min)) (grid - 1),
+// between the two rows around it.
+template <typename TY>
+__global__ __launch_bounds__(kT) void timestep_curve_kernel(
+    const float* __restrict__ t, const float* __restrict__ table, TY* __restrict__ y,
+    int grid, int n, float clamp_min, int y_ld) {
+    const int m = blockIdx.x;
+    const float tv = fmaxf(t[m], clamp_min);
+    const float pos = fminf(fmaxf(tv, 0.0f), 1.0f) * (float)(grid - 1);
+    float i0f = floorf(pos);
+    if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);   /* as torch clamps it */
+    const float fr = pos - i0f;
+    const int i0 = (int)i0f;
+    for (int i = threadIdx.x; i < n; i += kT) {
+        const float a0 = table[(size_t)i0 * n + i];
+        const float a1 = table[(size_t)(i0 + 1) * n + i];
+        st1(y + (size_t)m * y_ld + i, a0 + fr * (a1 - a0));
     }
 }
 
@@ -1123,30 +1143,48 @@ extern "C" int r4d_rad_chan_stats(const RadArgs* a, RadStream s) {
 }
 
 /* Both rows: a bf16 embedding (timestep_embed_bf16) or an f32 one (timestep_embed_f32, a timestep
- * MLP kept in f32). */
+ * MLP kept in f32); with `curve`, the table form. */
 extern "C" int r4d_rad_timestep_embed(const RadArgs* a, RadStream s) {
     const RadTensor *t = r4d_opt(a, 0), *y = r4d_opt(a, 1);
     if (!t || !y) return R4D_NO(RAD_E_INVAL);
     if (t->dtype != RAD_F32 || !r4d_contig(t) || (!is_bf16(y) && y->dtype != RAD_F32))
         return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
-    if (n <= 0 || (n & 1)) return R4D_NO(RAD_E_SHAPE);
+    const long long grid = r4d_geti_or(a, "curve", 0);
+    if (n <= 0 || (!grid && (n & 1))) return R4D_NO(RAD_E_SHAPE);
     long long ry = 0;
     const long long yl = r4d_rows_pitch(y, n, &ry);
     if (yl < 0) return R4D_NO(RAD_E_STRIDE);
     if (ry <= 0 || r4d_numel(t) < ry) return R4D_NO(RAD_E_SHAPE);
+    if (grid > 0) {
+        const RadTensor* tab = r4d_opt(a, 2);
+        if (!tab) return R4D_NO(RAD_E_INVAL);
+        if (tab->dtype != RAD_F32 || !r4d_contig(tab) || r4d_numel(tab) < grid * n)
+            return R4D_NO(RAD_E_SHAPE);
+        const float clamp = (float)r4d_getf(a, "clamp_min", 0.0);
+        if (y->dtype == RAD_F32)
+            hipLaunchKernelGGL(timestep_curve_kernel<float>, dim3((unsigned)ry), dim3(kT), 0,
+                               (hipStream_t)s, (const float*)t->data, (const float*)tab->data,
+                               (float*)y->data, (int)grid, (int)n, clamp, (int)yl);
+        else
+            hipLaunchKernelGGL(timestep_curve_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
+                               (hipStream_t)s, (const float*)t->data, (const float*)tab->data,
+                               (uint16_t*)y->data, (int)grid, (int)n, clamp, (int)yl);
+        return st_of(hipGetLastError());
+    }
     const float mp = (float)r4d_getf(a, "max_period", 10000.0);
     const float coef = (float)(-std::log((double)mp));
     const float scale = (float)r4d_getf(a, "scale", 1000.0);
     const int round = (int)r4d_geti_or(a, "round", 0);
+    const float clamp = (float)r4d_getf(a, "clamp_min", 0.0);
     if (y->dtype == RAD_F32)
         hipLaunchKernelGGL(timestep_kernel<float>, dim3((unsigned)ry), dim3(kT), 0,
                            (hipStream_t)s, (const float*)t->data, (float*)y->data, (int)(n / 2),
-                           scale, coef, round, (int)yl);
+                           scale, coef, round, clamp, (int)yl);
     else
         hipLaunchKernelGGL(timestep_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
                            (hipStream_t)s, (const float*)t->data, (uint16_t*)y->data, (int)(n / 2),
-                           scale, coef, round, (int)yl);
+                           scale, coef, round, clamp, (int)yl);
     return st_of(hipGetLastError());
 }
 

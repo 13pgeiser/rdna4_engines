@@ -334,13 +334,9 @@ static const RadOperandSpec oKvStoreStreamed[] = { OPD("k"), OPD("v"), OPD("slot
                                                    INOUT("kv_cache"), OPD("res"),
                                                    INOUT("host") };
 
-/* The residency map of a streamed group. Every operand is i32 state or a byte plane, so no dtype
- * parameter: the op is the same code at every cache layout. `kv_cache` is the same RAD_KV operand
- * (docs/OPS.md, `kv_resolve`) the attention and kv_store take, INOUT for the same reason kv_store's
- * is -- only the slots a miss lands in are written. No constraint either: `block_size` is
- * deliberately not a parameter here, because `Builder::find_kv_consumer` binds a KV group to the
- * first unclaimed op after it carrying `block_size`, and that must stay the resolved attention
- * kernel, not the op that only copies its pages. */
+/* The residency map of a streamed group: i32 state and byte planes, so no dtype parameter, and
+ * no `block_size` (libref/ref_kvstream.cpp says why). `kv_cache` is inout: only the slots a miss
+ * lands in are written. */
 static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
                                            P_INT("sel_pitch"), P_INT("block_bytes") };
 static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("res"),
@@ -584,18 +580,22 @@ static const RadParamSpec pRmsMod[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P
                                          P_STR("dtype"), P_F64O("wadd"),
                                          P_INTO("norm_once"), P_STRO("norm") };
 static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
-                                          OPD("cu_seqlens"), INOUT("x"), OUT("z") };
+                                          OPD("cu_seqlens"), INOUT("x"), OUT("z"),
+                                          OPD_O("colmap") };
 static const RadParamSpec pRmsModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                           P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
                                          P_INTO("norm_once"), P_STRO("norm") };
 static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                            OPD("cu_seqlens"), INOUT("x"), OUT("q"), OUT("scale"),
-                                           OUT_O("z") };
+                                           OUT_O("z"), OPD_O("colmap") };
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
+static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
+                                          OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_STR("dtype") };
-static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y"), WGT_O("table") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
 static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
@@ -653,6 +653,17 @@ static const RadParamSpec pVtileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("o
                                              P_INT("keep"), P_INT("blend"), P_INT("period"),
                                              P_STR("mean"), P_STR("std") };
 static const RadOperandSpec oVtileStitch[] = { OPD("x"), OPD("geom"), INOUT("prev"), OUT("y") };
+/* The tiled encoder (avx_video.cpp), as libref declares it: `geom` is the request's
+ * (clip, H, W); plan and crop take it in pixels, join in latent units. */
+static const RadParamSpec pVtilePlan[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio") };
+static const RadOperandSpec oVtilePlan[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileCrop[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oVtileCrop[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileJoin[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                           P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oVtileJoin[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { OUT("y") };
@@ -675,8 +686,9 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
 /* ---- the latent upscaler (avx_video.cpp), as libref declares it; patch_fold takes
  * patch_unfold's parameters and operands ------------------------------------------------------ */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype"), P_STRO("tpad"),
-                                        P_INTO("tpre") };
+                                        P_INT("kt"), P_STR("dtype"), P_INTO("stride"),
+                                        P_INTO("stride_t"), P_INTO("causal"), P_STRO("pad"),
+                                        P_INTO("reflect"), P_STRO("tpad"), P_INTO("tpre") };
 static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
                                           OPD_O("res"), OUT("y") };
 static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
@@ -689,6 +701,9 @@ static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
+static const RadParamSpec pCondAug[] = { P_INT("M"), P_INT("n"), P_INT("stream"), P_F64("aug"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oCondAug[] = { OPD("seed"), INOUT("x") };
 
 /* ---- LTX-2 (avx_ltx.cpp) */
 static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
@@ -739,7 +754,7 @@ static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 /* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad"),
                                         P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
@@ -934,6 +949,9 @@ static const RadOpSchema kSchemas[] = {
   "local attention with a relative-position term and a softcap (Gemma 4's audio)." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "y[r] = the mean of x's rows [r*k, r*k + k), rounded to y's dtype, times mult, rounded again." },
+{ "pool_cols", ARR(pPoolRows), ARR(oUnary),
+  "y[m][c] = the mean of x[m]'s columns [c*k, c*k + k), rounded to y's dtype, times mult, rounded "
+  "again." },
 { "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
   "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
@@ -1199,6 +1217,9 @@ static const RadOpSchema kSchemas[] = {
 { "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
   "x = r x + (1 - r)(x + (1 - t) v), r = sigma_next / sigma, each step one f32 rounding, bit for "
   "bit libref's." },
+{ "flow_res_multistep", ARR(pMnD), ARR(oFlowRM),
+  "d = x + sigma v, then x = r x + hb1 d + hb2 x0 (order 2) or r x + (1 - r) d (order 1), and "
+  "d written back to x0; each product one f32 rounding, bit for bit libref's." },
 { "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
   "patch rows to denormalised voxel rows, f32(f32(x * mul) + add), bit for bit libref's." },
 { "vtile_gather", ARR(pVtileGather), ARR(oVtileGather),
@@ -1206,6 +1227,20 @@ static const RadOpSchema kSchemas[] = {
 { "vtile_stitch", ARR(pVtileStitch), ARR(oVtileStitch),
   "decoded tiles blended into frames, the chunk overlap blended and kept, RGB bytes out; bit for "
   "bit libref's." },
+{ "vtile_plan", ARR(pVtilePlan), ARR(oVtilePlan),
+  "the tiled encoder's plan for one frame of geom = (clip, H, W) pixels: split_tiles_axis over "
+  "the spatial axes in latent units (tile, overlap, pixels per latent ratio), tiles row-major; "
+  "row t of the i32 [M, 22] y is the tile's first pixel (y0, x0), its pixel extent (th, tw) and "
+  "level L's volume (1, th / 2^min(L, 4), tw / 2^min(L, 4)) for L = 0..5; M is the tile count." },
+{ "vtile_crop", ARR(pVtileCrop), ARR(oVtileCrop),
+  "one frame's pixel plane [>= H W, 3] (geom = (clip, H, W) pixels) cut into vtile_plan's tiles: "
+  "y [M, 3] the tiles' pixels tile-major, M the tiles' pixel count (sum of th tw)." },
+{ "vtile_join", ARR(pVtileJoin), ARR(oVtileJoin),
+  "the tiled encoder's per-tile moments (vtile_crop's row layout at latent extent) blended into "
+  "the canvas y [M, n], M = geom's (clip, lat_h, lat_w) lat_h lat_w: a canvas position's tile "
+  "kept range, blended with the tile above and then the tile to the left, both RAW (never "
+  "already blended), the products and sums rounding to x's dtype as the reference's bf16 blends "
+  "do." },
 { "grid_pos3", ARR(pGridPos3), ARR(oGridPos3),
   "a video decoder's rotary positions over its tiles, [3, >= M] at the operand's row pitch, bit "
   "for bit libref's." },
@@ -1218,8 +1253,11 @@ static const RadOpSchema kSchemas[] = {
   "and their `sel` tiles, blocked online softmax; the gated coarse term on the output rounded "
   "to its dtype." },
 { "conv3d_ndhwc", ARR(pConv3d), ARR(oConv3d),
-  "a 3-D convolution over voxel rows, `same` zero padding, PyTorch's [cout, cin, kt, k, k] "
-  "weight, as GEMMs over bands of patch rows; with `res` (possibly y) rd(rd(acc + b) + res)." },
+  "a 3-D convolution over voxel rows, PyTorch's [cout, cin, kt, k, k] weight, as GEMMs over "
+  "bands of patch rows, `same` zero padding by default. `stride` and `stride_t` stride after "
+  "the padding (3x3x3 only), `causal` 1 puts kt - 1 zero frames in front, `pad` `down` pads one "
+  "row and column below and right only, `reflect` 1 mirrors the spatial padding. With `res` "
+  "(possibly y) rd(rd(acc + b) + res)." },
 { "group_norm", ARR(pGroupNorm), ARR(oGroupNorm),
   "a group norm over all rows, its statistics in f64 over fixed row blocks combined in order, "
   "then the optional [scale | shift] row and silu, one rounding; stats[0, 2 groups) the mean "
@@ -1235,6 +1273,9 @@ static const RadOpSchema kSchemas[] = {
 { "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
   "x = f32(f32(1 - s) x) + f32(s z), z the (seed, stream) normal stream at k n + c, bit for bit "
   "libref's." },
+{ "cond_aug", ARR(pCondAug), ARR(oCondAug),
+  "x = f32(f32(a x) + f32(oma z)) with a the `aug` parameter and oma the f32 of the f64 1 - aug, "
+  "z the (seed, stream) normal stream at k n + c, bit for bit libref's." },
 { "rope_split", ARR(pRopeSplit), ARR(oRopeSplit),
   "LTX-2's split rotary over fractional coordinates, libref's arithmetic element by element." },
 { "head_gate", ARR(pHeadGate), ARR(oHeadGate),
@@ -1494,6 +1535,8 @@ SIMPLE("avx_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's ro
        L(seg_mean)),
 SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, L(pool_rows)),
+SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
+       "multiplier", DT_FLOAT, L(pool_cols)),
 SIMPLE("avx_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, L(relu)),
 SIMPLE("avx_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, L(clamp)),
 SIMPLE("avx_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",
@@ -1776,6 +1819,8 @@ SIMPLE("avx_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
        L(rms_mod_quant_fp8)),
 SIMPLE("avx_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, L(flow_x0_step)),
+SIMPLE("avx_flow_res_multistep", "flow_res_multistep", "elem",
+       "a second-order sampler step on the clean estimate", DT_FLOAT, L(flow_res_multistep)),
 SIMPLE("avx_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
        DT_FLOAT, L(patch_unfold)),
 SIMPLE("avx_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",
@@ -1783,6 +1828,12 @@ SIMPLE("avx_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out 
 SIMPLE("avx_vtile_stitch", "vtile_stitch", "elem",
        "decoded tiles blended into frames, the chunk overlap, bytes out", DT_FLOAT,
        L(vtile_stitch)),
+SIMPLE("avx_vtile_plan", "vtile_plan", "elem", "the tiled encoder's per-tile geometry table",
+       DT_ANY, L(vtile_plan)),
+SIMPLE("avx_vtile_crop", "vtile_crop", "elem", "a frame's pixel plane cut into encode tiles",
+       DT_FLOAT, L(vtile_crop)),
+SIMPLE("avx_vtile_join", "vtile_join", "elem",
+       "per-tile encoder moments blended into the latent canvas", DT_FLOAT, L(vtile_join)),
 SIMPLE("avx_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions over its tiles",
        DT_FLOAT, L(grid_pos3)),
 SIMPLE("avx_vsa_select", "vsa_select", "attn",
@@ -1804,6 +1855,8 @@ SIMPLE("avx_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch r
        L(patch_fold)),
 SIMPLE("avx_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma",
        DT_FLOAT, L(flow_renoise)),
+SIMPLE("avx_cond_aug", "cond_aug", "elem", "condition rows blended with fresh noise at a fixed aug",
+       DT_FLOAT, L(cond_aug)),
 SIMPLE("avx_rope_split", "rope_split", "elem", "LTX-2's split rotary over coordinates", DT_FLOAT,
        L(rope_split)),
 SIMPLE("avx_head_gate", "head_gate", "elem", "each head times 2 sigmoid of its logit", DT_FLOAT,

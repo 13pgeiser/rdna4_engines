@@ -100,6 +100,13 @@ int rad_tools_text_prepare(const LoadedPlugins& plugins, int field, const std::s
 using VideoPositionsFn = int64_t (*)(int, const RadVideoGeom*, float*, int64_t);
 VideoPositionsFn rad_tools_video_positions(const LoadedPlugins& plugins);
 
+/* Its rad_arch_video_pack and rad_arch_encode_geom, null when it does not export them. */
+using VideoPackFn = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int32_t*, int32_t*,
+                                int32_t*, float*, int64_t);
+VideoPackFn rad_tools_video_pack(const LoadedPlugins& plugins);
+using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);
+EncodeGeomFn rad_tools_encode_geom(const LoadedPlugins& plugins);
+
 /* Run declare.
  *
  * `also` declares into the same builder after the architecture plugin, which is how the sampler

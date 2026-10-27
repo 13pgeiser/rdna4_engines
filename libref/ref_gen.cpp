@@ -164,14 +164,16 @@ int ref_ln_mod_quant_fp8(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
 /* The checks both forms share: `s` holds [shift | scale] in each of its n_seq rows, `g` a gate
- * row per sequence when `gated`, and every row operand at least `rows` rows. */
+ * row per sequence when `gated`, and every row operand at least `rows` rows. With `mapped`, the
+ * sequences address table rows through the column map, so `s` and `g` may hold fewer rows than
+ * there are sequences; the map's bound is the caller's. */
 static int rms_mod_check(const RadTensor* y, const RadTensor* g, const RadTensor* s,
                          const RadTensor* w, const RadTensor* x, int64_t n, int64_t n_seq,
-                         int64_t rows, bool gated) {
+                         int64_t rows, bool gated, bool mapped) {
     if (rows <= 0 || n_seq <= 0 || rows_of(x, n) < rows || (w && numel(w) < n) ||
-        numel(s) < n_seq * 2 * n)
+        (!mapped && numel(s) < n_seq * 2 * n))
         return RAD_E_SHAPE;
-    if (gated && (rows_of(y, n) < rows || numel(g) < n_seq * n)) return RAD_E_SHAPE;
+    if (gated && (rows_of(y, n) < rows || (!mapped && numel(g) < n_seq * n))) return RAD_E_SHAPE;
     return RAD_OK;
 }
 
@@ -230,11 +232,14 @@ static void rms_mod_row(const RadTensor* y, const RadTensor* g, const RadTensor*
 
 /* A diffusion transformer's adaptive RMS norm with a shift (MiniMax-H3's
  * `norm(h) * (1 + scale) + shift`), the gated residual of the branch before it optionally first;
- * the norm chain rounds to z's dtype. */
+ * the norm chain rounds to z's dtype.
+ *
+ * The optional trailing `colmap` (slot 7, or 9 for the quantising form), one i32 a sequence, maps a
+ * sequence to its row of the modulation table, so sequences that share a cell read one row. */
 int ref_rms_mod(const RadArgs* a, RadStream) {
     if (a->n_t < 7) return RAD_E_INVAL;
     const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = t_in(a, 3);
-    const RadTensor *cu = &a->t[4], *x = &a->t[5], *z = &a->t[6];
+    const RadTensor *cu = &a->t[4], *x = &a->t[5], *z = &a->t[6], *cm = t_in(a, 7);
     const int64_t n = p_int(a, "n", 0);
     const bool gated = p_int(a, "gated", 0) != 0;
     const float eps = p_f32(a, "eps", 1e-6f);
@@ -246,11 +251,14 @@ int ref_rms_mod(const RadArgs* a, RadStream) {
     if (none && t_in(a, 3)) return RAD_E_INVAL;
     if (n <= 0 || (gated && (!y || !g))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(z, n), n_seq = numel(cu) - 1;
-    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated, cm != nullptr));
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> o((size_t)n);
-        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
+        int64_t e = seq_of(cu, n_seq, r);
+        if (cm) e = (int64_t)ldt(cm, e);
+        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
         const int64_t zb = rowoff(z, r, n), zs = laststride(z);
         for (int64_t i = 0; i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
     }
@@ -264,6 +272,7 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
     if (a->n_t < 9) return RAD_E_INVAL;
     const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = t_in(a, 3);
     const RadTensor *cu = &a->t[4], *x = &a->t[5], *q = &a->t[6], *sc = &a->t[7], *z = t_in(a, 8);
+    const RadTensor *cm = t_in(a, 9);
     const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
     const bool gated = p_int(a, "gated", 0) != 0;
     const float eps = p_f32(a, "eps", 1e-6f);
@@ -275,12 +284,15 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
     if (none && t_in(a, 3)) return RAD_E_INVAL;
     if (n <= 0 || grp <= 0 || n % grp || (gated && (!y || !g))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated, cm != nullptr));
     if (numel(sc) < rows * ngrp || (z && rows_of(z, n) < rows)) return RAD_E_SHAPE;
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> o((size_t)n);
-        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, RAD_BF16, o.data(), wadd, once, layer, none);
+        int64_t e = seq_of(cu, n_seq, r);
+        if (cm) e = (int64_t)ldt(cm, e);
+        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, RAD_BF16, o.data(), wadd, once, layer, none);
         const int64_t zb = z ? rowoff(z, r, n) : 0, zs = z ? laststride(z) : 0;
         for (int64_t i = 0; z && i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
         const int64_t qb = rowoff(q, r, n), qs = laststride(q);
@@ -298,7 +310,10 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})], h = n / 2, where
  * f_i = exp(-ln(max_period) * i / h) in f32 and t' = scale * t -- or, with `round` 1, the value
  * diffusers' pipeline hands its transformer: t rounded to bf16 at scale, divided back and rounded
- * again, then scaled: scale * bf16(bf16(t * scale) / scale). */
+ * again, then scaled: scale * bf16(bf16(t * scale) / scale). t is raised to `clamp_min` first.
+ * With `curve` = G > 0 and a `table` [G, n] f32 operand instead, y[m] is the table at
+ * clamp01(max(t[m], clamp_min)) (G - 1), between the two rows around it: a curve-form
+ * checkpoint's embeddings. */
 int ref_timestep_embed(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *t = &a->t[0], *y = &a->t[1];
@@ -306,13 +321,36 @@ int ref_timestep_embed(const RadArgs* a, RadStream) {
     const float scale = p_f32(a, "scale", 1000.0f);
     const double mp = p_f32(a, "max_period", 10000.0f);
     const int round = (int)p_int(a, "round", 0);
-    if (n <= 0 || (n & 1)) return RAD_E_SHAPE;
+    const float clamp = p_f32(a, "clamp_min", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t grid = p_int(a, "curve", 0);
+    if (!grid && (n & 1)) return RAD_E_SHAPE;
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || numel(t) < rows) return RAD_E_SHAPE;
+    if (grid > 0) {
+        const RadTensor* tab = t_in(a, 2);
+        if (!tab) return RAD_E_INVAL;
+        if (tab->dtype != (uint32_t)RAD_F32 || numel(tab) < grid * n) return RAD_E_SHAPE;
+        for (int64_t m = 0; m < rows; ++m) {
+            const float tv = std::fmax(ldt(t, offlin(t, m)), clamp);
+            const float pos = std::fmin(std::fmax(tv, 0.0f), 1.0f) * (float)(grid - 1);
+            float i0f = std::floor(pos);
+            if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);
+            const float fr = pos - i0f;
+            const int64_t i0 = (int64_t)i0f;
+            const int64_t yb = rowoff(y, m, n), ys = laststride(y);
+            for (int64_t i = 0; i < n; ++i) {
+                const float a0 = ldt(tab, offlin(tab, i0 * n + i));
+                const float a1 = ldt(tab, offlin(tab, (i0 + 1) * n + i));
+                stt(y, yb + i * ys, a0 + fr * (a1 - a0));
+            }
+        }
+        return RAD_OK;
+    }
     const int64_t h = n / 2;
     const float coef = (float)(-std::log(mp));
     for (int64_t m = 0; m < rows; ++m) {
-        const float tv = ldt(t, offlin(t, m));
+        const float tv = std::fmax(ldt(t, offlin(t, m)), clamp);
         const float tt = round == 3 ? rbf(scale * rbf(tv)) : round == 2 ? scale * rbf(tv)
                        : round ? scale * rbf(rbf(tv * scale) / scale) : scale * tv;
         const int64_t yb = rowoff(y, m, n), ys = laststride(y);
@@ -527,6 +565,44 @@ int ref_flow_x0_step(const RadArgs* a, RadStream) {
             const float xv = ldt(x, xb + c * xs);
             const float d = xv + st * ldt(v, vb + c * vs);
             stt(x, xb + c * xs, r * xv + omr * d);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ flow_res_multistep */
+/* k-diffusion's res_multistep at eta 0 (DPM-Solver++ 2M) on the clean estimate d = x + sigma v:
+ * x' = r x + hb1 d + hb2 x0, r = sigma_next / sigma and x0 the last step's estimate, which d then
+ * replaces; with `order` < 2, Euler, x' = r x + (1 - r) d. sigma, r, hb1, hb2 and order are one
+ * f32 each, x and x0 f32. */
+int ref_flow_res_multistep(const RadArgs* a, RadStream) {
+    if (!have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *v = &a->t[0], *x0 = &a->t[1], *sg = &a->t[2], *rr = &a->t[3];
+    const RadTensor *hb1 = &a->t[4], *hb2 = &a->t[5], *ord = &a->t[6], *x = &a->t[7];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || rows_of(v, n) < rows || rows_of(x0, n) < rows || numel(sg) < 1 ||
+        numel(rr) < 1 || numel(hb1) < 1 || numel(hb2) < 1 || numel(ord) < 1)
+        return RAD_E_SHAPE;
+    const float sgv = ldt(sg, offlin(sg, 0));
+    const float r = ldt(rr, offlin(rr, 0));
+    const float b1 = ldt(hb1, offlin(hb1, 0));
+    const float b2 = ldt(hb2, offlin(hb2, 0));
+    const bool two = ldt(ord, offlin(ord, 0)) >= 1.5f;
+    const float omr = 1.0f - r;
+    REF_PAR_FOR(rows * n)
+    for (int64_t k = 0; k < rows; ++k) {
+        const int64_t vb = rowoff(v, k, n), vs = laststride(v);
+        const int64_t xb = rowoff(x, k, n), xs = laststride(x);
+        const int64_t ob = rowoff(x0, k, n), os = laststride(x0);
+        for (int64_t c = 0; c < n; ++c) {
+            const float xv = ldt(x, xb + c * xs);
+            const float d = xv + sgv * ldt(v, vb + c * vs);
+            const float nx = two ? r * xv + b1 * d + b2 * ldt(x0, ob + c * os)
+                                 : r * xv + omr * d;
+            stt(x, xb + c * xs, nx);
+            stt(x0, ob + c * os, d);
         }
     }
     return RAD_OK;

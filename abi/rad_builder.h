@@ -188,11 +188,20 @@ typedef struct RadBuildCtx {
      * 0, so an exact declare is unchanged. The engine refuses to start when no resolved kernel
      * takes it, so a plugin that ignores the field is refused rather than silently exact.
      *
-     * Zero-defaulted and in the padding after kv_quant, so no other field moves and a plugin built
-     * against the older struct is unchanged. */
+     * Zero-defaulted and in the padding after kv_quant, so no other field moves. */
     int      attn_prefill_fp8;
 
-    /* ---- appended in ABI 26 (control vectors) */
+    /* ---- appended in ABI 30 (KV streaming) */
+    /* --kv-resident in tokens, 0 when nothing streams: the ring a streamed group carves is this in
+     * whole blocks, raised to the engine's floors and clamped to the context. A plugin states it as
+     * its `kv_resolve`'s ring depth. */
+    int64_t  kv_resident_blocks;
+    /* RadArchProbe::kv_stream_ok. The streamed-only ops (`kv_store_streamed`, its folded form,
+     * `kv_resolve`) are declared only when this is set and kv_resident_blocks asks for a ring;
+     * otherwise rad_op_declared says no and the plugin takes its resident path. */
+    int      kv_stream_ok;
+
+    /* ---- appended in ABI 27 (control vectors) */
     /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
      *
      * The engine loads and validates it once, at bringup, and the plugin only reads it: the
@@ -240,6 +249,17 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      draft_coupling;
+
+    /* ---- appended in ABI 28 (weight prefetch) */
+    /* Nonzero from --weight-prefetch off: the plugin declares none of its weight prefetches, the
+     * reads of a following GEMM's weight beside a collective (arch/common/rad_arch.h
+     * prefetch_beside). An engine that shares its cards with another server sets it: where the
+     * read goes on the second lane, the two servers hold more compute queues than a card has
+     * slots, and the join from the first lane puts a queue switch into every decode step. 0, the
+     * zero-initialised default, prefetches where the plugin does.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      weight_prefetch_off;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -428,6 +448,10 @@ typedef struct RadKVGroupDecl {
 rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name, const RadKVGroupDecl* d);
 /* Valid only after the op that reads this group has been declared. 0 before that. */
 int64_t     rad_kv_block_size(RadBuilder* b, rad_kvgroup g);
+/* Bytes one block of one layer of a paged group occupies: its pool slot's pitch and its host
+ * mirror row's. 0 for a group that is not paged, or before the block size is known. Additive
+ * export. */
+int64_t     rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g);
 
 /* Bind a layer to a group, so the block manager knows how many state instances a sequence owns. */
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g);
@@ -526,8 +550,15 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
  * rank computes whole, an indexer's key cache every rank pools into); the engine moves bytes and
  * cannot know. RADIANCE_DEBUG_TIER_VERIFY checks the claim: each follower hashes what it would
  * have written and the leader compares. Paged groups only, and never a group this rank declared
- * zero. No effect at one rank. Additive export; RAD_ABI_VERSION does not move. */
+ * zero. No effect at one rank, and none on a group that streams, whose host mirror is its tier.
+ * Additive export. */
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g);
+
+/* The group is read over its whole history every decode step (an indexer's block keys), so it
+ * cannot stream. While a sibling group streams, its carve holds every sequence's full context
+ * rather than the split's share, as the sibling's host mirror holds --max-num-seqs sequences.
+ * Additive export. */
+int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g);
 
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
@@ -1206,9 +1237,24 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * pass carries the geometry its latent has at that point: a step before the VUPSCALE pass is at
  * W' x H'. The schedule is the request's own, whatever size each evaluation runs at.
  *
+ * Reference conditioning, for a plugin with the VAE encoders (`max_enc_side`, `max_enc_samples`,
+ * below): before the prompt pass each of a request's reference media and keyframes is encoded,
+ * one a pass, into the lane, where the steps read it. Nothing an encode makes is read back.
+ *
+ *   RAD_GEN_PASS_VENCODE  one picture or video, its frames in `enc_pixels` (RadVideoGenBatch),
+ *                         through the video VAE's encoder.
+ *   RAD_GEN_PASS_AENCODE  one soundtrack, its samples in `enc_samples`, through the audio VAE's
+ *                         encoder.
+ *
+ * `enc_kind` (RAD_ENC_*, rad_runtime.h) and `enc_slot`, the media's 1-based number within its kind,
+ * say where the latents go. The media's shape is the plugin's to accept: rad_arch_encode_geom
+ * (below) refuses what the encoders cannot take, and the step's packed sequence with the encoded
+ * media in it is the plugin's rad_arch_video_pack.
+ *
  * A program declares exactly one of this, the other generators, logits or pooled vectors. */
 enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10,
-       RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12 };
+       RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12,
+       RAD_GEN_PASS_VENCODE = 13, RAD_GEN_PASS_AENCODE = 14 };
 
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
@@ -1326,6 +1372,20 @@ typedef struct RadVideoGenDecl {
      * Null: one decoder. */
     const char*    decoders;
     const int64_t* decoder_max_area;
+
+    /* ---- appended in ABI 31 (MiniMax-H3 reference conditioning, above) */
+    /* The reference media a request may carry: pictures, videos (each with an optional soundtrack
+     * of its own) and standalone soundtracks. 0 for none of a kind; a plugin that declares any
+     * exports rad_arch_video_pack. */
+    int64_t       max_ref_images, max_ref_videos, max_ref_audios;
+    /* What one encode pass carries: a video's frames after rad_arch_encode_geom pads them to whole
+     * clips, a frame's longer side and a soundtrack's samples. `max_enc_side` 0: no video encoder,
+     * `max_enc_samples` 0: no audio encoder. A picture's sides are multiples of `enc_ratio`. */
+    int64_t       max_enc_frames, max_enc_side, max_enc_samples;
+    int32_t       enc_ratio;
+    /* The distinct modulations a step's groups may read (rad_arch_video_pack's `mod`, the highest
+     * cell + 1); a request needing more is refused at submit. 0: no limit. */
+    int32_t       max_mod_cells;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
@@ -1429,6 +1489,12 @@ typedef struct RadArchProbe {
      * then takes them. Zero keeps them off: plain decode measured slower chained, and a plugin
      * that never measured them asks for nothing. */
     int32_t chain_pays;
+    /* ---- appended in ABI 30 (KV streaming) */
+    /* Nonzero when the architecture can stream a KV group between host memory and a VRAM ring: its
+     * attention is sparse and block-addressed and it declares a streamed store and `kv_resolve`.
+     * --kv-resident on an architecture that says 0 is turned off at startup, and nothing streamed
+     * is declared (RadBuildCtx::kv_stream_ok). */
+    int32_t kv_stream_ok;
     /* Nonzero when the plugin applies RadBuildCtx::cvec for this model. --control-vector is
      * refused at startup with the plugin named when this is 0. */
     int32_t control_vector_ok;
@@ -1645,6 +1711,27 @@ typedef struct RadVideoGeom {
 } RadVideoGeom;
 enum { RAD_VPOS_STEP = 1, RAD_VPOS_DECODE = 2 };
 int64_t rad_arch_video_positions(int which, const RadVideoGeom* g, float* pos, int64_t cap);
+
+/* The geometry of an encode pass (RAD_GEN_PASS_VENCODE, RAD_GEN_PASS_AENCODE): the int32s the
+ * driver stages verbatim in RadVideoGenBatch::enc_geom_d for the plugin's kernels. `kind` is the
+ * pass; `in` is {frames or samples, height, width, channels}, 0 where unused. With `out` null it
+ * returns the count, with `out` it fills out[cap]; negative for media the encoders cannot take.
+ * Entry 0 of an Aencode geometry is the samples padded to the encoder's hop, entry 23 of a Vencode
+ * geometry the frames padded to whole clips and entry 24 its latent frames: the driver stages the
+ * media padded to those lengths. A plugin with encoders exports it. Called on any thread. */
+int64_t rad_arch_encode_geom(int32_t kind, const int64_t* in, int32_t* out, int64_t cap);
+
+/* The packed sequence of a step with reference media or keyframes in: `ref_tab` is
+ * RadVideoGenBatch::ref_tab. Returns the sequence's rows, the rows RAD_VPOS_STEP would position, or
+ * a negative status. `seg` receives the segment boundaries (seg[0] = 0, the last the rows) and
+ * `mod` the boundaries of the modulation groups, then the cell each group reads (groups that read
+ * the same modulation share a cell, numbered from 0); `*n_seg` and `*n_mod` are their capacities
+ * in and their counts out, and a null array asks for the count alone. `pos` receives the rotary
+ * positions, f32 [3, rows], when `cap_pos` holds 3 x rows. A plugin that declares reference media
+ * exports it. Called on any thread. */
+int64_t rad_arch_video_pack(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg,
+                            int32_t* n_seg, int32_t* mod, int32_t* n_mod, float* pos,
+                            int64_t cap_pos);
 
 int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx);
 /* Forward declaration; the signature is in rad_runtime.h. */

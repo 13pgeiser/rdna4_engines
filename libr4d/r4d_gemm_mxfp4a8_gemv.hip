@@ -366,16 +366,11 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs* a, RadStream s) {
 // to arrive (an agent-scope counter per group, keyed on the output as the decode row's) takes the
 // group's amax and writes its codes and scales.
 //
-// Why a tile pair a block: one block a 128-column group, each wave running every K partial of one of
-// its sixteen tiles, left the grid at n / 128 blocks, 68 at Qwen's per-rank gate_up on 32 WGPs, so a
-// few WGPs ran a third block while the rest idled, and the fold (97..101 us) lost to the gemv row and
-// gated_quant_fp8 it replaces (78 + 7 us). Splitting K across a group's blocks instead moved an fp32
-// partial of the whole product per split through memory (4.4 MB at eight rows; 106 us). A tile pair
-// a block is the gemv row's own grid and K order; what crosses blocks is the bf16 product and the
-// amaxes, M * n * 2 bytes and n / 16 * M floats: Qwen 78..81 us, TranslateGemma 99 (as before), at
-// TP1 148 against the pair's 152 (r4d_selftest --perfmx). End to end the gain is smaller, since a
-// replayed step overlaps the old fold's idle WGPs with other work: Qwen without speculation x1 / x4 /
-// x8 +1.4 / +1.8 / +1.5 % (three alternating rounds).
+// Why a tile pair a block: a block per 128-column group leaves too few blocks (68 for Qwen's
+// per-rank gate_up on 32 WGPs), and splitting K across a group's blocks moves an fp32 partial of
+// the whole product through memory; both lost to the gemv row plus gated_quant_fp8. A tile pair a
+// block is the gemv row's own grid and K order, and only the bf16 product and the amaxes cross
+// blocks: Qwen 78..81 us against the pair's 85 (r4d_selftest --perfmx), about +1.5 % end to end.
 //
 // Byte-identical to the WMMA form above followed by gated_quant_fp8. Wave v of a tile runs what wave
 // v of that form runs (partial v sums chunks v, v + KW, .. in order), and the partials are added
@@ -511,14 +506,13 @@ void r4d_gemm_mxfp4a8_gated_kernel(
 // (gemm_mxfp4a8_gated_gemv_wide)
 //
 // From 9 rows the GEMM the fold replaces is gemv_wide's (r4d_gemm_mxfp4a8_gemvw_kernel, RT row tiles).
-// This is that kernel over a tile PAIR, gate tile j and up tile n / 16 + j, in place of two adjacent
+// This is that kernel over a tile pair, gate tile j and up tile n / 16 + j, in place of two adjacent
 // tiles (its TN = 2): eight K waves, each loading both tiles' words of its chunks and running one WMMA
-// chain per row tile over each, so a chunk's activation fragments are read once for both halves. The
-// narrow form's sixteen waves (eight a half, each reading the activation for its own tile) would be
-// gemv_wide at TN = 1, which at 25..64 rows took TranslateGemma's gate_up 21504 x 5376 from 111 to 154
-// us at 32 rows and from 150 to 183 at 64 (the comment above r4d_gemm_mxfp4a8_gemvw_kernel). Then the
-// narrow form's epilogue: a thread a (row, column) of the pair, the GeGLU or SwiGLU product rounded to
-// bf16, each row's amax over the tile, and the 128-column group's last block quantising it.
+// chain per row tile over each, so a chunk's activation fragments are read once for both halves.
+// (The narrow form's sixteen waves, eight a half, would be gemv_wide at TN = 1: 20-40 % slower at
+// 32-64 rows on TranslateGemma's gate_up.) Then the narrow form's epilogue: a thread a (row, column)
+// of the pair, the GeGLU or SwiGLU product rounded to bf16, each row's amax over the tile, and the
+// 128-column group's last block quantising it.
 //
 // Byte-identical to gemv_wide followed by gelu_mul and quant_act_fp8 (or gated_quant_fp8). A row's sum
 // in gemv_wide is its row tile's chain alone, the same at every RT and TN; wave v here sums chunks v,

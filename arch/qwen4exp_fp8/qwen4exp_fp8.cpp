@@ -1090,6 +1090,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * paths must give identical text; any difference is a defect. */
             if (m.qsaw.qk) {
                 lay.attn.qsa_sel      = m.qsaw.sel;
+                lay.attn.qsa_nsel     = m.qsaw.nsel;
                 lay.attn.qsa_sequ     = m.qsaw.sequ;
                 lay.attn.qsa_topk     = m.qsacfg.topk;
                 /* The exactness bound, below which prefill issues the cheaper dense attention.
@@ -1357,6 +1358,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.mtp.attn.kv_block = 4;
         if (m.qsaw.qk) {
             m.mtp.attn.qsa_sel      = m.qsaw.sel;
+            m.mtp.attn.qsa_nsel     = m.qsaw.nsel;
             m.mtp.attn.qsa_sequ     = m.qsaw.sequ;
             m.mtp.attn.qsa_topk     = m.qsacfg.topk;
             m.mtp.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
@@ -1692,6 +1694,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * mapped table). */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* The gated attention block declares the streamed store and the resolve
+     * (rad_block_attn_gated_fp8.h). */
+    out->kv_stream_ok = 1;
     out->draft_depth = 0;
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
         out->draft_depth = 3;

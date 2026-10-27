@@ -318,6 +318,8 @@ private:
     /* What this deployment can do (chat, tools, reasoning, grammar, media, logprobs, reasoning
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
     json capabilities() const;
+    /* A video model's capabilities (videos.cpp). */
+    static void video_caps(json& caps, const IVideoGen* gen);
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
 
     /* ------------------------------------------------------------------ dashboard.cpp */

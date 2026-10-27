@@ -205,6 +205,10 @@ public:
     int64_t block_size() const { return block_size_; }
     int64_t checkpoint_interval() const { return interval_; }
     const std::vector<int32_t>& cached_groups() const { return groups_; }
+    /* Whether the host tier can hold this cache's entries. False when a cached group streams: its
+     * rows are addressed by the sequence's block ids, so entries stay in VRAM and are evicted
+     * whole (docs/KV-STREAMING.md §4.1). */
+    bool demotable() const { return demotable_; }
     std::string report() const;
 
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
@@ -461,6 +465,7 @@ private:
     int64_t     block_size_ = 0;
     int64_t     interval_ = 0;
     std::vector<int32_t> groups_;         /* paged groups this cache indexes */
+    bool demotable_ = false;              /* the host tier can hold every group in an entry */
     bool        has_linear_ = false;
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;

@@ -60,6 +60,11 @@ struct SchedMetrics {
      * expert slab (`kv_bytes_carved` in bytes). The smallest over the paged groups, which share
      * one token axis; windowed groups are excluded, since their carve bounds lookback, not fit. */
     int64_t kv_tokens_max = 0;
+    /* KV streaming: the rings' depth over every streamed group, and the resolve's cumulative misses
+     * and bytes copied in from the host mirrors. Zero when nothing streams. */
+    int64_t kv_resident_blocks = 0;
+    int64_t kv_stream_misses = 0;
+    int64_t kv_stream_bytes_in = 0;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. They rise as reusable prefixes are dropped, while
@@ -568,6 +573,46 @@ public:
     virtual int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                         std::shared_ptr<mm::Item>* out, std::string* why) = 0;
 
+    /* A frame the caller decoded, for the vision tower: a keyframe resized to the output canvas,
+     * so the tower sees the same pixels the video VAE is handed. Unsupported where the tower cannot
+     * read host-built frames. */
+    virtual int prepare_frame(const mm::Frame& f, std::shared_ptr<mm::Item>* out,
+                              std::string* why) {
+        (void)f; (void)out;
+        if (why) *why = "this server cannot show a pre-decoded frame to the vision tower";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    /* Media for a video generator's VAE encoders, as mm::Processor::encoder_image and the rest
+     * make them; unsupported without a processor. */
+    virtual int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                              mm::Frame* out, std::string* why) {
+        (void)bytes; (void)n; (void)ratio; (void)max_side; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    virtual int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h,
+                                     bool cover, mm::Frame* out, std::string* why) {
+        (void)bytes; (void)n; (void)w; (void)h; (void)cover; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    virtual int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                              int32_t max_frames, std::vector<mm::Frame>* out, std::string* why) {
+        (void)bytes; (void)n; (void)ratio; (void)max_side; (void)max_frames; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                              std::vector<float>* out, std::string* why) {
+        (void)bytes; (void)n; (void)rate; (void)max_samples; (void)out;
+        if (why) *why = "this server prepares no reference media for an audio encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* Audio in two halves, for a route that cuts a long recording into clips itself
      * (/v1/audio/transcriptions): the file decoded to mono samples at audio_rate(), at most
      * `max_samples` of them (RAD_E_INVAL past that, never a silent cut), and a clip of at most
@@ -722,9 +767,16 @@ struct VideoGenInfo {
     int64_t sample_rate = 0, channels = 0;
     int64_t default_steps = 0, max_steps = 0, max_lanes = 1;
     bool    fixed_steps = false;   /* a trained schedule: max_steps grid points and no other */
+    /* The schedule shifts a request that names none runs (RadVideoGenDecl). */
+    double  shift_video = 0.0, shift_audio = 0.0;
     /* A latent upscaler: the largest factor (0: none) and the full-size evaluations by default. */
     double  upscale_max = 0.0;
     int64_t upscale_refine = 0;
+    /* Reference conditioning (RadVideoGenDecl): the reference pictures, videos and soundtracks a
+     * request may carry (a video's own soundtrack counts with the video), and the encoders' bounds
+     * the server fits media to; `max_enc_side` 0 means no video encoder, so no keyframes either. */
+    int64_t max_ref_images = 0, max_ref_videos = 0, max_ref_audios = 0;
+    int64_t max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0, enc_ratio = 0;
     /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
     bool    step_evals = false;
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the

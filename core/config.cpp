@@ -60,6 +60,9 @@ static const Flag g_flags[] = {
                                         "attention splits over the ranks: rows gives each rank all\n"
                                         "heads of its rows, a faster prefill for the projections at\n"
                                         "full width on every card; not bit-identical to heads" },
+    { "--weight-prefetch",    "MODE",   "on (default) | off -- read a GEMM's weight into the cache\n"
+                                        "beside the collective before it; off for an engine that\n"
+                                        "shares its cards with another server" },
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
@@ -85,6 +88,11 @@ static const Flag g_flags[] = {
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
+    { "--kv-resident",        "N",      "stream the sparse attention group's KV from host memory,\n"
+    "                                    keeping N tokens of it in a VRAM ring (0, the default, is\n"
+    "                                    off). Raised to 32768 and to what one decode step selects;\n"
+    "                                    a ring that covers the context (sequences x\n"
+    "                                    --max-model-len) streams nothing" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
@@ -109,7 +117,8 @@ static const Flag g_flags[] = {
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
-    "                                    recently used entries. 0 is off" },
+    "                                    recently used entries. 0 is off. Off while a KV group\n"
+    "                                    streams (--kv-resident)" },
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
@@ -461,6 +470,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "rows"))  c->tp_attn_rows = 1;
             else { RAD_ERR("--tp-attn-split takes heads or rows, not '%s'", v); return RAD_E_INVAL; }
         }
+        else if (S("--weight-prefetch")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->weight_prefetch = true;
+            else if (!std::strcmp(v, "off")) c->weight_prefetch = false;
+            else { RAD_ERR("--weight-prefetch takes on or off, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--p2p")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "auto")) c->p2p = RAD_P2P_AUTO;
@@ -531,6 +546,7 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
         else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
             const bool emb = S("--embedding-placement");
@@ -1073,6 +1089,7 @@ const ShowRow kShow[] = {
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
     { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },
+    { "--weight-prefetch",    [](const Config& c) { return onoff(c.weight_prefetch); } },
     { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
     { "--p2p",                [](const Config& c) {
           return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
@@ -1091,6 +1108,8 @@ const ShowRow kShow[] = {
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
+    { "--kv-resident",        [](const Config& c) {
+          return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off)"); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },

@@ -189,5 +189,16 @@ int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, b
 /* The f32 positions (0, s h, s w, l) of an h x w grid: [4, h * w] component-major. */
 void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total);
 
+/* A prompt's pictures for the vision tower of a conditioning pass (RadBatch::enc_*, mm_rows), the
+ * image and the video drivers': every item's patches in prompt order at `patch_dim` bf16 each, their
+ * coordinates [4, patches], the segment boundaries and the prompt rows the tower's output
+ * replaces. */
+struct StagedMedia {
+    int64_t n_patch = 0, n_seg = 0, n_rows = 0;
+    int32_t max_seg = 0;
+};
+StagedMedia stage_media(const mm::PromptMedia& pm, int64_t patch_dim, uint16_t* pixels,
+                        int32_t* coords, int32_t* cu, int32_t* rows);
+
 }  /* namespace gen */
 }  /* namespace rad */

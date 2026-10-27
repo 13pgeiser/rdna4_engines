@@ -238,26 +238,40 @@ AVX_KERNEL(conv1d) {
     if (!Y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
-    const int64_t st = p_int(a, "stride", 1), cd = p_int(a, "cu_div", 1);
+    const int64_t st = p_int(a, "stride", 1), ep = p_int(a, "pad", -1), cd = p_int(a, "cu_div", 1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
-    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) ||
-        cd < 1)
+    /* A stride takes one of two forms: causal (bounds in cu_div units, each sequence a multiple of
+     * the stride) or, with `pad`, PyTorch's zero-padded one (bf16, one sequence, cu_div 1). */
+    const bool padded = ep >= 0 && st > 1;
+    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) || dil <= 0 ||
+        causal < 0 || causal > 1 || st < 1 || (ep >= 0 && (st <= 1 || causal || cd != 1)) ||
+        (st > 1 && ep < 0 && (!causal || dil * (k - 1) + 1 < st)) || cd < 1)
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
-    for (int64_t e = 0; e <= n_seq; ++e)
+    const int64_t cdv = padded ? 1 : cd;
+    for (int64_t e = 0; !padded && e <= n_seq; ++e)
         if (cu_at(cu, e) % (cd * st)) return RAD_E_SHAPE;
-    /* r0, r1: the output rows, the input's over the stride. */
-    const int64_t r0 = cu_at(cu, 0) / (cd * st), r1 = cu_at(cu, n_seq) / (cd * st);
-    if (r0 < 0 || r1 <= r0 || rows_of(Y, cout) < r1 || rows_of(X, cin) < r1 * st)
-        return RAD_E_SHAPE;
+    const int64_t x0 = cu_at(cu, 0) / cdv, x1 = cu_at(cu, n_seq) / cdv;
+    if (x0 < 0 || x1 <= x0 || rows_of(X, cin) < x1) return RAD_E_SHAPE;
     if (numel(W) < cout * cin * k || (B && numel(B) < cout)) return RAD_E_SHAPE;
+    /* r0, r1: the output rows. A causal stride takes each sequence of L rows to L / stride; the
+     * padded form has PyTorch's (L + 2 pad - dil (k - 1) - 1) / stride + 1, y exactly that many. */
+    int64_t r0 = x0 / st, r1 = x1 / st;
+    if (padded) {
+        if (X->dtype != RAD_BF16) return RAD_E_DTYPE;
+        if (n_seq != 1 || x0 != 0 || x1 != rows_of(X, cin)) return RAD_E_SHAPE;
+        r0 = 0;
+        r1 = (x1 + 2 * ep - dil * (k - 1) - 1) / st + 1;
+    }
+    if (r0 >= r1) return RAD_E_SHAPE;
+    if (padded ? rows_of(Y, cout) != r1 : rows_of(Y, cout) < r1) return RAD_E_SHAPE;
     if (res && rows_of(res, cout) < r1) return RAD_E_SHAPE;
-    const int64_t pad = causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2, KK = k * cin;
+    const int64_t pad = padded ? ep : (causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2),
+                  KK = k * cin;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
     static thread_local std::vector<float> ybuf;
 
@@ -272,7 +286,8 @@ AVX_KERNEL(conv1d) {
     const bool b16 = X->dtype == RAD_BF16 && laststride(X) == 1;
     const uint32_t adt = b16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32;
     const size_t ael = b16 ? 2 : 4;
-    /* A 1-wide kernel's patch row is x's own row. */
+    /* A 1-wide kernel's patch row is x's own row; a strided op reads rows `stride` apart, so it
+     * always builds patches. */
     const bool direct = k == 1 && st == 1 && X->rank == 2 && X->shape[1] == cin &&
                         X->stride[1] == 1 && (X->dtype == RAD_BF16 || X->dtype == RAD_F32);
     const int64_t band = band_rows(KK, cout, r1 - r0);
@@ -291,8 +306,8 @@ AVX_KERNEL(conv1d) {
             pt = mat_view(pp, adt, nb, KK);
             AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
             for (int64_t p = 0; p < nb; ++p) {
-                const int64_t r = b0 + p, e = seq_of(cu, n_seq, r * st * cd);
-                const int64_t s0 = cu_at(cu, e) / cd, s1 = cu_at(cu, e + 1) / cd;
+                const int64_t r = b0 + p, e = seq_of(cu, n_seq, r * st * cdv);
+                const int64_t s0 = cu_at(cu, e) / cdv, s1 = cu_at(cu, e + 1) / cdv;
                 for (int64_t t = 0; t < k; ++t) {
                     const int64_t ir = r * st + t * dil - pad;
                     patch_slot(X, ir, cin, ir >= s0 && ir < s1, b16,

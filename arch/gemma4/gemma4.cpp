@@ -141,33 +141,6 @@ struct Kind {
     int64_t kv_dim() const { return nkv * hd; }
 };
 
-/* ---- the GPTQ calibration tap (rad_arch.h's calib_*): the Gram of one bf16 linear's input,
- * summed over a corpus in a PERSIST [K, K] f32 buffer. Declared only with RADIANCE_CALIB_DIR set,
- * for the dense layers RADIANCE_G4_CALIB_LAYERS names ("lo:hi", default every layer): the 31B's
- * four taps a layer are ~364 MiB a rank at --tp 4, so its 60 layers do not fit beside the bf16
- * weights and a calibration runs in slices of layers, the corpus pushed through once per slice. */
-struct G4Tap {
-    rad_buf h = 0;
-    rad_op  op = 0;
-    int64_t K = 0;
-
-    int declare(RadBuilder* b, Names& nm, int64_t max_tok, const char* name, rad_buf a, int64_t k) {
-        K = k;
-        h = decl_b(b, nm.f("%s.gram", name), RAD_F32, { k, k }, RAD_BUF_PERSIST);
-        if (!h) return RAD_E_INVAL;
-        op = rw(b, RAD_OP(b, "gram_accum",
-                    RAD_PARAMS(RAD_RANGE("M", 1, max_tok), RAD_INT("n", k),
-                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
-                    RAD_NOWEIGHTS),
-                { a, h }, { h });
-        return op ? RAD_OK : RAD_E_INVAL;
-    }
-    /* gram_accum takes a, a_scale?, h: no scale for a bf16 input. */
-    void step(RadCtx* c, rad_buf a, int64_t T, bool live) const {
-        if (op && live) RAD_ISSUE_N(c, op, T, brows(a, T), RAD_NONE, brows(h, K));
-    }
-};
-
 struct Layer {
     int full = 0;
     /* attention */
@@ -217,7 +190,7 @@ struct Layer {
     /* Calibration: the attention's input (q, k and v share it), its output (this rank's columns,
      * o_proj's input), the dense arm's input and its gated product (this rank's columns, down's
      * input). */
-    G4Tap tap_in{}, tap_o{}, tap_gu{}, tap_dn{};
+    CalibTap tap_in{}, tap_o{}, tap_gu{}, tap_dn{};
 };
 
 struct Model {
@@ -1269,20 +1242,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (calib_dir()) {
         m.overlap = false;
         m.arms = false;
-        m.calib_lo = 0;
-        m.calib_hi = (int64_t)m.layers.size();
-        if (const char* s = std::getenv("RADIANCE_G4_CALIB_LAYERS")) {
-            long long lo = 0, hi = 0;
-            int used = 0;
-            if (std::sscanf(s, "%lld:%lld%n", &lo, &hi, &used) != 2 || s[used] != '\0' || lo < 0 ||
-                hi > (long long)m.layers.size() || lo >= hi) {
-                fprintf(stderr, "radiance: gemma4: RADIANCE_G4_CALIB_LAYERS '%s' is not lo:hi within "
-                                "0:%zu\n", s, m.layers.size());
-                return RAD_E_INVAL;
-            }
-            m.calib_lo = lo;
-            m.calib_hi = hi;
-        }
+        RAD_ARCH_TRY(calib_layers("gemma4", "RADIANCE_G4_CALIB_LAYERS", (int64_t)m.layers.size(),
+                                  &m.calib_lo, &m.calib_hi));
         for (int64_t l = m.calib_lo; l < m.calib_hi; ++l) {
             Layer& y = m.layers[(size_t)l];
             const Kind& k = y.full ? m.kf : m.ks;

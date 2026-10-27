@@ -19,9 +19,8 @@ with the int4 codes chosen by GPTQ against the bf16 model's own activations.
    its block (`.part`), which libquant places on the diagonal.
 2. **The convert.** `CALIB=DIR rad-convert` with the recipe: libquant's `gptq` on the trunk's four
    linears, everything else as the -df2 recipe makes it. libquant factors each Hessian through
-   OpenBLAS's LAPACK where the build finds OpenBLAS (the container image does once libopenblas-dev
-   is in its build stage, a separate change); without it, libquant's own single-threaded loops take
-   hours for each 21504-wide down projection.
+   OpenBLAS's LAPACK where the build finds OpenBLAS (the Docker image has it); without it,
+   libquant's own single-threaded loops take hours for each 21504-wide down projection.
 
 The w4a8 container's own plugin cannot record them: its linears read int8 activations, which
 `gram_accum` does not take, and a quantised container's activations would come through its
@@ -43,7 +42,7 @@ and the other 2.47M tokens (4,252 conversations) is the calibration corpus.
 | reasoning | 417K | 285 | rStar-Coder (CC-BY-4.0) prompts, the 31B's replies |
 
 The held-out tenth (305K tokens) is never fitted to; 44.5K tokens of it are the KL mode's corpus
-below. BetterBench's corpora, on which the stall was found and is measured, are in neither.
+below. BetterBench's corpora, on which the stall is measured, are in neither.
 
 ## Running it
 
@@ -141,7 +140,7 @@ on BetterBench's 7 multi-turn conversations is the same: first turns 159.6 tok/s
 thinking off, the two containers served at once and the card pairs swapped for a second run (both
 runs given):
 
-| | main's container | this one |
+| | RTN | GPTQ |
 |---|---|---|
 | multi-turn: the right tool | 15/18, 15/18 | **18/18, 18/18** |
 | multi-turn: a turn after the tool's result | 16/21, 17/21 | **18/18, 18/18** |

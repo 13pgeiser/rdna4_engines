@@ -106,11 +106,9 @@ struct PleLayer {
     rad_op  op_gate = 0, op_conv = 0, op_add = 0;
 
     int64_t hn() const { return c.hc * g.n_embd; }
-    /* The read-ahead queue's depth, in steps: the scheduler stages this many steps of the
-     * following prompt per step (batch.cpp, k_ahead_chunks) and the gather hands them to the
-     * reader thread, which prefetches their rows off the step path while the current chunk runs.
-     * Clamped to what `b_ids` was declared to hold, so a scheduler that offers more degrades the
-     * queue's depth, never an overflow. */
+    /* The read-ahead queue's depth in steps: batch.cpp's k_ahead_chunks steps of the following
+     * prompt, whose rows the gather's reader thread prefetches. Clamped to what `b_ids` holds, so
+     * a larger offer only shortens the queue. */
     static constexpr int64_t kAheadChunks = 8;
     /* The prompt that follows the step, bounded by what `b_ids` holds after the step's rows. */
     int64_t ahead_rows(const RadBatch* batch) const {
@@ -283,9 +281,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
      * follows declared order, where the two ops are adjacent, so a transient could be overwritten
      * in between. */
     {
-        /* The step's rows, then the read-ahead queue's: up to kAheadChunks further steps of the
-         * following prompt (RadBatch::n_ahead), which the gather's reader prefetches while the
-         * step runs, so a prefill's table rows are read at disk speed off the step path. */
+        /* The step's rows, then kAheadChunks further steps of the following prompt
+         * (RadBatch::n_ahead) for the reader to prefetch. */
         RadBufDecl d{};
         d.dtype = RAD_I32; d.rank = 2;
         d.shape[0] = (1 + kAheadChunks) * g.max_tok; d.shape[1] = c.heads;

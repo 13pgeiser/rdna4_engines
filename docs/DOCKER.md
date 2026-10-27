@@ -189,3 +189,8 @@ Every model listens on the same port and most take both cards (`flashnext-tp1.ya
 `ornith-1.5-122b*.yaml` files four, `glm53-flash.yaml` eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
 the dashboard page answer without the API key, and the health check fetches `/health` with
 busybox's `wget`.
+
+A container serving MiniMax-H3 also serves ComfyUI's Radiance MiniMax node
+(`integrations/comfyui/ComfyUI-Radiance-MiniMax`), a client of `/v1/videos`. With
+`--lora-dir /models/loras/h3` in the command, the node's adapter lists show the files under
+`$RADIANCE_MODELS/loras/h3`.

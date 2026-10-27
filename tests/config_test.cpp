@@ -422,13 +422,14 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
-        { "--tp-attn-split", { "rows" } },
+        { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
@@ -656,6 +657,19 @@ TEST(the_attention_split_is_one_of_two_names) {
     CHECK_EQ(parse({ "--tp-attn-split", "ROWS" }, &c), RAD_E_INVAL);
 }
 
+/* The weight reads beside the collectives are on unless a deployment turns them off; anything but
+ * the two names stops the server. */
+TEST(weight_prefetch_is_on_or_off) {
+    Config c;
+    CHECK(c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "off" }, &c), RAD_OK);
+    CHECK(!c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "on" }, &c), RAD_OK);
+    CHECK(c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--weight-prefetch", "" }, &c), RAD_E_INVAL);
+}
+
 /* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
  * names stops the server. */
 TEST(the_attention_fp8_mode_is_one_of_four_names) {
@@ -724,6 +738,22 @@ TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+}
+
+/* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
+ * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
+ * passes it is refused by name rather than silently served without streaming. */
+TEST(kv_resident_is_the_whole_switch_and_its_ring_is_whole_tokens) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.kv_resident, 0ll);              /* nothing streams */
+    CHECK(!d.kv_streams);                      /* derived: no group streams either */
+    Config c;
+    CHECK_EQ(parse({ "--kv-resident", "262144" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 262144ll);
+    CHECK_EQ(parse({ "--kv-resident", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 0ll);
+    CHECK_EQ(parse({ "--kv-resident", "-1" }, &c), RAD_E_INVAL);
 }
 
 /* The embedding takes ram (default) or vram; the n-gram table takes auto (default), vram, ram or

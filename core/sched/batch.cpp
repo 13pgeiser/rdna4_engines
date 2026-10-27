@@ -4,6 +4,7 @@
 #include "mm/processor.h"
 #include "derive.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 
 #include <algorithm>
 #include <cassert>
@@ -12,11 +13,9 @@
 
 namespace rad {
 
-/* How many steps of the following prompt the PLE read-ahead queue stages (RadBatch::n_ahead):
- * the arch's reader thread drains the queue at disk speed, off the step path, so a prefill
- * chunk's table rows are already cached when its gather runs. Keep in step with rad_block_ple.h
- * (kAheadChunks), which clamps to the buffer it declared; a mismatch degrades to a smaller queue,
- * never an overflow. */
+/* Steps of the following prompt a prefill batch carries for the PLE read-ahead queue
+ * (RadBatch::n_ahead), whose rows the arch's reader thread prefetches off the step path. Keep in
+ * step with rad_block_ple.h's kAheadChunks, which clamps to the buffer it declared. */
 static constexpr int64_t k_ahead_chunks = 8;
 
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
@@ -104,9 +103,7 @@ void BatchBuilder::carve(Set& s, char* h) {
         *ph = ::rad::carve<int32_t>(h, oh, n);
         *pd = ::rad::carve<int32_t>(d, od, n);
     };
-    /* The step's tokens, then the PLE read-ahead queue -- k_ahead_chunks steps of the following
-     * prompt (RadBatch::n_ahead), which the arch's reader thread prefetches off the step path
-     * (rad_block_ple.h, which clamps to the same count). */
+    /* The step's tokens, then k_ahead_chunks steps of the following prompt (RadBatch::n_ahead). */
     pair(&s.h_tok,    &s.d_tok,    (1 + k_ahead_chunks) * T);
     pair(&s.h_pos,    &s.d_pos,    T);
     pair(&s.h_parent, &s.d_parent, T);
@@ -241,6 +238,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
 
     for (Out& o : out_) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
+        o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
     }
     pitch_.assign(s.groups.size(), 1);
@@ -829,6 +827,8 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
+        /* Each rank's own view of the group's ring and mirror (kvstream_step_view). */
+        const RadKVStream* sv = kv.stream_view((int32_t)gi);
         for (size_t r = 0; r < ranks_.size(); ++r) {
             void* base = s.dev[r];
             RadKVGroupBatch& b = o.kv[r][gi];
@@ -841,6 +841,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
             b.max_blocks = pitch;
+            b.stream = kvstream_step_view(&o.stream[r][gi],
+                                          ranks_[r].kv_streams ? ranks_[r].kv_streams[gi] : sv,
+                                          ranks_[r].kv_streams != nullptr,
+                                          ranks_[0].kv_base, ranks_[r].kv_base);
 
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }
@@ -1052,10 +1056,10 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
-    /* Up to the read-ahead queue's worth of the last sequence's following tokens, after this
-     * step's own (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk,
-     * bounded by the tokens the request has; like token_at, a re-prefill after preemption
-     * continues into its own output. The arch clamps to the rows it declared. */
+    /* Up to k_ahead_chunks steps of the last sequence's following tokens, after this step's own
+     * (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk, bounded by the
+     * tokens the request has; like token_at, a re-prefill after preemption continues into its own
+     * output. The arch clamps to the rows it declared. */
     int64_t n_ahead = 0;
     if (n_seq > 0 && plan.draft_pass == 0 && plan.tok_shift == 0) {
         const StepEntry& e = plan.e[(size_t)(n_seq - 1)];

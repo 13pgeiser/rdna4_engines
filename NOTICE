@@ -16,8 +16,10 @@ Written by Deadcode, with contributions from:
   pass for up to 80 routed rows, --prefill-span, the towers' lookup tables counted once, and for
   Gemma 4 its assistant head as a drafter that reads the trunk's cache, bf16 checkpoints, the fused
   w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume, the
-  Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files, and Gemma 4's E2B/E4B form (KV-shared
-  layers, per-layer embeddings, clipped vision linears) with NVIDIA-Nemotron-3.5-Bolt-E4B
+  Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files, Gemma 4's E2B/E4B form (KV-shared
+  layers, per-layer embeddings, clipped vision linears) with NVIDIA-Nemotron-3.5-Bolt-E4B, its audio
+  encoder, its i8a8 linears and its KV heads replicated over ranks, 4-bit weights at decode heights
+  through w4a16_asym, and the Ornith-1.5-122B compose files
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
   coupling with its cooperative verify (--draft-coupling)
@@ -31,14 +33,17 @@ Written by Deadcode, with contributions from:
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
-  asymmetric GEMMs
+  asymmetric GEMMs, and the int8 tiled GEMMs loading the weight a slab ahead
 - Perire: Gemma 4 26B-A4B with z-lab's DFlash drafter -- its plugin, its kernels in libr4d (the
   windowed paged attention, pair_argmax, the fused sandwich joins and expert_scale) and the host
   emulator that tests them, the prefill split into two slices with their all-reduces beside the
   compute, and the vocabulary-sharded draft head; Gemma 4 31B on four cards (its all-reduces fused
   with the junctions, overlapped with the compute and sent compressed, chained launches with block
-  drafters), the embedding scale rounded as Hugging Face rounds it, and block drafters' drafts
-  accepted on the card
+  drafters), the embedding scale rounded as Hugging Face rounds it, block drafters' drafts
+  accepted on the card, z-lab's DFlash drafter drafting on after a prefix-cache hit and the 31B's
+  GPTQ calibration tap, and for speculation the MTP head's first draft read up to where it sits, no
+  step queued behind one that ends its requests, and a step's tokens streamed before the drafter's
+  passes end
 - redxherring: --model taking a Hugging Face repo id
 - Smellyyyy: the idea behind --prefill-interleave
 - gearwave00001: /v1/messages as Claude Code sends it
@@ -56,7 +61,10 @@ Written by Deadcode, with contributions from:
   decodes them, the MXFP4 GEMM rows for one to 64 rows and the tiled prefill GEMM's TN=4 form, the
   fp8 and int8 heads read once up to 128 rows, the pipelined prefill of one sequence on a second
   lane, Gemma 3's junctions under a lossy wire, the block drafter's short block
-  (--draft-short-from) and the f16 delta-net state cache
+  (--draft-short-from), the f16 delta-net state cache, the two-rank all-reduce checking a peer's push
+  has landed, the MXFP4 decode gate_up folded with its activation and fp8 quantiser, the head-256
+  split-KV decode attention, weight reads beside the decode all-reduces (--weight-prefetch), the
+  head-256 prefill attention's KV split for small launches, and the GUIDE's two engines on one pair
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -67,7 +75,8 @@ Written by Deadcode, with contributions from:
   name the opener opens, GLM-5.3-Flash's vision tower and processor, its decode at a few rows and
   its DSA indexer split over the ranks, a host-tier restore that makes room as pressure does, KV
   groups every rank holds kept once a host slot, the eight-rank two-shot in ring order, the MLA
-  row form (--tp-attn-split rows) and DELETE /sessions
+  row form (--tp-attn-split rows), DELETE /sessions, and the dispatch stamps of a played pass with
+  stampgaps.py
 - John McDonough: GLM-5.3-Flash -- its plugin, its blocks (mHC streams, KDA, the DSA indexer and
   sparse latent attention, f32-scaled FP8 and MXFP4 experts under sigmoid routing) and their
   reference and AVX ops -- a Quark export's block-FP8 layers, the signed QSA ranking, the
@@ -76,13 +85,19 @@ Written by Deadcode, with contributions from:
   the bringup time in /stats, the acceptance tiles' live figures and statsdump's size-capped
   rotation
 - C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
-  projection
+  projection, KV streaming for a context bigger than VRAM (--kv-resident), and the dashboard's
+  request history
 - J-Nova: Unlimited-OCR, and Sage-A1.5 with its vision tower and its DFlash2 drafter
 - thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8)
-- lortht: Krea 2's rebalance of the text taps
+- lortht: Krea 2's rebalance of the text taps and its presets, and MiniMax-H3's modulation rows
 - Quackster: cards with a small PCI BAR, their kernel arguments kept in host memory
 - farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
-- gostar: snapshot-backed prefix KV kept across recomputes
+- gostar: snapshot-backed prefix KV kept across recomputes, and Tencent's Hy-Memory (HYV3) -- its
+  BF16, FP8 and GGUF adapters, its KV scales, and its native sectioned tool calls
+- launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
+  per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch
+- hugypufy: M2XFP4 -- its quantiser, its GEMMs and its linears in the Qwen3.8 trunk and the DFlash2
+  drafter -- and the ParoQuant M2XFP4 import
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

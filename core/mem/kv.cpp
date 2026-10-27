@@ -1,6 +1,9 @@
 /* kv.cpp -- see kv.h. */
 #include "mem/kv.h"
 
+#include "kvstream/carve.h"
+#include "kvstream/plan.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -71,7 +74,7 @@ std::string BundleComparison::report() const {
 
 /* ------------------------------------------------------------------ configure */
 
-static const char* kv_kind_name(int k) {
+const char* kv_kind_name(int k) {
     switch (k) {
         case RAD_KV_FULL:   return "full";
         case RAD_KV_WINDOW: return "window";
@@ -133,6 +136,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
          * other plan-path code has to know the kind. */
         p.kind     = g.decl.kind == RAD_KV_RING ? RAD_KV_WINDOW : g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
+        p.dense_read = g.dense_read;
 
         if (p.n_layers <= 0) {
             RAD_ERR("KV group '%s': no layers are bound to it, so its page size is unknown "
@@ -309,8 +313,10 @@ int64_t KVManager::ceiling(int64_t ctx) const {
         int64_t blocks = max_seqs_ * ((ctx + p.block_size - 1) / p.block_size);
         if (p.kind == RAD_KV_WINDOW && !p.runtime_win && p.window_blocks > 0)
             blocks = std::min(blocks, window_pool_cap(p));
-        need += blocks * p.bytes_per_block;
+        need += kv_ceiling_bytes(p, blocks, stream_.resident_blocks(p));
     }
+    /* The streamed groups' maps come out of this pool too (kvstream/carve.h). */
+    need += kvstream_maps_charged(plans_, stream_, ctx, max_seqs_);
     return need;
 }
 
@@ -415,9 +421,15 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
     /* Zero groups take no part in the split; they get the shared table's block count, which is
      * what the costed groups settle on here or, under the cap, on the ranks holding the cache. */
     std::vector<int32_t> open, zeros;
-    for (const auto& p : plans_)
-        if (p.paged()) (p.zero ? zeros : open).push_back(p.index);
-    /* Every paged group zero: this rank limits nothing, so take the cap, or report unbounded. */
+    bool dense = false;
+    for (const auto& p : plans_) {
+        if (!p.paged()) continue;
+        if (p.zero) zeros.push_back(p.index);
+        else if (kvstream_dense(p, plans_, stream_)) dense = true;   /* its carve is a floor */
+        else if (!stream_.windowed(p.index)) open.push_back(p.index);
+    }
+    kvstream_split_windows(plans_, stream_, max_ctx_, max_seqs_, &remaining, &out);
+    /* Every paged group is zero: this rank limits nothing, so take the cap, or report unbounded. */
     if (open.empty() && !zeros.empty()) {
         const int64_t tokens = tokens_cap_ > 0 ? tokens_cap_ : kUnboundedTokens;
         if (blocks) {
@@ -453,6 +465,9 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
     }
     for (int32_t i : open) out[i] = remaining > 0 ? tokens / plans_[i].block_size : 0;
     for (int32_t i : zeros) out[i] = remaining > 0 ? zero_blocks(plans_[i], tokens) : 0;
+    /* A dense-read group's floor is already charged; with no other open group the pool still pages
+     * one full-length sequence, which is what the report and the admission cap see. */
+    if (dense && open.empty() && remaining > 0) tokens = max_ctx_;
     if (blocks) *blocks = std::move(out);
     return tokens;
 }
@@ -486,8 +501,11 @@ int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
 }
 
 int KVManager::carve_into(Pool& kv_pool) {
-    /* The pool size is the resolver's; this only splits it between the groups. */
-    const int64_t budget_bytes = kv_pool.avail();
+    /* The pool size is the resolver's; this only splits it between the groups. The streamed
+     * groups' maps were reserved from it before the carve and paged_split() charges them, so they
+     * are added back here rather than charged twice. */
+    const int64_t budget_bytes = kv_pool.avail() +
+                                 kvstream_maps_charged(plans_, stream_, max_ctx_, max_seqs_);
     const int64_t fixed        = fixed_;
     pool_base_ = kv_pool.base();
     pool_ = &kv_pool;
@@ -505,11 +523,19 @@ int KVManager::carve_into(Pool& kv_pool) {
         return RAD_E_NOMEM;
     }
 
+    /* ---- the resident windows, before anything is split (kvstream/carve.h) ---- */
+    RAD_TRY(kvstream_window_fit(plans_, stream_, fixed, budget_bytes, max_ctx_, max_seqs_));
+
     /* ---- the paged split; under a cap, the least rank's ---- */
     std::vector<int64_t> blocks;
     (void)paged_split(budget_bytes, &blocks);
     for (auto& p : plans_) if (p.paged()) p.n_blocks = blocks[p.index];
 
+    /* How much of that the pool backs, and the refusal of an unbacked streamed plan. */
+    RAD_TRY(kvstream_apply(plans_, stream_, max_ctx_, max_seqs_));
+
+    /* A streamed group's `n_blocks` is its context, so this asks whether it can address anything,
+     * not whether its window is large enough. */
     for (auto& p : plans_) {
         if (!p.paged()) continue;
         if (p.n_blocks <= 0 && p.zero) {
@@ -531,7 +557,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
     for (auto& p : plans_) {
-        int64_t bytes = p.paged() ? p.n_blocks * p.bytes_per_block
+        int64_t bytes = p.paged() ? kv_pool_bytes(p)
                                   : p.n_states * p.bytes_per_state;
         if (p.zero) {
             p.base = nullptr;
@@ -625,14 +651,16 @@ int KVManager::carve_into(Pool& kv_pool) {
         return p.runtime_win ? "ring" : kv_kind_name(p.kind);
     };
     for (const auto& p : plans_) {
-        if (p.paged())
+        if (p.paged()) {
             report_ += fmt("    %-14s %-6s %3lld layers  block %4lld tok  page %8s  "
                            "%7lld blocks = %9s  (%lld tokens)\n",
                            p.name.c_str(), kind_of(p), (long long)p.n_layers,
                            (long long)p.block_size, humanb(p.bytes_per_block).c_str(),
                            (long long)p.n_blocks, humanb(p.pool_bytes).c_str(),
                            (long long)(p.n_blocks * p.block_size));
-        else
+            if (p.streamed())
+                report_ += kvstream_report_line(p);
+        } else
             report_ += fmt("    %-14s %-6s %3lld layers  state %8s  %7lld slots = %9s\n",
                            p.name.c_str(), kind_of(p), (long long)p.n_layers,
                            humanb(p.bytes_per_state).c_str(),
@@ -758,6 +786,9 @@ int64_t KVManager::total_blocks(int32_t g) const {
 int64_t KVManager::live_blocks(int32_t g) const {
     return (g >= 0 && g < (int32_t)live_.size()) ? live_[(size_t)g] : 0;
 }
+int64_t KVManager::held_top_blocks(int32_t g) const {
+    return (g >= 0 && g < (int32_t)plans_.size()) ? held_top((size_t)g) : 0;
+}
 
 /* The larger of one prefill chunk and the recent shortfall peak (see buffer_bytes in kv.h). */
 int64_t KVManager::buf_blocks(size_t i) const {
@@ -786,8 +817,10 @@ int64_t KVManager::available_blocks(int32_t g) const {
 
 bool KVManager::lendable(int32_t g) const {
     const KVGroupPlan* p = plan(g);
+    /* A streamed group never lends: its pool is the ring, and a lent block would leave fewer
+     * slots than one launch's selection needs. */
     return p && p->kind == RAD_KV_FULL && p->n_blocks > 0 && p->block_size > 0 &&
-           p->bytes_per_block > 0;
+           p->bytes_per_block > 0 && !p->streamed();
 }
 
 int64_t KVManager::lent_blocks(size_t i, int64_t tokens) const {
@@ -905,7 +938,7 @@ int64_t KVManager::pool_bytes(int32_t g) const {
 int64_t KVManager::pool_bytes_carved(int32_t g) const {
     const KVGroupPlan* p = plan(g);
     if (!p) return 0;
-    if (p->paged())    return p->n_blocks * p->bytes_per_block;
+    if (p->paged())    return kv_pool_bytes(*p);
     if (p->stateful()) return p->n_states * p->bytes_per_state;
     return 0;
 }

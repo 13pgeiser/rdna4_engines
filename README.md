@@ -119,8 +119,9 @@ soundtrack from a prompt, 5 to 14 s, up to 1344x768. On two R9700s a 5.17 s clip
 about 68 s with FastH3 and 8.8 minutes at MiniMax-H3's 50 steps; both read about 39 GiB of pinned
 host memory. With LBH-123-AI's latent upscaler in the container, `"latent_upscale": 2` runs the first
 steps at half the size and refines at the full size: MiniMax-H3's clip then takes 3.4 minutes
-(docs/GUIDE.md §5.16). MiniMax-H3's license, which FastH3 carries, does not cover the EU, the UK,
-the Republic of Korea or the USA.
+(docs/GUIDE.md §5.16). A ComfyUI node, `integrations/comfyui/ComfyUI-Radiance-MiniMax`, renders
+through `/v1/videos` from a ComfyUI graph as a client of the server. MiniMax-H3's license, which
+FastH3 carries, does not cover the EU, the UK, the Republic of Korea or the USA.
 
 MiniMax-Music3 and Breeze-TTS-2 answer `/v1/audio/speech`, whole or streamed as they are made: a song
 from lyrics and a description, 44.1 kHz stereo, made at about the speed it plays on two cards; and
@@ -328,6 +329,7 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 | [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
 | [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
+| [`docs/PREPARING_YOUR_RIG.md`](docs/PREPARING_YOUR_RIG.md) | a two-R9700 machine from firmware setup to a serving model |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |
 | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |
 | [`docs/TP3.md`](docs/TP3.md) | any world size: the attention world and uneven delta-net heads; three ranks |

@@ -21,21 +21,17 @@
 
 #include "rad_fp8.h"
 
-#include <cstdlib>
 #include <cstring>
 
 namespace rad {
 namespace arch {
 
-/* RADIANCE_ATTN_BAND_SPLIT=0 issues a mixed step's dense attention as one launch at the step's
- * widest band, as before the per-band issue in AttnGatedFP8::step; unset or anything else splits.
- * An A/B and debugging knob, not configuration. Read once. */
-inline bool attn_band_split() {
-    static const bool on = [] {
-        const char* e = std::getenv("RADIANCE_ATTN_BAND_SPLIT");
-        return !(e && !std::strcmp(e, "0"));
-    }();
-    return on;
+/* Whether the streamed store has a row for this cache layout: libr4d's are E4M3 and bf16 only. A
+ * packed cache (fp8_v4, k6_v4) must not declare it, since a weightless op with no row is a hole
+ * that refuses startup even with --kv-resident off; kvstream_configure then names the layout. */
+inline bool kv_store_streamed_dtype(const char* kv_dtype) {
+    return kv_dtype && (std::strcmp(kv_dtype, "fp8_e4m3") == 0 ||
+                        std::strcmp(kv_dtype, "bf16") == 0);
 }
 
 struct AttnGatedFP8 {
@@ -81,6 +77,7 @@ struct AttnGatedFP8 {
      * block table and context length: same op, same kernel, different list. `sel` is `topk + 1`
      * wide and the kernel takes its block-table pitch from the operand. */
     rad_buf     qsa_sel  = 0;
+    rad_buf     qsa_nsel = 0;   /* [max_tok] i32, the valid entries of each `qsa_sel` row */
     rad_buf     qsa_sequ = 0;
     /* Context length up to which dense attention gives the same result, `budget + ratio - 1`.
      * Below it every complete block is selected, the paths agree to the bit, and dense is cheaper
@@ -122,10 +119,19 @@ struct AttnGatedFP8 {
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
     rad_op     op_fused_kv = 0;                              /* the same with kv_store folded in */
+    /* The same with the streamed store folded in, issued instead when the batch hands this group a
+     * stream (its mirror and map are the batch's). */
+    rad_op     op_fused_stream = 0;
     int64_t    fused_rows = 0;                               /* widest T the fused ops take */
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
+     * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
+    rad_op     op_kv_stream = 0;
+    /* kv_resolve: this layer's selection made resident and rewritten as ring slots, issued before
+     * each sparse launch. */
+    rad_op     op_resolve = 0;
     /* The output gate as `sigmoid` then `mul`: the bf16-linear form (Geom::w_bf16), and with fp8
      * linears the chain gate_quant_fp8 fuses, where it is not served. `gate` is the sigmoid's
      * output (the wire's with bf16 linears, the block's own otherwise) and `q_gate` the chain's
@@ -155,6 +161,13 @@ struct AttnGatedFP8 {
      * by passes that only leave layer state behind, such as the MTP head's history pass over a
      * prompt chunk with no drafting row. */
     void store_kv(RadCtx* c, const RadBatch* batch) const;
+    /* The layer's cache store, before its resolve and attention: `kv_store`, or for a streamed
+     * group the stage wait and `kv_store_streamed`. */
+    void store_cache(RadCtx* c, const RadKVGroupBatch* kvb, const int32_t* slot, int64_t T) const;
+    /* A staged pass reads the pool at block-id identity, while the streamed store writes only
+     * where the residency map names a ring slot (none before the group's first decode). This
+     * stores the same bytes at identity, after the mirror writer. */
+    void store_stage_identity(RadCtx* c, const int32_t* slot, int64_t T) const;
 
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
@@ -174,7 +187,8 @@ struct AttnGatedFP8 {
      * normed pieces (ArPieces::in_ready): one prefill sequence in two pieces, each the chunk a
      * span of 1 makes, on the unfused prologue with one rotary component per token (every token's
      * components agree, so plane 0 of an M-RoPE batch's positions is each token's position) and
-     * the gate quantised by gate_quant_fp8. */
+     * the gate quantised by gate_quant_fp8. A streamed group never takes it: the pieces path's
+     * plain store never writes the host mirror. */
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -182,7 +196,7 @@ struct AttnGatedFP8 {
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
-               kvb && kvb->slot_mapping && kvb->block_table && kvb->seqused;
+               kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
     }
 };
 
@@ -338,10 +352,17 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * ids: an aperture violation outside the cache. rad_op_reads rather than rw() because the list
      * depends on whether the layer has an indexer. */
     if (op_attn) {
-        const rad_buf rd[3] = { w.q, qsa_sel, qsa_sequ };
-        rad_op_reads(b, op_attn, rd, (qsa_sel && qsa_sequ) ? 3 : 1);
+        const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
+        rad_op_reads(b, op_attn, rd,
+                     (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
     }
+
+    /* The resolve belongs here rather than in the indexer: it must follow this layer's store,
+     * since a block copied in from the mirror has to carry this step's tokens. Its band is the
+     * step's widest launch and its row `qsa_topk + 1` wide, as the attention declares. */
+    if (qsa_sel && qsa_nsel)
+        op_resolve = kv_resolve_declare(b, g, kv, qsa_sel, qsa_nsel, qsa_topk + 1);
 
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
@@ -351,12 +372,40 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                          RAD_NOWEIGHTS),
                      {w.k, w.v}, {});
 
+    /* The streamed store: kv_store's operands and parameters plus the residency map and the layer's
+     * mirror row, which the batch carries (store_cache). `block_size` does not bind the group;
+     * `attn_paged` already has. Only for a layout with a row (kv_store_streamed_dtype). */
+    if (kv_store_streamed_dtype(g.kv_dtype) && rad_op_declared(b, "kv_store_streamed"))
+        op_kv_stream = rw(b, RAD_OP(b, "kv_store_streamed",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                        RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("n_head_kv", g.n_head_kv),
+                                        RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                        RAD_STR("kv_dtype", g.kv_dtype)),
+                             RAD_NOWEIGHTS),
+                         {w.k, w.v}, {});
+
     /* The fused prologue with the cache store folded in: a k head's block already holds its
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. */
     if (op_fused && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
+                            RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
+                                       RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
+                                       RAD_INT("n_head_kv", g.n_head_kv), RAD_INT("rot", n_rot),
+                                       RAD_STR("q_dtype", g.dtype), RAD_F64("eps", g.eps),
+                                       RAD_F64("wadd", g.wadd_qk), RAD_INT("cs_f32", 1),
+                                       RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                       RAD_STR("kv_dtype", g.kv_dtype)),
+                            RAD_WEIGHTS(w_q_norm, w_k_norm)),
+                         {w.qg, w.k, w.cos_sin, w.v}, {w.q, w.k});
+
+    /* The fold for a streamed group: also writes the mirror and consults the residency map, whose
+     * operands are added at issue. Gated on the same layouts. */
+    if (op_fused && kv_store_streamed_dtype(g.kv_dtype) &&
+        rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
+        op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
                                        RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
                                        RAD_INT("n_head_kv", g.n_head_kv), RAD_INT("rot", n_rot),
@@ -481,6 +530,34 @@ inline int AttnGatedFP8::declare_out(RadBuilder* b, bool add_out) {
     return RAD_OK;
 }
 
+inline void AttnGatedFP8::store_stage_identity(RadCtx* c, const int32_t* slot, int64_t T) const {
+    RAD_ISSUE_N(c, op_kv_store, T, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
+                kv_cache(kv, layer));
+}
+
+inline void AttnGatedFP8::store_cache(RadCtx* c, const RadKVGroupBatch* kvb,
+                                      const int32_t* slot, int64_t T) const {
+    if (!kvb || !kvb->stream) {
+        RAD_ISSUE(c, op_kv_store,
+                  brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+        return;
+    }
+    /* A streamed group writes its host mirror, and the ring slot only where the block is resident
+     * (docs/OPS.md "kv_store_streamed"). kv_store alone would treat a block id as a ring slot, so
+     * a build without the streamed store fails the step. */
+    const bool staged = kv_stage_wait(c, kv, kvb, layer);
+    const KVStreamLayer L = kv_stream_layer(c, kv, layer, kvb);
+    if (!op_kv_stream || !L.host || L.blocks <= 0) {
+        rad_step_fail(c, "kv streaming: this layer's KV group streams but the build has no "
+                         "kv_store_streamed row to write its host mirror with");
+        return;
+    }
+    RAD_ISSUE(c, op_kv_stream,
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+              praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
+    if (staged) store_stage_identity(c, slot, T);
+}
+
 inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     if (!ext_in) nq_h.step(c, T);
@@ -491,8 +568,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
     vp.step(c, w.h, w.v, T);
     RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
     RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_kv_store,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    store_cache(c, kvb, slot, T);
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
@@ -567,8 +643,24 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * token, so a pass with media tokens (differing components) takes the unfused path with the
      * full [3, T] positions. */
     const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
-    const bool fused_kv = op_fused_kv && fuse_ok;
-    if (fused_kv) {
+    /* A streamed group folds the streamed store into the prologue instead (op_fused_stream); one
+     * whose layer has no mirror row leaves the store to store_cache, which fails the step. */
+    const bool streamed = kvb && kvb->stream;
+    const bool fused_kv = op_fused_kv && fuse_ok && !streamed;
+    const KVStreamLayer L = streamed && op_fused_stream && fuse_ok
+                                ? kv_stream_layer(c, kv, layer, kvb) : KVStreamLayer{};
+    const bool folded_stream = L.host && L.blocks > 0;
+    if (folded_stream) {
+        /* The prologue is the store, so the stage copy must land before it (kv_stage_wait). */
+        const bool staged = kv_stage_wait(c, kv, kvb, layer);
+        RAD_ISSUE_N(c, op_fused_stream, T,
+                    brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
+                    RAD_W(w_q_norm), RAD_W(w_k_norm),
+                    brows(w.q, T), brows(w.k, T), RAD_NONE,
+                    brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+                    praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
+        if (staged) store_stage_identity(c, slot, T);
+    } else if (fused_kv) {
         RAD_ISSUE_N(c, op_fused_kv, T,
                     brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
@@ -588,9 +680,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
     }
 
-    if (!fused_kv)
-        RAD_ISSUE(c, op_kv_store,
-                  brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with
@@ -604,9 +694,31 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * `q_len` (rows = max_seqs * q_len_max * heads); more rows are refused as RAD_E_SCRATCH at
      * issue. Rows of q_len 1 up to the declared max_seqs always fit. */
     const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    /* A pass on a streamed group's ring (a ring smaller than the id space, and not staged) must
+     * take the sparse path: on the ring a block id is not a pool address, so the dense path would
+     * read ring slots as pages. `T == n_seq` alone misses a verify pass, whose T is
+     * n_seq x (1 + n_spec), on a context under qsa_exact_to. A ring that covers the context keeps
+     * the dense path, where ids and slots coincide. */
+    const RadKVStream* st = kvb ? kvb->stream : nullptr;
+    const int64_t st_blocks =
+        (st && st->block_bytes > 0) ? st->host_layer_stride / st->block_bytes : 0;
+    const bool ring_addressed = st && st->slots > 0 && st_blocks > 0 && st->slots < st_blocks;
+    const bool ring_bound = ring_addressed && !kv_stage_layer(c, kv, kvb, layer);
     const bool    sparse = qsa_sel && qsa_sequ &&
-                           (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
+                           (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
+                            reach > qsa_exact_to);
     const bool gated = sparse && op_attn_gq;
+    /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
+     * as ring slots, after this layer's store (a block copied in from the mirror must carry this
+     * step's tokens) and before the attention. A pass on the stage view leaves `sel` as block ids
+     * and never resolves, so a prefill cannot overflow the ring. */
+    const KVStreamLayer res_l = op_resolve ? kv_stream_layer(c, kv, layer, kvb) : KVStreamLayer{};
+    auto resolve_sel = [&](int64_t off, int64_t rows) {
+        if (kv_stage_layer(c, kv, kvb, layer)) return;
+        if (!res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || rows <= 0) return;
+        kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                         brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
+    };
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
@@ -619,6 +731,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             const int64_t pn = T - p0 < pieces->rows ? T - p0 : pieces->rows;
             for (int64_t off = p0; off < p0 + pn; off += chunk) {
                 const int64_t rows = (p0 + pn - off) < chunk ? (p0 + pn - off) : chunk;
+                resolve_sel(off, rows);
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
@@ -633,6 +746,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             o.step(c, w.attn, w.h.x, T, p0, pn);
             if (p0 + pn < T) pieces->hand(p0, pn);
         }
+        /* Every attention launch of this layer is issued: start the next layer's stage copy. */
+        if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
         return;
     }
     if (gated) {
@@ -640,6 +755,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t qw = g.q_dim(), hd = g.head_dim;
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
+            resolve_sel(off, rows);
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
@@ -656,6 +772,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t qw = g.q_dim();
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
+            resolve_sel(off, rows);
             RAD_ISSUE_N(c, op_attn, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
@@ -665,34 +782,35 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.x, off, rows, qw));
         }
     } else {
-        /* A mixed step once per band, as the GDN blocks issue theirs (rad_block_gdn_fp8.h): one
-         * launch at the chunk's band would serve the decode rows by the query-tiled prefill kernel,
-         * one workgroup a kv head walking each decode sequence's whole context, the step's tail
-         * beside a chunk of thousands of rows (one sequence decoding at 188k beside a 25k prompt's
-         * 2048-row chunks: 512 ms a mixed step against 218 ms at 0.7k of context, the prompt's
-         * prefill 5.1 -> 11.3 s). The decode half, sequences [0, D) and rows [0, DT), is the prefix:
-         * its own band (the split-KV decode row) over its rows, tables and cu. The prefill half
-         * takes its per-sequence arrays past the decode sequences and keeps q, out and cu at their
-         * absolute rows (the kernels index q and out by cu, and the merge of a split launch keeps
-         * to cu's span).
+        /* Below qsa_exact_to the dense path reads block ids straight from the table and never
+         * resolves, so a staged pass stages this layer here (a no-op without a stage view). A
+         * ring-bound pass with no selection to resolve cannot be served at all. */
+        if (ring_bound) {
+            rad_step_fail(c, "kv streaming: a pass on the streamed group's ring has no selection "
+                             "to resolve, so its block ids are not pool addresses");
+        } else if (kvb && kvb->stream) {
+            (void)kv_stage_layer(c, kv, kvb, layer);
+        }
+        /* A mixed step issues its attention once per band, as the GDN blocks do: one launch at
+         * the chunk's band would walk every decode sequence's whole context with one query-tiled
+         * workgroup a KV head, the step's tail beside a long chunk. The decode half (sequences
+         * [0, D), rows [0, DT)) is a prefix at its own band. The prefill half takes its
+         * per-sequence arrays past the decode sequences and keeps q, out and cu at their absolute
+         * rows, as the kernels index q and out by cu.
          *
-         * The prefill half is issued at the op's top band (max_tok), not at its own query length:
-         * a launch over part of the step (q and out whole, cu past row 0, as ArPieces issues its
-         * pieces) is served by the query-tiled row, while the band of a short chunk (10 rows or
-         * fewer at gqa 6) is the split-KV decode row's, whose partials are laid out by the step's
-         * rows and sized at declare for its own band: 1.10-next6u issued it there and stopped
-         * under load on RAD_E_SCRATCH. Kernels read exact lengths from cu, so the loose band costs
-         * nothing. A chunk no longer than the verify blocks beside it keeps the one launch at
-         * their band, as before the split: the whole step is decode-shaped then.
-         *
-         * Pure steps issue one launch, as before. */
+         * The prefill half is issued at the op's top band, not at its own query length: a launch
+         * over part of the step must be served by the query-tiled row, while a short chunk's band
+         * (10 rows or fewer at gqa 6) is the split-KV decode row's, whose partials are sized at
+         * declare for that band and would overflow the scratch. Kernels read exact lengths from
+         * cu, so the loose band costs nothing. A chunk no longer than the verify blocks beside it
+         * keeps one launch at their band: the whole step is decode-shaped then. */
         int64_t D = 0, DT = 0;
         batch_split(batch, &D, &DT);
         const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
         const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill
                                                         : batch->max_q_len;
         if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
-            batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode && attn_band_split()) {
+            batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode) {
             const int64_t P = batch->n_seq - D;
             RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,
                         brows(w.q, DT), kv_cache(kv, layer),
@@ -711,13 +829,15 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         praw2(table, RAD_I32, batch->n_seq, pitch),
                         praw(used, RAD_I32, batch->n_seq),
                         RAD_NONE, RAD_NONE,
-                        /* cu_seqlens: the batch may be ragged (verify rows of different
-                         * lengths; a chunk beside decode rows at RADIANCE_ATTN_BAND_SPLIT=0). */
+                        /* cu_seqlens: verify rows may be of different lengths. */
                         praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                         brows(w.attn.x, T));
         }
     }
 
+    /* Every attention launch of this layer is issued: start the next layer's stage copy, which
+     * crosses the link under the out projection and the next layer's projections. */
+    if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
     if (gated) {
         /* the sparse attention gated and quantised in its merge */
     } else if (op_sig) {

@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -152,6 +153,20 @@ void usage() {
         "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
         "                       the checkpoint the --reuse container was converted from. Every\n"
         "                       weight that reads one is converted; the rest are copied\n"
+        "      --lora FILE|DIR  a PEFT adapter (.safetensors file or directory of them) merged\n"
+        "                       into the checkpoint tensors it names before they are converted:\n"
+        "                       W + strength * (alpha/r where the adapter states one) * B @ A.\n"
+        "                       Repeatable, merged in the order given; each merged tensor joins\n"
+        "                       the --changed set, so --reuse never copies an unmerged weight\n"
+        "      --lora-strength F\n"
+        "                       the strength of every --lora (default 1)\n"
+        "      --lora-map FILE  with --lora: a JSON map for adapters trained on module names this\n"
+        "                       checkpoint does not use. {\"strip\": [\"prefix\", ...], \"modules\":\n"
+        "                       {\"<pat>\": [\"<target>\", ...]}}: a pattern holds at most one '*',\n"
+        "                       which matches one run (the block index) and is substituted into\n"
+        "                       every target; several targets mean the module is their concate-\n"
+        "                       nation (a fused qkv), and the adapter's rows split along them\n"
+        "                       in the order listed\n"
         "      --in-place       with --reuse: EXTEND that container instead of writing a new one.\n"
         "                       Its weights stay where they are; new ones are written past its\n"
         "                       end and the header last. Refused when a weight it holds would\n"
@@ -200,6 +215,9 @@ int main(int argc, char** argv) {
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
     std::string reuse_path, changed_path;
+    std::vector<std::string> lora_paths;
+    double      lora_strength = 1.0;
+    std::string lora_map;
     bool        in_place = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
@@ -245,6 +263,18 @@ int main(int argc, char** argv) {
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse")     reuse_path = next("--reuse");
         else if (a == "--changed")   changed_path = next("--changed");
+        else if (a == "--lora")      lora_paths.push_back(next("--lora"));
+        else if (a == "--lora-strength") {
+            const char* v = next("--lora-strength");
+            char* end = nullptr;
+            lora_strength = std::strtod(v, &end);
+            if (!end || *end || end == v) {
+                std::fprintf(stderr, "rad-convert: --lora-strength wants a number, got '%s'\n",
+                             v);
+                return 2;
+            }
+        }
+        else if (a == "--lora-map")  lora_map = next("--lora-map");
         else if (a == "--in-place")  in_place = true;
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
@@ -301,6 +331,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
                              "container --reuse names, and needs --reuse without --in-place (a "
                              "weight cannot be replaced in place)\n");
+        return 2;
+    }
+    if (!lora_paths.empty() && in_place) {
+        std::fprintf(stderr, "rad-convert: --lora merges into the source, whose weights "
+                             "--in-place copies from --reuse unchanged; convert to a new file\n");
+        return 2;
+    }
+    if (!lora_map.empty() && lora_paths.empty()) {
+        std::fprintf(stderr, "rad-convert: --lora-map renames the modules --lora merges; give "
+                             "a --lora to go with it\n");
         return 2;
     }
     if (in_place) {
@@ -394,6 +434,15 @@ int main(int argc, char** argv) {
             RAD_ERR("--changed %s names no tensor", changed_path.c_str());
             return 1;
         }
+    }
+    /* Adapters merge before anything reads the source, and a merged tensor joins the changed set:
+     * --reuse matches a weight by how it was converted, not by its source bytes. */
+    for (const std::string& lp : lora_paths) {
+        std::vector<std::string> merged;
+        if (ck.add_lora(lp, lora_strength, &merged,
+                        lora_map.empty() ? nullptr : &lora_map) < 0)
+            return 1;
+        for (std::string& m : merged) changed.insert(std::move(m));
     }
     /* --in-place inherits the container's radiance.* keys (the convert-time choices its weights
      * were made under), except `radiance.encoder`, which this run derives. */
@@ -874,7 +923,8 @@ int main(int argc, char** argv) {
             if (!changed_read.count(n)) unread.push_back(n);
         if (!unread.empty()) {
             std::sort(unread.begin(), unread.end());
-            RAD_ERR("--changed names %zu tensor(s) no weight of this conversion reads, e.g. '%s'",
+            RAD_ERR("the changed set (--changed and merged adapters) names %zu tensor(s) no "
+                    "weight of this conversion reads, e.g. '%s'",
                     unread.size(), unread[0].c_str());
             w.abort();
             return 1;

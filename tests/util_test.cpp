@@ -521,4 +521,16 @@ TEST(a_phase_that_logs_is_never_reported) {
     CHECK(out.find("probe: step 59") != std::string::npos);
 }
 
+/* Progress marked without a log line keeps a phase from being reported the same way. */
+TEST(a_phase_that_marks_progress_is_never_reported) {
+    const std::string out = stderr_of([] {
+        StallWatch w("probe", 150);
+        for (int i = 0; i < 60; ++i) {
+            w.progress();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+    CHECK(out.find("nothing has been logged") == std::string::npos);
+}
+
 RAD_TEST_MAIN()

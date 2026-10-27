@@ -2401,6 +2401,24 @@ void video_cases(std::vector<Hand>& hs) {
             hs.push_back(std::move(h));
         }
 
+        /* ---- flow_res_multistep: a bf16 velocity, the f32 state and previous estimate both
+         *      INOUT at wider pitches; order 2 reads the previous estimate, order 1 is Euler ---- */
+        for (float order : { 2.0f, 1.0f }) {
+            Hand h((std::string(order >= 1.5f ? "two-estimate" : "Euler limit") +
+                    ", bf16 velocity, f32 state and history" + sfx).c_str(),
+                   "flow_res_multistep", 0.0);
+            h.dense(dt, { 7, 96 }, hfill(422, 2.0f))
+             .view(RAD_F32, { 7, 96 }, { 99, 1 }, 7 * 99, hfill(423), true)   /* x0, INOUT */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.5625f; })           /* sigma */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.625f; })            /* r */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.24f; })             /* hb1 */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return -0.005f; })           /* hb2 */
+             .dense(RAD_F32, { 1 }, [order](int64_t) { return order; })        /* order */
+             .view(RAD_F32, { 7, 96 }, { 101, 1 }, 7 * 101, hfill(424), true)  /* x, INOUT */
+             .pi("M", 7).pi("n", 96).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+
         /* ---- the decoder's geometry: 3 frames of 6 x 9 latents, tiles of 4 over 1 ------------ *
          * Rows split 6 -> starts 0, 2 (overlap 2); columns 9 -> 0, 2, 5 (overlaps 2, 1). */
         {
@@ -2513,6 +2531,84 @@ void upscaler_cases(std::vector<Hand>& hs) {
              .pi("M", R).pi("cin", ci).pi("cout", co).pi("k", 2).pi("kt", 3).ps("dtype", dn)
              .refuses(RAD_E_SHAPE);
             hs.push_back(std::move(e));
+
+            /* The video encoder's convolution forms. The generated cases never stride, reflect
+             * or pad one side only, so the downsample, a res block reflecting on every edge and
+             * the one-frame case are written out here. */
+            {
+                /* (3 + 2 - 3) / 2 + 1 = 2 frames, (4 + 1 - 3) / 2 + 1 = 2 rows and
+                 * (5 + 1 - 3) / 2 + 1 = 2 columns: the pad below and right only, both strides,
+                 * and a column of reflected taps. */
+                Hand h(("3 x 4 x 5 causal, stride 2 down reflect" + sfx).c_str(),
+                       "conv3d_ndhwc", tol);
+                h.dense(dt, { 3 * 4 * 5, ci }, hfill(960))
+                 .dense(dt, { co, ci, 3, 3, 3 }, hfill(961, 0.3f))
+                 .dense(dt, { co }, hfill(962, 0.5f))
+                 .idx({ 3, 4, 5 })
+                 .none()
+                 .dense(dt, { 8, co }, hfill(963), true)
+                 .pi("M", 8).pi("cin", ci).pi("cout", co).pi("k", 3).pi("kt", 3).ps("dtype", dn)
+                 .pi("stride", 2).pi("stride_t", 2).pi("causal", 1).ps("pad", "down")
+                 .pi("reflect", 1);
+                hs.push_back(std::move(h));
+
+                Hand g(("2 x 2 x 3 causal reflect, a mirror on every edge" + sfx).c_str(),
+                       "conv3d_ndhwc", tol);
+                g.dense(dt, { 12, ci }, hfill(964))
+                 .dense(dt, { co, ci, 3, 3, 3 }, hfill(965, 0.3f))
+                 .dense(dt, { co }, hfill(966, 0.5f))
+                 .idx({ 2, 2, 3 })
+                 .none()
+                 .dense(dt, { 12, co }, hfill(967), true)
+                 .pi("M", 12).pi("cin", ci).pi("cout", co).pi("k", 3).pi("kt", 3).ps("dtype", dn)
+                 .pi("causal", 1).pi("reflect", 1);
+                hs.push_back(std::move(g));
+
+                /* One frame in, one out: the causal pad's zero frames stand for the taps the
+                 * reference drops, and the residual is y itself. */
+                Hand q(("one frame, causal reflect, residual in place" + sfx).c_str(),
+                       "conv3d_ndhwc", tol);
+                q.dense(dt, { 4, ci }, hfill(968))
+                 .dense(dt, { co, ci, 3, 3, 3 }, hfill(969, 0.3f))
+                 .dense(dt, { co }, hfill(970, 0.5f))
+                 .idx({ 1, 2, 2 })
+                 .dense(dt, { 4, co }, hfill(971), true)
+                 .alias(4)
+                 .pi("M", 4).pi("cin", ci).pi("cout", co).pi("k", 3).pi("kt", 3).ps("dtype", dn)
+                 .pi("causal", 1).pi("reflect", 1);
+                hs.push_back(std::move(q));
+
+                /* The refusals, with libref's error codes: a 5-wide kernel with a stride, a pad
+                 * neither `same` nor `down`, a reflect pad on an axis of 1, y short of the strided
+                 * output, and a zero stride. */
+                const auto refusal = [&](const char* what, const std::vector<int64_t>& g3,
+                                         int k, const char* pad, int stride, int causal,
+                                         int reflect, int64_t yrows) {
+                    Hand z((std::string(what) + sfx).c_str(), "conv3d_ndhwc", tol);
+                    z.dense(dt, { 12, ci }, hfill(972))
+                     .dense(dt, { co, ci, (uint32_t)k, (uint32_t)k, (uint32_t)k }, hfill(973))
+                     .dense(dt, { co }, hfill(974))
+                     .idx(g3)
+                     .none()
+                     .dense(dt, { yrows, co }, zero, true)
+                     .pi("M", yrows).pi("cin", ci).pi("cout", co).pi("k", k).pi("kt", k)
+                     .ps("dtype", dn);
+                    if (stride != 1) z.pi("stride", stride);
+                    if (pad && *pad) z.ps("pad", pad);
+                    if (causal) z.pi("causal", causal);
+                    if (reflect) z.pi("reflect", reflect);
+                    z.refuses(RAD_E_SHAPE);
+                    hs.push_back(std::move(z));
+                };
+                refusal("a stride with a 5-wide kernel is refused", { 2, 2, 3 }, 5, nullptr, 2, 0,
+                        0, 12);
+                refusal("a reflect pad reaching an axis of 1 is refused", { 2, 1, 2 }, 3, nullptr,
+                        1, 1, 1, 4);
+                refusal("a mirror pad is refused", { 2, 2, 3 }, 3, "mirror", 1, 0, 0, 12);
+                refusal("y short of the strided output is refused", { 3, 4, 5 }, 3, "down", 2, 1,
+                        1, 7);
+                refusal("a zero stride is refused", { 2, 2, 3 }, 3, nullptr, 0, 0, 0, 12);
+            }
         }
 
         /* ---- group_norm: stats f32 of exactly groups (2 + 3 1024) values --------------------- */
@@ -3223,8 +3319,7 @@ void kv_cases(std::vector<Hand>& hs) {
 
     /* Blocks 2 and 5 are resident; the selection names them, then 6 and 4. The epoch reaches both
      * hit slots, the misses are claimed once each and placed in ascending block order (4 then 6),
-     * not in the order the rows name them. Pinned to the rule, so both libraries are held to it
-     * and not only to each other. */
+     * not in the order the rows name them. Pinned to the rule, not only to each other. */
     {
         Hand h = pool("hits take the epoch, misses land in block order", 2, 8, 4, 4, 8,
                       { 2, 5, 6, -1, 2, 4, -1, -1 }, { 3, 2 },
@@ -3267,7 +3362,7 @@ void kv_cases(std::vector<Hand>& hs) {
     /* The heat counter, and the three shapes that separate it from a one-bit CLOCK. Slot 0 was hit
      * on two earlier calls (counter 2), slots 1 and 2 once each: a CLOCK sweep clears all three bits
      * and evicts slot 0 on its second pass, while 2 -> 1 -> 0 leaves slot 0 resident and takes slot
-     * 1. Pinned to the victim, so both libraries are held to the rule and not only to each other. */
+     * 1. Pinned to the victim. */
     {
         Hand h = pool("a slot hit twice survives two sweep passes", 1, 32, 3, 1, 8, { 20 }, { 1 },
                       { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1,
@@ -3357,9 +3452,7 @@ void kv_cases(std::vector<Hand>& hs) {
     /* 2052 claims -- four rows of 513, which is what `--max-num-seqs 4` selects, and eight more than
      * the largest fixed list can hold. Every slot is free, so all 2052 are placed: ids 100..2099
      * take their own slot and the 52 past the ring (2100..2151) take the first free slots from the
-     * hand, which are 0..51. Pinned, so both libraries are held to the placement and not only to
-     * each other. The claim list is gathered from the selection, so the id space (`blocks`) is not
-     * in the cost. */
+     * hand, which are 0..51. Pinned to the placement. */
     {
         const int64_t M = 4, blocks = 4096, slots = 2100, pitch = 513, bbytes = 8, first = 100;
         std::vector<int64_t> sel, nsel((size_t)M, 513), res((size_t)blocks, -1),
@@ -3380,8 +3473,8 @@ void kv_cases(std::vector<Hand>& hs) {
      * so the eight smallest ids are placed and the four largest revert to -1 with the
      * overflow latched. 1, 2, 3, 5 and 7 fit the ring and take their own slots; 9, 11 and 100 are
      * past it and take the first free slots from the hand, 0, then past the identity slots, 4 and
-     * 6. The claim list cannot be clipped at the ring's depth -- the order the sweep takes is the
-     * ascending order of the whole claim set. */
+     * 6. The sweep's order is that of the whole claim set, so the list cannot be clipped at the
+     * ring's depth first. */
     {
         Hand h = pool("12 claims in 8 slots place the eight smallest", 1, 4096, 8, 12, 8,
                       { 4090, 3, 2000, 7, 1, 4000, 5, 9, 11, 2, 100, 500 }, { 12 },
@@ -3526,8 +3619,8 @@ void kvstream_cases(std::vector<Hand>& hs) {
     }
     /* The mirror's exact bytes, laid out by hand: four tokens fill both blocks at both offsets
      * with constants, so the paged layout [kv_heads][block_size][2 * head_dim] and the E4M3
-     * encoding are pinned against an answer no library computes. Agreement alone cannot catch a
-     * store that writes the right values at the wrong address or with the wrong scale. */
+     * encoding are pinned against an answer no library computes: agreement alone cannot catch a
+     * store that writes the right values to the wrong address or at the wrong scale. */
     {
         const int64_t blocks = 2, slots = 2, bs = 2, kvh = 1, hd = 2, M = 4;
         const int64_t lane = kvh * hd, row = kvh * bs * 2 * hd, span = M * 2 * lane;
@@ -4534,6 +4627,26 @@ void audio_cases(std::vector<Hand>& hs) {
              .pi("M", 16).pi("cin", cin).pi("cout", cout).pi("k", 4).pi("dil", dil)
              .pi("causal", 1).ps("dtype", dn);
             hs.push_back(std::move(h));
+        }
+        if (dt == (uint32_t)RAD_BF16) {
+            /* The zero-padded strided form, bf16 only: one sequence, kernel 2 stride, pad
+             * stride / 2, so 16 input rows give exactly 16 / stride output rows. */
+            const int64_t cin = 20, cout = 13;
+            for (const int64_t s : { 2, 4 }) {
+                const int64_t k = 2 * s, in = 16, out = in / s;
+                Hand h(("stride " + std::to_string(s) + ", even kernel, one sequence" + sfx)
+                           .c_str(),
+                       "conv1d", norm_tol);
+                h.dense(dt, { in, cin }, hfill(350 + s))
+                 .dense(dt, { cout, cin, k }, hfill(356, 0.3f))
+                 .idx({ 0, in })
+                 .none()
+                 .dense(dt, { out, cout }, zero, true)
+                 .dense(dt, { cout }, hfill(357, 0.5f))
+                 .pi("M", in).pi("cin", cin).pi("cout", cout).pi("k", k).pi("dil", 1)
+                 .pi("stride", s).pi("pad", s / 2).ps("dtype", dn);
+                hs.push_back(std::move(h));
+            }
         }
         for (const int64_t s : { 2, 4 }) {
             /* A codec encoder's downsampling: kernel 2 stride, causal, the bounds in samples

@@ -51,13 +51,14 @@ inline int64_t ldi(const RadTensor* t, int64_t i) {
  * them), outside of which the input reads zero (each sequence is padded on its own). w is
  * PyTorch's Conv1d weight [cout, cin, k], b [cout], `dil` the dilation and the padding
  * dil (k - 1) / 2 on each side (k odd), so a sequence keeps its length; with `causal` 1 all of it,
- * dil (k - 1), on the left (any k). A `stride` s > 1 (causal only, a reach of at least s) keeps
- * every s-th output row: the left pad is the reach less s, and a sequence of L rows (every bound a
- * whole number of strides) gives L / s, y's and res's rows the input's over s. `cu_div` reads the
- * bounds in units that many input rows apart: sequence e is input rows [cu[e] / cu_div,
- * cu[e+1] / cu_div), each bound a multiple of cu_div stride. `res`, when bound, is added after the
- * bias; then `act` (none, tanh, or clamp to [-1, 1], a vocoder's output clamp). f32
- * accumulation, one rounding. */
+ * dil (k - 1), on the left (any k). A `stride` s > 1 comes in two forms. The causal one (a reach
+ * of at least s) keeps every s-th output row: the left pad is the reach less s, and a sequence of
+ * L rows (every bound a whole number of strides) gives L / s; `cu_div` reads the bounds in units
+ * that many input rows apart. With an explicit `pad` (bf16 only) it is PyTorch's zero-padded
+ * strided conv over one sequence of all of x, any k: output row m reads
+ * x[m * stride + tap * dil - pad], and y has exactly (rows + 2 pad - dil (k - 1) - 1) / stride + 1
+ * rows. `res`, when bound, is added after the bias; then `act` (none, tanh, or clamp to [-1, 1],
+ * a vocoder's output clamp). f32 accumulation, one rounding. */
 int ref_conv1d(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cu = &a->t[2];
@@ -65,33 +66,45 @@ int ref_conv1d(const RadArgs* a, RadStream) {
     if (!y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
-    const int64_t st = p_int(a, "stride", 1), cd = p_int(a, "cu_div", 1);
+    const int64_t st = p_int(a, "stride", 1), pp = p_int(a, "pad", -1), cd = p_int(a, "cu_div", 1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
-    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) ||
-        cd < 1)
+    /* The causal strided form or the padded one, never both. */
+    const bool padded = pp >= 0 && st > 1;
+    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) || dil <= 0 ||
+        causal < 0 || causal > 1 || st < 1 || (pp >= 0 && (st <= 1 || causal || cd != 1)) ||
+        (st > 1 && pp < 0 && (!causal || dil * (k - 1) + 1 < st)) || cd < 1)
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
+    const int64_t cdv = padded ? 1 : cd;
     /* A stride takes each sequence of L rows to L / stride, so every bound is a whole number of
-     * strides (of cu_div units each). */
-    for (int64_t e = 0; e <= n_seq; ++e)
+     * strides (of cu_div units each); the padded form bounds only its one full sequence. */
+    for (int64_t e = 0; !padded && e <= n_seq; ++e)
         if (cu_at(cu, e) % (cd * st)) return RAD_E_SHAPE;
-    const int64_t r0 = cu_at(cu, 0) / cd, r1 = cu_at(cu, n_seq) / cd;
-    if (r0 < 0 || r1 <= r0 || rows_of(y, cout) < r1 / st || rows_of(x, cin) < r1)
-        return RAD_E_SHAPE;
+    const int64_t r0 = cu_at(cu, 0) / cdv, r1 = cu_at(cu, n_seq) / cdv;
+    if (r0 < 0 || r1 <= r0 || rows_of(x, cin) < r1) return RAD_E_SHAPE;
     if (numel(w) < cout * cin * k || (b && numel(b) < cout)) return RAD_E_SHAPE;
-    if (res && rows_of(res, cout) < r1 / st) return RAD_E_SHAPE;
+    int64_t rmin = r0 / st, rmax = r1 / st;
+    if (padded) {
+        if (x->dtype != RAD_BF16) return RAD_E_DTYPE;
+        if (n_seq != 1 || r0 != 0 || r1 != rows_of(x, cin)) return RAD_E_SHAPE;
+        rmin = 0;
+        rmax = (r1 + 2 * pp - dil * (k - 1) - 1) / st + 1;
+    }
+    if (rmin >= rmax) return RAD_E_SHAPE;
+    if (padded ? rows_of(y, cout) != rmax : rows_of(y, cout) < rmax) return RAD_E_SHAPE;
+    if (res && rows_of(res, cout) < rmax) return RAD_E_SHAPE;
     /* Causal: the reach is dil (k - 1) + 1 input rows and the left pad that less the stride, so
-     * output row o of a sequence reads input rows o stride - pad .. o stride + stride - 1. */
-    const int64_t pad = causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2;
-    REF_PAR_FOR((r1 - r0) / st * cout * cin * k)
-    for (int64_t r = r0 / st; r < r1 / st; ++r) {
-        const int64_t e = seq_of(cu, n_seq, r * st * cd);
-        const int64_t s0 = cu_at(cu, e) / cd, s1 = cu_at(cu, e + 1) / cd;
+     * output row o of a sequence reads input rows o stride - pad .. o stride + stride - 1. The
+     * padded form takes PyTorch's zero padding from the explicit `pad` instead. */
+    const int64_t pad = padded ? pp : (causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2);
+    REF_PAR_FOR((rmax - rmin) * cout * cin * k)
+    for (int64_t r = rmin; r < rmax; ++r) {
+        const int64_t e = seq_of(cu, n_seq, r * st * cdv);
+        const int64_t s0 = cu_at(cu, e) / cdv, s1 = cu_at(cu, e + 1) / cdv;
         const int64_t yb = rowoff(y, r, cout), ys = laststride(y);
         for (int64_t co = 0; co < cout; ++co) {
             float acc = 0.0f;

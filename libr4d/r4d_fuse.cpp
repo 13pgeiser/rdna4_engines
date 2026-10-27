@@ -647,8 +647,8 @@ extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, u
 }
 
 /* ==========================================================================================
- * qk_norm_rope_gate_kv_store_streamed -- the same prologue with the STREAMED store folded on.
- * (row: qk_norm_rope_gate_kv_store_streamed_fp8; kernel: r4d_qk_norm_rope_gate.hip under
+ * qk_norm_rope_gate_kv_store_streamed -- the same prologue with the streamed store folded on.
+ * (rows: qk_norm_rope_gate_kv_store_streamed_{fp8,bf16}; kernel: r4d_qk_norm_rope_gate.hip under
  * QK_KV_STREAMED)
  *
  * Operands: [0] q_gate?  [1] k  [2] cos_sin  [3] positions  [4] q_w?  [5] k_w  [6] q_out?

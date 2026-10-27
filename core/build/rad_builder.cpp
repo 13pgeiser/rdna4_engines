@@ -9,6 +9,7 @@
  * which makes fusion a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
+#include "kvstream/bringup.h"
 #include "lora/lora.h"
 #include "../device/device.h"
 
@@ -466,20 +467,31 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
     return 0;
 }
 
+/* One layer's bytes of a paged group's block: what a kernel addressing one layer sees, and the
+ * pitch of a streamed group's host mirror rows. */
+int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
+    if (g == 0 || g >= prog_.kv_groups.size()) return 0;
+    KVGroupInfo& gi = prog_.kv_groups[g];
+    if (gi.decl.kind != RAD_KV_FULL && gi.decl.kind != RAD_KV_WINDOW) return 0;
+    const int64_t bs = kv_block_size(g);
+    if (bs <= 0) return 0;
+    const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
+    return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
+}
+
 /* ================================================================== ops */
+/* A kernel instantiation: (kernel, plugin, resolved input params). Keyed on geom_key, not
+ * geom.str(), so tuner and selector key identically: geom_key is tunecache.h's canonical sorted
+ * spelling without the tuned axes, while geom.str() keeps declaration order and includes them. */
+static std::string tune_key(const Resolved& r) {
+    return r.row->info->name + std::string("\x1f") + r.row->plugin + std::string("\x1f") +
+           r.geom_key;
+}
+
 void Builder::record_tune_request(const Resolved& r) {
     if (!r.row || !r.row->info || r.row->info->n_tunables <= 0) return;
-    /* One request per kernel instantiation: (kernel, plugin, resolved input params). The same
-     * shape requested by many layers is one benchmark (spec §15).
-     *
-     * Keyed on geom_key, not geom.str(), so tuner and selector key identically: geom_key is
-     * tunecache.h's canonical sorted spelling without the tuned axes, while geom.str() keeps
-     * declaration order and includes the axes. */
-    const std::string key = r.row->info->name + std::string("\x1f") + r.row->plugin +
-                            std::string("\x1f") + r.geom_key;
-    for (auto& t : prog_.tune_requests)
-        if (t.kernel + std::string("\x1f") + t.plugin + std::string("\x1f") + t.geom_key == key)
-            return;
+    /* The same shape requested by many layers is one benchmark (spec §15). */
+    if (!tune_index_.emplace(tune_key(r), prog_.tune_requests.size()).second) return;
 
     Program::TuneRequest req;
     req.kernel     = r.row->info->name;
@@ -599,26 +611,19 @@ void Builder::finish_instances() {
     }
 }
 
-/* The instances are made in finish_instances(), after record_tune_request ran, so the requests
- * now carry the instance their kernel will launch with. A collective's launch cannot be formed
- * without it -- the peer bundle (scratch, flags, sequence counters) is what init() builds and
- * RadArgs reaches the exchange through nothing else -- so the tuner forms its launches from this.
- * Keyed exactly as record_tune_request keyed. */
+/* Hand each tune request the instance finish_instances() made for its kernel: a collective's
+ * launch reaches its peer bundle (scratch, flags, sequence counters) only through the instance, so
+ * the tuner forms its launches from this. */
 void Builder::fill_tune_instances() {
-    for (size_t i = 1; i < prog_.ops.size(); ++i) {
-        const OpInfo& oi = prog_.ops[i];
-        for (const Band& b : oi.bands)
+    if (prog_.tune_requests.empty()) return;
+    for (size_t i = 1; i < prog_.ops.size(); ++i)
+        for (const Band& b : prog_.ops[i].bands)
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 const Resolved& r = b.dom[d];
-                if (!r || !r.row || !r.row->info) continue;
-                const std::string key = r.row->info->name + std::string("\x1f") + r.row->plugin +
-                                        std::string("\x1f") + r.geom_key;
-                for (auto& t : prog_.tune_requests)
-                    if (t.kernel + std::string("\x1f") + t.plugin + std::string("\x1f") +
-                        t.geom_key == key)
-                        t.instance = r.instance;
+                if (!r || !r.row || !r.row->info || r.row->info->n_tunables <= 0) continue;
+                const auto it = tune_index_.find(tune_key(r));
+                if (it != tune_index_.end()) prog_.tune_requests[it->second].instance = r.instance;
             }
-    }
 }
 
 rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
@@ -827,6 +832,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
 }
 
 int Builder::op_declared(const char* op) const {
+    if (kvstream_op_gated(prog_.ctx, op)) return 0; /* kvstream_op_gated */
     return op && reg_.schema(op) ? 1 : 0;
 }
 
@@ -979,6 +985,21 @@ int Builder::kv_group_zero(rad_kvgroup h) {
         return RAD_E_INVAL;
     }
     prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
+int Builder::kv_group_dense_read(rad_kvgroup h) {
+    if (finished_) { err(RAD_E_STATE, "kv_group_dense_read after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Full groups only: a state slot is already per sequence, and a window bounds its own
+     * history. */
+    const KVGroupInfo& gi = prog_.kv_groups[h];
+    if (gi.decl.kind != RAD_KV_FULL) {
+        err(RAD_E_INVAL, "kv group '%s': dense_read on a group that is not a full attention group",
+            gi.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].dense_read = true;
     return RAD_OK;
 }
 
@@ -2473,6 +2494,11 @@ int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) {
     return B(b)->kv_block_size(g);
 }
 
+int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return 0;
+    return B(b)->kv_layer_bytes(g);
+}
+
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->bind_layer_kv(layer, g);
@@ -2533,6 +2559,11 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
 int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->kv_group_zero(g);
+}
+
+int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_dense_read(g);
 }
 
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {

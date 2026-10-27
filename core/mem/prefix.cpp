@@ -186,6 +186,15 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
                             p.name.c_str(), (long long)p.block_size, (long long)block_size_);
     }
 
+    /* An entry can be demoted only when the host tier can hold every group in it. A streamed
+     * group's rows are its pinned mirror, addressed by the block id the sequence used, so an entry
+     * holding one stays in VRAM and is evicted whole (docs/KV-STREAMING.md §4.1). */
+    demotable_ = true;
+    for (int32_t g : groups_) {
+        const KVGroupPlan* p = kv->plan(g);
+        if (p && p->streamed()) demotable_ = false;
+    }
+
     interval_ = checkpoint_interval;
     /* A window snapshot is state too: a hit is reusable only at a checkpoint, whose slot carries
      * the window behind it (KVManager::has_window_snapshot). */
@@ -217,6 +226,11 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
                   (long long)kv->checkpoint_slots(), humanb(kv->checkpoint_bytes()).c_str(),
                   policy_->name());
     report_ += skipped;
+    if (!demotable_) {
+        /* Stated whether or not a host tier is configured. */
+        report_ += "  a streamed group is cached, so no entry can be demoted to the host tier: a "
+                   "streamed group's rows are its pinned mirror, addressed by block id\n";
+    }
     return RAD_OK;
 }
 
@@ -431,14 +445,15 @@ int PrefixCache::insert(uint64_t session,
      * The ids come from the map, not from `blocks`. For an entry that already existed the loop
      * above kept the cache's blocks, and `blocks` belongs to a sequence about to be freed; the
      * tiers would copy from blocks reassigned to another sequence. */
-    if (tiers_) {
+    if (tiers_ && demotable_) {
         for (int64_t b = 0; b < n_full; ++b) {
             auto it = map_.find(hs[(size_t)b]);
             if (it == map_.end()) continue;
             tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
         }
-        tiers_->note_session(session, hs, n_tokens, now, label);
     }
+    /* The session index names no blocks, so it is kept with or without a host copy. */
+    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label);
 
     take_over(session, hs, n_full * block_size_);
     return RAD_OK;
@@ -635,11 +650,12 @@ int64_t PrefixCache::trim_sparing(int64_t n_blocks,
             it = next;
             continue;
         }
-        if (keep && !tiers_->droppable(h)) { ++it; continue; }
+        /* Skip an entry whose copy is still in flight; one the tier cannot hold never gets a copy. */
+        if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
         it = lru_.erase(it);
         e.in_lru = false;
         release_blocks(e);
-        if (keep) {
+        if (keep && demotable_) {
             tiers_->drop_commit(h);
             ++stats_.drops;
         } else {

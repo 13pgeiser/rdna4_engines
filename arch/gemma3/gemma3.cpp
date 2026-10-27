@@ -347,33 +347,6 @@ inline void G3Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int
     gemm_rows(c, y, r0, n);
 }
 
-/* ---- the GPTQ calibration tap (rad_arch.h's calib_*): the Gram of one linear's bf16 input,
- * summed over the corpus in a PERSIST [K, K] f32 buffer. Declared only with RADIANCE_CALIB_DIR set,
- * for the layers RADIANCE_G3_CALIB_LAYERS names ("lo:hi", default every layer): a down projection's
- * Gram is 10752^2 f32 a rank at TP2, so 62 layers of four taps do not fit beside the weights and a
- * calibration runs in slices of layers, the corpus pushed through once per slice. */
-struct G3Tap {
-    rad_buf h = 0;
-    rad_op  op = 0;
-    int64_t K = 0;
-
-    int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, rad_buf a, int64_t k) {
-        K = k;
-        h = decl_b(b, nm.f("%s.gram", name), RAD_F32, { k, k }, RAD_BUF_PERSIST);
-        if (!h) return RAD_E_INVAL;
-        op = rw(b, RAD_OP(b, "gram_accum",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", k),
-                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
-                    RAD_NOWEIGHTS),
-                { a, h }, { h });
-        return op ? RAD_OK : RAD_E_INVAL;
-    }
-    /* gram_accum takes a, a_scale?, h: no scale for a bf16 input. */
-    void step(RadCtx* c, rad_buf a, int64_t T, const bool* live) const {
-        if (op && live && *live) RAD_ISSUE_N(c, op, T, brows(a, T), RAD_NONE, brows(h, K));
-    }
-};
-
 /* ---- one attention block, parameterised by class. */
 struct Gemma3Attn {
     struct Wire { rad_buf x = 0, h = 0, q = 0, k = 0, v = 0, attn = 0; };
@@ -393,7 +366,7 @@ struct Gemma3Attn {
      * resolves; byte-identical to the four */
     rad_op op_qnr = 0;
     /* Calibration: q|k|v's shared input and o_proj's (this rank's columns). */
-    G3Tap       tap_in{}, tap_o{};
+    CalibTap    tap_in{}, tap_o{};
     const bool* tap_live = nullptr;
     /* Set before declare by a pipelined deployment: the all-reduce a second time at `overlap` 1 (a
      * launch that leaves the CUs to the compute beside it), and q|k|v's input pair shared by every
@@ -409,10 +382,6 @@ struct Gemma3Attn {
     /* The branch's post-norm alone, for a caller fusing the add and the next norm after it. */
     void post(RadCtx* c, int64_t T) const {
         RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
-    }
-    /* The block's all-reduce alone, as Gemma3Mlp::ar. */
-    void ar(RadCtx* c, int64_t T) const {
-        if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     }
     /* The pipelined prefill (step_pipelined): the block over one prefill sequence in two pieces,
      * its input pair already written; hands the first piece behind its out projection. */
@@ -615,7 +584,7 @@ void Gemma3Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
         ln_q.step(c, w.h, w.q, T);
         ln_k.step(c, w.h, w.k, T);
         ln_v.step(c, w.h, w.v, T);
-        tap_in.step(c, w.h, T, tap_live);
+        tap_in.step(c, w.h, T, tap_live && *tap_live);
     }
 
     if (op_qnr) {
@@ -639,7 +608,7 @@ void Gemma3Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
                 praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                 brows(w.attn, T));
 
-    tap_o.step(c, w.attn, T, tap_live);
+    tap_o.step(c, w.attn, T, tap_live && *tap_live);
     ln_o.step(c, w.attn, w.h, T);
     /* All-reduce before the post-norm: o_proj is column-sharded, and the norm is of the sum. */
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
@@ -659,17 +628,13 @@ struct Gemma3Mlp {
     G3Linear   ln_gu{}, ln_down{};
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
     rad_op op_gq = 0;
-    /* gate|up, the GeGLU and down's E4M3 quantiser in one launch (libr4d gemm_nt_q_gated_mx at
-     * gelu_tanh) at up to `fold_rows` rows, when both linears are MXFP4: byte-identical to the
-     * GEMM, gelu_mul and quant_act_fp8 it replaces. */
+    /* gate|up, the GeGLU and down's E4M3 quantiser in one launch (gemm_nt_q_gated_mx at gelu_tanh)
+     * up to `fold_rows` rows, when both linears are MXFP4: byte-identical to the GEMM, gelu_mul and
+     * quant_act_fp8 it replaces. */
     rad_op  op_fold = 0;
     int64_t fold_rows = 0;
-    /* Set before declare: the band the fold is declared over (RADIANCE_G3_FOLD_ROWS). libr4d's
-     * gemm_mxfp4a8_gated_gemv serves 1..8 rows and _gated_gemv_wide 9..64, each byte-identical to
-     * the GEMM row of its band (gemv, gemv_wide) followed by gelu_mul and quant_act_fp8. */
-    int64_t fold_max = 8;
     /* Calibration: gate|up's input and down's (this rank's columns). */
-    G3Tap       tap_gu{}, tap_dn{};
+    CalibTap    tap_gu{}, tap_dn{};
     const bool* tap_live = nullptr;
     /* Set before declare by a pipelined deployment, as Gemma3Attn's. */
     int             ar_overlap = 0;
@@ -681,11 +646,6 @@ struct Gemma3Mlp {
               bool ar_fused = false) const;
     void post(RadCtx* c, int64_t T) const {
         RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
-    }
-    /* The block's all-reduce alone, for a caller that issues it after something of its own (the
-     * step's read beside it, RADIANCE_G3_PF_EARLY). */
-    void ar(RadCtx* c, int64_t T) const {
-        if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     }
     /* The pipelined prefill: the block over rows [r0, r0 + n), its input pair already written, up
      * to the down projection; then the tail a piece at a time on the second lane. */
@@ -745,6 +705,10 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                    {w.gu}, {ln_down.q8, ln_down.s8});
     // Not under calibration either: the down tap reads the bf16 product, which the fold never writes.
     {
+        /* libr4d folds 1..8 rows (gemm_mxfp4a8_gated_gemv) and, from K 2688, 9..64
+         * (_gated_gemv_wide), each byte-identical to its band's GEMM row followed by gelu_mul and
+         * quant_act_fp8. At 2-8 sequences with speculation a decode step is 16-64 rows. */
+        const int64_t fold_max = ln_gu.K >= 2688 ? 64 : 8;
         const int64_t hi = g.max_tok < fold_max ? g.max_tok : fold_max;
         // G3Linear's mx is linear_is_mxfp4, never a rotated (ParoQuant) weight, so one part.
         if (ln_gu.mx && ln_down.mx && !ln_down.shared_in && !calib_dir() && hi > 0 &&
@@ -797,7 +761,7 @@ void Gemma3Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
             ln_gu.step(c, w.h, w.gu, T);
         else if (!ln_gu.shared_in)
             RAD_ISSUE_N(c, ln_gu.op_q, T, brows(w.h, T), brows(ln_gu.q8, T), brows(ln_gu.s8, T));
-        tap_gu.step(c, w.h, T, tap_live);
+        tap_gu.step(c, w.h, T, tap_live && *tap_live);
     }
     if (fold) {
         RAD_ISSUE_N(c, op_fold, T, brows(ln_gu.q8, T), brows(ln_gu.s8, T), RAD_W(ln_gu.w),
@@ -809,7 +773,7 @@ void Gemma3Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
         ln_down.gemm(c, w.h, T);
     } else {
         RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
-        tap_dn.step(c, w.ffn, T, tap_live);
+        tap_dn.step(c, w.ffn, T, tap_live && *tap_live);
         ln_down.step(c, w.ffn, w.h, T);
     }
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
@@ -929,69 +893,13 @@ struct G3JunctionFP8 {
 
 /* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h): a weight's first
  * kPrefetchBytes, on decode steps of up to kPrefetchStepRows rows (a verify of four sequences at
- * speculation 7, as qwen35_fp8's). TranslateGemma-27B MXFP4 + DFlash2 at tp 2 on 2x R9700 (Gen5 x8),
- * no speculation, two rounds each, x1 / x4 / x8 tok/s against none (56.8 / 182.0 / 325.0): 8 MB 63.3 /
- * 203.1 / 354.9; 12 MB 63.0 / 202.6 / 354.9; 16 MB 63.5 / 203.9 / 356.6; 20 MB 64.1 / 204.0 / 359.4;
- * 24 MB 64.4 / 206.4 / 359.3; 32 MB 63.1 / 201.4 / 351.9. Larger than qwen35_fp8's 12 MB: this
- * model's hidden width (5376) and weights are larger, so its all-reduces take longer and its GEMMs
- * read more; past ~24 MB the read outlasts the reduction and takes bandwidth from the GEMM it should
- * feed. With speculation 7 (three rounds, greedy, medians) x1 / x4 / x8 / x16 158.1 / 409.0 / 592.0 / 710.8 -> 177.3 / 428.4 / 592.3 / 717.6. The drafter's reads (Dflash2::Config::prefetch) take the same size. */
+ * speculation 7). TranslateGemma-27B MXFP4 + DFlash2, tp 2 on two R9700s: 24 MB was best, +13 %
+ * at one stream and +10 % at eight with no speculation, +12 % / +5 % at one / four streams with
+ * speculation 7. Larger than qwen35_fp8's 12 MB, since this model's wider all-reduces take longer;
+ * past ~24 MB the read outlasts the reduction and takes bandwidth from the GEMM it feeds. The
+ * drafter's reads (Dflash2::Config::prefetch) take the same size. */
 constexpr int64_t kPrefetchBytes    = (int64_t)24 << 20;
 constexpr int64_t kPrefetchStepRows = 32;
-
-/* A/B knobs over the decode steps, read at declare; unset, each is today's behaviour and the graph
- * and steps are the ones pinned before they existed (arch_test,
- * gemma3_served_knobs_at_their_defaults_keep_the_pinned_graph_and_steps).
- *
- *   RADIANCE_G3_PF_ROWS   the tallest decode step that reads beside its reductions (default
- *                         kPrefetchStepRows, 32, qwen35_fp8's). Eight sequences at speculation 7
- *                         verify 64 rows, and every all-reduce of such a step runs with the card's
- *                         memory idle (~5.8 ms eager a step on 2x R9700).
- *   RADIANCE_G3_PF_MIB    the read's size on the steps above 32 rows (default kPrefetchBytes, whose
- *                         sweep was at 1..32-row steps): a 64-row step's GEMMs are partly compute-
- *                         bound, so the size that fits beside its longer reduction may differ.
- *   RADIANCE_G3_PF_EARLY  1: issue the read between the GEMM and a bare (unfused) all-reduce
- *                         rather than after it. Above ar_wire_is_exact's rows the lossy wire's
- *                         all-reduce is issued by the block itself, so the read's join on lane 1
- *                         comes after the reduction and the read runs beside the post-norm, the
- *                         junction and the next GEMM, not beside the reduction. The fused steps
- *                         (exact wire) have it in front either way.
- *   RADIANCE_G3_FOLD_ROWS the gated fold's band (Gemma3Mlp::fold_max): 0 is today's 8; up to 64. */
-struct G3Knobs {
-    int64_t pf_rows  = kPrefetchStepRows;
-    int64_t pf_wide  = kPrefetchBytes;   /* bytes, steps of more than kPrefetchStepRows rows */
-    bool    pf_early = false;
-    int64_t fold     = 8;
-};
-
-/* An integer knob in [lo, hi], or `dflt` when unset; anything else is refused by name, so a typo
- * in an A/B does not silently measure the default. */
-static int g3_knob(const char* name, long long lo, long long hi, long long dflt, long long* out) {
-    *out = dflt;
-    const char* s = std::getenv(name);
-    if (!s || !*s) return RAD_OK;
-    char* end = nullptr;
-    const long long v = std::strtoll(s, &end, 10);
-    if (!end || *end != '\0' || v < lo || v > hi) {
-        fprintf(stderr, "radiance: gemma3: %s='%s' is not an integer in %lld..%lld\n", name, s, lo, hi);
-        return RAD_E_INVAL;
-    }
-    *out = v;
-    return RAD_OK;
-}
-
-static int g3_knobs(G3Knobs* k) {
-    long long v = 0;
-    RAD_ARCH_TRY(g3_knob("RADIANCE_G3_PF_ROWS", 1, 1 << 20, kPrefetchStepRows, &v));
-    k->pf_rows = v;
-    RAD_ARCH_TRY(g3_knob("RADIANCE_G3_PF_MIB", 1, 256, kPrefetchBytes >> 20, &v));
-    k->pf_wide = (int64_t)v << 20;
-    RAD_ARCH_TRY(g3_knob("RADIANCE_G3_PF_EARLY", 0, 1, 0, &v));
-    k->pf_early = v != 0;
-    RAD_ARCH_TRY(g3_knob("RADIANCE_G3_FOLD_ROWS", 0, 64, 0, &v));
-    k->fold = v == 0 ? 8 : v;
-    return RAD_OK;
-}
 
 struct Layer {
     bool       global = false;
@@ -999,12 +907,9 @@ struct Layer {
     Gemma3Mlp  mlp{};
     G3Junction j_am{}, j_ma{};
     G3JunctionFP8 jf_am{}, jf_ma{};
-    /* The reads beside the decode all-reduces: gate|up's leading bytes beside the attention block's
-     * reduction, the next layer's q's beside the feed-forward's. 0 where none is declared. The
-     * `_wide` pair serves the steps above kPrefetchStepRows rows; it is the narrow pair itself
-     * unless RADIANCE_G3_PF_MIB gives those steps another size. */
+    /* gate|up's leading bytes beside the attention block's reduction, the next layer's q's beside
+     * the feed-forward's; 0 where none is declared. */
     rad_op     op_pf_gu = 0, op_pf_next = 0;
-    rad_op     op_pf_gu_wide = 0, op_pf_next_wide = 0;
     rad_weight pf_gu_w = 0, pf_next_w = 0;
 };
 
@@ -1024,7 +929,6 @@ struct Model {
     rad_op op_embed = 0, op_embed_ar = 0, op_final = 0, op_gather = 0, op_logits = 0;
 
     std::vector<Layer> layers;
-    G3Knobs            knobs{};
 
     G3Junction j0{};
     bool       fuse = false;
@@ -1220,7 +1124,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.pipe_tbl) rad_dev_free(m.pipe_tbl, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope);
-    RAD_ARCH_TRY(g3_knobs(&m.knobs));
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
     /* The rotary scaling (linear, factor 8 on the 27B) into g.rope_scale, for the global class. */
     RAD_ARCH_TRY(yarn_from(m.g, meta, "", m.g.head_dim));
@@ -1377,7 +1280,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             lay.attn.ar_overlap = lay.mlp.ar_overlap = 1;
             lay.attn.pipe_in = lay.mlp.pipe_in = &m.pipe_in;
         }
-        lay.mlp.fold_max = m.knobs.fold;
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, attn_scale));
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw));
     }
@@ -1445,9 +1347,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         m.fuse_mx_ar = ar;
     }
-    /* ---- the weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h). Only at
-     * more than one rank; RADIANCE_PREFETCH_BESIDE=0 issues none (prefetch_beside). */
-    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+    /* ---- the weight reads beside the decode all-reduces, at more than one rank;
+     * --weight-prefetch off declares none. */
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
         for (int64_t l = 0; l < g.n_layer; ++l) {
             Layer& lay = m.layers[(size_t)l];
             lay.pf_gu_w  = lay.mlp.ln_gu.w;
@@ -1455,14 +1357,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (l + 1 < g.n_layer) {
                 lay.pf_next_w  = m.layers[(size_t)l + 1].attn.ln_q.w;
                 lay.op_pf_next = decl_prefetch(b, lay.pf_next_w, kPrefetchBytes);
-            }
-            /* A size of their own for the steps above kPrefetchStepRows, declared only when some
-             * step can take it, so an unused RADIANCE_G3_PF_MIB leaves the graph as it was. */
-            lay.op_pf_gu_wide = lay.op_pf_gu;
-            lay.op_pf_next_wide = lay.op_pf_next;
-            if (m.knobs.pf_rows > kPrefetchStepRows && m.knobs.pf_wide != kPrefetchBytes) {
-                lay.op_pf_gu_wide = decl_prefetch(b, lay.pf_gu_w, m.knobs.pf_wide);
-                if (lay.pf_next_w) lay.op_pf_next_wide = decl_prefetch(b, lay.pf_next_w, m.knobs.pf_wide);
             }
         }
     }
@@ -1502,26 +1396,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the calibration tap. It reads the bf16 input of every linear, which the fused junctions
      * never write, so under it none is declared (above): any container calibrates, unfused. */
     if (calib_dir()) {
-        m.calib_lo = 0;
-        m.calib_hi = g.n_layer;
-        if (const char* s = std::getenv("RADIANCE_G3_CALIB_LAYERS")) {
-            long long lo = 0, hi = 0;
-            int used = 0;
-            if (std::sscanf(s, "%lld:%lld%n", &lo, &hi, &used) != 2 || s[used] != '\0' || lo < 0 ||
-                hi > g.n_layer || lo >= hi) {
-                fprintf(stderr, "radiance: gemma3: RADIANCE_G3_CALIB_LAYERS '%s' is not lo:hi within "
-                                "0:%lld\n", s, (long long)g.n_layer);
-                return RAD_E_INVAL;
-            }
-            m.calib_lo = lo;
-            m.calib_hi = hi;
-        }
+        RAD_ARCH_TRY(calib_layers("gemma3", "RADIANCE_G3_CALIB_LAYERS", g.n_layer, &m.calib_lo,
+                                  &m.calib_hi));
         for (int64_t l = m.calib_lo; l < m.calib_hi; ++l) {
             Layer& lay = m.layers[(size_t)l];
-            RAD_ARCH_TRY(lay.attn.tap_in.declare(b, nm, g, nm.f("blk.%d.attn_in", (int)l), m.b_h, g.n_embd));
-            RAD_ARCH_TRY(lay.attn.tap_o.declare(b, nm, g, nm.f("blk.%d.attn_o", (int)l), m.b_attn, m.cs.q_dim()));
-            RAD_ARCH_TRY(lay.mlp.tap_gu.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up", (int)l), m.b_h, g.n_embd));
-            RAD_ARCH_TRY(lay.mlp.tap_dn.declare(b, nm, g, nm.f("blk.%d.ffn_down", (int)l), m.b_ffn, g.n_ff));
+            RAD_ARCH_TRY(lay.attn.tap_in.declare(b, nm, g.max_tok, nm.f("blk.%d.attn_in", (int)l), m.b_h, g.n_embd));
+            RAD_ARCH_TRY(lay.attn.tap_o.declare(b, nm, g.max_tok, nm.f("blk.%d.attn_o", (int)l), m.b_attn, m.cs.q_dim()));
+            RAD_ARCH_TRY(lay.mlp.tap_gu.declare(b, nm, g.max_tok, nm.f("blk.%d.ffn_gate_up", (int)l), m.b_h, g.n_embd));
+            RAD_ARCH_TRY(lay.mlp.tap_dn.declare(b, nm, g.max_tok, nm.f("blk.%d.ffn_down", (int)l), m.b_ffn, g.n_ff));
         }
         m.calib = true;
         m.tap_live = true;
@@ -1783,11 +1665,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * m.g.n_embd, brows(m.b_x, T), RAD_NONE);
 
-    /* The reads beside the reductions go on decode steps of up to RADIANCE_G3_PF_ROWS rows
-     * (kPrefetchStepRows by default), none on a step that carries a prompt's rows (as
-     * qwen35_fp8's); the steps above kPrefetchStepRows take the `_wide` reads. */
-    const int64_t pf_h = batch->phase == RAD_PHASE_DECODE && T <= m.knobs.pf_rows ? 1 : INT64_MAX;
-    const bool pf_wide = T > kPrefetchStepRows;
+    /* Decode steps of up to kPrefetchStepRows rows only, as qwen35_fp8's. */
+    const int64_t pf_h = batch->phase == RAD_PHASE_DECODE && T <= kPrefetchStepRows ? 1 : INT64_MAX;
     if (m.fuse_mx) {
         /* MXFP4 trunk: [post-norm, then add + next norm + quantiser as one op] at every junction;
          * the last block's tail runs unfused into the final norm. */
@@ -1797,20 +1676,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
             const bool last = li + 1 == m.layers.size();
             /* Per step: the fused junction sends the exact wire only (G3JunctionFP8::op_ar). */
             const bool far = m.fuse_mx_ar && ar_wire_is_exact(m.g, T);
-            /* RADIANCE_G3_PF_EARLY: a bare all-reduce issued here, behind the read, rather than by
-             * the block (the last feed-forward, with no read after it, keeps its own). */
-            const bool early = m.knobs.pf_early && !far;
-            const rad_op pf_gu = pf_wide ? l.op_pf_gu_wide : l.op_pf_gu;
-            const rad_op pf_next = pf_wide ? l.op_pf_next_wide : l.op_pf_next;
-            l.attn.step(c, batch, true, true, far || early);
-            prefetch_beside(c, pf_gu, l.pf_gu_w, pf_h);
-            if (early) l.attn.ar(c, T);
+            l.attn.step(c, batch, true, true, far);
+            prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
             if (!far) l.attn.post(c, T);
             l.jf_am.step(c, T, far);
-            l.mlp.step(c, batch, true, !last, far || early);
-            prefetch_beside(c, pf_next, l.pf_next_w, pf_h);
+            l.mlp.step(c, batch, true, !last, far);
+            prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
             if (!last) {
-                if (early) l.mlp.ar(c, T);
                 if (!far) l.mlp.post(c, T);
                 l.jf_ma.step(c, T, far);
             }
@@ -1823,10 +1695,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const bool last = li + 1 == m.layers.size();
         const bool ar = m.fuse_ar && ar_wire_is_exact(m.g, T);   /* exact wire only, as above */
         l.attn.step(c, batch, m.fuse, m.fuse, ar);
-        prefetch_beside(c, pf_wide ? l.op_pf_gu_wide : l.op_pf_gu, l.pf_gu_w, pf_h);
+        prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
         if (m.fuse) l.j_am.step(c, T, ar);
         l.mlp.step(c, batch, m.fuse, m.fuse && !last, ar);
-        prefetch_beside(c, pf_wide ? l.op_pf_next_wide : l.op_pf_next, l.pf_next_w, pf_h);
+        prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
         if (m.fuse && !last) l.j_ma.step(c, T, ar);
         tap(li);
     }

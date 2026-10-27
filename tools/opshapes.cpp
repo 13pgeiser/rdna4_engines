@@ -154,17 +154,13 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         add((uint32_t)RAD_F32, {M, (n + group - 1) / group});
     }
     else if (op == "gemm_nt_q") {
-        /* Block-scaled fp8, mxfp4 and the 2-bit asymmetric grid. `gemm_nt_q` covers six weight
-         * formats whose scale grids (per row, per row-group, per output-row-block, e8m0 exponents,
-         * zero points, reference exponents) belong to the reading kernel, not the schema. The fp8
-         * grid is fixed by the checkpoint: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)]
-         * scale plane, `group` being the 128. libref describes the symmetric integer grids, so a
-         * tool takes those from its hook and never reaches this table for them; every grid with a
-         * zero point is declined there (ref_planes.h joins scale and zero into one operand a
-         * description cannot state), and the ones named here are sized from the kernel's own
-         * stored layout instead. Anything else is skipped and counted.
-         *
-         * `a_sum` and `b_ref` belong to the asymmetric-integer and mxfp4 grids. */
+        /* Block-scaled fp8, mxfp4 and the 2-bit asymmetric grid, sized from each kernel's stored layout.
+         * `gemm_nt_q`'s scale grids belong to the reading kernel, not the schema. The fp8 grid is the
+         * checkpoint's: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)] scale plane, `group` 128.
+         * libref describes the symmetric integer grids, so a tool takes those from its hook; a grid
+         * with a zero point is declined there (ref_planes.h joins scale and zero into one operand).
+         * Anything else is skipped and counted. `a_sum` and `b_ref` belong to the asymmetric-integer
+         * and mxfp4 grids. */
         const char* q = g.get_s("dtype");
         /* OCP-MXFP4: e2m1 codes with one E8M0 exponent per 32 of K (`group` 32), against the fp8
          * activation pair (E4M3 plus an f32 scale per row and 128 of K, as LinearFP8 feeds it).

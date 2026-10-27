@@ -205,12 +205,10 @@ with the decode row at those rows. Within the family a row's bits do not depend 
 `gemv`'s K order), the bf16 product and row amaxes in the op's scratch; the last of a 128-column
 group's blocks to arrive (a counter keyed on the output) writes the group's codes and scales. Byte
 for byte `gemm_mxfp4a8_gemv` followed by `gated_quant_fp8`, or by `gelu_mul` and `quant_act_fp8`
-(`r4d_selftest`, M = 1..8, Qwen's and TranslateGemma's gate_up). A decode step of Qwen3.8-27B
-at TP2 issues 631 kernels a card, and a dependent kernel costs 3.5-6.4 µs in a replayed graph on
-gfx1201 however little it does, so the launch it saves is the point. TranslateGemma 27B alone,
-one stream at speculation 7: 144.5 / 144.9 → 151.5 / 150.5 tok/s, measured with the first form of
-this row (a block per 128-column group, the same bytes); the tile-pair form, Qwen3.8-27B without
-speculation x1 / x4 / x8 +1.4 / +1.8 / +1.5 %.
+(`r4d_selftest`, M = 1..8, Qwen's and TranslateGemma's gate_up). It saves a launch: a dependent
+kernel costs 3.5-6.4 µs in a replayed graph on gfx1201 however little it does, and a Qwen3.8-27B
+TP2 decode step issues 631 a card. About +1.5 % at one to eight streams on Qwen3.8-27B, +4.5 % on
+TranslateGemma 27B at speculation 7.
 
 **`gemm_mxfp4a8_gated_gemv_wide`** (`gemm_nt_q_gated_mx`, 9 ≤ M ≤ 64, K a multiple of 128 and at
 least 2688, N of 256, the same `act` rule). The fold over `gemv_wide`, the GEMM row of that band:
@@ -223,13 +221,14 @@ then the narrow row's epilogue. Byte for byte `gemm_mxfp4a8_gemv_wide` followed 
 or by `gelu_mul` and `quant_act_fp8` (`r4d_selftest`, M = 9..64). No spills: 101 / 137 / 166 / 196
 VGPRs at one to four row tiles (per-(row, 128) activation scale), against `gemv_wide`'s 131 / 160 / 190
 at two to four tiles and two columns. K from 2688 keeps it out of `decode_shortk`'s corner, where the
-unfused GEMM sums 33..64 rows in the decode kernel's order. gemma3 declares it up to
-RADIANCE_G3_FOLD_ROWS rows (default 8, i.e. not at all).
+unfused GEMM sums 33..64 rows in the decode kernel's order. gemma3 declares the fold up to 64 rows
+where K reaches it, which at two to eight TranslateGemma streams with speculation 7 is 2-5 % more
+throughput than the unfused three past 8 rows.
 
 **Tunables.** `gemv`, `gemv_wide` and `gated_gemv` have none, so a `RADIANCE_TUNE` pin on
-`gemm_nt_q` passes them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of
-those reaches both. A pin applies to every row serving the op, and an axis a serving row lacks
-stops startup by name.
+`gemm_nt_q` passes them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the
+rule), so a pin of those reaches both. A pin applies to every row serving the op, and an axis a
+serving row lacks stops startup by name.
 
 ## The OCP-MXFP4 tiled GEMM (prefill)
 

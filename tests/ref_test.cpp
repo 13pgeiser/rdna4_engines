@@ -967,7 +967,8 @@ TEST(op_vocabulary) {
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
-        "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
+        "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
+        "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
         "fill",
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
@@ -987,10 +988,11 @@ TEST(op_vocabulary) {
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
-        "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
+        "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "qk_norm_rope", "qsa_block_key",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
-        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
+        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -1023,7 +1025,8 @@ TEST(op_vocabulary) {
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
-        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "patch_unfold", "vtile_gather",
+        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "flow_res_multistep", "patch_unfold",
+        "vtile_gather",
         "vtile_stitch", "grid_pos3", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
@@ -1031,7 +1034,10 @@ TEST(op_vocabulary) {
         /* Its latent upscaler: the 3-D and temporal convolutions, the group norm, the resize,
          * the fold back into patch rows and the re-noising. */
         "conv3d_ndhwc", "group_norm", "tconv_dw", "resize_bilinear", "patch_fold",
-        "flow_renoise",
+        "flow_renoise", "cond_aug",
+        /* Its encoder's tiling for one-frame media bigger than a tile: the plan, the cut and
+         * the moments' blend back into the latent canvas. */
+        "vtile_plan", "vtile_crop", "vtile_join",
         /* The joint image generators' (Krea 2, FLUX.3): attention over separate key bounds, a
          * per-layer table added to every row, a learned mix of consecutive rows, and the VAE's
          * channel statistics. */
@@ -3396,6 +3402,18 @@ TEST(op_pool_rows) {
     CHECK(run("pool_rows", bad) < 0);
 }
 
+/* pool_cols: the mean of every k columns of a row, rounded, then the multiplier. */
+TEST(op_pool_cols) {
+    T x(RAD_F32, {2, 4}); x.f({ 1, 2,  3, 4,  5, 6,  7, 9 });
+    T y(RAD_F32, {2, 2});
+    A a; a.t(x).t(y).i("M", 2).i("n", 4).i("k", 2).d("mult", 2.0).s("dtype", "f32");
+    CHECK_OK(run("pool_cols", a));
+    CHECK_NEAR(y.at(0), 3.0f, 1e-6);  CHECK_NEAR(y.at(1), 7.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 11.0f, 1e-6); CHECK_NEAR(y.at(3), 16.0f, 1e-6);
+    A bad; bad.t(x).t(y).i("M", 2).i("n", 4).i("k", 3).s("dtype", "f32");
+    CHECK(run("pool_cols", bad) < 0);
+}
+
 /* rmsnorm with no gain: a unit gain. */
 TEST(op_rmsnorm_no_gain) {
     T x(RAD_F32, {1, 2}); x.f({ 3, 4 });
@@ -3513,6 +3531,148 @@ TEST(op_kv_store_reads_the_row_stride_and_not_the_shape) {
     /* Nothing reached the query columns and nothing reached the unmapped fourth slot. */
     CHECK_EQ(qkv.at(0), 90.0f);
     CHECK_EQ(kv.at(12), 0.0f); CHECK_EQ(kv.at(15), 0.0f);
+}
+
+/* The E4M3 byte a value stores as. The mirror is a byte plane, so `T::at` on it reads the byte and
+ * not the value; comparing a mirror byte to a ring element needs the byte both sides are. */
+static int e4m3_byte(float x) {
+    T t(RAD_F8E4M3, {1});
+    t.f({ x });
+    return (int)(uint8_t)t.mem[0];
+}
+
+/* kv_store_streamed: the group's host mirror is written for every token with a slot, and the ring
+ * slot only when the residency map says the block is resident. The two planes are the same paged
+ * layout, so a token's bytes land at the same offset in either.
+ *
+ * The case that decides the design: block 0 is NOT resident and block 1 is, and one token lands in
+ * each. Block 1's token must reach both copies (the ring's copy of a resident block would otherwise
+ * fall behind, and the resolve does not re-copy a resident block); block 0's must reach the mirror
+ * only, leaving the ring untouched until a resolve copies the whole block in. */
+TEST(op_kv_store_streamed_writes_the_mirror_always_and_the_ring_when_resident) {
+    /* head_dim 2, one kv head, block_size 2: a block row is [kv_heads, block_size, 2 * head_dim]
+     * = 8 bytes, K then V inside a position. */
+    T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
+    T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
+    T sm(RAD_I32, {2});       sm.n({ 0, 3 });        /* block 0 offset 0, block 1 offset 1 */
+    T res(RAD_I32, {2});      res.n({ -1, 0 });      /* block 0 absent, block 1 in ring slot 0 */
+    T host(RAD_U8, {2, 8});
+    T kv(RAD_F8E4M3, {1, 1, 2, 4});                  /* one ring slot, one block deep */
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "fp8_e4m3");
+    CHECK_OK(run("kv_store_streamed", a));
+    /* Token 0, block 0, position 0: K then V, mirror only. */
+    CHECK_EQ((int)host.at(0), e4m3_byte(1.0f)); CHECK_EQ((int)host.at(1), e4m3_byte(2.0f));
+    CHECK_EQ((int)host.at(2), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(3), e4m3_byte(4.0f));
+    /* Token 1, block 1, position 1: both planes, at the same in-block offset, so the same bytes. */
+    CHECK_EQ((int)host.at(12), e4m3_byte(5.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(6.0f));
+    CHECK_EQ((int)host.at(14), e4m3_byte(7.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(8.0f));
+    CHECK_EQ((int)host.at(12), e4m3_byte(kv.at(4)));
+    CHECK_EQ((int)host.at(13), e4m3_byte(kv.at(5)));
+    CHECK_EQ((int)host.at(14), e4m3_byte(kv.at(6)));
+    CHECK_EQ((int)host.at(15), e4m3_byte(kv.at(7)));
+    /* Nothing else: block 0 has no slot, so its ring stays as it was, and block 1's position 0 is
+     * another token's. */
+    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);
+    for (int i = 4; i < 12; ++i) CHECK_EQ(host.at(i), 0.0f);
+}
+
+/* The bf16 streamed store: both planes hold the values themselves, two bytes an element, exactly
+ * as kv_store_bf16 writes them. The descales are fp8-only, so a bf16 call with a non-1 k_scale
+ * still stores the value (this is the difference from the E4M3 row, and the reason the fused bf16
+ * fold passes the prologue's bf16 bytes straight through). */
+TEST(op_kv_store_streamed_bf16_writes_the_values_into_both_planes) {
+    T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
+    T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
+    T sm(RAD_I32, {2});       sm.n({ 0, 3 });        /* block 0 offset 0, block 1 offset 1 */
+    T res(RAD_I32, {2});      res.n({ -1, 0 });      /* block 0 absent, block 1 in ring slot 0 */
+    T host(RAD_U8, {2, 16});                         /* 1 kv head, 2 positions, 2*hd=4, bf16 */
+    T kv(RAD_BF16, {1, 1, 2, 4});                    /* one ring slot, one block deep */
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "bf16").d("k_scale", 0.5).d("v_scale", 2.0);
+    CHECK_OK(run("kv_store_streamed", a));
+    auto at16 = [](const std::vector<uint8_t>& m, size_t i) {
+        return (unsigned)((unsigned)m[i] | ((unsigned)m[i + 1] << 8));
+    };
+    /* Token 0, block 0: mirror only, the values themselves. */
+    CHECK_EQ(at16(host.mem, 0), (unsigned)f32_to_bf16(1.0f));
+    CHECK_EQ(at16(host.mem, 2), (unsigned)f32_to_bf16(2.0f));
+    CHECK_EQ(at16(host.mem, 4), (unsigned)f32_to_bf16(3.0f));
+    CHECK_EQ(at16(host.mem, 6), (unsigned)f32_to_bf16(4.0f));
+    /* Token 1, block 1 position 1: both planes at the same in-block offset. */
+    CHECK_EQ(at16(host.mem, 24), (unsigned)f32_to_bf16(5.0f));
+    CHECK_EQ(at16(host.mem, 26), (unsigned)f32_to_bf16(6.0f));
+    CHECK_EQ(at16(host.mem, 28), (unsigned)f32_to_bf16(7.0f));
+    CHECK_EQ(at16(host.mem, 30), (unsigned)f32_to_bf16(8.0f));
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ(kv.mem[i], 0);       /* block 0 wrote no slot */
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ((int)kv.mem[8 + i], (int)host.mem[24 + i]);
+}
+
+/* A block absent from the ring is written to the mirror alone, whatever the map holds: this is the
+ * state every token of a block's first step is in, and the resolve copies the whole block in. */
+TEST(op_kv_store_streamed_a_block_with_no_slot_reaches_only_the_mirror) {
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 2, 4 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 6, 8 });
+    T sm(RAD_I32, {1});       sm.n({ 3 });           /* block 1, position 1 */
+    T res(RAD_I32, {2});      res.n({ -1, -1 });
+    T host(RAD_U8, {2, 8});
+    T kv(RAD_F8E4M3, {1, 1, 2, 4});
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "fp8_e4m3").
+          d("k_scale", 0.5).d("v_scale", 2.0);      /* the store divides by the reader's descal */
+    CHECK_OK(run("kv_store_streamed", a));
+    CHECK_EQ((int)host.at(12), e4m3_byte(4.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(8.0f));
+    CHECK_EQ((int)host.at(14), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(4.0f));
+    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);       /* the ring is untouched */
+}
+
+/* The refusals libref makes before its first write: a slot naming a block past the mirror, a
+ * residency entry outside [-1, slots), and a mirror row wider than the block. Nothing is written on
+ * any of them - a half-written mirror is what the next step's copies would believe. */
+TEST(op_kv_store_streamed_refuses_a_state_fault_before_writing) {
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 1, 2 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 3, 4 });
+
+    /* A map entry naming a slot the ring does not have. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 0 });
+        T res(RAD_I32, {2}); res.n({ 1, -1 });       /* slot 1 of a one-slot ring */
+        T host(RAD_U8, {2, 8});
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_INVAL);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+    }
+    /* A slot naming a block past the mirror's extent. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 4 });            /* block 2 of a two-block mirror */
+        T res(RAD_I32, {2}); res.n({ -1, -1 });
+        T host(RAD_U8, {2, 8});
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_SHAPE);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+    }
+    /* A mirror row that is not the block's byte pitch: a copy into it would spill over the next
+     * block. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 0 });
+        T res(RAD_I32, {2}); res.n({ -1, -1 });
+        T host(RAD_U8, {2, 8});
+        host.t.stride[0] = 12;                       /* a padded row */
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_STRIDE);
+    }
 }
 
 TEST(op_rope) {
@@ -5931,6 +6091,17 @@ TEST(timestep_embed_is_cos_then_sin_of_the_scaled_time) {
     CHECK_OK(run("timestep_embed", b));
     CHECK_NEAR(y2.at(0), std::cos(300.78125), 1e-5);
     CHECK_NEAR(y2.at(1), std::sin(300.78125), 1e-5);
+
+    /* clamp_min raises a timestep below it to it before the embedding (the pinned references'
+     * near-clean timestep). h = n/2 = 1, so f_0 = 1 and the row is [cos | sin](t'). Row 0's t is
+     * below the floor and is embedded at it; row 1's is above and is embedded as it is. */
+    T t3(RAD_F32, {2}); t3.f({0.05f, 1.0f});
+    T y3(RAD_F32, {2, 2});
+    A c; c.t(t3).t(y3).i("M", 2).i("n", 2).d("scale", 1.0).d("max_period", 100.0)
+           .d("clamp_min", 0.999).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed", c));
+    CHECK_NEAR(y3.at(0), std::cos(0.999), 1e-6); CHECK_NEAR(y3.at(1), std::sin(0.999), 1e-6);
+    CHECK_NEAR(y3.at(2), std::cos(1.0), 1e-6);   CHECK_NEAR(y3.at(3), std::sin(1.0), 1e-6);
 }
 
 /* gather_rows2: idx >= 0 reads a, idx < 0 reads b[-1 - idx], and a row past either source is
@@ -6545,6 +6716,71 @@ TEST(rms_mod_rounds_each_step_and_reads_shift_then_scale) {
     CHECK_EQ(run("rms_mod", c), RAD_E_SHAPE);
 }
 
+/* The optional column map: sequences that share a modulation cell read one table row, and the
+ * gate and table may hold fewer rows than there are sequences. A mapped run must equal the same
+ * computation with the rows laid out in sequence order and no map. */
+TEST(rms_mod_column_map_redirects_sequences_to_table_columns) {
+    const std::vector<float> yv = { 2, -4, 2, -4, 2, -4 };
+    T w(RAD_BF16, {2}); w.f({1.5f, 0.75f});
+    T cu(RAD_I32, {3}); cu.n({0, 1, 3});         /* row 0 is sequence 0, rows 1-2 sequence 1 */
+    /* Mapped: columns {B, A} read by sequences {1, 0} -- A's shift/scale/gate land on sequence 0,
+     * B's on the rest, exactly the identity run's pairing with the table rows swapped. */
+    T sA(RAD_BF16, {2, 4}); sA.f({0, 0.5f, 0.00390625f, 0,   0.125f, 1, 0.5f, 0.25f});
+    T gA(RAD_BF16, {2, 2}); gA.f({0, 0,  0.5f, 0.25f});
+    T cm(RAD_I32, {2}); cm.n({1, 0});
+    T y(RAD_BF16, {3, 2}); y.f(yv);
+    T x1(RAD_BF16, {3, 2}); x1.f({1, -1, 1, -1, 1, -1});
+    T z1(RAD_BF16, {3, 2});
+    A a; a.t(y).t(gA).t(sA).t(w).t(cu).t(x1).t(z1).t(cm).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", a));
+    CHECK_EQ(x1.at(0), 2.0f); CHECK_EQ(x1.at(1), -2.0f);          /* sequence 0: A's gate */
+    CHECK_EQ(z1.at(0), 2.375f); CHECK_EQ(z1.at(1), 0.0625f);      /* sequence 0: A's row */
+    CHECK_EQ(z1.at(2), 1.5f);   CHECK_EQ(z1.at(3), -0.25f);       /* rows 1-2: B, ungated */
+    CHECK_EQ(z1.at(4), 1.5f);   CHECK_EQ(z1.at(5), -0.25f);
+
+    /* The same output with no map, columns in sequence order. */
+    T sB(RAD_BF16, {2, 4}); sB.f({0.125f, 1, 0.5f, 0.25f,  0, 0.5f, 0.00390625f, 0});
+    T gB(RAD_BF16, {2, 2}); gB.f({0.5f, 0.25f,  0, 0});
+    T x2(RAD_BF16, {3, 2}); x2.f({1, -1, 1, -1, 1, -1});
+    T z2(RAD_BF16, {3, 2});
+    A b; b.t(y).t(gB).t(sB).t(w).t(cu).t(x2).t(z2).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", b));
+    CHECK(x1.mem == x2.mem);
+    CHECK(z1.mem == z2.mem);
+
+    /* One column for two sequences: the map makes a smaller-than-sequences gate and table legal,
+     * and without the map the same call is refused. */
+    T s1(RAD_BF16, {1, 4}); s1.f({0.125f, 1, 0.5f, 0.25f});
+    T g1(RAD_BF16, {1, 2}); g1.f({0.5f, 0.25f});
+    T cm1(RAD_I32, {2}); cm1.n({0, 0});
+    T x3(RAD_BF16, {3, 2}); x3.f({1, -1, 1, -1, 1, -1});
+    T z3(RAD_BF16, {3, 2});
+    A d; d.t(y).t(g1).t(s1).t(w).t(cu).t(x3).t(z3).t(cm1).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", d));
+    for (int64_t r = 0; r < 3; ++r) {
+        CHECK_EQ(z3.at(2 * r), 2.375f);
+        CHECK_EQ(z3.at(2 * r + 1), 0.0625f);
+    }
+    A e; e.t(y).t(g1).t(s1).t(w).t(cu).t(x3).t(z3).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", e), RAD_E_SHAPE);
+
+    /* A map that is not i32, or shorter than the sequence count, is refused. */
+    T cmf(RAD_F32, {2}); cmf.f({1, 0});
+    T x4(RAD_BF16, {3, 2}); x4.f({1, -1, 1, -1, 1, -1});
+    T z4(RAD_BF16, {3, 2});
+    A f; f.t(y).t(gA).t(sA).t(w).t(cu).t(x4).t(z4).t(cmf).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", f), RAD_E_SHAPE);
+    T cms(RAD_I32, {1}); cms.n({1});
+    A g; g.t(y).t(gA).t(sA).t(w).t(cu).t(x4).t(z4).t(cms).i("M", 3).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", g), RAD_E_SHAPE);
+}
+
 /* rms_mod_quant_fp8 is rms_mod with its chain in bf16 and quant_act_fp8 over that row: the same
  * bytes in x, z, the codes and the scales as the pair. */
 TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
@@ -6573,6 +6809,43 @@ TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
     T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2});
     A d; d.t(z2).t(q2).t(sc2).i("M", 2).i("n", n).i("group", 2).s("dtype", "bf16");
     CHECK_OK(run("quant_act_fp8", d));
+    CHECK(x1.mem == x2.mem);
+    CHECK(z1.mem == z2.mem);
+    CHECK(q1.mem == q2.mem);
+    CHECK(sc1.mem == sc2.mem);
+}
+
+/* The quant form takes the column map at its own trailing slot (9): the same run, both per-column
+ * operands' rows swapped, the sequences redirected to each other's column, matches byte for byte. */
+TEST(rms_mod_quant_fp8_takes_the_column_map_too) {
+    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
+    const std::vector<float> gv = { 0, 0.5f, 2, -1, 0.5f, 1, -1, 2 };
+    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
+    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2,
+                                    0, 1, -1, 0.5f, 0.125f, 0.25f, 0.5f, 1 };
+    const int64_t n = 4;
+    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
+    T y(RAD_BF16, {2, n}); y.f(yv);
+    T g(RAD_BF16, {2, n}); g.f(gv);
+    T s(RAD_BF16, {2, 2 * n}); s.f(sv);
+    T w(RAD_BF16, {n}); w.f({1, 0.5f, 2, 0.75f});
+    T x1(RAD_BF16, {2, n}); x1.f(xv);
+    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
+    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x1).t(q1).t(sc1).t(z1)
+          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod_quant_fp8", a));
+
+    T gs(RAD_BF16, {2, n});
+    gs.f({ gv[4], gv[5], gv[6], gv[7], gv[0], gv[1], gv[2], gv[3] });
+    T ss(RAD_BF16, {2, 2 * n});
+    ss.f({ sv[8], sv[9], sv[10], sv[11], sv[12], sv[13], sv[14], sv[15],
+           sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7] });
+    T cm(RAD_I32, {2}); cm.n({1, 0});
+    T x2(RAD_BF16, {2, n}); x2.f(xv);
+    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2}), z2(RAD_BF16, {2, n});
+    A b; b.t(y).t(gs).t(ss).t(w).t(cu).t(x2).t(q2).t(sc2).t(z2).t(cm)
+          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod_quant_fp8", b));
     CHECK(x1.mem == x2.mem);
     CHECK(z1.mem == z2.mem);
     CHECK(q1.mem == q2.mem);
@@ -6781,6 +7054,243 @@ TEST(grid_pos3_places_each_tile_token_and_zeroes_the_rest) {
     CHECK_EQ(at3(2, 29), 1.5f);
 }
 
+/* ================================================================== the tiled encoder
+ * docs/OPS.md "Video generation", the tiled encoder: vae.py's split over a one-frame plane, the
+ * plane cut into tiles, and the per-tile moments blended back with the RAW neighbours. */
+
+/* 640 x 320 px in latent units is 40 x 20: the rows split at 0, 12, 24 and the columns at 0, 4
+ * -- six tiles, every one 16 latents a side (256 px). Level L's volume is the tile over
+ * 2^min(L,4) pixels a side, and a plane smaller than one tile is one short tile (vae.py's
+ * ([0], [len], [])), 128 x 96 px here with levels down to 8 x 6. */
+TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
+    T geom(RAD_I32, {3}); geom.n({1, 640, 320});
+    T y(RAD_I32, {6, 22});
+    A a; a.t(geom).t(y).i("M", 6).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", a));
+    const int64_t y0[6] = { 0, 0, 192, 192, 384, 384 }, x0[6] = { 0, 64, 0, 64, 0, 64 };
+    for (int64_t t = 0; t < 6; ++t) {
+        CHECK_EQ(y.iat(t * 22 + 0), y0[t]);
+        CHECK_EQ(y.iat(t * 22 + 1), x0[t]);
+        CHECK_EQ(y.iat(t * 22 + 2), 256);
+        CHECK_EQ(y.iat(t * 22 + 3), 256);
+        const int64_t d[6] = { 1, 2, 4, 8, 16, 16 };
+        for (int L = 0; L < 6; ++L) {
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 0), 1);
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 1), 256 / d[L]);
+            CHECK_EQ(y.iat(t * 22 + 4 + 3 * L + 2), 256 / d[L]);
+        }
+    }
+    T g1(RAD_I32, {3}); g1.n({1, 128, 96});
+    T y1(RAD_I32, {1, 22});
+    A b; b.t(g1).t(y1).i("M", 1).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", b));
+    const int64_t lone[22] = { 0, 0, 128, 96,   1, 128, 96,   1, 64, 48,   1, 32, 24,
+                               1, 16, 12,   1, 8, 6,   1, 8, 6 };
+    for (int i = 0; i < 22; ++i) CHECK_EQ(y1.iat(i), lone[i]);
+
+    /* A 96 x 768 px plane: one short row band (6 latents) and 48 latents a row, split at 0, 10,
+     * 21, 32 -- the slack of 4 going to the overlaps one at a time round-robin (6, 5, 5),
+     * so the last column still runs the full 16 latents to the plane's edge. A short band only
+     * ever stands alone on its axis, but it still has the other axis' neighbours. */
+    T g3(RAD_I32, {3}); g3.n({1, 96, 768});
+    T y3(RAD_I32, {4, 22});
+    A e; e.t(g3).t(y3).i("M", 4).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", e));
+    const int64_t x3[4] = { 0, 160, 336, 512 };
+    for (int64_t t = 0; t < 4; ++t) {
+        CHECK_EQ(y3.iat(t * 22 + 0), 0);
+        CHECK_EQ(y3.iat(t * 22 + 1), x3[t]);
+        CHECK_EQ(y3.iat(t * 22 + 2), 96);
+        CHECK_EQ(y3.iat(t * 22 + 3), 256);
+        const int64_t d[6] = { 1, 2, 4, 8, 16, 16 };
+        for (int L = 0; L < 6; ++L) {
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 0), 1);
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 1), 96 / d[L]);
+            CHECK_EQ(y3.iat(t * 22 + 4 + 3 * L + 2), 256 / d[L]);
+        }
+    }
+
+    /* A row count that is not the tile count, and a plane the ratio does not divide. */
+    T y2(RAD_I32, {5, 22});
+    A c; c.t(geom).t(y2).i("M", 5).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", c), RAD_E_SHAPE);
+    T g2(RAD_I32, {3}); g2.n({1, 100, 96});
+    A d; d.t(g2).t(y1).i("M", 1).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound (m.tiles), never to this call: a ceiling above the
+     * tiles plans the same rows, and a y that cannot hold them is still refused. */
+    T yb(RAD_I32, {6, 22});
+    A f; f.t(geom).t(yb).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", f));
+    for (int64_t t = 0; t < 6; ++t) CHECK_EQ(yb.iat(t * 22 + 0), y0[t]);
+    T ys(RAD_I32, {5, 22});
+    A g; g.t(geom).t(ys).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_EQ(run("vtile_plan", g), RAD_E_SHAPE);
+}
+
+/* A 20 x 20 px plane in ratio 4, tiles of 3 latents (12 px) with overlap 1: each axis splits at
+ * 0 and 2 -- four tiles of 12 x 12 px, 576 rows, tile-major (row band first). x holds
+ * (Y, X, Y W + X) per row, so every tile row says which plane pixel it cut. */
+TEST(vtile_crop_cuts_the_plane_tile_major) {
+    T x(RAD_F32, {400, 3});
+    std::vector<float> xv(1200);
+    for (int64_t i = 0; i < 400; ++i)
+        xv[(size_t)i * 3] = (float)(i / 20), xv[(size_t)i * 3 + 1] = (float)(i % 20),
+        xv[(size_t)i * 3 + 2] = (float)i;
+    x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 20, 20});
+    T y(RAD_F32, {576, 3});
+    A a; a.t(x).t(geom).t(y).i("M", 576).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", a));
+    const int64_t sy[2] = { 0, 8 }, sx[2] = { 0, 8 };   /* latent starts 0 and 2, in px */
+    for (int64_t i = 0; i < 2; ++i)
+        for (int64_t j = 0; j < 2; ++j) {
+            const int64_t off = (i * 2 + j) * 144;
+            for (int64_t k = 0; k < 144; ++k) {
+                const int64_t py = sy[i] + k / 12, pxx = sx[j] + k % 12;
+                CHECK_EQ(y.at((off + k) * 3 + 0), (float)py);
+                CHECK_EQ(y.at((off + k) * 3 + 1), (float)pxx);
+                CHECK_EQ(y.at((off + k) * 3 + 2), (float)(py * 20 + pxx));
+            }
+        }
+
+    /* A plane whose row axis is below one tile and whose column axis is not: one short row band
+     * with two column neighbours -- 8 x 20 px in ratio 4 is 2 x 5 latents, columns at 0 and 2
+     * (8 px), so two tiles of 8 x 12 px, 192 rows, the overlap column range cut twice. */
+    T g4(RAD_I32, {3}); g4.n({1, 8, 20});
+    T x4(RAD_F32, {160, 3});
+    std::vector<float> x4v(480);
+    for (int64_t i = 0; i < 160; ++i)
+        x4v[(size_t)i * 3] = (float)(i / 20), x4v[(size_t)i * 3 + 1] = (float)(i % 20),
+        x4v[(size_t)i * 3 + 2] = (float)i;
+    x4.f(x4v);
+    T y4(RAD_F32, {192, 3});
+    A e4; e4.t(x4).t(g4).t(y4).i("M", 192).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", e4));
+    for (int64_t j = 0; j < 2; ++j)
+        for (int64_t k = 0; k < 96; ++k) {
+            const int64_t py = k / 12, pxx = 8 * j + k % 12;
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 0), (float)py);
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 1), (float)pxx);
+            CHECK_EQ(y4.at((j * 96 + k) * 3 + 2), (float)(py * 20 + pxx));
+        }
+
+    /* A plane below one tile is a lone tile -- the crop is the plane itself. */
+    T g1(RAD_I32, {3}); g1.n({1, 8, 8});
+    T x1(RAD_F32, {64, 3});
+    std::vector<float> x1v(192);
+    for (int64_t i = 0; i < 64; ++i) x1v[(size_t)i * 3] = (float)i;
+    x1.f(x1v);
+    T y1(RAD_F32, {64, 3});
+    A b; b.t(x1).t(g1).t(y1).i("M", 64).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", b));
+    for (int64_t i = 0; i < 64; ++i) CHECK_EQ(y1.at(i * 3), (float)i);
+
+    /* A row count that is not the tiles' pixel sum, and a plane short of geom. */
+    T y2(RAD_F32, {575, 3});
+    A c; c.t(x).t(geom).t(y2).i("M", 575).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", c), RAD_E_SHAPE);
+    T x2(RAD_F32, {399, 3});
+    A d; d.t(x2).t(geom).t(y).i("M", 576).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound, never to this call: a ceiling above the cut copies
+     * the same rows, and a y that cannot hold the tiles is still refused. */
+    T yb(RAD_F32, {576, 3});
+    A f; f.t(x).t(geom).t(yb).i("M", 33 * 256 * 256).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_OK(run("vtile_crop", f));
+    CHECK_EQ(yb.at(575 * 3 + 2), (float)399);
+    T ys(RAD_F32, {575, 3});
+    A g; g.t(x).t(geom).t(ys).i("M", 33 * 256 * 256).i("tile", 3).i("overlap", 1).i("ratio", 4);
+    CHECK_EQ(run("vtile_crop", g), RAD_E_SHAPE);
+}
+
+/* A 6 x 6 latent canvas, tiles of 4 with overlap 2: each axis splits at 0 and 2, the kept ranges
+ * are [0, 2) and [2, 6), and the blends are two rows and two columns wide. Tile (i, j) is the
+ * constant 4 << (2 i + j) -- [[4, 8], [16, 32]] -- so every blend shows its two sources: (2, 0)
+ * is the top row of the bottom-left tile fully from the tile above (wb(0, 2) = 0), (3, 0) is its
+ * second row, half and half; (2, 2) is the bottom-right tile's corner blended up (8) and then
+ * left (16 -- the RAW tile to the left, never a blended one), and (3, 3) takes half of 8 up and
+ * then half of 16 left of that: rd(rd(8 0.5) + rd(32 0.5)) = 20, then rd(rd(16 0.5) + rd(20 0.5))
+ * = 18. Blending across first, or reading a blended neighbour, gives other numbers. */
+TEST(vtile_join_blends_raw_neighbours_down_then_across) {
+    T x(RAD_BF16, {64, 1});
+    std::vector<float> xv(64);
+    const float base[4] = { 4, 8, 16, 32 };
+    for (int64_t k = 0; k < 4; ++k)
+        for (int64_t r = 0; r < 16; ++r) xv[(size_t)(k * 16 + r)] = base[k];
+    x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 6, 6});
+    T y(RAD_BF16, {36, 1});
+    A a; a.t(x).t(geom).t(y).i("M", 36).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", a));
+    auto px = [&](int64_t Y, int64_t X) { return y.at(Y * 6 + X); };
+    CHECK_EQ(px(0, 0), 4.0f);    CHECK_EQ(px(0, 2), 4.0f);   /* left blend at wb(0, 2) = 0 */
+    CHECK_EQ(px(0, 3), 6.0f);    CHECK_EQ(px(2, 0), 4.0f);   /* top blend at wa(0, 2) = 1 */
+    CHECK_EQ(px(2, 2), 16.0f);   CHECK_EQ(px(3, 0), 10.0f);
+    CHECK_EQ(px(4, 3), 24.0f);   CHECK_EQ(px(3, 3), 18.0f);
+    CHECK_EQ(px(5, 5), 32.0f);   CHECK_EQ(px(4, 0), 16.0f);
+
+    /* A 6 x 9 latent canvas, tiles of 4 with overlap 1: rows split at 0, 2 (slack 1 -> overlap
+     * 2) and columns at 0, 2, 5 (slack 1 to the FIRST boundary: overlaps 2 then 1 -- distributing
+     * the slack to every boundary instead would start the columns at 0, 2, 4). Six tiles of 4 x 4,
+     * tile
+     * (i, j) the constant 1 << (2 i + j) -- [[1, 2, 4], [8, 16, 32]]. Top before left, RAW
+     * neighbours, in bf16 halves: (3, 0) is half of 1 up and half of 8 = 4.5; (3, 5) blends up to
+     * half of 4 and half of 8 = 6 and then fully to the RAW left 16; (1, 2) has no top (i = 0)
+     * and takes 1 fully left; (5, 3) takes half of 8 left of 16 = 12; (2, 5) takes 4 fully up,
+     * then 16 fully left; (3, 6) takes half of 4 up of its 32 = 18 and no left at lx = 1.
+     */
+    T g5(RAD_I32, {3}); g5.n({1, 6, 9});
+    T x5(RAD_BF16, {96, 1});
+    std::vector<float> x5v(96);
+    for (int64_t t = 0; t < 6; ++t)
+        for (int64_t r = 0; r < 16; ++r) x5v[(size_t)t * 16 + r] = (float)(1 << t);
+    x5.f(x5v);
+    T y5(RAD_BF16, {54, 1});
+    A e5; e5.t(x5).t(g5).t(y5).i("M", 54).i("tile", 4).i("overlap", 1).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", e5));
+    auto qx = [&](int64_t Y, int64_t X) { return y5.at(Y * 9 + X); };
+    CHECK_EQ(qx(0, 0), 1.0f);    CHECK_EQ(qx(1, 2), 1.0f);    /* no top at i = 0; 1 fully left */
+    CHECK_EQ(qx(0, 3), 1.5f);    CHECK_EQ(qx(0, 5), 2.0f);    /* half of 1 left of 2; 2 fully */
+    CHECK_EQ(qx(3, 0), 4.5f);    CHECK_EQ(qx(2, 5), 16.0f);   /* half up, then RAW left overrides */
+    CHECK_EQ(qx(3, 5), 16.0f);   CHECK_EQ(qx(3, 6), 18.0f);   /* left fully at lx = 0; half up at 1 */
+    CHECK_EQ(qx(5, 2), 8.0f);    CHECK_EQ(qx(5, 3), 12.0f);   /* fully left at lx = 0, half at 1 */
+    CHECK_EQ(qx(0, 8), 4.0f);    CHECK_EQ(qx(4, 2), 8.0f);    /* past every blend: own or fully left */
+
+    /* A canvas below one tile is a lone tile: the join is the copy. */
+    T g1(RAD_I32, {3}); g1.n({1, 3, 3});
+    T x1(RAD_BF16, {9, 1});
+    std::vector<float> x1v(9);
+    for (int64_t i = 0; i < 9; ++i) x1v[(size_t)i] = (float)(i + 1);
+    x1.f(x1v);
+    T y1(RAD_BF16, {9, 1});
+    A b; b.t(x1).t(g1).t(y1).i("M", 9).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", b));
+    for (int64_t i = 0; i < 9; ++i) CHECK_EQ(y1.at(i), (float)(i + 1));
+
+    /* M is the canvas, x holds every tile. */
+    T y2(RAD_BF16, {35, 1});
+    A c; c.t(x).t(geom).t(y2).i("M", 35).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", c), RAD_E_SHAPE);
+    T x2(RAD_BF16, {63, 1});
+    A d; d.t(x2).t(geom).t(y).i("M", 36).i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", d), RAD_E_SHAPE);
+
+    /* The engine binds M to the band's bound, never to this call: a ceiling above the canvas
+     * blends the same rows, and a y short of the canvas is still refused. */
+    T yb(RAD_BF16, {36, 1});
+    A f; f.t(x).t(geom).t(yb).i("M", 320 * 320).i("tile", 4).i("overlap", 2).i("n", 1)
+             .s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", f));
+    CHECK_EQ(yb.at(5 * 6 + 5), 32.0f);
+    T ys(RAD_BF16, {35, 1});
+    A g; g.t(x).t(geom).t(ys).i("M", 320 * 320).i("tile", 4).i("overlap", 2).i("n", 1)
+             .s("dtype", "bf16");
+    CHECK_EQ(run("vtile_join", g), RAD_E_SHAPE);
+}
+
 /* ================================================================== the latent upscaler
  * docs/OPS.md "The latent upscaler": voxel rows (t, i, j) of a T x H x W volume, channels
  * innermost, the volume in `geom`. */
@@ -6865,6 +7375,59 @@ TEST(conv3d_ndhwc_rounds_the_conv_before_the_residual_in_place) {
           .i("kt", 1).s("dtype", "bf16");
     CHECK_OK(run("conv3d_ndhwc", d));
     CHECK_EQ(y2.at(0), 1.0078125f);
+}
+
+/* The causal video VAE's convolution forms: `stride` and `stride_t` stride after the padding,
+ * `causal` 1 pads time in front only, `pad` `down` pads one row and column below and right only,
+ * and `reflect` 1 mirrors the spatial padding. Three frames of 2 x 2, causal, spatial stride 2
+ * with `down` and `reflect`: one voxel a frame, frame t reading frames t - 2, t - 1 and t. The
+ * taps (dt, kh, kw) are w(1,0,0) = 1, w(2,1,1) = 3, w(0,2,2) = 100, w(0,0,2) = 10 and
+ * w(0,2,0) = 20; row and column 2 reflect to 0, so the three dt = 0 taps all read (0, 0) and
+ * output t is 3 x(t,1,1) + x(t-1,0,0) + 130 x(t-2,0,0) + b, a frame before the first reading
+ * zero: 120.5, 250.5 and 3 * 120 + 50 + 130 * 10 + 0.5 = 1710.5. Refused: a stride with a 5-wide
+ * kernel, a `pad` neither `same` nor `down`, a reflect pad on an axis of 1, a zero stride, a
+ * `causal` neither 0 nor 1, and y short of the strided output. */
+TEST(conv3d_ndhwc_causal_forms_stride_mirror_and_pad_front_only) {
+    T x(RAD_F32, {12, 1}); x.f({10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120});
+    std::vector<float> wv(27, 0.0f);
+    wv[9] = 1.0f;     /* (dt 1, kh 0, kw 0): the previous frame's (0, 0) */
+    wv[22] = 3.0f;    /* (dt 2, kh 1, kw 1): this frame's (1, 1) */
+    wv[8] = 100.0f;   /* (dt 0, kh 2, kw 2): both axes reflect to (0, 0) */
+    wv[2] = 10.0f;    /* (dt 0, kh 0, kw 2): the column reflects to 0 */
+    wv[6] = 20.0f;    /* (dt 0, kh 2, kw 0): the row reflects to 0 */
+    T w(RAD_F32, {1, 1, 3, 3, 3}); w.f(wv);
+    T b(RAD_F32, {1}); b.f({0.5f});
+    T geom(RAD_I32, {3}); geom.n({3, 2, 2});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("kt", 3).s("dtype", "f32").i("stride", 2).i("stride_t", 1).i("causal", 1)
+          .s("pad", "down").i("reflect", 1);
+    CHECK_OK(run("conv3d_ndhwc", a));
+    CHECK_EQ(y.at(0), 120.5f);
+    CHECK_EQ(y.at(1), 250.5f);
+    CHECK_EQ(y.at(2), 1710.5f);
+
+    A e5; e5.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 5)
+           .i("kt", 3).s("dtype", "f32").i("stride", 2);
+    CHECK_EQ(run("conv3d_ndhwc", e5), RAD_E_SHAPE);
+    A ep; ep.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+            .i("kt", 3).s("dtype", "f32").s("pad", "mirror");
+    CHECK_EQ(run("conv3d_ndhwc", ep), RAD_E_SHAPE);
+    T g1(RAD_I32, {3}); g1.n({2, 1, 2});
+    A eh; eh.t(x).t(w).t(b).t(g1).tnull().t(y).i("M", 4).i("cin", 1).i("cout", 1).i("k", 3)
+            .i("kt", 3).s("dtype", "f32").i("causal", 1).i("reflect", 1);
+    CHECK_EQ(run("conv3d_ndhwc", eh), RAD_E_SHAPE);
+    A e0; e0.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("stride", 0);
+    CHECK_EQ(run("conv3d_ndhwc", e0), RAD_E_SHAPE);
+    A e2; e2.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("causal", 2);
+    CHECK_EQ(run("conv3d_ndhwc", e2), RAD_E_SHAPE);
+    T y2(RAD_F32, {2, 1});
+    A es; es.t(x).t(w).t(b).t(geom).tnull().t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("stride", 2).i("stride_t", 1).i("causal", 1)
+             .s("pad", "down").i("reflect", 1);
+    CHECK_EQ(run("conv3d_ndhwc", es), RAD_E_SHAPE);
 }
 
 /* group_norm's statistics are over every row of a group's channels. Two rows of four channels in
@@ -7050,6 +7613,48 @@ TEST(flow_renoise_draws_its_own_stream_by_element) {
         CHECK_EQ(x.at(k * 5 + 4), -9.0f);
     }
     CHECK(differs);
+}
+
+/* cond_aug: x = f32(f32(a x) + f32(oma z(k n + c))) with a = 0.999 the f64 parameter and oma
+ * the f32 of the f64 1 - a -- NOT the f32 difference 1.0f - 0.999f, whose low bits differ; the
+ * reference subtracts that scalar in python double -- and z the (seed, 2) normal stream. x is
+ * [2, 3] at a pitch of 5, last two columns not written. The second call is the caller's
+ * per-item restart: item B issued alone with the same (seed, stream) draws from e = 0 again,
+ * which a single joined call would not (its row 1 reads k n + c). aug 1 -- the audio twin's
+ * disabled spelling -- and a missing aug are refused, not approximated. */
+TEST(cond_aug_blends_conditions_with_a_restarted_stream) {
+    const uint64_t seed = 0x0000f00dbeef000dull;
+    T sd(RAD_U32, {2}); sd.n({(int64_t)(seed & 0xffffffffu), (int64_t)(seed >> 32)});
+    const float av = 0.999f, omv = (float)(1.0 - 0.999);
+    const float xa[3] = { 1, -2, 3 }, xb[3] = { 0.5f, 0, -4 };
+    T x(RAD_F32, {2, 5});
+    x.f({ xa[0], xa[1], xa[2], -9, -9, xb[0], xb[1], xb[2], -9, -9 });
+    x.t.shape[1] = 3;
+    A a1; a1.t(sd).t(x).i("M", 2).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_OK(run("cond_aug", a1));
+    for (int k = 0; k < 2; ++k) {
+        for (int c = 0; c < 3; ++c) {
+            const float z = rad_philox_normal_s(seed, 2, (uint64_t)(k * 3 + c));
+            CHECK_EQ(x.at(k * 5 + c), av * (k ? xb[c] : xa[c]) + omv * z);
+        }
+        CHECK_EQ(x.at(k * 5 + 3), -9.0f);
+        CHECK_EQ(x.at(k * 5 + 4), -9.0f);
+    }
+    T y(RAD_F32, {1, 3});
+    y.f({ xb[0], xb[1], xb[2] });
+    A a2; a2.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_OK(run("cond_aug", a2));
+    for (int c = 0; c < 3; ++c) {
+        const float restarted = av * xb[c] + omv * rad_philox_normal_s(seed, 2, (uint64_t)c);
+        CHECK_EQ(y.at(c), restarted);
+        CHECK(restarted != x.at(5 + c));   // joined, row 1 read element 3 + c instead
+    }
+    A a3; a3.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 1.0).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a3), RAD_E_SHAPE);
+    A a4; a4.t(sd).t(y).i("M", 1).i("n", 3).i("stream", 2).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a4), RAD_E_SHAPE);
+    A a5; a5.t(y).i("M", 1).i("n", 3).i("stream", 2).d("aug", 0.999).s("dtype", "f32");
+    CHECK_EQ(run("cond_aug", a5), RAD_E_INVAL);
 }
 
 /* ================================================================== video sparse attention
@@ -7455,6 +8060,44 @@ TEST(conv_t1d_takes_any_kernel_of_at_least_a_stride) {
     CHECK_EQ(run("conv_t1d", e), RAD_E_SHAPE);
 }
 
+/* conv1d's strided form (a DAC encoder's downsample): kernel 2 stride, pad stride / 2, one
+ * sequence. x rows [1 .. 8], w [1, 2, 3, 4], stride 2, pad 1: output row m reads
+ * x[2m - 1 + t] (zeros outside [0, 8)): 20, 40, 60, 44 — 8 rows halve to exactly 4. */
+TEST(conv1d_strided_downsamples_one_sequence) {
+    T x(RAD_BF16, {8, 1}); x.f({1, 2, 3, 4, 5, 6, 7, 8});
+    T w(RAD_BF16, {1, 1, 4}); w.f({1, 2, 3, 4});
+    T cu(RAD_I32, {2}); cu.n({0, 8});
+    T y(RAD_BF16, {4, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(0), 20.0f); CHECK_EQ(y.at(1), 40.0f);
+    CHECK_EQ(y.at(2), 60.0f); CHECK_EQ(y.at(3), 44.0f);
+
+    /* The refusals: `pad` without a stride, a stride without `pad`, a stride over more than
+     * one sequence, a y that is not the formula's rows, and a stride on the f32 rows. */
+    A p; p.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", p), RAD_E_SHAPE);
+    A q; q.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", q), RAD_E_SHAPE);
+    T cu2(RAD_I32, {3}); cu2.n({0, 4, 8});
+    A m; m.t(x).t(w).t(cu2).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", m), RAD_E_SHAPE);
+    T y5(RAD_BF16, {5, 1});
+    A r; r.t(x).t(w).t(cu).tnull().t(y5).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", r), RAD_E_SHAPE);
+    T xf(RAD_F32, {8, 1}); xf.f({1, 2, 3, 4, 5, 6, 7, 8});
+    T wf(RAD_F32, {1, 1, 4}); wf.f({1, 2, 3, 4});
+    T yf(RAD_F32, {4, 1});
+    A f; f.t(xf).t(wf).t(cu).tnull().t(yf).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", f), RAD_E_DTYPE);
+}
+
 /* conv1d `act` clamp: min(max(y, -1), 1) after the bias. */
 TEST(conv1d_act_clamp_bounds_the_output) {
     T x(RAD_F32, {4, 1}); x.f({0.5f, 2, -3, -1});
@@ -7649,6 +8292,453 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.sel[2], -1LL); CHECK_EQ(r.sel[4], -1LL);
     CHECK_EQ(r.nsel[0], 2LL);
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
+}
+
+/* ================================================================== kv_resolve
+ * The residency map of a streamed group: selected block ids in, ring slots out, a block copied in
+ * from the host mirror when it is not resident (docs/OPS.md "kv_resolve",
+ * docs/KV-STREAMING.md §3.4). */
+namespace {
+/* One pool's worth of state. A block's bytes in the mirror are `10 * b + i` for i < block_bytes, so
+ * a copied block is recognisable byte by byte; a slot nothing wrote holds NOB (a marker, not a
+ * block's bytes). */
+enum { kKvNob = 0xEE };
+struct KVF {
+    const int64_t M, blocks, slots, pitch, bbytes;
+    T sel, nsel, res, sblk, sst, ctl, host, pool;
+
+    KVF(int64_t M_, int64_t blocks_, int64_t slots_, int64_t pitch_, int64_t bbytes_)
+        : M(M_), blocks(blocks_), slots(slots_), pitch(pitch_), bbytes(bbytes_),
+          sel(RAD_I32, {M, pitch}), nsel(RAD_I32, {M}), res(RAD_I32, {blocks_}),
+          sblk(RAD_I32, {slots_}), sst(RAD_I32, {slots_, 2}), ctl(RAD_I32, {16}),
+          host(RAD_U8, {blocks_, bbytes_}), pool(RAD_U8, {slots_, bbytes_}) {}
+
+    void fill_host() {
+        for (int64_t b = 0; b < blocks; ++b)
+            for (int64_t i = 0; i < bbytes; ++i)
+                host.mem[(size_t)(b * bbytes + i)] = (uint8_t)(10 * b + i);
+    }
+    /* The pool as a resident block leaves it, and a slot no block occupies. */
+    void put(int64_t s, int64_t b) {
+        for (int64_t i = 0; i < bbytes; ++i)
+            pool.mem[(size_t)(s * bbytes + i)] = (uint8_t)(10 * b + i);
+    }
+    void clear_slot(int64_t s) {
+        for (int64_t i = 0; i < bbytes; ++i) pool.mem[(size_t)(s * bbytes + i)] = (uint8_t)kKvNob;
+    }
+    int call() {
+        A a; a.t(sel).t(nsel).t(res).t(sblk).t(sst).t(ctl).t(host).t(pool)
+            .i("M", M).i("blocks", blocks).i("slots", slots).i("sel_pitch", pitch)
+            .i("block_bytes", bbytes);
+        return run("kv_resolve", a);
+    }
+    int64_t slot(int64_t s, int64_t i) const { return pool.mem[(size_t)(s * bbytes + i)]; }
+};
+
+/* A slot's bytes are block b's, from the mirror. */
+#define CHECK_SLOT_HOLDS(F, S, B)                                                                \
+    for (int64_t i_ = 0; i_ < (F).bbytes; ++i_)                                                  \
+        CHECK_EQ((F).slot((S), i_), (int64_t)(uint8_t)(10 * (B) + i_))
+
+/* A whole int operand, element by element, against the values on paper. */
+#define CHECK_ENTRIES(T, ...)                                                                    \
+    do {                                                                                         \
+        const std::vector<int64_t> want_ = { __VA_ARGS__ };                                      \
+        REQUIRE_EQ((int64_t)want_.size(), numel(&(T).t));                                        \
+        for (size_t i_ = 0; i_ < want_.size(); ++i_) CHECK_EQ((T).iat((int64_t)i_), want_[i_]);   \
+    } while (0)
+}  /* namespace */
+
+/* Blocks 2 and 5 are resident; the selection names them (hits), then 6 and 4 (misses). The epoch
+ * reaches the hit slots, the two misses are claimed once each and placed in ascending block order
+ * (4 then 6) - not the order the rows name them - and the copies land in the mirror's bytes. */
+TEST(kv_resolve_hits_take_the_epoch_and_misses_are_placed_in_block_order) {
+    KVF f(2, 8, 4, 4, 8);
+    f.fill_host();
+    f.put(0, 2); f.put(3, 5); f.clear_slot(1); f.clear_slot(2);
+    f.res.n({ -1, -1, 0, -1, -1, 3, -1, -1 });
+    f.sblk.n({ 2, -1, -1, 5 });
+    f.sst.n({ 0, 1, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 2, 5, 6, -1, 2, 4, -1, -1 });
+    f.nsel.n({ 3, 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    /* Block 6 came after block 4 in the selection, and still lands after it: ascending block id. */
+    CHECK_ENTRIES(f.res, -1, -1, 0, -1, 1, 3, 2, -1);
+    CHECK_ENTRIES(f.sblk, 2, 4, 6, 5);
+    /* Slot 0 was referenced already (counter 1), so its use takes it to 2; slot 3's block was
+     * resident but cold, as the two placements are, so they land at 1. That is the counter doing
+     * its job on a normal decode call. */
+    CHECK_ENTRIES(f.sst, 1, 2, 1, 1, 1, 1, 1, 1);
+    CHECK_ENTRIES(f.sel, 0, 3, 2, -1, 0, 1, -1, -1);
+    CHECK_SLOT_HOLDS(f, 0, 2);
+    CHECK_SLOT_HOLDS(f, 1, 4);
+    CHECK_SLOT_HOLDS(f, 2, 6);
+    CHECK_SLOT_HOLDS(f, 3, 5);
+    CHECK_EQ(f.ctl.iat(0), 1);            /* epoch */
+    CHECK_EQ(f.ctl.iat(1), 3);            /* hand, just past the last slot taken */
+    CHECK_EQ(f.ctl.iat(2), 2);            /* placed */
+    CHECK_EQ(f.ctl.iat(3), 0);            /* no overflow */
+    CHECK_EQ(f.ctl.iat(4), 2);            /* u64 misses */
+    CHECK_EQ(f.ctl.iat(6), 5);            /* u64 lookups: 3 + 2 entries, one each */
+    CHECK_EQ(f.ctl.iat(8), 1);            /* u64 calls */
+}
+
+/* An unreferenced resident slot is the victim, and the block it held leaves the map: the sweep
+ * re-points both maps, so a block that is no longer anywhere resident reads as -1. */
+TEST(kv_resolve_evicts_an_unreferenced_slot_and_unmaps_its_block) {
+    KVF f(1, 8, 4, 1, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, s + 1);
+    f.res.n({ -1, 0, 1, 2, 3, -1, -1, -1 });
+    f.sblk.n({ 1, 2, 3, 4 });
+    f.sst.n({ 0, 1, 0, 0, 0, 1, 0, 0 });   /* slot 1's block is unreferenced */
+    f.ctl.n({ 0, 1, 0, 0 });               /* the hand starts on slot 1 */
+    f.sel.n({ 0 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 1, 0, -1, 2, 3, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 1, 0, 3, 4);
+    CHECK_ENTRIES(f.sst, 0, 1, 1, 1, 0, 1, 0, 0);
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_SLOT_HOLDS(f, 1, 0);
+    CHECK_EQ(f.ctl.iat(1), 2);
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* A free slot is claimed before any live block is evicted, even when the hand starts on an
+ * unreferenced resident slot: the ring's empty region is not a victim. The block in that slot
+ * stays resident, its map entry and its heat counter untouched. */
+TEST(kv_resolve_takes_a_free_slot_before_an_unreferenced_one) {
+    KVF f(1, 8, 4, 1, 4);
+    f.fill_host();
+    f.put(0, 3);
+    f.res.n({ -1, -1, -1, 0, -1, -1, -1, -1 });
+    f.sblk.n({ 3, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });               /* the hand starts on the resident slot */
+    f.sel.n({ 0 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 1, -1, -1, 0, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 3, 0, -1, -1);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0, 0, 0);   /* slot 0 never went through CLOCK */
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_SLOT_HOLDS(f, 1, 0);
+    CHECK_SLOT_HOLDS(f, 0, 3);             /* block 3 was not evicted */
+    CHECK_EQ(f.ctl.iat(1), 2);             /* hand just past the slot taken */
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* A block whose id fits the ring and whose own slot is free takes that slot, not the hand's: the
+ * map stays res[b] = b while the context is shorter than the ring, which is the layout that makes
+ * the attention's gather of adjacent ids sequential inside one layer's stripe. Identity does not
+ * move the hand, so ctl[1] is still where the call found it. */
+TEST(kv_resolve_places_a_block_in_its_own_slot_when_that_slot_is_free) {
+    KVF f(1, 12, 8, 4, 4);
+    f.fill_host();
+    f.res.n({ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 6, 3, 7, 3 });
+    f.nsel.n({ 4 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, -1, -1, -1, 3, -1, -1, 6, 7, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, -1, -1, -1, 3, -1, -1, 6, 7);
+    CHECK_ENTRIES(f.sel, 6, 3, 7, 3);
+    CHECK_SLOT_HOLDS(f, 3, 3);
+    CHECK_SLOT_HOLDS(f, 6, 6);
+    CHECK_SLOT_HOLDS(f, 7, 7);
+    CHECK_EQ(f.ctl.iat(1), 0);            /* identity never moves the hand */
+    CHECK_EQ(f.ctl.iat(2), 3);
+}
+
+/* A clash is not an eviction. Block 3's own slot holds block 5, so the placement is the ordinary
+ * free-slot walk from the hand -- slot 0 here -- and block 5 stays resident and referenced. Block
+ * 4's slot is free and takes it even though the hand has moved past it. */
+TEST(kv_resolve_own_slot_occupied_falls_back_to_a_free_slot) {
+    KVF f(1, 12, 8, 3, 4);
+    f.fill_host();
+    f.put(3, 5);
+    f.res.n({ -1, -1, -1, -1, -1, 3, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, 5, -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 3, 4, -1 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, -1, -1, -1, 0, 4, 3, -1, -1, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 3, -1, -1, 5, 4, -1, -1, -1);
+    CHECK_ENTRIES(f.sel, 0, 4, -1);
+    CHECK_SLOT_HOLDS(f, 0, 3);
+    CHECK_SLOT_HOLDS(f, 4, 4);
+    CHECK_SLOT_HOLDS(f, 3, 5);
+    CHECK_EQ(f.ctl.iat(1), 1);            /* only the fallback moved it */
+    CHECK_EQ(f.ctl.iat(2), 2);
+}
+
+/* Second chance: every slot is referenced, so the hand clears all four bits and the miss takes the
+ * slot it started on, one full turn later. The bit it passed stays cleared. */
+TEST(kv_resolve_gives_a_referenced_slot_a_second_chance) {
+    KVF f(1, 8, 4, 2, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, s + 4);
+    f.res.n({ -1, -1, -1, -1, 0, 1, 2, 3 });
+    f.sblk.n({ 4, 5, 6, 7 });
+    f.sst.n({ 0, 1, 0, 1, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 0, 1 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 0, 1, -1, -1, -1, -1, 2, 3);
+    CHECK_ENTRIES(f.sblk, 0, 1, 6, 7);
+    CHECK_ENTRIES(f.sst, 1, 1, 1, 1, 0, 0, 0, 0);   /* 2 and 3 lost their second chance */
+    CHECK_ENTRIES(f.sel, 0, 1);
+    CHECK_SLOT_HOLDS(f, 0, 0);
+    CHECK_SLOT_HOLDS(f, 1, 1);
+    CHECK_SLOT_HOLDS(f, 2, 6);            /* untouched: still block 6 */
+    CHECK_EQ(f.ctl.iat(1), 2);
+}
+
+/* The heat counter is what makes this different from a one-bit CLOCK: slot 0 was hit on two
+ * earlier calls (counter 2), slots 1 and 2 once each. A CLOCK sweep would clear all three bits and
+ * evict slot 0 on the second pass; the counter halves 2 -> 1 -> 0, so slot 0 survives two passes and
+ * slot 1, whose single step of heat the first pass spends, is the victim. Same inputs, a different
+ * slot: the fixture is here to pin the policy and not only agreement between two implementations. */
+TEST(kv_resolve_a_slot_hit_twice_survives_two_sweep_passes) {
+    KVF f(1, 32, 3, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 2, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sblk, 10, 20, 12);     /* slot 0, the hot one, was not the victim */
+    /* The sweep writes only the counter; the epoch column is what a hit or a placement stamps, so
+     * slots 0 and 2 keep the 0 they entered with. */
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0);
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_EQ(f.ctl.iat(1), 2);
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* The halving sequence, across three calls, with the hand put back on slot 0 so each call passes
+ * the hot slot once -- the same visits a hand that wraps once gives it. A saturated 3 is 1 after one
+ * pass (a one-bit CLOCK would have cleared it to 0, and the next call would evict it), 1 is 0 after
+ * the second, and only the third pass takes the slot. Each step is checked, because the whole of the
+ * policy is the difference between 1 and 0 here. */
+TEST(kv_resolve_halves_a_saturated_counter_three_to_one_to_zero) {
+    KVF f(1, 32, 3, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 3, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 3 -> 1: the pass cost it one halving, not the whole counter. Slot 1 (cold) was the victim. */
+    CHECK_ENTRIES(f.sblk, 10, 20, 12);
+    CHECK_ENTRIES(f.sst, 0, 1, 1, 1, 0, 0);
+
+    f.sel.n({ 21 });
+    ((int32_t*)f.ctl.t.data)[1] = 0;       /* the hand back on slot 0, the epoch untouched */
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 1 -> 0: slot 0 passed again and is still resident; slot 2 (cold) is the victim. */
+    CHECK_ENTRIES(f.sblk, 10, 20, 21);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 0, 2, 1);
+
+    f.sel.n({ 22 });
+    ((int32_t*)f.ctl.t.data)[1] = 0;
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 0: the third visit takes it. */
+    CHECK_ENTRIES(f.sblk, 22, 20, 21);
+    CHECK_ENTRIES(f.sst, 3, 1, 1, 0, 2, 1);
+    CHECK_EQ(f.res.iat(10), -1);           /* evicted on the third pass */
+    CHECK_EQ(f.res.iat(20), 1);
+    CHECK_EQ(f.res.iat(21), 2);
+    CHECK_EQ(f.res.iat(22), 0);
+}
+
+/* A saturated counter and a slot placed on the previous call differ by two steps of heat, and the
+ * sweep spends the fresh one first: {3,1,1,1} walks two full laps, leaving the 3 at 1 then 0 and
+ * taking slot 1. A one-bit CLOCK, for which all four are "referenced", evicts slot 0 -- the hottest
+ * block in the ring. */
+TEST(kv_resolve_a_saturated_counter_outlasts_a_fresh_placement) {
+    KVF f(1, 32, 4, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12, 13 });
+    f.sst.n({ 0, 3, 0, 1, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sblk, 10, 20, 12, 13);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0, 0, 0);
+    CHECK_EQ(f.ctl.iat(1), 2);
+}
+
+/* One bump a slot a call, not one an entry: block 10 is resident and named by both entries, so its
+ * counter goes 1 -> 2 rather than 1 -> 3. The device kernel counts the first thread to stamp a slot
+ * (`atomicExch`), so a per-entry bump in the reference would be a real disagreement, not a detail. */
+TEST(kv_resolve_counts_one_bump_a_slot_a_call) {
+    KVF f(1, 32, 3, 2, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 1, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 10, 10 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sst, 1, 2, 0, 0, 0, 0);
+    CHECK_ENTRIES(f.sel, 0, 0);
+    CHECK_EQ(f.ctl.iat(2), 0);
+}
+
+/* Overflow: three hits hold slots 0..2 and two misses want the one slot left. The first is placed,
+ * the second has nowhere and must NOT steal the slot the first took (every slot of the ring is
+ * marked with this call's epoch, so the sweep passes it), nor any hit's. ctl[3] latches, the
+ * unplaced block reverts to -1, and its selection entry is rewritten to slot 0: leaving the block id
+ * would make a device attention dereference an address past the ring, and ctl[3] is what says the
+ * table is unusable. */
+TEST(kv_resolve_overflow_latches_instead_of_taking_a_slot_it_just_filled) {
+    KVF f(1, 8, 4, 5, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, s);
+    f.clear_slot(3);
+    f.res.n({ 0, 1, 2, -1, -1, -1, -1, -1 });
+    f.sblk.n({ 0, 1, 2, -1 });
+    f.sst.n({ 0, 1, 0, 1, 0, 1, 0, 0 });
+    f.ctl.n({ 0, 3, 0, 0 });               /* the hand starts on the one free slot */
+    f.sel.n({ 6, 7, 0, 1, 2 });
+    f.nsel.n({ 5 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 0, 1, 2, -1, -1, -1, 3, -1);
+    CHECK_ENTRIES(f.sblk, 0, 1, 2, 6);
+    CHECK_ENTRIES(f.sst, 1, 2, 1, 2, 1, 2, 1, 1);   /* three hits on referenced slots, one placement */
+    /* Entry 1 is block 7, unplaced: it names slot 0, a defined address inside the ring, and ctl[3]
+     * below is what marks the table unusable. */
+    CHECK_ENTRIES(f.sel, 3, 0, 0, 1, 2);
+    CHECK_SLOT_HOLDS(f, 3, 6);             /* the second miss did not overwrite the first */
+    CHECK_SLOT_HOLDS(f, 0, 0);
+    CHECK_EQ(f.ctl.iat(2), 1);
+    CHECK_EQ(f.ctl.iat(3), 1);             /* overflow, latched */
+    CHECK_EQ(f.ctl.iat(4), 1);
+    CHECK_EQ(f.ctl.iat(6), 5);
+}
+
+/* A launch's claim count is derived from its own operands, never a constant: one claim is one
+ * distinct absent block a selection entry names, so a launch makes at most `M * sel_pitch` of them
+ * -- 2052 for four rows of 513, which is what `--max-num-seqs 4` selects -- and the miss list has to
+ * hold every one of them. This runs the same fixture at 2048 and at 2052 claims and holds the wider
+ * launch to the narrower one's placement: every block the two share lands in the same slot, so the
+ * launch above the old fixed list is not a different placement, and ctl[12] reports the depth the
+ * list had to hold. */
+TEST(kv_resolve_places_2052_claims_exactly_as_it_places_2048) {
+    const int64_t bbytes = 8, blocks = 4096, pitch = 513, M = 4, slots = 2100, first = 100;
+    /* Every slot free: ids below the ring take their own slot, and the ids past it walk the free
+     * slots from the hand. */
+    auto launch = [&](int64_t per_row) {
+        KVF f(M, blocks, slots, pitch, bbytes);
+        f.fill_host();
+        std::vector<int64_t> sel((size_t)(M * pitch), -1), nsel((size_t)M, per_row);
+        for (int64_t q = 0; q < M; ++q)
+            for (int64_t i = 0; i < per_row; ++i)
+                sel[(size_t)(q * pitch + i)] = first + q * per_row + i;
+        f.sel.n(sel);
+        f.nsel.n(nsel);
+        f.res.n(std::vector<int64_t>((size_t)blocks, -1));
+        f.sblk.n(std::vector<int64_t>((size_t)slots, -1));
+        f.sst.n(std::vector<int64_t>((size_t)(slots * 2), 0));
+        f.ctl.n(std::vector<int64_t>(16, 0));
+        CHECK_EQ(f.call(), RAD_OK);
+        return f;
+    };
+    KVF small = launch(512);   /* 4 x 512 = 2048 claims */
+    KVF large = launch(513);   /* 4 x 513 = 2052 claims */
+
+    /* 2052 claims are all placed, ascending from the first, and the counters say so. Identity
+     * covers every id below the ring: block `first + k` takes slot `first + k`. The 52 ids past
+     * `slots` (2100..2151) fall back to the first free slots after the hand, which is still 0. */
+    for (int64_t k = 0; k < 2000; ++k) {              /* ids first .. slots - 1 */
+        CHECK_EQ(large.res.iat(first + k), first + k);
+        CHECK_EQ(large.sblk.iat(first + k), first + k);
+    }
+    for (int64_t j = 0; j < 52; ++j) {                /* ids slots .. first + 2051 */
+        CHECK_EQ(large.res.iat(slots + j), j);
+        CHECK_EQ(large.sblk.iat(j), slots + j);
+    }
+    CHECK_EQ(large.ctl.iat(12), 2052);    /* the claim list's depth */
+    CHECK_EQ(large.ctl.iat(10), 2052);    /* every claim is a miss: no block was resident */
+    CHECK_EQ(large.ctl.iat(2), 2052);
+    CHECK_EQ(large.ctl.iat(1), 52);       /* identity never moves the hand: 52 fallbacks did */
+    CHECK_EQ(large.ctl.iat(3), 0);
+    CHECK_SLOT_HOLDS(large, 0, slots);
+    CHECK_SLOT_HOLDS(large, 51, first + 2051);
+    CHECK_SLOT_HOLDS(large, 2051, first + 1951);
+
+    /* The 2048-claim launch places its own blocks in exactly those slots. The four blocks only the
+     * wider launch names (2148..2151) are the sole difference, so they are skipped. */
+    for (int64_t s = 0; s < slots; ++s)
+        if (large.sblk.iat(s) < first + 2048)
+            CHECK_EQ(small.sblk.iat(s), large.sblk.iat(s));
+    for (int64_t k = 0; k < 2048; ++k)
+        CHECK_EQ(small.res.iat(first + k), large.res.iat(first + k));
+    CHECK_EQ(small.ctl.iat(12), 2048);
+    CHECK_EQ(small.ctl.iat(2), 2048);
+    /* The rewrite: every valid entry names the slot of its block, and the padding past nsel[q] is
+     * -1 (the 2048-claim launch has one such entry a row). */
+    for (int64_t q = 0; q < M; ++q)
+        for (int64_t i = 0; i < pitch; ++i) {
+            const int64_t e = q * pitch + i;
+            /* The block's own id while it fits the ring, then the slot it fell back to. The wider
+             * launch packs 513 a row, the narrower one 512. */
+            const int64_t bl = first + q * pitch + i;
+            const int64_t bs = first + q * 512 + i;
+            CHECK_EQ(large.sel.iat(e), bl < slots ? bl : bl - slots);
+            if (i < 512) CHECK_EQ(small.sel.iat(e), bs < slots ? bs : bs - slots);
+            else         CHECK_EQ(small.sel.iat(e), -1);
+        }
+}
+
+
+TEST(kv_resolve_refuses_a_selection_that_does_not_fit_the_maps) {
+    KVF f(1, 8, 4, 2, 4);
+    f.fill_host();
+    f.res.n({ -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 8, -1 });                    /* block 8 is outside [0, blocks) */
+    f.nsel.n({ 1 });
+    CHECK_EQ(f.call(), RAD_E_INVAL);
+    CHECK_EQ(f.sel.iat(0), 8);             /* nothing rewritten */
+    CHECK_ENTRIES(f.res, -1, -1, -1, -1, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sel, 8, -1);
+    CHECK_EQ(f.ctl.iat(0), 0);             /* no epoch bump either */
+    f.sel.n({ 1, 1 });
+    f.nsel.n({ 3 });                       /* more entries than the row holds */
+    CHECK_EQ(f.call(), RAD_E_SHAPE);
+    CHECK_EQ(f.ctl.iat(0), 0);
 }
 
 /* qsa_tail_store: only the last `ring` tokens of a sequence write, to row pos % ring of the
@@ -8458,6 +9548,7 @@ std::vector<Geo> geometries() {
         G("act_mul", "M", 3, a.i("M", R).i("n", 8).s("act", "silu").s("dtype", "f32")),
         G("seg_mean", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
+        G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("clamp", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("conv2d", "M", 8, a.i("M", R).i("width", 4).i("cin", 2).i("cout", 3).i("kh", 3).i("kw", 3)
@@ -8529,6 +9620,9 @@ std::vector<Geo> geometries() {
                               .d("scale", 0.3535533905932738).s("dtype", "bf16")),
         G("kv_store", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 4)
                               .s("kv_dtype", "f32")),
+        G("kv_store_streamed", "M", 3,
+          a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 8)
+           .s("kv_dtype", "fp8_e4m3")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
                           .d("theta", 1e4).d("scale", 1.0).s("mode", "neox")),
         G("qk_norm_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
@@ -8540,6 +9634,8 @@ std::vector<Geo> geometries() {
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)
                                .s("dtype", "bf16")),
         G("qsa_select", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4).i("seqs", 2)),
+        G("kv_resolve", "M", 3, a.i("M", R).i("blocks", 8).i("slots", 6).i("sel_pitch", 4)
+                                 .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                                     .s("dtype", "bf16")),
         G("qsa_work", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
@@ -8611,7 +9707,10 @@ std::vector<Geo> geometries() {
                                       .i("gated", 1).s("dtype", "bf16")),
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
-                                    .d("max_period", 10000.0).s("dtype", "f32")),
+                                    .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
+        /* The curve form: the same op over a precomputed table instead of the sinusoid. */
+        G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).i("curve", 5).d("clamp_min", 0.3)
+                                    .s("dtype", "f32")),
         G("gather_rows2", "M", 4, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("lane_gather", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
         G("lane_store", "M", 4, a.i("M", R).i("n", 8).i("stride", 8).s("dtype", "bf16")),
@@ -8693,6 +9792,7 @@ std::vector<Geo> geometries() {
         G("rms_mod_quant_fp8", "M", 4, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                        .i("gated", 1).s("dtype", "bf16")),
         G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("flow_res_multistep", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                    .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("vtile_gather", "M", 60, a.i("M", R).i("n", 8).i("tile", 2).i("overlap", 1)
@@ -8722,6 +9822,17 @@ std::vector<Geo> geometries() {
         G("patch_fold", "M", 8, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                 .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("flow_renoise", "M", 3, a.i("M", R).i("n", 8).i("stream", 1).s("dtype", "f32")),
+        G("cond_aug", "M", 3, a.i("M", R).i("n", 8).i("stream", 2).d("aug", 0.999)
+                             .s("dtype", "f32")),
+        /* The drawn frame is 20 latent units a side (ref_shapes.cpp), so a tile of 16 with
+         * overlap 4 splits it 2 x 2: the plan has 4 rows, the crop (ratio 16) 4 tiles of 256
+         * pixels -- 512 x 512 px of plane into 4 x 256 x 256 = 262144 rows -- and the join
+         * blends 4 x 16 x 16 = 1024 moment rows into the 400-row canvas. */
+        G("vtile_plan", "M", 4, a.i("M", R).i("tile", 16).i("overlap", 4).i("ratio", 16)),
+        G("vtile_crop", "M", 262144, a.i("M", R).i("tile", 16).i("overlap", 4).i("ratio", 16)
+                                    .s("dtype", "f32")),
+        G("vtile_join", "M", 400, a.i("M", R).i("tile", 16).i("overlap", 4).i("n", 48)
+                                 .s("dtype", "bf16")),
         G("attn_cross", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
                                 .s("dtype", "f32").i("n_head", 2)),
         G("table_add", "M", 3, a.i("M", R).i("n", 8).i("L", 3).s("dtype", "f32")),

@@ -134,17 +134,11 @@ tune_candidates(const RadKernelInfo* k, const Geometry& g, int64_t* space_size,
     return out;
 }
 
-/* One rank's side of one candidate's launch: the instance declare made for it, the operands it
- * owns on its own card, its scratch, and the stream it runs on. A row that is not a collective
- * has exactly one of these, as an engine step's local op does. A collective has one per rank, and
- * they are fired together: a rank that launches alone waits for a peer flag nobody raises.
- *
- * The instance is the reason this exists. init() is what builds the peer bundle -- the scratch and
- * the flags and the sequence counters, published to every rank and made peer-accessible -- and
- * RadArgs reaches the exchange through nothing else, so a tool that leaves it null cannot form a
- * collective's launch at all. Every `ar_*` row used to end here that way: declared tunable
- * (nblocks, nthreads, drain, acq), requested by the declared graph, and refused at the entry
- * point before a single launch, so the served card ran the axis defaults for every all-reduce. */
+/* One rank's side of one candidate's launch: the instance its declare made, its operands on its
+ * card, its scratch and its stream. A plain row has one; a collective has one per rank, fired
+ * together, since a rank launching alone waits for a peer flag nobody raises. The instance is the
+ * only route to the peer bundle (scratch, flags, sequence counters) init() builds, so a
+ * collective cannot launch without it. */
 struct Rank {
     int       rank = 0, world = 1;
     void*     instance = nullptr;
@@ -197,31 +191,27 @@ int zero_scratch(std::vector<Rank>& rs) {
     return RAD_OK;
 }
 
-/* `iters` launches on every rank, from one thread each: the exchange only pipelines once both
- * cards have work queued, so enqueuing rank 1's whole batch after rank 0's would charge every
- * iteration for the enqueue of the batch, not just the first.
+/* `iters` launches on every rank. A collective's ranks launch from one thread each: the exchange
+ * pipelines only once every card has work queued. A single rank launches inline, so the timed
+ * region holds no thread start.
  *
- * A refusal comes back before anything is waited on. It is symmetric by construction -- every
- * rank resolved the same kernel for the same geometry, and the launch's checks read only the
- * geometry and the instance -- so a refusal means no rank queued work and there is nothing to
- * drain. Were it ever asymmetric, the peers would be left spinning on a flag; that is why the
- * caller treats any refusal as fatal for the candidate instead of retrying it. */
+ * A refusal is symmetric (every rank resolved the same kernel for the same geometry, and a launch
+ * checks only the geometry and the instance), so no rank has queued work to drain; the caller
+ * treats it as fatal for the candidate. */
 int launch_all(const KernelRow& row, std::vector<Rank>& rs, const Geometry& g, int iters) {
+    auto run = [&](Rank& r) {
+        if (rad_dev_set(r.rank) < 0) return (int)RAD_E_DEVICE;
+        RadArgs a;
+        fill_args(row, r, g, &a);
+        for (int k = 0; k < iters; ++k)
+            if (const int s = row.info->launch(&a, r.stream); s < 0) return s;
+        return (int)RAD_OK;
+    };
+    if (rs.size() == 1) return run(rs[0]);
     std::vector<int> st(rs.size(), (int)RAD_E_STATE);
     std::vector<std::thread> th;
     th.reserve(rs.size());
-    for (size_t i = 0; i < rs.size(); ++i)
-        th.emplace_back([&, i] {
-            Rank& r = rs[i];
-            if (rad_dev_set(r.rank) < 0) { st[i] = RAD_E_DEVICE; return; }
-            RadArgs a;
-            fill_args(row, r, g, &a);
-            for (int k = 0; k < iters; ++k) {
-                const int s = row.info->launch(&a, r.stream);
-                if (s < 0) { st[i] = s; return; }
-            }
-            st[i] = RAD_OK;
-        });
+    for (size_t i = 0; i < rs.size(); ++i) th.emplace_back([&, i] { st[i] = run(rs[i]); });
     for (std::thread& t : th) t.join();
     for (int s : st) if (s < 0) return s;
     return RAD_OK;
@@ -614,14 +604,10 @@ int main(int argc, char** argv) {
         }
         const int64_t vocab_rows = kf_vocab_rows(kop);
 
-        /* One set of operands per rank that takes part. A collective's ranks each contribute their
-         * own bytes on their own card -- peers write into each other's scratch, never into each
-         * other's input -- so rank 1's x has to be its own allocation, and each rank needs the
-         * instance its own declare made. Ranks draw different bytes on purpose: a fold of two
-         * identical halves would let a kernel that read its own contribution twice pass.
-         *
-         * `rs` is sized up front and never grown: DevBuf frees what it points at, so moving one
-         * into new storage would leave the old handle to free the buffer as well. */
+        /* One set of operands per rank: a collective's ranks contribute their own bytes on their own
+         * card, with the instance their own declare made. Each rank draws different bytes, so a
+         * kernel that read its own contribution twice cannot pass. `rs` is sized once and never
+         * grown: a moved DevBuf would leave its old handle to free the buffer too. */
         const int world = row->collective && tp > 1 ? tp : 1;
         std::string scale;
         if (world > 1) scale = ", " + std::to_string(world) + " ranks";

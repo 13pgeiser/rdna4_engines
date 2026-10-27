@@ -1808,6 +1808,520 @@ TEST(qwen4exp_yarn_reaches_attention_indexer_and_compressed_keys) {
     CHECK(direct > 0); CHECK(table > 0); CHECK(compressed > 0);
 }
 
+/* A streamed attention group's selection must be made resident and rewritten between
+ * `qsa_select` and the sparse attention, and the layer's KV store must come first: a block this
+ * step writes may not be in the ring, and the resolve copies such a block whole out of the host
+ * mirror, so the mirror write precedes the resolve. The order per layer is therefore
+ * store -> resolve -> attention, with the same `sel` buffer in the resolve and the attention, and
+ * exactly one resolve per attention launch -- a second one for one launch would read slots as block
+ * ids, and one for an earlier launch would let a later launch's evictions move the blocks it names.
+ *
+ * The indexer issues none: it produces `sel`, and a resolve between `qsa_select` and the store
+ * would copy the mirror before this step's tokens reached it. */
+TEST(a_streamed_qwen4exp_group_stores_then_resolves_then_attends) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+
+    /* The parity configuration's declaration: blocks == slots and the block's own byte pitch. */
+    const RecOp* rop = nullptr;
+    for (const RecOp& o : b.ops) if (o.op == "kv_resolve") { rop = &o; break; }
+    REQUIRE(rop != nullptr);
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    for (const RecParam& p : rop->p) {
+        if (p.key == "blocks")      blocks = p.ival;
+        if (p.key == "block_bytes") bbytes = p.ival;
+        if (p.key == "sel_pitch")   pitch  = p.ival;
+    }
+    REQUIRE(blocks > 0);
+    REQUIRE(bbytes > 0);
+    REQUIRE(pitch > 0);
+
+    std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+    std::vector<int32_t> res((size_t)blocks, -1), sblk((size_t)blocks, -1),
+                         sst((size_t)blocks * 2, 0), ctl(16, 0);
+    RadKVStream st{};
+    st.host              = (uint8_t*)res.data();
+    st.res               = res.data();
+    st.slot_block        = sblk.data();
+    st.slot_state        = sst.data();
+    st.ctl               = ctl.data();
+    st.block_bytes       = bbytes;
+    st.host_layer_stride = blocks * bbytes;
+    st.slots             = blocks;
+    st.host_bytes        = blocks * bbytes * (int64_t)b.kv_groups.size();
+    int streamed = 0;
+    for (size_t gi = 0; gi < b.kv_groups.size(); ++gi)
+        if (b.kv_groups[gi].name.find("kv_attn") != std::string::npos) {
+            k->kv[gi].stream = &st;
+            ++streamed;
+        }
+    CHECK_EQ(streamed, 1);
+
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.batch = &k->b;
+    qwen4exp_fp8::step(&ctx, &k->b);
+
+    int selects = 0, stores = 0, resolves = 0, attn = 0;
+    size_t last_select = 0, last_store = 0;
+    for (size_t i = 0; i < ctx.issues.size(); ++i) {
+        const RecOp* o = b.op_of(ctx.issues[i].op);
+        if (!o) continue;
+        if (o->op == "qsa_select") { ++selects; last_select = i; }
+        else if (o->op == "kv_store_streamed" ||
+                 o->op == "qk_norm_rope_gate_kv_store_streamed") {
+            ++stores;
+            last_store = i;
+            /* The mirror and the residency map are the stream's raw planes, and they are the
+             * operands the layer's KV reaches storage through. A streamed group's store is folded
+             * into the prologue whenever the fused pair resolves and the step fits its rows, so
+             * both forms are accepted and each is checked at its own operand positions. */
+            const bool folded = o->op == "qk_norm_rope_gate_kv_store_streamed";
+            const int ro = folded ? 12 : 4, ho = folded ? 13 : 5;
+            CHECK_EQ(ctx.issues[i].opd[ro].kind, (int)RAD_OPK_RAW);   /* res */
+            CHECK_EQ(ctx.issues[i].opd[ro].dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(ctx.issues[i].opd[ro].rows, blocks);
+            CHECK_EQ(ctx.issues[i].opd[ho].kind, (int)RAD_OPK_RAW);   /* host, this layer's row */
+            CHECK_EQ(ctx.issues[i].opd[ho].dtype, (uint32_t)RAD_U8);
+            CHECK_EQ(ctx.issues[i].opd[ho].rows, blocks);
+            CHECK_EQ(ctx.issues[i].opd[ho].cols, bbytes);
+        } else if (o->op == "kv_resolve") {
+            ++resolves;
+            CHECK(i > last_store);                  /* the mirror write precedes the copy */
+            CHECK(i > last_select);                 /* and the selection precedes the rewrite */
+            CHECK_EQ(ctx.issues[i].opd[0].handle, ctx.issues[last_select].opd[5].handle);
+            CHECK_EQ(ctx.issues[i].opd[0].offset, ctx.issues[last_select].opd[5].offset);
+            CHECK_EQ(ctx.issues[i].opd[1].kind, (int)RAD_OPK_BUF);   /* nsel, its row count */
+            /* One resolve per attention launch: the launch that follows reads exactly its rows. */
+            size_t j = i + 1;
+            for (; j < ctx.issues.size(); ++j) {
+                const RecOp* n = b.op_of(ctx.issues[j].op);
+                if (!n) continue;
+                if (n->op == "attn_paged" || n->op == "attn_paged_gate_quant") break;
+            }
+            REQUIRE(j < ctx.issues.size());
+            CHECK_EQ(ctx.issues[j].opd[2].handle, ctx.issues[i].opd[0].handle);
+            CHECK_EQ(ctx.issues[j].opd[2].offset, ctx.issues[i].opd[0].offset);
+            CHECK_EQ(ctx.issues[j].opd[2].rows,   ctx.issues[i].opd[0].rows);
+        } else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            ++attn;
+            CHECK(ctx.issues[i].opd[2].handle == ctx.issues[last_select].opd[5].handle);
+            CHECK_EQ(ctx.issues[i].opd[2].offset, ctx.issues[last_select].opd[5].offset);
+        }
+    }
+    CHECK(selects > 0);
+    CHECK_EQ(stores, 2);           /* one store a full-attention layer, before its attention */
+    CHECK_EQ(attn, stores);
+    CHECK_EQ(resolves, attn);      /* exactly one resolve per attention launch, never two */
+}
+
+/* The parity configuration's stream: a ring as wide as the group's context and an identity map, so
+ * a resolve may rewrite a selection but can never copy. Only the rewrite is under test here, so
+ * the maps alias one allocation and no kernel runs. */
+struct StreamRig {
+    std::vector<int32_t> res, slot_block, slot_state, ctl;
+    RadKVStream st{};
+};
+
+/* `blocks` and `block_bytes` come from the declaration's own `kv_resolve`, so the rig is exactly
+ * what the plugin planned for. The group is reached by name because `kv_attn` is the only full
+ * group a stream flows through (the indexer's own block keys stay resident). */
+void attach_stream(const RadBuilder& b, Kit& k, StreamRig& r, int64_t blocks, int64_t bbytes) {
+    r.res.assign((size_t)blocks, -1);
+    r.slot_block.assign((size_t)blocks, -1);
+    r.slot_state.assign((size_t)blocks * 2, 0);
+    r.ctl.assign(16, 0);
+    r.st.host              = (uint8_t*)r.res.data();
+    r.st.res               = r.res.data();
+    r.st.slot_block        = r.slot_block.data();
+    r.st.slot_state        = r.slot_state.data();
+    r.st.ctl               = r.ctl.data();
+    r.st.block_bytes       = bbytes;
+    r.st.host_layer_stride = blocks * bbytes;
+    r.st.slots             = blocks;
+    r.st.host_bytes        = blocks * bbytes * (int64_t)b.kv_groups.size();
+    int streamed = 0;
+    for (size_t gi = 0; gi < b.kv_groups.size(); ++gi)
+        if (b.kv_groups[gi].name.find("kv_attn") != std::string::npos) {
+            k.kv[gi].stream = &r.st;
+            ++streamed;
+        }
+    CHECK_EQ(streamed, 1);
+}
+
+/* The `blocks`, `block_bytes` and `sel_pitch` the plugin declared for `kv_resolve`. */
+void resolve_geom(const RadBuilder& b, int64_t* blocks, int64_t* bbytes, int64_t* pitch) {
+    for (const RecOp& o : b.ops)
+        if (o.op == "kv_resolve")
+            for (const RecParam& p : o.p) {
+                if (p.key == "blocks")      *blocks = p.ival;
+                if (p.key == "block_bytes") *bbytes = p.ival;
+                if (p.key == "sel_pitch")   *pitch  = p.ival;
+            }
+}
+
+/* The `slots` the plugin declared for `kv_resolve`: the ceiling a ring may not pass. */
+int64_t resolve_slots(const RadBuilder& b) {
+    int64_t slots = 0;
+    for (const RecOp& o : b.ops)
+        if (o.op == "kv_resolve")
+            for (const RecParam& p : o.p)
+                if (p.key == "slots") slots = p.ival;
+    return slots;
+}
+
+/* The declared slot domain covers a ring the engine raised, not just the flag's own number. The
+ * engine raises --kv-resident to the smallest ring one decode step can name when the operator asks
+ * for less (kvstream_ring, kvstream/plan.h), and the resolve refuses a pool deeper than its declared
+ * `slots` (libref/ref_kvstream.cpp: the parameter is the ceiling the operand may not pass). So the
+ * declaration states that step bound: max_seqs x (1 + n_spec) x sel_pitch, the same product
+ * kvstream_ceiling_blocks states on the engine's side. With nothing streaming it stays the context,
+ * which is what an undeclared ring has always meant. */
+TEST(the_declared_slot_ceiling_covers_a_ring_raised_to_one_decode_step) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    c.kv_resident_blocks = 8192;              /* 2048 blocks of 4: under one step's selection */
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    resolve_geom(b, &blocks, &bbytes, &pitch);
+    REQUIRE(blocks > 0);
+    REQUIRE(pitch > 0);
+    const int64_t slots = resolve_slots(b);
+    CHECK_EQ(slots, c.max_seqs * (1 + c.max_spec) * pitch);
+    CHECK(slots > c.kv_resident_blocks / 4);  /* the raised depth, not the flag's */
+    CHECK(slots < blocks);
+
+    /* Nothing streaming: the ring covers the context, so the declaration is the context. */
+    c.kv_resident_blocks = 0;
+    RadBuilder b2;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b2, &meta, &c), RAD_OK);
+    CHECK_EQ(resolve_slots(b2), blocks);
+}
+
+/* A streamed group's prefill stage: every layer's mirror row is copied into the one-layer stage
+ * view after that layer's store and before its attention, in layer order. The stage is the whole
+ * context at identity addressing, so the attention reads block ids straight out of it and issues
+ * no resolve. Both the sparse path (above qsa_exact_to) and the dense path (below it, which has no
+ * resolve at all) must stage; a skipped stage would read the previous layer's bytes.
+ *
+ * A staged store is two writers: `kv_store_streamed` (the mirror, and the ring only where the
+ * residency map says the block is resident) and then `kv_store` at the same slots (the identity
+ * copy the stage view reads). Without the second, a prefill before the group's first decode
+ * advances the mirror and not the pool, and the attention reads the previous layer's bytes. This
+ * test counts both and pins their order. */
+TEST(a_staged_prefill_copies_each_layer_before_its_attention) {
+    for (int dense = 0; dense < 2; ++dense) {
+        RadModelMeta meta = qwen4exp_meta();
+        RadBuildCtx c = build_ctx(0, 1);
+        c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+        RadBuilder b;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        int64_t blocks = 0, bbytes = 0, pitch = 0;
+        resolve_geom(b, &blocks, &bbytes, &pitch);
+        REQUIRE(blocks > 0);
+        REQUIRE(bbytes > 0);
+
+        /* 100 tokens of history is below qsa_exact_to (dense); 5000 is above it (sparse). */
+        auto k = kit(b, {}, { 32 }, dense ? 100 : 5000);
+        StreamRig rig;
+        attach_stream(b, *k, rig, blocks, bbytes);
+
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k->b;
+        ctx.stage_on = true;
+        qwen4exp_fp8::step(&ctx, &k->b);
+
+        int stores = 0, identity = 0, attn = 0;
+        size_t last_store = 0;
+        int last_slot_opd = -1;
+        for (size_t i = 0; i < ctx.issues.size(); ++i) {
+            const RecOp* o = b.op_of(ctx.issues[i].op);
+            if (!o) continue;
+            if (o->op == "kv_store_streamed" ||
+                o->op == "qk_norm_rope_gate_kv_store_streamed") {
+                ++stores;
+                last_store = i;
+                /* The streamed store's slot operand: 2 for the separate store, 10 for the folded
+                 * prologue (qg, k, cos/sin, pos, two norm weights, q, k, the v gap, v, slot,
+                 * cache, res, host). */
+                last_slot_opd = o->op == "kv_store_streamed" ? 2 : 10;
+            } else if (o->op == "kv_store") {
+                /* A staged pass writes the pool at block-id identity, and kv_store_streamed writes
+                 * its device copy only where the residency map says the block is resident. Before
+                 * a decode the map is empty, so the stage would hold the previous layer's bytes
+                 * unless the identity store follows the mirror writer with the same slots. */
+                ++identity;
+                CHECK(last_slot_opd >= 0);                     /* a streamed store came first */
+                CHECK(i > last_store);
+                CHECK_EQ(ctx.issues[i].opd[2].kind,
+                         ctx.issues[last_store].opd[last_slot_opd].kind);
+                CHECK_EQ(ctx.issues[i].opd[2].handle,
+                         ctx.issues[last_store].opd[last_slot_opd].handle);
+                CHECK_EQ(ctx.issues[i].opd[2].offset,
+                         ctx.issues[last_store].opd[last_slot_opd].offset);
+            } else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+                ++attn;
+            }
+        }
+        CHECK(stores > 0);
+        CHECK_EQ(identity, stores);                    /* one identity store a staged store */
+        CHECK_EQ(attn, stores);
+        CHECK_EQ(ctx.stages.size(), (size_t)stores);   /* one stage a layer, no repeats */
+
+        /* The stage copy's wait is immediately before the layer's store, not after it: the copy
+         * reads the mirror, which the store has not written yet (core/kvstream/stage.h). */
+        int prev_layer = -1;
+        for (size_t s = 0; s < ctx.stages.size(); ++s) {
+            const StageRec& r = ctx.stages[s];
+            CHECK(r.layer > prev_layer);               /* layers in order */
+            prev_layer = r.layer;
+            REQUIRE(r.issue < ctx.issues.size());
+            const RecOp* next = b.op_of(ctx.issues[r.issue].op);
+            REQUIRE(next != nullptr);
+            /* The wait sits immediately before the layer's store, which is either the separate
+             * streamed store or the prologue that has it folded in (a step narrow enough for the
+             * fused prologue). */
+            CHECK(next->op == "kv_store_streamed" ||
+                  next->op == "qk_norm_rope_gate_kv_store_streamed");
+            if (s + 1 < ctx.stages.size())
+                CHECK(ctx.stages[s + 1].issue > r.issue);
+        }
+        /* And the next layer's copy is handed over after every attention launch of this one, so the
+         * ride it waits on is behind all of them. */
+        CHECK_EQ(ctx.stages_next.size(), (size_t)stores);
+        for (size_t s = 0; s < ctx.stages_next.size(); ++s) {
+            const StageRec& r = ctx.stages_next[s];
+            CHECK_EQ(r.layer, ctx.stages[s].layer);
+            int seen = 0;
+            for (size_t i = 0; i < r.issue && i < ctx.issues.size(); ++i) {
+                const RecOp* o = b.op_of(ctx.issues[i].op);
+                if (o && (o->op == "attn_paged" || o->op == "attn_paged_gate_quant")) ++seen;
+            }
+            /* This layer's own attention (at least) is behind the hand-over; a layer wider than a
+             * launch has more than one. */
+            CHECK(seen >= (int)s + 1);
+        }
+    }
+}
+
+/* Below `qsa_exact_to` a prefill takes the dense attention, which reads the block table and never
+ * `sel`. The selection is still produced, but a resolve there would be read by nothing: work on the
+ * step path whose only other effect is on the residency map's epoch, in a configuration the design
+ * says never sees the op. So the dense step must issue none. */
+TEST(qsa_below_the_exact_bound_takes_the_dense_path_without_a_resolve) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    resolve_geom(b, &blocks, &bbytes, &pitch);
+    REQUIRE(blocks > 0);
+    REQUIRE(bbytes > 0);
+    REQUIRE(pitch > 0);
+
+    /* reach = max_ctx_len + max_q_len = (100 + 32) + 32: far below the 2051 bound, so dense. */
+    auto k = kit(b, {}, { 32 }, 100);
+    StreamRig rig;
+    attach_stream(b, *k, rig, blocks, bbytes);
+
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.batch = &k->b;
+    qwen4exp_fp8::step(&ctx, &k->b);
+
+    int selects = 0, resolves = 0, dense = 0;
+    rad_buf sel = 0;
+    for (const RecIssue& i : ctx.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "qsa_select") { ++selects; sel = i.opd[5].handle; }
+        else if (o->op == "kv_resolve") ++resolves;
+        else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            if (i.opd[2].handle != sel) ++dense;   /* the block table, not the selection */
+        }
+    }
+    CHECK(selects > 0);   /* the score/select half still runs */
+    CHECK_EQ(resolves, 0);
+    CHECK(dense > 0);     /* and the launch that ran is the dense one, not a sparse one */
+}
+
+/* Above `qsa_exact_to` the prefill is sparse: the attention takes the step in one launch, and the
+ * resolve right before it rewrites exactly its rows, in the same `sel` buffer the selection
+ * produced. */
+TEST(qsa_above_the_exact_bound_resolves_once_per_sparse_launch) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    resolve_geom(b, &blocks, &bbytes, &pitch);
+    REQUIRE(blocks > 0);
+    REQUIRE(bbytes > 0);
+    REQUIRE(pitch > 0);
+
+    /* reach = (3000 + 32) + 32: above the bound, so every layer's launch is sparse. */
+    auto k = kit(b, {}, { 32 }, 3000);
+    StreamRig rig;
+    attach_stream(b, *k, rig, blocks, bbytes);
+
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.batch = &k->b;
+    qwen4exp_fp8::step(&ctx, &k->b);
+
+    int selects = 0, resolves = 0, attn = 0;
+    size_t last_select = 0;
+    for (size_t i = 0; i < ctx.issues.size(); ++i) {
+        const RecOp* o = b.op_of(ctx.issues[i].op);
+        if (!o) continue;
+        if (o->op == "qsa_select") { ++selects; last_select = i; }
+        else if (o->op == "kv_resolve") {
+            ++resolves;
+            const RadOperand& rsel  = ctx.issues[i].opd[0];
+            const RadOperand& rnsel = ctx.issues[i].opd[1];
+            const RadOperand& ssel  = ctx.issues[last_select].opd[5];
+            const RadOperand& snsel = ctx.issues[last_select].opd[6];
+            CHECK(i > last_select);              /* after the selection it rewrites */
+            CHECK_EQ(rsel.handle, ssel.handle);
+            CHECK_EQ(rsel.offset, ssel.offset);
+            CHECK_EQ(rsel.rows,   ssel.rows);    /* the launch's rows, not the step's */
+            CHECK_EQ(rnsel.offset, snsel.offset);
+            CHECK_EQ(rnsel.rows,   snsel.rows);
+            CHECK_EQ(rsel.rows, (int64_t)32);    /* one select launch of the whole step */
+        } else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            ++attn;
+            CHECK_EQ(ctx.issues[i].opd[2].handle,
+                     ctx.issues[last_select].opd[5].handle);
+            CHECK_EQ(ctx.issues[i].opd[2].offset,
+                     ctx.issues[last_select].opd[5].offset);
+            CHECK_EQ(ctx.issues[i].opd[2].rows, ctx.issues[last_select].opd[5].rows);
+        }
+    }
+    CHECK_EQ(selects, 2);      /* one indexer per full-attention layer of the eight */
+    CHECK_EQ(resolves, selects);
+    CHECK_EQ(attn, selects);
+}
+
+/* A step wider than the score plane selects in windows, and the gated sparse attention takes the
+ * whole step in one launch. The resolve is the attention's, not the indexer's: exactly one per
+ * launch, over exactly that launch's rows, after the layer's store. So a launch may span several
+ * select windows, and the resolve that precedes it rewrites all of their rows. */
+TEST(qsa_a_widened_step_resolves_the_launch_that_reads_each_window) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 4096; c.max_mixed_tok = 2048;
+    c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    const int64_t PR = m.qsacfg.plane_rows;
+    REQUIRE(PR > 0);
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    resolve_geom(b, &blocks, &bbytes, &pitch);
+    REQUIRE(blocks > 0);
+    REQUIRE(bbytes > 0);
+    REQUIRE(pitch > 0);
+
+    auto k = kit(b, {}, { 4096 }, 4096);   /* T = 2 windows, one sequence: reach is above */
+    StreamRig rig;
+    attach_stream(b, *k, rig, blocks, bbytes);
+
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.batch = &k->b;
+    qwen4exp_fp8::step(&ctx, &k->b);
+
+    struct Span { int64_t off, rows; };
+    std::vector<Span> resolved;
+    int selects = 0, stores = 0, resolves = 0, attn = 0;
+    size_t last_select = 0, last_store = 0;
+    for (size_t i = 0; i < ctx.issues.size(); ++i) {
+        const RecOp* o = b.op_of(ctx.issues[i].op);
+        if (!o) continue;
+        if (o->op == "qsa_select") {
+            ++selects;
+            last_select = i;
+        } else if (o->op == "kv_store_streamed" ||
+                   o->op == "qk_norm_rope_gate_kv_store_streamed") {
+            ++stores;
+            last_store = i;
+        } else if (o->op == "kv_resolve") {
+            ++resolves;
+            const RadOperand& rsel = ctx.issues[i].opd[0];
+            CHECK(i > last_store);              /* the mirror write precedes the copy */
+            CHECK(i > last_select);
+            CHECK_EQ(rsel.handle, ctx.issues[last_select].opd[5].handle);
+            /* `sel` offsets are element offsets into a `pitch`-wide row buffer. */
+            CHECK_EQ(rsel.offset % pitch, 0);
+            resolved.push_back({ rsel.offset / pitch, rsel.rows });
+        } else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            ++attn;
+            const RadOperand& asel = ctx.issues[i].opd[2];
+            /* The resolve that reads this launch's rows is the issue right before it. */
+            REQUIRE(i > 0);
+            const RecOp* p = b.op_of(ctx.issues[i - 1].op);
+            REQUIRE(p != nullptr);
+            CHECK_EQ(std::string(p->op), std::string("kv_resolve"));
+            CHECK_EQ(ctx.issues[i - 1].opd[0].handle, asel.handle);
+            CHECK_EQ(ctx.issues[i - 1].opd[0].offset, asel.offset);
+            CHECK_EQ(ctx.issues[i - 1].opd[0].rows,   asel.rows);
+            CHECK_EQ(asel.offset % pitch, 0);
+        }
+    }
+    CHECK_EQ(selects, 4);      /* two full layers, two windows each */
+    CHECK_EQ(stores, 2);
+    CHECK_EQ(resolves, attn);  /* one resolve per attention launch, never two */
+    CHECK(attn > 0);
+    /* Every row of the step is resolved once a layer, by the one launch that reads it. */
+    int64_t covered_to = 0;
+    for (const Span& s : resolved) {
+        CHECK_EQ(s.off, covered_to % 4096);
+        covered_to += s.rows;
+    }
+    CHECK_EQ(covered_to, (int64_t)4096 * stores);   /* one launch, the whole step, a layer */
+}
+
+/* With no stream on the attention group's batch there is nothing to resolve: the selection is a
+ * block table the pool already addresses. Issuing the op anyway would make a non-streaming
+ * configuration pay for it. */
+TEST(qsa_without_a_stream_the_selection_is_never_resolved) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+
+    auto k = kit(b, {}, { 32 }, 3000);   /* the sparse path, but no stream to make resident */
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.batch = &k->b;
+    qwen4exp_fp8::step(&ctx, &k->b);
+
+    int selects = 0, resolves = 0, attn = 0;
+    rad_buf sel = 0;
+    for (const RecIssue& i : ctx.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "qsa_select") { ++selects; sel = i.opd[5].handle; }
+        else if (o->op == "kv_resolve") ++resolves;
+        else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            ++attn;
+            CHECK_EQ(i.opd[2].handle, sel);   /* the sparse path still read the selection */
+        }
+    }
+    CHECK_EQ(selects, 2);   /* the two full-attention layers of the eight */
+    CHECK_EQ(resolves, 0);
+    CHECK_EQ(attn, selects);
+}
+
 /* The plugin declares by each weight's stored encoding. Flash-Next's experts, gated-residual
  * mixing matrices, MTP fc and 2-bit draft head each have a recipe-chosen format the plugin reads
  * from rad_weight_encoding, at convert and at load alike. With int4-rotated, E4M3-row and u2
@@ -4279,7 +4793,8 @@ TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
  * layer scalar, norm and quantiser), and q, k and v read one quantised pair. The last layer goes to
  * the final norm unfused. Without the fused op the whole chain stays unfused, still with the shared
  * q/k/v pair. */
-static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refuse, int world = 1) {
+static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refuse, int world = 1,
+                                               bool prefetch_off = false) {
     RadBuilder b;
     const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
     b.encs = { { "attn_q.", w4 }, { "attn_k.", w4 }, { "attn_v.", w4 }, { "attn_o.", w4 },
@@ -4287,6 +4802,7 @@ static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refu
     for (const auto& r : refuse) b.refuse.insert(r);
     RadModelMeta meta = gemma4_meta();
     RadBuildCtx  ctx  = build_ctx(0, world);
+    ctx.weight_prefetch_off = prefetch_off ? 1 : 0;
     CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
     RadBatch batch = decode_batch();
     RadCtx c{ .b = &b, .batch = &batch, .world = world };
@@ -4333,6 +4849,18 @@ TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
         plain.push_back(s);
     CHECK_EQ(join(gemma4_w4_step({ "ar_rmsnorm_quant_i8" }, 2)), join(plain));
+}
+
+/* --weight-prefetch off (RadBuildCtx::weight_prefetch_off) declares none of the reads beside the
+ * reductions, and the rest of the step is the step with them. */
+TEST(a_gemma4_step_under_weight_prefetch_off_issues_no_prefetch) {
+    const std::vector<std::string> on = gemma4_w4_step({}, 2), off = gemma4_w4_step({}, 2, true);
+    CHECK_EQ(count_issued(on, "prefetch"), 36);
+    CHECK_EQ(count_issued(off, "prefetch"), 0);
+    std::vector<std::string> rest;
+    for (const std::string& s : on)
+        if (s != "prefetch") rest.push_back(s);
+    CHECK_EQ(join(off), join(rest));
 }
 
 TEST(a_gemma4_w4a8_step_fuses_its_residual_junctions) {
@@ -7015,15 +7543,10 @@ TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
 }
 
-/* The dense attention of a mixed step is issued once per band (AttnGatedFP8::step): the decode
- * sequences at their own band (the split-KV decode row), then the prefill chunks at theirs, so a
- * long decode sequence riding a prefill chunk is not walked by one query-tiled workgroup. The
- * decode half is the prefix (its rows, its tables, cu to its end); the prefill half has its
- * per-sequence arrays past the decode sequences and q, out and cu at their absolute rows, as the
- * GDN blocks issue their prefill half, at the op's top band so a row written for such a launch
- * serves it. A pure step issues one attention per layer, as before
- * (and with RADIANCE_ATTN_BAND_SPLIT=0, under which every pinned_steps pin of the families on this
- * block holds unchanged, so a mixed step is the only one the split touches). */
+/* A mixed step's dense attention is issued once per band (AttnGatedFP8::step): the decode
+ * sequences as a prefix at their own band, then the prefill chunks at the op's top band with
+ * their per-sequence arrays past the decode sequences and q, out and cu at absolute rows. A pure
+ * step issues one attention a layer. */
 TEST(qwen35_fp8_issues_a_mixed_steps_attention_once_per_band) {
     MetaKV mk = q35fp8_meta();
     RadBuilder b;
@@ -7048,10 +7571,6 @@ TEST(qwen35_fp8_issues_a_mixed_steps_attention_once_per_band) {
     CHECK_EQ(attn(*dec).size(), (size_t)2);
     CHECK_EQ(attn(*pre).size(), (size_t)2);
     const auto m = attn(*mixed);
-    if (!rad::arch::attn_band_split()) {               /* RADIANCE_ATTN_BAND_SPLIT=0: one launch */
-        CHECK_EQ(m.size(), (size_t)2);
-        return;
-    }
     REQUIRE_EQ(m.size(), (size_t)4);
     const int32_t* table = mixed->table.data();
     const int32_t* used  = mixed->used.data();
@@ -7075,10 +7594,9 @@ TEST(qwen35_fp8_issues_a_mixed_steps_attention_once_per_band) {
         CHECK_EQ(d.opd[1].handle, p.opd[1].handle);      /* the same layer's cache */
         CHECK_EQ(d.opd[1].offset, p.opd[1].offset);
     }
-    /* A chunk no longer than the decode band's bound (1.10-next6u issued it at its own 10 and
-     * the decode row took the whole step's rows: RAD_E_SCRATCH under load) still goes to the top
-     * band; a chunk no longer than the verify blocks beside it keeps the one launch at their
-     * band, as before the split (r4d_selftest attn_mixed_step checks both halves' scratch). */
+    /* A chunk within the decode row's band still goes to the top band (the decode row's scratch
+     * is sized for its own band); a chunk no longer than the verify blocks beside it keeps one
+     * launch at their band (r4d_selftest attn_mixed_step checks both halves' scratch). */
     const auto shortc = kit(b, { 3, 2 }, { 4 }, 20);
     const auto m2 = attn(*shortc);
     REQUIRE_EQ(m2.size(), (size_t)4);
@@ -7620,8 +8138,7 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
 
 /* ---- TranslateGemma as served: the MXFP4 trunk with DFlash2 at speculation 7 over two ranks, a lossy
  * wire whose fused junction takes the steps of up to 12 rows, eight sequences (verify steps of 8..64
- * rows). The A/B knobs over its decode steps (RADIANCE_G3_PF_ROWS, _PF_MIB, _PF_EARLY, _FOLD_ROWS)
- * are read at declare. */
+ * rows). */
 namespace {
 
 struct G3Served {
@@ -7629,17 +8146,14 @@ struct G3Served {
     RadBuilder b;
     int        rank = 0;
     int        rc = RAD_E_INVAL;
-    using Env = std::vector<std::pair<const char*, const char*>>;
-    explicit G3Served(int rk, const Env& env = {}) : rank(rk) {
+    explicit G3Served(int rk) : rank(rk) {
         const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
         b.encs = { { "blk.", mx } };
         RadBuildCtx ctx = spec_ctx(rank, 2, 7);
         ctx.max_tok = 2048;
         ctx.tp_wire_lossy = 1;
         ctx.tp_wire_min_bytes = 128 * 1024;
-        for (const auto& e : env) setenv(e.first, e.second, 1);
         rc = stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); });
-        for (const auto& e : env) unsetenv(e.first);
     }
     std::vector<std::unique_ptr<Kit>> kits;   /* a step's context points into its kit */
     /* A verify step of `n_seq` sequences, 8 rows each. */
@@ -7649,193 +8163,38 @@ struct G3Served {
     }
 };
 
-/* The decode-side fingerprint: three plain decodes, every verify height a deployment of eight
- * sequences reaches (8..64 rows), a prefill chunk and a mixed step. */
-uint64_t g3_decode_steps(G3Served& s) {
-    std::vector<std::unique_ptr<Kit>> ks;
-    ks.push_back(kit(s.b, { 1, 1, 1 }, {}));
-    for (int n = 1; n <= 8; ++n) ks.push_back(kit(s.b, std::vector<int>((size_t)n, 8), {}));
-    ks.push_back(kit(s.b, {}, { 24 }));
-    ks.push_back(kit(s.b, { 8 }, { 6 }));
-    std::vector<std::unique_ptr<RadCtx>> all;
-    std::vector<const Kit*> kp;
-    for (const auto& k : ks) {
-        auto v = run_passes(s.b, gemma3::step, { k.get() }, s.rank, 2);
-        CHECK_PASSES(s.b, v);
-        for (auto& c : v) all.push_back(std::move(c));
-        kp.push_back(k.get());
-    }
-    return issue_hash(s.b, all, kp);
-}
-
-/* The trunk's reads beside the reductions in one step: issue indices and their ops. */
-std::vector<size_t> g3_trunk_reads(const RadBuilder& b, const RadCtx& c) {
-    std::vector<size_t> at;
-    for (size_t i = 0; i < c.issues.size(); ++i) {
-        const RecOp* o = b.op_of(c.issues[i].op);
-        if (o && o->op == "prefetch" && o->w.size() == 1 &&
-            b.weights[o->w[0] - 1].name.rfind("blk.", 0) == 0)
-            at.push_back(i);
-    }
-    return at;
-}
-
 }  /* namespace */
 
-/* With the knobs set to their defaults the served build declares and steps exactly what it does with
- * them unset: graph and decode-side steps per rank against the knobs-unset build of the same tree.
- * RADIANCE_G3_PF_MIB alone changes nothing, since it sizes only the reads above 32 rows. */
-TEST(gemma3_served_knobs_at_their_defaults_keep_the_graph_and_steps) {
-    struct Pin { uint64_t graph, steps; };
-    Pin pins[2] = {};
-    for (int rank = 0; rank < 2; ++rank) {
-        G3Served k(rank, {});
-        REQUIRE_EQ(k.rc, RAD_OK);
-        pins[rank] = { graph_hash(k.b), g3_decode_steps(k) };
-    }
-    const std::vector<G3Served::Env> envs = {
-        { { "RADIANCE_G3_PF_ROWS", "32" }, { "RADIANCE_G3_PF_MIB", "24" },
-          { "RADIANCE_G3_PF_EARLY", "0" }, { "RADIANCE_G3_FOLD_ROWS", "0" } },
-        { { "RADIANCE_G3_PF_MIB", "12" } },
-        { { "RADIANCE_G3_FOLD_ROWS", "8" } },
-    };
-    for (int rank = 0; rank < 2; ++rank)
-        for (const auto& env : envs) {
-            G3Served k(rank, env);
-            REQUIRE_EQ(k.rc, RAD_OK);
-            const uint64_t g = graph_hash(k.b), st = g3_decode_steps(k);
-            fprintf(stderr, "    pin: gemma3 served rank %d (%zu knobs): graph 0x%016llxull, steps "
-                            "0x%016llxull\n", rank, env.size(), (unsigned long long)g,
-                    (unsigned long long)st);
-            CHECK_EQ(g, pins[rank].graph);
-            CHECK_EQ(st, pins[rank].steps);
-        }
-}
-
-/* RADIANCE_G3_PF_ROWS raises the height up to which a decode step reads the next GEMM's weight
- * beside each reduction (32 by default, as qwen35_fp8's). At 64 a verify of eight sequences takes
- * the reads too, every one of the 2L - 1; RADIANCE_G3_PF_MIB sizes the reads of the steps above 32
- * rows (24 MiB, the narrow steps' size, by default) as ops of their own, so the narrow steps keep
- * theirs. A prompt's rows never take them. */
-TEST(gemma3_prefetch_rows_knob_reads_beside_the_wider_verify_steps) {
+/* The gated fold (gate_up, the GeGLU and down's quantiser in one launch) is declared up to 64 rows at
+ * TranslateGemma's K (5376, past the wide fold's 2688): every verify height of eight sequences issues
+ * the fold once a layer and neither gelu_mul nor down's own quantiser; only o's quantiser is left. */
+TEST(gemma3_folds_the_gated_gemm_up_to_64_rows) {
     const int L = 12;
-    for (const char* mib : { (const char*)nullptr, "12" }) {
-        for (const char* rows : { (const char*)nullptr, "48", "64" }) {
-            G3Served::Env env;
-            if (rows) env.push_back({ "RADIANCE_G3_PF_ROWS", rows });
-            if (mib) env.push_back({ "RADIANCE_G3_PF_MIB", mib });
-            G3Served s(0, env);
-            REQUIRE_EQ(s.rc, RAD_OK);
-            const int64_t ceil = rows ? std::atoll(rows) : 32;
-            const int64_t wide_bytes = (int64_t)(mib ? std::atoll(mib) : 24) << 20;
-            for (int n = 1; n <= 8; ++n) {
-                const auto v = s.verify(n);
-                CHECK_PASSES(s.b, v);
-                const RadCtx& c = *v[0];
-                const std::vector<size_t> at = g3_trunk_reads(s.b, c);
-                const int64_t T = 8 * n;
-                CHECK_EQ((int)at.size(), T <= ceil ? 2 * L - 1 : 0);
-                for (size_t i : at) {
-                    const RecOp* o = s.b.op_of(c.issues[i].op);
-                    CHECK_EQ(pint(o, "bytes"), T <= 32 ? (int64_t)24 << 20 : wide_bytes);
-                    CHECK_EQ(c.issues[i].lane, 1);
-                }
-                CHECK_EQ(races(s.b, c), 0);
-            }
-            for (const auto& k : { kit(s.b, {}, { 24 }), kit(s.b, { 8, 8 }, { 6 }) }) {
-                const auto v = run_passes(s.b, gemma3::step, { k.get() }, 0, 2);
-                CHECK_PASSES(s.b, v);
-                CHECK(g3_trunk_reads(s.b, *v[0]).empty());
-            }
+    G3Served s(0);
+    REQUIRE_EQ(s.rc, RAD_OK);
+    int folds = 0;
+    for (const auto& o : s.b.ops)
+        if (o.op == "gemm_nt_q_gated_mx" && !o.w.empty() &&
+            s.b.weights[o.w[0] - 1].name.rfind("blk.", 0) == 0) {
+            ++folds;
+            CHECK_EQ(pstr(&o, "act"), std::string("gelu_tanh"));
+            CHECK_EQ(param(&o, "M")->ihi, (int64_t)64);
+            CHECK_EQ(pint(&o, "N"), 21504);   /* gate|up, this rank's half of 2 x 21504 */
         }
-    }
-    /* Out of range or not a number: refused at declare, naming the knob. */
-    for (const auto& bad : { std::make_pair("RADIANCE_G3_PF_ROWS", "0"),
-                             std::make_pair("RADIANCE_G3_PF_ROWS", "x"),
-                             std::make_pair("RADIANCE_G3_PF_MIB", "0"),
-                             std::make_pair("RADIANCE_G3_PF_MIB", "257"),
-                             std::make_pair("RADIANCE_G3_PF_EARLY", "2") }) {
-        G3Served s(0, { bad });
-        CHECK(s.rc != RAD_OK);
-    }
-}
-
-/* Above 12 rows the lossy wire's all-reduce runs bare (unfused), issued by the block itself, so a
- * read issued after the block waits for that reduction rather than sitting beside it (its lane-1
- * join comes after the all-reduce). RADIANCE_G3_PF_EARLY=1 issues the read between the GEMM and the
- * bare all-reduce, as the fused junction's steps always have it. The fused steps (8 rows) are the
- * same either way: GEMM, read, fused all-reduce. */
-TEST(gemma3_prefetch_early_knob_puts_the_read_in_front_of_a_bare_all_reduce) {
-    for (int early : { 0, 1 }) {
-        G3Served s(1, early ? G3Served::Env{ { "RADIANCE_G3_PF_EARLY", "1" } } : G3Served::Env{});
-        REQUIRE_EQ(s.rc, RAD_OK);
-        for (int n : { 1, 2, 4 }) {
-            const auto v = s.verify(n);
-            CHECK_PASSES(s.b, v);
-            const RadCtx& c = *v[0];
-            const std::vector<std::string> ops = issued_ops(s.b, c);
-            const std::vector<size_t> at = g3_trunk_reads(s.b, c);
-            REQUIRE(!at.empty());
-            const bool fused = n == 1;
-            for (size_t i : at) {
-                REQUIRE(i > 0 && i + 1 < ops.size());
-                const std::string& before = ops[i - 1];
-                const std::string& after = ops[i + 1];
-                if (fused) {
-                    CHECK_EQ(before, std::string("gemm_nt_q"));
-                    CHECK_EQ(after, std::string("ar_rmsnorm_post_quant_fp8"));
-                } else if (early) {
-                    CHECK_EQ(before, std::string("gemm_nt_q"));
-                    CHECK_EQ(after, std::string("all_reduce"));
-                    CHECK(ordered(c, i - 1, i));
-                } else {
-                    CHECK_EQ(before, std::string("all_reduce"));
-                }
+    CHECK_EQ(folds, L);
+    for (int n = 1; n <= 8; ++n) {
+        const auto v = s.verify(n);
+        CHECK_PASSES(s.b, v);
+        const std::vector<std::string> ops = issued_ops(s.b, *v[0]);
+        int gated = 0;
+        for (size_t i = 0; i < ops.size(); ++i)
+            if (ops[i] == "gemm_nt_q_gated_mx") {
+                ++gated;
+                CHECK_EQ(v[0]->issues[i].n, 8 * n);
             }
-            CHECK_EQ(races(s.b, c), 0);
-        }
-    }
-}
-
-/* RADIANCE_G3_FOLD_ROWS declares the gated fold (gate_up, the GeGLU and down's quantiser in one
- * launch) up to that many rows instead of 8: a verify step at or under the ceiling issues the fold
- * once a layer and neither gelu_mul nor down's own quantiser; above it, the unfused three. Only o's
- * quantiser is left at a folded step. Out of range (past 64, or not a number) is refused. */
-TEST(gemma3_fold_rows_knob_folds_the_gated_gemm_up_to_its_ceiling) {
-    const int L = 12;
-    for (const char* fr : { (const char*)nullptr, "16", "32", "64" }) {
-        G3Served s(0, fr ? G3Served::Env{ { "RADIANCE_G3_FOLD_ROWS", fr } } : G3Served::Env{});
-        REQUIRE_EQ(s.rc, RAD_OK);
-        const int64_t hi = fr ? std::atoll(fr) : 8;
-        int folds = 0;
-        for (const auto& o : s.b.ops)
-            if (o.op == "gemm_nt_q_gated_mx" && !o.w.empty() &&
-                s.b.weights[o.w[0] - 1].name.rfind("blk.", 0) == 0) {
-                ++folds;
-                CHECK_EQ(pstr(&o, "act"), std::string("gelu_tanh"));
-                CHECK_EQ(param(&o, "M")->ihi, hi);
-                CHECK_EQ(pint(&o, "N"), 21504);   /* gate|up, this rank's half of 2 x 21504 */
-            }
-        CHECK_EQ(folds, L);
-        for (int n = 1; n <= 8; ++n) {
-            const auto v = s.verify(n);
-            CHECK_PASSES(s.b, v);
-            const std::vector<std::string> ops = issued_ops(s.b, *v[0]);
-            const bool fold = 8 * n <= hi;
-            int gated = 0;
-            for (size_t i = 0; i < ops.size(); ++i)
-                if (ops[i] == "gemm_nt_q_gated_mx") {
-                    ++gated;
-                    CHECK_EQ(v[0]->issues[i].n, 8 * n);
-                }
-            CHECK_EQ(gated, fold ? L : 0);
-            CHECK_EQ(count_issued(ops, "gelu_mul"), fold ? 0 : L);
-            CHECK_EQ(count_issued(ops, "quant_act_fp8"), fold ? L : 2 * L);
-        }
-    }
-    for (const char* bad : { "65", "-1", "x" }) {
-        G3Served s(0, { { "RADIANCE_G3_FOLD_ROWS", bad } });
-        CHECK(s.rc != RAD_OK);
+        CHECK_EQ(gated, L);
+        CHECK_EQ(count_issued(ops, "gelu_mul"), 0);
+        CHECK_EQ(count_issued(ops, "quant_act_fp8"), L);
     }
 }
 
@@ -7874,7 +8233,12 @@ TEST(qwen35_fp8_fp8_v4_cache_is_400_bytes_a_token_and_head) {
     const int v4 = count(b, "fp8_v4"), e4 = count(b, "fp8_e4m3");
     CHECK(v4 > 0);
     CHECK(e4 > 0);                       /* the drafter's attention */
-    CHECK_EQ(v4 + e4, n8);
+    /* The packed build declares no streamed store or fold (libr4d has no row for the layout), so it
+     * has exactly those two ops fewer than the plain build. */
+    const int streamed = count_op(f8, "kv_store_streamed") +
+                         count_op(f8, "qk_norm_rope_gate_kv_store_streamed");
+    CHECK(streamed > 0);
+    CHECK_EQ(v4 + e4, n8 - streamed);
     CHECK(noted(b, "kv cache fp8_v4"));
 
     RadArchProbe p{};
@@ -7906,6 +8270,49 @@ TEST(qwen35_fp8_k6_v4_cache_is_352_bytes_a_token_and_head) {
     CHECK(e4 > 0);
     CHECK_EQ(v4, 0);
     CHECK(noted(b, "kv cache k6_v4"));
+}
+
+/* A packed KV cache declares no streamed store and no fold. libr4d's streamed rows are the E4M3 and
+ * bf16 ones only (libr4d/r4d_rows.cpp), and both streamed ops are weightless, so a declaration with
+ * no row for the layout is a device band that resolved to nothing -- a hole, which refuses startup
+ * with or without --kv-resident and never names the flag. The group's core dtype is plain E4M3 at
+ * head_dim 25/32 or 22/32 of the model's, so nothing downstream of declare can tell a packed cache
+ * from fp8: the gate has to be here. Everything else the build declares is unchanged -- the
+ * layout-blind resolve included, where the model has an indexer -- because a packed group is
+ * unstreamable for want of a writer, not because its attention cannot address a ring. */
+TEST(a_packed_kv_cache_declares_no_streamed_store_and_no_fold) {
+    using DeclareFn = int (*)(RadBuilder*, const RadModelMeta*, const RadBuildCtx*);
+    RadModelMeta m4 = qwen4exp_meta();
+    MetaKV m35 = q35fp8_meta();
+    struct Plugin { const char* name; DeclareFn declare; const RadModelMeta* meta; };
+    const Plugin plugins[] = { { "qwen4exp", qwen4exp_fp8::declare, &m4 },
+                               { "qwen35", qwen35_fp8::declare, m35.meta() } };
+    for (const Plugin& pl : plugins) {
+        /* The same build at plain fp8: the two streamed ops are declared, so the zeros below are
+         * the layout gate and not an architecture that never streams. */
+        RadBuildCtx plain = build_ctx();
+        plain.kv_dtype = RAD_F8E4M3;
+        plain.max_ctx = 200000;
+        RadBuilder p;
+        REQUIRE_EQ(pl.declare(&p, pl.meta, &plain), RAD_OK);
+        CHECK(count_op(p, "kv_store_streamed") > 0);
+        REQUIRE(count_op(p, "qk_norm_rope_gate_kv_store_streamed") > 0);
+
+        for (int q : { (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+            RadBuildCtx ctx = plain;
+            ctx.kv_quant = q;
+            RadBuilder b;
+            REQUIRE_EQ(pl.declare(&b, pl.meta, &ctx), RAD_OK);
+            const RadKVGroupDecl& f = b.kv_groups[0].d;
+            CHECK_EQ(f.kind, RAD_KV_FULL);
+            CHECK_EQ(f.dtype, (uint32_t)RAD_F8E4M3);   /* the core sees E4M3, not the layout */
+            CHECK_EQ(f.head_dim, q == RAD_KVQ_V4 ? (int64_t)200 : (int64_t)176);
+            CHECK(count_op(b, "kv_store") > 0);        /* the base store still serves the group */
+            CHECK_EQ(count_op(b, "kv_resolve"), count_op(p, "kv_resolve"));
+            CHECK_EQ(count_op(b, "kv_store_streamed"), 0);
+            CHECK_EQ(count_op(b, "qk_norm_rope_gate_kv_store_streamed"), 0);
+        }
+    }
 }
 
 /* --attn-prefill-fp8: the trunk's attn_paged ops state `prefill_fp8` with the context's bits and
@@ -9674,32 +10081,44 @@ struct ArchCases {
             qwen35_bf16::step, 0, {}, 0xf82117051023e608ull);
         add("qwen35_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            qwen35_fp8::step, 3, {}, 0x74fd4495028c1525ull);
+            qwen35_fp8::step, 3, {}, 0x20ab9ed24e409329ull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x7c11e3c8243c955full);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0xd12381e7e3ede24dull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0x5eaef1ee37575caeull);
+            qwen35_fp8::step, 7, {}, 0x365e4cbb415ac284ull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x5a4f256c6fda0e87ull);
+            qwen35_w8a8::step, 7, {}, 0x742a596708bbda1dull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xdc5540151b0d6684ull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7b7a1b301de20c1eull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
+            qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x43048d3448778280ull);
+            qwen4exp_fp8::step, 3, {}, 0x4a12ebade34d845bull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0x43d3be2b6d76e470ull);
+            nullptr, 3, { "ar_hc_write" }, 0xeb856cde42ac3e3bull);
         add("qwen4exp_fp8, four-bit experts", [this](RadBuilder* b) {
                 b->encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x08d082fcbef37889ull);
+            qwen4exp_fp8::step, 3, {}, 0xa9458e439054bfa0ull);
+        /* The cache dtype stated rather than left to the plugin's default. The streamed store and
+         * the prologue that folds it are declared only where the vocabulary has them, and both are
+         * written at the KV group's dtype -- bf16 being the copy-only one, and it is what
+         * every case above already gets from the default, the "fp8" in this architecture's name
+         * being its trunk's quantisation rather than its cache. Naming it here makes that coverage
+         * visible; the fingerprint below is therefore `qwen4exp_fp8`'s exact value, since the two
+         * declare one graph, and the test after this table says by name what that graph holds. */
+        add("qwen4exp_fp8, bf16 KV", [this](RadBuilder* b) {
+                auto c = q4_ctx(0, 1);
+                c.kv_dtype = RAD_BF16;
+                return qwen4exp_fp8::declare(b, &q4, &c); },
+            qwen4exp_fp8::step, 3, {}, 0x4a12ebade34d845bull);
         add("llama_fp8 + DSpark", [this](RadBuilder* b) {
                 auto c = dspark_ctx(0, 1); return llama_fp8::declare(b, lla.meta(), &c); },
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
@@ -9834,6 +10253,40 @@ TEST(with_every_op_declared_each_architecture_declares_its_unchanged_graph) {
                     (unsigned long long)h, (unsigned long long)ac.graph);
         CHECK_EQ(h, ac.graph);
     }
+}
+
+/* What the bf16 KV pin above is worth: a fingerprint that moves says nothing about which ops it
+ * covered. The full-attention group must be bf16, and every layer that declares its cache store
+ * must have both forms at that dtype -- the streamed store and the prologue that folds it in, which
+ * is the one bf16 issues. With the store's row gone from the vocabulary the bf16
+ * declare loses both and the hash above moves; this names them, so a bf16 streamed path that
+ * silently disappears fails as itself rather than as a number. */
+TEST(the_bf16_kv_qwen4exp_graph_declares_the_streamed_store_and_its_fold) {
+    const ArchCase* ac = nullptr;
+    for (const ArchCase& c : arch_cases().list)
+        if (c.name == "qwen4exp_fp8, bf16 KV") ac = &c;
+    REQUIRE(ac != nullptr);
+    RadBuilder b;
+    REQUIRE_EQ(ac->declare(&b), RAD_OK);
+    int group = 0, store = 0, folded = 0, hosted = 0;
+    for (const auto& g : b.kv_groups)
+        if (g.name.find("kv_attn") != std::string::npos) {
+            CHECK_EQ((int)g.d.dtype, (int)RAD_BF16);
+            ++group;
+        }
+    for (const auto& o : b.ops) {
+        const bool stream = o.op == "kv_store_streamed";
+        const bool fold   = o.op == "qk_norm_rope_gate_kv_store_streamed";
+        if (o.op == "kv_store") ++hosted;
+        if (!stream && !fold) continue;
+        for (const auto& p : o.p)
+            if (p.key == "kv_dtype") CHECK_EQ(p.sval, std::string("bf16"));
+        ++(stream ? store : folded);
+    }
+    CHECK_EQ(group, 1);
+    CHECK_EQ(hosted, 3);              /* two full-attention layers and the MTP head's */
+    CHECK_EQ(store, hosted);          /* each one's store has a streamed form ... */
+    CHECK_EQ(folded, store);          /* ... and a folded form beside it */
 }
 
 /* Where gate_quant_fp8 is not declared, or declared and not resolved, the fp8 gated attention runs
@@ -10381,15 +10834,15 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x23ec76c443e2cb6full, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0x88290524cfd7714full, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0xa4268bda72739be8ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0xaa5abead708b106full, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x9ffc4cf1b074a153ull, 0x36df57cac613c6cfull },
-        { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
-        { "qwen35_fp8", 2, 1, 0xcaf28466af9e917dull, 0x0bcf5833fce11a86ull },
-        { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
-        { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
+        { "qwen4exp_fp8", 1, 0, 0xc38f2b3063262a80ull, 0x26a9e2c23cf85696ull },
+        { "qwen4exp_fp8", 2, 0, 0xab53806937d83c1aull, 0x889c6b36c014609full },
+        { "qwen4exp_fp8", 2, 1, 0x983f38c3a7ee5a29ull, 0x959ef6b7c6f57d8bull },
+        { "qwen4exp_fp8", 4, 0, 0x780814049d36bebcull, 0xfbe74f2b9d7020bfull },
+        { "qwen4exp_fp8", 4, 3, 0x0723ed824fef82d4ull, 0x36df57cac613c6cfull },
+        { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
+        { "qwen35_fp8", 2, 1, 0x61d309383f96b1acull, 0xbf359de7b8a6322cull },
+        { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },
+        { "qwen35moe_fp8", 2, 0, 0x3a2761e9546797f1ull, 0x4a597c66b5868eeeull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;

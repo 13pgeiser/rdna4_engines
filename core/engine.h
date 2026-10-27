@@ -114,6 +114,9 @@ private:
      * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
+     * cannot reach each rank's manager. */
+    std::vector<std::vector<const RadKVStream*>> rank_stream_views_;
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
@@ -254,10 +257,8 @@ private:
         /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
          * empty on a step with none. */
         std::vector<TokenLogprobs> lp;
-        /* The ids' copy has its own event ahead of the drafter's passes (collect_issue's
-         * `fence`): collect_step waits on it, the commit streams the tokens, and the passes are
-         * waited for after that (step_end_), before anything reads what they wrote or reuses what
-         * the commit released. */
+        /* The ids' copy recorded tok_end_ ahead of the drafter's passes: collect_step waits for
+         * it alone, and the step loop for step_end_ after the commit. */
         bool                  early = false;
     };
 
@@ -328,9 +329,8 @@ private:
     void probe_arena_levels();
     int  step_loop();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
-     * Split so the copy is issued before draft passes overwrite the ids. With `fence` (a drafter
-     * queueing its passes behind the step) the copy gets an event of its own, tok_end_, so the
-     * wait for the ids need not wait for the passes too (StepOut::early). */
+     * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
+     * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
     int  collect_issue(StepOut& so, bool fence = false);
     int  collect_step(const RadBatch* b, StepOut& so);
     int  row_logprobs(StepOut& so, int32_t row, int32_t token);
@@ -342,8 +342,25 @@ private:
     /* The sampled ids' copy, ahead of the drafter's passes (collect_issue's `fence`). */
     RadEvent tok_end_ = nullptr;
     /* Whether the ids may be read before the drafter's passes end: not in KL mode, whose scored
-     * rows are read out of the logits after collection, nor in an embedding program. */
+     * rows are read from the logits after collection, nor for an embedding program. */
     bool     early_ids_ = false;
+
+    /* ---- KV streaming's counters (engine.cpp, "KV streaming's counters"). Pinned, because a
+     * device-to-host copy into pageable memory blocks the stream. */
+    struct StreamRead {
+        int64_t  resolves = 0, lookups = 0, misses = 0;
+        int64_t  max_union = 0, max_misses = 0, max_claims = 0;
+        int64_t  slots = 0, block_bytes = 0;
+        bool     overflow = false;
+        int32_t  group = -1;
+    };
+    std::vector<StreamRead> stream_prev_;   /* what metrics have already been charged */
+    /* Pinned landing area for the copies: [n_kv_groups][16] i32, grown on first use. */
+    int32_t*                stream_ctl_p_ = nullptr;
+    size_t                  stream_ctl_n_ = 0;
+    int  stream_probe_issue(const RadBatch* b);
+    int  stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end);
+    void stream_report(const char* when, const StreamRead& r, const StreamRead& prev);
 
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the
@@ -529,6 +546,9 @@ private:
     void decide(const std::string& key, const std::string& value, const std::string& why) {
         diag::decide(&decisions_, key, value, why);
     }
+    /* The architecture's RadArchProbe, asked once in declare(): a property of the model, so every
+     * RadBuildCtx carries the same answer (RadBuildCtx::kv_stream_ok). */
+    RadArchProbe arch_probe_{};
     std::string devnote_;            /* the devices usable_devices left out, and why */
     int         p2p_measured_ = -1;  /* 1 peer to peer, 0 through host memory, -1 not asked */
     std::string p2p_blocked_;

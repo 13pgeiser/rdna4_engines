@@ -360,8 +360,8 @@ TEST(a_history_pass_keeps_the_hosts_rows_and_repeats_the_last_committed_one) {
  * So on every pass the card stages, the last row of a run -- round 1's input on a history pass,
  * the only row whose output the head goes on with -- must sit exactly at its own position, and no
  * row may count past its own: a key past it is a position the head's layer has not written for
- * this sequence. A history pass that accepted acc < n_spec drafts used to put its last row
- * n_spec - acc positions too far, and MTP round 1 read whatever those slots held. */
+ * this sequence. (After a verify that accepted acc < n_spec drafts, a history pass's whole run
+ * length would put its last row n_spec - acc positions too far.) */
 TEST(no_draft_pass_row_reads_keys_past_its_own_position) {
     const int n_spec = 3;
     for (int aux = 0; aux <= 2; ++aux)

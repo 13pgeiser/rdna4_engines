@@ -338,6 +338,22 @@ __global__ __launch_bounds__(kThreads) void pool_rows_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- pool_cols
+// ref_pool_cols: column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in
+// f32 and rounded to bf16, then times `mult` and rounded again. A thread an output column.
+__global__ __launch_bounds__(kThreads) void pool_cols_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t k, float mult,
+    uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= n / k) return;
+    for (uint32_t r = blockIdx.y; r < M; r += gridDim.y) {
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < k; ++j) acc += bf2f(x[(size_t)r * x_ld + (size_t)i * k + j]);
+        const float mean = bf2f(f32_to_bf16(acc * (1.0f / (float)k)));
+        y[(size_t)r * y_ld + i] = f32_to_bf16(mean * mult);
+    }
+}
+
 // ---------------------------------------------------------------------------- cast bf16 -> f32
 __global__ __launch_bounds__(kThreads) void widen_kernel(
     const uint16_t* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t x_ld,
@@ -860,6 +876,18 @@ extern "C" int r4d_pool_rows_bf16(long x, long y, int rows, int n, int k, float 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int r4d_pool_cols_bf16(long x, long y, int rows, int n, int k, float mult, int x_ld,
+                                  int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (rows <= 0 || n <= 0 || k <= 0 || n % k) return -2;
+    hipLaunchKernelGGL(pool_cols_kernel,
+                       dim3((uint32_t)((n / k + kThreads - 1) / kThreads), grid_rows(rows)),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)y,
+                       (uint32_t)n, (uint32_t)k, mult, (uint32_t)x_ld, (uint32_t)y_ld,
+                       (uint32_t)rows);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r4d_widen_bf16_f32(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -1202,6 +1230,25 @@ extern "C" int r4d_rad_pool_rows(const RadArgs* a, RadStream s) {
     if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (Mx <= 0 || Mx % k || My < Mx / k) return R4D_NO(RAD_E_SHAPE);
     return enc_status(r4d_pool_rows_bf16(r4d_addr(X), r4d_addr(Y), (int)(Mx / k), (int)n, (int)k,
+                                         (float)r4d_getf(a, "mult", 1.0), (int)x_ld, (int)y_ld,
+                                         (long)(uintptr_t)s));
+}
+
+/* ------------------------------------------------------------------ pool_cols */
+extern "C" int r4d_rad_pool_cols(const RadArgs* a, RadStream s) {
+    const RadTensor* X = r4d_opt(a, 0);
+    const RadTensor* Y = r4d_opt(a, 1);
+    if (!X || !Y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(X));
+    R4D_NEED(dt_bf16(Y));
+    const long long n = r4d_geti_or(a, "n", 0), k = r4d_geti_or(a, "k", 0);
+    if (n <= 0 || k <= 0 || n % k) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(X, n, &M);
+    const long long y_ld = r4d_rows_pitch(Y, n / k, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    return enc_status(r4d_pool_cols_bf16(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)k,
                                          (float)r4d_getf(a, "mult", 1.0), (int)x_ld, (int)y_ld,
                                          (long)(uintptr_t)s));
 }

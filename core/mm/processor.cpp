@@ -1,5 +1,6 @@
 /* processor.cpp -- see processor.h. */
 #include "mm/processor.h"
+#include "mm/imaging.h"
 
 #include "rad_internal.h"
 #include "rad_plugin.h"
@@ -1810,6 +1811,126 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
 }
 
 namespace {
+/* A picture's sides for a video encoder: the longer one scaled to at most `max_side`, aspect
+ * kept, then each floored to a multiple of `ratio`, at least one multiple. */
+void encoder_sides(int32_t fw, int32_t fh, int32_t ratio, int32_t max_side, int32_t* w,
+                   int32_t* h) {
+    const int32_t longest = std::max(fw, fh);
+    const double  scale = longest > max_side ? (double)max_side / (double)longest : 1.0;
+    auto snap = [&](int32_t s) {
+        const int64_t v = (int64_t)std::floor(s * scale) / ratio * ratio;
+        return (int32_t)std::min<int64_t>(std::max<int64_t>(v, ratio), max_side / ratio * ratio);
+    };
+    *w = snap(fw);
+    *h = snap(fh);
+}
+}  /* namespace */
+
+int Processor::encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                             Frame* out, std::string* why) const {
+    if (ratio < 1 || max_side < ratio) {
+        if (why) *why = "the encoder's side ratio and maximum are not usable";
+        return RAD_E_INVAL;
+    }
+    /* image()'s decode guard. The encoder runs a picture whole, not in ComfyUI's 256-pixel tiles,
+     * so a larger one is shrunk to its bound. */
+    Frame f;
+    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    int32_t w = 0, h = 0;
+    encoder_sides(f.w, f.h, ratio, max_side, &w, &h);
+    if (w == f.w && h == f.h) {
+        *out = std::move(f);
+        return RAD_OK;
+    }
+    resize_lanczos_rgb(f, w, h, out);
+    return RAD_OK;
+}
+
+int Processor::encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h,
+                                    bool cover, Frame* out, std::string* why) const {
+    if (w < 1 || h < 1) {
+        if (why) *why = "the keyframe canvas is empty";
+        return RAD_E_INVAL;
+    }
+    /* image()'s decode guard. */
+    Frame f;
+    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    if (!cover) {
+        /* A stretch, ComfyUI's first-frame resize. */
+        if (w == f.w && h == f.h) { *out = std::move(f); return RAD_OK; }
+        resize_lanczos_rgb(f, w, h, out);
+        return RAD_OK;
+    }
+    /* Scaled to cover the canvas, aspect kept, then cropped at the centre: ComfyUI's last-frame
+     * resize. */
+    const double s = std::max((double)w / (double)f.w, (double)h / (double)f.h);
+    int32_t cw = (int32_t)std::llround((double)f.w * s);
+    int32_t ch = (int32_t)std::llround((double)f.h * s);
+    if (cw < w) cw = w;
+    if (ch < h) ch = h;
+    Frame big;
+    resize_lanczos_rgb(f, cw, ch, &big);
+    const int32_t x0 = (cw - w) / 2, y0 = (ch - h) / 2;
+    out->w = w;
+    out->h = h;
+    out->rgb.resize((size_t)w * h * 3);
+    for (int32_t y = 0; y < h; ++y)
+        for (int32_t x = 0; x < w * 3; ++x)
+            out->rgb[(size_t)y * w * 3 + x] =
+                big.rgb[(size_t)(y0 + y) * cw * 3 + (size_t)(x0 * 3 + x)];
+    return RAD_OK;
+}
+
+namespace {
+/* The frames a reference video keeps, spread over the stream: the most, within the stream and
+ * `max_frames`, that is 5 modulo 17, ComfyUI's trim; a shorter stream keeps what it has. */
+struct VaeSampleArgs { int32_t max_frames; };
+std::vector<int64_t> vae_sample_cb(const VideoInfo& info, const void* user) {
+    const VaeSampleArgs* a = static_cast<const VaeSampleArgs*>(user);
+    const int64_t avail = info.n_frames > 0 ? info.n_frames : 1;
+    const int64_t cap = a->max_frames > 0 ? std::min<int64_t>(a->max_frames, avail) : avail;
+    int64_t want = cap - (((cap - 5) % 17) + 17) % 17;   /* the largest v <= cap, v % 17 == 5 */
+    if (want < 5) want = std::min<int64_t>(cap, 5);
+    const int64_t take = std::max<int64_t>(1, std::min(want, avail));
+    std::vector<int64_t> idx((size_t)take);
+    for (int64_t i = 0; i < take; ++i)
+        idx[(size_t)i] = take > 1 ? (i * (avail - 1)) / (take - 1) : 0;
+    return idx;
+}
+}  /* namespace */
+
+int Processor::encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                             int32_t max_frames, std::vector<Frame>* out, std::string* why) const {
+    if (ratio < 1 || max_side < ratio) {
+        if (why) *why = "the encoder's side ratio and maximum are not usable";
+        return RAD_E_INVAL;
+    }
+    /* image()'s decode guard. */
+    Video v;
+    const VaeSampleArgs a{ max_frames };
+    RAD_TRY(decode_video(bytes, n, vae_sample_cb, &a, cfg_.max_source_pixels, &v, why));
+    if (v.frames.empty()) {
+        if (why) *why = "the video holds no frames";
+        return RAD_E_INVAL;
+    }
+    int32_t w = 0, h = 0;
+    encoder_sides(v.frames.front().w, v.frames.front().h, ratio, max_side, &w, &h);
+    out->clear();
+    out->reserve(v.frames.size());
+    for (const Frame& f : v.frames) {
+        Frame r;
+        resize_lanczos_rgb(f, w, h, &r);
+        out->push_back(std::move(r));
+    }
+    return RAD_OK;
+}
+
+int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                             std::vector<float>* out, std::string* why) const {
+    return decode_audio(bytes, n, rate, max_samples, out, why);
+}
+
+namespace {
 struct SampleArgs { double fps; int32_t lo, hi; bool gemma4; };
 std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
     const SampleArgs* a = static_cast<const SampleArgs*>(user);
@@ -2336,37 +2457,6 @@ int Processor::audio(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
     const bool whole = acfg_.family == AudioFamily::Qwen3ASR;
     RAD_TRY(decode_audio(bytes, n, acfg_.rate, acfg_.max_samples + (whole ? 1 : 0), &s, why));
     return audio_from(s, out, why);
-}
-
-/* ================================================================== rotary layout */
-
-void PromptMedia::layout() {
-    rope.runs.clear();
-    int64_t pos = 0, tok = 0;
-    for (size_t pi = 0; pi < items.size(); ++pi) {
-        const Placed& p = items[pi];
-        const Item& it = *p.item;
-        const int32_t m = it.rows_h > 0 ? it.grid_h / it.rows_h : 1;
-        for (int32_t s = 0; s < it.n_seg; ++s) {
-            const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];
-            pos += run_tok - tok;            /* the text in front of the run counts up */
-            const int32_t rh = it.segments.empty() ? it.rows_h : it.seg_h(s) / m;
-            const int32_t rw = it.segments.empty() ? it.rows_w : it.seg_w(s) / m;
-            RopeLayout::Run r;
-            r.tok = (int32_t)run_tok;
-            r.n = (int32_t)(it.row_at(s + 1) - it.row_at(s));
-            r.w = rw;
-            r.base = (int32_t)pos;
-            r.flat = it.rope_1d;
-            /* A grid advances the rotary by its longer side; a 1-D run by its length. */
-            pos += it.rope_1d ? r.n : std::max(rh, rw);
-            tok = run_tok + r.n;
-            r.shift = (int32_t)(pos - tok);
-            r.item = (int32_t)pi;
-            r.row0 = (int32_t)it.row_at(s);
-            rope.runs.push_back(r);
-        }
-    }
 }
 
 }  /* namespace mm */

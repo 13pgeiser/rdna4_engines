@@ -1,155 +1,59 @@
 // kv_resolve: turn a streamed KV group's selected block ids into the ring slots that hold them,
-// copy a block in from the pinned host mirror when it is not resident, and rewrite the selection
-// in place (docs/OPS.md "kv_resolve", docs/KV-STREAMING.md §3.4 and §4.2).
+// copy a block in from the pinned host mirror when it is absent, and rewrite the selection in place
+// (docs/OPS.md "kv_resolve", docs/KV-STREAMING.md §3.4). `sel` is the only place the sparse path
+// names KV storage, so after this op the attention reads ring slots unchanged.
 //
-// `qsa_select` already writes the group's pool page id into `sel`, and `attn_paged` reads every
-// entry as a raw pool index. A streamed group's device pool is `slots` blocks deep while the id
-// space is `blocks`, so an id is no longer an address; after this op each entry is a slot of
-// `kv_cache` and the attention is unchanged. `sel` is the only place the sparse path names KV
-// storage, which is why one op between select and attention suffices.
+// libref/ref_kvstream.cpp is the contract and its seven steps are kept, so both place the same
+// blocks in the same slots. Here:
 //
-// The order is the contract (libref/ref_kvstream.cpp), because two implementations must place the
-// same blocks in the same slots and so produce the same table:
+//   1. the epoch is bumped;
+//   2. one lookup per entry below nsel[q]. A hit stamps its slot with the epoch; the thread whose
+//      exchange stamps it first bumps its heat counter and counts it into the union. A miss claims
+//      its map entry once (atomicCAS -1 -> -2) and appends the block to the claim list, so the CAS
+//      count is the distinct-claim count. The value read is kept for step 7 (the entry cache);
+//   3. the claim list is sorted ascending (bitonic, in LDS), so atomic claim order never reaches
+//      the placement;
+//   4. one victim per miss from the hand: the block's own slot when free, else a free slot, else
+//      CLOCK over the heat counter. Phase 3b counts the free slots once in parallel, so a full ring
+//      goes straight to CLOCK;
+//   5. both maps are re-pointed as each victim is taken;
+//   6. each placed block is copied, one warp a miss, so every miss's host read is in flight at once;
+//   7. every valid entry is rewritten as its slot.
 //
-//   1. bump the epoch (ctl[0] + 1);
-//   2. one lookup per entry below nsel[q]: a hit takes the epoch and, the first time this call
-//      stamps that slot, bumps its two-bit heat counter by one (clamped at 3) -- one bump a slot a
-//      call, not one an entry, so a block many rows name gains one step of heat, the same as one a
-//      single row names. A miss claims its map entry once (-1 -> -2, atomicCAS), so the map is its
-//      own set. That CAS is also the distinct-claim count: it succeeds exactly once per block,
-//      which is the
-//      `s_distinct` step 3 would otherwise have to scan the map for. The value read is kept, one
-//      int an entry, for step 7 below;
-//   3. compact the claimed blocks out of `res` in ASCENDING block id. The claims are made by
-//      whichever thread reaches them first, but this scan is what fixes the miss order, so
-//      atomic claim order never reaches the placement. A thread owns one contiguous chunk of the
-//      map and reads it four ids at a time, so the list is still ascending by construction. Only
-//      taken when the call claimed something: with no claim there is no `-2` and nothing to
-//      place (step 2's count says so);
-//   4. one victim per miss, in the hand order from ctl[1]: a FREE slot (slot_block < 0) first, so
-//      no resident block is evicted while the ring has room (the free count is taken in parallel
-//      once per call); only a call with no free slot falls back to CLOCK's second chance, where a
-//      slot stamped with this call's epoch is passed and keeps its counter, a warm slot (counter
-//      non-zero) has its counter HALVED and is passed, and a cold slot (counter 0) is taken. The
-//      hand PICKS the victim: this is a per-visit decision, so the policy costs no reduction, no
-//      barrier and no extra traffic -- an add-and-clamp and a shift where a constant store and a
-//      zero store would do. An exact LRU would need the minimum over the ring per miss, a
-//      collective reduction that pays more than the choice is worth. The hand ends just past the
-//      last slot taken; the sweep visits at most 3*slots, because every write clamps the counter
-//      to 3 and two halvings take any value to 0;
-//   5. re-point both maps as each victim is taken (`res[old] = -1`, then slot -> b and b -> slot,
-//      with the slot's counter bumped by one as a use: the victim's is 0 by construction, so it is
-//      1 in the common case, and the clamp keeps a slot taken by identity or from the free region
-//      inside [0, 3]);
-//   6. copy `block_bytes` of host[b] into kv_cache[s] for each placed miss, as bytes, in this one
-//      launch;
-//   7. rewrite every entry below nsel[q] whose block is resident as its slot; entries past nsel[q]
-//      keep qsa_select's -1 padding. An entry step 2 saw resident uses the slot it read there, so
-//      `res` is read once a selection entry, not twice (see "THE ENTRY CACHE").
+// Overflow: unplaced claims revert to -1, ctl[3] latches, and their entries are rewritten as slot 0
+// (the id would be an address past the ring, which attn_paged dereferences unchecked). The row is
+// stateful, so it is not in r4d_rows.cpp's concurrent list; it is recordable, since the maps, ring
+// and mirror never move.
 //
-// OVERFLOW. The ring must hold the union of the call's selection (`hits + misses <= slots`). When it
-// does not, the sweep cannot place every miss: the unplaced claims are reverted to -1 (so a later
-// call may claim them again), ctl[3] is latched to 1, and their selection entries are rewritten to
-// SLOT 0 rather than left holding the block id. The id would be an address past the ring, which
-// attn_paged dereferences with no bounds check, so an overflow would fault or read another layer;
-// slot 0 is defined memory, wrong numbers the caller discards on ctl[3].
+// Cost. A decode step issues this once per QSA layer, so a launch's cost is its misses (tens a
+// launch at 16K-160K of history), and nothing it does is sized by `blocks`: the claim list comes
+// out of the lookup pass, the union is counted on first stamps, and the copies run in parallel.
+// What remains is the host read, PCIe transactions on mirror pages the card has not touched. The
+// sweep visits about one slot a miss, since each launch halves the counters it passes.
 //
-// STATE. The epoch, the hand, the two-bit heat counters and the counters live between launches, so
-// this row is not concurrent (r4d_rows.cpp's kStateful[]): two launches must never overlap, and the
-// engine orders them. It is still recordable: the maps, the ring and the mirror are fixed-size
-// from the group's declaration, so addresses and pitches never move.
+// The claim list. A call claims at most `M * sel_pitch` blocks (in fact at most `lookups`), so the
+// list is `next_pow2(min(M * sel_pitch, LDS room))` ids of dynamic LDS (kv_claim_cap): 4096 for
+// four sequences at `sel_pitch` 513. Only the first `slots` claims can be placed. A launch wider
+// than the list (28 rows or more at pitch 513) gathers its claims from the selection into the row's
+// scratch, padded to a power of two, and sorts them there: still `lookups` entries, never `blocks`.
+// Only a call claiming more blocks than the ring holds, which has overflowed, walks the map to put
+// the smallest `slots` claims in order. ctl[12] records the largest claim count.
 //
-// COST. A decode step issues this once per QSA layer -- twelve launches, in a step whose whole
-// budget is ~33 ms -- so a launch's own cost is the miss path, not the dispatch: ~20 to ~60 misses
-// a launch at 16k-160k of history. Everything that path touches is therefore sized from the call's
-// own entries and not from `blocks`:
+// The entry cache. Steps 2 and 7 both read `res[b]` for every entry, scattered over the map. A
+// hit's slot cannot move during the call, because the sweep never takes a slot stamped with this
+// call's epoch, so step 2 keeps what it read (one int an entry, dynamic LDS after the claim list,
+// when it fits) and step 7 reads the map again only for entries that were absent. Same entry index,
+// same thread, so no barrier between them.
 //
-//   - the claim list comes out of the lookup pass, which already sees every claim, so no pass walks
-//     `res` over `blocks`;
-//   - the union is a metric (`ctl[10]`), counted on the first stamp per slot, so no pass walks
-//     `slot_state` over `slots`: a ring is sized by misses and not by slots, and a ring larger than
-//     the history does not cost more than a small one;
-//   - the copies are independent, so each miss has a warp of its own and every miss's read is in
-//     flight at once.
+// Scratch: `next_pow2(slots)` block ids, then `slots` slots. State faults: libref refuses them
+// before writing; a kernel cannot return a status, so here an out-of-range hand starts at 0, a map
+// value outside its domain addresses nothing, an out-of-range id stays in `sel` and nsel is clamped
+// to `sel_pitch`. A legal call is bit-identical to the reference.
 //
-// What is left is the host read itself: a miss copies 2 KiB from a pinned mirror page the card has
-// not touched, so it is PCIe transactions with a page walk behind them, and no arrangement of the
-// copy loop changes that. The CLOCK sweep is not the cost either: each launch halves the counters
-// of the slots it passes, so the ring arrives at the next launch mostly cold and a sweep visits
-// about one slot a miss. The free-slot scan ahead of it costs a visit per slot it passes, and the
-// count that says whether to scan at all (phase 3b) is one coalesced pass over the two slot maps per
-// call, so a ring with no free slot -- where every eviction is unavoidable -- pays neither a full
-// turn of scanning per miss nor one serial scan per launch.
-//
-// SCRATCH. `next_pow2(slots)` block ids then `slots` slots (the row's scratch hook sizes it). The
-// miss list is a per-call temporary and would cost the arena planner, the recorded pass and the
-// tape key bytes nothing outside this launch reads. The claim list is dynamic LDS (`cap` ids) while
-// it fits -- the sort reads every element from every thread, so it wants shared memory -- and the
-// scratch's first plane when it does not, which is why that plane is padded to a power of two. The
-// entry cache is dynamic LDS too, after the claim list, and absent when it does not fit.
-//
-// THE CLAIM LIST'S SIZE IS DERIVED, NOT WRITTEN DOWN. A claim is a distinct absent block the
-// selection names, so one call makes at most `M * sel_pitch` of them -- and at most `lookups =
-// sum_q nsel[q]` in fact -- which is a fact about the call and not about the cache: `blocks` is the
-// id space, `max_seqs * ceil(max_ctx / block_size)` and never the size of a launch. So the
-// launcher sizes the list at `next_pow2(min(M * sel_pitch, the room a workgroup has))`, and for
-// `--max-num-seqs 4` at `sel_pitch` 513 that is 4096 ids, where a constant would have to be chosen
-// for the largest configuration or hand that one the map walk below. Nothing here mentions
-// `max_seqs`: the engine declares `sel_pitch` and launches `M` rows, and any --max-num-seqs follows
-// from those two. `ctl[12]` records the largest claim count one call has made, so a list that is
-// ever too shallow is visible in the counters rather than only in the launch's time.
-//
-// Only the first `slots` claimed blocks are needed: the sweep cannot place more than `slots`, and
-// every claim past that is still reverted to -1 by the final pass, so a capped list changes no
-// placement.
-//
-// ABOVE THE LIST. A launch wider than the list -- 28 or more rows at `sel_pitch` 513, since a
-// workgroup has tens of thousands of ids of room -- gathers its claims from the selection into the
-// scratch and sorts them there (phase 3). The walk is over the call's entries, `lookups` of them,
-// never over `blocks`: the map is only the set that says whether an id is a claim and that keeps a
-// block four rows name out of the list four times. Same ids, same ascending order, same placements
-// as the fast path. The one call this cannot serve is one claiming more blocks than the ring holds:
-// no structure there can hold the whole claim set, so that call -- which has overflowed and whose
-// step the caller discards -- keeps the map walk that puts the smallest `slots` claims in order.
-//
-// THE ENTRY CACHE. Step 2 and step 7 each read `res[b]` for every selection entry, and those reads
-// are scattered over `blocks` i32: at decode that is two 513-load waves over a map the launch has
-// already touched once. But step 7's answer for a HIT is step 2's
-// answer: the only thing that clears a `res` entry in a call is an eviction, and the sweep never
-// takes a slot stamped with this call's epoch (the `slot_state` test in both the free scan and the
-// CLOCK sweep), which is exactly the stamp step 2 puts on every hit's slot. So a hit's slot cannot move, and only an entry step 2 saw absent can
-// change -- a claimed block becomes its placed slot, or stays -1 when the sweep could not place it
-// (step 6a's revert), or in the above-the-list path passes through -3 and back. Step 2 therefore
-// stores the value it read, one int an entry, and step 7 uses it when it is >= 0 and reads the map
-// only otherwise: the same slots, the same `sel`, one scattered wave instead of two.
-//
-// The cache is `M * sel_pitch` ints of dynamic LDS, the launch's whole entry count, and only while
-// the workgroup has that room beside the claim list; a prefill-shaped launch that has not gets
-// zero and step 7 reads the map instead. Nothing outside the launch sees it: no operand,
-// no scratch, no contract. Entries whose block id is out of range are skipped in both steps and
-// never reach the cache, and the read is by `sel`'s entry index, which is the same index -- and the
-// same thread -- in both steps, so no barrier is needed between them.
-//
-// STATE FAULTS. libref refuses a `res` entry outside [-1, slots), a `slot_block` outside
-// [-1, blocks), a hand outside [0, slots) and a selection entry outside [0, blocks) before it
-// writes anything. A device launch cannot return a host status from inside its kernel, so this
-// kernel guards instead: an out-of-range hand starts at 0, a map value outside its domain is not
-// used to address memory, an out-of-range block id is left in `sel`, and nsel is clamped to
-// `sel_pitch` so a bad count cannot steer a row into its neighbour. Those paths are the state
-// fault libref refuses; a legal call never takes them and is bit-identical to the reference.
-//
-// The shape checks (ranks, dtypes, pitches, byte extent per block) belong to the shim below. Like
-// every step-sized kernel it takes the launch's row count and row pitch from `sel`'s own extent,
-// not from the ranged `M`/`sel_pitch` parameters: `M` arrives as the band's ceiling, so a one-row
-// decode and a 625-token prefill would otherwise be refused (arch/common/rad_arch.h's "step-sized
-// operands"). `M` is still checked as the ceiling it is, so a genuinely over-wide launch is refused.
-// The ring depth is the operand's for the same reason: `slot_block`'s extent is the ring this call
-// may address, and the declared `slots` is the ceiling it may not pass -- the pool is planned after
-// declare, so a ring the engine sized smaller (--kv-resident) arrives shorter.
-// It reads the two byte planes by row pitch in bytes, as libref does, so the same kernel serves
-// every cache layout (`fp8`, `fp8_v4`, `k6_v4`, `bf16`) and the copy converts nothing.
-//
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// The shim takes the row count, row pitch and ring depth from the operands (`sel`, `slot_block`),
+// with the ranged `M`, `sel_pitch` and `slots` as ceilings (arch/common/rad_arch.h, "step-sized
+// operands"), and addresses the byte planes by row pitch, so one kernel serves every cache layout.
+// It returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -162,8 +66,8 @@ namespace {
 
 constexpr int kThreads = 1024;
 
-/* A 16-byte vector as a builtin type, not `uint4`: the class copies through a memcpy call, and the
- * miss copy needs its four loads to stay four loads (phase 6). */
+/* A 16-byte vector as a builtin type: `uint4` copies through a memcpy call, which keeps a load and
+ * its store adjacent, and the miss copy needs its four loads issued first (step 6). */
 typedef unsigned int kv_v16 __attribute__((ext_vector_type(4)));
 
 /* The next power of two at or above `n`, clamped to what an i32 can index: the sort pads to one and
@@ -174,10 +78,9 @@ static long long kv_pow2ceil(long long n) {
     return p;
 }
 
-/* The claim list's capacity, in ids, from the launch's own operands and the device's LDS room (the
- * header above, "the claim list's size is derived"). `0` means a workgroup has no room at all, which
- * the shim refuses. `*room_out` is the dynamic LDS room in ints, so the entry cache can take what the
- * claim list leaves (header, "the entry cache"). */
+/* The claim list's capacity in ids, from the launch's operands and the device's LDS room (header,
+ * "The claim list"); 0 when a workgroup has no room, which the shim refuses. `*room_out` is the
+ * dynamic LDS room in ints, for the entry cache. */
 static int kv_claim_cap(long long M, long long pitch, int* room_out) {
     /* Static LDS: the two reduction arrays and the scalars. Everything else is dynamic. */
     const size_t stat = (size_t)kThreads * 2 * sizeof(int) + 64;
@@ -195,8 +98,7 @@ static int kv_claim_cap(long long M, long long pitch, int* room_out) {
     }();
     *room_out = room;
     if (room < 1) return 0;
-    /* The largest power of two the room holds: `cap` is always one, because the sort pads the list
-     * to a power of two and must not pad past the buffer. */
+    /* The largest power of two the room holds: the sort pads the list to one. */
     int top = 1;
     while (top <= room / 2) top *= 2;
     const long long bound = M * pitch;   /* the call's claim ceiling */
@@ -205,16 +107,13 @@ static int kv_claim_cap(long long M, long long pitch, int* room_out) {
     return p;
 }
 
-/* The heat counter's two writes, the same function in all three implementations (libref's
- * heat_up/heat_down): a use bumps by one and saturates at 3, a sweep pass halves, and a negative
- * value -- never written by a legal call -- reads as cold rather than surviving every pass. */
+/* The heat counter's two writes, as libref's heat_up/heat_down: a use bumps by one and saturates
+ * at 3, a sweep pass halves, and a negative value (never written by a legal call) reads as cold. */
 __device__ __forceinline__ int kv_heat_up(int h) { return h < 0 ? 1 : (h < 3 ? h + 1 : 3); }
 __device__ __forceinline__ int kv_heat_down(int h) { return h > 0 ? (h >> 1) : 0; }
 
-/* Ascending order of `n` distinct claim ids in the claim list, padded to a power of two with
- * INT32_MAX, which sorts past every block id. A caller's buffer, because both paths sort: the whole
- * claim set when it fits the list and one window of the id space when it does not. Block ids are
- * distinct, so no equal pair decides anything. */
+/* Sort `n` distinct claim ids ascending, padded to a power of two with INT32_MAX. The caller's
+ * buffer: LDS for the claim list, the row's scratch for a launch wider than it. */
 __device__ __forceinline__ void kv_sort_claims(int* list, int n, int tid) {
     int n2 = 1;
     while (n2 < n) n2 <<= 1;
@@ -248,11 +147,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     __shared__ int s_epoch, s_lookups, s_nmiss, s_distinct, s_placed, s_overflow, s_claims, s_hits;
     __shared__ int s_free;
     __shared__ int s_cnt[kThreads], s_off[kThreads];
-    /* The claim list, before the sort, `cap` ids of dynamic LDS (kv_claim_cap). Shared rather than
-     * the row's scratch because the sort reads every element from every thread; the scratch still
-     * holds the placed miss list, which is what the row declares and what the sweep and the copies
-     * walk in order. `ecache` ints follow it: the value this call's lookup read for each selection
-     * entry, which step 7 reuses (header, "the entry cache"). */
+    /* The claim list, `cap` ids of dynamic LDS (kv_claim_cap), in LDS because the sort reads every
+     * element from every thread; the placed miss list stays in the row's scratch. The entry cache
+     * follows it (header, "The entry cache"). */
     R4D_DYN_LDS(int, s_dyn);
     int* const s_list = s_dyn;
     int* const s_ent = s_dyn + cap;
@@ -272,8 +169,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         s_placed = 0;
         s_overflow = 0;
         s_free = 0;
-        /* This call's miss count. A call that claims nothing returns it as zero below without
-         * reaching the sweep, so it is cleared here rather than left as the last call's. */
+        /* This call's miss count, cleared here: a call that claims nothing returns before the sweep. */
         ctl[2] = 0;
     }
     __syncthreads();
@@ -291,24 +187,18 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             const int b = sel[e];
             if ((unsigned)b >= (unsigned)blocks) continue;
             const int s = res[b];
-            /* The value this lookup saw, for step 7: a hit's slot cannot move in this call (the
-             * sweep passes every slot this pass stamps with the epoch), so only an entry that was
-             * absent here needs the map read again. Header, "the entry cache". */
+            /* The value this lookup saw, for step 7 (header, "The entry cache"). */
             if (ecache > 0) s_ent[e] = s;
             if (s >= 0 && s < slots) {
-                /* The stamp is this call's mark on the slot and the union's counter at once: the
-                 * exchange says whether this thread was the first to stamp it, so the ring is
-                 * counted here instead of walked after the fact. */
+                /* The first thread to stamp the slot counts it into the union. */
                 if (atomicExch(&slot_state[(size_t)s * sst_ld], epoch) != epoch) {
-                    /* One bump a slot a call: the exchange says this thread was the first to stamp
-                     * it, so a block twenty rows name gains one step of heat, not twenty. */
+                    /* One heat bump a slot a call, by the first stamper. */
                     slot_state[(size_t)s * sst_ld + 1] =
                         kv_heat_up(slot_state[(size_t)s * sst_ld + 1]);
                     ++hits;
                 }
             } else if (s == -1) {
-                /* One CAS wins per block, so this is the distinct-claim count, and the claim list
-                 * needs no walk over `res` to find them. */
+                /* One CAS wins per block: the distinct-claim count and the list's fill, without a map walk. */
                 if (atomicCAS(&res[b], -1, -2) == -1) {
                     const int k = atomicAdd(&s_claims, 1);
                     if (k < cap) s_list[k] = b;
@@ -316,8 +206,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             }
         }
     }
-    /* The launch's hit count: a per-thread total, then the same warp-first reduction the union
-     * ends with. */
+    /* The launch's hit count: per-thread totals, then the warp-first reduction the union uses. */
     s_cnt[tid] = hits;
     __syncthreads();
     if (tid < 32) {
@@ -340,19 +229,12 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     const int want = claims < slots ? claims : slots;
     if (claims > 0) {
         if (claims <= cap) {
-            /* The list holds every claim, so sorting it says exactly what walking `res` said --
-             * ascending block id -- over `claims` elements instead of `blocks`. */
             kv_sort_claims(s_list, claims, tid);
             for (int i = tid; i < want; i += kThreads) miss_block[i] = s_list[i];
         } else {
-            /* Above the list: the launch is wide enough that `M * sel_pitch` -- the claim ceiling
-             * it declares -- passes the workgroup's LDS room, so the list is not held in shared
-             * memory. The claims are gathered from the selection into the row's scratch instead and
-             * sorted there, over `lookups` entries: the same ids, the same ascending order, and
-             * still nothing about `blocks` in the cost. Only a call that fits its ring takes this
-             * path; a call with more claims than the ring has slots cannot be listed at all and
-             * keeps the map walk below, because a sorted list of the smallest `slots` claims has to
-             * come from the whole claim set. */
+            /* Above the list (header, "The claim list"): the claims are gathered from the selection
+             * into the row's scratch and sorted there. A call with more claims than slots keeps
+             * the map walk below, since the smallest `slots` claims need the whole claim set. */
             if (claims <= slots) {
                 if (tid == 0) s_wc = 0;
                 __syncthreads();
@@ -363,8 +245,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
                     for (int i = tid; i < n; i += kThreads) {
                         const int b = sel[(size_t)q * pitch + i];
                         if ((unsigned)b >= (unsigned)blocks) continue;
-                        /* One claim per distinct block: the map is the set, so a block four rows
-                         * name enters the list once. -3 is "collected", restored below. */
+                        /* The map is the set: -3 marks a block already collected, restored below. */
                         if (atomicCAS(&res[b], -2, -3) == -2) {
                             const int k = atomicAdd(&s_wc, 1);
                             if (k < slots) miss_block[k] = b;
@@ -383,15 +264,13 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
                     }
                 }
                 __syncthreads();
-                /* `claims` ids, padded to a power of two: the row's scratch is sized for exactly
-                 * that (r4d_rad_kv_resolve_scratch). */
+                /* Padded to a power of two, as the row's scratch is sized (r4d_rad_kv_resolve_scratch). */
                 kv_sort_claims(miss_block, claims, tid);
             } else {
-                /* More claims than the ring can hold: this call has overflowed whatever it places,
-                 * so the sweep stops at its first unplaceable miss and `ctl[3]` latches. The list
-                 * here is `blocks`-wide because the ascending order of the WHOLE claim set is the
-                 * contract, and with no structure able to hold it the map is where it lives. A legal
-                 * call -- one the ring can hold -- never reaches this. */
+                /* More claims than slots: the call has overflowed, the sweep stops at its first
+                 * unplaceable miss and ctl[3] latches. The ascending order of the whole claim set
+                 * is the contract and nothing can hold it, so the map is walked. A call the ring can
+                 * hold never comes here. */
                 const int chunk = (blocks + kThreads - 1) / kThreads;
                 const int lo = (int)((long long)tid * chunk);
                 const int hi = lo + chunk < blocks ? lo + chunk : blocks;
@@ -434,7 +313,6 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             }
         }
         if (tid == 0) {
-            /* The list is the first `want` claims in ascending order whichever path built it. */
             s_nmiss = want;
             s_overflow = claims > slots;
             s_placed = 0;
@@ -443,12 +321,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     }
 
     /* ---- 3b. how many slots are free ---- */
-    /* A free slot is claimed before any resident block is evicted (phase 4), and this is what says
-     * whether there is one to claim: a call whose ring is full -- where every slot holds a block --
-     * must not pay a turn of scanning per miss to discover it, and above that a full ring never
-     * becomes free again during the call. Counting in parallel costs one coalesced pass over the
-     * two slot maps; the sweep then reads the count and, when it is zero, goes straight to CLOCK.
-     * A slot this call stamped is not free whatever it holds: it is the call's own. */
+    /* Free slots are taken before any resident block is evicted (step 4). One coalesced pass over
+     * the slot maps counts them, so a full ring goes straight to CLOCK instead of scanning a turn
+     * per miss. A slot this call stamped is not free: it is the call's own. */
     if (claims > 0) {
         int nf = 0;
         for (int s = tid; s < slots; s += kThreads)
@@ -458,31 +333,15 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     __syncthreads();
 
     /* ---- 4. one victim per miss: the block's own slot first, else a free slot, else CLOCK ---- */
-    /* Identity first: a block whose id fits the ring and whose own slot is free goes there, so
-     * res[b] = b for a context shorter than the ring. The attention's gather is a long run of
-     * adjacent block ids, and a layer's slots are 2 KiB apart inside one stripe, so identity turns
-     * that run into a sequential walk of one stripe instead of the order the blocks entered the
-     * selection.
-     *
-     * It is only a placement preference, never a replacement one: it takes a slot only when that
-     * slot is free, and it does not move the hand, so a ring that cannot give identity the slot
-     * falls through to the walk below with the hand exactly where it was. The fallback is free slot
-     * first, then CLOCK, so a depth where most ids are past `slots` places the same blocks in the
-     * same slots.
-     *
-     * A free slot (nothing resident in it) is not a victim at all: taking it costs no block, so
-     * every free slot is claimed before a live one is even considered. CLOCK's second chance over
-     * the heat counter is what a ring with no free slot falls back to, and the free scan has no
-     * side effect when it finds nothing (it halves no counter and leaves the hand where it
-     * started), so a full ring takes exactly the victim the sweep below names.
-     *
-     * `free_left` is the call's free-slot count from phase 3b, decremented as the sweep fills one.
-     * Once it is zero nothing can free a slot -- a placement makes a free slot live and an eviction
-     * re-points a live one -- so a full ring pays the count once, not a scan per miss. */
+    /* Identity first: a block whose id fits the ring and whose own slot is free goes there, so a
+     * context shorter than the ring has res[b] = b and the attention's run of adjacent ids walks
+     * one stripe in order. It never evicts and leaves the hand alone, so the fallback (free slot,
+     * then CLOCK) is unchanged. The free scan changes nothing when it finds nothing, and
+     * `free_left` (step 3b) only falls during the call, so a full ring pays the count once. */
     if (tid == 0 && claims > 0) {
         int hand = ctl[1];
-        /* A hand outside the ring is a state fault libref refuses; start at the beginning
-         * rather than address outside it. */
+        /* A hand outside the ring is a state fault libref refuses; start at 0 rather than address
+         * outside it. */
         if (hand < 0 || hand >= slots) hand = 0;
         int placed = 0;
         bool overflow = s_overflow;
@@ -491,17 +350,14 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         for (int k = 0; k < nmiss; ++k) {
             const int b = miss_block[k];
             int victim = -1;
-            /* Identity: the block's own slot, if the id fits the ring and the slot is free (or
-             * already holds it). Leaving the hand alone is what keeps the fallback identical. */
+            /* Identity, if the id fits and the slot is free or already holds it. */
             if (b < slots) {
                 const int want = b;
                 if (slot_state[(size_t)want * sst_ld] != epoch &&
                     (slot_block[want] < 0 || slot_block[want] == b))
                     victim = want;
             }
-            /* Free first, in the same hand order CLOCK walks, so a ring with frees to give
-             * places every miss identically in both implementations. A stamp of this call's epoch
-             * is never taken, free or not: it is a slot the call itself already uses. */
+            /* Free slots first, in CLOCK's hand order; a slot stamped this call is never taken. */
             if (victim < 0 && free_left > 0) {
                 int h = hand;
                 for (int scanned = 0; scanned < slots; ++scanned) {
@@ -552,12 +408,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     }
     __syncthreads();
 
-    /* A miss the sweep could not place is not resident: undo every remaining claim, so the next
-     * call may claim them again. A `res` entry still -2 here is by definition such a claim (a
-     * placed one holds its slot), and every claim is named by at least one selection entry, so the
-     * selection reaches all of them: `lookups` entries instead of `blocks` map entries, and the
-     * write is idempotent, so an entry repeating a block is harmless. The list is the shorter pass
-     * when it holds every claim, which is the normal case. */
+    /* Unplaced claims (still -2) revert to -1 so a later call may claim them. Every claim is named
+     * by a selection entry, so the selection reaches all of them; the list is the shorter pass when
+     * it holds every claim. */
     if (claims > 0) {
         if (s_distinct <= slots) {
             for (int k = tid; k < s_distinct; k += kThreads)
@@ -578,27 +431,15 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     __syncthreads();
 
     /* ---- 6. the copies, one block each, in miss order, in this launch ---- */
-    /* One warp a miss, so every miss's host read is in flight at once and each warp's lanes are
-     * independent. One 2 KiB copy out of the host mirror is PCIe transactions at ~1 us of latency
-     * each, and a decode launch takes tens of them: a loop that waits out one miss at a time, or a
-     * flattened loop that re-reads `miss_block`/`miss_slot` from the scratch for every lane, spends
-     * the launch waiting. The copies are independent -- each writes its own slot -- so the order
-     * between them is the miss order only for the record.
+    /* One warp a miss, so every miss's host read is in flight at once: a 2 KiB copy from the
+     * mirror is PCIe transactions at about 1 us each, and a decode launch has tens of misses.
      *
-     * Four loads per thread, issued before any of them is stored from. A wave issues in order and a
-     * store waits on its load, so `dst[i] = src[i]` at a stride of 32 makes the next iteration's load
-     * wait behind the previous iteration's store and the 2 KiB copy pays the mirror's read latency
-     * four times over instead of once (the trip count is `block_bytes`, a runtime value, so the
-     * compiler cannot unroll it). Loading the four vectors of one thread's quarter of the block
-     * first puts four requests in flight, and a block is
-     * a whole number of them at the declared geometry (2 KiB = 128 vectors = one full turn of the
-     * group), so the common path never takes the tail. Four more VGPRs: the kernel goes 32 -> 36
-     * with no spill, and it runs one workgroup by design.
-     *
-     * The vectors are `kv_v16`, not `uint4`: that class's assignment is a 16-byte memcpy call, and a
-     * memcpy is a load and a store that are adjacent by construction however the four are written in
-     * the source, which is the serialised shape this loop exists to avoid. Builtin vectors leave the
-     * four as four loads and four stores, which is what the scheduler needs. Same bytes either way. */
+     * Four loads per thread before any store. A wave issues in order and a store waits on its
+     * load, so `dst[i] = src[i]` at a stride of 32 would pay the read latency once per iteration;
+     * the trip count is runtime, so the compiler cannot unroll it. A 2 KiB block is one full turn
+     * of the group (128 vectors), so the common path never takes the tail. Four more VGPRs
+     * (32 -> 36, no spill); the kernel runs one workgroup. `kv_v16` rather than `uint4` keeps
+     * the loads apart from their stores. */
     const int placed = s_placed;
     const int lane = tid & 31;
     if (bbytes >= 16 && bbytes % 16 == 0) {
@@ -615,9 +456,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
                 dst[i + 64] = c;
                 dst[i + 96] = d;
             }
-            /* A block that is not a whole number of four-wide turns -- `block_bytes` not a multiple
-             * of 2048 -- finishes at the original one-vector stride, so every lane sequence is
-             * covered exactly once whatever the pitch. */
+            /* A block that is not a whole number of four-wide turns finishes one vector at a time. */
             for (; i < vec; i += 32) dst[i] = src[i];
         }
     } else {
@@ -637,25 +476,21 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             const size_t e = (size_t)q * pitch + i;
             const int b = sel[e];
             if ((unsigned)b >= (unsigned)blocks) continue;
-            /* A hit's slot is the one step 2 read; anything absent then (-1, -2, -3) only the map
-             * knows where the sweep placed it. Same index, same thread, so no barrier is needed. */
+            /* A hit's slot is the one step 2 read; for an entry absent then, only the map knows where the
+             * sweep placed it. */
             int s = ecache > 0 ? s_ent[e] : -1;
             if (s < 0) s = res[b];
             sel[e] = s >= 0 ? s : 0;
         }
     }
 
-    /* The distinct blocks this call touched, for the union the caller reports: the slots this call
-     * hit or filled (counted in phase 2 and by the sweep) plus the claims it could not place. Both
-     * halves are known by now -- distinct hit slots and distinct claimed blocks -- and an entry
-     * count would overcount them, because many of a launch's rows share swaths of the history.
-     * Nothing walks the ring for it. */
+    /* The union: the distinct slots this call hit or filled, plus the claims it could not place. */
     if (tid == 0) {
         const int placed = s_placed;
         const int uni = s_hits + s_distinct;
         if (uni > ctl[10]) ctl[10] = uni;
         if (placed > ctl[11]) ctl[11] = placed;
-        /* The depth the claim list had to hold, which is what the next size of it is derived from. */
+        /* The depth the claim list had to hold. */
         if (s_distinct > ctl[12]) ctl[12] = s_distinct;
         uint64_t* const ctr = (uint64_t*)(ctl + 4);
         ctr[0] += (uint64_t)placed;
@@ -691,15 +526,13 @@ static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, l
         return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || blocks <= 0 || slots <= 0 || pitch <= 0 || bbytes <= 0 || sst_ld < 2)
         return R4D_NO(RAD_E_SHAPE);
-    /* The list is sized from this launch's own operands. A workgroup with no LDS room for even one
-     * id cannot run the op at all, which is a shape the caller cannot satisfy rather than a slow
-     * launch: refuse it. */
+    /* A workgroup with no LDS room for one id cannot run the op: a shape the caller cannot satisfy,
+     * so refuse. */
     int room = 0;
     const int cap = kv_claim_cap(M, pitch, &room);
     if (cap < 1) return R4D_NO(RAD_E_SHAPE);
-    /* One int a selection entry for the entry cache (the header), while the room the claim list
-     * leaves holds them all: a decode launch caches its 513, a prefill this wide does not and step 7
-     * reads the map again. */
+    /* The entry cache, one int an entry, while it fits beside the claim list: a decode launch caches
+     * its 513, a wide prefill does not and step 7 reads the map. */
     const long long entries = (long long)M * pitch;
     const int ecache = entries <= (long long)(room - cap) ? (int)entries : 0;
     return R4D_EMIT(stream, kv_resolve_kernel, dim3(1), dim3(kThreads),
@@ -736,21 +569,17 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
     if (!se || !ns || !re || !sb || !st || !ct || !ho || !ca)
         return R4D_NO(RAD_E_INVAL);
 
-    /* `M` is a RANGED parameter, so the resolved geometry carries the band's ceiling (max_tok),
-     * not this launch's rows: a 625-token prefill and a one-row decode both arrive with 2048 here.
-     * The operand names the call, as arch/common/rad_arch.h's "step-sized operands" rule says, so
-     * the row count is `sel`'s own extent and the parameter is only the ceiling it may not pass. */
+    /* `M` is ranged, so the geometry carries the band's ceiling (max_tok), not this launch's rows: the
+     * row count is `sel`'s extent, and `M` the ceiling it may not pass. */
     const long long band  = r4d_geti_or(a, "M", 0);
     const long long M     = se->shape[0];
     const long long blocks = r4d_geti_or(a, "blocks", 0);
-    /* The ring depth is the operand's, for the same reason: the pool is planned after declare, so
-     * the declared `slots` is the context bound and a ring the engine sized smaller
-     * (--kv-resident) arrives as a shorter `slot_block`. The parameter is the ceiling a
-     * call may not pass (libref/ref_kvstream.cpp, "The parameters"). */
+    /* The ring depth is `slot_block`'s: the pool is planned after declare, so a ring --kv-resident
+     * sized smaller arrives shorter than the declared `slots`, its ceiling. */
     const long long slots_decl = r4d_geti_or(a, "slots", 0);
     const long long slots = sb->shape[0];
-    /* The row pitch is the operand's too. Reading it from `sel_pitch` would let a view whose rows
-     * are wider or narrower than its declared geometry be rewritten into its neighbour. */
+    /* The row pitch is `sel`'s too: one different from the geometry would rewrite a row into its
+     * neighbour. */
     const long long declared_pitch = r4d_geti_or(a, "sel_pitch", 0);
     const long long pitch = r4d_row_pitch(se);
     const long long bbytes = r4d_geti_or(a, "block_bytes", 0);
@@ -763,8 +592,7 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
     if (band > 0 && M > band) return R4D_NO(RAD_E_SHAPE);
     if (declared_pitch > 0 && pitch != declared_pitch) return R4D_NO(RAD_E_STRIDE);
 
-    /* The map and the counts are one format, written by one op and read by the writer and the
-     * sweep: i32, dense. */
+    /* The maps and counts are one format: i32, dense. */
     const RadTensor* state[] = { se, ns, re, sb, st, ct };
     for (const RadTensor* t : state)
         if (t->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
@@ -779,9 +607,8 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
     if (ho->rank < 2 || ca->rank < 2) return R4D_NO(RAD_E_SHAPE);
     if (ho->shape[0] < blocks || ca->shape[0] < slots) return R4D_NO(RAD_E_SHAPE);
 
-    /* One block of one layer: the mirror's row and the pool's slot are the same bytes, and the
-     * copy length `block_bytes` is both pitches. The pool arrives as a KV group's cache, so its
-     * dtype is the cache layout's, not u8; only the byte pitch is fixed. */
+    /* The mirror's row and the pool's slot are both `block_bytes`. The pool is a KV group's cache, so
+     * its dtype is the cache layout's; only its byte pitch is fixed. */
     long long hdense = 0, pdense = 0;
     if (r4d_kv_block_row_bytes(ho, &hdense) != RAD_OK || hdense != bbytes)
         return R4D_NO(RAD_E_STRIDE);
@@ -790,8 +617,8 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
     /* The counters are read as u64 in an i32 block. */
     if (((uintptr_t)ct->data & 7u) != 0) return R4D_NO(RAD_E_STRIDE);
 
-    /* The row's scratch: `nlist` ids (the miss list, padded to a power of two when a wide launch
-     * sorts it there), then `slots` slots. */
+    /* The row's scratch: `nlist` ids (the miss list, a power of two when a wide launch sorts there),
+     * then `slots` slots. */
     const int64_t nlist = kv_pow2ceil(slots);
     const long long need = (nlist + slots) * 4;
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_INVAL);
@@ -805,8 +632,7 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
                                (int)st->stride[0], stream);
 }
 
-/* The miss list -- `next_pow2(slots)` block ids, because a launch too wide for the shared claim list
- * sorts the list in this scratch -- then `slots` slots (the header above). */
+/* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots. */
 extern "C" int64_t r4d_rad_kv_resolve_scratch(const RadArgs* a) {
     const long long slots = r4d_geti_or(a, "slots", 0);
     if (slots <= 0 || slots > INT32_MAX) return 0;

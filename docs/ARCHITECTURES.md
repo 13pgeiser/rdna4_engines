@@ -33,7 +33,7 @@ plugin claims.
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
 | `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
-| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
+| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`), or the DiT's per-token linears int8, served w8a8 (`minimax-h3-w8a8.recipe`); a curve-form checkpoint, whose timestep embeddings ship as a table, by the `minimax-h3-curve-*` recipes |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
 The traps below are readings that are wrong without any error: the model produces fluent output.
@@ -1868,13 +1868,14 @@ a frame with the codec), a paragraph at 0.29 (11.6 s in 3.34 s); a stream's firs
 # `minimaxh3`: MiniMax-H3, video with sound
 
 `arch/minimaxh3` declares a video generator (`rad_declare_video_generator`), which makes the
-program a four-pass one the engine drives through `core/gen/video_driver.h`: VCOND runs the text
-encoder and the refiner over the prompt and computes every step's modulation, VSTEP is one
-denoising step of one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes
-one temporal chunk of frames. A request is a lane; two hold state at once (one denoising, one
-conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 on two
-cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline directory,
-read as one; only workflow t2va is served.
+program one the engine drives through `core/gen/video_driver.h`: VCOND runs the text encoder and
+the refiner over the prompt and computes every step's modulation, VSTEP is one denoising step of
+one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes one temporal chunk of
+frames; with keyframes or reference media, VENCODE and AENCODE first run each through the video or
+the audio VAE's encoder into the lane. A request is a lane; two hold state at once (one denoising,
+one conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 or
+int8 on two cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline
+directory, read as one; the workflows t2va, i2va, l2va, fl2va and ref2va are served.
 
 ```
 text      Qwen3-VL-32B's language model: 64 layers of 5120 (64 q / 8 kv heads of 128, ff 25600,
@@ -1907,6 +1908,16 @@ VAE       2 2 2), each followed by the mean of three AMP blocks (k 3/7/11, dilat
           channel, clamped. 800 samples a latent, 32 kHz, each stereo channel its own sequence
 length    24 fps; a video of n chunks is 17 n + 5 frames over 5 n + 2 latent frames, n 7..20
           (5.17 to 14.4 s); the soundtrack is round-half-even(frames x 40 / 24) latents a channel
+encoders  the video VAE's: six levels of two causal 3x3x3 residual blocks (GroupNorm 32), four
+          strided downsamplers, 17-frame clips to 5 latent frames, reflect padding; the audio
+          VAE's: a DAC encoder (strides 2 4 4 5 5) and a causal attention block, 800 samples a
+          latent, a channel at a time. Latents normalised as the decoders read them
+pack      with references the sequence is [text | keyframes | references | soundtrack | video]
+          (arch/minimaxh3/rad_ref2va_pack.h, ComfyUI's PackedLayout): a reference in its own
+          latent grid on a clock before the video's, a keyframe at its frame of the video. Their
+          rows take a timestep pinned at max(t, 0.999) (1.0 for sound), and the sampler steps only
+          the last two segments. Each segment is its own attention sink; a run of segments with
+          the same modulation is one group of the modulation table, eight at most
 ```
 
 Traps:
@@ -1918,10 +1929,14 @@ Traps:
   embedding reads t in [0, 1] as it is, not scaled to 1000.
 - **The grid's second half is linspace's from the end**: torch computes `linspace(1, 0, N)` half
   from each end in f32, which `gen::video_schedule` reproduces.
-- **The packed rows' positions are f64 rounded to f32**: a latent frame spans 5/3 x (1, 4, 4, 4,
+- **The packed rows' positions are f64 rounded to f32** (ComfyUI's arithmetic, tested against its
+  own numbers in tests/data/ref2va): a latent frame spans 5/3 x (1, 4, 4, 4,
   4)[i mod 5] time units from `n_text`, the spatial axes are each side's latents over the square
   root of the frame's area, centred on the unit interval, times 32, and the soundtrack's two
   channels sit at the two ends of the width axis.
+- **The video encoder's shortcut convolves the block's raw input**, before norm1 normalises it in
+  place; and the audio encoder's attention block feeds its qkv from norm1 but its projection
+  from norm3. Either swapped shrinks every latent after it.
 - **A tile is blended with its neighbours as they were decoded**: the vertical blend reads the
   original tile above, and the horizontal blend the original tile to the left, not the blended
   ones. Chunks keep frames [3, 20) of their 28 and blend their last 5 linearly into the next

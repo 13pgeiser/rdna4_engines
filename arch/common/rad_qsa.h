@@ -216,6 +216,9 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         d.head_dim  = c.head_dim / (2 * c.ratio);
         *bk = rad_decl_kv_group(b, nm.f("kv_qsa_bkey"), &d);
         if (!*bk) return RAD_E_INVAL;
+        /* qsa_score reads every complete block of the history each step, so this group stays resident
+         * and holds every sequence's context while a sibling streams (kvstream/carve.h). */
+        RAD_ARCH_TRY(rad_kv_group_dense_read(b, *bk));
     }
     kv_bk = *bk;
     /* Under M-RoPE a block key rotates at its first token's three components, which qsa_work
@@ -255,6 +258,9 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                  RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
                       RAD_NOWEIGHTS),
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+
+    /* When the attention group streams, the attention block resolves `sel` to ring slots after its
+     * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
     return RAD_OK;
 }
 
