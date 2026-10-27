@@ -426,6 +426,12 @@ if(TARGET rad-avx-check AND TARGET libref)
   set_tests_properties(avx_check_general PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT} ENVIRONMENT "${env}")
 endif()
 
+# The ISA instruments' parsers, on fixtures in the script: no build tree, no card, no ROCm. The
+# wave counts at the 24-VGPR boundaries and the waterfall back-edge detection are the parts that
+# can be wrong without anything else noticing.
+add_test(NAME isa_tools COMMAND sh ${CMAKE_SOURCE_DIR}/libr4d/isa/selftest.sh)
+set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
+
 # ================================================================== libr4d's kernels, on the host
 #
 # Some libr4d ops (the sandwich-norm joins, expert_scale) have no libref oracle by design
