@@ -52,6 +52,7 @@ driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 | Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
 | With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM there. On a card whose BAR is smaller than its VRAM they stay in pinned host memory and every dispatch reads them over the link: on R9700s, Qwen3.8-27B fp8 decode steps take 0.4-1.8% longer at `--tp 1` and 2 than with the arguments in VRAM. Peer access needs the large BAR too, so at `--tp 2` and above such a card takes the collectives through host memory (§4.7) |
 | Optional | OpenMP, used by the host kernel libraries if present |
+| Optional | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` (ffmpeg 6+), for image, video and audio input. The probe is `RAD_WITH_FFMPEG` (`ON` fatal, `OFF` off, default `AUTO`): built without them the engine boots normal, serves text, and refuses every image/video/audio part with HTTP 500 — the configure log is the only warning (`radiance: no libavformat ...`). `GET /diagnostics` shows `media decoders` |
 | Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
 | Shell harnesses | `curl` and `jq` |
 
