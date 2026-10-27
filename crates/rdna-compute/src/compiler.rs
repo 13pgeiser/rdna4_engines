@@ -263,9 +263,10 @@ fn publish_pair(
 /// mismatch)` naming the other home's paths.
 fn precompiled_dir_for(arch: &str) -> Option<PathBuf> {
     precompiled_dir_choice(
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| crate::kernel_pack::pack_arch_dir(p, arch))),
+        std::env::current_exe().ok().and_then(|exe| {
+            exe.parent()
+                .map(|p| crate::kernel_pack::pack_arch_dir(p, arch))
+        }),
         Some(PathBuf::from("kernels/compiled").join(arch)),
         hipfire_config::hipfire_home()
             .ok()
