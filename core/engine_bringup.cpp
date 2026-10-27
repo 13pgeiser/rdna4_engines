@@ -37,6 +37,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <sstream>
 #include <cstdint>
 #include <cstdlib>
@@ -1652,16 +1653,21 @@ int Engine::plan() {
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
-             * bound). */
+             * bound), each with the blocks an entry at the lcm of their block sizes holds
+             * (PrefixCache::entry_groups). */
             if (cfg_.prefix_cache_mib > 0) {
                 int64_t entry = 0, bs = 0;
                 int ng = 0;
                 for (size_t g = 0; g < r->program.kv_groups.size(); ++g) {
                     const KVGroupPlan* p = probe.plan((int32_t)g);
-                    if (!p || !p->paged() || p->bytes_per_block <= 0) continue;
-                    entry += p->bytes_per_block;
-                    bs = bs > 0 ? std::min<int64_t>(bs, p->block_size) : p->block_size;
-                    ++ng;
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    bs = bs > 0 ? std::lcm<int64_t>(bs, p->block_size) : p->block_size;
+                }
+                for (size_t g = 0; g < r->program.kv_groups.size() && bs > 0; ++g) {
+                    const KVGroupPlan* p = probe.plan((int32_t)g);
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    entry += p->bytes_per_block * (bs / p->block_size);
+                    ng += (int)(bs / p->block_size);
                 }
                 const int64_t tier = TierExec::device_bytes(entry, ng, TierExec::sizes(entry, ctx, bs));
                 f.staging += tier;
@@ -3232,8 +3238,11 @@ int Engine::configure_kv() {
             shard_off[i] = slot;
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
-        /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
-        const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
+        /* A slot holds linear state, a trunk's window (KVGroupPlan::win_snap), or both. */
+        bool linear = false;
+        for (const KVGroupPlan& p : ranks_[0]->kv.plans()) linear = linear || p.stateful();
+        const char* what = !ranks_[0]->kv.has_window_snapshot() ? "linear-state"
+                           : linear ? "linear-state + sliding-window" : "sliding-window";
         const bool sized_auto = cfg_.checkpoint_slots < 0;
         if (sized_auto) RAD_TRY(size_checkpoint_store(slot, what));
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
@@ -3283,7 +3292,9 @@ int Engine::configure_kv() {
      * sessions view reads. The flags gate only the mover, below. */
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
-        const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
+        /* An entry's blocks, one group per block: a cached group whose blocks are shorter than
+         * the entry appears once for each of its blocks (PrefixCache::entry_groups). */
+        const std::vector<int32_t>& cg = ranks_[0]->prefix.entry_groups();
         /* One slot holds the whole engine's entry: the groups every rank holds alike
          * (rad_kv_group_replicated) once, at the front, then every rank's own shard in its own
          * window. Shards can differ or be empty (uneven heads, rad_kv_group_zero). The layout is

@@ -1117,6 +1117,123 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     CHECK_EQ(m.linear_cached_tokens, 0);
 }
 
+/* The same model with the trunk's window in the checkpoint slot (KVGroupPlan::win_snap beside
+ * linear state, as DeepSeek-V4.1's sliding layers beside its compressor state): the hit resumes at
+ * the snapshot, which restores the linear state and the window together, and the cached group's
+ * blocks are adopted. Before, a model with linear state never put its window in the slot, so this
+ * clamp refused every hit on it. */
+TEST(a_hit_on_a_hybrid_whose_slot_carries_the_window_resumes_at_the_snapshot) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    const int32_t swa = 3;
+    f.kv.snap = { swa };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+
+    const uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    CHECK_EQ(b->ctx_lens[0], 256);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+    CHECK_EQ(f.kv.block_table(a, 0)[0], f.pc.seeded[0][0]);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.linear_cached_tokens, 256);
+    CHECK_EQ(m.hit_cut_window, 0);
+
+    /* A hit with no snapshot under it still reuses nothing: the window has nowhere to come from. */
+    Fixture g;
+    g.build(4096, 64, 512, 4096, /*windowed=*/true);
+    g.kv.snap = { swa };
+    g.pc.groups = { 0 };
+    CHECK_OK(g.start());
+    g.pc.seed(304);
+    g.pc.lin = 0;
+    g.pc.src = -1;
+    const uint64_t c = g.submit(300, 8);
+    REQUIRE(g.sch.step() != nullptr);
+    CHECK_EQ(g.sch.find(c)->n_computed, 0);
+}
+
+/* A trunk group the cache does not index and no slot carries is a hole no snapshot fills: a full
+ * group left out (as a group at another block size was before the cache took every block size)
+ * refuses the hit even where the window is in the slot. */
+TEST(a_trunk_group_neither_cached_nor_in_the_slot_refuses_the_hit) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 16;
+    k.layers = { 3 };
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(300, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().hit_cut_window, 1);
+}
+
+/* Groups at two block sizes: a hit adopts each group's own blocks (the 8-token group twice as
+ * many), and the cache's reserve is asked for in entries, from the group furthest short. */
+TEST(a_hit_over_mixed_block_sizes_adopts_each_groups_own_blocks) {
+    Fixture f;
+    f.build(4096, 64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    const int32_t fine = 3;
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0, fine };
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().quantum % 16, 0ll);
+    f.pc.seed(304);                                   /* 19 blocks of 16, 38 of 8 */
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1000, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    const std::vector<int32_t> t0 = f.kv.block_table(a, 0), t1 = f.kv.block_table(a, fine);
+    CHECK_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
+    CHECK_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
+    for (int i = 0; i < 16; ++i) CHECK_EQ(t0[(size_t)i], f.pc.seeded[0][(size_t)i]);
+    for (int i = 0; i < 32; ++i) CHECK_EQ(t1[(size_t)i], f.pc.seeded[1][(size_t)i]);
+}
+
+TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+    f.pc.groups = { 0, 3 };
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 1 << 20;
+    f.submit(160, /*max_tokens=*/1);                 /* 10 + 20 blocks, finishes on the first commit */
+    f.submit(176, /*max_tokens=*/64);                /* 11 + 22 each, still running after it */
+    f.submit(176, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.held_blocks(0), 32ll);             /* 32 free against a reserve of 16 */
+    CHECK_EQ(f.kv.held_blocks(3), 64ll);             /* none free against 16: 8 entries of 2 */
+    f.commit_plain();
+    REQUIRE(f.pc.trims.size() == 1u);
+    CHECK_EQ(f.pc.trims[0], 8ll);
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */
