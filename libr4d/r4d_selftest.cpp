@@ -29561,6 +29561,13 @@ static void device_phase(const Plugin& pl) {
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
+        /* The rows past the last full M tile: the tile heights the prefill arms dispatch are 64,
+         * 96, 128 and 256 (tile_bmbn), so every one of them gets a row count one past its tile and
+         * the row count of a tile plus one row. A scale read that escapes the store guard reads
+         * Ascale[M], which the buffer does not have. */
+        for (const int64_t m : { 1, 7, 63, 64, 65, 95, 96, 97, 127, 128, 129, 255, 256, 257 })
+            gemm_case(pl, "gemm_w4a8_prefill", "w4a8", m, 256, K, RAD_I8, 1, 0, 0, 256*K/2,
+                      256*(K/128)*4);
 
         /* Block-scaled fp8. The matvec runs at every point of its space (each `rb` is a different
          * instantiation of the K loop). The shapes give the narrow W8A8 row K a multiple of 256
