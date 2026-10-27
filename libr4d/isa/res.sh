@@ -7,12 +7,8 @@
 # SPILL IS THE LOUD COLUMN, and SCRATCH after it: spilled registers are a memory round trip the
 # source does not show, and scratch without spills is a private array the compiler could not keep
 # in registers. WAVES is the other one: on gfx1201 a SIMD has 1536 VGPRs in wave32 allocated in
-# groups of 8, so 256 VGPRs is 6 waves and 128 is 12 -- and LDS can cut it further, which this
-# column does NOT model.
-#
-# The metadata is msgpack printed as YAML and its keys are ALPHABETICAL, so .vgpr_count comes after
-# .symbol and .sgpr_count before it. Emitting a row at .symbol prints the previous kernel's VGPR
-# count. The row is flushed at .wavefront_size, which is last.
+# groups of 24, so 96 VGPRs is 16 waves, 97 is 12 and 256 is 5 -- and LDS can cut it further, which
+# this column does NOT model. The parse is rows.awk, which selftest.sh checks at those boundaries.
 : "${ROCM:=/opt/rocm}"
 : "${BUILD:=build}"
 : "${ISA_OUT:=/tmp/r4disa}"
@@ -24,16 +20,4 @@ for o in $(find "$BUILD" -name '*.hip.o'); do
   "$ROCM/llvm/bin/llvm-readelf" --notes "$D/$n.co" 2>/dev/null > "$D/$n.md"
 done
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' vgpr sgpr lds scratch spill waves wg kernel
-awk -v OFS='\t' '
-  /^ *\.group_segment_fixed_size:/   { lds = $2 }
-  /^ *\.private_segment_fixed_size:/ { sc  = $2 }
-  /^ *\.sgpr_count:/                 { s   = $2 }
-  /^ *\.sgpr_spill_count:/           { ss  = $2 }
-  /^ *\.vgpr_count:/                 { v   = $2 }
-  /^ *\.vgpr_spill_count:/           { vs  = $2 }
-  /^ *\.max_flat_workgroup_size:/    { wg  = $2 }
-  /^ *\.name:/                       { nm  = $2 }
-  /^ *\.wavefront_size:/ { if (nm != "") { g = int((v + 7) / 8) * 8; w = (g > 0) ? int(1536 / g) : 16
-                                           if (w > 16) w = 16
-                                           print v, s, lds, sc, vs + ss, w, wg, nm; nm = "" } }
-' "$D"/*.md | sort -k5,5nr -k4,4nr -k1,1nr
+  awk -f "$here/rows.awk" "$D"/*.md | sort -k5,5nr -k4,4nr -k1,1nr
