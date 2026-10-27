@@ -92,6 +92,27 @@ cmake --build build -j
 ctest --test-dir build -L fast -j8 --output-on-failure
 ```
 
+A ROCm SDK installed outside `/opt/rocm` — a userspace SDK tree under a virtualenv, a core-only
+system install — needs more than `ROCM_PATH`: hipcc is found, then device compilation dies inside
+`cuda_wrappers/cmath` with `Could not find standard C++ header 'cmath'`, because ROCm's clang
+does not pick up the distro gcc's libstdc++ headers on its own. The flags that make it work:
+
+```sh
+ROCM=/path/to/_rocm_sdk_devel   # the SDK root (the venv's site-packages/_rocm_sdk_devel)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DRAD_HIPCC=$ROCM/bin/hipcc \
+  -DCMAKE_HIP_COMPILER=$ROCM/llvm/bin/clang++ \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=$ROCM \
+  -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM --rocm-device-lib-path=$ROCM/lib/llvm/amdgcn/bitcode --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15"
+export LD_LIBRARY_PATH=$ROCM/lib:$LD_LIBRARY_PATH
+```
+
+`--gcc-install-dir` takes the distro gcc's directory (the installed gcc-15's; after a distro gcc
+upgrade it must be repointed, and the configure cached in `build/CMakeCache.txt` reset with
+`-c`). The device-lib path is where the SDK tree keeps `amdgcn/bitcode` (under `lib/llvm/` in a
+userspace SDK, `$ROCM/amdgcn/bitcode` in a core system install). The flags are not needed for a
+full `/opt/rocm` install, and `DOCKER.md`'s container sidesteps them.
+
 ### 1.3 Check that it works
 
 The tests are grouped into tiers by label, and `CMakePresets.json` names the usual runs. A preset
