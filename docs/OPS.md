@@ -190,6 +190,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | op | params | operands |
 |---|---|---|
 | `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (no gain operand: a gain of one) |
+| `rmsnorm_rows` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (the same norm; at n <= 256 with 1024+ rows a wave a row, byte-identical) |
 | `rmsnorm_p` | `M`(range) `n` `eps`:f64 `dtype` | `x` → `y` |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
@@ -617,6 +618,7 @@ and is optional.
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `swiglu_clamped_quant_fp8` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_gated_wide` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? (the same fold at every M: the narrow tile to 64 rows, past them the gated prefill tile) |
 | `gemm_nt_q_gated_mx` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w, `b_ref`w → `q`, `scale`, `out_bf16`? |
 
 `quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
@@ -730,6 +732,7 @@ may not have arrived.
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
@@ -893,6 +896,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
+| `rope_rows` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` (the same rotation; at 64+ rows and 4+ heads one angle a (token, pair), byte-identical) |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |

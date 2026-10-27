@@ -13316,6 +13316,103 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
                          "rc=" + std::to_string(rc));
     else same("gate_quant_fp8 is byte-identical to sigmoid + mul + quant_act_fp8");
 
+    /* --- mul + quant_act_fp8, against gate_quant_fp8 at act none -------------------------------
+     *
+     * LFM2's convolution gate: C * conv(B * x), then the codes its out projection reads. The
+     * kernel must round the product to bf16 (the `mul` step stores bf16) and take the codes over
+     * that value. Strided sources: gate and x are column slices of [M, 2K] planes, so a kernel
+     * ignoring a pitch reads the wrong half. Rows 1, 8 and 65 cover the narrow width's boundary
+     * and one past it; the scale plane stays K/128 wide at every M. */
+    {
+        const int64_t NROW = 65;
+        std::vector<uint16_t> hg((size_t)NROW * 2 * K), hx2((size_t)NROW * 2 * K);
+        for (int64_t r = 0; r < NROW; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const float m = std::ldexp(1.0f, (int)(c / 128) - 2);
+                const float v = m * (0.041f * (float)((r * 31 + c * 17) % 73) - 1.4f);
+                hg[(size_t)r * 2 * K + c]  = h_to_bf16(c == (r * 13) % K ? v * 23.0f : v);
+                hx2[(size_t)r * 2 * K + c] = h_to_bf16(m * (0.013f * (float)((r * 7 + c * 11) % 47) - 0.3f));
+            }
+        void* d_g  = dalloc(hg.size() * 2);
+        void* d_x2 = dalloc(hx2.size() * 2);
+        void* d_py[2] = { dalloc((size_t)NROW * K * 2), dalloc((size_t)NROW * K * 2) };
+        void* d_pq[2] = { dalloc((size_t)NROW * K), dalloc((size_t)NROW * K) };
+        void* d_ps[2] = { dalloc((size_t)NROW * nkb * 4), dalloc((size_t)NROW * nkb * 4) };
+        if (!d_g || !d_x2 || !d_py[1] || !d_pq[1] || !d_ps[1]) {
+            ok("mul + quant_act_fp8 vs gate_quant_fp8 act none", false, "hipMalloc failed");
+        } else {
+            st_memcpy(d_g,  hg.data(),  hg.size() * 2,  hipMemcpyHostToDevice);
+            st_memcpy(d_x2, hx2.data(), hx2.size() * 2, hipMemcpyHostToDevice);
+            for (const int64_t m : { (int64_t)1, (int64_t)8, (int64_t)65 }) {
+                RadTensor g = T(d_g,  RAD_BF16, { m, K }); g.stride[0]  = 2 * K;
+                RadTensor x = T(d_x2, RAD_BF16, { m, K }); x.stride[0] = 2 * K;
+                int r2 = launch_row(ml, { g, x, T(d_py[0], RAD_BF16, { m, K }) },
+                                    { PI("M", m), PI("n", K), PS("dtype", "bf16") });
+                if (r2 == RAD_OK)
+                    r2 = launch_row(qz, { T(d_py[0], RAD_BF16, { m, K }),
+                                          T(d_pq[0], RAD_F8E4M3, { m, K }),
+                                          T(d_ps[0], RAD_F32, { m, nkb }) },
+                                    { PI("M", m), PI("n", K), PI("group", 128),
+                                      PS("dtype", "bf16") });
+                if (r2 == RAD_OK)
+                    r2 = launch_row(tq, { g, x, T(d_pq[1], RAD_F8E4M3, { m, K }),
+                                          T(d_ps[1], RAD_F32, { m, nkb }),
+                                          T(d_py[1], RAD_BF16, { m, K }) },
+                                    { PI("M", m), PI("n", K), PI("group", 128),
+                                      PS("dtype", "bf16"), PS("act", "none") });
+                if (r2 != RAD_OK) {
+                    ok(("mul + quant_act_fp8 vs gate_quant_fp8 act none, M=" +
+                        std::to_string(m)).c_str(), false, "rc=" + std::to_string(r2));
+                    continue;
+                }
+                std::vector<uint16_t> y0((size_t)m * K), y1((size_t)m * K);
+                std::vector<uint8_t>  qq0((size_t)m * K), qq1((size_t)m * K);
+                std::vector<float>    ss0((size_t)m * nkb), ss1((size_t)m * nkb);
+                st_memcpy(y0.data(),  d_py[0], y0.size() * 2, hipMemcpyDeviceToHost);
+                st_memcpy(y1.data(),  d_py[1], y1.size() * 2, hipMemcpyDeviceToHost);
+                st_memcpy(qq0.data(), d_pq[0], qq0.size(), hipMemcpyDeviceToHost);
+                st_memcpy(qq1.data(), d_pq[1], qq1.size(), hipMemcpyDeviceToHost);
+                st_memcpy(ss0.data(), d_ps[0], ss0.size() * 4, hipMemcpyDeviceToHost);
+                st_memcpy(ss1.data(), d_ps[1], ss1.size() * 4, hipMemcpyDeviceToHost);
+                size_t ny = 0, nq = 0, ns = 0, nz = 0;
+                for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
+                for (size_t i = 0; i < qq0.size(); ++i) {
+                    nq += qq0[i] != qq1[i];
+                    nz += qq1[i] != 0;
+                }
+                for (size_t i = 0; i < ss0.size(); ++i)
+                    ns += std::memcmp(&ss0[i], &ss1[i], 4) != 0;
+                ok(("gate_quant_fp8 act none is byte-identical to mul + quant_act_fp8, M=" +
+                    std::to_string(m)).c_str(),
+                   ny == 0 && nq == 0 && ns == 0 && nz > qq1.size() / 2,
+                   "bf16 differs " + std::to_string(ny) + ", codes " + std::to_string(nq) +
+                       ", scales " + std::to_string(ns) + ", nonzero codes " +
+                       std::to_string(nz));
+
+                /* Without out_bf16 the codes are taken over the same rounded product. */
+                r2 = launch_row(tq, { g, x, T(d_pq[1], RAD_F8E4M3, { m, K }),
+                                      T(d_ps[1], RAD_F32, { m, nkb }),
+                                      T(nullptr, RAD_BF16, {}) },
+                                { PI("M", m), PI("n", K), PI("group", 128),
+                                  PS("dtype", "bf16"), PS("act", "none") });
+                if (r2 != RAD_OK) {
+                    ok(("gate_quant_fp8 act none without out_bf16, M=" +
+                        std::to_string(m)).c_str(), false, "rc=" + std::to_string(r2));
+                    continue;
+                }
+                st_memcpy(qq1.data(), d_pq[1], qq1.size(), hipMemcpyDeviceToHost);
+                st_memcpy(ss1.data(), d_ps[1], ss1.size() * 4, hipMemcpyDeviceToHost);
+                size_t dq2 = 0, ds2 = 0;
+                for (size_t i = 0; i < qq0.size(); ++i) dq2 += qq0[i] != qq1[i];
+                for (size_t i = 0; i < ss0.size(); ++i)
+                    ds2 += std::memcmp(&ss0[i], &ss1[i], 4) != 0;
+                ok(("gate_quant_fp8 act none without out_bf16 keeps the codes, M=" +
+                    std::to_string(m)).c_str(), dq2 == 0 && ds2 == 0,
+                   "codes differ " + std::to_string(dq2) + ", scales " + std::to_string(ds2));
+            }
+        }
+    }
+
     /* --- the same two at int8 codes, against the same products and quant_act_i8g ---
      *
      * With an I8 codes operand the producer writes int8 codes for an int8 trunk linear: the bf16
@@ -14546,6 +14643,90 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                            std::to_string(nz) + ", bf16 " + std::to_string(nb) + ", nonzero " +
                            std::to_string(live));
                     }
+                }
+
+                /* ---- past the narrow tile: `gemm_nt_q_gated_wide` runs the gated prefill tile,
+                 * whose accumulators are the unfused prefill GEMM's, so its codes, scales and bf16
+                 * product are the pair's over the whole prompt. 65 and 129 rows straddle one and
+                 * two 64-row blocks. */
+                const RadKernelInfo* gt = find(pl, "gemm_fp8a8_tiled");
+                const RadKernelInfo* gw = find(pl, "gemm_fp8a8_gated_nt_wide");
+                for (const int64_t M : { (int64_t)65, (int64_t)129 }) {
+                    if (!gt || !gw) {
+                        ok("gemm_fp8a8_gated_nt_wide numeric", false, "row absent");
+                        break;
+                    }
+                    void* dx  = dalloc((size_t)M * K * 2);
+                    void* dq  = dalloc((size_t)M * K);
+                    void* dqs = dalloc((size_t)M * sk * 4);
+                    void* dy  = dalloc((size_t)M * N * 2);
+                    void* c0  = dalloc((size_t)M * nout);
+                    void* c1  = dalloc((size_t)M * nout);
+                    void* z0  = dalloc((size_t)M * gkb * 4);
+                    void* z1  = dalloc((size_t)M * gkb * 4);
+                    void* b0  = dalloc((size_t)M * nout * 2);
+                    void* b1  = dalloc((size_t)M * nout * 2);
+                    if (!dx || !dq || !dqs || !dy || !c1 || !z1 || !b1) {
+                        ok("gemm_fp8a8_gated_nt_wide alloc", false, "hipMalloc failed");
+                        continue;
+                    }
+                    std::vector<uint16_t> xm((size_t)M * K);
+                    for (int64_t m = 0; m < M; ++m)
+                        for (int64_t c = 0; c < K; ++c)
+                            xm[(size_t)m * K + c] = xb[(size_t)((c + m * 37) % K)];
+                    st_memcpy(dx, xm.data(), xm.size() * 2, hipMemcpyHostToDevice);
+                    int rc = launch_row(qz, { T(dx, RAD_BF16, { M, K }), T(dq, RAD_F8E4M3, { M, K }),
+                                              T(dqs, RAD_F32, { M, sk }) },
+                                        { PI("M", M), PI("n", K), PI("group", 128),
+                                          PS("dtype", "bf16") });
+                    if (rc == RAD_OK)
+                        rc = launch_row(gt, { T(dq, RAD_F8E4M3, { M, K }),
+                                              T(dqs, RAD_F32, { M, sk }),
+                                              T(d_wf, RAD_F8E4M3, { N, K }),
+                                              T(d_s, RAD_BF16, { sn, sk }),
+                                              T(dy, RAD_BF16, { M, N }) },
+                                        { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                          PS("dtype", "fp8a8") });
+                    if (rc == RAD_OK)
+                        rc = launch_row(gq, { T(dy, RAD_BF16, { M, N }),
+                                              T(c0, RAD_F8E4M3, { M, nout }),
+                                              T(z0, RAD_F32, { M, gkb }),
+                                              T(b0, RAD_BF16, { M, nout }) },
+                                        { PI("M", M), PI("n", nout), PI("group", 128),
+                                          PS("dtype", "bf16"), PS("act", "silu") });
+                    if (rc == RAD_OK)
+                        rc = launch_row(gw, { T(dq, RAD_F8E4M3, { M, K }),
+                                              T(dqs, RAD_F32, { M, sk }),
+                                              T(d_wf, RAD_F8E4M3, { N, K }),
+                                              T(d_s, RAD_BF16, { sn, sk }),
+                                              T(c1, RAD_F8E4M3, { M, nout }),
+                                              T(z1, RAD_F32, { M, gkb }),
+                                              T(b1, RAD_BF16, { M, nout }) },
+                                        { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                          PS("dtype", "fp8a8"), PS("act", "silu") });
+                    const std::string wn =
+                        std::string("gemm_fp8a8_gated_nt_wide is byte-identical to the GEMM + "
+                                    "gated_quant_fp8, N ") + std::to_string((long long)N) +
+                        " M " + std::to_string((long long)M);
+                    if (rc != RAD_OK) { ok(wn.c_str(), false, "rc=" + std::to_string(rc)); continue; }
+                    std::vector<uint8_t>  q0((size_t)M * nout), q1((size_t)M * nout);
+                    std::vector<float>    s0((size_t)M * gkb),  s1((size_t)M * gkb);
+                    std::vector<uint16_t> y0((size_t)M * nout), y1((size_t)M * nout);
+                    st_memcpy(q0.data(), c0, q0.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(q1.data(), c1, q1.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(s0.data(), z0, s0.size() * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(s1.data(), z1, s1.size() * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(y0.data(), b0, y0.size() * 2, hipMemcpyDeviceToHost);
+                    st_memcpy(y1.data(), b1, y1.size() * 2, hipMemcpyDeviceToHost);
+                    int nc = 0, nz = 0, ny = 0, live = 0;
+                    for (size_t i = 0; i < q0.size(); ++i) nc += q0[i] != q1[i];
+                    for (size_t i = 0; i < s0.size(); ++i)
+                        nz += std::memcmp(&s0[i], &s1[i], 4) != 0;
+                    for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
+                    for (size_t i = 0; i < q1.size(); ++i) live += q1[i] != 0;
+                    ok(wn.c_str(), nc == 0 && nz == 0 && ny == 0 && live > (int)q1.size() / 2,
+                       "codes differ " + std::to_string(nc) + ", scales " + std::to_string(nz) +
+                           ", bf16 " + std::to_string(ny) + ", nonzero " + std::to_string(live));
                 }
             }
         }
@@ -28695,9 +28876,10 @@ static void device_phase(const Plugin& pl) {
         hipDeviceProp_t p;
         if (hipGetDeviceProperties(&p, d) != hipSuccess) continue;
         if (!g_case) std::printf("  device %d: %s\n", d, p.gcnArchName);
-        if (std::strncmp(p.gcnArchName, "gfx1201", 7) == 0) devs.push_back(d);
+        if (std::strncmp(p.gcnArchName, "gfx1201", 7) == 0 ||
+            std::strncmp(p.gcnArchName, "gfx1200", 7) == 0) devs.push_back(d);
     }
-    if (devs.empty()) { skip("device phase", "no gfx1201 device"); return; }
+    if (devs.empty()) { skip("device phase", "no gfx1200/gfx1201 device"); return; }
     st_set_device(devs[0]);
 
     if (!g_case) std::printf("\ndevice smoke tests (device %d)\n", devs[0]);

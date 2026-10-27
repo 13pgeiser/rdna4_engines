@@ -757,6 +757,13 @@ int  r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws,
                                  int a_ld, int sa_ld, int w_ld, int sw_ld,
                                  int q_ld, int s_ld, int y_ld, long stream);
 int  r4d_gemm_fp8a8_gated_nt_m16_max_m(void);
+// The same fold at any M (`gemm_nt_q_gated_wide`): past the narrow tile's 64 rows it takes the gated
+// prefill tile, whose accumulators are the unfused prefill GEMM's, so its bytes are the pair's.
+int  r4d_gemm_fp8a8_gated_nt_wide(long a, long ascale, long wq, long ws,
+                                  long q, long s, long y, int act,
+                                  int M, int K, int nout,
+                                  int a_ld, int sa_ld, int w_ld, int sw_ld,
+                                  int q_ld, int s_ld, int y_ld, long stream);
 // The narrow GEMM with a bias: `bias` bf16 [N], added to each output column's f32 accumulator before
 // its one rounding, and C written at row pitch `c_ld` (0 = N), so C may be a column slice of a wider
 // buffer. Never split. M up to r4d_gemm_fp8a8_nt_m16_max_m(); K a multiple of 128, N of 16.
@@ -811,7 +818,7 @@ int  r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s,
 int  r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
                              int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
 // The activation is rounded to bf16 before the product, matching the unfused `sigmoid` then `mul`
-// pair with a bf16 buffer between them.
+// pair with a bf16 buffer between them; `mode` 2 is the plain product (`mul` + quantiser).
 // The same epilogue with the gate in a different buffer from what it scales, as in gated
 // attention: `x` is the attention output and the gate a column slice of the [q|gate] projection.
 // A row is then a (token, head) pair; both sources are a fixed stride apart and the scale plane

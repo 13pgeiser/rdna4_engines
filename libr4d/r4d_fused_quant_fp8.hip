@@ -245,6 +245,9 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
 // then contiguous, the gate a fixed stride apart, and the scale plane [T * n_head, head_dim / 128]
 // is byte-identical to the [T, n_head * head_dim / 128] the out projection reads. Replaces three
 // launches (sigmoid, multiply, quantise) per attention layer.
+//
+// ACT 2 is the product with no activation: the unfused pair is `mul` then the quantiser, so the
+// gate is not rounded on its own and the product is rounded once, as mul_bf16 does.
 template <int ACT, bool I8 = false>
 __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
@@ -270,13 +273,18 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const float gv = bf2f(gb[j]);
-                // The activation is rounded to bf16 before the multiply, unlike gated_quant_fp8:
-                // the unfused reference here is `sigmoid` then `mul` with a bf16 buffer between
-                // them (silu_mul_bf16 keeps f32). Skipping the round trip changes the output.
-                const uint16_t ab =
-                    f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
-                const uint16_t h = f2bf(bf2f(ab) * bf2f(xb[j]));
+                uint16_t h;
+                if (ACT == 2) {
+                    h = f2bf(bf2f(gb[j]) * bf2f(xb[j]));
+                } else {
+                    const float gv = bf2f(gb[j]);
+                    // The activation is rounded to bf16 before the multiply, unlike gated_quant_fp8:
+                    // the unfused reference here is `sigmoid` then `mul` with a bf16 buffer between
+                    // them (silu_mul_bf16 keeps f32). Skipping the round trip changes the output.
+                    const uint16_t ab =
+                        f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
+                    h = f2bf(bf2f(ab) * bf2f(xb[j]));
+                }
                 if (yr) yr[c0 + j] = h;
                 v[j] = bf2f(h);
             }
@@ -850,7 +858,7 @@ static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, in
     if (!g || !x || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;
-    if (mode != 0 && mode != 1) return -5;
+    if (mode < 0 || mode > 2) return -5;
     if (!g_ld) g_ld = n;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
@@ -867,7 +875,8 @@ static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, in
                        (uint32_t)s_ld)
 #define R4D_GTQ(a) do { if (i8) R4D_GTQ_I(a, true); else R4D_GTQ_I(a, false); } while (0)
     if (mode == 0) R4D_GTQ(0);
-    else           R4D_GTQ(1);
+    else if (mode == 1) R4D_GTQ(1);
+    else R4D_GTQ(2);
 #undef R4D_GTQ
 #undef R4D_GTQ_I
     if (emit_rc != RAD_OK) return -4;
@@ -1058,6 +1067,7 @@ static int act_mode(const RadArgs* a, int dflt) {
     if (!act) return (int)r4d_geti_or(a, "mode", dflt);
     if (!std::strcmp(act, "silu")) return 0;
     if (!std::strcmp(act, "sigmoid")) return 1;
+    if (!std::strcmp(act, "none")) return 2;
     return -1;
 }
 

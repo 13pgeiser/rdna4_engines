@@ -575,6 +575,10 @@ int r4d_rad_rope_table            (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a16_m1  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_m16  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs*, RadStream);
+int r4d_rad_gemm_fp8a8_gated_wide(const RadArgs*, RadStream);
+/* `gemm_nt_q_short`: the narrow row with the short-prompt split rule (narrow_ksplit). */
+int r4d_rad_gemm_fp8a8_m16_short(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_fp8a8_m16_short_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_bias_m16(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
@@ -740,6 +744,8 @@ int r4d_rad_gather_rows_u8  (const RadArgs*, RadStream);
 int r4d_rad_scatter_rows_u8 (const RadArgs*, RadStream);
 int r4d_rad_scatter_rows_bf16(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
+/* The same row choosing the short-row form when it serves (`rmsnorm_rows`, rmsnorm_short_kernel). */
+int r4d_rad_rmsnorm_rows    (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_p       (const RadArgs*, RadStream);
 int r4d_rad_add             (const RadArgs*, RadStream);
 int r4d_rad_mul             (const RadArgs*, RadStream);
@@ -798,6 +804,8 @@ int r4d_shape_moe_gather_inv(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_gelu_mul        (const RadArgs*, RadStream);
 int r4d_rad_rope            (const RadArgs*, RadStream);
+/* The same row choosing the per-(token, pair) angles form when it serves (`rope_rows`). */
+int r4d_rad_rope_rows       (const RadArgs*, RadStream);
 /* -- the vision tower's ops (r4d_vit_bf16.hip) -- */
 int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
