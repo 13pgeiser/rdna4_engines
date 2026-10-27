@@ -1162,6 +1162,12 @@ just retaining the tip afterward. This restores tail-only snapshot scheduling an
 avoids the extra copies, at the cost of full re-prefill if an edit precedes the tip.
 Recurrent-state models still checkpoint at intervals under `tip-only`; their
 existing scheduling is unchanged.
+Both kinds also take a snapshot at a head other prompts share: when a prompt leaves a cached
+head that at least two earlier prompts already left differently (the same system prompt or
+instructions in front of a different text, as a translation service sends its pieces) and no
+snapshot lets it skip at least 256 tokens of that head, the request takes one where the head
+ends, at the cost of one chunk split, and the requests after it resume there. A conversation's
+next turn has only its own earlier turn past that point, so it splits nothing extra.
 
 **One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
 from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the

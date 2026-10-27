@@ -292,15 +292,19 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
 
     int64_t matched = 0;
+    bool departed = false;              /* the prompt goes on where nothing is cached */
     for (; matched < n_full; ++matched) {
         auto it = map_.find(hs[(size_t)matched]);
-        if (it == map_.end()) break;
+        if (it == map_.end()) { departed = true; break; }
         /* An off-device entry is not a hit: demotion released its blocks and its recorded ids now
          * belong to other sequences. The prefix stops here (also while a promotion is in flight);
          * the caller may promote and look up again (restorable_from). */
         if (!it->second.in_lru) break;
         if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
     }
+
+    if (departed && matched > 0 && map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
+        hit.branch_at = (int32_t)(matched * block_size_);
 
     /* Back a full hit off by one block so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
@@ -435,6 +439,10 @@ int PrefixCache::insert(uint64_t session,
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
         map_.emplace(h, std::move(e));
+        if (b > 0) {
+            auto p = map_.find(hs[(size_t)b - 1]);
+            if (p != map_.end() && p->second.n_children < 255) ++p->second.n_children;
+        }
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
     for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);

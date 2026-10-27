@@ -2128,6 +2128,43 @@ TEST(prefix_cache_hits_the_shared_prefix_only) {
     CHECK_EQ(f.pc.lookup(p1, {}).n_attn_tokens, 48);
 }
 
+/* Where a hit ends at a head two cached prompts already left differently (CacheHit::branch_at):
+ * the same instructions in front of different texts. One cached prompt past it is not enough, the
+ * next prompt could be the same conversation going on; a prompt that follows one of them further, or
+ * is all cached, is at no branch. */
+TEST(a_hit_reports_the_head_two_cached_prompts_left_differently) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto head = tok_run(10, 64);                  /* 4 blocks every prompt starts with */
+    auto with_tail = [&](int32_t base) {
+        auto p = head;
+        for (int i = 0; i < 48; ++i) p.push_back(base + i);
+        return p;
+    };
+    const auto a = with_tail(1000), b = with_tail(2000), c = with_tail(3000);
+    publish(f, 1, a, 112);
+    CacheHit h1 = f.pc.lookup(b, {});
+    CHECK_EQ(h1.n_attn_tokens, 64);
+    CHECK_EQ(h1.branch_at, 0);
+    publish(f, 2, b, 112);
+    CacheHit h2 = f.pc.lookup(c, {});
+    CHECK_EQ(h2.n_attn_tokens, 64);
+    CHECK_EQ(h2.branch_at, 64);
+
+    auto a2 = a;
+    for (int i = 0; i < 32; ++i) a2.push_back(4000 + i);
+    CHECK_EQ(f.pc.lookup(a2, {}).n_attn_tokens, 112);
+    CHECK_EQ(f.pc.lookup(a2, {}).branch_at, 0);
+    CHECK_EQ(f.pc.lookup(a, {}).branch_at, 0);
+    /* Publishing the same prompt again adds no way on. */
+    publish(f, 3, a, 112);
+    auto d = head;
+    for (int i = 0; i < 16; ++i) d.push_back(1000 + i);
+    for (int i = 0; i < 32; ++i) d.push_back(5000 + i);
+    CHECK_EQ(f.pc.lookup(d, {}).n_attn_tokens, 80);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 0);
+}
+
 TEST(prefix_cache_lru_eviction_order) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/false));

@@ -1209,6 +1209,17 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             }
         }
 
+        /* A head other prompts share (CacheHit::branch_at) that no snapshot lets this request
+         * skip: it takes one there on its way past (Request::checkpoint_at), and every later
+         * request with the same head skips it -- the same system prompt or instructions in front
+         * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
+         * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
+        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+            r.checkpoint_at = h.branch_at;
+            RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
+                      (unsigned long long)r.id, (long long)h.branch_at);
+        }
+
         r.n_computed = reuse;
         r.n_cached = reuse;
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&

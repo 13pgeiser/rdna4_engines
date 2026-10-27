@@ -362,6 +362,7 @@ struct FakeKV : IKVManager {
 struct FakePC : IPrefixCache {
     FakeKV* kv = nullptr;
     int32_t attn = 0, lin = 0, src = -1;
+    int32_t branch_at = 0;       /* CacheHit::branch_at, as the real cache reports it */
     int32_t next_slot = 0;
     int32_t reserved = 0;
     int64_t evicted = 0, ckpt_evicted = 0;
@@ -407,6 +408,7 @@ struct FakePC : IPrefixCache {
                 (*out)[i] = seeded[i];
         }
         CacheHit h{ attn, lin, src };
+        h.branch_at = branch_at;
         const int64_t whole = src >= 0 ? lin : 0;
         if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
             const int64_t a = cap->tokens / 16 * 16;

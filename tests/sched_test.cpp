@@ -434,6 +434,47 @@ TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
 }
 
+/* A hit that ends at a head other prompts share (CacheHit::branch_at) and resumes nothing there:
+ * the request takes a snapshot at that point (Request::checkpoint_at), so the requests after it
+ * skip the head. TranslateGemma's chunks: the same instructions, then a different text each. Not
+ * when a snapshot already resumes within Scheduler::kSharedHeadMin of it, nor for an ordinary hit. */
+TEST(a_hit_at_a_shared_head_takes_a_snapshot_there) {
+    {   /* a window model, tip-only: the head's snapshot comes in addition to the tail's */
+        Fixture f;
+        f.build(4096, 64, 512, 4096, /*windowed=*/true);
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_policy = "tip-only";
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(640);
+        f.pc.branch_at = 640;
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)640);
+        f.commit_plain();
+        for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
+        CHECK_EQ(f.sch.metrics().checkpoints_written, 2ll);
+        const std::vector<int64_t> want = { 640, 1072 };
+        CHECK(f.pc.committed == want);
+    }
+    for (int c = 0; c < 3; ++c) {   /* a hybrid model, interval 256, quantum 64 */
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.pc.seed(640);
+        if (c == 1) { f.pc.lin = 512; f.pc.src = 3; }   /* resumes 128 short: not worth a split */
+        f.pc.branch_at = c == 2 ? 0 : 640;              /* an ordinary hit: no branch */
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)(c == 1 ? 512 : 0));
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)(c == 0 ? 640 : 0));
+    }
+}
+
 TEST(tip_only_does_not_disable_recurrent_interval_checkpoints) {
     Fixture f;
     f.build();

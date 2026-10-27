@@ -427,6 +427,9 @@ public:
 
     /* plan_chunk's tail-checkpoint rule (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
+    /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
+     * request for the chunk split that takes it. */
+    static constexpr int64_t kSharedHeadMin = 256;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
