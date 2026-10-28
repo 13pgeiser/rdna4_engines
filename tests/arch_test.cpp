@@ -4851,6 +4851,105 @@ TEST(the_gemma4_e4b_form_is_refused_where_it_cannot_run) {
     }
 }
 
+/* The 31B's linears on the asymmetric grids, u4 (a4) or u5 codes with a u8 zero point and an f16
+ * scale per [1 x 128], at one and two ranks: each is two GEMMs over the codes and the joined
+ * (scale, zero) view, up to 64 rows the input cast to f16 for w4a16_asym / w5a16, above that
+ * quant_act_i8g's int8 codes for w4a8i8_asym / w5a8i8. q|k|v stay one GEMM; o_proj and down_proj
+ * are cut along K, in whole scale groups. A decode step issues only the f16 band, a step of 200
+ * rows only the int8 one. */
+TEST(the_gemma4_31b_form_reads_asymmetric_int4_and_int5_linears) {
+    static const int32_t tall_out[] = { 99, 199 };
+    for (const uint32_t cdt : { (uint32_t)RAD_U4, (uint32_t)RAD_U5 }) {
+        const bool five = cdt == RAD_U5;
+        const std::string dec = five ? "w5a16" : "w4a16_asym", pre = five ? "w5a8i8" : "w4a8i8_asym";
+        RadEncoding e = rad_enc_affine(cdt, RAD_F16, 1, 128);
+        rad_enc_add_plane(&e, "zero", RAD_U8, 1, 128);
+        for (int world : { 1, 2 }) {
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                b.encs = { { "attn_qkv.", e }, { "attn_o.", e }, { "ffn_gate_up.", e },
+                           { "ffn_down.", e } };
+                RadModelMeta meta = gemma4_meta();
+                RadBuildCtx  ctx  = build_ctx(rank, world);
+                CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+                CHECK(!gemma4_bf16::g_model[rank].fuse);
+                int n_dec = 0, n_pre = 0, other = 0;
+                for (const RecOp& o : b.ops) {
+                    if (o.op != "gemm_nt_q") continue;
+                    const std::string dt = pstr(&o, "dtype");
+                    const RecParam* m = param(&o, "M");
+                    REQUIRE(m != nullptr);
+                    if (dt == dec) {
+                        ++n_dec;
+                        CHECK_EQ(m->ihi, 64LL);
+                    } else if (dt == pre) {
+                        ++n_pre;
+                        CHECK_EQ(m->ihi, (long long)ctx.max_tok);
+                    } else {
+                        ++other;
+                    }
+                    CHECK_EQ(pint(&o, "group"), 128);
+                    CHECK(param(&o, "pb1") == nullptr);
+                }
+                /* twelve layers of q|k|v, o, gate_up and down */
+                CHECK_EQ(n_dec, 48);
+                CHECK_EQ(n_pre, 48);
+                CHECK_EQ(other, 0);
+                CHECK_EQ(count_op(b, "quant_act_i8g"), 48);
+                int codes = 0, joined = 0;
+                for (const RecWeight& w : b.weights) {
+                    if (!w.d.planes) continue;
+                    if (std::string(w.d.planes) == "codes") {
+                        ++codes;
+                        CHECK_EQ(w.d.dtype, cdt);
+                    } else if (std::string(w.d.planes) == "scale,zero") {
+                        ++joined;
+                        CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+                    }
+                }
+                CHECK_EQ(codes, 48);
+                CHECK_EQ(joined, 48);
+                /* o_proj of a sliding (0) and a global (5) layer, and down_proj: this rank's K */
+                const std::initializer_list<std::pair<std::string, int64_t>> cut = {
+                    { "blk.0.attn_o", 32 * 256 }, { "blk.5.attn_o", 32 * 512 },
+                    { "blk.0.ffn_down", 21504 } };
+                for (const auto& [base, k] : cut)
+                    for (const char* v : { ".weight", ".scale" }) {
+                        const RecWeight* w = find_w(b, base + v);
+                        REQUIRE(w != nullptr);
+                        CHECK_EQ(w->d.shard, (int)RAD_SHARD_COL);
+                        CHECK_EQ(w->d.shape[0], (int64_t)5376);
+                        CHECK_EQ(w->d.shape[1], k / world);
+                        CHECK_EQ(w->d.shape[1] % 128, (int64_t)0);
+                    }
+
+                RadBatch tall = prefill_batch();
+                tall.n_tok = 200; tall.max_q_len = 100; tall.max_ctx_len = 100;
+                tall.out_ids = tall_out;
+                for (const RadBatch& batch : { decode_batch(), tall }) {
+                    RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+                    gemma4_bf16::step(&c, &batch);
+                    CHECK_LINT(b, &c);
+                    CHECK(c.step_fail.empty());
+                    const std::string want = batch.n_tok <= 64 ? dec : pre;
+                    int gemms = 0, casts = 0;
+                    for (const auto& i : c.issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        if (o->op == "gemm_nt_q") {
+                            ++gemms;
+                            CHECK_EQ(pstr(o, "dtype"), want);
+                        }
+                        if (o->op == "cast" && pstr(o, "to") == "f16") ++casts;
+                    }
+                    CHECK_EQ(gemms, 48);
+                    CHECK_EQ(casts, batch.n_tok <= 64 ? 48 : 0);
+                }
+            }
+        }
+    }
+}
+
 TEST(gemma4_attention_shapes_for_both_classes) {
     RadBuilder b;
     RadModelMeta meta = gemma4_meta();

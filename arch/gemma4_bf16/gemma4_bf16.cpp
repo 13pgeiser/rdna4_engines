@@ -130,6 +130,10 @@ struct G4Linear {
      * per [1 x 128] (libquant `codes=u4 zero=u8 group=128 scale=f16`), gemm_nt_q at w4a8i8_asym
      * over the same per-(row, 128) int8 activation as i8g. */
     bool       a4 = false;
+    /* true with a4: the same grid at five bits, u5 codes and a zero point 0..31 (libquant
+     * `codes=u5 zero=u8 group=128 scale=f16`), ParoQuant int5's grid with no rotation. Read by
+     * w5a8i8 and w5a16 where a4 reads w4a8i8_asym and w4a16_asym, over the same activations. */
+    bool       w5 = false;
     bool       grouped() const { return i8g || a4; }
     /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
      * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
@@ -224,9 +228,10 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         const RadEncPlane* sp = rad_enc_plane(&enc, "scale");
         const RadEncPlane* zp = rad_enc_plane(&enc, "zero");
         a4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 3 && !enc.transform[0] &&
-             cdt == RAD_U4 && enc.plane[0].block[1] == 1 && sp && sp->dtype == RAD_F16 &&
-             sp->block[0] == 1 && sp->block[1] == RAD_FP8_BLOCK && zp && zp->dtype == RAD_U8 &&
-             zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK;
+             (cdt == RAD_U4 || cdt == RAD_U5) && enc.plane[0].block[1] == 1 && sp &&
+             sp->dtype == RAD_F16 && sp->block[0] == 1 && sp->block[1] == RAD_FP8_BLOCK && zp &&
+             zp->dtype == RAD_U8 && zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK;
+        w5 = a4 && cdt == RAD_U5;
     }
     if (i8g || a4) {
         if (N % 16 || K % RAD_FP8_BLOCK) {
@@ -236,7 +241,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
             return RAD_E_INVAL;
         }
         if (a4) {
-            w  = decl_view(b, wn, nullptr, "codes", RAD_U4, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+            w  = decl_view(b, wn, nullptr, "codes", w5 ? RAD_U5 : RAD_U4, { N, K }, RAD_ACCESS_PER_TOKEN,
+                           shard, grp, parts, np);
             ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
                            RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         } else {
@@ -264,7 +270,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
                                RAD_INT("group", RAD_FP8_BLOCK),
-                               RAD_STR("dtype", a4 ? "w4a8i8_asym" : "i8a8")),
+                               RAD_STR("dtype", w5 ? "w5a8i8" : a4 ? "w4a8i8_asym" : "i8a8")),
                     RAD_WEIGHTS(w, ws)),
                 { q8, s8 }, { y });
         if (!op) return RAD_E_INVAL;
@@ -279,7 +285,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                         { a }, { a16 });
             op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
                             RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
-                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a16_asym")),
+                                       RAD_INT("group", RAD_FP8_BLOCK),
+                                       RAD_STR("dtype", w5 ? "w5a16" : "w4a16_asym")),
                             RAD_WEIGHTS(w, ws)),
                         { a16 }, { y });
             if (!op_a16 || !op_dec) return RAD_E_INVAL;
@@ -328,7 +335,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
     char en[256];
     rad_enc_format(&enc, en, sizeof en);
     fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8, w8a8, "
-                    "int8 a 128 (i8a8) or asymmetric int4 a 128 -- none matches\n", wn, en);
+                    "int8 a 128 (i8a8) or asymmetric int4 or int5 a 128 -- none matches\n", wn, en);
     return RAD_E_DTYPE;
 }
 
@@ -514,11 +521,13 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     if (cls.has_v) RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src, v_src }));
     else           RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src }));
     {
-        /* one q|k|v GEMM wherever the weight is on a quantised grid: w4a8 / w8a8, i8a8 or a4 */
+        /* one q|k|v GEMM wherever the weight is on a quantised grid: w4a8 / w8a8, i8a8, a4 or
+         * its five-bit form */
         RadEncoding e{};
         fused = weight_enc(b, qkv_wn, &e) && (g4_grid_w4(e) || linear_is_w8(e) ||
                                               (rad_enc_is(&e, "affine") && e.n_planes == 3 &&
-                                               e.plane[0].dtype == RAD_U4));
+                                               (e.plane[0].dtype == RAD_U4 ||
+                                                e.plane[0].dtype == RAD_U5)));
     }
     if (fused) {
         if (!qkv_slot) return RAD_E_INVAL;
