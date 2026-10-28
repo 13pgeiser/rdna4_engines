@@ -151,14 +151,21 @@ constexpr uint32_t kSplitThinCap = 64u;
  * tuned at (the NT accumulators and K-step unroll are sized against it), so a compiler release
  * cannot change occupancy. Shapes with one or two waves per block are LDS-bound and use that
  * count. */
-constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bool i8) {
+constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bool i8,
+                            bool gated = false) {
     if (mw == 1u) return nt == 1u ? 8u : nt == 2u ? 4u : nt == 3u ? 3u : 2u;
     if (mw == 2u) return nt == 1u ? 12u : nt == 2u ? 8u : nt == 3u ? 5u : 4u;
     if (!i8) {
         if (fk == 128u)
             return nt == 1u ? 16u : nt == 2u ? (full ? 16u : 12u) : nt == 3u ? 10u
                  : (full && mw >= 8u) ? 10u : 9u;
-        return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? 9u : mw == 4u ? 7u : 8u;
+        /* The gated three-tile form at 8, not 9. At 9 waves' 168 registers its epilogue spilled
+         * 57 at the full tile (48 rows), which ran gate_up 51 % slower than 56 rows, and 10 below
+         * it. 8 waves leave 192, where it spills 7 at 48 rows and none below. The gated form is
+         * always MW 16, four waves a SIMD a block, so 8 and 9 both hold two blocks a WGP: no
+         * occupancy is lost. */
+        return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? (gated ? 8u : 9u)
+             : mw == 4u ? 7u : 8u;
     }
     if (fk == 128u)
         return nt == 1u ? 16u : nt == 2u ? (full ? 10u : 12u) : nt == 3u ? (full ? 9u : 10u)
@@ -598,7 +605,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
     Sc, Yb, q_ld, s_ld, y_ld, Bias, c_ld
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false, bool BIAS = false>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, GATED))
 void gemm_fp8a8_kernel(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
@@ -613,7 +620,7 @@ void gemm_fp8a8_kernel(
 }
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false, bool BIAS = false>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, GATED))
 void r4dchain_gemm_fp8a8(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
