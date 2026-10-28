@@ -1232,7 +1232,9 @@ __device__ __forceinline__ void hc_role_wait(unsigned int* __restrict__ sync, un
          * vector caches, and a poll of them would keep emptying them under the A blocks. */
         while (__hip_atomic_load(&sync[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < na) {
             __builtin_amdgcn_s_sleep(1);
-            if (wall_clock64() - t0 > 50000000ull) break;   /* 0.5 s at the 100 MHz wall clock */
+            /* 0.5 s at the 100 MHz wall clock. A blocks that never finish are a counter fault:
+             * trap rather than read a stale `d`, as the all-reduce handshakes do. */
+            if (wall_clock64() - t0 > 50000000ull) __builtin_trap();
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         if (__hip_atomic_fetch_add(&sync[2], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u
@@ -1516,8 +1518,8 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
  * smaller ticket has already started, so the blocks it waits on are resident and finish whatever
  * the waiters do: no co-residency is assumed and none can deadlock. The last B block past the
  * wait clears the three counters for the next launch on this stream (stream order publishes it).
- * A wait that runs past half a second gives up rather than hang the card; it cannot happen with
- * the counters in order.
+ * A wait that runs past half a second traps rather than hang the card or read a stale `d`; it
+ * cannot happen with the counters in order.
  *
  * Bit-identical to the two launches: the same bodies, the same per-block work. */
 template <int RG, bool I8, int RPT, int HCP, int PER>
