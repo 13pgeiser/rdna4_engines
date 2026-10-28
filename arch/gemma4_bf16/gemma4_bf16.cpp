@@ -42,7 +42,13 @@ using namespace rad::arch;
  * v read one quantised pair instead of three. `qkv_norm_rope` does the same for the attention
  * prologue's five ops, `gelu_mul_quant_i8` for down's input, and at two ranks
  * `ar_rmsnorm_quant_i8` also folds in the all-reduce before each junction. A kernel set without an
- * op keeps that op's chain. */
+ * op keeps that op's chain.
+ *
+ * The linears on quant_act_i8g's grid (i8a8, a4 and its five-bit form) take the `_i8g` twins of the
+ * three: the same junctions with a scale per (row, 128) instead of per row. An a4 linear reads no
+ * int8 pair up to its decode band (G4Linear::kA4Split rows) but an f16 copy of the bf16 norm output
+ * (`cast`, then w4a16_asym or w5a16), so there its junction also writes that norm output where the
+ * unfused norm would, into the linear's input row, and the cast and the skinny GEMM run as before. */
 
 /* layer_types is optional. When present it must name every layer "full_attention" or
  * "sliding_attention"; when absent, layer l is global when (l + 1) % interval == 0. */
@@ -123,8 +129,8 @@ struct G4Linear {
     /* true: i8a8 as arch/gemma3's G3Linear: int8 codes with a bf16 scale per [1 x 128] (libquant
      * `codes=i8 group=128 scale=bf16`) over quant_act_i8g, an activation scale per (row, 128).
      * Gemma 4 E4B's activations carry a few channels 40-200 times the row's median (the down
-     * projection's input most), and one int8 scale a row spends its codes on them. There is no
-     * fused norm/quantiser at this grid, so the junctions stay off for a model that uses it. */
+     * projection's input most), and one int8 scale a row spends its codes on them. Its junctions
+     * are the `_i8g` twins (see "Residual junctions" above). */
     bool       i8g = false;
     /* true: asymmetric int4 as arch/gemma3's G3Linear: u4 codes, a u8 zero point and an f16 scale
      * per [1 x 128] (libquant `codes=u4 zero=u8 group=128 scale=f16`), gemm_nt_q at w4a8i8_asym
@@ -135,6 +141,11 @@ struct G4Linear {
      * w5a8i8 and w5a16 where a4 reads w4a8i8_asym and w4a16_asym, over the same activations. */
     bool       w5 = false;
     bool       grouped() const { return i8g || a4; }
+    /* reads an int8 pair a junction can write, at either grid */
+    bool       pair() const { return quant || grouped(); }
+    /* the pair's scales a row: one, or one per 128 columns */
+    int64_t    scale_w() const { return grouped() ? K / RAD_FP8_BLOCK : 1; }
+    rad_buf    in = 0;            /* the bf16 input row `a` given at declare */
     /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
      * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
      * which at one row does 16 times the matrix work and reads its weight a quarter as fast. */
@@ -154,7 +165,8 @@ struct G4Linear {
                  std::initializer_list<int64_t> row_parts = {},
                  const G4Linear* in_from = nullptr);
     void step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const;
-    /* the GEMM alone, for a caller that wrote the int8 pair itself (a fused norm + quantiser) */
+    /* the GEMM alone, for a caller that wrote the int8 pair itself (a fused norm + quantiser); an
+     * a4 linear's decode band reads the bf16 input row instead, which that caller then wrote */
     void gemm(RadCtx* c, rad_buf y, int64_t T) const;
     /* The same two over rows [r0, r0 + n) of the step: a slice of the prefill overlap. The
      * quantiser and the GEMM are a row at a time above their bands, so a slice's rows are the
@@ -191,7 +203,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                             rad_buf a, rad_buf y,
                             std::initializer_list<int64_t> row_parts,
                             const G4Linear* in_from) {
-    N = n_out; K = n_in;
+    N = n_out; K = n_in; in = a;
     if (N <= 0 || K <= 0) return RAD_E_INVAL;
     const char* wn = nm.f("%s.weight", base);
     if (src.size() == 1)     RAD_ARCH_TRY(map_copy(b, wn, *src.begin()));
@@ -362,6 +374,13 @@ inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
 }
 
 inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
+    if (a4 && T <= a4_split) {
+        /* the decode band reads no pair: the junction wrote the norm output into `in` instead */
+        RAD_ISSUE_N(c, op_a16, T, brows(in, T), brows(a16, T));
+        RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
+                    RAD_NONE, RAD_NONE);
+        return;
+    }
     RAD_ISSUE_N(c, op, T, brows(q8, T), brows(s8, T), RAD_W(w), RAD_W(ws),
                 brows(y, T), RAD_NONE, RAD_NONE);
 }
@@ -377,20 +396,19 @@ inline void G4Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int
         RAD_ISSUE_N(c, op, n, brow_slice(a, r0, n, K), RAD_W(w), brow_slice(y, r0, n, N));
         return;
     }
-    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;   /* the scale plane's row width */
     if (!shared_in && grouped())
         RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
-                    brow_slice(s8, r0, n, sw));
+                    brow_slice(s8, r0, n, scale_w()));
     else if (!shared_in)
         RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
                     brow_slice(s8, r0, n, 1), RAD_NONE);
     gemm_rows(c, y, r0, n);
 }
 
+/* A slice of the prefill overlap only, which is above every decode band (kOverlapRows). */
 inline void G4Linear::gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const {
-    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;
-    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, sw), RAD_W(w), RAD_W(ws),
-                brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, scale_w()), RAD_W(w),
+                RAD_W(ws), brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
 }
 
 /* ---- one attention block, parameterised by class. */
@@ -447,9 +465,9 @@ struct Gemma4Attn {
     /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
     const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
     bool reads_pair() const {
-        if (shared) return ln_q.quant;
-        return fused ? ln_qkv.quant
-                     : ln_q.quant && ln_k.shared_in && (!cls.has_v || ln_v.shared_in);
+        if (shared) return ln_q.pair();
+        return fused ? ln_qkv.pair()
+                     : ln_q.pair() && ln_k.shared_in && (!cls.has_v || ln_v.shared_in);
     }
 
     /* `kv_src` < 0: the layer keeps its own cache; else the layer whose cache it reads. */
@@ -1064,8 +1082,11 @@ struct Gemma4Mlp {
     rad_weight w_norm = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_gu{}, ln_down{};      /* the GEMM weights (bf16 or w4a8) */
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
-    /* gelu_mul and down's quantiser as one, where it resolves (libr4d `gelu_mul_quant_i8`) */
-    rad_op op_gq = 0;
+    /* gelu_mul and down's quantiser as one, where it resolves (libr4d `gelu_mul_quant_i8`, or its
+     * `_i8g` twin before a down_proj on quant_act_i8g's grid); not in an a4 down_proj's decode
+     * band, which reads bf16 (gq_lo: the most rows that band takes, else 0) */
+    rad_op  op_gq = 0;
+    int64_t gq_lo = 0;
     /* the next layer's q|k|v read into the cache beside this block's all-reduce, or 0 (see
      * "Prefetch beside the reductions") */
     rad_op     op_pf = 0;
@@ -1084,9 +1105,9 @@ struct Gemma4Mlp {
 void Gemma4Mlp::arm(RadCtx* c, int64_t r0, int64_t n) const {
     const int64_t F = g.n_ff;
     ln_gu.gemm_rows(c, w.gu, r0, n);
-    if (op_gq) {
+    if (op_gq && n > gq_lo) {
         RAD_ISSUE_N(c, op_gq, n, brow_slice(w.gu, r0, n, 2 * F), brow_slice(ln_down.q8, r0, n, F),
-                    brow_slice(ln_down.s8, r0, n, 1), RAD_NONE);
+                    brow_slice(ln_down.s8, r0, n, ln_down.scale_w()), RAD_NONE);
         ln_down.gemm_rows(c, w.h, r0, n);
     } else {
         RAD_ISSUE_N(c, op_act, n, brow_slice(w.gu, r0, n, 2 * F), brow_slice(w.ffn, r0, n, F));
@@ -1134,11 +1155,15 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
-    if (ln_down.quant && !ln_down.shared_in && rad_op_declared(b, "gelu_mul_quant_i8"))
-        op_gq = rw(b, RAD_OP(b, "gelu_mul_quant_i8",
+    const char* gq = ln_down.quant ? "gelu_mul_quant_i8"
+                   : ln_down.grouped() ? "gelu_mul_quant_i8g" : nullptr;
+    if (gq && !ln_down.shared_in && rad_op_declared(b, gq)) {
+        op_gq = rw(b, RAD_OP(b, gq,
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                    {w.gu}, {ln_down.q8, ln_down.s8});
+        gq_lo = ln_down.a4 ? ln_down.a4_split : 0;
+    }
     /* down_proj is column-sharded: reduce first, then the post-norm. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
@@ -1168,7 +1193,7 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
         RAD_ISSUE(c, op_norm,  brows(w.x, T),   RAD_W(w_norm),  brows(w.h, T));
         ln_gu.step(c, w.h, w.gu, T);
     }
-    if (op_gq) {
+    if (op_gq && T > gq_lo) {
         RAD_ISSUE_N(c, op_gq, T, brows(w.gu, T), brows(ln_down.q8, T), brows(ln_down.s8, T), RAD_NONE);
         ln_down.gemm(c, w.h, T);
     } else {
@@ -1184,8 +1209,11 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 }
 
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
- * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
- * `res` null it is the plain norm of `x`, the first block's entry. */
+ * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`, or
+ * `rmsnorm_quant_i8g` before a linear on quant_act_i8g's grid). With `res` null it is the plain
+ * norm of `x`, the first block's entry. Before an a4 linear the op also writes the bf16 norm output
+ * into the linear's input row (`out_bf16`, `y`) in a step its decode band takes; that row is `x`
+ * itself past the first block, as the unfused chain normalises into `h`. */
 /* The four-rank fold's band. libr4d's four-rank row serves it in three forms, all byte-identical
  * to all_reduce + rmsnorm_quant_i8. Up to 4 rows it is the exact one-shot with the junction as its
  * epilogue: three times the message per rank and one fenced handshake a row, which wins at one row
@@ -1215,14 +1243,26 @@ struct G4Junction {
     int64_t    sp_hi = 0;   /* the most rows op_sp serves, from kArSpMinRows */
     rad_buf    x = 0, res = 0, q8 = 0, s8 = 0;
     rad_weight w = 0, wp = 0, sc = 0;
+    int64_t    sw = 1;      /* the pair's scales a row (G4Linear::scale_w) */
+    rad_buf    y = 0;       /* an a4 linear's input row, written in its decode band, or 0 */
+    int64_t    y_hi = 0;    /* ...that band's most rows */
 
     /* `full_res`: something besides the next junction reads the residual stream after this one,
      * so the split form must leave it on every row. */
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
                 rad_weight wp_, rad_weight sc_, const G4Linear& into, bool full_res = false) {
         x = x_; res = res_; w = w_; wp = wp_; sc = sc_; q8 = into.q8; s8 = into.s8;
-        if (!into.quant || into.shared_in || !q8 || !s8 || !w || (sc && !wp) || ((wp || sc) && !res))
+        sw = into.scale_w();
+        if (!into.pair() || into.shared_in || !q8 || !s8 || !w || (sc && !wp) || ((wp || sc) && !res))
             return RAD_E_INVAL;
+        if (into.a4) {
+            y = into.in;
+            y_hi = into.a4_split;
+            if (!y) return RAD_E_INVAL;
+        }
+        const bool grp = into.grouped();
+        const char* rq  = grp ? "rmsnorm_quant_i8g" : "rmsnorm_quant_i8";
+        const char* arq = grp ? "ar_rmsnorm_quant_i8g" : "ar_rmsnorm_quant_i8";
         const RadParam p[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
                                RAD_F64("wadd", g.wadd) };
@@ -1230,35 +1270,40 @@ struct G4Junction {
         const int nw = sc ? 3 : (wp ? 2 : 1);
         /* Not declared by any loaded library (CPU-only) or not resolved: the caller keeps the
          * unfused chain. */
-        if (rad_op_declared(b, "rmsnorm_quant_i8"))
-            op = rad_decl_op(b, "rmsnorm_quant_i8", p, (int)(sizeof p / sizeof p[0]), ws, nw);
+        if (rad_op_declared(b, rq))
+            op = rad_decl_op(b, rq, p, (int)(sizeof p / sizeof p[0]), ws, nw);
         if (!op) return RAD_OK;
         const rad_buf rd[2] = { x, res };
-        const rad_buf wr[3] = { q8, s8, res };
+        rad_buf wr[4] = { q8, s8, 0, 0 };
+        int nwr = 2;
+        if (res) wr[nwr++] = res;
+        if (y)   wr[nwr++] = y;
         rad_op_reads (b, op, rd, res ? 2 : 1);
-        rad_op_writes(b, op, wr, res ? 3 : 2);
+        rad_op_writes(b, op, wr, nwr);
         /* With the all-reduce in front, at two or four ranks on the exact wire: `x` is then a
          * rank's partial sum of a column-sharded linear. With the lossy wire allowed, the
          * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold
-         * serves steps of up to kAr4FoldRows rows. */
+         * serves steps of up to kAr4FoldRows rows; the i8a8 grid has no four-rank fold, so there the
+         * standalone all-reduce stays. */
         const bool four = g.world == 4;
         const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, g.max_tok) : g.max_tok;
-        if (res && g.wire_exact && (g.world == 2 || four) && hi >= 1 &&
-            rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+        if (res && g.wire_exact && (g.world == 2 || (four && !grp)) && hi >= 1 &&
+            rad_op_declared(b, arq)) {
             const RadParam pa[] = { RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
-            op_ar = rad_decl_op(b, "ar_rmsnorm_quant_i8", pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
+            op_ar = rad_decl_op(b, arq, pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
             if (op_ar) {
-                const rad_buf wa[4] = { x, q8, s8, res };
+                const rad_buf wa[5] = { x, q8, s8, res, y };
                 rad_op_reads (b, op_ar, rd, 2);
-                rad_op_writes(b, op_ar, wa, 4);
+                rad_op_writes(b, op_ar, wa, y ? 5 : 4);
                 ar_rows = hi;
             }
             /* The split form from kArSpMinRows to kArSpMaxRows rows. It needs the post-norm, as
-             * every trunk junction past the first has; `x` is declared written, as the fold's. */
+             * every trunk junction past the first has; `x` is declared written, as the fold's.
+             * Not at quant_act_i8g's grid, whose fold has no split form. */
             const int64_t top = std::min<int64_t>(g.max_tok, kArSpMaxRows);
-            if (op_ar && four && wp && top >= kArSpMinRows) {
+            if (op_ar && four && wp && !grp && top >= kArSpMinRows) {
                 const RadParam ps[] = { RAD_RANGE("M", 1, top), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                         RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd),
@@ -1280,14 +1325,14 @@ struct G4Junction {
     void step(RadCtx* c, int64_t T, bool with_ar = false) const {
         const rad_op o = !with_ar ? op : (op_sp && T >= kArSpMinRows && T <= sp_hi) ? op_sp : op_ar;
         RAD_ISSUE_N(c, o, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
-                    brows(q8, T), brows(s8, T), RAD_NONE,
+                    brows(q8, T), brows(s8, T), y && T <= y_hi ? brows(y, T) : RAD_NONE,
                     wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
     }
     /* Rows [r0, r0 + n), without the all-reduce: a slice of the prefill overlap, whose reduction
-     * rode the second lane. */
+     * rode the second lane. A slice is above every decode band, so no bf16 row. */
     void step_rows(RadCtx* c, int64_t E, int64_t r0, int64_t n) const {
         RAD_ISSUE_N(c, op, n, brow_slice(x, r0, n, E), res ? brow_slice(res, r0, n, E) : RAD_NONE,
-                    RAD_W(w), brow_slice(q8, r0, n, E), brow_slice(s8, r0, n, 1), RAD_NONE,
+                    RAD_W(w), brow_slice(q8, r0, n, E), brow_slice(s8, r0, n, sw), RAD_NONE,
                     wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
     }
 };
@@ -1757,6 +1802,9 @@ void Gemma4Head::step(RadCtx* c, const RadBatch* batch) const {
  * sum-of-squares partition. And it is large enough that a slice's reduction is worth a second
  * lane. */
 static constexpr int64_t kOverlapRows = 512;
+/* ...and above an a4 linear's decode band, so a slice always reads the int8 pair a junction's
+ * slice writes (G4Linear::gemm_rows, G4Junction::step_rows). */
+static_assert(kOverlapRows > G4Linear::kA4Split, "a prefill slice inside an a4 decode band");
 
 struct Layer {
     bool       global = false;
@@ -2543,13 +2591,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain).
      * Used only when all resolved and every linear a junction feeds reads its int8 pair (q, k and
-     * v through q's, and gate_up): a junction writes that pair, not the bf16 norm output, so a bf16
-     * k or v beside an int8 q would read a stale buffer. Otherwise the blocks keep their own norms,
-     * quantisers, post-norms and adds. */
+     * v through q's, and gate_up), at either grid: a junction writes that pair, not the bf16 norm
+     * output (an a4 linear's decode band aside), so a bf16 k or v beside an int8 q would read a
+     * stale buffer. Otherwise the blocks keep their own norms, quantisers, post-norms and adds. */
     if (m.n_main > 0) {
         bool ok = true;
         for (const Layer& lay : m.layers)
-            ok = ok && lay.attn.reads_pair() && lay.mlp.ln_gu.quant;
+            ok = ok && lay.attn.reads_pair() && lay.mlp.ln_gu.pair();
         if (ok) {
             RAD_ARCH_TRY(m.j0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, 0, 0,
                                          m.layers[0].attn.ln_in()));

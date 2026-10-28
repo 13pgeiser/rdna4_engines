@@ -1265,6 +1265,16 @@ step at tp 4 then has two standalone reductions (the embedding's and the last fe
 it had 121. `r4d_selftest --case ar_rmsnorm_quant_i8_4rank` checks every form on four cards, and
 the startup note says which forms a deployment takes.
 
+**Junctions on the int8 grids with a scale per (row, 128).** A trunk at i8a8, or at asymmetric int4
+or int5 (`codes=u4|u5 zero=u8 group=128 scale=f16`), reads `quant_act_i8g`'s pair. Its junctions
+are libr4d's `_i8g` twins of the three above (`rmsnorm_quant_i8g`, `gelu_mul_quant_i8g`, and at two
+ranks `ar_rmsnorm_quant_i8g`; at four the all-reduce in front of each is issued apart), so the
+prefill overlap runs on these trunks too. An int4 or int5 linear reads an f16 copy of its input up
+to 64 rows (`w4a16_asym`, `w5a16`): in such a step each junction also writes the bf16 norm output
+into `h`, where the unfused norm would, the linear casts it as before, and the feed-forward keeps
+`gelu_mul`. `r4d_selftest --case rmsnorm_quant_i8g` (and `gelu_mul_quant_i8g`,
+`ar_rmsnorm_quant_i8g`) holds each to its chain.
+
 **Weight reads beside the all-reduces.** At more than one rank, on decode and verify steps of up to
 16 rows that carry no prompt rows, the 31B reads the next GEMM's leading weight bytes into the
 on-die cache (libr4d `prefetch`) while an all-reduce leaves the card's memory idle: gate_up's first

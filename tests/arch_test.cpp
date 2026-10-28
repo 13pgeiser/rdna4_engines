@@ -4856,7 +4856,7 @@ TEST(the_gemma4_e4b_form_is_refused_where_it_cannot_run) {
  * (scale, zero) view, up to 64 rows the input cast to f16 for w4a16_asym / w5a16, above that
  * quant_act_i8g's int8 codes for w4a8i8_asym / w5a8i8. q|k|v stay one GEMM; o_proj and down_proj
  * are cut along K, in whole scale groups. A decode step issues only the f16 band, a step of 200
- * rows only the int8 one. */
+ * rows only the int8 one. The residual junctions are fused (the next case covers them). */
 TEST(the_gemma4_31b_form_reads_asymmetric_int4_and_int5_linears) {
     static const int32_t tall_out[] = { 99, 199 };
     for (const uint32_t cdt : { (uint32_t)RAD_U4, (uint32_t)RAD_U5 }) {
@@ -4872,7 +4872,7 @@ TEST(the_gemma4_31b_form_reads_asymmetric_int4_and_int5_linears) {
                 RadModelMeta meta = gemma4_meta();
                 RadBuildCtx  ctx  = build_ctx(rank, world);
                 CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
-                CHECK(!gemma4_bf16::g_model[rank].fuse);
+                CHECK(gemma4_bf16::g_model[rank].fuse);
                 int n_dec = 0, n_pre = 0, other = 0;
                 for (const RecOp& o : b.ops) {
                     if (o.op != "gemm_nt_q") continue;
@@ -7043,6 +7043,233 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
     gemma4_bf16::step(&sc, &big);
     CHECK(sc.step_fail.empty());
     for (const auto& i : sc.issues) CHECK_EQ(i.lane, 0);
+}
+
+/* The 31B on the grids that read quant_act_i8g's pair -- int8 a 128 (i8a8), a4 and its five-bit
+ * form -- fuses its residual junctions as w4a8 does, through the `_i8g` twins: one
+ * rmsnorm_quant_i8g a junction (2L), one gelu_mul_quant_i8g a feed-forward, at two ranks the
+ * all-reduce folded in (ar_rmsnorm_quant_i8g on all but the embedding's and the last
+ * feed-forward's) and a prefill of 1024 rows or more in two slices. An a4 or w5 linear reads bf16
+ * up to 64 rows: in such a step every junction also writes the norm output into `h`, the row each
+ * linear's cast reads, and the feed-forward keeps gelu_mul and down's own cast; above that no
+ * junction writes `h` and no linear casts. Either way the fused step runs the unfused step's GEMMs
+ * and casts over the same rows. Without the twins (a CPU-only engine) the chains are declared and no
+ * undeclared op is asked for. */
+TEST(the_gemma4_31b_fuses_its_junctions_on_the_grouped_int8_grids) {
+    RadEncoding u4 = rad_enc_affine(RAD_U4, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u4, "zero", RAD_U8, 1, 128);
+    RadEncoding u5 = rad_enc_affine(RAD_U5, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u5, "zero", RAD_U8, 1, 128);
+    struct Fmt { const char* name; RadEncoding e; bool band; };
+    const Fmt fmts[] = { { "i8g", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128), false },
+                         { "a4", u4, true }, { "w5", u5, true } };
+    const int64_t L = 12;
+    const char* const twins[] = { "rmsnorm_quant_i8g", "gelu_mul_quant_i8g", "ar_rmsnorm_quant_i8g" };
+    for (const Fmt& f : fmts)
+        for (int world : { 1, 2 }) {
+            auto model = [&](RadBuilder& b, bool fused, bool lossy) {
+                b.encs = { { "attn_qkv.", f.e }, { "attn_o.", f.e }, { "ffn_gate_up.", f.e },
+                           { "ffn_down.", f.e } };
+                if (!fused) for (const char* op : twins) b.undeclared.insert(op);
+                RadModelMeta meta = gemma4_meta();
+                RadBuildCtx ctx = build_ctx(0, world);
+                ctx.max_tok = 4096;
+                if (lossy) ctx.tp_wire_lossy = 1;
+                return gemma4_bf16::declare(&b, &meta, &ctx);
+            };
+            {
+                RadBuilder d;
+                CHECK_OK(model(d, true, false));
+                const gemma4_bf16::Model& m = gemma4_bf16::g_model[0];
+                CHECK(m.fuse);
+                CHECK_EQ(m.fuse_ar, world == 2);
+                CHECK_EQ(m.overlap, world == 2);
+                if (world == 2)
+                    CHECK(noted(d, "prefill overlap: a step of 1024 rows or more runs as two slices"));
+                CHECK_EQ(count_op(d, "rmsnorm_quant_i8g"), 2 * (int)L);
+                CHECK_EQ(count_op(d, "gelu_mul_quant_i8g"), (int)L);
+                CHECK_EQ(count_op(d, "ar_rmsnorm_quant_i8g"), world == 2 ? 2 * (int)L - 1 : 0);
+                for (const char* op : { "rmsnorm_quant_i8", "gelu_mul_quant_i8", "ar_rmsnorm_quant_i8" })
+                    CHECK_EQ(count_op(d, op), 0);
+                /* a junction declares `h` written only where a linear after it has a decode band;
+                 * the all-reduce form writes `h` (its `x`, the reduced sum) either way, and the bf16
+                 * row besides in the band */
+                const rad_buf h = (rad_buf)buf_named(d, "h");
+                for (const RecOp& o : d.ops) {
+                    if (o.op == "rmsnorm_quant_i8g")
+                        CHECK_EQ(std::find(o.writes.begin(), o.writes.end(), h) != o.writes.end(), f.band);
+                    if (o.op == "ar_rmsnorm_quant_i8g") {
+                        CHECK_EQ(o.writes.size(), (size_t)(f.band ? 5 : 4));
+                        CHECK(param(&o, "sp") == nullptr);
+                    }
+                }
+            }
+            {
+                RadBuilder u;
+                CHECK_OK(model(u, false, false));
+                CHECK(!gemma4_bf16::g_model[0].fuse);
+                CHECK(u.asked_undeclared.empty());
+            }
+
+            /* step() runs the model declare last made, so each step below follows its own */
+            auto linears = [](const RadBuilder& bb, const RadCtx& cc, int64_t TT) {
+                std::map<std::string, int64_t> w;
+                for (const auto& i : cc.issues) {
+                    const RecOp* o = bb.op_of(i.op);
+                    if (!o) continue;
+                    if (o->op == "gemm_nt_q") w["gemm_nt_q " + pstr(o, "dtype")] += i.n < 0 ? TT : i.n;
+                    if (o->op == "cast" && pstr(o, "to") == "f16") w["cast f16"] += i.n < 0 ? TT : i.n;
+                }
+                return w;
+            };
+            for (const int64_t T : { (int64_t)1, (int64_t)16, (int64_t)64, (int64_t)65, (int64_t)200,
+                                     (int64_t)4096 }) {
+                const int32_t out[1] = { (int32_t)(T - 1) };
+                const bool band = f.band && T <= 64;
+                const bool sliced = world == 2 && T >= 1024;
+                RadBuilder b;
+                CHECK_OK(model(b, true, false));
+                RadBatch batch = one_prompt(T, out);
+                RadCtx c; c.b = &b; c.rank = 0; c.world = world; c.batch = &batch;
+                gemma4_bf16::step(&c, &batch);
+                CHECK(c.step_fail.empty());
+                CHECK_LINT(b, &c);
+                CHECK_EQ(races(b, c), 0);
+                const std::vector<std::string> ops = issued_ops(b, c);
+                const rad_buf h = (rad_buf)buf_named(b, "h");
+                const int k = sliced ? 2 : 1;   /* issues a row op takes: one a slice */
+                const int n_ar = count_issued(ops, "ar_rmsnorm_quant_i8g");
+                CHECK_EQ(count_issued(ops, "rmsnorm_quant_i8g") + n_ar, 1 + (k * (2 * (int)L - 1)));
+                CHECK_EQ(n_ar, world == 2 && !sliced ? 2 * (int)L - 1 : 0);
+                CHECK_EQ(count_issued(ops, "gelu_mul_quant_i8g"), band ? 0 : k * (int)L);
+                CHECK_EQ(count_issued(ops, "gelu_mul"), band ? (int)L : 0);
+                /* o_proj's own quantiser only: every other linear reads a junction's pair */
+                CHECK_EQ(count_issued(ops, "quant_act_i8g"), band ? 0 : k * (int)L);
+                int y_written = 0;
+                for (size_t i = 0; i < c.issues.size(); ++i) {
+                    if (ops[i] != "rmsnorm_quant_i8g" && ops[i] != "ar_rmsnorm_quant_i8g") continue;
+                    REQUIRE(c.issues[i].opd.size() > 5);
+                    const RadOperand& y = c.issues[i].opd[5];
+                    if (y.kind != RAD_OPK_BUF) continue;
+                    ++y_written;
+                    CHECK_EQ((rad_buf)y.handle, h);
+                }
+                CHECK_EQ(y_written, band ? 2 * (int)L : 0);
+                /* Every int8 pair a step writes or reads, a slice's included, is the same rows of codes
+                 * and of scales: a scale row is a codes row's 128th. */
+                int pairs = 0;
+                for (size_t i = 0; i < c.issues.size(); ++i) {
+                    const RecOp* o = b.op_of(c.issues[i].op);
+                    if (!o) continue;
+                    int iq = -1;
+                    if (o->op == "rmsnorm_quant_i8g" || o->op == "ar_rmsnorm_quant_i8g") iq = 3;
+                    else if (o->op == "gelu_mul_quant_i8g" || o->op == "quant_act_i8g") iq = 1;
+                    else if (o->op == "gemm_nt_q" && pstr(o, "dtype") != "w4a16_asym" &&
+                             pstr(o, "dtype") != "w5a16") iq = 0;
+                    if (iq < 0) continue;
+                    REQUIRE(c.issues[i].opd.size() > (size_t)iq + 1);
+                    const RadOperand& q = c.issues[i].opd[(size_t)iq];
+                    const RadOperand& s = c.issues[i].opd[(size_t)iq + 1];
+                    CHECK_EQ(s.offset * 128, q.offset);
+                    CHECK_EQ(s.rows, q.rows);
+                    ++pairs;
+                }
+                CHECK(pairs > 0);
+                int lane1 = 0;
+                for (const auto& i : c.issues) lane1 += i.lane == 1;
+                CHECK_EQ(lane1, sliced ? 4 * (int)L : 0);
+                const std::map<std::string, int64_t> fused_lin = linears(b, c, T);
+                const int64_t casts = fused_lin.count("cast f16") ? fused_lin.at("cast f16") : 0;
+                CHECK_EQ(casts, band ? 4 * L * T : 0);
+
+                /* the same GEMMs and casts over the same rows as the unfused step */
+                RadBuilder u;
+                CHECK_OK(model(u, false, false));
+                RadBatch ub = one_prompt(T, out);
+                RadCtx uc; uc.b = &u; uc.rank = 0; uc.world = world; uc.batch = &ub;
+                gemma4_bf16::step(&uc, &ub);
+                CHECK(uc.step_fail.empty());
+                CHECK_LINT(u, &uc);
+                CHECK(fused_lin == linears(u, uc, T));
+
+                /* the slices issue the rows the whole step issues (the lossy wire runs it whole) */
+                if (sliced) {
+                    std::map<std::string, int64_t> sl = rows_by_op(b, c, T);
+                    RadBuilder w;
+                    CHECK_OK(model(w, true, true));
+                    CHECK(!gemma4_bf16::g_model[0].overlap);
+                    RadBatch wb = one_prompt(T, out);
+                    RadCtx wc; wc.b = &w; wc.rank = 0; wc.world = world; wc.batch = &wb;
+                    gemma4_bf16::step(&wc, &wb);
+                    CHECK(wc.step_fail.empty());
+                    sl.erase("kv_len_trim");
+                    CHECK(sl == rows_by_op(w, wc, T));
+                }
+            }
+        }
+
+    /* At four ranks libr4d has no ar_rmsnorm_quant_i8g row: the junctions fuse, the all-reduce in
+     * front of each is issued apart, and the prefill still runs as two slices. */
+    for (const Fmt& f : fmts)
+        for (const int64_t T : { (int64_t)1, (int64_t)4096 }) {
+            const int32_t out[1] = { (int32_t)(T - 1) };
+            RadBuilder b;
+            b.refuse.insert("ar_rmsnorm_quant_i8g");
+            b.encs = { { "attn_qkv.", f.e }, { "attn_o.", f.e }, { "ffn_gate_up.", f.e }, { "ffn_down.", f.e } };
+            RadModelMeta meta = gemma4_meta();
+            RadBuildCtx ctx = build_ctx(0, 4);
+            ctx.max_tok = 4096;
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            const gemma4_bf16::Model& m = gemma4_bf16::g_model[0];
+            CHECK(m.fuse);
+            CHECK(!m.fuse_ar);
+            CHECK(m.overlap);
+            CHECK(noted(b, "residual junctions: the all-reduce in front of each issued apart"));
+            RadBatch batch = one_prompt(T, out);
+            RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK(c.step_fail.empty());
+            CHECK_LINT(b, &c);
+            CHECK_EQ(races(b, c), 0);
+            const std::vector<std::string> ops = issued_ops(b, c);
+            CHECK_EQ(count_issued(ops, "ar_rmsnorm_quant_i8g"), 0);
+            CHECK_EQ(count_issued(ops, "rmsnorm_quant_i8g"), T > 1 ? 1 + 2 * (2 * 12 - 1) : 2 * 12);
+            CHECK_EQ(count_issued(ops, "all_reduce"), T > 1 ? 1 + 4 * 12 : 1 + 2 * 12);
+        }
+
+    /* The E2B/E4B form (KV-shared layers, the per-layer branch) on the same grids. With q, k and v
+     * apart, i8g's k and v read q's pair and the junctions fuse; an a4 linear shares no pair, so an
+     * a4 trunk with q, k and v apart keeps its chain. With q|k|v one linear (and the KV-shared
+     * layers' q on the same grid) it fuses, and its decode band reads the junctions' bf16 output. */
+    struct E4 { const Fmt* f; bool qkv; bool fuse; };
+    for (const E4 k : { E4{ &fmts[0], false, true }, E4{ &fmts[1], false, false },
+                        E4{ &fmts[2], true, true } })
+        for (int world : { 1, 2 })
+            for (const int64_t T : { (int64_t)4, (int64_t)200 }) {
+                RadBuilder b;
+                const RadEncoding& e = k.f->e;
+                b.encs = { { "attn_q.", e }, { "attn_o.", e }, { "ffn_gate_up.", e }, { "ffn_down.", e } };
+                if (k.qkv) b.encs.push_back({ "attn_qkv.", e });
+                else       for (const char* x : { "attn_k.", "attn_v." }) b.encs.push_back({ x, e });
+                RadModelMeta meta = gemma4_e4b_meta();
+                RadBuildCtx ctx = build_ctx(0, world);
+                CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+                CHECK_EQ(gemma4_bf16::g_model[0].fuse, k.fuse);
+                CHECK(!gemma4_bf16::g_model[0].overlap);
+                static const int32_t outs[] = { 99, 199 };
+                RadBatch batch = T == 4 ? decode_batch() : prefill_batch();
+                if (T != 4) {
+                    batch.n_tok = 200; batch.max_q_len = 100; batch.max_ctx_len = 100;
+                    batch.out_ids = outs;
+                }
+                RadCtx c; c.b = &b; c.rank = 0; c.world = world; c.batch = &batch;
+                gemma4_bf16::step(&c, &batch);
+                CHECK(c.step_fail.empty());
+                CHECK_LINT(b, &c);
+                const std::vector<std::string> ops = issued_ops(b, c);
+                CHECK_EQ(count_issued(ops, "rmsnorm_quant_i8g") + count_issued(ops, "ar_rmsnorm_quant_i8g"),
+                         k.fuse ? 2 * 12 : 0);
+            }
 }
 
 /* Where no loaded library declares libr4d's fused ops (a CPU-only build, where rad-convert and the
