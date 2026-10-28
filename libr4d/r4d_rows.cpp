@@ -1523,6 +1523,11 @@ static const RadOperandSpec oRmsNormQuantI8[] = {
     { "w_post",   RAD_OPD_WEIGHT, 1 },   /* rmsnorm(x; w_post) before the add; needs the residual */
     { "scalar",   RAD_OPD_WEIGHT, 1 },   /* [1], multiplies the sum; needs the residual */
 };
+/* `rmsnorm_quant_i8g` is the same junction with quant_act_i8g's quantiser on its pass: row-major
+ * int8 codes and an f32 scale per (row, 128 columns), what gemm_nt_q reads at i8a8, w4a8i8_asym and
+ * w5a8i8. Same parameters and operands, `scale` [M, n / 128]; `out_bf16` may be x's own buffer,
+ * which a caller whose next linear reads bf16 at decode heights uses (every thread writes it only
+ * after every read of x). */
 
 /* `qkv_norm_rope` is `qk_norm_rope` over separate q, k and v projections: the per-head q and k
  * norms, the weightless value norm and the rotary of q and k in one dispatch (Gemma 4's attention
@@ -1626,6 +1631,17 @@ static const RadOperandSpec oArRmsNormQuantI8[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
     { "w_post",   RAD_OPD_WEIGHT, 1 },
     { "scalar",   RAD_OPD_WEIGHT, 1 },
+};
+/* `ar_rmsnorm_quant_i8g` is rmsnorm_quant_i8g with the exact all-reduce of `x` in front: the same
+ * operands as ar_rmsnorm_quant_i8 with `scale` [M, n / 128]. No `sp`: the split form gathers one
+ * scale a row. */
+static const RadParamSpec pArRmsNormQuantI8g[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "n",          RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
 };
 
 static const RadParamSpec pGatedQuantFp8[] = {
@@ -3474,6 +3490,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
            "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
            "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
+    SCHEMA("rmsnorm_quant_i8g", pRmsNormQuantI8, oRmsNormQuantI8,
+           "rmsnorm_quant_i8 with quant_act_i8g's quantiser on its pass: row-major int8 codes and "
+           "an f32 scale per (row, 128 columns); byte-identical to the chain ending in "
+           "quant_act_i8g. out_bf16 may be x's own buffer."),
     SCHEMA("add_rmsnorm", pAddRmsNorm, oAddRmsNorm,
            "x = x + a, then y = rmsnorm(x) * (w + wadd) * mult over the x written: a residual add "
            "and the next norm in one pass, byte-identical to add then rmsnorm. The norm is taken "
@@ -3495,8 +3515,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gelu_mul_quant_i8", pGeluMulQuantI8, oGeluMulQuantI8,
            "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
            "one pass."),
+    SCHEMA("gelu_mul_quant_i8g", pGeluMulQuantI8, oGeluMulQuantI8,
+           "gelu(gate) * up (tanh form) and quant_act_i8g's quantiser (row-major int8, an f32 scale "
+           "per (row, 128 columns)), in one pass; byte-identical to gelu_mul + quant_act_i8g."),
     SCHEMA("ar_rmsnorm_quant_i8", pArRmsNormQuantI8, oArRmsNormQuantI8,
            "the two- or four-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
+    SCHEMA("ar_rmsnorm_quant_i8g", pArRmsNormQuantI8g, oArRmsNormQuantI8,
+           "the two-rank exact all-reduce of x and rmsnorm_quant_i8g after it, in one kernel."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -5093,6 +5118,10 @@ static const RadConstraint cQuantActI8[] = {
 static const RadConstraint cRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
+/* The same at quant_act_i8g's grid: whole 128-column scale groups. */
+static const RadConstraint cRmsNormQuantI8g[] = {
+    C_DIV("n", 128), C_LE("n", 30720), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cAddRmsNorm[] = {
     C_GE("n", 1), C_IN("dtype", "bf16"),
 };
@@ -5125,9 +5154,15 @@ static const RadConstraint cQkvNormRopeKvH128Bf16[] = {
 static const RadConstraint cGeluMulQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cGeluMulQuantI8g[] = {
+    C_DIV("n", 128), C_LE("n", 30720), C_IN("dtype", "bf16"),
+};
 /* x is the message, pushed as 16B words, and the row is staged in LDS for the fragment store. */
 static const RadConstraint cArRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 2), C_P2P,
+};
+static const RadConstraint cArRmsNormQuantI8g[] = {
+    C_DIV("n", 128), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 2), C_P2P,
 };
 /* The same at four ranks, on the wide family's transport. */
 static const RadConstraint cArRmsNormQuantI84[] = {
@@ -8997,6 +9032,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cRmsNormQuantI8), ROW(tRmsQ8), nullptr,
   nullptr, nullptr, r4d_rad_rmsnorm_quant_i8 },
 
+/* Its quant_act_i8g twin: the same kernels with q8_row_i8g as their epilogue (r4d_q8.h). */
+{ "rmsnorm_quant_i8g", "rmsnorm_quant_i8g", "quant",
+  "RMS norm and quant_act_i8g's quantiser in one pass over the row; optionally the residual "
+  "junction in front of it -- a post-norm on x, the add into the residual and a scalar on the sum",
+  "n a multiple of 128 and n*2 bytes within LDS; one workgroup per row at rmsnorm_bf16's width; "
+  "the gains f32 or bf16, read off the operand; w_post and scalar need the residual; out_bf16 may "
+  "be x's own buffer",
+  "bf16 in, int8 out row-major with an f32 scale per (row, 128 columns), optional bf16 out; every "
+  "stored intermediate rounded to bf16 as the unfused chain stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsNormQuantI8g), ROW(tRmsQ8), nullptr,
+  nullptr, nullptr, r4d_rad_rmsnorm_quant_i8g },
+
 { "qkv_norm_rope_bf16", "qkv_norm_rope", "attn",
   "per-head RMS norms of separate q and k projections, the weightless norm of v (or of the raw k), "
   "and the rotary of q and k, in place, in one dispatch",
@@ -9093,6 +9141,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cGeluMulQuantI8), NOTUNE,
   nullptr, nullptr, r4d_rad_gelu_mul_quant_i8 },
 
+{ "gelu_mul_quant_i8g", "gelu_mul_quant_i8g", "quant",
+  "gelu(gate) * up, the tanh form, and quant_act_i8g's quantiser in one pass over the row",
+  "n a multiple of 128 and n*2 bytes within LDS; one workgroup per row",
+  "bf16 gate_up in, int8 out row-major with an f32 scale per (row, 128 columns), optional bf16 "
+  "out; the codes taken over the bf16-rounded product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGeluMulQuantI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_mul_quant_i8g },
+
 { "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8", "quant",
   "the two-rank exact all-reduce and the junction after it -- post-norm of the reduced sum, residual "
   "add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
@@ -9102,6 +9159,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArRmsNormQuantI8), ROW(tAr), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8 },
+
+/* Its quant_act_i8g twin: the two-rank kernel with rmsnorm_quant_i8g's epilogue. No four-rank
+ * form yet; a four-rank caller finds no row and issues the all-reduce apart. */
+{ "ar_rmsnorm_quant_i8g", "ar_rmsnorm_quant_i8g", "quant",
+  "the two-rank exact all-reduce and the junction after it -- post-norm of the reduced sum, residual "
+  "add, scalar, RMS norm and quant_act_i8g's quantiser -- in one kernel",
+  "exactly 2 ranks; n a multiple of 128, x unpitched (it is the message); one block a row; exact "
+  "wire; out_bf16 may be x's own buffer",
+  "bf16 in, int8 out row-major with an f32 scale per (row, 128 columns); the reduced sum rounded "
+  "to bf16 as the standalone exact all-reduce stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormQuantI8g), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8g },
 
 /* Its arithmetic is the four-rank exact all-reduce's fold followed by the two-rank form's
  * junction, each the code those two run, in every form (one-shot, tail, split). r4d_selftest's
@@ -10440,7 +10510,7 @@ extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
     static const char* const kChained[] = {
-        "gemm_w4a8_nt_m64", "gelu_mul_quant_i8", "qkv_norm_rope_bf16",
+        "gemm_w4a8_nt_m64", "gelu_mul_quant_i8", "gelu_mul_quant_i8g", "qkv_norm_rope_bf16",
         "qkv_norm_rope_kv_store_fp8", "qkv_norm_rope_kv_store_bf16",
         /* the split-KV decode and its merge (r4d_decode_launch_win); their prefill kernel stays
          * plain, and the backend chains only the kernels named r4dchain* */

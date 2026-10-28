@@ -14164,38 +14164,49 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
 }
 
 /* ---- gelu_mul_quant_i8, against gelu_mul + quant_act_i8 -------------------------------------
- * Gemma 4 31B's per-rank feed-forward width (10752 of 21504 at two ranks), both batch widths. */
-static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
+ * Gemma 4 31B's per-rank feed-forward width (10752 of 21504 at two ranks), both batch widths.
+ * `grp`: gelu_mul_quant_i8g against gelu_mul + quant_act_i8g, a scale per (row, 128), and a
+ * prefill height (the 256-thread width) besides. */
+static void gelu_mul_quant_i8_numeric(const Plugin& pl, bool grp = false) {
+    const char* const fzn = grp ? "gelu_mul_quant_i8g" : "gelu_mul_quant_i8";
+    const char* const qzn = grp ? "quant_act_i8g" : "quant_act_i8";
     const RadKernelInfo* gm = find(pl, "gelu_mul_bf16");
-    const RadKernelInfo* qz = find(pl, "quant_act_i8");
-    const RadKernelInfo* fz = find(pl, "gelu_mul_quant_i8");
-    if (!gm || !qz || !fz) { ok("gelu_mul_quant_i8 vs its pair", false, "rows absent"); return; }
-    for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40 }) {
+    const RadKernelInfo* qz = find(pl, qzn);
+    const RadKernelInfo* fz = find(pl, fzn);
+    const std::string pair = std::string("gelu_mul + ") + qzn;
+    if (!gm || !qz || !fz) { ok((std::string(fzn) + " vs its pair").c_str(), false, "rows absent"); return; }
+    for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40, (int64_t)200 }) {
+        if (M == 200 && !grp) continue;
         const int64_t n = 10752;
+        const int64_t sn = grp ? n / 128 : 1;   /* scales a row */
         std::vector<uint16_t> hgu((size_t)M * 2 * n);
         for (size_t i = 0; i < hgu.size(); ++i)
             hgu[i] = h_to_bf16(std::ldexp(1.0f, (int)((i / 512) % 5) - 2) * (0.029f * (float)((i * 41) % 103) - 1.5f));
         void* dgu = dalloc(hgu.size() * 2);
         void* dy[2] = { dalloc((size_t)M * n * 2), dalloc((size_t)M * n * 2) };
         void* dq[2] = { dalloc((size_t)M * n), dalloc((size_t)M * n) };
-        void* ds[2] = { dalloc((size_t)M * 4), dalloc((size_t)M * 4) };
-        if (!dgu || !dy[1] || !dq[1] || !ds[1]) { ok("gelu_mul_quant_i8 alloc", false, "hipMalloc failed"); return; }
+        void* ds[2] = { dalloc((size_t)(M * sn) * 4), dalloc((size_t)(M * sn) * 4) };
+        if (!dgu || !dy[1] || !dq[1] || !ds[1]) { ok((std::string(fzn) + " alloc").c_str(), false, "hipMalloc failed"); return; }
         st_memcpy(dgu, hgu.data(), hgu.size() * 2, hipMemcpyHostToDevice);
         int rc = launch_row(gm, { T(dgu, RAD_BF16, { M, 2 * n }), T(dy[0], RAD_BF16, { M, n }) },
                             { PI("M", M), PI("n", n), PS("dtype", "bf16") });
-        if (rc == RAD_OK)
+        if (rc == RAD_OK && grp)
+            rc = launch_row(qz, { T(dy[0], RAD_BF16, { M, n }), T(dq[0], RAD_I8, { M, n }), T(ds[0], RAD_F32, { M, sn }) },
+                            { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16") });
+        else if (rc == RAD_OK)
             rc = launch_row(qz, { T(dy[0], RAD_BF16, { M, n }), T(dq[0], RAD_I8, { M, n }), T(ds[0], RAD_F32, { M }),
                                   T(nullptr, RAD_F32, {}) },
                             { PI("M", M), PI("n", n), PI("group", n), PS("dtype", "bf16") });
         if (rc == RAD_OK)
-            rc = launch_row(fz, { T(dgu, RAD_BF16, { M, 2 * n }), T(dq[1], RAD_I8, { M, n }), T(ds[1], RAD_F32, { M }),
+            rc = launch_row(fz, { T(dgu, RAD_BF16, { M, 2 * n }), T(dq[1], RAD_I8, { M, n }),
+                                  grp ? T(ds[1], RAD_F32, { M, sn }) : T(ds[1], RAD_F32, { M }),
                                   T(dy[1], RAD_BF16, { M, n }) },
                             { PI("M", M), PI("n", n), PS("dtype", "bf16") });
-        const std::string what = "gelu_mul_quant_i8 M=" + std::to_string(M);
-        if (rc != RAD_OK) { ok((what + " vs gelu_mul + quant_act_i8").c_str(), false, "rc=" + std::to_string(rc)); continue; }
+        const std::string what = std::string(fzn) + " M=" + std::to_string(M);
+        if (rc != RAD_OK) { ok((what + " vs " + pair).c_str(), false, "rc=" + std::to_string(rc)); continue; }
         std::vector<uint16_t> y0((size_t)M * n), y1((size_t)M * n);
         std::vector<uint8_t>  q0((size_t)M * n), q1((size_t)M * n);
-        std::vector<float>    s0((size_t)M), s1((size_t)M);
+        std::vector<float>    s0((size_t)(M * sn)), s1((size_t)(M * sn));
         st_memcpy(y0.data(), dy[0], y0.size() * 2, hipMemcpyDeviceToHost);
         st_memcpy(y1.data(), dy[1], y1.size() * 2, hipMemcpyDeviceToHost);
         st_memcpy(q0.data(), dq[0], q0.size(), hipMemcpyDeviceToHost);
@@ -14206,7 +14217,7 @@ static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
         for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
         for (size_t i = 0; i < q0.size(); ++i) { nq += q0[i] != q1[i]; nz += q1[i] != 0; }
         for (size_t i = 0; i < s0.size(); ++i) ns += std::memcmp(&s0[i], &s1[i], 4) != 0;
-        ok((what + " is byte-identical to gelu_mul + quant_act_i8").c_str(), ny == 0 && nq == 0 && ns == 0 && nz > (int)q1.size() / 2,
+        ok((what + " is byte-identical to " + pair).c_str(), ny == 0 && nq == 0 && ns == 0 && nz > (int)q1.size() / 2,
            "bf16 differs " + std::to_string(ny) + ", codes " + std::to_string(nq) + ", scales " + std::to_string(ns) +
            ", nonzero codes " + std::to_string(nz));
     }
@@ -14471,23 +14482,29 @@ static void add_rmsnorm_numeric(const Plugin& pl) {
  * feed-forward) and with one (feed-forward -> next layer). The unfused chain, kernel by kernel, is
  * rmsnorm(x; w_post) -> add(residual) -> scale -> rmsnorm(residual; w) -> quant_act_i8. bf16 gains
  * (as Gemma's checkpoint stores), and two batch heights covering both r4d_act_threads widths a
- * decode step meets (1024 at M <= 32, 512 above), the first in both of its forms. */
-static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
+ * decode step meets (1024 at M <= 32, 512 above), the first in both of its forms. `grp`:
+ * rmsnorm_quant_i8g against the same chain ending in quant_act_i8g. */
+static void rmsnorm_quant_i8_numeric(const Plugin& pl, bool grp = false) {
+    const char* const rqn = grp ? "rmsnorm_quant_i8g" : "rmsnorm_quant_i8";
+    const char* const qzn = grp ? "quant_act_i8g" : "quant_act_i8";
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
     const RadKernelInfo* ad  = find(pl, "add_bf16");
     const RadKernelInfo* scl = find(pl, "scale_bf16");
-    const RadKernelInfo* qz  = find(pl, "quant_act_i8");
-    const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
-    if (!nrm || !ad || !scl || !qz || !rq) { ok("rmsnorm_quant_i8 vs its chain", false, "rows absent"); return; }
+    const RadKernelInfo* qz  = find(pl, qzn);
+    const RadKernelInfo* rq  = find(pl, rqn);
+    if (!nrm || !ad || !scl || !qz || !rq) { ok((std::string(rqn) + " vs its chain").c_str(), false, "rows absent"); return; }
     /* The row's reg axis at 1024 threads: 1 (the default) holds a thread's columns in registers,
      * 0 re-reads the row each pass; both must leave the chain's bytes. */
     struct RqCase { int64_t M; int reg; };
     /* 40 and 64 rows: the 512-thread width, its register form and its re-read form */
+    /* ...and at quant_act_i8g's grid a prefill height besides (the 256-thread width) */
     for (const RqCase rqc : { RqCase{ 1, 1 }, RqCase{ 8, 1 }, RqCase{ 8, 0 }, RqCase{ 40, 1 },
-                              RqCase{ 40, 0 }, RqCase{ 64, 1 } }) {
+                              RqCase{ 40, 0 }, RqCase{ 64, 1 }, RqCase{ 200, 1 } }) {
+        if (rqc.M == 200 && !grp) continue;
         const int64_t M = rqc.M;
         const std::string form = rqc.reg ? "" : " (re-read form)";
         const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps */
+        const int64_t SK = grp ? K / 128 : 1;   /* scales a row */
         std::vector<uint16_t> hx((size_t)M * K), hr((size_t)M * K), hw((size_t)K), hp((size_t)K);
         for (int64_t r = 0; r < M; ++r)
             for (int64_t c = 0; c < K; ++c) {
@@ -14509,9 +14526,9 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
         void* d_r[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
         void* d_y[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
         void* d_q[2] = { dalloc((size_t)M * K), dalloc((size_t)M * K) };
-        void* d_s[2] = { dalloc((size_t)M * 4), dalloc((size_t)M * 4) };
+        void* d_s[2] = { dalloc((size_t)(M * SK) * 4), dalloc((size_t)(M * SK) * 4) };
         if (!d_x || !d_w || !d_p || !d_sc || !d_t || !d_r[1] || !d_y[1] || !d_q[1] || !d_s[1]) {
-            ok("rmsnorm_quant_i8 alloc", false, "hipMalloc failed");
+            ok((std::string(rqn) + " alloc").c_str(), false, "hipMalloc failed");
             return;
         }
         st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
@@ -14521,14 +14538,17 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
         const double eps = 1e-6, wadd = 0.0;
         const std::vector<RadParam> pn = { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) };
         const std::vector<RadParam> pe = { PI("M", M), PI("n", K), PS("dtype", "bf16") };
-        const std::vector<RadParam> pq = { PI("M", M), PI("n", K), PI("group", K), PS("dtype", "bf16") };
+        const std::vector<RadParam> pq = { PI("M", M), PI("n", K), PI("group", grp ? 128 : K), PS("dtype", "bf16") };
+        const RadTensor ts0 = grp ? T(d_s[0], RAD_F32, { M, SK }) : T(d_s[0], RAD_F32, { M });
+        const RadTensor ts1 = grp ? T(d_s[1], RAD_F32, { M, SK }) : T(d_s[1], RAD_F32, { M });
+        const std::string chain_q = std::string(" + ") + qzn;
         std::vector<RadParam> prq = pn;
         prq.push_back(PI("reg", rqc.reg));
 
         auto compare = [&](const std::string& what, bool res) {
             std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K), r0((size_t)M * K), r1((size_t)M * K);
             std::vector<uint8_t>  q0((size_t)M * K), q1((size_t)M * K);
-            std::vector<float>    s0((size_t)M), s1((size_t)M);
+            std::vector<float>    s0((size_t)(M * SK)), s1((size_t)(M * SK));
             st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
             st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
             st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
@@ -14547,11 +14567,13 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
                "bf16 differs " + std::to_string(ny) + ", codes " + std::to_string(nq) + ", scales " +
                std::to_string(ns) + ", residual " + std::to_string(nr) + ", nonzero codes " + std::to_string(nz));
         };
-        auto norm_quant = [&](void* src) {   /* rmsnorm(src; w) -> quant_act_i8, into slot 0 */
+        auto norm_quant = [&](void* src) {   /* rmsnorm(src; w) -> the quantiser, into slot 0 */
             int rc = launch_row(nrm, { T(src, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }), T(d_y[0], RAD_BF16, { M, K }) }, pn);
-            if (rc == RAD_OK)
+            if (rc == RAD_OK && grp)
+                rc = launch_row(qz, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }), ts0 }, pq);
+            else if (rc == RAD_OK)
                 rc = launch_row(qz, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
-                                      T(d_s[0], RAD_F32, { M }), T(nullptr, RAD_F32, {}) }, pq);
+                                      ts0, T(nullptr, RAD_F32, {}) }, pq);
             return rc;
         };
 
@@ -14559,15 +14581,21 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
         int rc = norm_quant(d_x);
         if (rc == RAD_OK)
             rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}), T(d_w, RAD_BF16, { K }),
-                                  T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
+                                  T(d_q[1], RAD_I8, { M, K }), ts1, T(d_y[1], RAD_BF16, { M, K }),
                                   T(nullptr, RAD_BF16, {}), T(nullptr, RAD_BF16, {}) }, prq);
-        if (rc != RAD_OK) ok(("rmsnorm_quant_i8 vs rmsnorm + quant_act_i8" + form).c_str(), false, "rc=" + std::to_string(rc));
-        else compare("rmsnorm_quant_i8 is byte-identical to rmsnorm + quant_act_i8" + form, false);
+        if (rc != RAD_OK) ok((rqn + std::string(" vs rmsnorm") + chain_q + form).c_str(), false, "rc=" + std::to_string(rc));
+        else compare(rqn + std::string(" is byte-identical to rmsnorm") + chain_q + form, false);
 
-        /* --- the junction, without and with the scalar --- */
-        for (const bool with_sc : { false, true }) {
+        /* --- the junction, without and with the scalar; at quant_act_i8g's grid also with the
+         * norm output written over the branch output (out_bf16 on x's own buffer), as Gemma 4's
+         * junction writes it before an a4 linear's decode band --- */
+        for (const int jf : { 0, 1, 2 }) {
+            const bool with_sc = jf > 0, alias = jf == 2;
+            if (alias && !grp) continue;
             st_memcpy(d_r[0], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
             st_memcpy(d_r[1], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+            if (alias) st_memcpy(d_y[1], hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            void* const fx = alias ? d_y[1] : d_x;
             rc = launch_row(nrm, { T(d_x, RAD_BF16, { M, K }), T(d_p, RAD_BF16, { K }), T(d_t, RAD_BF16, { M, K }) }, pn);
             if (rc == RAD_OK)
                 rc = launch_row(ad, { T(d_r[0], RAD_BF16, { M, K }), T(d_t, RAD_BF16, { M, K }), T(d_r[0], RAD_BF16, { M, K }) }, pe);
@@ -14575,12 +14603,13 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
                 rc = launch_row(scl, { T(d_r[0], RAD_BF16, { M, K }), T(d_sc, RAD_BF16, { 1 }), T(d_r[0], RAD_BF16, { M, K }) }, pe);
             if (rc == RAD_OK) rc = norm_quant(d_r[0]);
             if (rc == RAD_OK)
-                rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(d_r[1], RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }),
-                                      T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
+                rc = launch_row(rq, { T(fx, RAD_BF16, { M, K }), T(d_r[1], RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }),
+                                      T(d_q[1], RAD_I8, { M, K }), ts1, T(d_y[1], RAD_BF16, { M, K }),
                                       T(d_p, RAD_BF16, { K }),
                                       with_sc ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) }, prq);
-            const std::string what = (with_sc ? "rmsnorm_quant_i8 junction with scalar" : "rmsnorm_quant_i8 junction") + form;
-            if (rc != RAD_OK) ok((what + " vs rmsnorm + add + scale + rmsnorm + quant_act_i8").c_str(), false, "rc=" + std::to_string(rc));
+            const std::string what = rqn + std::string(with_sc ? " junction with scalar" : " junction") +
+                                     (alias ? ", out_bf16 over x" : "") + form;
+            if (rc != RAD_OK) ok((what + " vs rmsnorm + add + scale + rmsnorm" + chain_q).c_str(), false, "rc=" + std::to_string(rc));
             else compare(what + " is byte-identical to its chain", true);
         }
     }
@@ -28712,6 +28741,8 @@ struct ArQ8 {
     long long gate_after = -1;                     /* ...and what the launch left in it */
     int tail = -1;                                 /* the `tail` axis pinned, or -1: the default */
     int sp = 0;                                    /* `sp`: the all-reduce split around the junction */
+    bool grp = false;                              /* quant_act_i8g's grid (ar_rmsnorm_quant_i8g) */
+    bool alias = false;                            /* out_bf16 on x's own buffer */
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     const std::vector<uint16_t>* r_in = nullptr;   /* the replicated residual, w and w_post */
@@ -28739,10 +28770,11 @@ static void ar_q8_worker(ArQ8* t) {
     void* x = nullptr; void* r = nullptr; void* w = nullptr; void* wp = nullptr; void* sc = nullptr;
     void* q = nullptr; void* s = nullptr; void* y = nullptr; void* gw = nullptr;
     const size_t xb = (size_t)(M * K * 2), wb = (size_t)K * 2;
+    const int64_t SK = t->grp ? K / 128 : 1;   /* scales a row */
     const bool mem = hipMalloc(&x, xb) == hipSuccess && hipMalloc(&r, xb) == hipSuccess &&
                      hipMalloc(&w, wb) == hipSuccess && hipMalloc(&wp, wb) == hipSuccess &&
                      hipMalloc(&sc, 4) == hipSuccess && hipMalloc(&q, (size_t)(M * K)) == hipSuccess &&
-                     hipMalloc(&s, (size_t)M * 4) == hipSuccess && hipMalloc(&y, xb) == hipSuccess &&
+                     hipMalloc(&s, (size_t)(M * SK) * 4) == hipSuccess && hipMalloc(&y, xb) == hipSuccess &&
                      (!t->gated || hipMalloc(&gw, 8) == hipSuccess);
     if (!mem) {
         t->rc_launch = RAD_E_NOMEM;
@@ -28760,8 +28792,8 @@ static void ar_q8_worker(ArQ8* t) {
         st_memcpy(sc, &t->sc, 2, hipMemcpyHostToDevice);
         std::vector<RadTensor> ts = {
             T(x, RAD_BF16, { M, K }), T(r, RAD_BF16, { M, K }), T(w, RAD_BF16, { K }),
-            T(q, RAD_I8, { M, K }), T(s, RAD_F32, { M }), T(y, RAD_BF16, { M, K }),
-            T(wp, RAD_BF16, { K }), T(sc, RAD_BF16, { 1 }) };
+            T(q, RAD_I8, { M, K }), t->grp ? T(s, RAD_F32, { M, SK }) : T(s, RAD_F32, { M }),
+            T(t->alias ? x : y, RAD_BF16, { M, K }), T(wp, RAD_BF16, { K }), T(sc, RAD_BF16, { 1 }) };
         if (!t->res) { absent(ts[1]); absent(ts[6]); }
         if (!t->scal) absent(ts[7]);
         if (t->sp) absent(ts[5]);   /* the split form leaves no bf16 output */
@@ -28778,12 +28810,12 @@ static void ar_q8_worker(ArQ8* t) {
         t->r_out.resize((size_t)(M * K));
         t->y_out.resize((size_t)(M * K));
         t->q_out.resize((size_t)(M * K));
-        t->s_out.resize((size_t)M);
+        t->s_out.resize((size_t)(M * SK));
         st_memcpy(t->x_out.data(), x, xb, hipMemcpyDeviceToHost);
         st_memcpy(t->r_out.data(), r, xb, hipMemcpyDeviceToHost);
-        st_memcpy(t->y_out.data(), y, xb, hipMemcpyDeviceToHost);
+        st_memcpy(t->y_out.data(), t->alias ? x : y, xb, hipMemcpyDeviceToHost);
         st_memcpy(t->q_out.data(), q, (size_t)(M * K), hipMemcpyDeviceToHost);
-        st_memcpy(t->s_out.data(), s, (size_t)M * 4, hipMemcpyDeviceToHost);
+        st_memcpy(t->s_out.data(), s, (size_t)(M * SK) * 4, hipMemcpyDeviceToHost);
         if (gw) st_memcpy(&t->gate_after, gw, 8, hipMemcpyDeviceToHost);
     }
     for (void* p : { x, r, w, wp, sc, q, s, y, gw }) if (p) st_free(p);
@@ -28796,8 +28828,10 @@ static bool nm_ends_with(const char* s, const char* tail) {
 
 static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<int>& devs,
                                           const char* name) {
+    /* ar_rmsnorm_quant_i8g: quant_act_i8g's grid, two ranks, held to rmsnorm_quant_i8g */
+    const bool grp = std::strstr(name, "_i8g") != nullptr;
     const RadKernelInfo* row = find(pl, name);
-    const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
+    const RadKernelInfo* rq  = find(pl, grp ? "rmsnorm_quant_i8g" : "rmsnorm_quant_i8");
     if (!row || !rq) { ok(name, false, "row absent"); return; }
     const int world = std::strstr(name, "_4rank") ? 4 : 2;
     if ((int)devs.size() < world) {
@@ -28825,7 +28859,9 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
     const std::string nm(name);
     for (const Shape& sh : shapes) {
         if (world == 2 && (sh.tail || sh.sp)) continue;
+        if (grp && sh.K % 128) continue;
         const int64_t M = sh.M, K = sh.K;
+        const int64_t SK = grp ? K / 128 : 1;   /* scales a row */
         std::vector<uint16_t> hr((size_t)(M * K)), hw((size_t)K), hp((size_t)K);
         for (int64_t i = 0; i < M; ++i)
             for (int64_t c = 0; c < K; ++c)
@@ -28854,11 +28890,15 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             xsum[(size_t)i] = h_to_bf16(acc);
         }
 
-        for (const int form : { 0, 1, 2 }) {   /* the plain norm, the junction, with the scalar */
-            const bool res = form > 0, scal = form == 2;
+        /* the plain norm, the junction, with the scalar; at quant_act_i8g's grid that last with
+         * the norm output written over x (out_bf16 on x's buffer) besides */
+        for (const int form : { 0, 1, 2, 3 }) {
+            if (form == 3 && !grp) continue;
+            const bool res = form > 0, scal = form >= 2, alias = form == 3;
             const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(K) +
                                    (form == 0 ? ", plain" : form == 1 ? ", junction"
-                                                                      : ", junction with scalar") +
+                                    : form == 2 ? ", junction with scalar"
+                                                : ", junction with scalar, out_bf16 over x") +
                                    (sh.sp == 2 ? ", split around the junction, residual gathered"
                                     : sh.sp ? ", split around the junction"
                                     : sh.tail ? ", two-shot with the junction as its tail" : ", one-shot");
@@ -28868,7 +28908,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             const size_t xb = (size_t)(M * K * 2), wb = (size_t)K * 2;
             void* d_x = dalloc(xb); void* d_r = dalloc(xb); void* d_w = dalloc(wb);
             void* d_p = dalloc(wb); void* d_sc = dalloc(4); void* d_q = dalloc((size_t)(M * K));
-            void* d_s = dalloc((size_t)M * 4); void* d_y = dalloc(xb);
+            void* d_s = dalloc((size_t)(M * SK) * 4); void* d_y = dalloc(xb);
             if (!d_x || !d_r || !d_w || !d_p || !d_sc || !d_q || !d_s || !d_y) {
                 ok((nm + at + " alloc").c_str(), false, "hipMalloc failed");
                 return;
@@ -28883,7 +28923,8 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             const int rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }),
                                             res ? T(d_r, RAD_BF16, { M, K }) : T(nullptr, RAD_BF16, {}),
                                             T(d_w, RAD_BF16, { K }), T(d_q, RAD_I8, { M, K }),
-                                            T(d_s, RAD_F32, { M }), T(d_y, RAD_BF16, { M, K }),
+                                            grp ? T(d_s, RAD_F32, { M, SK }) : T(d_s, RAD_F32, { M }),
+                                            T(d_y, RAD_BF16, { M, K }),
                                             res ? T(d_p, RAD_BF16, { K }) : T(nullptr, RAD_BF16, {}),
                                             scal ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) },
                                       pn);
@@ -28893,11 +28934,11 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             }
             std::vector<uint16_t> want_r((size_t)(M * K)), want_y((size_t)(M * K));
             std::vector<uint8_t>  want_q((size_t)(M * K));
-            std::vector<float>    want_s((size_t)M);
+            std::vector<float>    want_s((size_t)(M * SK));
             st_memcpy(want_r.data(), d_r, xb, hipMemcpyDeviceToHost);
             st_memcpy(want_y.data(), d_y, xb, hipMemcpyDeviceToHost);
             st_memcpy(want_q.data(), d_q, (size_t)(M * K), hipMemcpyDeviceToHost);
-            st_memcpy(want_s.data(), d_s, (size_t)M * 4, hipMemcpyDeviceToHost);
+            st_memcpy(want_s.data(), d_s, (size_t)(M * SK) * 4, hipMemcpyDeviceToHost);
 
             std::vector<ArQ8> t((size_t)world);
             std::vector<std::thread> th;
@@ -28907,6 +28948,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
                 x.M = M; x.K = K; x.res = res; x.scal = scal; x.gated = scal;
                 x.tail = sh.tail;
                 x.sp = sh.sp;
+                x.grp = grp; x.alias = alias;
                 x.r_in = &hr; x.w = &hw; x.wp = &hp; x.sc = hs;
                 x.x_in = hx[(size_t)r];
                 th.emplace_back(ar_q8_worker, &x);
@@ -28945,13 +28987,14 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
                     const int64_t na = base + (x.rank < rem ? 1 : 0);
                     for (int64_t i = 0; i < M * K; ++i) {
                         const int64_t row = i / K;
-                        if (!sh.sp) bx += x.x_out[(size_t)i] != xsum[(size_t)i];
+                        /* with out_bf16 over x, x ends holding the norm output */
+                        if (!sh.sp) bx += x.x_out[(size_t)i] != (alias ? want_y : xsum)[(size_t)i];
                         if (res && (sh.sp != 1 || (row >= a && row < a + na)))
                             br += x.r_out[(size_t)i] != want_r[(size_t)i];
                         if (!sh.sp) by += x.y_out[(size_t)i] != want_y[(size_t)i];
                         bq += x.q_out[(size_t)i] != want_q[(size_t)i];
                     }
-                    for (int64_t i = 0; i < M; ++i)
+                    for (int64_t i = 0; i < M * SK; ++i)
                         bs += std::memcmp(&x.s_out[(size_t)i], &want_s[(size_t)i], 4) != 0;
                 }
                 for (int64_t i = 0; i < M * K; ++i) nz += want_q[(size_t)i] != 0;
@@ -32545,6 +32588,10 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\ngelu_mul_quant_i8, against the pair it replaces\n");
         gelu_mul_quant_i8_numeric(pl);
     }
+    if (sel("gelu_mul_quant_i8g")) {
+        if (!g_case) std::printf("\ngelu_mul_quant_i8g, against the pair it replaces\n");
+        gelu_mul_quant_i8_numeric(pl, true);
+    }
     if (sel("qkv_norm_rope_bf16") || sel("qkv_norm_rope_kv_store_fp8") ||
         sel("qkv_norm_rope_kv_store_bf16") || sel("qkv_norm_rope_kv_store_h128_bf16")) {
         if (!g_case) std::printf("\nqkv_norm_rope, and with kv_store folded in, against the ops it "
@@ -32554,6 +32601,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_quant_i8")) {
         if (!g_case) std::printf("\nrmsnorm_quant_i8, against the chain it replaces\n");
         rmsnorm_quant_i8_numeric(pl);
+    }
+    if (sel("rmsnorm_quant_i8g")) {
+        if (!g_case) std::printf("\nrmsnorm_quant_i8g, against the chain it replaces\n");
+        rmsnorm_quant_i8_numeric(pl, true);
     }
     if (sel("add_rmsnorm_bf16")) {
         if (!g_case) std::printf("\nadd_rmsnorm, against add then rmsnorm\n");
@@ -32669,7 +32720,8 @@ static void device_phase(const Plugin& pl) {
      * they need, on a box with fewer cards. */
     /* The junction's fused all-reduce at two and four ranks, and their host twins. */
     for (const char* n : { "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8_host",
-                           "ar_rmsnorm_quant_i8_4rank", "ar_rmsnorm_quant_i8_4rank_host" }) {
+                           "ar_rmsnorm_quant_i8_4rank", "ar_rmsnorm_quant_i8_4rank_host",
+                           "ar_rmsnorm_quant_i8g", "ar_rmsnorm_quant_i8g_host" }) {
         if (!sel(n)) continue;
         if (!g_case) std::printf("\ncross-rank, fused with the sandwich-norm junction\n");
         std::printf("  %s\n", n);

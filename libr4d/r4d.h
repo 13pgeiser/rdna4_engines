@@ -867,12 +867,13 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
-// GEMM's per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch.
+// GEMM's per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch. `grp`
+// takes quant_act_i8g's quantiser instead (ar_rmsnorm_quant_i8g): `s` [M][n / 128], n % 128 == 0.
 int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                              long seq_ctrs, long slot_stride16, long x, long res, long w, long wp,
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                             int drain, int acq, long stage = 0);
+                             int drain, int acq, int grp, long stage = 0);
 // ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
 // arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
 // engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with

@@ -707,7 +707,9 @@ the wrong copy.
 | `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gelu_mul_quant_i8g` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
@@ -727,6 +729,14 @@ norm is of `residual + x`, stored back; `w_post` normalises `x` before that add 
 multiplies the sum after it, together a sandwich-norm model's residual junction (`rmsnorm` → `add`
 → `scale` → `rmsnorm` → `quant_act_i8`). Byte-identical to that chain: every intermediate the chain
 stores is rounded to bf16, and both sums of squares take `rmsnorm`'s partition.
+
+`rmsnorm_quant_i8g` and `gelu_mul_quant_i8g` are `rmsnorm_quant_i8` and `gelu_mul_quant_i8` with
+`quant_act_i8g`'s quantiser instead: row-major int8 codes and an f32 scale per (row, 128 columns),
+`scale` `[M, n / 128]`, what `gemm_nt_q` reads at `dtype=i8a8`, `w4a8i8_asym` and `w5a8i8`.
+Byte-identical to the same chains ending in `quant_act_i8g`. `n` is a multiple of 128. On
+`rmsnorm_quant_i8g`, `out_bf16` may be `x`'s own buffer: a junction whose next linear reads bf16 at
+decode heights (`w4a16_asym`, `w5a16`) writes the norm output where the unfused norm would, in
+place of the branch output it has consumed.
 
 ### `dequant_w4` (device-only)
 
@@ -2453,6 +2463,7 @@ device code.
 | `ar_rmsnorm_post_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w |
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
@@ -2463,6 +2474,8 @@ parameter for the same reason as `min_bytes`. `x` is inout on `ar_rmsnorm_quant_
 the message and the input, and the reduced sum lands in it.
 `ar_rmsnorm_had_quant_i8g` is `ar_rmsnorm_quant_fp8` with `rmsnorm_had_quant_i8g`'s quantiser:
 `x` and the residual are the same bytes, and the codes are int8 for a weight at `i8a8h`.
+`ar_rmsnorm_quant_i8g` is `ar_rmsnorm_quant_i8` with `rmsnorm_quant_i8g`'s quantiser, at two
+ranks, with no `sp`; `out_bf16` may be `x`'s buffer, which then ends holding the norm output.
 
 `sp` on `ar_rmsnorm_quant_i8` (0 when absent) lets a row split the all-reduce around the
 junction: reduce-scatter, the junction on the rows this rank owns (`M` split evenly over the

@@ -1448,14 +1448,15 @@ extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
  * all-reduce. Width and block count as in ar_rmsnorm_quant_fp8. */
 enum { AQ8_X = 0, AQ8_RES, AQ8_W, AQ8_Q, AQ8_S, AQ8_Y, AQ8_WP, AQ8_SC };
 
-/* The operands and their rules, the same at every width. */
+/* The operands and their rules, the same at every width. `grp`: quant_act_i8g's grid
+ * (ar_rmsnorm_quant_i8g), a scale per (row, 128 columns) and K in whole groups. */
 struct ArQ8Args {
     const RadTensor *x = nullptr, *rs = nullptr, *w = nullptr, *q = nullptr, *sc = nullptr;
     const RadTensor *ob = nullptr, *wp = nullptr, *sl = nullptr;
     long long M = 0, K = 0, yp = 0, rp = 0;
 };
 
-static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
+static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o, bool grp = false) {
     const RadTensor* x  = o->x  = r4d_opt(a, AQ8_X);
     const RadTensor* rs = o->rs = r4d_opt(a, AQ8_RES);
     const RadTensor* w  = o->w  = r4d_opt(a, AQ8_W);
@@ -1471,12 +1472,12 @@ static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
     long long M = 0, K = 0;
     if (r4d_rows_of(x, &M, &K) != RAD_OK) return RAD_E_SHAPE;
     if (M * K > in->max_numel) return RAD_E_SHAPE;
-    if (K % 16) return RAD_E_SHAPE;
+    if (K % 16 || (grp && K % 128)) return RAD_E_SHAPE;
     if (r4d_numel(w) != K || (w->dtype != RAD_F32 && w->dtype != RAD_BF16)) return RAD_E_DTYPE;
     if (wp && (r4d_numel(wp) != K || wp->dtype != w->dtype)) return RAD_E_SHAPE;
     if (sl && (r4d_numel(sl) != 1 || (sl->dtype != RAD_F32 && sl->dtype != RAD_BF16))) return RAD_E_SHAPE;
     if (r4d_numel(q) != M * K || !r4d_contig(q)) return RAD_E_SHAPE;
-    if (r4d_numel(sc) != M || !r4d_contig(sc)) return RAD_E_SHAPE;
+    if (r4d_numel(sc) != M * (grp ? K / 128 : 1) || !r4d_contig(sc)) return RAD_E_SHAPE;
     if (ob && r4d_numel(ob) != M * K) return RAD_E_SHAPE;
     if (rs && r4d_numel(rs) != M * K) return RAD_E_SHAPE;
     const long long xp = r4d_row_pitch(x), yp = ob ? r4d_row_pitch(ob) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
@@ -1486,12 +1487,12 @@ static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
     return RAD_OK;
 }
 
-extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+static int rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s, bool grp) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 2) return RAD_E_SHAPE;
     ArQ8Args v;
-    const int arc = ar_q8_args(a, in, &v);
+    const int arc = ar_q8_args(a, in, &v, grp);
     if (arc != RAD_OK) return arc;
     const long long M = v.M, K = v.K;
 
@@ -1508,8 +1509,18 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
         (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
-        cfgv.acq, in->my_stage);
+        cfgv.acq, grp ? 1 : 0, in->my_stage);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant_i8(a, s, false);
+}
+
+/* The same at quant_act_i8g's grid (rmsnorm_quant_i8g's junction): two ranks only. A four-rank
+ * deployment declares it, finds no row, and issues the all-reduce apart. */
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8g(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant_i8(a, s, true);
 }
 
 /* The same at four ranks, on the wide family's one-shot transport (r4d_rmsnorm_quant_i8.hip's

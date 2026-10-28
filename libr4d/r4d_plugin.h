@@ -567,9 +567,12 @@ int r4d_rad_layout_any(const RadParam*, int, int, const RadEncoding*, const int*
                        const RadTensor*, int, RadLayout*);
 int r4d_rad_qkv_norm_rope_kv_store(const RadArgs*, RadStream);
 int r4d_rad_gelu_mul_quant_i8     (const RadArgs*, RadStream);
+int r4d_rad_gelu_mul_quant_i8g    (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8   (const RadArgs*, RadStream);
+int r4d_rad_ar_rmsnorm_quant_i8g  (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_i8      (const RadArgs*, RadStream);
+int r4d_rad_rmsnorm_quant_i8g     (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8      (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_had_quant_i8  (const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_i8    (const RadArgs*, RadStream);
