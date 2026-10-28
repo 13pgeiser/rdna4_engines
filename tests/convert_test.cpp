@@ -12,6 +12,7 @@
 #include "format/encoding.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "text/tokenizer.h"
 
 #include <sys/stat.h>
 
@@ -965,6 +966,29 @@ TEST(an_fp8_kv_cache_declares) {
     CHECK_EQ(convert(w.ckpt, { "-o", d / "k.rad", "--recipe", w.recipe, "--kv-cache-dtype", "fp8" },
                      nullptr), 0);
     CHECK(exists(d / "k.rad"));
+}
+
+/* --chat-template bakes a template into the container's vocab section, for a release that ships
+ * none (DeepSeek's). Without the flag the container carries what the checkpoint carried. A missing
+ * file is refused, not silently skipped. */
+TEST(chat_template_flag_bakes_the_template) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_ct");
+    const std::string tmpl = d / "chat_template.jinja";
+    REQUIRE(tiny::write_text(tmpl, "{%- raw %}{{ messages }}{%- endraw %}\n\n"));
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "with.rad", "--recipe", w.recipe,
+                                 "--chat-template", tmpl }, &log), 0);
+    RadFile f;
+    REQUIRE_EQ(f.open((d / "with.rad").c_str()), RAD_OK);
+    VocabBuild vb;
+    REQUIRE_EQ(vocab_deserialize(f.base(), (uint64_t)f.size(), f.vocab().h, vb), RAD_OK);
+    CHECK_EQ(vb.chat_template, std::string("{%- raw %}{{ messages }}{%- endraw %}"));
+
+    std::string bad;
+    CHECK_EQ(convert(w.ckpt, { "-o", d / "bad.rad", "--recipe", w.recipe,
+                               "--chat-template", d / "absent.jinja" }, &bad), 1);
 }
 
 RAD_TEST_MAIN()
