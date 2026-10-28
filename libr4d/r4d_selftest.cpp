@@ -20428,6 +20428,27 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
         };
         perf_row(pl, "gemm_fp8a8_nt_m16", ts, ps, d_w, wbytes, copies, bytes, iters);
         perf_row(pl, "gemm_fp8a8_tiled", ts, ps, d_w, wbytes, copies, bytes, iters);
+        /* The gated row, at a gate_up shape: N is the gate and up rows together, as the engine
+         * fuses them, and the output is their quantised SiLU product, N / 2 wide. It refuses a
+         * shape the split rule would split. */
+        if (N % 256 == 0 && K % 256 == 0 && M <= 64) {
+            const int64_t nout = N / 2, gkb = nout / 128;
+            void* d_gq = dalloc((size_t)M * nout);
+            void* d_gs = dalloc((size_t)M * gkb * 4);
+            void* d_gy = dalloc((size_t)M * nout * 2);
+            if (!d_gq || !d_gs || !d_gy) {
+                std::printf("  %-22s hipMalloc failed\n", "gemm_fp8a8_gated_nt_m16");
+            } else {
+                perf_row(pl, "gemm_fp8a8_gated_nt_m16",
+                         { T(d_q, RAD_F8E4M3, { M, K }), T(d_qs, RAD_F32, { M, sk }),
+                           T(d_w, RAD_F8E4M3, { N, K }), T(d_s, RAD_BF16, { sn, sk }),
+                           T(d_gq, RAD_F8E4M3, { M, nout }), T(d_gs, RAD_F32, { M, gkb }),
+                           T(d_gy, RAD_BF16, { M, nout }) },
+                         { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                           PS("dtype", "fp8a8"), PS("act", "silu") },
+                         d_w, wbytes, copies, bytes, iters);
+            }
+        }
     }
 
     /* The lm head, a decode GEMM too. Its weight is [N][K + 2*nkb] E4M3 with each row's bf16
@@ -31370,8 +31391,8 @@ static void usage(void) {
                 "             given byte offsets in a safetensors file, compared with a host\n"
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
-                "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
-                "             weight bandwidth each reaches.\n"
+                "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape (the gated row with\n"
+                "             N a gate_up's width) and print the weight bandwidth each reaches.\n"
                 "  --perfwpa N K M [iters] [pb1]:  the int5 and int4 x int8 tiled GEMMs (gemm_w5a8i8_tiled,\n"
                 "             gemm_w4a8i8_tiled), warmed, min / median time and a hash of the output.\n"
                 "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
