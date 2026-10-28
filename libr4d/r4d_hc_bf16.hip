@@ -371,6 +371,16 @@ __device__ __forceinline__ void hc8_up_dot_rows(const unsigned short* __restrict
  * Bit-identical: same lanes, same order. */
 __device__ __forceinline__ float wave_sum(float v) { return r4d_wave_sum(v); }
 
+/* A barrier that orders LDS only. __syncthreads() fences at workgroup scope, which in
+ * WGP mode on gfx12 waits for every outstanding global load: a load issued for the next pass of a
+ * K loop could not stay in flight across it, and a software-pipelined loop ran as serially as the
+ * plain one. Where a barrier guards only LDS tiles, this one leaves global loads in flight. */
+__device__ __forceinline__ void hc_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 /* ============================================================== hc_enter
  *
  * h[c][i] = x[i] for every stream. One launch per step; its own op because the embedding lookup's
@@ -2116,6 +2126,15 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
 /* Eight elements of row j of W_up at k as staged bf16: the stored bf16, or eight E4M3 codes decoded
  * with their group's scale. A group is a multiple of sixteen codes, so eight aligned codes never
  * straddle two groups. */
+/* e4m3x8_bf16 on codes already in registers. */
+__device__ __forceinline__ uint4 e4m3x8_bf16v(uint2 c, float sc) {
+    float f[8];
+    e4m3x8(c.x, c.y, f);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] *= sc;
+    return f2bf8(f);
+}
+
 template <bool F8>
 __device__ __forceinline__ uint4 hc_up_stage(const void* __restrict__ upv, long uld, long j, long k,
                                             long lr) {
@@ -2255,6 +2274,99 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
 #pragma unroll
         for (int in = 0; in < AN; ++in) acc[im][in] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
+    /* The WMMA of one staged pass. */
+    auto mma = [&]() {
+#pragma unroll
+        for (int im = 0; im < AM; ++im) {
+            const int mt = wave / WN + im * WM;
+            if (mt >= MT) continue;
+#pragma unroll
+            for (int in = 0; in < AN; ++in) {
+                const int nt = wave % WN + in * WN;
+                if (nt >= NT16) continue;
+                acc[im][in] = gemm<kTKT / 16>(sA, kTAP, mt, sB, kTAP, nt, lane, acc[im][in]);
+            }
+        }
+    };
+
+    /* At the decode tile (RT 32, E4M3, lr a whole number of passes) the K loop is
+     * software-pipelined: a pass issues the next pass's loads before staging its own from
+     * registers, and the mix's operands are loaded with the first pass, where each pass waited
+     * on its own loads. Addresses are computed once, nothing branches and the barriers order LDS
+     * only (hc_lds_barrier), so the waits stay partial. 17.8 -> 16.6 us at 32 rows (rad-kbench,
+     * cold): the kernel is bound less by memory than by its staging, barriers and WMMA. The staged
+     * values are the loop's own, in the same order: bit-identical. */
+    constexpr int  kAPer = RT * (kTKT / 8) / kThreads, kBPer = NT * (kTKT / 8) / kThreads;
+    constexpr int  kNPer = RT * NT / kThreads;
+    constexpr bool kPipe = F8 && RT == 32 && kAPer == 1 && kBPer * kThreads == NT * (kTKT / 8)
+                           && kNPer * kThreads == RT * NT;
+    const bool pipe = kPipe && lr % kTKT == 0;
+    float nh[kPipe ? kNPer : 1], nw[kPipe ? kNPer : 1], nsc[kPipe ? kNPer : 1];
+    if constexpr (kPipe) {
+        if (pipe) {
+            const int nit = (int)(lr / kTKT), G = (int)r4d_hc8::up_group(lr);
+            const int rrA = tid / (kTKT / 8), k8A = (tid % (kTKT / 8)) * 8;
+            long rA = r0 + rrA;
+            if (rA >= rows) rA = rows - 1;
+            const unsigned short* const ap = dbuf + rA * lr + k8A;
+            const unsigned char* bp[kBPer];
+            int k8B[kBPer], ttB[kBPer];
+#pragma unroll
+            for (int b = 0; b < kBPer; ++b) {
+                const int idx = tid + b * kThreads;
+                ttB[b] = idx / (kTKT / 8);
+                k8B[b] = (idx % (kTKT / 8)) * 8;
+                bp[b]  = (const unsigned char*)upv + s_j[ttB[b]] * uld;
+            }
+            uint4 ca = *(const uint4*)ap;
+            uint2 cb[kBPer];
+            float cs[kBPer];
+#pragma unroll
+            for (int b = 0; b < kBPer; ++b) {
+                cb[b] = *(const uint2*)(bp[b] + k8B[b]);
+                cs[b] = ((const float*)(bp[b] + lr))[k8B[b] / G];
+            }
+#pragma unroll
+            for (int q2 = 0; q2 < kNPer; ++q2) {
+                const int  idx = tid + q2 * kThreads;
+                const int  rl = idx / NT, rem = idx - rl * NT;
+                const int  c  = rem / ipb, ii = rem - c * ipb;
+                long r = r0 + rl;
+                if (r >= rows) r = rows - 1;
+                const long j = (long)c * n + i0 + ii;
+                nh[q2]  = bf2f(h[r * hrow + j]);
+                nsc[q2] = scalein[r * kHcMax + c];
+                nw[q2]  = w[j];
+            }
+            for (int it = 0; it < nit; ++it) {
+                /* The next pass's operands; after the last pass the first's again, in bounds. */
+                const int kn = it + 1 < nit ? (it + 1) * kTKT : 0;
+                const uint4 na = *(const uint4*)(ap + kn);
+                uint2 nb[kBPer];
+                float ns[kBPer];
+#pragma unroll
+                for (int b = 0; b < kBPer; ++b) {
+                    nb[b] = *(const uint2*)(bp[b] + kn + k8B[b]);
+                    ns[b] = ((const float*)(bp[b] + lr))[(kn + k8B[b]) / G];
+                }
+                hc_lds_barrier();
+                *(uint4*)(sA + rrA * kTAP + k8A) = ca;
+#pragma unroll
+                for (int b = 0; b < kBPer; ++b)
+                    *(uint4*)(sB + ttB[b] * kTAP + k8B[b]) = e4m3x8_bf16v(cb[b], cs[b]);
+                hc_lds_barrier();
+                mma();
+                ca = na;
+#pragma unroll
+                for (int b = 0; b < kBPer; ++b) {
+                    cb[b] = nb[b];
+                    cs[b] = ns[b];
+                }
+            }
+        }
+    }
+
+    if (!pipe)
     for (long k0 = 0; k0 < lr; k0 += kTKT) {
         __syncthreads();
         for (int idx = tid; idx < RT * (kTKT / 8); idx += kThreads) {
@@ -2273,21 +2385,20 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
             *(uint4*)(sB + tt * kTAP + k8) = v;
         }
         __syncthreads();
-#pragma unroll
-        for (int im = 0; im < AM; ++im) {
-            const int mt = wave / WN + im * WM;
-            if (mt >= MT) continue;
-#pragma unroll
-            for (int in = 0; in < AN; ++in) {
-                const int nt = wave % WN + in * WN;
-                if (nt >= NT16) continue;
-                acc[im][in] = gemm<kTKT / 16>(sA, kTAP, mt, sB, kTAP, nt, lane, acc[im][in]);
-            }
-        }
+        mma();
     }
     /* N in a separate coalesced pass: in the WMMA epilogue consecutive lanes hold consecutive
      * sub-streams, so reading `h` there would stride n elements per lane. Here consecutive threads
      * take consecutive channels of one sub-stream, as in hc_mix. */
+    if (pipe) {
+#pragma unroll
+        for (int q2 = 0; q2 < (kPipe ? kNPer : 1); ++q2) {
+            const int  idx = tid + q2 * kThreads;
+            const int  rl = idx / NT, rem = idx - rl * NT;
+            const int  c  = rem / ipb, ii = rem - c * ipb;
+            if (r0 + rl < rows) s_N[rl * NT + ii * hc + c] = f2bf(nh[q2] * nsc[q2] * (nw[q2] + wadd));
+        }
+    } else
     for (int idx = tid; idx < RT * NT; idx += kThreads) {
         const int  rl = idx / NT, rem = idx - rl * NT;
         const int  c  = rem / ipb, ii = rem - c * ipb;
@@ -2349,35 +2460,54 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
 
     /* The rotated codes need a whole wave per row, while the codes below use kThreads / RT threads
      * per row, so the rotation walks the tile's rows a wave at a time first. */
+    /* Both finishers below load what they read before using any of it -- the
+     * rotation every row of the wave's, the codes a thread's four-channel runs -- where they
+     * walked rows and channels a dependent load at a time; the codes' amax is over the same 128
+     * values. The tail of this kernel is one block's chain, so these were its links. Bit-identical. */
     if (rq) {
         const long gb = (i0 / kUpTB) * kUpTB;
-        for (int rl = wave; rl < RT; rl += kWaves) {
-            const long r = r0 + rl;
-            if (r >= rows) break;
-            const unsigned short* const xr = x + r * xrow + gb;
-            float v[4];
+        constexpr int kRPW = (RT + kWaves - 1) / kWaves;   /* rows a wave */
+        float v[kRPW][4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) v[j] = bf2f(xr[lane * 4 + j]);
-            hc_rot_group(v, lane, rq + r * rqrow + gb, rqs + r * rsrow + gb / kUpTB);
+        for (int i = 0; i < kRPW; ++i) {
+            const long r = r0 + wave + i * kWaves;
+            const unsigned short* const xr = x + (r < rows ? r : rows - 1) * xrow + gb;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[i][j] = bf2f(xr[lane * 4 + j]);
+        }
+#pragma unroll
+        for (int i = 0; i < kRPW; ++i) {
+            const long r = r0 + wave + i * kWaves;
+            if (wave + i * kWaves >= RT || r >= rows) break;
+            hc_rot_group(v[i], lane, rq + r * rqrow + gb, rqs + r * rsrow + gb / kUpTB);
         }
     }
 
     constexpr int kTPR = kThreads / RT;             /* threads a row; RT divides kThreads */
+    constexpr int kRuns = (kUpTB / 4) / kTPR;       /* a thread's four-channel runs */
     const int  rl = tid / kTPR, lr_ = tid % kTPR;
     const long r  = r0 + rl;
     if (r >= rows) return;
     const long base = (i0 / kUpTB) * kUpTB;
     const unsigned short* const xr = x + r * xrow + base;
+    float xv[kRuns][4];
+#pragma unroll
+    for (int u = 0; u < kRuns; ++u)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) xv[u][j] = bf2f(xr[(lr_ + u * kTPR) * 4 + j]);
     float m = 0.0f;
-    for (int t = lr_; t < kUpTB; t += kTPR) m = fmaxf(m, fabsf(bf2f(xr[t])));
+#pragma unroll
+    for (int u = 0; u < kRuns; ++u)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(xv[u][j]));
     m = r4d_xor_max<kTPR>(m);
     const float sc  = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
     const float inv = 1.0f / sc;
     if (lr_ == 0) qs[r * srow + base / kUpTB] = sc;
-    for (int d = lr_; d < kUpTB / 4; d += kTPR) {
-        const int c4 = d * 4;
-        const uint32_t pk = q8_pack4<I8>(bf2f(xr[c4 + 0]), bf2f(xr[c4 + 1]), bf2f(xr[c4 + 2]),
-                                         bf2f(xr[c4 + 3]), inv);
+#pragma unroll
+    for (int u = 0; u < kRuns; ++u) {
+        const int c4 = (lr_ + u * kTPR) * 4;
+        const uint32_t pk = q8_pack4<I8>(xv[u][0], xv[u][1], xv[u][2], xv[u][3], inv);
         *(unsigned*)(q + r * qrow + base + c4) = (unsigned)pk;
     }
 }
