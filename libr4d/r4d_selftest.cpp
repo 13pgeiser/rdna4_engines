@@ -18198,11 +18198,20 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
                                          "the wide kernels", "the PF2 kernels" };
     std::vector<Out> outs;
+    std::vector<int> ran;   /* the form each of `outs` came from */
     for (int form = f_lo; form <= f_hi; ++form) {
         if (pl.pin_hc) pl.pin_hc(form);
         st_memset(d_x, 0, xb); st_memset(d_inj, 0, ib); st_memset(d_q, 0, qb);
         st_memset(d_qs, 0, sb); st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb);
         const int rc = r->launch(&a, rst);
+        /* A pinned form refusing the shape is not a failure: the wide kernels serve only the wide
+         * row tile, so from 8 rows up to it --perfhc times the decode tiles' kernels alone. The
+         * first form (the decode tiles') must serve. */
+        if (rc == RAD_E_SHAPE && pl.pin_hc && form > f_lo) {
+            skip(fmt("%s prefill form '%s' at M=%lld", rn, kForm[form], (long long)M).c_str(),
+                 "not served at this row count");
+            continue;
+        }
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
             ok(fmt("%s prefill form '%s' at M=%lld is served", rn, kForm[form],
                    (long long)M).c_str(), false, fmt("rc=%d", rc));
@@ -18217,6 +18226,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
         get(o.x, d_x, xb); get(o.inj, d_inj, ib); get(o.q, d_q, qb);
         get(o.qs, d_qs, sb); get(o.rq, d_rq, qb); get(o.rs, d_rs, sb);
         outs.push_back(std::move(o));
+        ran.push_back(form);
     }
     /* Form f against the decode tiles' kernels, outs[0]. */
     auto same = [&](size_t f, const char* what) {
@@ -18235,10 +18245,10 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
            bad.empty() && nz > qb / 2, bad.empty() ? fmt("%zu of %zu codes non-zero", nz, qb)
                                                    : "differs in" + bad);
     };
-    for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[f_lo + (int)f]);
+    for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[ran[f]]);
 
     if (timed) {
-        for (int form = f_lo; form <= f_hi; ++form) {
+        for (const int form : ran) {
             if (pl.pin_hc) pl.pin_hc(form);
             hipEvent_t w0, w1;
             st_ev_create(&w0); st_ev_create(&w1);
@@ -31409,8 +31419,8 @@ static void usage(void) {
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
-                "             prefill-tile form (PF2 from M=512) compared byte for byte and timed\n"
-                "             as one op each;\n"
+                "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
+                "             PF2 from M=512) compared byte for byte and timed as one op each;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"
