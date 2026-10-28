@@ -142,6 +142,7 @@ struct Plugin {
     void (*pin_gather)(int) = nullptr;
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
+    void (*pin_hc_dec)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -212,6 +213,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gather_pin_form", &pl->pin_gather);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
+    okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -18088,6 +18090,129 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
                    : "the int8 run changed" + bad);
 }
 
+/* The gated residual's read at its decode kernels, byte for byte: the launcher's rule (kernels A and
+ * B as one grid at one to seven rows, the tiled up-mix pipelined from eight) against the kernels it
+ * replaced, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
+ * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
+ * that is ignored cannot pass by comparing a form with itself. */
+static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
+                               "byte-identical to the previous kernels", (long long)M,
+                               i8 ? "int8" : "E4M3");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.pin_hc_dec || !pl.record) { skip(nm.c_str(), "no r4d_hc_read_pin_decode"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0xD1B54A32D192ED03ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; };
+    Out out[2];
+    for (int form = 0; form < 2; ++form) {
+        pl.pin_hc_dec(form);
+        st_memset(d_x, 0, xb); st_memset(d_q, 0, qb); st_memset(d_qs, 0, sb);
+        st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb); st_memset(d_inj, 0, ib);
+        const void* fns[16] = {};
+        pl.record(fns, 16);
+        const int rc = r->launch(&a, (RadStream)hs);
+        const int nd = pl.record(nullptr, 0);
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("%s rc=%d", form ? "the previous kernels" : "the rule", rc));
+            pl.pin_hc_dec(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        out[form].fns.assign(fns, fns + (nd < 16 ? nd : 16));
+        auto get = [&](std::vector<uint8_t>& v, void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[form].x, d_x, xb); get(out[form].inj, d_inj, ib); get(out[form].q, d_q, qb);
+        get(out[form].qs, d_qs, sb); get(out[form].rq, d_rq, qb); get(out[form].rs, d_rs, sb);
+    }
+    pl.pin_hc_dec(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    if (out[0].x != out[1].x)     bad += " x";
+    if (out[0].inj != out[1].inj) bad += " inj";
+    if (out[0].q != out[1].q)     bad += " q";
+    if (out[0].qs != out[1].qs)   bad += " qs";
+    if (out[0].rq != out[1].rq)   bad += " rq";
+    if (out[0].rs != out[1].rs)   bad += " rs";
+    int64_t nz = 0;
+    for (uint8_t v : out[0].q) nz += v != 0;
+    const bool distinct = out[0].fns != out[1].fns;
+    ok(nm.c_str(), bad.empty() && nz > (int64_t)qb / 2 && distinct,
+       !bad.empty() ? "differs in" + bad
+       : !distinct  ? std::string("both forms dispatched the same kernels")
+                    : fmt("%lld of %zu codes non-zero; %zu and %zu launches", (long long)nz, qb,
+                          out[0].fns.size(), out[1].fns.size()));
+}
+
 /* The gated residual's read at a prefill chunk: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
  * 2560, four streams, lowrank 320, inject gains, the fp8 twin and its rotated twin). Several
  * launches at prefill, so also a harness for libr4d/isa/trace.sh. Random codes, small positive
@@ -18248,8 +18373,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[ran[f]]);
 
     if (timed) {
-        for (const int form : ran) {
-            if (pl.pin_hc) pl.pin_hc(form);
+        auto time_now = [&](const char* label) {
             hipEvent_t w0, w1;
             st_ev_create(&w0); st_ev_create(&w1);
             st_ev_record(w0, hs);
@@ -18265,8 +18389,21 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
             const double flop = 2.0 * (double)M * (double)HN * (double)(2 * lr + hc);
             std::printf("%s at M=%lld (n %lld, hc %lld, lowrank %lld, inject, fp8 twin + "
                         "rotated), %s: %.1f us a call, %.1f TFLOP/s\n", rn, (long long)M,
-                        (long long)n, (long long)hc, (long long)lr, kForm[form], us,
+                        (long long)n, (long long)hc, (long long)lr, label, us,
                         flop / (us * 1e6));
+        };
+        for (const int form : ran) {
+            if (pl.pin_hc) pl.pin_hc(form);
+            time_now(kForm[form]);
+        }
+        /* The decode kernels against the ones they replaced (r4d_hc_read_pin_decode), under the
+         * launcher's prefill rule. */
+        if (pl.pin_hc_dec && f8) {
+            if (pl.pin_hc) pl.pin_hc(0);
+            pl.pin_hc_dec(1);
+            time_now("the previous decode kernels");
+            pl.pin_hc_dec(0);
+            time_now("the launcher's rule");
         }
     }
     if (pl.pin_hc) pl.pin_hc(0);
@@ -30956,6 +31093,10 @@ static void device_phase(const Plugin& pl) {
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
+        /* The decode kernels against the ones they replaced: each one-grid instantiation (1 to 7
+         * rows) and the tiled up-mix at both of its row tiles. */
+        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64 })
+            for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "
@@ -31420,7 +31561,8 @@ static void usage(void) {
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
                 "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
-                "             PF2 from M=512) compared byte for byte and timed as one op each;\n"
+                "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
+                "             then the previous decode kernels against the launcher's rule;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"

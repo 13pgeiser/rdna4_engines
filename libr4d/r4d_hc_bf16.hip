@@ -1611,6 +1611,307 @@ static inline int hc_up_rpt(bool f8, int hc, long n) {
 
 /* hc_up_mix_kernel's launch: hc_up's row group; counter slots are (rows / rg) row groups of
  * n / kUpTB scale groups. */
+/* ============================================================== the previous decode kernels
+ *
+ * hc_read's decode kernels as they were before the one-grid form and the pipelined tiled up-mix:
+ * kernel A, then the up-mix kernel in a second launch, and the tiled up-mix with its K passes in
+ * sequence. Kept verbatim behind r4d_hc_read_pin_decode(1) so r4d_selftest can compare the
+ * current forms with them byte for byte and --perfhc can time both from one build. */
+static int g_hc_decode_form = 0;
+
+template <bool F8>
+__global__ __launch_bounds__(kThreads)
+__attribute__((amdgpu_waves_per_eu(F8 ? 9 : 1, F8 ? 9 : 16)))
+void hc_read_a_prev_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                      const void* __restrict__ downv, long dld,
+                      const unsigned short* __restrict__ injw,
+                      unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                      float* __restrict__ scaleout,
+                      long rows, long n, int hc, long lr, long ta, long hrow, long irow,
+                      float eps, float wadd) {
+    extern __shared__ unsigned short sN[];          /* [hc * n], transposed per 256-element chunk */
+    __shared__ float s_part[kWaves][kHcMax];
+    __shared__ float s_scale[kHcMax];
+    /* One 256-entry staging slot per wave (4 KiB); no barrier, a wave uses only its own. */
+    __shared__ unsigned short s_stage[kWaves][kWave * 8];
+    static_assert(sizeof(s_part) + sizeof(s_scale) + sizeof(s_stage) == kHcReadAStaticLds,
+                  "the launcher sizes N's allocation against this kernel's static LDS");
+
+    constexpr long kPer = kWave * 8;
+
+    const long r  = blockIdx.y;
+    if (r >= rows) return;
+    const long HN = (long)hc * n;
+    /* The inject gains get a block of their own for load balance. With ta = kWaves every wave does
+     * one dot over HN; adding the gains to a column-owning block would give its waves a second
+     * one, and that slowest block would set the kernel's duration. So the grid is one wider and
+     * the last block owns no columns. */
+    const bool pub = (blockIdx.x == gridDim.x - 1);
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const unsigned short* hp = h + r * hrow;
+    const unsigned short* __restrict__ down = (const unsigned short*)downv;
+
+    /* The transposed layout follows from the shape: the chunk must sit inside one sub-stream
+     * (n % 256) and every 16-byte group be aligned in LDS and in `h`; otherwise the plain layout,
+     * with the same N. The E4M3 dot reads N in natural order, so only the bf16 form transposes. */
+    const bool swz = !F8 && (n % kPer == 0) && (((uintptr_t)hp   & 15u) == 0u)
+                  && (((uintptr_t)down & 15u) == 0u)
+                  && (!injw || ((uintptr_t)injw & 15u) == 0u);
+
+    /* ---- sums of squares, one stream at a time, straight from `h`. One stream at a time keeps
+     * the accumulator a scalar; an array indexed by runtime `hc` would live in scratch.
+     *
+     * This prologue is latency-bound, not traffic-bound: 20 KiB against the block's 320 KiB of
+     * W_down, yet 6.7 of the kernel's 18.7 us at the decode grid, because ten dependent iterations
+     * wait on loads with nothing else resident. Issuing kPreSs iterations' loads first turns eight
+     * serial latencies into one, bit-identically. Wider loads (these bytes are served from the
+     * 64 MB last-level cache, not DRAM), reading `h` once instead of twice, and deeper prefetch
+     * were all measured as no gain. */
+    constexpr int kPreSs = 8;      // n / kThreads is 10 a stream at this shape, and 12 spills
+    for (int c = 0; c < hc; ++c) {
+        const long cb = (long)c * n;
+        float acc = 0.0f;
+        long  i = tid;
+        for (; i + (long)(kPreSs - 1) * kThreads < n; i += (long)kPreSs * kThreads) {
+            uint32_t hv[kPreSs];
+#pragma unroll
+            for (int p = 0; p < kPreSs; ++p) hv[p] = bfw(hp + cb + i + (long)p * kThreads);
+#pragma unroll
+            for (int p = 0; p < kPreSs; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
+        }
+        for (; i < n; i += kThreads) { const float v = bf2f(hp[cb + i]); acc += v * v; }
+        acc = wave_sum(acc);
+        if (lane == 0) s_part[wave][c] = acc;
+    }
+    __syncthreads();
+    if (tid < hc) {
+        float ss = 0.0f;
+        for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
+        s_scale[tid] = __frsqrt_rn(ss / (float)n + eps);
+        /* One workgroup publishes; the others compute the identical value. */
+        if (pub && scaleout) scaleout[r * kHcMax + tid] = s_scale[tid];
+    }
+    __syncthreads();
+
+    /* ---- N into LDS, narrowed to bf16 where the reference narrows it. Looped per stream rather
+     * than computing `j / n`, a 64-bit integer division per element (a software sequence here). */
+    for (int c = 0; c < hc; ++c) {
+        const long  cb = (long)c * n;
+        const float sc = s_scale[c];
+        if (swz) {
+            /* A thread owns one (chunk, lane) group: logical elements `lane + 32t`, one 16-byte
+             * store at physical `q`. A wave covers one chunk, so `ch` is wave-uniform and the
+             * `h` and `w` reads stay coalesced. */
+            for (long base = 0; base < n; base += (long)kThreads * 8) {
+                const long q = base + (long)tid * 8;
+                if (q >= n) break;
+                const long ch = cb + (q & ~(kPer - 1));
+                float out[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const long li = ch + lane + (long)t * kWave;
+                    out[t] = bfw_f(bfw(hp + li)) * sc * (w[li] + wadd);
+                }
+                *(uint4*)(sN + cb + q) = f2bf8(out);
+            }
+        } else {
+            constexpr int kPreScale = 8;
+            long i = tid;
+            for (; i + (long)(kPreScale - 1) * kThreads < n; i += (long)kPreScale * kThreads) {
+                float          wv[kPreScale];
+                uint32_t       hv[kPreScale];
+#pragma unroll
+                for (int p = 0; p < kPreScale; ++p) {
+                    wv[p] = w[cb + i + (long)p * kThreads];
+                    hv[p] = bfw(hp + cb + i + (long)p * kThreads);
+                }
+#pragma unroll
+                for (int p = 0; p < kPreScale; ++p)
+                    sN[cb + i + (long)p * kThreads] = f2bf(bfw_f(hv[p]) * sc * (wv[p] + wadd));
+            }
+            for (; i < n; i += kThreads)
+                sN[cb + i] = f2bf(bf2f(hp[cb + i]) * sc * (w[cb + i] + wadd));
+        }
+    }
+    __syncthreads();
+
+    /* ---- this workgroup's columns of W_down, one wave per column. */
+    const float inv_hc = 1.0f / (float)hc;
+    const long  k0 = (long)blockIdx.x * ta;
+    for (long k = k0 + wave; k < k0 + ta && k < lr; k += kWaves) {
+        float acc;
+        if constexpr (F8) {
+            acc = hc8_dot_down<kDotU>(sN, (const unsigned char*)downv + k * dld, HN, lane);
+        } else {
+            const unsigned short* wr = down + k * HN;
+            acc = swz ? wave_dot_swz<kDotU>(sN, wr, HN, lane)
+                      : wave_dot_lds<kDotU>(sN, wr, HN, lane, s_stage[wave]);
+        }
+        acc = wave_sum(acc);
+        if (lane == 0) dout[r * lr + k] = f2bf(siluf_(acc * inv_hc));
+    }
+
+    /* ---- the inject gains, on the block that owns no columns and already holds N. */
+    if (pub && injw && inj) {
+        for (int c = wave; c < hc; c += kWaves) {
+            const unsigned short* wr = injw + (long)c * HN;
+            float acc = swz ? wave_dot_swz<kDotU>(sN, wr, HN, lane)
+                            : wave_dot_lds<kDotU>(sN, wr, HN, lane, s_stage[wave]);
+            acc = wave_sum(acc);
+            if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+        }
+    }
+}
+
+template <int RG, bool F8, bool I8 = false>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_prev_kernel(const void* __restrict__ upv, long uld,
+                      const unsigned short* __restrict__ dbuf,
+                      const unsigned short* __restrict__ h, const float* __restrict__ w,
+                      const float* __restrict__ scalein,
+                      unsigned short* __restrict__ x, unsigned char* __restrict__ q,
+                      float* __restrict__ qs, unsigned char* __restrict__ rq,
+                      float* __restrict__ rqs, unsigned int* __restrict__ ctr,
+                      long rows, long n, int hc, long lr, long hrow, long xrow,
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+    extern __shared__ float sd[];                   /* [RG * lr] */
+    __shared__ unsigned short s_stage[kWaves][kWave * 8];   /* wave_dot_lds, one slot a wave */
+    __shared__ unsigned short s_u[RG * kUpRows];
+    const unsigned short* __restrict__ up = (const unsigned short*)upv;
+    const long r0 = (long)blockIdx.y * RG;
+    if (r0 >= rows) return;
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int  ipb = kUpRows / hc;                  /* channels this workgroup owns */
+    const long i0  = (long)blockIdx.x * ipb;
+
+    for (long k = tid; k < (long)RG * lr; k += kThreads) {
+        const long r = k / lr;
+        sd[k] = (r0 + r < rows) ? bf2f(dbuf[(r0 + r) * lr + (k - r * lr)]) : 0.0f;
+    }
+    __syncthreads();
+
+    /* Row t of this workgroup's slice of W_up is sub-stream t / ipb of channel i0 + t % ipb. The
+     * E4M3 form takes each row four threads at a time, as in hc_up_kernel. */
+    if constexpr (F8) {
+        static_assert(kUpRows * 4 == kThreads, "four threads a row of W_up");
+        const int  t = tid >> 2, q4 = tid & 3;
+        const long j = (long)(t / ipb) * n + i0 + t % ipb;
+        float acc[RG];
+        hc8_dot_up<RG>(sd, lr, (const unsigned char*)upv + j * uld, q4, acc);
+#pragma unroll
+        for (int r = 0; r < RG; ++r)
+            if (q4 == 0) s_u[r * kUpRows + t] = f2bf(sigmoidf_(acc[r]));
+    } else {
+        for (int t = wave; t < kUpRows; t += kWaves) {
+            const long j = (long)(t / ipb) * n + i0 + t % ipb;
+            float acc[RG];
+            wave_dot_lds_rows<RG>(sd, lr, up + j * lr, lr, lane, s_stage[wave], acc);
+#pragma unroll
+            for (int r = 0; r < RG; ++r) {
+                const float a = wave_sum(acc[r]);
+                if (lane == 0) s_u[r * kUpRows + t] = f2bf(sigmoidf_(a));
+            }
+        }
+    }
+    __syncthreads();
+
+    const float inv_hc = 1.0f / (float)hc;
+    for (int idx = tid; idx < RG * ipb; idx += kThreads) {
+        const int  rl = idx / ipb, ii = idx - rl * ipb;
+        const long r  = r0 + rl;
+        if (r >= rows) continue;
+        const long i = i0 + ii;
+        float acc = 0.0f;
+        for (int c = 0; c < hc; ++c) {
+            const long j = (long)c * n + i;
+            const float Nv = nbf(bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c]
+                                 * (w[j] + wadd));
+            acc += bf2f(s_u[rl * kUpRows + c * ipb + ii]) * Nv;
+        }
+        acc *= inv_hc;
+        x[r * xrow + i] = f2bf(acc);
+    }
+    if (!q || !ctr) return;
+
+    /* The group's last workgroup quantises it: kUpTB / ipb of them cover one group of a row group. */
+    const int nb = kUpTB / ipb;
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_arrived;
+    const unsigned slot = blockIdx.y * (unsigned)(n / kUpTB) + (unsigned)(i0 / kUpTB);
+    if (tid == 0)
+        s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_arrived + 1u != (unsigned)nb) return;
+    if (tid == 0)
+        __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __threadfence();
+
+    /* One wave per row (RG <= wave count); a lane takes four of the group's 128 channels, one
+     * packed dword of codes. */
+    if (wave >= RG) return;
+    const long r = r0 + wave;
+    if (r >= rows) return;
+    const long base = (i0 / kUpTB) * kUpTB;
+    const unsigned short* const xr = x + r * xrow + base;
+    float m = 0.0f;
+    for (int t = lane; t < kUpTB; t += kWave) m = fmaxf(m, fabsf(bf2f(xr[t])));
+    m = r4d_wave_max(m);
+    const float sc  = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
+    const float inv = 1.0f / sc;
+    if (lane == 0) qs[r * srow + base / kUpTB] = sc;
+    for (int d = lane; d < kUpTB / 4; d += kWave) {
+        const int c4 = d * 4;
+        const uint32_t pk = q8_pack4<I8>(bf2f(xr[c4 + 0]), bf2f(xr[c4 + 1]), bf2f(xr[c4 + 2]),
+                                         bf2f(xr[c4 + 3]), inv);
+        *(unsigned*)(q + r * qrow + base + c4) = (unsigned)pk;
+    }
+    if (rq) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = bf2f(xr[lane * 4 + j]);
+        hc_rot_group(v, lane, rq + r * rqrow + base, rqs + r * rsrow + base / kUpTB);
+    }
+}
+
+static inline int hc_up_mix_prev_launch(const RadTensor* up, long uld, bool f8, bool i8,
+                                        const unsigned short* dbuf,
+                                        const unsigned short* h, const float* w, const float* scale,
+                                        unsigned short* x, unsigned char* q, float* qs,
+                                        unsigned char* rq, float* rqs,
+                                        unsigned int* ctr, long long rows, long long n, int hc,
+                                        long long lr, long long hrow, long long xrow, long long qrow,
+                                        long long srow, long long rqrow, long long rsrow, float wadd,
+                                        RadStream stream) {
+    int emit_rc = RAD_OK;
+    const long rg = hc_up_rg(rows, lr);
+    const dim3 grid((unsigned)(n / (kUpRows / hc)), (unsigned)((rows + rg - 1) / rg));
+    const unsigned lds = (unsigned)(rg * lr * sizeof(float));
+    const void* upp = up->data;
+#define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
+    emit_rc = R4D_EMIT(stream, (hc_up_mix_prev_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds,     \
+                       upp, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, (long)rows, (long)n,  \
+                       hc,                                                                        \
+                       (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
+                       (long)rsrow, wadd)
+#define HC_UPMIX_CASE(RG_, F8_)                                                                  \
+    do { if (i8) HC_UPMIX_CASE3(RG_, F8_, true); else HC_UPMIX_CASE3(RG_, F8_, false); } while (0)
+    switch (rg) {
+        case 8:  if (f8) HC_UPMIX_CASE(8, true); else HC_UPMIX_CASE(8, false); break;
+        case 7:  if (f8) HC_UPMIX_CASE(7, true); else HC_UPMIX_CASE(7, false); break;
+        case 6:  if (f8) HC_UPMIX_CASE(6, true); else HC_UPMIX_CASE(6, false); break;
+        case 5:  if (f8) HC_UPMIX_CASE(5, true); else HC_UPMIX_CASE(5, false); break;
+        case 4:  if (f8) HC_UPMIX_CASE(4, true); else HC_UPMIX_CASE(4, false); break;
+        case 3:  if (f8) HC_UPMIX_CASE(3, true); else HC_UPMIX_CASE(3, false); break;
+        case 2:  if (f8) HC_UPMIX_CASE(2, true); else HC_UPMIX_CASE(2, false); break;
+        default: if (f8) HC_UPMIX_CASE(1, true); else HC_UPMIX_CASE(1, false); break;
+    }
+#undef HC_UPMIX_CASE
+#undef HC_UPMIX_CASE3
+    return emit_rc;
+}
+
 static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool i8,
                                    const unsigned short* dbuf,
                                    const unsigned short* h, const float* w, const float* scale,
@@ -1620,6 +1921,10 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool 
                                    long long lr, long long hrow, long long xrow, long long qrow,
                                    long long srow, long long rqrow, long long rsrow, float wadd,
                                    RadStream stream) {
+    if (g_hc_decode_form == 1)
+        return hc_up_mix_prev_launch(up, uld, f8, i8, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr,
+                                     rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd,
+                                     stream);
     int emit_rc = RAD_OK;
     const long rg = hc_up_rg(rows, lr);
     const int rpt = hc_up_rpt(f8, hc, n);
@@ -2512,6 +2817,172 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
+/* The tiled up-mix as it was before its K passes were pipelined (see the previous decode
+ * kernels above; r4d_hc_read_pin_decode(1)). */
+template <int RT, int NT, bool F8, bool I8 = false>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_tiled_prev_kernel(const void* __restrict__ upv, long uld,
+                            const unsigned short* __restrict__ dbuf,
+                            const unsigned short* __restrict__ h, const float* __restrict__ w,
+                            const float* __restrict__ scalein,
+                            unsigned short* __restrict__ x, unsigned char* __restrict__ q,
+                            float* __restrict__ qs, unsigned char* __restrict__ rq,
+                            float* __restrict__ rqs, unsigned int* __restrict__ ctr,
+                            long rows, long n, int hc, long lr, long hrow, long xrow,
+                            long qrow, long srow, long rqrow, long rsrow, float wadd) {
+    __shared__ unsigned short sA[RT * kTAP];
+    __shared__ unsigned short sB[NT * kTAP];
+    __shared__ unsigned short s_u[RT * NT];
+    __shared__ unsigned short s_N[RT * NT];
+    __shared__ long           s_j[NT];
+
+    constexpr int MT = RT / 16, NT16 = NT / 16;
+    constexpr int WM = (MT < kWaves) ? MT : kWaves, WN = kWaves / WM;
+    constexpr int AM = (MT + WM - 1) / WM, AN = (NT16 + WN - 1) / WN;
+
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int  ipb = NT / hc;                       /* channels this workgroup owns */
+    const long r0  = (long)blockIdx.y * RT;
+    const long i0  = (long)blockIdx.x * ipb;
+    if (r0 >= rows) return;
+
+    /* The column map, once: tile column t is sub-stream t % hc of channel i0 + t / hc. */
+    if (tid < NT) s_j[tid] = (long)(tid % hc) * n + i0 + tid / hc;
+    __syncthreads();
+
+    v8f acc[AM][AN];
+#pragma unroll
+    for (int im = 0; im < AM; ++im)
+#pragma unroll
+        for (int in = 0; in < AN; ++in) acc[im][in] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (long k0 = 0; k0 < lr; k0 += kTKT) {
+        __syncthreads();
+        for (int idx = tid; idx < RT * (kTKT / 8); idx += kThreads) {
+            const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
+            long r = r0 + rr; if (r >= rows) r = rows - 1;
+            const long ka = k0 + k8;
+            uint4 va = make_uint4(0u, 0u, 0u, 0u);
+            if (ka + 8 <= lr) va = *(const uint4*)(dbuf + r * lr + ka);
+            *(uint4*)(sA + rr * kTAP + k8) = va;
+        }
+        for (int idx = tid; idx < NT * (kTKT / 8); idx += kThreads) {
+            const int tt = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
+            const long k = k0 + k8;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (k + 8 <= lr) v = hc_up_stage<F8>(upv, uld, s_j[tt], k, lr);
+            *(uint4*)(sB + tt * kTAP + k8) = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int im = 0; im < AM; ++im) {
+            const int mt = wave / WN + im * WM;
+            if (mt >= MT) continue;
+#pragma unroll
+            for (int in = 0; in < AN; ++in) {
+                const int nt = wave % WN + in * WN;
+                if (nt >= NT16) continue;
+                acc[im][in] = gemm<kTKT / 16>(sA, kTAP, mt, sB, kTAP, nt, lane, acc[im][in]);
+            }
+        }
+    }
+    /* N in a separate coalesced pass: in the WMMA epilogue consecutive lanes hold consecutive
+     * sub-streams, so reading `h` there would stride n elements per lane. Here consecutive threads
+     * take consecutive channels of one sub-stream, as in hc_mix. */
+    for (int idx = tid; idx < RT * NT; idx += kThreads) {
+        const int  rl = idx / NT, rem = idx - rl * NT;
+        const int  c  = rem / ipb, ii = rem - c * ipb;
+        const long r  = r0 + rl;
+        if (r >= rows) continue;
+        const long j = (long)c * n + i0 + ii;
+        s_N[rl * NT + ii * hc + c] =
+            f2bf(bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c] * (w[j] + wadd));
+    }
+
+    /* u from the accumulators. */
+    const int e0 = 8 * (lane >> 4), nn = lane & 15;
+#pragma unroll
+    for (int im = 0; im < AM; ++im) {
+        const int mt = wave / WN + im * WM;
+        if (mt >= MT) continue;
+#pragma unroll
+        for (int in = 0; in < AN; ++in) {
+            const int nt = wave % WN + in * WN;
+            if (nt >= NT16) continue;
+            const int  t = nt * 16 + nn;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const long r = r0 + mt * 16 + e0 + e;
+                if (r >= rows) continue;
+                s_u[(r - r0) * NT + t] = f2bf(sigmoidf_(acc[im][in][e]));
+            }
+        }
+    }
+    __syncthreads();
+
+    const float inv_hc = 1.0f / (float)hc;
+    for (int idx = tid; idx < RT * ipb; idx += kThreads) {
+        const int  rl = idx / ipb, ii = idx - rl * ipb;
+        const long r  = r0 + rl;
+        if (r >= rows) continue;
+        const unsigned short* const up_ = s_u + rl * NT + ii * hc;
+        const unsigned short* const np_ = s_N + rl * NT + ii * hc;
+        float a = 0.0f;
+        for (int c = 0; c < hc; ++c) a += bf2f(up_[c]) * bf2f(np_[c]);
+        x[r * xrow + i0 + ii] = f2bf(a * inv_hc);
+    }
+    if (!q || !ctr) return;
+
+    /* The group's last workgroup quantises it; `nb` workgroups cover one 128-channel group. */
+    const int nb = kUpTB / ipb;
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_arrived;
+    const unsigned slot = blockIdx.y * (gridDim.x / nb) + (unsigned)(i0 / kUpTB);
+    if (tid == 0)
+        s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_arrived + 1u != (unsigned)nb) return;
+    if (tid == 0)
+        __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __threadfence();
+
+    /* The rotated codes need a whole wave per row, while the codes below use kThreads / RT threads
+     * per row, so the rotation walks the tile's rows a wave at a time first. */
+    if (rq) {
+        const long gb = (i0 / kUpTB) * kUpTB;
+        for (int rl = wave; rl < RT; rl += kWaves) {
+            const long r = r0 + rl;
+            if (r >= rows) break;
+            const unsigned short* const xr = x + r * xrow + gb;
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = bf2f(xr[lane * 4 + j]);
+            hc_rot_group(v, lane, rq + r * rqrow + gb, rqs + r * rsrow + gb / kUpTB);
+        }
+    }
+
+    constexpr int kTPR = kThreads / RT;             /* threads a row; RT divides kThreads */
+    const int  rl = tid / kTPR, lr_ = tid % kTPR;
+    const long r  = r0 + rl;
+    if (r >= rows) return;
+    const long base = (i0 / kUpTB) * kUpTB;
+    const unsigned short* const xr = x + r * xrow + base;
+    float m = 0.0f;
+    for (int t = lr_; t < kUpTB; t += kTPR) m = fmaxf(m, fabsf(bf2f(xr[t])));
+    m = r4d_xor_max<kTPR>(m);
+    const float sc  = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
+    const float inv = 1.0f / sc;
+    if (lr_ == 0) qs[r * srow + base / kUpTB] = sc;
+    for (int d = lr_; d < kUpTB / 4; d += kTPR) {
+        const int c4 = d * 4;
+        const uint32_t pk = q8_pack4<I8>(bf2f(xr[c4 + 0]), bf2f(xr[c4 + 1]), bf2f(xr[c4 + 2]),
+                                         bf2f(xr[c4 + 3]), inv);
+        *(unsigned*)(q + r * qrow + base + c4) = (unsigned)pk;
+    }
+}
+
 /* ==================================== hc_read, kernels B and B2 in one launch at the prefill tile
  *
  * At RT 128 hc_up_mix_tiled_kernel's two staging planes plus the A tile take 58 KiB of LDS (one
@@ -2767,16 +3238,22 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
                                           long xrow, long qrow, long srow, long rqrow, long rsrow,
                                           float wadd, RadStream s) {
     const dim3 gm((unsigned)(n / (kTNT / hc)), (unsigned)((rows + rt - 1) / rt));
+    /* Through r4d_emit, so r4d_record_dispatches sees which form ran. */
+#define HC_UM_K(K_)                                                                               \
+    (void)R4D_EMIT(s, K_, gm, dim3(kThreads), 0, up, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, \
+                   rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd)
 #define HC_UM_CASE3(RT_, F8_, I8_)                                                               \
-    hipLaunchKernelGGL((hc_up_mix_tiled_kernel<RT_, kTNT, F8_, I8_>), gm, dim3(kThreads), 0,      \
-                       (hipStream_t)s, up, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, rows, \
-                       n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd)
+    do {                                                                                         \
+        if (g_hc_decode_form == 1) HC_UM_K((hc_up_mix_tiled_prev_kernel<RT_, kTNT, F8_, I8_>));   \
+        else                       HC_UM_K((hc_up_mix_tiled_kernel<RT_, kTNT, F8_, I8_>));        \
+    } while (0)
 #define HC_UM_CASE(RT_, F8_)                                                                     \
     do { if (i8) HC_UM_CASE3(RT_, F8_, true); else HC_UM_CASE3(RT_, F8_, false); } while (0)
     if (f8) { if (rt == 32) HC_UM_CASE(32, true);  else HC_UM_CASE(64, true); }
     else    { if (rt == 32) HC_UM_CASE(32, false); else HC_UM_CASE(64, false); }
 #undef HC_UM_CASE
 #undef HC_UM_CASE3
+#undef HC_UM_K
 }
 
 /* The codes of `x` and the rotated codes, after a mix that writes only `x`: hc_quant_rows_kernel
@@ -4278,7 +4755,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* The preloaded prologue at the shape it is instantiated for (hc 4, n 2560), and
      * there kernels A and B as one grid (hc_read_fused_kernel) when the row group is the whole
      * step, the up-mix fuses (q's counters or none) and the per-stream counters exist. */
-    const bool pre = f8 && hc == 4 && n == 10LL * kThreads;
+    const bool pre = f8 && hc == 4 && n == 10LL * kThreads && g_hc_decode_form != 1;
     if (pre) {
         const long rgf = hc_up_rg(rows, lr);
         const int       rpt = hc_up_rpt(true, (int)hc, n);
@@ -4332,7 +4809,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
              (long)dld, injw ? (const unsigned short*)injw->data : nullptr, dbuf,                 \
              inj ? (unsigned short*)inj->data : nullptr, scale, (long)rows, (long)n, (int)hc,     \
              (long)lr, (long)ta, (long)hrow, (long)irow, eps, wadd)
-    if (pre) emit_rc = HC_READ_A((hc_read_a_kernel<true, 4, 10>));
+    if (g_hc_decode_form == 1)
+        emit_rc = f8 ? HC_READ_A(hc_read_a_prev_kernel<true>) : HC_READ_A(hc_read_a_prev_kernel<false>);
+    else if (pre) emit_rc = HC_READ_A((hc_read_a_kernel<true, 4, 10>));
     else          emit_rc = f8 ? HC_READ_A(hc_read_a_kernel<true>) : HC_READ_A(hc_read_a_kernel<false>);
 #undef HC_READ_A
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
@@ -4384,3 +4863,4 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
+extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }

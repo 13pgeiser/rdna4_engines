@@ -701,6 +701,12 @@ void r4d_moe_gemm_pin_down_dec(int pin);
 // (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
 // All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
+// B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
+// passes pipelined from eight rows), 1 the kernels the rule replaced (A, then the up-mix in a second
+// launch; the tiled up-mix's passes in sequence). Bit-identical; r4d_selftest compares their bytes
+// and --perfhc times both.
+void r4d_hc_read_pin_decode(int form);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.
