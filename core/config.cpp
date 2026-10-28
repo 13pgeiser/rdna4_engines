@@ -305,7 +305,7 @@ static const Flag g_flags[] = {
     { "--expert-pin-top",     "F",      "pin the hottest fraction F of the routed experts (0 < F <= 1) by\n"
     "                                    --expert-profile's share: heat never demotes them, so the decode-hot\n"
     "                                    set stays resident while the rest streams. 0 is off" },
-    { "--draft-expert-placement", "auto|host", "where a draft head's (MTP/DSpark) routed experts live.\n"
+    { "--draft-expert-placement", "PLACEMENT", "where a draft head's (MTP/DSpark) routed experts live.\n"
     "                                    `host` pins them in the host pool before any strategy runs, read in\n"
     "                                    place like a pooled expert: the drafter's experts fit beside a trunk\n"
     "                                    that already fills the card, instead of the strategy having to make\n"
