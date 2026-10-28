@@ -1448,7 +1448,7 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
 };
 
 /* ar_rmsnorm_post_quant_fp8: the same with a sandwich post-norm of the reduced sum before the add
- * (Gemma 3's junction, arch/gemma3), exact wire only. Its own op: an optional seventh operand on
+ * (Gemma 3's junction, arch/gemma3), on either wire. Its own op: an optional seventh operand on
  * ar_rmsnorm_quant_fp8 would break every plugin that issues that op's six. */
 static const RadOperandSpec oArRmsNormPostQuantFp8[] = {
     { "x",        RAD_OPD_INOUT,  0 },
@@ -3529,7 +3529,7 @@ static const RadOpSchema kSchemas[] = {
 
     SCHEMA("ar_rmsnorm_post_quant_fp8", pArRmsNormQuantFp8, oArRmsNormPostQuantFp8,
            "ar_rmsnorm_quant_fp8 with a post-norm of the reduced sum against w_post before the "
-           "residual add (a sandwich-norm junction), exact wire only, byte-identical to all_reduce, "
+           "residual add (a sandwich-norm junction), either wire, byte-identical to all_reduce, "
            "rmsnorm, rmsnorm_quant_fp8."),
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
@@ -8756,7 +8756,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "exactly 2 ranks; n a multiple of 8 and x unpitched, because x is the message and a block pushes "
   "its rows as 16B words; group 128; a block owns whole ROWS, so the block count is clamped to M; "
   "either wire, chosen by `wire` -- the rotated 6-bit payload additionally needs n to be a "
-  "multiple of 512, so that a chunk never straddles a row; residual and out_bf16 may be null",
+  "multiple of 64, so that a group never straddles a row (a row's last 512-element chunk may be partial); residual and out_bf16 may be null",
   "bf16 in, E4M3 out with an f32 scale per (row, 128 columns) and an optional bf16 out; codes "
   "taken over the BF16-ROUNDED norm output, and the reduced sum rounded to bf16 exactly as the "
   "standalone all-reduce of the SAME wire stores it -- byte-identical to the pair it replaces",
@@ -8773,7 +8773,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "back",
   "exactly 2 ranks; n a multiple of 128 (a rotation block cannot straddle a row) and x unpitched; "
   "group 128; a block owns whole ROWS, so the block count is clamped to M; either wire, chosen by "
-  "`wire` -- the rotated 6-bit payload additionally needs n to be a multiple of 512; residual and "
+  "`wire` -- the rotated 6-bit payload pads a row's partial last 512-element chunk; residual and "
   "out_bf16 may be null",
   "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out of the "
   "UNROTATED norm output; x and the residual are ar_rmsnorm_quant_fp8's bytes, and the codes "
@@ -8786,8 +8786,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 { "ar_rmsnorm_post_quant_fp8", "ar_rmsnorm_post_quant_fp8", "quant",
   "the two-rank all-reduce, a post-norm of the reduced sum, the residual add, RMS norm and "
   "block-scaled fp8 quantisation in one kernel: a sandwich-norm junction (Gemma 3)",
-  "exactly 2 ranks, the exact wire; n a multiple of 8 and x unpitched; group 128; a block owns whole "
-  "rows; the residual is required",
+  "exactly 2 ranks, either wire chosen by `wire` (the rotated 6-bit payload needs n a multiple of 64; "
+  "a row's last 512-element chunk may be partial); n a multiple of 8 and x unpitched; group 128; a "
+  "block owns whole rows; the residual is required",
   "bf16 in, E4M3 out with an f32 scale per (row, 128 columns); x receives the reduced sum",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArRmsNormQuantFp8), ROW(tAr), nullptr,

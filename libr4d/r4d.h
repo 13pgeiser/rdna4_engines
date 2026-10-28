@@ -791,8 +791,8 @@ int  r4d_gate_quant_fp8(long g, long x, long y, long q, long s, int M, int n, in
 // on the norm's load. IPC arguments are r4d_ar_oneshot_2rank_exact's; `nblocks` is clamped to M
 // because a block owns whole rows, and `x` takes no pitch because it is also the message. Like the
 // int8 twin r4d_ar_ln_had_quant_i8 it has two wires: `wire` 0 is the exact bf16 payload, 6 the
-// rotated 6-bit one. Wire 6 needs `n` to be a multiple of r4d_ar_rmsnorm_quant_fp8_chunk_elems()
-// so a chunk never straddles a row.
+// rotated 6-bit one. Wire 6 needs `n` to be a multiple of 64 (a group never straddles a row); a
+// row that is not whole r4d_ar_rmsnorm_quant_fp8_chunk_elems() chunks pads its last one with zeros.
 int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                               long seq_ctrs, long slot_stride16,
                               long x, long res, long w, long y, long q, long s,
