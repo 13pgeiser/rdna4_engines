@@ -1742,24 +1742,37 @@ inline rad_op decl_gated_fold(RadBuilder* b, int64_t rows, int64_t N, int64_t K,
 }
 
 /* The same fold over an OCP-MXFP4 [2n, K] gate_up weight (`gemm_nt_q_gated_mx`: codes, the E8M0
- * plane and that plane again as the per-row reference), up to min(rows, 8) rows, the band of
- * libr4d's one-to-eight-row GEMM. Declared only when a loaded library declares the op (libref
- * does not), so a CPU-only engine takes the pair. */
+ * plane and that plane again as the per-row reference), declared for M up to min(rows, 16):
+ * libr4d's gated_gemv serves 1..8 rows and gated_gemv_wide 9..64, each byte-identical to its band's
+ * GEMM row (gemv, gemv_wide) followed by gated_quant_fp8. 16, not the wide row's 64: Qwen3.8-27B
+ * at TP2 on 2x R9700 (spec 7, ms a decode step, three interleaved rounds against the 1..8 band)
+ * gains at 16 rows (two sequences: 1k 20.96 -> 20.78, 16k 21.96 -> 21.70) but loses at 32 (four
+ * sequences at 1k 23.97 -> 24.10, eight in the short block 24.99 -> 25.14), and 64 lost more
+ * (16k x16 +2.1 %). The wide row refuses a short K (decode_shortk's corner), so where 1..16 does
+ * not resolve the band drops to 1..8 rather than lose the fold. Optional like decl_gated_fold, and
+ * asked for only when a loaded library declares the op: libref does not, so a CPU-only engine takes
+ * the pair without ever naming it. */
 inline rad_op decl_gated_fold_mx(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
                                  rad_weight ws, rad_weight wref,
                                  std::initializer_list<rad_buf> reads,
                                  std::initializer_list<rad_buf> writes, int64_t* gated_rows) {
-    const int64_t hi = rows < 8 ? rows : 8;
-    if (hi <= 0 || N % 256 || K % RAD_FP8_BLOCK) return 0;
+    if (rows <= 0 || N % 256 || K % RAD_FP8_BLOCK) return 0;
     if (!rad_op_declared(b, "gemm_nt_q_gated_mx")) return 0;
-    const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
-                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                        RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
-                                        RAD_STR("act", "silu")),
-                             RAD_WEIGHTS(w, ws, wref)),
-                         reads, writes);
-    if (op) *gated_rows = hi;
-    return op;
+    for (const int64_t band : { (int64_t)16, (int64_t)8 }) {
+        const int64_t hi = rows < band ? rows : band;
+        const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                            RAD_INT("group", RAD_MX_GROUP),
+                                            RAD_STR("dtype", "mxfp4a8"), RAD_STR("act", "silu")),
+                                 RAD_WEIGHTS(w, ws, wref)),
+                             reads, writes);
+        if (op) {
+            *gated_rows = hi;
+            return op;
+        }
+        if (hi <= 8) break;
+    }
+    return 0;
 }
 
 /* ================================================== a calibration tap */

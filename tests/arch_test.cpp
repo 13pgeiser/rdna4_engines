@@ -7754,6 +7754,48 @@ TEST(qwen35_fp8_declares_fp8_linears_and_the_fused_output_gate) {
     CHECK(find_b(b, "mtp_x") == nullptr);
 }
 
+/* On an MXFP4 trunk the feed-forward's gated fold (gate_up, silu_mul and down's quantiser in one
+ * launch) is declared over 1..16 rows, libr4d's gated_gemv (1..8) and part of gated_gemv_wide's
+ * (9..64) band: a verify step of one or two sequences at speculation 7 (8 or 16 rows) issues it
+ * once a layer at the step's height and no gated_quant_fp8; a taller one (24..64 rows) the unfused
+ * gate_up and gated_quant_fp8. */
+TEST(qwen35_fp8_mxfp4_feed_forward_folds_verify_steps_up_to_16_rows) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    const int L = 8;
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = { { "blk.", mx } };
+        RadBuildCtx ctx = spec_ctx(rank, 2, 7);
+        ctx.max_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+        int folds = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_gated_mx" && !o.w.empty() &&
+                b.weights[o.w[0] - 1].name.rfind("blk.", 0) == 0) {
+                ++folds;
+                CHECK_EQ(pstr(&o, "act"), std::string("silu"));
+                CHECK_EQ(param(&o, "M")->ihi, 16);
+            }
+        CHECK_EQ(folds, L);
+        for (int n = 1; n <= 8; ++n) {
+            const auto k = kit(b, std::vector<int>((size_t)n, 8), {});
+            const auto v = run_passes(b, qwen35_fp8::step, { k.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            const bool fold = 8 * n <= 16;
+            int gated = 0;
+            for (size_t i = 0; i < ops.size(); ++i)
+                if (ops[i] == "gemm_nt_q_gated_mx") {
+                    ++gated;
+                    CHECK_EQ(v[0]->issues[i].n, 8 * n);
+                }
+            CHECK_EQ(gated, fold ? L : 0);
+            CHECK_EQ(count_issued(ops, "gated_quant_fp8"), fold ? 0 : L);
+        }
+    }
+}
+
 /* At two ranks each delta-net layer reads its out-projection into the on-die cache beside the decode
  * recurrent update (GdnFP8::op_pf_out): a `prefetch` of the whole projection, issued right before
  * the update on steps of up to four decode sequences and 32 rows, none on a step of five or more

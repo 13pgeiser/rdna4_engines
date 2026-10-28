@@ -120,9 +120,9 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                swiglu_limit));
 
     /* The fold: decl_gated_fold (an fp8a8 tile) for block-fp8 weights, decl_gated_fold_mx for plain
-     * MXFP4 at one to eight rows. Other gate_up encodings (M2XFP4 included), and a clamped
-     * (swiglu_limit) product, take the pair. Over int8 codes only a host kernel would take it, which
-     * would pin the layer's weights to the host. */
+     * MXFP4 at one to 16 rows (eight where K is short). Other gate_up encodings (M2XFP4 included),
+     * and a clamped (swiglu_limit) product, take the pair. Over int8 codes only a host kernel would
+     * take it, which would pin the layer's weights to the host. */
     const bool fold_ok = swiglu_limit <= 0 && !gate_up.f32_scale;
     if (fold_ok && !gate_up.bf16 && !gate_up.mx && !gate_up.m2x && !gate_up.paro5 && !gate_up.w4 &&
         !gate_up.i8)
