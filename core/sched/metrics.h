@@ -24,6 +24,9 @@ struct SchedMetrics {
     int64_t failed = 0;
     int64_t cancelled = 0;
     int64_t preemptions = 0;
+    /* --preempt-wait-ms fallback: waits that ended by evicting cache blocks and forcing a running
+     * victim, not just by the pool freeing itself. */
+    int64_t preempt_forced = 0;
     int64_t steps = 0;
 
     /* Steps by shape. `steps_mixed` counts steps carrying both a prefill chunk and decode rows.
@@ -148,6 +151,14 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
+     * made, proposals held back unverified and their drafts, and of the held proposals scored
+     * against the text that followed, the drafts that came true (what a verify would have
+     * accepted). */
+    int64_t lookup_proposals = 0;
+    int64_t lookup_held = 0;
+    int64_t lookup_held_drafts = 0;
+    int64_t lookup_held_hits = 0;
 };
 
 

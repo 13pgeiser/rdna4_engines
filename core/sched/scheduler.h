@@ -14,7 +14,9 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "lookup.h"
 #include "metrics.h"
+#include "ngram.h"
 
 #include <chrono>
 #include <memory>
@@ -40,6 +42,8 @@ struct SchedReq {
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
     int64_t  first_tok_us = 0;   /* 0 until the first output token: this request's TTFT */
+    int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
+                                  * whole-recompute admission wait (--preempt-wait-ms). */
 
     /* The drafter's proposal for the next step, and the conv-window read cursor a rejection
      * moves rather than rolls back (§10). */
@@ -81,6 +85,13 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
+     * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
+     * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
+    NgramIndex ngram_ix;
+    /* Prompt lookup's record on this text for the verify gate (lookup.h): it describes the text,
+     * so preemption keeps it; a new request starts it over. */
+    LookupSeq  look;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -425,6 +436,7 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    LookupGate&          lookup_gate() { return lookup_; }
     SchedMetrics         metrics() const;
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
@@ -566,11 +578,30 @@ private:
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
-    /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
-     * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
-     * lengths it tries, longest first. */
-    int draft_ngram(SchedReq& s, int depth) const;
-    enum { kNgramMin = 2, kNgramMax = 4 };
+    /* The built-in prompt-lookup drafter (scheduler.cpp, ngram.h). Fills s.draft and returns how
+     * many tokens it proposed; 0 when the sequence has no repeated pattern to extend. It tries
+     * --spec-ngram-max down to --spec-ngram-min tokens, longest first. `match`, if given, gets how
+     * far the match behind the proposal runs back (NgramIndex::propose), -1 when the proposal did
+     * not come from the index (--debug-draft-oracle). */
+    int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
+    /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
+     * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
+    bool lookup_adapt_ = false;
+    /* Prompt lookup is the deployment's only drafter: each proposal is verified only when its
+     * sequence's record says it pays for its verify rows at the measured step cost (lookup.h).
+     * Beside a draft head the lookup only fills in for a sequence the head declines, and is
+     * left to the head's window. */
+    bool       lookup_gate_on_ = false;
+    LookupGate lookup_;
+    /* Decode rows and expected tokens of the step being planned, for the gate: a decode row
+     * counts once up front, and each verified proposal adds its drafts and expected yield. */
+    int64_t    gate_rows_ = 0;
+    double     gate_tokens_ = 0.0;
+    /* --debug-draft-oracle (draft_ngram): a fixed continuation the lookup proposes from instead,
+     * with kDebugMiss of the drafts corrupted, so a verify accepts and rejects at every depth on
+     * any model. A test harness; empty when not given. */
+    std::vector<int32_t>    debug_oracle_;
+    static constexpr double kDebugMiss = 0.3;
 
     mutable std::mutex mu_;
 
@@ -766,8 +797,11 @@ private:
     void preempt_back();
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute plus one
      * block of headroom for every running sequence; otherwise admitting it now just gets it
-     * preempted again next step and the prefill loops. */
+     * preempted again next step and the prefill loops. `preempt_wait_overdue` bounds that wait
+     * for every overdue preempted request: after --preempt-wait-ms the scheduler reclaims cache
+     * blocks and preempts lowest-priority running requests until one of them can prefill. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind

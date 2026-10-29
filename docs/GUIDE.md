@@ -825,7 +825,14 @@ radiance --model qwen3.8-27b-fp8.rad --tp 1 --vision-tower-placement ram
 
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
-are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
+are first-seen, so steps wait on the drive. (That is libavx's `embed_lookup_q`. A host gather
+without a row source of its own, such as libref's `embed_lookup_planes` over a GGUF table's planes,
+reads through the mapping; the engine then asks for every page a step's rows cover before the
+gather runs, so the drive answers them together rather than one fault at a time. A long gather
+(a prefill chunk's) whose sampled rows are already resident is asked for beside the gather
+instead, so a warm chunk does not wait for the asking: ~0.5 us a page, ~240 ms a rank for an
+8192-token Engram chunk.
+`--row-prefetch off` turns that off.) `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
 after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
@@ -1326,6 +1333,50 @@ more than two windows is kept whole. The startup line `draft floor` says which a
 `radiance:draft_refills_total` counts the hits ended early and `radiance:draft_refill_tokens_total`
 the tokens recomputed.
 
+**Prompt lookup.** The engine also drafts with no model at all: for each sequence it finds the
+latest earlier occurrence of the sequence's last n tokens (prompt and output alike, n from
+`--spec-ngram-max` down to `--spec-ngram-min`, 4 and 2 by default, the longest first) and proposes
+the tokens that followed it, continuing past the end with its own proposal when the pattern repeats
+within the window. There is no draft pass, and no proposal when nothing recurs, so such a step is an
+ordinary decode. It pays where the reply copies its context -- code edits, rewrites, diffs, JSON,
+quoting -- and costs a verify row per wrong draft elsewhere. Each sequence keeps an index of where
+its n-grams last occurred (about 8 bytes a token per pattern length, 16 MiB at 400k tokens and the
+default range), extended by each commit, so a lookup does not scan the context.
+
+A verify row is not free: on a MoE each row reads its own routed experts, and five drafts can cost
+a couple of plain steps. So when prompt lookup is the only drafter, a proposal is verified only when
+it is expected to pay: K drafts are verified when E[accepted] * T(R) > tokens * (T(R + K) - T(R)),
+with T(R) the measured time of a decode step of R query rows (timed online over every pure decode
+step) and `tokens` what the step already expects to emit -- for one sequence, 1 + E[accepted] >
+T(1 + K) / T(1). E[accepted] is the sequence's own record, kept apart for a match that runs at least
+8 tokens back (the reply is copying a stretch; drafted at once) and a shorter one (a recurring
+bigram; drafted once its record says so). A proposal held back is still scored against the tokens
+the sequence goes on to emit, which is exactly what a verify would have accepted, so a sequence that
+stops drafting on prose keeps learning and drafts again as soon as it starts copying. There is
+nothing to configure; the constants are in `core/sched/lookup.h`. Only which proposals are verified
+changes, never the text. `radiance:lookup_held_total` counts the held proposals.
+
+```sh
+radiance --model m.rad --spec-ngram 5                         # prompt lookup alone, up to 5 drafts
+radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's window follows its acceptance
+radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
+```
+
+`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) and asks
+the plugin to leave out any draft head the container carries (`RadBuildCtx::draft_head_off`), so
+the head's weights take no memory: the choice for a model whose head does not fit, or does not pay.
+A plugin that declares its head regardless is refused at startup. Without the flag, prompt lookup
+still drafts for every sequence a declared head declines, and is the only drafter when speculation
+is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
+(`speculation: prompt lookup only (--spec-ngram K)`), and the drafts count in `draft_n` /
+`draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
+committed sequence, so a step is not issued ahead of the previous one's readback.
+
+A lookup draft is a single token, a point mass, and the verify accepts it when the target's own draw
+at that position equals it: with probability p(x), and otherwise the emitted token is the target's
+draw conditioned on not being x. That is the speculative-sampling rule for a deterministic proposal,
+so output is distribution-exact at any temperature and greedy text matches decoding without it.
+
 **Adaptive window.** Code and JSON keep accepting deep into the window; prose falls off after a
 position or two. With `--draft-window adaptive`, `--num-speculative-tokens` is the ceiling and the
 engine keeps a smoothed acceptance per draft position for every sequence:
@@ -1342,9 +1393,11 @@ being emitted is under one in ten. The depth moves only after eight steps and fo
 each new window is a new pass shape and a new recording. A new sequence starts from what earlier
 sequences finished on.
 
-The adaptive window needs a serial draft head; with a block drafter, prompt lookup alone, or
-speculation off, the window stays fixed and startup says so. Prompt-lookup proposals made when the
-head declines count in the acceptance metrics but do not move the window. At temperature 0 the text
+A block drafter proposes its whole block in one pass and each sequence verifies the first min(D,
+its stop) of it; prompt lookup as the only drafter is measured the same way, its drafts feeding each
+sequence's estimate. With speculation off the window has nothing to adapt and startup says so.
+Prompt-lookup proposals made when a head declines count in the acceptance metrics but do not move
+the head's window. At temperature 0 the text
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
@@ -1992,6 +2045,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
+| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
@@ -2012,6 +2066,8 @@ by 0.002-0.003 nats.
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
+| `--row-prefetch MODE` | on | `on` or `off`: a host gather from a table read through the container's mapping (`--ngram-placement disk`) asks for its rows' pages before its kernel, or beside it when they are resident (§4.3); the output is the same either way |
+| `--mapped-rewarm MODE` | on | `on` or `off`: at startup, the pages of such a table an earlier run left in the page cache, and the load's own allocations pushed out, are asked for again (at most half of the available memory), so the first requests after a restart do not read them from the drive |
 
 **LoRA adapters** (§4.9.1)
 
@@ -2059,9 +2115,11 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; no draft head declared; sets the window to K (§4.6) |
+| `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
+| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
-| `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
+| `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature `RADIANCE_DFLASH_Q_TEMP` (default 0.6, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -2070,7 +2128,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -2138,6 +2196,8 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
+| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
+| `--debug-tape-dump` | list the dispatches of the first recorded pass of each kind (`TAPEDUMP` lines on stderr, every rank) and which of them start unordered behind the one before |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |
 | `--expert-stats FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
@@ -3531,6 +3591,7 @@ there is none.
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
+| `lookup_proposals_total`, `lookup_held_total`, `lookup_held_drafts_total`, `lookup_held_hits_total` | prompt lookup as the only drafter: proposals made, proposals held back as not paying for their verify rows and their drafts, and of the held ones scored against the text that followed, the drafts that came true (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
@@ -3543,7 +3604,8 @@ there is none.
 | `prefix_restore_cuts_total` | restores from the host tier the pool could not hold whole, even after giving up other conversations' VRAM copies (§4.8); `RADIANCE_LOG=debug` logs where each was cut |
 | `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
 | `prefix_cache_released_total{what}` | entries and snapshots clients forgot through `DELETE /sessions` (§4.8) |
-| `num_requests_preempted` | |
+| `num_requests_preempted` | | 
+| `preempt_forced_total` | preempted prefill waits that ended by reclaiming cache blocks and forcing a lowest-priority running victim (`--preempt-wait-ms`) |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
@@ -3594,16 +3656,11 @@ With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's
 or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
 `/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
 `/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
-and sends it on every data fetch. The exemption follows those paths' methods -- reads, plus the
-`POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
-An empty `--api-key` value is a startup error: it would guard nothing.
+and sends it on every data fetch.
 
 Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
 the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
-server with `--api-key`. The same loopback-only rule covers the control-vector default and runtime
-LoRA loads, and a browser page on another origin does not qualify as a loopback client even when
-its own machine serves the port: that is how a hostile web page would reach these routes through a
-victim's browser, and a request that says `Origin: http://evil` is refused the way a remote one is.
+server with `--api-key`.
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:

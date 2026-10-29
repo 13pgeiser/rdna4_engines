@@ -440,6 +440,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
@@ -448,12 +449,16 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
+        { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
+        { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },
-        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
+        { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
+        { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
+        { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
@@ -1261,6 +1266,39 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.n_spec, -1);                /* auto is also the default */
+}
+
+/* --spec-ngram K is prompt lookup alone at window K: it sets the window, agrees with a matching
+ * --num-speculative-tokens and refuses another; the pattern range must be a range. Off by
+ * default, at the lengths 2..4. */
+TEST(spec_ngram_sets_the_window_and_refuses_another) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.spec_ngram, 0);
+    CHECK_EQ(d.spec_ngram_min, 2);
+    CHECK_EQ(d.spec_ngram_max, 4);
+    Config c;
+    CHECK_EQ(parse({ "--spec-ngram", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.spec_ngram, 5);
+    CHECK_EQ(c.n_spec, 5);
+    Config e;
+    CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "5" }, &e), RAD_OK);
+    CHECK_EQ(e.n_spec, 5);
+    Config f;
+    {
+        LogGuard lg;
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "auto" }, &f),
+                 RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-min", "5", "--spec-ngram-max", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-max", "16" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "65" }, &f), RAD_E_INVAL);
+    }
+    Config g;
+    CHECK_EQ(parse({ "--spec-ngram-min", "1", "--spec-ngram-max", "8" }, &g), RAD_OK);
+    CHECK_EQ(g.spec_ngram_min, 1);
+    CHECK_EQ(g.spec_ngram_max, 8);
+    CHECK_EQ(g.n_spec, -1);              /* the range alone changes no window */
 }
 
 /* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */
