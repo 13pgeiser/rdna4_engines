@@ -3416,6 +3416,39 @@ TEST(a_sessions_standing_share_is_what_retention_keeps) {
     CHECK_EQ((int64_t)most, 9ll);
 }
 
+/* The reserve --host-headroom-mib charges a store's floor: it gives back exactly what the floor is
+ * short, never below a gigabyte, never above what was asked for, and stays put when the floor
+ * already fits. A byte rule, so a wider slot (any hybrid model's linear state) or a wider mirror
+ * (any KV encoding) needs no second case. */
+TEST(the_host_reserve_gives_way_to_a_stores_floor_and_no_further) {
+    const int64_t gib = (int64_t)1 << 30, mib = (int64_t)1 << 20;
+    const int64_t slot = 113 * mib, floor8 = 8 * slot, reserve = 4 * gib;
+
+    /* The floor fits: the reserve never moves, so a host with room to spare sees nothing. */
+    CHECK_EQ(host_reserve_for_floor(floor8, 20 * floor8, reserve), reserve);
+    CHECK_EQ(host_reserve_for_floor(floor8, floor8, reserve), reserve);
+    /* Short: the shortfall comes back in whole MiB, rounded up so the store is never a byte
+     * short of its floor, and the rest of the reserve stays. */
+    CHECK_EQ(host_reserve_for_floor(floor8, slot / 2, reserve), reserve - 848 * mib);
+    CHECK_EQ(host_reserve_for_floor(floor8, floor8 - 1, reserve), reserve - 1 * mib);
+    CHECK_EQ(host_reserve_for_floor(floor8, floor8 - mib, reserve), reserve - 1 * mib);
+    CHECK_EQ(host_reserve_for_floor(floor8, floor8 - mib - 1, reserve), reserve - 2 * mib);
+    /* A floor beyond both the spare memory and the reserve: down to the floor, never below. */
+    CHECK_EQ(host_reserve_for_floor(64 * gib, 0, reserve), gib);
+    /* Never above the margin asked for, so a small --host-headroom-mib is still a real bound. */
+    CHECK_EQ(host_reserve_for_floor(floor8, 0, 512 * mib), 512 * mib);
+    /* Nothing to protect. */
+    CHECK_EQ(host_reserve_for_floor(0, 0, reserve), reserve);
+    CHECK_EQ(host_reserve_for_floor(floor8, 0, 0), 0);
+
+    /* The count a floor is taken from: the policy's hold plus a running turn, per sequence. */
+    const GeometricBackoff g(2048);
+    CHECK_EQ(checkpoint_slots_want(g, 8, 200000, 2048), 80ll);
+    CHECK_EQ(checkpoint_slots_want(g, 1, 200000, 2048), 10ll);
+    CHECK_EQ(checkpoint_slots_want(g, 0, 200000, 2048), 10ll);
+    CHECK_EQ(checkpoint_slots_want(KeepTipOnly(), 1, 200000, 2048), 2ll);
+}
+
 /* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of
  * memory but not below the floor, and to the room the host has. */
 TEST(the_auto_store_gives_every_sequence_its_sessions_share) {

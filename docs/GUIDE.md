@@ -1589,6 +1589,23 @@ none of it on the card; 10 a sequence for --max-num-seqs 8: geometric-backoff ke
 200000-token session at a 2048-token interval, and one more for a running turn
 ```
 
+**The floor outranks the reserve.** A store one snapshot short of its floor is not a smaller store:
+it is every prefix hit prefilling from the start. `--host-headroom-mib` is a courtesy to the system
+— the unpooled allocations, the load's staging, the page cache — and it may not, alone, decide the
+feature off. So when the floor does not fit with the reserve held free, the reserve gives back
+exactly the shortfall, never below 1 GiB and never above the margin asked for, and the startup line
+says how much it gave:
+
+```
+checkpoint slots: auto: 8 linear-state snapshot(s) of 112.73 MiB ... ; 16 wanted, held to what the
+host can pin: ... ; the host reserve gave back 835.00 MiB of its 4.00 GiB for the floor of 8
+snapshot(s), holding 3.19 GiB
+```
+
+It is a byte rule over the host's own measurement, so it needs no second case for a wider slot (a
+model with more linear state), a wider streaming mirror (any KV encoding), or a larger `--tp`: a
+host that can pin the floor gets it, and one that cannot says what it is short.
+
 A line that says `held to an eighth of host memory`, or (a warning) `held to what the host can
 pin`, means the store is smaller than the policy wants; `--checkpoint-slots N` sets the count
 outright. An agent client with subagents keeps more
@@ -1939,7 +1956,7 @@ by 0.002-0.003 nats.
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
-| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
+| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`--checkpoint-slots`, §4.8) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
@@ -1970,7 +1987,7 @@ by 0.002-0.003 nats.
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
 | `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
-| `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; the startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
+| `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; a floor of 8 (or what the policy wants, if fewer) outranks `--host-headroom-mib`, which gives back exactly the shortfall down to 1 GiB rather than take the store to none, and the startup line says so. The startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--prefix-resume MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `--no-prefix-cache` | prefix cache on | disable prefix caching |

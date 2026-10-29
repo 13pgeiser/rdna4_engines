@@ -174,6 +174,9 @@ std::unique_ptr<CheckpointPolicy> make_checkpoint_policy(const std::string& name
  * the room is a hard bound. */
 constexpr int64_t kCheckpointSlotsFloor = 8;
 
+/* The least --host-headroom-mib is reduced to for a store's floor (host_reserve_for_floor). */
+constexpr int64_t kHostReserveFloor = (int64_t)1 << 30;
+
 struct CheckpointSlots {
     int64_t per_seq = 0;      /* snapshots a sequence is given */
     int64_t want = 0;         /* --max-num-seqs x per_seq */
@@ -181,9 +184,27 @@ struct CheckpointSlots {
     enum class Bound { Want, Share, Room } bound = Bound::Want;
 };
 
+/* What --checkpoint-slots auto wants before any byte budget applies: the policy's hold for one
+ * --max-model-len session plus one for its running turn, for each of --max-num-seqs. */
+int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
+                              int64_t interval);
+
 CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
                                       int64_t ctx, int64_t interval, int64_t slot_bytes,
                                       int64_t share_bytes, int64_t room_bytes);
+
+/* The reserve to charge a store whose floor `need_bytes` must fit. `room_bytes` is what the host
+ * can pin with `margin_bytes` (--host-headroom-mib) held free; it is what the engine measures, not
+ * what a model or a KV encoding is assumed to cost.
+ *
+ * The reserve is a courtesy to the system -- the process's unpooled allocations, the load's
+ * staging windows, the page cache -- and a store that turns prefix reuse on or off outranks it: a
+ * store too small for one snapshot re-prefills the whole conversation on every turn, while the
+ * reserve it displaced is memory the host would merely have kept. So the reserve gives back
+ * exactly the shortfall, never below kHostReserveFloor, and never above the margin asked for.
+ * It answers `margin_bytes` unchanged whenever the floor already fits, so a host with room to
+ * spare never sees the reserve move. */
+int64_t host_reserve_for_floor(int64_t need_bytes, int64_t room_bytes, int64_t margin_bytes);
 
 /* ------------------------------------------------------------------ a release */
 /* What PrefixCache::release_session took out and what it left. Blocks are left for three

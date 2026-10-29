@@ -3087,22 +3087,50 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
-    std::string limit;
-    int64_t room = lockable_bytes(still, host_headroom_bytes(), &limit);
-    if (!device_is_host()) {
-        bool lifted = false;
-        if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
-            int64_t pinned = 0, mapped = 0;
-            rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
-            rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-            const int64_t left = std::max<int64_t>(cap - pinned - mapped - still, 0);
-            if (left < room) {
-                room = left;
-                limit = fmt("the amdgpu driver's pin cap of %s, of which this process holds %s "
-                            "and still pins %s", humanb(cap).c_str(),
-                            humanb(pinned + mapped).c_str(), humanb(still).c_str());
+    /* The fewest snapshots the store means to hold, in bytes: the count below which prefix reuse
+     * is not worth the pinning. It is what the reserve below must not decide away, and it scales
+     * with the model's own state -- any hybrid's linear layers, any KV encoding's mirror -- since
+     * it is measured from this rank's slot and the host's own spare memory. */
+    const int64_t floor_slots =
+        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval),
+                          kCheckpointSlotsFloor);
+    const int64_t floor_bytes =
+        slot > INT64_MAX / std::max<int64_t>(floor_slots, 1) ? INT64_MAX : floor_slots * slot;
+    const int64_t asked = host_headroom_bytes();
+    int64_t margin = asked;
+    std::string limit, gave_way;
+    /* What the host can pin with `marg` held free: spare memory (MemAvailable and every memory
+     * cgroup), then the driver's own pin cap. Both are the host's own measurement, so a wider
+     * mirror, a bigger pool or a larger slot never needs a second rule here. */
+    auto room_with = [&](int64_t marg, std::string* why) {
+        int64_t r = lockable_bytes(still, marg, why);
+        if (!device_is_host()) {
+            bool lifted = false;
+            if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
+                int64_t pinned = 0, mapped = 0;
+                rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+                rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+                const int64_t left = std::max<int64_t>(cap - pinned - mapped - still, 0);
+                if (left < r) {
+                    r = left;
+                    *why = fmt("the amdgpu driver's pin cap of %s, of which this process holds %s "
+                               "and still pins %s", humanb(cap).c_str(),
+                               humanb(pinned + mapped).c_str(), humanb(still).c_str());
+                }
             }
         }
+        return r;
+    };
+    int64_t room = room_with(margin, &limit);
+    if (const int64_t keep = host_reserve_for_floor(floor_bytes, room, margin); keep < margin) {
+        /* The host has the bytes, but the reserve stood between them and a store that works.
+         * Take back exactly the shortfall and say so; a host that cannot pin the floor even
+         * then still gets the honest warning below. */
+        const int64_t wider = room_with(keep, &limit);
+        gave_way = fmt("; the host reserve gave back %s of its %s for the floor of %lld "
+                       "snapshot(s), holding %s", humanb(margin - keep).c_str(),
+                       humanb(asked).c_str(), (long long)floor_slots, humanb(keep).c_str());
+        room = wider;
     }
     const int64_t total = meminfo_bytes("MemTotal");
     const int64_t share = total > 0 ? total / 8 : room;
@@ -3122,19 +3150,19 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     else if (c.bound == CheckpointSlots::Bound::Room)
         bound = fmt("; %lld wanted, held to what the host can pin: %s", (long long)c.want,
                     limit.c_str());
-    decide("--checkpoint-slots", std::to_string(c.slots), need + bound);
+    decide("--checkpoint-slots", std::to_string(c.slots), need + bound + gave_way);
     if (c.slots == 0) {
-        RAD_WARN("checkpoint slots: auto finds no room for one %s snapshot of %s (%s), so every "
-                 "prefix hit on this model prefills from the start. Free host memory, or lower "
-                 "--host-pool-mib or --prefix-cache-mib", what, humanb(slot).c_str(),
-                 limit.c_str());
+        RAD_WARN("checkpoint slots: the host cannot pin one %s snapshot of %s: %s%s. Every prefix "
+                 "hit on this model prefills from the start. Free host memory, or lower "
+                 "--host-pool-mib, --prefix-cache-mib or --host-headroom-mib", what,
+                 humanb(slot).c_str(), limit.c_str(), gave_way.c_str());
         return RAD_OK;
     }
     const std::string line =
         fmt("checkpoint slots: auto: %lld %s snapshot(s) of %s in pinned host memory (%s), none of "
-            "it on the card; %s%s", (long long)c.slots, what, humanb(slot).c_str(),
-            humanb(slot * c.slots).c_str(), need.c_str(), bound.c_str());
-    if (c.bound == CheckpointSlots::Bound::Room) RAD_WARN("%s", line.c_str());
+            "it on the card; %s%s%s", (long long)c.slots, what, humanb(slot).c_str(),
+            humanb(slot * c.slots).c_str(), need.c_str(), bound.c_str(), gave_way.c_str());
+    if (c.slots < floor_slots || c.bound == CheckpointSlots::Bound::Room) RAD_WARN("%s", line.c_str());
     else RAD_INFO("%s", line.c_str());
     return RAD_OK;
 }
@@ -3265,7 +3293,14 @@ int Engine::configure_kv() {
             };
             if (!sized) return refuse("no host has");
             std::string why;
-            if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
+            /* The same reserve rule the sizing used, or a count that auto could fit by giving the
+             * reserve back would be refused a few lines after it was chosen. */
+            std::string guard_why;
+            const int64_t want_bytes = slot * n;
+            const int64_t marg = host_reserve_for_floor(
+                want_bytes, lockable_bytes(0, host_headroom_bytes(), &guard_why),
+                host_headroom_bytes());
+            if (!lockable_room(want_bytes, 0, marg, false, &why))
                 return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());

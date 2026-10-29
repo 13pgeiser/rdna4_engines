@@ -122,8 +122,7 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
                                       int64_t share_bytes, int64_t room_bytes) {
     CheckpointSlots c;
     c.per_seq = policy.held(ctx, interval) + 1;
-    const int64_t seqs = std::max<int64_t>(max_seqs, 1);
-    c.want = seqs > INT64_MAX / c.per_seq ? INT64_MAX : seqs * c.per_seq;
+    c.want = checkpoint_slots_want(policy, max_seqs, ctx, interval);
     if (slot_bytes <= 0) return c;
     const int64_t share = std::max<int64_t>(share_bytes, 0) / slot_bytes;
     const int64_t room = std::max<int64_t>(room_bytes, 0) / slot_bytes;
@@ -134,6 +133,24 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
         c.bound = CheckpointSlots::Bound::Room;
     }
     return c;
+}
+
+int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
+                              int64_t interval) {
+    const int64_t per = policy.held(ctx, interval) + 1;
+    const int64_t seqs = std::max<int64_t>(max_seqs, 1);
+    return seqs > INT64_MAX / per ? INT64_MAX : seqs * per;
+}
+
+int64_t host_reserve_for_floor(int64_t need_bytes, int64_t room_bytes, int64_t margin_bytes) {
+    if (need_bytes <= 0 || margin_bytes <= 0 || room_bytes >= need_bytes) return margin_bytes;
+    /* Whole MiB, the unit --host-headroom-mib takes, and the shortfall rounding up: the reserve
+     * gives back at least what the floor asked for, so the store is never a byte short of it. */
+    const int64_t mib = (int64_t)1 << 20;
+    const int64_t shortfall = (need_bytes - room_bytes + mib - 1) / mib;
+    const int64_t margin = margin_bytes / mib;
+    const int64_t keep = margin - shortfall;
+    return std::min(margin, std::max(kHostReserveFloor / mib, keep)) * mib;
 }
 
 /* ------------------------------------------------------------------ configure */
