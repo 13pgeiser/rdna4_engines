@@ -382,8 +382,8 @@ __device__ __forceinline__ unsigned int arq_load_acq(const unsigned int* p) {
 // HI8: ar_rmsnorm_had_quant_i8g, pass two in norm_quant_row's rotated int8 form. The reduction and
 // the norm are untouched, so `x`, the residual and `y` are ar_rmsnorm_quant_fp8's bytes.
 // PAD (wire 6 only): the row is whole 64-element groups but not whole chunks, so its last chunk is
-// padded and a chunk's elements are found by (row, chunk in row). Without it the flat index is the
-// element offset, the code a row of whole chunks has always run.
+// padded and a chunk's elements are found by (row, chunk in row). Without it, for a row of whole
+// chunks, the flat chunk index gives the element offset.
 template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false,
           bool PAD = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
@@ -393,7 +393,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
     unsigned int* seq_ctrs, char* loc_pack, long loc_scale_off, int M, uint32_t n, uint32_t nkb,
     float eps, float wadd, uint32_t r_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld,
-    int slot_stride16, int drain, int acq, unsigned int nbw) {
+    int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
     __shared__ float lds[THR / kWave];
     __shared__ unsigned int s_seq, s_slot;
     const int b = (int)blockIdx.x, nb = (int)gridDim.x;
@@ -412,14 +412,15 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   /* device-resident, replay-safe */
     const unsigned int sq = s_seq;
     int4* const ps = peer_base + (size_t)s_slot * slot_stride16;
-    const int4* const ms = my_base + (size_t)s_slot * slot_stride16;
+    const int4* ms = my_base + (size_t)s_slot * slot_stride16;
+    const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
     /* The slot is split as in the standalone compressed all-reduce: packed symbols from the base,
      * bf16 group scales from half way up. Group indices are global over the [M][n] message. */
     char* const p_pay = (char*)ps;
-    const char* const m_pay = (const char*)ms;
+    const char* m_pay = (const char*)ms;
     unsigned short* const p_sc =
         (unsigned short*)((char*)ps + (size_t)(slot_stride16 >> 1) * 16);
-    const unsigned short* const m_sc =
+    const unsigned short* m_sc =
         (const unsigned short*)((const char*)ms + (size_t)(slot_stride16 >> 1) * 16);
     /* This rank's own packed half, laid out like the peer slot (symbols from the base, scales from
      * `loc_scale_off`) and indexed by global chunk and group, so blocks never overlap. */
@@ -538,7 +539,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
             const int wpr = (int)(n >> 3);
             const int4* const m4 = (const int4*)ms;
             for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR)
-                h += r4d_archk_u4(m4[k], 4u * (unsigned)k);
+                h += r4d_archk_u4(r4d_archk_keep(&m4[k], md), 4u * (unsigned)k);
         } else {
             for (int ci = (int)wave; ci < cpb; ci += (int)(THR / ARQ_WV)) {
                 const int c = c00 + ci;
@@ -546,24 +547,33 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 const unsigned int cd = (unsigned)c * (ARQ_CBYTES / 4);
 #pragma unroll
                 for (int w4 = 0; w4 + 4 <= ARQ_NWORD; w4 += 4)
-                    h += r4d_archk_u4(*(const uint4*)(pb + w4 * 4 * ARQ_WV + lane * 16),
-                                      cd + (unsigned)(w4 * ARQ_WV) + lane * 4u);
+                    h += r4d_archk_u4(
+                        r4d_archk_keep((const uint4*)(pb + w4 * 4 * ARQ_WV + lane * 16), md),
+                        cd + (unsigned)(w4 * ARQ_WV) + lane * 4u);
                 if constexpr (ARQ_NWORD % 4 >= 2) {
-                    const uint2 u = *(const uint2*)(pb + (ARQ_NWORD & ~3) * 4 * ARQ_WV + lane * 8);
+                    const uint2 u = r4d_archk_keep(
+                        (const uint2*)(pb + (ARQ_NWORD & ~3) * 4 * ARQ_WV + lane * 8), md);
                     const unsigned int e = cd + (unsigned)((ARQ_NWORD & ~3) * ARQ_WV) + lane * 2u;
                     h += r4d_archk_mix(u.x, e) + r4d_archk_mix(u.y, e + 1u);
                 }
                 if constexpr (ARQ_NWORD % 2 == 1)
-                    h += r4d_archk_mix(*(const unsigned int*)(pb + (ARQ_NWORD - 1) * 4 * ARQ_WV + lane * 4),
-                                       cd + (unsigned)((ARQ_NWORD - 1) * ARQ_WV) + lane);
+                    h += r4d_archk_mix(
+                        r4d_archk_keep((const unsigned int*)(pb + (ARQ_NWORD - 1) * 4 * ARQ_WV +
+                                                             lane * 4), md),
+                        cd + (unsigned)((ARQ_NWORD - 1) * ARQ_WV) + lane);
 #pragma unroll
                 for (int t = 0; t < ARQ_ITERS; ++t) {
                     const int g = c * ARQ_CG + t * ARQ_GPW + gw;
-                    if (lig == 0) h += r4d_archk_mix(m_sc[g], R4D_ARCHK_U16 + (unsigned)g);
+                    if (lig == 0)
+                        h += r4d_archk_mix(r4d_archk_keep(&m_sc[g], md),
+                                           R4D_ARCHK_U16 + (unsigned)g);
                 }
             }
         }
     });
+    ms = r4d_archk_moved(ms, md);
+    m_pay = r4d_archk_moved(m_pay, md);
+    m_sc = r4d_archk_moved(m_sc, md);
 
     if constexpr (WIRE == 6) {
         /* Reduce: unpack both halves of every chunk this block owns, add in fp32, inverse-rotate,
@@ -889,7 +899,8 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                                    int M, int n, float eps, float wadd, int w_f32,
                                    int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                    int nblocks, int nthreads, int drain, int acq, int wire,
-                                   long loc_pack, long loc_scale_off, long wp, bool hi8) {
+                                   long loc_pack, long loc_scale_off, long wp, bool hi8,
+                                   long stage) {
     if (!x || !w || !q || !s) return -1;
     if (wp && !res) return -10;                  // a post-norm needs the stream
     if (hi8 && wp) return -11;
@@ -928,7 +939,7 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                        (unsigned int*)my_flags, (unsigned int*)seq_ctrs, (char*)loc_pack,        \
                        (long)loc_scale_off, M, (uint32_t)n,                                      \
                        (uint32_t)nkb, eps, wadd, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld, \
-                       (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw)
+                       (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw, stage)
 #define R4D_ARQ_H(wf, rs, T, W, PO, H)                                                           \
     do { if (pad) R4D_ARQ_HP(wf, rs, T, W, PO, H, (W == 6));                                     \
          else R4D_ARQ_HP(wf, rs, T, W, PO, H, false); } while (0)
@@ -962,11 +973,11 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
                                         int M, int n, float eps, float wadd, int w_f32,
                                         int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                         int nblocks, int nthreads, int drain, int acq, int wire,
-                                        long loc_pack, long loc_scale_off, long wp) {
+                                        long loc_pack, long loc_scale_off, long wp, long stage) {
     return ar_rmsnorm_quant_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs,
                                    slot_stride16, x, res, w, y, q, s, M, n, eps, wadd, w_f32,
                                    r_ld, y_ld, q_ld, s_ld, stream, nblocks, nthreads, drain, acq,
-                                   wire, loc_pack, loc_scale_off, wp, false);
+                                   wire, loc_pack, loc_scale_off, wp, false, stage);
 }
 
 // The same with had_quant_act_i8g's quantiser on the norm's pass (no post-norm).
@@ -976,11 +987,12 @@ extern "C" int r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, 
                                             int M, int n, float eps, float wadd, int w_f32,
                                             int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                             int nblocks, int nthreads, int drain, int acq,
-                                            int wire, long loc_pack, long loc_scale_off) {
+                                            int wire, long loc_pack, long loc_scale_off,
+                                            long stage) {
     return ar_rmsnorm_quant_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs,
                                    slot_stride16, x, res, w, y, q, s, M, n, eps, wadd, w_f32,
                                    r_ld, y_ld, q_ld, s_ld, stream, nblocks, nthreads, drain, acq,
-                                   wire, loc_pack, loc_scale_off, 0, true);
+                                   wire, loc_pack, loc_scale_off, 0, true, stage);
 }
 
 // ============================================================== the plugin ABI entry points

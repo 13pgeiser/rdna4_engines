@@ -64,6 +64,10 @@
 // Neither changes the arithmetic.
 #define O_QLD   134217728
 #define O_KVREP 268435456
+// TREE: a tree verify (attn_paged_qrow_tree; R4DArgs::spec_parent). A row whose entry is not -2
+// sees, inside its sequence's query block, only itself and its ancestors, and its window is
+// measured from the block's first position plus its depth. Compiled in only where a row asks.
+#define O_TREE  536870912
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
@@ -112,6 +116,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     static_assert(!V4 || (OPT & O_F16), "fp8_v4 widens to f16");
     constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
     constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
+    constexpr int TREE  = (OPT & O_TREE)  ? 1 : 0;
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
 
@@ -177,6 +182,16 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     if (t_lo >= ntl) return;
     const int t_hi = min(t_lo + tps, ntl);
 
+    // TREE: the block's parents staged once, so each row's walk below reads LDS rather than a
+    // chain of dependent global loads. Every early return above is uniform across the block.
+    __shared__ int s_tpar[TREE ? 64 : 1];
+    if constexpr (TREE) {
+        if (a.spec_parent) {
+            for (int r = tid; r < qlen && r < 64; r += NTHR) s_tpar[r] = a.spec_parent[qoff + r];
+            __syncthreads();
+        }
+    }
+
     const int row = warp * 16 + c;
     const int qi = row / GQA, hi = row - qi * GQA;
     const bool live = (qi < qlen);
@@ -214,8 +229,28 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     const int klimit = cz ? pos
                           : ((WIN && a.window > 0) ? min(ctx - 1, pos + a.window - 1)
                                                    : ctx - 1);
-    const int wlo    = (WIN && a.window > 0) ? (pos - a.window + 1 > 0
-                                               ? pos - a.window + 1 : 0) : 0;
+    // A tree verify's row (TREE): a bit per row of the block for itself and each ancestor, and
+    // its depth, from which its window is measured. Parents precede children, so the walk ends.
+    const int tbase = ctx - qlen;
+    uint64_t tmask = 0;
+    int tdep = 0;
+    bool trow = false;
+    if (TREE && a.spec_parent && qrow < 64) {
+        int pj = s_tpar[qrow];
+        if (pj != -2) {
+            trow  = true;
+            tmask = 1ull << qrow;
+            for (int at = qrow; pj >= 0 && pj < at; ) {
+                tmask |= 1ull << pj;
+                ++tdep;
+                at = pj;
+                pj = s_tpar[pj];
+            }
+        }
+    }
+    const int wpos   = (TREE && trow) ? tbase + tdep : pos;
+    const int wlo    = (WIN && a.window > 0) ? (wpos - a.window + 1 > 0
+                                               ? wpos - a.window + 1 : 0) : 0;
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
@@ -482,10 +517,13 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo))) {
+            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo)) ||
+                (TREE && wave_any(trow && kbase + 7 >= tbase))) {
                 #pragma unroll
                 for (int e = 0; e < 8; ++e)
-                    sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo))
+                    sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo) &&
+                             (!TREE || !trow || kbase + e < tbase ||
+                              ((tmask >> (kbase + e - tbase)) & 1ull)))
                           ? sc[e] : -INFINITY;
             }
             float smax = sc[0];

@@ -1857,6 +1857,35 @@ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
         CHECK_OK(kv.configure(g, cfg, p.kv()));
         CHECK(!kv.has_window_snapshot());
         CHECK_EQ(kv.checkpoint_bytes(), 0ll);
+        CHECK(!kv.drafter_window_snapshot());
+    }
+    {   /* the same, where the engine saves behind the drafter's context pass: the drafter's window
+         * rides in the snapshot, every page of it */
+        std::vector<KVGroupInfo> g = hybrid_groups(/*with_linear=*/false);
+        w.drafter = true;
+        g.push_back(w);
+        Pools p;
+        CHECK_OK(configure_pools(p, cfg));
+        KVManager kv;
+        kv.set_drafter_window_snapshot(true);
+        CHECK_OK(kv.configure(g, cfg, p.kv()));
+        CHECK(kv.has_window_snapshot());
+        CHECK(kv.drafter_window_snapshot());
+        const KVGroupPlan* d = kv.plan((int32_t)g.size() - 1);
+        REQUIRE(d && d->win_snap && d->drafter);
+        CHECK_EQ(kv.checkpoint_bytes(), d->window_blocks * d->bytes_per_block);
+    }
+    {   /* beside linear state the flag changes nothing: a hit there re-prefills the window */
+        std::vector<KVGroupInfo> g = hybrid_groups();
+        w.drafter = true;
+        g.push_back(w);
+        Pools p;
+        CHECK_OK(configure_pools(p, cfg));
+        KVManager kv;
+        kv.set_drafter_window_snapshot(true);
+        CHECK_OK(kv.configure(g, cfg, p.kv()));
+        CHECK(!kv.has_window_snapshot());
+        CHECK(!kv.drafter_window_snapshot());
     }
 }
 
@@ -2364,6 +2393,64 @@ TEST(a_capped_lookup_lands_on_a_checkpoint_at_or_below_the_cap) {
     CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 320);
 }
 
+/* tip-only under a drafter whose KV the cache does not hold (--draft-refill): a hit must end the
+ * drafter's window before the prompt's end, on a snapshot no more than max_give_back below the tip.
+ * Keeping the tip alone leaves no such snapshot once retention runs, the capped lookup keeps the
+ * whole hit, and the request decodes without drafts (measured: 8 x 22k-token sessions, 5 of 8 ran
+ * unspeculated, decode 424-521 t/s against 738-754 under geometric backoff). With the floor set,
+ * the policy also keeps the deepest snapshot at or below tip - floor. */
+TEST(tip_only_keeps_a_snapshot_below_the_drafter_floor) {
+    std::vector<int64_t> keep;
+    KeepTipOnly bare;
+    bare.select({64, 128, 192, 256}, &keep);
+    CHECK_EQ(keep.size(), (size_t)1);
+    CHECK_EQ(keep[0], 256ll);
+
+    KeepTipOnly floored;
+    floored.set_floor(100);
+    floored.select({64, 128, 192, 256}, &keep);
+    CHECK_EQ(keep.size(), (size_t)2);
+    CHECK_EQ(keep[0], 128ll);                 /* the deepest at or below 256 - 100 */
+    CHECK_EQ(keep[1], 256ll);
+    floored.select({200, 256}, &keep);        /* nothing below the floor: the tip alone */
+    CHECK_EQ(keep.size(), (size_t)1);
+    CHECK_EQ(floored.held(4096, 64), 2ll);
+    CHECK_EQ(bare.held(4096, 64), 1ll);
+}
+
+TEST(a_refill_capped_hit_after_tip_only_retention_still_gives_the_drafter_its_window) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    f.pc.set_policy(std::make_unique<KeepTipOnly>());
+    f.pc.set_drafter_floor(100);
+    auto prompt = tok_run(7000, 336);
+    publish(f, 1, prompt, 320);
+    const std::vector<BlockHash> hs = chain_of(prompt);
+    for (int64_t pos = 64; pos <= 256; pos += 64) {
+        f.pc.begin_step();
+        ckpt_at(f, 1, hs, pos);
+    }
+    /* Another session's reservation finds the store full: retention runs over every session. */
+    auto other = tok_run(90000, 128);
+    const std::vector<BlockHash> ho = chain_of(other);
+    f.pc.begin_step();
+    int32_t s = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(2, 64, ho[3], &s));
+    const std::vector<int64_t> left = f.pc.checkpoints(1);
+    CHECK_EQ(left.size(), (size_t)2);
+    CHECK_EQ(left[0], 128ll);
+    CHECK_EQ(left[1], 256ll);
+
+    /* Scheduler::admit_one's cap for a drafter window of 100: end the hit 100 before the prompt's
+     * end, give back at most 200. */
+    HitCap cap;
+    cap.tokens = (int64_t)prompt.size() - 100;
+    cap.max_give_back = 200;
+    const CacheHit c = f.pc.lookup(prompt, {}, nullptr, &cap);
+    CHECK_EQ(c.n_linear_tokens, 128);
+    CHECK_EQ(c.given_back, 128);
+}
+
 /* A checkpoint at a prompt's tail, off the interval, is one the next turn resumes from: lookup
  * takes the deepest snapshot under the hit at any block boundary. */
 TEST(a_checkpoint_at_the_tail_of_a_prompt_is_found_and_the_deepest_wins) {
@@ -2430,8 +2517,8 @@ TEST(checkpoint_interval_must_be_a_block_multiple) {
  * A model can keep KV at different strides: DeepSeek-V4's compressed attention stores one row per
  * r tokens (a block of r) beside groups at one row a token. The cache indexes every such group at
  * the lcm of their blocks, an entry holding lcm / B blocks of a B-token group, so a hit ends on a
- * block of each and adopt() takes every group. Leaving the finer groups out left the trunk a hole
- * the scheduler refuses every hit for.
+ * block of each and adopt() takes every group. A group left out would leave the trunk a hole, and
+ * the scheduler refuses every hit on such a model.
  */
 static KVGroupInfo gdn_group(std::vector<int32_t> layers) {
     KVGroupInfo k;

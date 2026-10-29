@@ -4705,8 +4705,8 @@ TEST(the_gemma4_e4b_form_replicates_kv_heads_at_four_ranks) {
 
 /* A double-wide MLP is per layer: layers 0..7 declare gate_up [2F, E] and down [E, F] with F =
  * intermediate_size, layers 8..11 [4F, E] and [E, 2F], and every activation op carries its layer's
- * width. The shared `gate_up` and `ffn` buffers hold the widest layer, so a narrow layer's slice
- * keeps the wide row pitch. */
+ * width. The narrow layers use the `gate_up` and `ffn` buffers and the wide ones `gate_up_wide`
+ * and `ffn_wide`, each at its own row width. */
 TEST(a_gemma4_e2b_form_declares_the_double_wide_layers) {
     RadBuilder b;
     RadModelMeta meta = gemma4_e2b_meta();
@@ -7118,6 +7118,52 @@ TEST(gemma4_31b_dflash2_folds_both_passes_prologues) {
             CHECK_EQ(count_issued(ops, "rope"), off ? (p == 0 ? L : 2 * L) : 0);
         }
     }
+}
+
+/* The block-16 DFlash2 drafter (the DBloom fine-tune) as a tree: its query pass also runs at its
+ * short block of 8 rows (rad_drafter_short_block), whose selector grows a 7-node tree at an anchor
+ * stride of 8, beside its own block's 15 at 16; a block it has no ops for fails the step. A
+ * 7-node tree over the block-16 drafter (--num-speculative-tokens 7) declares the same short
+ * block. At block 8 the drafter declares none. */
+TEST(gemma4_31b_dflash2_block16_tree_runs_its_short_block) {
+    for (int b16 = 0; b16 < 3; ++b16)
+        for (int world : { 1, 4 }) {
+            G431Df2 f;
+            for (size_t i = 0; i < f.keys.size(); ++i)
+                if (!std::strcmp(f.keys[i], "draft.block_size")) f.vals[i] = b16 ? "16" : "8";
+            const int64_t own = b16 == 2 ? 7 : b16 ? 15 : 7;   /* the tree's nodes */
+            const RadModelMeta meta = f.meta();
+            RadBuilder b;
+            g431df2_encs(b, true);
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = (int)own;
+            ctx.draft_tree = 1;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.drafter_parents != 0);
+            CHECK_EQ(b.drafter_short, b16 ? 8 : 0);
+            const int64_t full = b16 ? 16 : 8;
+            std::vector<int64_t> blocks = { full };
+            if (b16) blocks.push_back(8);
+            for (int64_t rows : blocks) {
+                const auto qry = query_pass(b, 2, rows, rows - 1);
+                const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, world);
+                REQUIRE(steps_ok(v));
+                int64_t nodes = -1, stride = -1, n_tree = 0;
+                for (const RecIssue& is : v[0]->issues)
+                    if (const RecOp* o = b.op_of(is.op); o && o->op == "dflash_tree") {
+                        nodes = pint(o, "nodes");
+                        stride = pint(o, "anchor_stride");
+                        ++n_tree;
+                    }
+                CHECK_EQ(n_tree, 1);
+                CHECK_EQ(nodes, std::min<int64_t>(own, rows - 1));
+                CHECK_EQ(stride, rows);
+            }
+            const auto qbad = query_pass(b, 2, 4, 3);
+            const auto vb = run_passes(b, gemma4_bf16::step, { qbad.get() }, 0, world);
+            CHECK(!vb[0]->step_fail.empty());
+        }
 }
 
 /* DFlash2's query pass issues each residual add with the norm after it, as one add_rmsnorm where it

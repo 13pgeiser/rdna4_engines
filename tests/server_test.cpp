@@ -2848,6 +2848,7 @@ TEST(the_live_view_prints_ordinary_lines_when_it_is_not_a_terminal) {
      * GEMM streaming across the link. */
     s.experts.routed = 200; s.experts.routed_resident = 150;
     s.link.stream_bytes = 700;
+    s.link.kv_streaming = true; s.link.kv_stream_bytes = 600;
 
     /* A pipe is not a terminal, so the constructor picks the line renderer and the frame must
      * contain no escape sequence: a log full of cursor-home codes is ungreppable, and the breakage
@@ -2871,11 +2872,12 @@ TEST(the_live_view_prints_ordinary_lines_when_it_is_not_a_terminal) {
     /* Hit rate is not residency: 37.50% of the units are in VRAM and 75% of the routing found one
      * there, which is the placement working. Both numbers, since either alone misleads. */
     CHECK(line.find("hit=75.00%") != std::string::npos);
-    /* The link, cumulative, with all three of the things that share it. */
+    /* The link, cumulative, with all four of the things that share it. */
     CHECK(line.find("link ar=5000") != std::string::npos);
     CHECK(line.find("h2d=900") != std::string::npos);
     CHECK(line.find("d2h=800") != std::string::npos);
     CHECK(line.find("stream=700") != std::string::npos);
+    CHECK(line.find("kv=600") != std::string::npos);
     CHECK(line.back() == '\n');
 
     /* The terminal renderer is the one that may use escapes, and it colours by tier. */

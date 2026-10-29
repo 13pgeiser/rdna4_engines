@@ -272,11 +272,15 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     for (const auto& p : plans_) if (p.stateful()) checkpoint_bytes_ += p.bytes_per_state;
     /* Then the window behind a checkpoint, after the linear state (see has_window_snapshot). A
      * trunk's window rides in the slot whether or not linear state is beside it: a hit resumes at
-     * a snapshot either way, and without the window there it could not resume at all. */
+     * a snapshot either way, and without the window there it could not resume at all. A drafter's
+     * window rides there only on a model without linear state (set_drafter_window_snapshot). */
+    bool has_state = false;
+    for (const auto& p : plans_) has_state = has_state || p.stateful();
     for (size_t i = 1; i < plans_.size(); ++i) {
         KVGroupPlan& p = plans_[i];
-        p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 &&
-                     !p.runtime_win && !groups[i].drafter;
+        p.drafter = groups[i].drafter;
+        p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 && !p.runtime_win &&
+                     (!groups[i].drafter || (snap_drafter_ && !has_state));
         if (p.win_snap && !p.zero && p.n_layers > 0)
             window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
     }

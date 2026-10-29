@@ -127,6 +127,10 @@ public:
      * of the store. The base applies select() to its own output one checkpoint at a time, which
      * is cheap only for a policy that keeps few. */
     virtual int64_t held(int64_t ctx, int64_t interval) const;
+    /* Tokens before the tip a hit must be able to end at: a drafter whose KV the cache does not
+     * hold recomputes that much of the prompt's tail (Scheduler::init, HitCap). 0: none. A policy
+     * that would otherwise keep nothing that deep keeps one snapshot there. */
+    virtual void set_floor(int64_t) {}
 };
 
 /* Keep the tip and, at every scale S = interval x 2^k, the shallowest checkpoint in the tip's
@@ -146,12 +150,18 @@ private:
     int64_t interval_;
 };
 
-/* The two ends of the trade, for comparison. */
+/* The two ends of the trade, for comparison. tip-only under a drafter floor also keeps the deepest
+ * snapshot at or below tip - floor: without it a refill-capped hit finds nothing to end on, keeps
+ * the whole hit, and the request decodes with no drafts (8 sessions of 22k tokens: 5 ran
+ * unspeculated, decode 424-521 t/s against 738-754 under geometric backoff). */
 class KeepTipOnly final : public CheckpointPolicy {
 public:
     const char* name() const override { return "tip-only"; }
     void select(const std::vector<int64_t>& positions, std::vector<int64_t>* keep) const override;
-    int64_t held(int64_t, int64_t) const override { return 1; }
+    int64_t held(int64_t, int64_t) const override { return floor_ > 0 ? 2 : 1; }
+    void set_floor(int64_t tokens) override { floor_ = tokens > 0 ? tokens : 0; }
+private:
+    int64_t floor_ = 0;
 };
 class KeepAll final : public CheckpointPolicy {
 public:
@@ -255,6 +265,8 @@ public:
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
      * tests). Call after configure(), which would undo it. */
     void set_policy(std::unique_ptr<CheckpointPolicy> p);
+    /* The drafter's refill window (CheckpointPolicy::set_floor), held across set_policy. */
+    void set_drafter_floor(int64_t tokens);
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -445,7 +457,7 @@ private:
     struct Entry {
         /* blocks_per_entry(i) per cached group, in groups_ order: entry_groups_[k] owns blocks[k] */
         std::vector<int32_t> blocks;
-        std::vector<int32_t> tokens;    /* the block's token ids, compared on hit */
+        std::vector<int32_t> tokens;    /* the entry's token ids, compared on hit */
         /* On the LRU exactly while the cache holds the blocks; `lru` is valid only then. An
          * off-device entry owns no block, so eviction must not reach it. */
         bool in_lru = false;
@@ -551,6 +563,7 @@ private:
     }
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;
+    int64_t drafter_floor_ = 0;
     mutable Stats stats_;
     std::string report_;
 };

@@ -400,6 +400,10 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
+     * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
+    bool           drafter_tree = false;
+    rad_buf        drafter_parents = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -708,6 +712,9 @@ struct Request {
      * (SchedReq owns this Request, so it outlives it) and is written alongside n_draft. Null when
      * n_draft is 0. */
     const int32_t*       draft = nullptr;
+    /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
+     * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
+    const int32_t*       draft_parent = nullptr;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -858,6 +865,9 @@ struct Config {
     TablePlacement embedding_placement = TablePlacement::Ram;
     bool           embedding_placement_given = false;
     TablePlacement ngram_placement     = TablePlacement::Auto;
+    /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
+     * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
+    std::string    ngram_share_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
@@ -898,13 +908,15 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
-    /* --prefix-resume exact|nearest. Exact (the default) resumes a prefix hit only on the grid an
-     * idle server's cold prefill chunks the same prompt on (ChunkGeometry::grid), and takes a
-     * prompt's tail snapshot where its last chunk starts: the hit recomputes the cold run's own
-     * chunks, so its output is the cold run's bit for bit, where a kernel rounds a row differently
-     * at another chunk length. Nearest resumes at the deepest snapshot or block, a prompt's tail
-     * snapshot at its last quantum boundary: up to a chunk less re-prefilled a turn, and a hit that
-     * can differ from a cold run in the last bits (a near-tie in greedy text). */
+    /* --prefix-resume exact|nearest.
+     * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
+     *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
+     *   where its last chunk starts. The hit recomputes the cold run's own chunks, so its output
+     *   is the cold run's bit for bit even where a kernel rounds a row differently at another
+     *   chunk length.
+     * - nearest: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is
+     *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
+     *   differ from a cold run in the last bits (a near-tie in greedy text). */
     bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
@@ -944,8 +956,10 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
-     * the step just run; 0 never. Ignored without a drafter that declares one. */
-    int64_t draft_short_from = 0;       /* --draft-short-from */
+     * the step just run; 0 never. -1, auto: never for a chain, and from two for a tree
+     * (rad_drafter_tree), whose nodes are verify rows every drafting sequence pays for. Ignored
+     * without a drafter that declares a short block. */
+    int64_t draft_short_from = -1;      /* --draft-short-from */
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify
@@ -1087,10 +1101,10 @@ struct Config {
      * share, keeping them resident: heat never demotes them. 0 is off. */
     float   expert_pin_top = 0.0f;
     bool    expert_pin_top_given = false;
-    /* --draft-expert-placement auto|host: a draft head's (MTP/DSpark) routed experts are pinned in
-     * the host pool before any strategy runs, streamed in place like a pooled expert. `auto` (the
-     * default) leaves them to the strategy. `host` is what lets a drafter's experts fit beside a
-     * trunk that already fills the card. */
+    /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
+     * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
+     * beside a trunk that already fills the card. `auto` (the default) leaves them to the
+     * strategy. */
     std::string draft_expert_placement = "auto";
     bool    draft_expert_placement_given = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */

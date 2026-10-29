@@ -159,11 +159,11 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
         if (fk == 128u)
             return nt == 1u ? 16u : nt == 2u ? (full ? 16u : 12u) : nt == 3u ? 10u
                  : (full && mw >= 8u) ? 10u : 9u;
-        /* The gated three-tile form at 8, not 9. At 9 waves' 168 registers its epilogue spilled
-         * 57 at the full tile (48 rows), which ran gate_up 51 % slower than 56 rows, and 10 below
-         * it, 70 with the LDS-staged scales. 8 waves leave 192, where it spills 9 and 10. The gated
-         * form is always MW 16, four waves a SIMD a block, so 8 and 9 both hold two blocks a WGP:
-         * no occupancy is lost. */
+        /* The gated three-tile form pins 8 waves, not 9. At 9 waves (168 registers) its epilogue
+         * spills 57 registers at the full tile (48 rows) and 10 below it, 70 with the LDS-staged
+         * scales; the full-tile spill makes gate_up 51% slower than at 56 rows. At 8 waves (192
+         * registers) it spills 9 and 10. The gated form is always MW 16, four waves a SIMD a
+         * block, so 8 and 9 waves both hold two blocks a WGP and no occupancy is lost. */
         return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? (gated ? 8u : 9u)
              : mw == 4u ? 7u : 8u;
     }
@@ -171,7 +171,7 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
         return nt == 1u ? 16u : nt == 2u ? (full ? 10u : 12u) : nt == 3u ? (full ? 9u : 10u)
              : full ? 7u : 9u;
     /* 10, not 12. The fold's LDS-staged scales (gemm_fp8a8_kernel) need a few more
-     * registers than 12 waves' 120 leave, and spilled. gfx12 allocates registers 24 at a time, so
+     * registers than the 120 that 12 waves leave, and spill there. gfx12 allocates registers 24 at a time, so
      * 11 waves leave 120 as well and 10 is the next step (144). No decode shape puts more than 8 of
      * these waves on a SIMD, so the lower pin costs no occupancy. */
     if (nt == 1u) return 10u;
@@ -294,16 +294,15 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             afrag + (size_t)(arow * ksuper + st) * r4d_fp8::kTileBytes, alive && st < ksuper);
     }
 
-    /* The fold's scales are staged through LDS a K tile ahead, beside the B tile. The
-     * fold loaded them itself, after the next tile's prefetch had been issued; loads return in
-     * order, so each fold waited for that whole prefetch, twice a tile at FK = 256, and the "one
-     * tile ahead" overlapped nothing. Now the block's threads each load one weight-scale dword and
-     * one activation scale of tile c0+FK with its B prefetch (a few each only in the selftest's
-     * one- and two-wave pins) and store them at the top of the next pass with the B tile, so a fold
-     * reads LDS. Two registers a thread: holding a tile's scales a lane (8 + 2*NT registers)
-     * spilled at the decode shapes' register pins. Same values as before: bit-identical. A dead
-     * wave's fp8 block scale reads as 0 instead of the plane row past the end it used to read; its
-     * rows are never stored.
+    /* The fold's scales are staged through LDS one K tile ahead, beside the B tile. A fold that
+     * loaded its own scales after the next tile's prefetch was issued would wait for that whole
+     * prefetch (loads return in order), twice a tile at FK = 256. Instead each thread loads one
+     * weight-scale dword and one activation scale of tile c0+FK with its B prefetch (a few each
+     * only in the selftest's one- and two-wave pins) and stores them with the B tile at the top of
+     * the next pass, so a fold reads LDS. That costs two registers a thread; holding a tile's
+     * scales per lane (8 + 2*NT registers) spills at the decode shapes' register pins. The staged
+     * values are the ones a direct load reads, so results are bit-identical. A dead wave's fp8
+     * block scale reads as 0; its rows are never stored.
      *
      * A tile holds kFolds = FK / kBlock scale blocks, and the fold at `ks` uses block ks / kBlock
      * of its tile. s_ws: I8, each wave's 16 bf16 row scales a block, [MW][kFolds][8] dwords
@@ -647,12 +646,10 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             const float* const w0 = (const float*)Y;
             uint16_t* const cy = (uint16_t*)C;
             /* Consecutive threads take consecutive weight rows, which are adjacent in a
-             * partial plane ([nb][rows]), four rows a thread as one 16-byte load and kFinU quads in
-             * flight at each z. The loop walked the token index fastest, `rows` floats apart, one
-             * element a thread at a time: a cache line a load and a round trip each, which at
-             * N = 512, M = 64 (four columns of blocks finishing 8,192 elements over four planes)
-             * was most of a 45 us call. Each element is still summed from 0.0f in ascending z:
-             * bit-identical. */
+             * partial plane ([nb][rows]): four rows a thread as one 16-byte load, kFinU quads in
+             * flight at each z. Walking the token index fastest would put consecutive threads
+             * `rows` floats apart, a cache line and a round trip per element. Both branches sum
+             * each element from 0.0f in ascending z, so they are bit-identical. */
             const uint32_t nr = rhi - rlo;
             const size_t zs = (size_t)rows * nb;
             if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u

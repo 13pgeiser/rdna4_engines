@@ -363,6 +363,7 @@ struct FakePC : IPrefixCache {
     FakeKV* kv = nullptr;
     int32_t attn = 0, lin = 0, src = -1;
     int32_t branch_at = 0;       /* CacheHit::branch_at, as the real cache reports it */
+    int64_t drafter_floor = -1;  /* set_drafter_floor's last value, -1 never called */
     int32_t next_slot = 0;
     int32_t reserved = 0;
     int64_t evicted = 0, ckpt_evicted = 0;
@@ -427,6 +428,7 @@ struct FakePC : IPrefixCache {
         return h;
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
+    void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }
 
     /* What the scheduler published and asked to be evicted, recorded rather than acted on: these
      * tests check that the scheduler publishes before it frees and evicts before it preempts, not

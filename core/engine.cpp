@@ -109,6 +109,8 @@ Engine::~Engine() {
     table_copies_.clear();
     for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
     card_copies_.clear();
+    for (TableShare& t : table_shares_) table_share_close(&t);
+    table_shares_.clear();
     rad_tools_registry().close();
 }
 
@@ -553,6 +555,14 @@ int Engine::step_loop() {
     pipelining_ = !cfg_.kld() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     early_ids_ = !cfg_.kld() && !embedding_;
+    /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
+     * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
+     * it keeps a tree from running unverified should another path turn pipelining off. */
+    if (tree_ && !pipelining_) {
+        RAD_ERR("speculation: drafter '%s' proposes trees, which are verified only on steps issued "
+                "ahead, and this server issues none; ask the plugin for a chain", drafter_.name);
+        return fail_loop(RAD_E_UNSUPPORTED);
+    }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -788,46 +798,11 @@ int Engine::step_loop() {
             return fail_loop(st);
         }
 
-        /* Snapshot after the step that produced the state: the chunker ended this chunk at the
-         * checkpoint position, so copy 0 holds exactly that state. The copy to the host slot is
-         * issued before collect_step's readback and before any step issued ahead, which orders the
-         * next write of the state after it. Under the scheduler's lock, as the restore. */
-        bool any_save = false;
-        for (const StepEntry& e : plan.e)
-            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
-        if (any_save) {
-            const int ss = sched_.locked([&]() -> int {
-                for (const StepEntry& e : plan.e) {
-                    if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
-                    if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the checkpoint position. The chunk ending there still
-                     * holds it, so a miss is a broken invariant; skipping would commit a slot
-                     * holding another sequence's pages. */
-                    if (ranks_[0]->kv.has_window_snapshot() &&
-                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
-                                                   &ckpt_win_)) {
-                        RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
-                                (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
-                        return RAD_E_STATE;
-                    }
-                    for (auto& rk : ranks_) {
-                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                        const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                             (int)ckpt_slots_.size(),
-                                                             e.ckpt_slot, rk->ctx.stream(),
-                                                             &ckpt_win_);
-                        if (s < 0) {
-                            RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
-                                    "%d: %s", rk->index, (unsigned long long)e.seq,
-                                    (int)e.ckpt_slot, rad_strerror(s));
-                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                            return s;
-                        }
-                    }
-                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                }
-                return RAD_OK;
-            });
+        /* Snapshot after the step that produced the state (save_checkpoints). Where a block
+         * drafter's window rides in the snapshot, its context pass must store the step's rows
+         * first, so the card's driver saves right behind that pass instead. */
+        if (!(block_drafting() && drafter_snap_)) {
+            const int ss = save_checkpoints();
             if (ss < 0) return fail_loop(ss);
         }
 
@@ -902,6 +877,7 @@ int Engine::step_loop() {
             res.lp        = so.lp.data();
             res.first_row = so.first_row.data();
         }
+        res.path = so.path.empty() ? nullptr : so.path.data();
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
@@ -1164,6 +1140,57 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* Snapshot after the step that produced the state. Linear state is what the chunk's last token
+ * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
+ * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
+ * (plan_chunk) and are still held when it ends. The copy to the host slot is issued before
+ * collect_step's readback and before any step issued ahead, which orders the next write of the
+ * state after it. Under the scheduler's lock, as the restore. A block drafter's window in the
+ * snapshot (drafter_snap_) is saved behind the drafter's context pass (issue_block_drafter),
+ * which writes only the drafter's groups. */
+int Engine::save_checkpoints() {
+    const StepPlan& plan = sched_.plan();
+    bool any_save = false;
+    for (const StepEntry& e : plan.e)
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
+    if (any_save) {
+        const int ss = sched_.locked([&]() -> int {
+            for (const StepEntry& e : plan.e) {
+                if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
+                if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+                /* The window behind the checkpoint position. This step's chunk reaches it, and
+                 * a window slides only from a step's first query, so a miss is a broken
+                 * invariant; skipping would commit a slot holding another sequence's pages. */
+                if (ranks_[0]->kv.has_window_snapshot() &&
+                    !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
+                                               &ckpt_win_)) {
+                    RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
+                            (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
+                    return RAD_E_STATE;
+                }
+                for (auto& rk : ranks_) {
+                    if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
+                                                         (int)ckpt_slots_.size(),
+                                                         e.ckpt_slot, rk->ctx.stream(),
+                                                         &ckpt_win_);
+                    if (s < 0) {
+                        RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
+                                "%d: %s", rk->index, (unsigned long long)e.seq,
+                                (int)e.ckpt_slot, rad_strerror(s));
+                        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                        return s;
+                    }
+                }
+                if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+            }
+            return RAD_OK;
+        });
+        if (ss < 0) return ss;
+    }
+    return RAD_OK;
+}
+
 /* Scored rows (Request::token_scores): the logits row at a scored prompt's last position, copied
  * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
  * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
@@ -1235,10 +1262,11 @@ int Engine::collect_scored_rows() {
 /* One sampled row's logprobs into the step's table, sized on first use. A non-finite row
  * (RAD_E_INVAL) is left at token -1, and the scheduler fails only that request. A row outside the
  * step, or never staged for logprobs, is an engine error. */
-int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token) {
+int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
     if (so.lp.empty()) so.lp.resize((size_t)so.n_rows);
-    if (row < 0 || row >= so.n_rows) return RAD_E_STATE;
-    TokenLogprobs& lp = so.lp[(size_t)row];
+    if (at < 0) at = row;
+    if (row < 0 || row >= so.n_rows || at >= so.n_rows) return RAD_E_STATE;
+    TokenLogprobs& lp = so.lp[(size_t)at];
     const int s = ranks_[0]->sampler.logprobs_for(row, token, &lp);
     if (s == RAD_E_INVAL) { lp = TokenLogprobs{}; return RAD_OK; }
     return s;
@@ -1252,6 +1280,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
+    so.path.clear();
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
@@ -1302,7 +1331,16 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             if (!e.req) continue;
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
-            RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            /* A tree step verifies every proposal as a tree (a chain one as the chain-shaped
+             * tree), as the card's acceptance does; `path` names the accepted nodes. */
+            int32_t path[RAD_SCHED_MAX_SPEC] = { 0 };
+            const bool tree = plan.spec_is_tree;
+            if (tree)
+                RAD_TRY(accept_tree(e.draft, e.draft_parent, e.n_spec,
+                                    &so.rows[(size_t)so.first_row[i]], out, path, &acc));
+            else
+                RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out,
+                                      &acc));
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
@@ -1313,11 +1351,19 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            if (tree) {
+                if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
+                for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
+            }
             /* Each emitted token's logprobs come from its own row, the distribution it was drawn
-             * from. */
+             * from: on a tree, the row of the node it follows. They are filed as the entry's j-th
+             * emitted token (StepResult::lp), whichever row they came from. */
             if (e.req && e.req->sp.n_probs >= 0)
-                for (int32_t j = 0; j <= acc; ++j)
-                    RAD_TRY(row_logprobs(so, so.first_row[i] + j, out[j]));
+                for (int32_t j = 0; j <= acc; ++j) {
+                    const int32_t from = tree && j > 0 ? path[j - 1] : j;
+                    RAD_TRY(row_logprobs(so, so.first_row[i] + from, out[j],
+                                         so.first_row[i] + j));
+                }
             /* Advance the grammar over every emitted token, accepted drafts included, up to the
              * truncated `acc`, so it sees exactly what the client sees. */
             if (e.req)
@@ -2351,6 +2397,12 @@ int Engine::run_server() {
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
             s.link.ssd_bytes = s.link.prefetched = s.link.prefetch_bytes = 0;
             s.link.stream_bytes = s.link.staged_bytes = 0;
+            s.link.kv_stream_bytes = 0;
+            s.link.kv_streaming = cfg_.kv_resident > 0;   /* zeroed here if the arch refused it */
+            /* The ring's depth, not the flag: KVStreamStats::resident_blocks sums the device pool
+             * of every group that really runs a window under its context, so this is zero when
+             * --kv-resident was asked for and nothing streams anyway. */
+            s.link.kv_stream_active = ranks_[0]->kv.stream_stats().resident_blocks > 0;
             for (const auto& rk : ranks_) {
                 const MoverStats rms = rk->mover.stats();
                 s.link.h2d_bytes      += (int64_t)rms.h2d_bytes;
@@ -2362,6 +2414,13 @@ int Engine::run_server() {
                 s.link.staged_bytes   += (int64_t)rms.staged_bytes;
                 if (rk->heat.enabled()) s.link.stream_bytes += (int64_t)rk->heat.stats().stream_bytes;
             }
+            /* KV streaming: only rank 0's resolve counters are read -- every rank sees the same
+             * misses by design -- so the figure takes the world factor to reach all cards, the
+             * way the summed move rows sit there. The counters ride the step's ctl read; nothing
+             * here costs a step. */
+            if (s.link.kv_streaming)
+                s.link.kv_stream_bytes =
+                    (int64_t)ranks_[0]->kv.stream_stats().bytes_in * (int64_t)ranks_.size();
         }
     };
 

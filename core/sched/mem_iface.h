@@ -172,10 +172,14 @@ struct IPrefixCache {
 
     /* Longest cached prefix, plus the checkpoint covering the linear state for a prefix of it.
      * `blocks_out` receives block ids per cached group, in cached_groups() order, for
-     * IKVManager::adopt: n_attn_tokens over the group's own block size of them. `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
+     * IKVManager::adopt: n_attn_tokens over the group's own block size of them. `cap`, when not
+     * null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
     virtual const std::vector<int32_t>& cached_groups() const = 0;
+    /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
+     * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
+    virtual void set_drafter_floor(int64_t) {}
 
     /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
      * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
@@ -472,6 +476,7 @@ struct PCBinding final : IPrefixCache {
     }
     void release(const Request& r) override { m->release(r.id); }
     const std::vector<int32_t>& cached_groups() const override { return m->cached_groups(); }
+    void set_drafter_floor(int64_t tokens) override { m->set_drafter_floor(tokens); }
 
     /* Indexes prompt ++ output: the next turn sends the reply back in its prompt, so indexing the
      * prompt alone would stop hitting at the first assistant token. */

@@ -1052,14 +1052,19 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
  * extent, is 1024. 90ede42 read the parameter, trimmed a 2048-key context to 0, and the attention
  * over slice A's rows wrote nothing. */
 /* The full-attention decode split law (r4d_decode_splits), read through the scratch hook's declare
- * path, where the depth is the declared max_ctx: the region the law sizes over the region at one
- * forced segment is the law's segment count (the region is the worst over 1..max_seqs sequences,
- * which is the last count wherever n * splits(n) peaks there or ties, as in every batch below).
- * Qwen3.8-27B's TP2 rank: 12 query heads over 2 KV heads, head_dim 256. An 8-row verify (three
- * waves at gqa 6) splits by depth: up to 16384 tokens 128 / units (x4: 16), then at least 64, and
- * past 65536 512 / units capped at 256 (x1: 256, x2: 128, x4 and more: 64). A plain decode and
- * the short block's 4-row verify keep the 256-workgroup target, and the two-tiles-a-segment cap
- * still binds a short context (1024 tokens: 64 tiles of 16, at most 32 segments). */
+ * path, where the depth is the declared max_ctx. Qwen3.8-27B's TP2 rank: 12 query heads over 2 KV
+ * heads, head_dim 256. An 8-row verify (three waves at gqa 6) splits by depth: up to 16384 tokens
+ * 128 / units (x4: 16), then at least 64, and past 65536 512 / units capped at 256 (x1: 256, x2:
+ * 128, x4 and more: 64). A plain decode and the short block's 4-row verify keep the 256-workgroup
+ * target, and the two-tiles-a-segment cap still binds a short context (1024 tokens: 64 tiles of
+ * 16, at most 32 segments).
+ *
+ * The declared region is the worst over every sequence count up to max_seqs and every query length
+ * up to q_len (a shorter step can split more: attn_decode_scratch), so the region over the region
+ * at one forced segment is that worst, in the batch's own rows: `splits` is the law at the batch,
+ * `region` what the declare path must hold, at least `splits`. Where a 5-row step at shallow depth
+ * splits more per row than the 8-row verify (x1 at 65536, x2 and x4 at 16384, x4 at 1024), the
+ * region is the shorter step's. */
 static void decode_split_law_case(const Plugin& pl) {
     const char* name = "attn_decode_h256_gqa6_bf16kv";
     if (!sel(name)) return;
@@ -1077,23 +1082,25 @@ static void decode_split_law_case(const Plugin& pl) {
         a.world_size = 1;
         return r->scratch(&a);
     };
-    struct Want { int64_t seqs, q_len, ctx, splits; };
+    struct Want { int64_t seqs, q_len, ctx, splits, region; };
     const Want want[] = {
-        { 1, 8, 100000, 256 }, { 2, 8, 100000, 128 }, { 4, 8, 100000, 64 }, { 6, 8, 100000, 64 },
-        { 8, 8, 100000, 64 },  { 2, 8, 65536, 64 },   { 2, 8, 65552, 128 }, { 1, 8, 65536, 64 },
-        { 2, 8, 32768, 64 },   { 4, 8, 32768, 64 },   { 7, 8, 32768, 64 },  { 4, 8, 16400, 64 },
-        { 4, 8, 16384, 16 },   { 2, 8, 16384, 32 },   { 4, 8, 1024, 16 },   { 1, 8, 1024, 32 },
-        { 4, 8, 640, 16 },     { 8, 4, 100000, 16 },  { 16, 4, 100000, 8 }, { 4, 1, 100000, 32 },
-        { 1, 1, 100000, 128 },
+        { 1, 8, 100000, 256, 256 }, { 2, 8, 100000, 128, 128 }, { 4, 8, 100000, 64, 64 },
+        { 6, 8, 100000, 64, 64 },   { 8, 8, 100000, 64, 64 },   { 2, 8, 65536, 64, 64 },
+        { 2, 8, 65552, 128, 128 },  { 1, 8, 65536, 64, 80 },    { 2, 8, 32768, 64, 64 },
+        { 4, 8, 32768, 64, 64 },    { 7, 8, 32768, 64, 64 },    { 4, 8, 16400, 64, 64 },
+        { 4, 8, 16384, 16, 20 },    { 2, 8, 16384, 32, 40 },    { 4, 8, 1024, 16, 20 },
+        { 1, 8, 1024, 32, 32 },     { 4, 8, 640, 16, 16 },      { 8, 4, 100000, 16, 16 },
+        { 16, 4, 100000, 8, 8 },    { 4, 1, 100000, 32, 32 },   { 1, 1, 100000, 128, 128 },
     };
     int bad = 0;
     for (const Want& w : want) {
         const int64_t law = bytes(w.seqs, w.q_len, w.ctx, 0), one = bytes(w.seqs, w.q_len, w.ctx, 1);
-        const int64_t got = one > 0 && law > 0 ? law / one : -1;
-        if (got != w.splits) {
-            std::printf("  FAIL  decode split law: %lld x %lld rows over %lld: %lld segments, want %lld\n",
+        const int64_t got = one > 0 && law > 0 && law % one == 0 ? law / one : -1;
+        if (got != w.region || w.region < w.splits) {
+            std::printf("  FAIL  decode split law: %lld x %lld rows over %lld: a region of %lld "
+                        "segments, want %lld (the batch's own %lld)\n",
                         (long long)w.seqs, (long long)w.q_len, (long long)w.ctx, (long long)got,
-                        (long long)w.splits);
+                        (long long)w.region, (long long)w.splits);
             ++bad;
         }
     }
@@ -1753,6 +1760,80 @@ static void attn_split_scratch_case(const Plugin& pl, const SplitGeo& g, const c
            worst > 0 && need >= worst && need <= 24576LL * 1032,
            fmt("need %lld worst %lld bound %lld", (long long)need, (long long)worst,
                24576LL * 1032));
+    }
+}
+
+/* Every split-KV decode row's scratch at declare (the band's bound, parameters only, as the core
+ * sizes it) against what its launch checks at issue (the same hook over the issue's tensors): for
+ * each band bound up to 64 / gqa rows, every query length up to it and every sequence count up to
+ * max_seqs must fit. Host only; the tensors carry shapes and aligned placeholder addresses. The
+ * h256 split law targets 256 workgroups at q_len * gqa <= 32 and 128 above, so a step shorter than
+ * its band's bound can need more partials than the bound: 1.13.0 sized the bound only, and an MTP
+ * step of 4 rows at gqa 8 (band 5) refused with RAD_E_SCRATCH at issue (#293). */
+static void attn_decode_scratch_band_case(const Plugin& pl) {
+    for (int k = 0; k < pl.kernel_count(); ++k) {
+        const RadKernelInfo* r = pl.kernel_at(k);
+        int hd = 0, gqa = 0;
+        if (std::strncmp(r->name, "attn_decode_h", 13) || !r->scratch ||
+            std::sscanf(r->name, "attn_decode_h%d_gqa%d", &hd, &gqa) != 2 || hd <= 0 || gqa <= 0)
+            continue;
+        if (!sel(r->name) && !sel("attn_decode_scratch")) continue;
+        const char* kvs = std::strrchr(r->name, '_') + 1;
+        const bool bf = !std::strcmp(kvs, "bf16kv");
+        const int64_t rowe = !std::strcmp(kvs, "fp8v4") ? 25 * hd / 16
+                           : !std::strcmp(kvs, "k6v4") ? 22 * hd / 16 : 2 * hd;
+        const int64_t bs = std::strstr(r->name, "_bs4_") ? 4 : 16;
+        const int64_t max_seqs = 32, max_ctx = 200000, mb = (max_ctx + bs - 1) / bs;
+        const int top = std::max(1, 64 / gqa);
+        void* const fake = (void*)(uintptr_t)4096;      /* aligned, never dereferenced */
+        std::string why;
+        int checked = 0;
+        for (const int64_t kv : { 1, 2 }) {
+            const int64_t n_head = kv * gqa;
+            for (int band = 1; band <= top; ++band) {
+                std::vector<RadParam> ps = {
+                    PI("q_len", band), PI("head_dim", hd), PI("gqa", gqa), PI("n_head", n_head),
+                    PI("max_seqs", max_seqs), PI("max_ctx", max_ctx), PI("block_size", bs),
+                    PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
+                    PS("kv_dtype", bf ? "bf16" : "fp8_e4m3") };
+                RadArgs d;
+                std::memset(&d, 0, sizeof(d));
+                d.p = ps.data(); d.n_p = (int)ps.size(); d.world_size = 1;
+                const int64_t declared = r->scratch(&d);
+                if (declared < 0) { why += fmt("; kv%lld band %d: declare refused %lld", (long long)kv,
+                                               band, (long long)declared); continue; }
+                /* the issue: no n_head / max_seqs, so the hook reads the tensors */
+                std::vector<RadParam> pi = {
+                    PI("q_len", band), PI("head_dim", hd), PI("gqa", gqa), PI("max_ctx", max_ctx),
+                    PI("block_size", bs), PI("causal", 1), PI("window", 0) };
+                for (int q = 1; q <= band; ++q)
+                    for (int64_t n = 1; n <= max_seqs; ++n) {
+                        std::vector<RadTensor> ts = {
+                            T(fake, RAD_BF16, { n * q, n_head, hd }),
+                            T(fake, bf ? RAD_BF16 : RAD_F8E4M3, { n * mb, kv, bs, rowe }),
+                            T(fake, RAD_I32, { n, mb }), T(fake, RAD_I32, { n }),
+                            T(fake, RAD_F32, { n, kv }), T(fake, RAD_F32, { n, kv }),
+                            T(nullptr, RAD_I32, { n + 1 }),
+                            T(fake, RAD_BF16, { n * q, n_head, hd }) };
+                        RadArgs a;
+                        std::memset(&a, 0, sizeof(a));
+                        a.t = ts.data(); a.n_t = (int)ts.size();
+                        a.p = pi.data(); a.n_p = (int)pi.size(); a.world_size = 1;
+                        const int64_t need = r->scratch(&a);
+                        ++checked;
+                        if (need < 0 || need > declared) {
+                            why += fmt("; kv%lld band %d: q_len %d x %lld sequences needs %lld, "
+                                       "declared %lld", (long long)kv, band, q, (long long)n,
+                                       (long long)need, (long long)declared);
+                            q = band;
+                            break;
+                        }
+                    }
+            }
+        }
+        ok(fmt("%s: decode scratch at declare covers every shorter step", r->name).c_str(),
+           why.empty() && checked > 0,
+           why.empty() ? fmt("%d issue geometries", checked) : why.substr(2));
     }
 }
 
@@ -18141,13 +18222,13 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
 }
 
 /* The gated residual's read at its decode kernels, byte for byte: the launcher's rule (kernels A and
- * B as one grid at one to seven rows, the tiled up-mix pipelined from eight) against the kernels it
- * replaced, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
+ * B as one grid at one to seven rows, the tiled up-mix pipelined from eight) against the two-grid
+ * form, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
  * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
  * that is ignored cannot pass by comparing a form with itself. */
 static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
     const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
-                               "byte-identical to the previous kernels", (long long)M,
+                               "byte-identical to the two-grid form", (long long)M,
                                i8 ? "int8" : "E4M3");
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
@@ -18232,7 +18313,7 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
         const int rc = r->launch(&a, (RadStream)hs);
         const int nd = pl.record(nullptr, 0);
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
-            ok(nm.c_str(), false, fmt("%s rc=%d", form ? "the previous kernels" : "the rule", rc));
+            ok(nm.c_str(), false, fmt("%s rc=%d", form ? "the two-grid form" : "the rule", rc));
             pl.pin_hc_dec(0);
             (void)hipStreamDestroy(hs);
             return;
@@ -18446,12 +18527,12 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
             if (pl.pin_hc) pl.pin_hc(form);
             time_now(kForm[form]);
         }
-        /* The decode kernels against the ones they replaced (r4d_hc_read_pin_decode), under the
+        /* The two-grid decode form (r4d_hc_read_pin_decode(1)) against the served one, under the
          * launcher's prefill rule. */
         if (pl.pin_hc_dec && f8) {
             if (pl.pin_hc) pl.pin_hc(0);
             pl.pin_hc_dec(1);
-            time_now("the previous decode kernels");
+            time_now("the two-grid decode form");
             pl.pin_hc_dec(0);
             time_now("the launcher's rule");
         }
@@ -25538,7 +25619,8 @@ struct ArThread {
  * The engine carries this fact (device.p2p, RAD_FACT_P2P) and selects around its absence; a card
  * count is not enough. hipDeviceCanAccessPeer answers it without a kernel: on a box with the IOMMU
  * off the peer path is absent, the enable call throws `enable_peer: invalid device ordinal`, and
- * init returns RAD_E_DEVICE — a skip line, like the card-count gates, not a failure. */
+ * init returns RAD_E_DEVICE. A missing path is a skip line, like the card-count gates, not a
+ * failure. */
 static bool ar_peer_path_ok(const std::vector<int>& devs, int world) {
     if (world < 2 || (int)devs.size() < world) return false;
     for (int a = 0; a < world; ++a)
@@ -28822,6 +28904,7 @@ static void device_phase(const Plugin& pl) {
                                std::make_pair(8, 53), std::make_pair(1, 300),
                                std::make_pair(15, 640) })
             attn_mixed_step_case(pl, *mr.g, mr.dec, mr.pre, mr.kv, c.first, c.second, 2048);
+    attn_decode_scratch_band_case(pl);
     /* Flash-Next's QSA layers: twelve queries per KV head over 4-token pages, and six at
      * four ranks, each layout's prefill (a long history and a ragged last tile), decode, and the
      * widest verify (q_len 5 at gqa 12, 10 at gqa 6). */
@@ -31144,8 +31227,8 @@ static void device_phase(const Plugin& pl) {
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
-        /* The decode kernels against the ones they replaced: each one-grid instantiation (1 to 7
-         * rows) and the tiled up-mix at both of its row tiles. */
+        /* The served decode kernels against the two-grid form: each one-grid instantiation (1 to
+         * 7 rows) and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
     }
@@ -31613,7 +31696,7 @@ static void usage(void) {
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
                 "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
                 "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
-                "             then the previous decode kernels against the launcher's rule;\n"
+                "             then the two-grid decode form against the launcher's rule;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"

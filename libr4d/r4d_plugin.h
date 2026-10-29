@@ -175,6 +175,18 @@ int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+/* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
+ * tree verify's mask from operand 8, `spec_parent`. */
+int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs*, RadStream);
+#define R4D_WIN_TREE_DECL(HD, G)                                                                  \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_bf16(const RadArgs*, RadStream);                \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_fp8 (const RadArgs*, RadStream);
+R4D_WIN_TREE_DECL(256, 1) R4D_WIN_TREE_DECL(256, 2) R4D_WIN_TREE_DECL(256, 4) R4D_WIN_TREE_DECL(256, 8)
+R4D_WIN_TREE_DECL(512, 1) R4D_WIN_TREE_DECL(512, 2) R4D_WIN_TREE_DECL(512, 4) R4D_WIN_TREE_DECL(512, 8)
+#undef R4D_WIN_TREE_DECL
+/* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
+int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);

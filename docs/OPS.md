@@ -464,7 +464,25 @@ at h128/gqa8 up to q_len 16 by reading each kv head for two query groups of 4 (a
 then holds each kv head once). Since no host library declares the op, a plugin that asks for it
 learns whether a card serves the geometry.
 
-libref has no row for any of them, deliberately. An architecture asks for a fusion and declares
+Tree verification (`rad_drafter_tree`, abi/rad_builder.h) adds one operand to both: the step's
+`RadBatch::spec_parent`, `[rows]` i32.
+
+| op | params | operands |
+|---|---|---|
+| `attn_paged_tree` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `spec_parent` |
+| `attn_paged_qrow_tree` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `spec_parent` |
+
+A row whose `spec_parent` is -2 is an ordinary causal row. Any other row is a node of its sequence's
+verify block, and its entry names its parent by row within the sequence's rows (`cu_seqlens`), -1
+for the block's first row, every parent before its child. Inside the block (keys from
+`seqused - q_len` on) such a row sees itself and its ancestors only; before it, every key as an
+ordinary row does, except that a window is measured from the block's first position plus the row's
+depth, the position its token takes once its path is committed. Causal layers only. libref serves
+`attn_paged_tree`; libr4d `attn_paged_qrow_tree` at h256/gqa2 on the split-KV decode kernel and at
+every geometry of the windowed kernels, to 64 rows a block.
+
+Of the ops above, libref serves only `attn_paged_tree`, which is not a fusion but `attn_paged`'s
+tree form. It has no row for any of the fusions, deliberately. An architecture asks for a fusion and declares
 the chain where it does not resolve (`rad_op_resolved`); a reference row would make it resolve
 everywhere, so a model loaded without the serving library would resolve to the reference and be
 refused at serve, instead of running the chain on libr4d or libavx. libr4d declares them with
@@ -2728,7 +2746,7 @@ greedy request's row (draw mode 0) keeps `dflash_select`'s tokens (`status = 0`)
 another card, or a position whose eight cannot form a `Q`, takes the walk's argmax (`status = -1`)
 and the ordinary verify. `Q_l` depends on the committed text and on `x_0 .. x_{l-1}`, never on the
 verify, and is stored exactly, which is all the coupling needs to be lossless; `q_temp` (the
-architecture's, `RADIANCE_DFLASH_Q_TEMP` on Qwen3.5/3.8) moves acceptance only. Each edge is eight
+architecture's, 0.6 on Qwen3.5/3.8) moves acceptance only. Each edge is eight
 partial `fmaf` chains over contiguous slices of the rank, added in order, so the device kernel and
 the host oracle agree bit for bit.
 
@@ -3194,6 +3212,17 @@ candidates, and what enters the head from the trunk.
 | op | params | operands |
 |---|---|---|
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
+| `dflash_tree` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `nodes` `temp`:f64/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens`, `parents` |
+
+`dflash_tree` grows the same lattice into a tree of `nodes` nodes instead of walking one path
+(`rad_drafter_tree`). Node 0 is the anchor at lattice position -1 with log probability 0. A node at
+position l with token t has a child for every candidate c at l + 1 whose id is in the vocabulary,
+scored as `dflash_select` scores c after t; with x = score / `temp` (default 1) over those
+candidates, the child's log probability is its parent's plus x - logsumexp(x). Best-first: each
+round takes the not-yet-taken child of a taken node with the largest log probability, ties to the
+one pushed first (lower parent, then lower c), until `nodes` are taken. Taken node j (1-based, so
+every parent comes before its child) is `tokens[s, j-1]`, and `parents[s, j-1]` its parent's node
+index, 0 for the anchor. A frontier that runs dry pads with token 0 under the last node.
 
 `dflash_conv` is the drafter's grouped convolution (coefficient add and every tap in one pass):
 

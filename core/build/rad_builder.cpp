@@ -1930,7 +1930,10 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     int64_t block = d->block;
     if (d->kind == RAD_DRAFT_BLOCK) {
         if (block == 0) block = (int64_t)d->depth + 1;
-        if (block < 2 || block < (int64_t)d->depth || block > (int64_t)d->depth + 1) {
+        /* A tree's (rad_drafter_tree) node count is not its block's draft count: more nodes
+         * than draft positions (a wider tree) or fewer (a block longer than the tree is deep on
+         * most steps). Checked at finish, once the tree is or is not declared. */
+        if (block < 2) {
             err(RAD_E_INVAL, "declare_drafter '%s': block %lld rows at depth %d. The head runs "
                              "over the last %d rows of the block, so the block is either %d rows "
                              "(the anchor predicts nothing) or %d (it does).",
@@ -2064,14 +2067,45 @@ int Builder::drafter_short_block(int64_t block) {
     }
     const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
     const int64_t lead = full - prog_.drafter.depth;     /* rows ahead of the proposing ones */
-    if (block >= full || block - lead < 1) {
+    /* A tree (rad_drafter_tree, declared first) grows a tree of its own over the shorter pass, up
+     * to block - 1 nodes whatever its own node count, so it needs only two rows. */
+    if (prog_.drafter_tree ? (block < 2 || block >= full) : (block >= full || block - lead < 1)) {
         err(RAD_E_INVAL, "drafter_short_block '%s': %lld rows. The short block must be shorter "
-                         "than the drafter's own (%lld) and still propose a token (more than %lld "
-                         "rows).", prog_.drafter_name.c_str(), (long long)block, (long long)full,
-            (long long)lead);
+                         "than the drafter's own (%lld) and still propose a token (%s %lld rows).",
+            prog_.drafter_name.c_str(), (long long)block, (long long)full,
+            prog_.drafter_tree ? "at least" : "more than",
+            (long long)(prog_.drafter_tree ? 2 : lead));
         return RAD_E_INVAL;
     }
     prog_.drafter_short_block = block;
+    return RAD_OK;
+}
+
+/* A block drafter whose proposal is a tree (rad_builder.h). */
+int Builder::drafter_tree(rad_buf parents) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_tree after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_STATE, "drafter_tree: %s. Only a BLOCK drafter's one pass proposes every node at "
+                         "once; declare it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a SERIAL head");
+        return RAD_E_STATE;
+    }
+    if (parents == RAD_NULL_HANDLE || (size_t)parents >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "drafter_tree '%s': parents buffer %u is not a declared buffer",
+            prog_.drafter_name.c_str(), (unsigned)parents);
+        return RAD_E_INVAL;
+    }
+    if (prog_.buffers[parents].decl.dtype != RAD_I32) {
+        err(RAD_E_DTYPE, "drafter_tree '%s': parents buffer '%s' is not i32",
+            prog_.drafter_name.c_str(), prog_.buffers[parents].name.c_str());
+        return RAD_E_DTYPE;
+    }
+    prog_.drafter_tree    = true;
+    prog_.drafter_parents = parents;
     return RAD_OK;
 }
 
@@ -2429,6 +2463,16 @@ int Builder::finish() {
                     w.source.c_str(), rad_dtype_name(w.decl.dtype));
         }
 
+    if (prog_.drafter.kind == RAD_DRAFT_BLOCK && !prog_.drafter_tree &&
+        (prog_.drafter.block < prog_.drafter.depth ||
+         prog_.drafter.block > (int64_t)prog_.drafter.depth + 1))
+        err(RAD_E_INVAL, "declare_drafter '%s': block %lld rows at depth %d. The head runs over the "
+                         "last %d rows of the block, so the block is either %d rows (the anchor "
+                         "predicts nothing) or %d (it does); only a tree (rad_drafter_tree) "
+                         "proposes a node count other than its block's drafts.",
+            prog_.drafter_name.c_str(), (long long)prog_.drafter.block, prog_.drafter.depth,
+            prog_.drafter.depth, prog_.drafter.depth + 1, prog_.drafter.depth);
+
     if (instances_) finish_instances();
     fill_tune_instances();
     finish_weight_uses();
@@ -2610,6 +2654,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
                    int64_t from_lo, int64_t from_hi, int64_t to_lo) {
     if (!b) return RAD_E_INVAL;
     return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
+}
+
+int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_tree(parents);
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }

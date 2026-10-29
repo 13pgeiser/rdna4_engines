@@ -119,7 +119,12 @@ typedef struct RadBatch {
     /* Speculative window (spec §10). n_spec == 0 for an ordinary decode step. */
     int            n_spec;             /* draft tokens per sequence this step */
     const int32_t* num_accepted;       /* [n_seq] device, from the previous verify */
-    const int32_t* spec_parent;        /* [n_tok] device, tree layout; null for a linear chain */
+    /* [n_tok] device; null for a linear chain. A tree verify (rad_drafter_tree): -2 marks an
+     * ordinary causal row; any other entry is a node of its sequence's verify block and names its
+     * parent by row within the sequence's rows (cu_seqlens), -1 for the block's first row, every
+     * parent before its child. Inside its block such a row attends to itself and its ancestors
+     * only (docs/OPS.md, attn_paged_tree). */
+    const int32_t* spec_parent;
 
     /* The draft pass. 0 is an ordinary step that runs the trunk; non-zero runs only the draft
      * head, and the sign gives the kind:

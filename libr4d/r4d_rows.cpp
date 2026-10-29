@@ -123,6 +123,18 @@ static const RadOperandSpec oAttnPaged[] = {
     { "cu_seqlens",  RAD_OPD_IN,  1 },   /* absent = one q_len for the whole batch */
     { "out",         RAD_OPD_OUT, 0 },
 };
+/* attn_paged_qrow with a tree verify's parents (RadBatch::spec_parent, rad_drafter_tree). */
+static const RadOperandSpec oAttnPagedTree[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "seqused",     RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+    { "spec_parent", RAD_OPD_IN,  0 },
+};
 
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters plus the two of
  * gate_quant_fp8's that are not implied (its `n` is `head_dim`, its rows attn_paged's (token,
@@ -699,6 +711,28 @@ static const RadOperandSpec oDflashSelect[] = {
     { "pred",   RAD_OPD_WEIGHT, 0 },
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
+};
+/* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
+static const RadParamSpec pDflashTree[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "steps",   RAD_P_INT, RAD_REQUIRED },
+    { "top_k",   RAD_P_INT, RAD_REQUIRED },
+    { "rank",    RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "anchor_stride", RAD_P_INT, RAD_OPTIONAL },
+    { "nodes",   RAD_P_INT, RAD_REQUIRED },
+    { "temp",    RAD_P_F64, RAD_OPTIONAL },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDflashTree[] = {
+    { "cand",    RAD_OPD_IN,     0 },
+    { "unary",   RAD_OPD_IN,     0 },
+    { "hp",      RAD_OPD_IN,     1 },
+    { "anchor",  RAD_OPD_IN,     0 },
+    { "pred",    RAD_OPD_WEIGHT, 0 },
+    { "succ",    RAD_OPD_WEIGHT, 0 },
+    { "tokens",  RAD_OPD_OUT,    0 },
+    { "parents", RAD_OPD_OUT,    0 },
 };
 
 /* ------------------------------------------------------------------------------ collectives */
@@ -3131,6 +3165,11 @@ static const RadOpSchema kSchemas[] = {
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
            "where it lies rather than lifted into a dense block first."),
+    SCHEMA("attn_paged_qrow_tree", pAttnPaged, oAttnPagedTree,
+           "attn_paged_qrow over a tree verify (rad_drafter_tree): spec_parent is -2 for an "
+           "ordinary causal row, else the row's parent's index within its sequence's rows (-1 for "
+           "the block's first row). Inside the block such a row sees itself and its ancestors "
+           "only, and its window is measured from the block's first position plus its depth."),
     SCHEMA("attn_paged_gate_quant", pAttnPagedGq, oAttnPagedGq,
            "attn_paged followed by gate_quant_fp8 over its output, in the split-KV merge: each "
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "
@@ -3237,6 +3276,12 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("dflash_tree", pDflashTree, oDflashTree,
+           "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
+           "a taken node's children are the valid candidates at the next position, each with log "
+           "probability parent + log_softmax(score / temp) over them; each round takes the largest "
+           "untaken child (ties to the first pushed). tokens and parents list the taken nodes in "
+           "order, a parent as its node index, 0 for the anchor."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -3907,6 +3952,15 @@ static const RadConstraint cAttnDecodeH256Gqa2Fp8[] = {
     C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
 };
+/* attn_paged_qrow_tree on the same kernel: causal only (a tree has no two-sided reading). */
+static const RadConstraint cAttnTreeDecodeH256Gqa2Fp8[] = {
+    C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnTreeDecodeH256Gqa2Bf16[] = {
+    C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
 static const RadConstraint cAttnDecodeH256Gqa2Bf16[] = {
     C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
@@ -4441,6 +4495,12 @@ static const RadConstraint cDflashConv[] = {
 static const RadConstraint cDflashSelect[] = {
     C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_IN("dtype", "bf16"),
+};
+/* dflash_tree's frontier (nodes x top_k children) and its node table live in LDS. */
+static const RadConstraint cDflashTree[] = {
+    C_GE("steps", 1), C_LE("steps", 63), C_GE("top_k", 1), C_LE("top_k", 32),
+    C_DIV("rank", 32), C_LE("rank", 512), C_GE("nodes", 1), C_LE("nodes", 63),
+    C_IN("dtype", "bf16"),
 };
 /* The sandwich-norm joins hold 24 elements a thread over a 256-thread block (n <= 6144), and the
  * route form quantises in whole 128-column groups. pair_argmax takes any row; expert_scale's top_k
@@ -6630,6 +6690,28 @@ static const RadKernelInfo kKernels[] = {
   r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
   nullptr, nullptr, nullptr },
 
+/* The same under attn_paged_qrow_tree: a tree verify's mask (O_TREE instances), causal only. */
+{ "attn_qrow_tree_decode_h256_gqa2_fp8kv", "attn_paged_qrow_tree", "attn",
+  "paged attention over a tree verify, q at its own row pitch, sliding window, split-KV",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, causal",
+  "bf16 query (any row pitch, a multiple of 4), fp8-e4m3 kv cache with per-(seq,head) descales, "
+  "i32 parents, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnTreeDecodeH256Gqa2Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
+{ "attn_qrow_tree_decode_h256_gqa2_bf16kv", "attn_paged_qrow_tree", "attn",
+  "paged attention over a tree verify, q at its own row pitch, sliding window, split-KV",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, causal",
+  "bf16 query (any row pitch, a multiple of 4), bf16 kv cache, i32 parents, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnTreeDecodeH256Gqa2Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
 /* Head_dim 128 at gqa 8 under attn_paged_qrow (cAttnQrowH128G8Fp8 says why). */
 { "attn_qrow_h128_gqa8_fp8kv", "attn_paged_qrow", "attn",
   "paged attention, any window, causal or not, split-KV (draft block); q at any row pitch",
@@ -6817,6 +6899,27 @@ R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256,
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
 #undef R4D_WIN_PAIR
 #undef R4D_WIN_ROW
+
+/* ...and under attn_paged_qrow_tree, the scalar kernel with a tree verify's mask (the launch
+ * refuses a non-causal one and never takes the WMMA kernel). */
+#define R4D_WIN_TREE_ROW(HD, G, KVN, KVS, C, KVDOC)                                               \
+{ "attn_qrow_tree_h" #HD "_gqa" #G "_" #KVN, "attn_paged_qrow_tree", "attn",                      \
+  "paged attention over a tree verify, q at its own row pitch, any window, causal",               \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query (any row pitch), " KVDOC " kv cache, i32 parents, bf16 out, f32 partials",          \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_tree_h##HD##_gqa##G##_##KVS,                              \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr, nullptr },
+#define R4D_WIN_TREE_PAIR(HD, GQ)                                                                  \
+    R4D_WIN_TREE_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                         \
+    R4D_WIN_TREE_ROW(HD, GQ, fp8kv, fp8, cWinH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WIN_TREE_PAIR(256, 1) R4D_WIN_TREE_PAIR(256, 2) R4D_WIN_TREE_PAIR(256, 4)
+R4D_WIN_TREE_PAIR(256, 8) R4D_WIN_TREE_PAIR(512, 1) R4D_WIN_TREE_PAIR(512, 2)
+R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
+#undef R4D_WIN_TREE_PAIR
+#undef R4D_WIN_TREE_ROW
 
 { "attn_prefill_h256_gqa12_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -9015,6 +9118,16 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
 
+{ "dflash_tree_bf16", "dflash_tree", "dflash",
+  "DFlash2's candidate lattice grown best-first into a tree (rad_drafter_tree): the selector's "
+  "edge scores for each taken node's children, one workgroup a sequence",
+  "top_k <= 32, rank a multiple of 32 and <= 512, steps and nodes <= 63: the frontier and the "
+  "node table are LDS extents",
+  "i32 candidate ids, f32 unary logits, bf16 hp and both codebooks, i32 tokens and parents out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashTree), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_tree, nullptr, nullptr, nullptr, nullptr },
+
 /* pair_argmax, the sandwich-norm joins and expert_scale. The joins and expert_scale have no
  * opd_shape: libref has no row for them, and tests/r4d_emu holds their source to the replaced chain
  * bit for bit on the host. pair_argmax is described as libref describes it. */
@@ -10034,6 +10147,8 @@ extern "C" int rad_kernel_chain(int i) {
          * plain, and the backend chains only the kernels named r4dchain* */
         "attn_decode_h256_gqa2_fp8kv", "attn_decode_h256_gqa2_bf16kv",
         "attn_qrow_decode_h256_gqa2_fp8kv", "attn_qrow_decode_h256_gqa2_bf16kv",
+        /* ...and their tree verify forms (O_TREE instances, the same launch) */
+        "attn_qrow_tree_decode_h256_gqa2_fp8kv", "attn_qrow_tree_decode_h256_gqa2_bf16kv",
         /* the fused junction: its tail form (the two-shot with the junction after it) only */
         "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8_4rank",
         /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
@@ -10041,6 +10156,9 @@ extern "C" int rad_kernel_chain(int i) {
         "attn_qrow_h512_gqa2_fp8kv", "attn_qrow_h512_gqa2_bf16kv",
         "attn_qrow_h512_gqa4_fp8kv", "attn_qrow_h512_gqa4_bf16kv",
         "attn_qrow_h512_gqa8_fp8kv", "attn_qrow_h512_gqa8_bf16kv",
+        "attn_qrow_tree_h512_gqa2_fp8kv", "attn_qrow_tree_h512_gqa2_bf16kv",
+        "attn_qrow_tree_h512_gqa4_fp8kv", "attn_qrow_tree_h512_gqa4_bf16kv",
+        "attn_qrow_tree_h512_gqa8_fp8kv", "attn_qrow_tree_h512_gqa8_bf16kv",
         "quant_act_i8",
         /* DFlash2's query and context passes: the narrow fp8 GEMMs (the gated gate_up among
          * them), the activation quantiser, the norms, the conv projection, the opening
@@ -10058,7 +10176,7 @@ extern "C" int rad_kernel_chain(int i) {
          * selector */
         "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
         "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
-        "dflash_select_bf16",
+        "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
     };

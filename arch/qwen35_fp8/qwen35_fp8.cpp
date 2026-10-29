@@ -434,11 +434,11 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     /* --draft-coupling (RadBuildCtx::draft_coupling): the walk samples each draft from Q, its
      * scores' softmax over the best eight candidates, and the sampler couples the target's own draw
      * to it (abi/rad_spechub.h). The planes are named as the MTP head's, which is how the engine
-     * finds them. RADIANCE_DFLASH_Q_TEMP sets Q's temperature; any value keeps the output exact
-     * and moves only acceptance. The default, 0.6, is where held-out acceptance peaked on
-     * Qwen3.8-27B MXFP4 + its DFlash2 drafter at request temperature 1 (tokens a step at x4, 32
-     * rows: ordinary rule 3.52; Q at 1.0 3.71, 0.7 3.88, 0.5 3.85, 0.35 3.77): the walk's scores
-     * are flatter than the target's law, and a sharper Q puts its mass where the target's is. */
+     * finds them. Q's temperature keeps the output exact at any value and moves only acceptance;
+     * 0.6 is where held-out acceptance peaked on Qwen3.8-27B MXFP4 + its DFlash2 drafter at request
+     * temperature 1 (tokens a step at x4, 32 rows: ordinary rule 3.52; Q at 1.0 3.71, 0.7 3.88,
+     * 0.5 3.85, 0.35 3.77): the walk's scores are flatter than the target's law, and a sharper Q
+     * puts its mass where the target's is. */
     if (ctx->draft_coupling) {
         if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
             dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
@@ -449,15 +449,6 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
             return RAD_E_UNSUPPORTED;
         }
         dc.q_temp = 0.6;
-        if (const char* e = std::getenv("RADIANCE_DFLASH_Q_TEMP")) {
-            const double t = std::strtod(e, nullptr);
-            if (!(t > 0.0) || t > 100.0) {
-                fprintf(stderr, "radiance: RADIANCE_DFLASH_Q_TEMP=%s is not a temperature in "
-                                "(0, 100]\n", e);
-                return RAD_E_INVAL;
-            }
-            dc.q_temp = t;
-        }
         dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
                                  {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
         dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
