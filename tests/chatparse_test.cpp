@@ -32,6 +32,8 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
+#include <arch/rad_deepseek41_chat.h>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -2017,6 +2019,84 @@ TEST(typed_argument_tags_are_refused_where_they_cannot_be_read) {
     c.struct_size = (uint32_t)offsetof(RadChatFormat, arg_json_value_prefix);
     CHECK_OK(chat_format_from_abi(&c, &g, &why));
     CHECK(g.arg_json_value_prefix.empty());
+}
+
+/* DeepSeek-V4.1's declared format reads what the model's encoder (encoding/encoding.py) writes for
+ * an assistant turn: test_encoding.py's V41_TOOL_CALL_OUTPUT and the calls of golden case 1. */
+TEST(deepseek41_reads_the_dsml_its_encoder_writes) {
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(rad::arch::deepseek41_chat_format(), &f, &why));
+    CHECK_OK(chat_format_check(f, &why));
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"lookup",
+      "parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}}}}},
+      {"type":"function","function":{"name":"get_weather","parameters":{"type":"object",
+      "properties":{"location":{"type":"string"},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},
+      "required":["location"]}}}])");
+    ReplyOptions ro;
+    ro.tools = &tools;
+    ro.generation_prompt = "<｜Assistant｜><think>";
+    const auto thinking = parser_of(f, ro);
+    REQUIRE(thinking != nullptr);
+    const std::string v41 =
+        "  reason  </think>summary\n\n"
+        "<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"lookup\">\n"
+        "<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>";
+    bool strict = false;
+    const ReplyMessage m = reply_parse(*thinking, v41, &strict);
+    CHECK(strict);
+    CHECK_EQ(m.reasoning, std::string("  reason  "));
+    CHECK_EQ(m.content, std::string("summary"));
+    REQUIRE(m.calls.size() == 1);
+    CHECK_EQ(m.calls[0].name, std::string("lookup"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"query\":\"value\",\"limit\":2}"));
+    CHECK(m.calls[0].closed);
+    std::string err = stream_all(*thinking, v41);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+
+    /* Thinking off: the prompt closed the block, and calls follow the (here empty) answer. */
+    ro.generation_prompt = "<｜Assistant｜></think>";
+    const auto chat = parser_of(f, ro);
+    REQUIRE(chat != nullptr);
+    const std::string golden1 =
+        "\n\n<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"get_weather\">\n"
+        "<｜DSML｜ parameter name=\"location\" string=\"true\">Beijing</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "<｜DSML｜ invoke name=\"lookup\">\n"
+        "<｜DSML｜ parameter name=\"query\" string=\"true\">北京 天气</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>";
+    const ReplyMessage g = reply_parse(*chat, golden1, &strict);
+    CHECK(strict);
+    CHECK_EQ(g.content, std::string());
+    CHECK_EQ(g.reasoning, std::string());
+    REQUIRE(g.calls.size() == 2);
+    CHECK_EQ(g.calls[0].arguments, std::string("{\"location\":\"Beijing\",\"unit\":\"celsius\"}"));
+    CHECK_EQ(g.calls[1].arguments, std::string("{\"query\":\"北京 天气\"}"));
+    err = stream_all(*chat, golden1);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+
+    /* No calls: the answer is content. A call tag outside the section is prose. */
+    const ReplyMessage plain = reply_parse(*chat, "Paris.");
+    CHECK_EQ(plain.content, std::string("Paris."));
+    CHECK(plain.calls.empty());
+    const std::string quoted = "Write <｜DSML｜ invoke name=\"lookup\"> to call it.";
+    const ReplyMessage q = reply_parse(*chat, quoted);
+    CHECK(q.calls.empty());
+    CHECK_EQ(q.content, quoted);
+
+    ChatGrammarRequest gq;
+    gq.tools = &tools;
+    ChatGrammar gr;
+    CHECK_OK(chat_format_grammar(f, gq, &gr, &why));
+    CHECK(gr.lazy);
+    CHECK(gr.trigger_words == std::vector<std::string>{ "<｜DSML｜ calls>" });
 }
 
 TEST(json_arguments_behind_a_name_tag_read_as_one_object) {
