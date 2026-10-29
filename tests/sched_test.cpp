@@ -11,6 +11,7 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -97,7 +98,9 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 512;
+        /* Above the 1000 + i the requests below spell: admission refuses ids past the
+         * vocabulary, and these prompts must be admissible. */
+        prog.meta.n_vocab = 65536;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -1278,6 +1281,30 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
     CHECK_EQ(rc[2], RAD_E_INVAL);
     CHECK_EQ(rc[3], RAD_E_INVAL);
     CHECK(!kept->may_speculate);
+}
+
+/* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
+ * request body, and an id past the embedding table must die at admission, never staged into a
+ * pass — the embedding gather would fail the step, a failed step is a device fault, and a
+ * device fault stops the engine (spec §17). One bad number must not be a server kill. */
+TEST(a_prompt_names_real_vocabulary_rows) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    std::unique_ptr<Request> rs[5];
+    const std::vector<std::vector<int32_t>> ids = { { 1, 2, n_vocab - 1 }, { n_vocab }, { -1 },
+                                                    { 7, INT32_MAX }, { 0, 1, 2, n_vocab + 9 } };
+    int rc[5] = { -1, -1, -1, -1, -1 };
+    for (int i = 0; i < 5; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt = ids[(size_t)i];
+    }
+    f.sch.add_all(rs, 5, rc);
+    CHECK_EQ(rc[0], RAD_OK);
+    for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
 }
 
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
