@@ -1676,23 +1676,29 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
  * the block it just reserved, its next chunk is refused, and preempt_back() resets it again. */
 TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     Fixture f;
-    f.build(/*blocks=*/30, /*states=*/64);   /* 30 x 16 = 480 tokens */
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
     CHECK_OK(f.start());
 
-    uint64_t a = f.submit(320, 64, /*priority=*/5);
-    uint64_t b = f.submit(160, 64, /*priority=*/0);
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
 
-    /* A takes 256 tokens (16 blocks), B 160 (10): the pool is full. */
+    /* A takes 287 tokens (18 blocks), B 128 (8): the pool is full. */
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ(f.sch.plan().e.size(), 2);
     f.commit_plain();
 
-    /* A's next chunk cannot fit; B is the lower-priority victim and is reset. */
+    /* B's next token needs a new block; it is the lowest-priority victim and is reset. */
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
     CHECK_EQ(f.sch.find(b)->n_computed, 0);
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     f.commit_plain();
+
+    /* One block the fake pool has free and no sequence holds: the victim's own blocks plus one.
+     * The gate still wants one block of headroom beside the running A. */
+    f.kv.total[0] += 1;
+    f.kv.refcnt[0].push_back(0);
+    f.kv.freelist[0].push_back(26);
 
     /* B stays in the queue while A runs; it must not be admitted into a pool that has no room
      * for its whole prompt plus A's next block. */
@@ -1703,6 +1709,8 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
 
     for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
         CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+        CHECK_EQ(f.sch.find(b)->n_computed, 0);
         f.commit_plain();
     }
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);

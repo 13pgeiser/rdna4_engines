@@ -1448,7 +1448,8 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
             const int64_t next = rs.req->n_computed + 1;
             const int64_t rows = (next + gg.block_size - 1) / gg.block_size;
             const int64_t extra = rows - (int64_t)kv_->block_table(rs.req->id, (int32_t)g).size();
-            if (extra > 0) need += extra;
+            need += 1;                       /* the step after this one keeps its block */
+            if (extra > 0) need += extra;    /* and the block its next token already needs */
         }
         if (need > kv_->available_blocks((int32_t)g)) return false;
     }
