@@ -7708,6 +7708,51 @@ TEST(qwen35_fp8_declares_fp8_linears_and_the_fused_output_gate) {
     CHECK(find_b(b, "mtp_x") == nullptr);
 }
 
+/* At two ranks each delta-net layer reads its out-projection into the on-die cache beside the decode
+ * recurrent update (GdnFP8::op_pf_out): a `prefetch` of the whole projection, issued right before
+ * the update on steps of up to four decode sequences and 32 rows, none on a step of five or more
+ * sequences, on a prompt's rows or at one rank. */
+TEST(qwen35_fp8_reads_the_delta_net_out_projection_beside_its_decode_update) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    const int n_gdn = 6;
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        b.encs = { { "blk.", mx } };
+        RadBuildCtx ctx = spec_ctx(0, world, 7);
+        ctx.max_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+        int declared = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "prefetch" && o.w.size() == 1 &&
+                b.weights[o.w[0] - 1].name.find("ssm_out") != std::string::npos) {
+                ++declared;
+                CHECK_EQ(pint(&o, "bytes"), (int64_t)8 << 20);
+            }
+        CHECK_EQ(declared, world > 1 ? n_gdn : 0);
+
+        /* (decode sequences, rows each, prompt rows) -> whether the reads go */
+        struct Case { int seqs, rows, prompt; bool reads; };
+        for (const Case& cs : { Case{ 1, 8, 0, true }, Case{ 2, 8, 0, true }, Case{ 4, 8, 0, true },
+                                Case{ 4, 1, 0, true }, Case{ 5, 4, 0, false }, Case{ 8, 4, 0, false },
+                                Case{ 0, 0, 64, false }, Case{ 2, 8, 64, false } }) {
+            const auto k = kit(b, std::vector<int>((size_t)cs.seqs, cs.rows),
+                               cs.prompt ? std::vector<int>{ cs.prompt } : std::vector<int>{});
+            const auto v = run_passes(b, qwen35_fp8::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            int updates = 0, beside = 0;
+            for (size_t i = 0; i < ops.size(); ++i)
+                if (ops[i] == "gdn_conv_recurrent_update" || ops[i] == "gdn_recurrent_update") {
+                    ++updates;
+                    if (i > 0 && ops[i - 1] == "prefetch") ++beside;
+                }
+            CHECK_EQ(updates, cs.seqs ? n_gdn : 0);
+            CHECK_EQ(beside, cs.reads && world > 1 ? n_gdn : 0);
+        }
+    }
+}
+
 /* Every engine step the dense fp8 model runs lints clean at one and two ranks, the MTP head's
  * history pass and rounds included. */
 TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
@@ -10467,7 +10512,7 @@ struct ArchCases {
             qwen35_fp8::step, 3, {}, 0x20ab9ed24e409329ull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0xd12381e7e3ede24dull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x5b52afb1706a954eull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
             qwen35_fp8::step, 7, {}, 0x365e4cbb415ac284ull);
@@ -10476,7 +10521,7 @@ struct ArchCases {
             qwen35_w8a8::step, 7, {}, 0x742a596708bbda1dull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7b7a1b301de20c1eull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x93b6390d30e59953ull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
@@ -11223,7 +11268,7 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 0, 0x780814049d36bebcull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x0723ed824fef82d4ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
-        { "qwen35_fp8", 2, 1, 0x61d309383f96b1acull, 0xbf359de7b8a6322cull },
+        { "qwen35_fp8", 2, 1, 0x6e644b3d13bac619ull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },
         { "qwen35moe_fp8", 2, 0, 0x3a2761e9546797f1ull, 0x4a597c66b5868eeeull },
     };

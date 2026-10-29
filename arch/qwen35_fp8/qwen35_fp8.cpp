@@ -114,6 +114,16 @@ using MtpHead = MtpFP8;
  * wash. The drafter's reads (Dflash2::Config::prefetch) take the same size. */
 constexpr int64_t kPrefetchBytes    = (int64_t)12 << 20;
 constexpr int64_t kPrefetchStepRows = 32;
+/* The delta net's out-projection read into the on-die cache beside its decode recurrent update
+ * (GdnFP8::op_pf_out): the update runs one workgroup per (sequence, head) and leaves the memory mostly
+ * idle, so the whole projection (7.9 MB a rank in MXFP4; the read stops at the weight's end) is read
+ * there. Qwen3.8-27B MXFP4 + DFlash2 at tp 2, production flags, 1k context, hwgrid ms/step, median of
+ * five interleaved rounds, none -> whole: x1 19.40 -> 19.10, x2 20.93 -> 20.78, x4 24.26 -> 24.17
+ * (every round faster), x8 25.22 -> 25.48 (four rounds of five slower: eight sequences' state traffic
+ * fills the memory and the read competes with it), so up to four sequences. 4 MB read as the whole
+ * (x1 19.24 / 19.10 against 19.20 / 19.06); 90k x4 and x16 (64 rows, no read) unchanged. */
+constexpr int64_t kGdnOutPrefetchBytes = (int64_t)8 << 20;
+constexpr int64_t kGdnOutPrefetchSeqs  = 4;
 
 struct Layer {
     int          full = 0;
@@ -1091,6 +1101,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             Layer& lay = m.layers[(size_t)l];
             lay.pf_gu_w  = lay.mlp.gate_up.w;
             lay.op_pf_gu = decl_prefetch(b, lay.pf_gu_w, kPrefetchBytes);
+            if (!lay.full) {
+                lay.gdn.op_pf_out   = decl_prefetch(b, lay.gdn.out.w, kGdnOutPrefetchBytes);
+                lay.gdn.pf_out_rows = kPrefetchStepRows;
+                lay.gdn.pf_out_seqs = kGdnOutPrefetchSeqs;
+            }
             if (l + 1 < m.n_main) {
                 const Layer& nx = m.layers[(size_t)l + 1];
                 lay.pf_next_w  = nx.full ? nx.attn.qg.w : nx.gdn.in.w;
