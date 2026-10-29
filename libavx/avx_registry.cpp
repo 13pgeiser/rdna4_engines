@@ -358,6 +358,23 @@ static const RadParamSpec pRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_
                                         P_F64O("llama3_orig") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 
+static const RadParamSpec pPositionScale[] = { P_INT("M"), P_INT("n"), P_INT("original"),
+                                              P_F64("beta"), P_STR("dtype") };
+static const RadOperandSpec oPositionScale[] = { INOUT("x"), OPD("positions") };
+
+static const RadParamSpec pEmbedAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+    P_INT("causal"), P_INTO("max_seqlen"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oEmbedAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"), OUT("out") };
+static const RadParamSpec pMinistralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+    P_INT("n_head_kv"), P_F64("theta"), P_STR("dtype"), P_F64O("yarn_factor"),
+    P_F64O("yarn_low"), P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oMinistralRope[] = { INOUT("qkv"), OPD("pos") };
+static const RadParamSpec pPixtralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                            P_F64("theta"), P_STR("dtype") };
+static const RadOperandSpec oPixtralRope[] = { INOUT("qkv"), OPD("coord") };
+static const RadParamSpec pPixtralMerge[] = { P_INT("M"), P_INT("n"), P_INT("merge"), P_STR("dtype") };
+static const RadOperandSpec oPixtralMerge[] = { OPD("x"), OPD("coord"), OUT("y") };
+
 static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("theta"),
                                              P_F64("scale"), P_STR("dtype"),
                                              P_F64O("yarn_factor"), P_F64O("yarn_low"),
@@ -1118,6 +1135,16 @@ static const RadOpSchema kSchemas[] = {
   "block-key page and first-token position; slots past the count get page -1. nc is each "
   "sequence's complete-block count." },
 { "rope", ARR(pRope), ARR(oRope), "rotary embedding in place." },
+{ "embed_attn", ARR(pEmbedAttn), ARR(oEmbedAttn),
+  "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
+{ "ministral_rope", ARR(pMinistralRope), ARR(oMinistralRope),
+  "Ministral NeoX rotary with BF16 cos/sin and separately rounded products; V is unchanged." },
+{ "pixtral_rope", ARR(pPixtralRope), ARR(oPixtralRope),
+  "Pixtral axial rotary with interleaved height/width frequencies and BF16 product rounding." },
+{ "pixtral_merge", ARR(pPixtralMerge), ARR(oPixtralMerge),
+  "Pack full raster patch grids into channel-major spatial merge blocks, without mixing images." },
+{ "position_scale", ARR(pPositionScale), ARR(oPositionScale),
+  "Ministral position-dependent query scaling, with the scale rounded before multiplication." },
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope), "per-head QK norm then rotary embedding." },
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
   "one scalar per row, optionally through an activation, broadcast across the row." },
@@ -1713,6 +1740,11 @@ SIMPLE("avx_kv_resolve", "kv_resolve", "attn",
        "streamed KV residency map: selected block ids become ring slots, misses copied in",
        "i32 maps, u8 block planes", L(kv_resolve)),
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
+SIMPLE("avx_embed_attn", "embed_attn", "attn", "BF16 materialized encoder attention", "bf16/f32, i32 cu", L(embed_attn)),
+SIMPLE("avx_ministral_rope", "ministral_rope", "attn", "Ministral BF16 rotary", "bf16/f32 inout, i32 positions", L(ministral_rope)),
+SIMPLE("avx_pixtral_rope", "pixtral_rope", "attn", "Pixtral interleaved axial rotary", "bf16/f32 inout, i32 coordinates", L(pixtral_rope)),
+SIMPLE("avx_pixtral_merge", "pixtral_merge", "vision", "channel-major patch merger packing", "bf16/f32, i32 coordinates", L(pixtral_merge)),
+SIMPLE("avx_position_scale", "position_scale", "attn", "Ministral position-dependent query scale", "bf16/f32 inout, i32 positions", L(position_scale)),
 SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT,
        L(rope_table)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",

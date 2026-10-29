@@ -2915,7 +2915,37 @@ static const RadOperandSpec oQuantCols[] = {
     { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
 };
 
+static const RadParamSpec pPositionScale[] = { P_INT("M"), P_INT("n"), P_INT("original"),
+                                              P_F64("beta"), P_STR("dtype") };
+static const RadOperandSpec oPositionScale[] = { { "x", RAD_OPD_INOUT, 0 }, { "positions", RAD_OPD_IN, 0 } };
+
+static const RadParamSpec pEmbedAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+    P_INT("causal"), P_INTO("max_seqlen"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oEmbedAttn[] = { { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pMinistralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+    P_INT("n_head_kv"), P_F64("theta"), P_STR("dtype"), P_F64O("yarn_factor"),
+    P_F64O("yarn_low"), P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oMinistralRope[] = { { "qkv", RAD_OPD_INOUT, 0 }, { "pos", RAD_OPD_IN, 0 } };
+static const RadParamSpec pPixtralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                            P_F64("theta"), P_STR("dtype") };
+static const RadOperandSpec oPixtralRope[] = { { "qkv", RAD_OPD_INOUT, 0 }, { "coord", RAD_OPD_IN, 0 } };
+static const RadParamSpec pPixtralMerge[] = { P_INT("M"), P_INT("n"), P_INT("merge"), P_STR("dtype") };
+static const RadOperandSpec oPixtralMerge[] = { { "x", RAD_OPD_IN, 0 }, { "coord", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+
+
 static const RadOpSchema kSchemas[] = {
+{ "embed_attn", ROW(pEmbedAttn), ROW(oEmbedAttn),
+  "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
+{ "ministral_rope", ROW(pMinistralRope), ROW(oMinistralRope),
+  "Ministral NeoX rotary with BF16 cos/sin and separately rounded products; V is unchanged." },
+{ "pixtral_rope", ROW(pPixtralRope), ROW(oPixtralRope),
+  "Pixtral axial rotary with interleaved height/width frequencies and BF16 product rounding." },
+{ "pixtral_merge", ROW(pPixtralMerge), ROW(oPixtralMerge),
+  "Pack full raster patch grids into channel-major spatial merge blocks, without mixing images." },
+{ "position_scale", ROW(pPositionScale), ROW(oPositionScale),
+  "Scale query row p by 1 + beta * log(1 + floor(position[p] / original)), rounding the scale "
+  "to x's dtype before multiplication. Positions are nonnegative i32." },
+
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
            "f32 after the load because forming it in bf16 first costs 0.3% per channel."),
@@ -4760,16 +4790,16 @@ static const RadConstraint cLogitRerank[] = {
 static const RadConstraint cGemmNt[] = {
     C_LE("M", 16), C_DIV("K", 256), C_IN("dtype", "bf16"),
 };
-/* No 64-row cap: grid.y covers any row count, so the band is the grid's reach. A cap would force a
- * caller with a taller projection (the gated delta net's a|b) to slice it. */
+/* Matrix rows use the signed-int device ABI. Bounded row launches cover taller matrices without
+ * requiring callers to slice their complete operations; arenas still follow configured budgets. */
 static const RadConstraint cGemmNt64[] = {
-    C_LE("M", 65536), C_DIV("K", 16), C_IN("dtype", "bf16"),
+    C_LE("M", 2147483647), C_DIV("K", 16), C_IN("dtype", "bf16"),
 };
 /* M > 64 is the prefill band, where the skinny row's per-wave fragment loads re-read the
  * activation once per N tile. N >= 128 because a 64- or 128-wide tile over a narrower N computes
  * mostly clamped rows; those shapes (the GDN a|b at 48, the shared-expert gate at 1) stay skinny. */
 static const RadConstraint cGemmNtTiled[] = {
-    C_GE("M", 65), C_LE("M", 65536), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
+    C_GE("M", 65), C_LE("M", 2147483647), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
 };
 /* The dense integer kernels take their group from a build constant and read no `group` argument.
  * A declaration at another group gets no kernel rather than a silent 128. */
@@ -5588,7 +5618,43 @@ static const RadConstraint cVsa[] = {
 /* A thread quantises eight columns: one 16-byte load and one 8-byte store a row. */
 static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
+static const RadConstraint cPixtralPatch[] = { C_IN("dtype","bf16"), C_EQ("K",588), C_GE("M",1), C_LE("M",2147483647), C_GE("N",1), C_LE("N",2147483647) };
+static const RadConstraint cNemotron[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647) };
+static const RadConstraint cNemotronMerge[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("merge",2) };
+static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64) };
+static const RadConstraint cNemotronRope128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128) };
+static const RadConstraint cNemotronAttn64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64), C_EQ("causal",0) };
+static const RadConstraint cNemotronAttn128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128), C_EQ("causal",0) };
 static const RadKernelInfo kKernels[] = {
+{ "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
+  "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
+  RAD_DOMAIN_DEVICE, 10, ROW(cPixtralPatch), NOTUNE,
+  nullptr, nullptr, r4d_rad_pixtral_patch },
+{ "position_scale_bf16", "position_scale", "attn", "Ministral rounded query scale", "pitched active rows, nonnegative i32 positions", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotron), NOTUNE,
+  nullptr, nullptr, r4d_rad_position_scale, r4d_nemotron_scratch },
+{ "pixtral_merge_bf16", "pixtral_merge", "vision", "Channel-major complete raster-grid merger", "merge 2, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronMerge), NOTUNE,
+  nullptr, nullptr, r4d_rad_pixtral_merge, r4d_nemotron_scratch },
+{ "ministral_rope_h64_bf16", "ministral_rope", "attn", "Ministral rotary with separately rounded products", "head_dim 64, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronRope64), NOTUNE,
+  r4d_ministral_init, r4d_rotary_fini, r4d_rad_ministral_rope, r4d_nemotron_scratch },
+{ "ministral_rope_h128_bf16", "ministral_rope", "attn", "Ministral rotary with separately rounded products", "head_dim 128, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronRope128), NOTUNE,
+  r4d_ministral_init, r4d_rotary_fini, r4d_rad_ministral_rope, r4d_nemotron_scratch },
+{ "pixtral_rope_h64_bf16", "pixtral_rope", "attn", "Pixtral axial rotary with BF16 product seams", "head_dim 64, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronRope64), NOTUNE,
+  r4d_pixtral_init, r4d_rotary_fini, r4d_rad_pixtral_rope, r4d_nemotron_scratch },
+{ "pixtral_rope_h128_bf16", "pixtral_rope", "attn", "Pixtral axial rotary with BF16 product seams", "head_dim 128, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronRope128), NOTUNE,
+  r4d_pixtral_init, r4d_rotary_fini, r4d_rad_pixtral_rope, r4d_nemotron_scratch },
+{ "embed_attn_h64_bf16", "embed_attn", "attn", "Three-pass BF16 eager whole-segment attention", "head_dim 64, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronAttn64), NOTUNE,
+  nullptr, nullptr, r4d_rad_embed_attn, r4d_nemotron_scratch },
+{ "embed_attn_h128_bf16", "embed_attn", "attn", "Three-pass BF16 eager whole-segment attention", "head_dim 128, pitched active rows", "bf16",
+  RAD_DOMAIN_DEVICE, 50, ROW(cNemotronAttn128), NOTUNE,
+  nullptr, nullptr, r4d_rad_embed_attn, r4d_nemotron_scratch },
+
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
  *
  * The ops between the larger kernels. They need device rows because the engine's buffers live in
@@ -7796,7 +7862,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "gemm_bf16_nt_m64", "gemm_nt", "gemm",
   "skinny GEMM C[M,N] = A[M,K] @ W[N,K]^T with 16x16x16 WMMA, split-K reduced in LDS",
-  "any M -- MT row tiles a block and grid.y covers the rest; K divisible by SK*16; N, K runtime",
+  "signed-int M, bounded row launches; K divisible by SK*16; N*K <= UINT32_MAX elements",
   "bf16 A / W / C, fp32 accumulate, deterministic reduction",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNt64), ROW(tGemmSkinny), r4d_tune_valid_gemm,
@@ -7806,7 +7872,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "gemm_bf16_nt_tiled", "gemm_nt", "gemm",
   "the same GEMM at prefill row counts: eight waves a block over an LDS-staged 64-deep K tile, "
   "the next tile prefetched in registers while the current one is computed",
-  "M > 64; N >= 128; K a multiple of 64; fragment rows past M or N clamped, never stored",
+  "64 < M <= INT_MAX; N >= 128; K%64; bounded row launches; N*K <= UINT32_MAX elements",
   "bf16 A / W / C, fp32 accumulate. BYTE-IDENTICAL to gemm_bf16_nt_m64: the same WMMA sequence "
   "a tile and the same split count, the slices summed in the same order from 0.f",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_BF16_TILED,
@@ -10213,6 +10279,8 @@ extern "C" int rad_kernel_concurrent(int i) {
         "hc_", "mtp_enter", "ar_", "gemm_w4a8_tiled", "gemm_w8a8_tiled", "lora_",
         /* The residency map's epoch, hand, heat counters and counters live across launches. */
         "kv_resolve",
+        // Each model-local entry validates metadata before its dependent data launch.
+        "position_scale_", "ministral_rope_", "pixtral_rope_", "pixtral_merge_", "embed_attn_",
     };
     for (const char* p : kStateful)
         if (std::strncmp(k->name, p, std::strlen(p)) == 0) return 0;

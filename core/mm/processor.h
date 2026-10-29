@@ -75,8 +75,12 @@ enum class Kind { Image, Video, Audio };
  *           fixed-point bicubic only when its size changes; the rest of the canvas, right and
  *           bottom, is zero bytes. Patches as QwenVL's. Images only, spelled <begin_of_image>
  *           placeholders <end_of_image>, the tokens at their positions (the language model has no
- *           rotary). */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next };
+ *           rotary).
+ *   Pixtral  Nemotron 3.5's noncausal Mistral3 wrapper: longest-edge resize, then ceil each side
+ *           to patch * merge; PIL bicubic and CLIP normalization. Raster (channel, y, x) patches;
+ *           image placeholders per merged grid row, each followed by IMG_BREAK (last: IMG_END).
+ *           Every token has ordinary 1-D positions, and separators retain their token embedding. */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -113,6 +117,10 @@ struct VisionConfig {
     /* The vocabulary's spelling of the picture marker (`processor.image_token`); every
      * placeholder of a picture is that one id. */
     std::string image_token = "<image>";
+    /* Pixtral: resize within this longest edge, then round each side up to patch * merge.
+     * Its image rows are separated by real vocabulary tokens, without an opening marker. */
+    int32_t pixtral_longest_edge = 0, tok_break = -1;
+    std::string image_break_token = "[IMG_BREAK]", image_end_token = "[IMG_END]";
 
     /* Deployment bounds, not the checkpoint's. `max_patches` is the encoder's pass size: an image
      * is one segment and a segment is never split, so the image band's ceiling is lowered to fit
@@ -272,6 +280,10 @@ struct Item {
      * them like any other id. */
     std::vector<int32_t> expand;
     std::vector<int32_t> seg_at;
+    /* Optional explicit placeholder positions within expand, one per encoder output row.
+     * Pixtral uses this because each grid row ends with a separator token that keeps its own
+     * language embedding. Empty preserves the existing contiguous per-segment representation. */
+    std::vector<int32_t> row_tokens;
 
     /* Content key over the patches and the grid, taken before the encoder runs, so a prefix-cache
      * hit over this item skips the encoder as well as the prefill. The patches already reflect
@@ -411,6 +423,7 @@ private:
     int image_unlimitedocr(const Frame& f, const ImageMode& mode, std::shared_ptr<Item>* out,
                            std::string* why) const;
     int image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;

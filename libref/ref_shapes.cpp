@@ -534,6 +534,52 @@ int ref_act_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     return binary_shape(p, n_p, operand, "act_mul", out);
 }
 
+int ref_position_scale_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), {M, n});
+    o.t_idx({M}, 32768, -1, 0);
+    return o.finish("position_scale", operand, out);
+}
+
+int ref_embed_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "head_dim", 0);
+    const int64_t G = gi(p, n_p, "gqa", 1), S = n_seq_of(p, n_p);
+    Opd o;
+    o.t(act_dt(p, n_p), {M, G * D});
+    o.t(act_dt(p, n_p), {M, D});
+    o.t(act_dt(p, n_p), {M, D});
+    o.t_idx({S + 1}, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t(act_dt(p, n_p), {M, G * D});
+    return o.finish("embed_attn", operand, out);
+}
+
+int ref_ministral_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "head_dim", 0);
+    const int64_t H = gi(p, n_p, "n_head", 0), K = gi(p, n_p, "n_head_kv", 0);
+    Opd o;
+    o.t(act_dt(p, n_p), {M, (H + 2 * K) * D});
+    o.t_idx({M}, 32768, -1, 0);
+    return o.finish("ministral_rope", operand, out);
+}
+
+int ref_pixtral_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "head_dim", 0),
+                  H = gi(p, n_p, "n_head", 0);
+    if (M <= 0 || D <= 0 || D % 4 || H <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), {M, 3 * H * D});
+    o.t_idx({2, M}, 80, -1, 0);
+    return o.finish("pixtral_rope", operand, out);
+}
+
+int ref_pixtral_merge_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    /* The coordinates describe complete raster grids. Random independent indices cannot make
+     * a legal fixture: callers provide the grid and its patch data together. */
+    return RAD_E_UNSUPPORTED;
+}
+
 int ref_seg_mean_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

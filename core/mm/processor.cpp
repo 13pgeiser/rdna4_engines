@@ -50,6 +50,48 @@ static bool meta_bool(const RadModelMeta& m, const char* key, bool dflt) {
 }
 
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
+    /* Only the requested noncausal Mistral3/Ministral3 wrapper selects this new path. */
+    if (!std::strcmp(rad_meta_gets(&m, "model_type", ""), "mistral3") &&
+        !std::strcmp(rad_meta_gets(&m, "text_config.model_type", ""), "ministral3") &&
+        !std::strcmp(rad_meta_gets(&m, "vision_config.model_type", ""), "pixtral") &&
+        !meta_bool(m, "is_causal", true) && !meta_bool(m, "text_config.is_causal", true)) {
+        family = Family::Pixtral;
+        patch = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
+        merge = (int32_t)rad_meta_geti(&m, "spatial_merge_size", 0);
+        temporal = 1;
+        if (patch != 14 || merge != 2) {
+            if (why) *why = "Nemotron 3.5's Pixtral processor requires patch 14 and merge 2";
+            return RAD_E_UNSUPPORTED;
+        }
+        pixtral_longest_edge =
+            (int32_t)rad_meta_geti(&m, "processor.image_processor.size.longest_edge", 1120);
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_index", -1);
+        image_token = rad_meta_gets(&m, "processor.image_token", "[IMG]");
+        image_break_token = rad_meta_gets(&m, "processor.image_break_token", "[IMG_BREAK]");
+        image_end_token = rad_meta_gets(&m, "processor.image_end_token", "[IMG_END]");
+        const char* root = "processor.image_processor.";
+        for (const char* flag : {"do_resize", "do_convert_rgb", "do_rescale", "do_normalize"}) {
+            if (!meta_bool(m, (std::string(root) + flag).c_str(), true)) {
+                if (why)
+                    *why = "Pixtral requires resize, RGB conversion, rescaling and normalization";
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+        if (rad_meta_geti(&m, "processor.image_processor.resample", 3) != 3 ||
+            rad_meta_getf(&m, "processor.image_processor.rescale_factor", 1.0 / 255) != 1.0 / 255) {
+            if (why) *why = "Pixtral supports bicubic RGB rescaling by 1/255";
+            return RAD_E_UNSUPPORTED;
+        }
+        const float clip_mean[] = {.48145466f, .4578275f, .40821073f};
+        const float clip_std[] = {.26862954f, .26130258f, .27577711f};
+        std::copy(clip_mean, clip_mean + 3, mean);
+        std::copy(clip_std, clip_std + 3, stdv);
+        read_triple(m, "processor.image_processor.image_mean", mean);
+        read_triple(m, "processor.image_processor.image_std", stdv);
+        image_min_pixels = video_min_pixels = (int64_t)factor() * factor();
+        image_max_pixels = video_max_pixels = (int64_t)pixtral_longest_edge * pixtral_longest_edge;
+        return check(why);
+    }
     /* Unlimited-OCR: one processor class, two modes, both stated in preprocessor_config.json and
      * processor_config.json (`processor.*`). Every key has the reference's default, so a container
      * converted before the tower landed still states a processor. */
@@ -304,6 +346,17 @@ int VisionConfig::check(std::string* why) const {
     if (max_frames < min_frames)
         return no("max_frames " + std::to_string(max_frames) + " is below min_frames " +
                   std::to_string(min_frames));
+    if (family == Family::Pixtral &&
+        (patch != 14 || merge != 2 || temporal != 1 || tok_image < 0 ||
+         pixtral_longest_edge < factor() || pixtral_longest_edge % factor() ||
+         pixtral_longest_edge > 1540 || image_token.empty() || image_break_token.empty() ||
+         image_end_token.empty()))
+        return no(
+            "Pixtral requires patch geometry, merge 2, image token ids and a whole merged-patch longest edge");
+    if (family == Family::Pixtral)
+        for (int i = 0; i < 3; ++i)
+            if (!std::isfinite(mean[i]) || !std::isfinite(stdv[i]))
+                return no("Pixtral requires finite image means and deviations");
     if (family == Family::Lfm2) {
         if (min_tiles < 1 || max_tiles < min_tiles || tile <= 0 || tile % factor())
             return no("the tiling (min_tiles " + std::to_string(min_tiles) + ", max_tiles " +
@@ -1066,6 +1119,17 @@ int Processor::init(const VisionConfig& cfg,
     if (cfg.patch <= 0 || cfg.temporal <= 0 || cfg.merge <= 0 || cfg.max_patches <= 0)
         return RAD_E_INVAL;
     cfg_ = cfg;
+    if (cfg.family == Family::Pixtral) {
+        if (!token_id) return RAD_E_INVAL;
+        cfg_.tok_image = token_id(cfg.image_token);
+        cfg_.tok_break = token_id(cfg.image_break_token);
+        cfg_.tok_end = token_id(cfg.image_end_token);
+        if (cfg_.tok_image < 0 || cfg_.tok_image != cfg.tok_image || cfg_.tok_break < 0 ||
+            cfg_.tok_end < 0)
+            return RAD_E_NOTFOUND;
+        encode_text_ = std::move(encode_text);
+        return cfg_.check(nullptr);
+    }
     if (cfg.family == Family::Lfm2) {
         /* The config names the markers rather than numbering them. Resolve all of them here so a
          * vocabulary missing one is refused at startup, not on the first large picture. */
@@ -1587,6 +1651,67 @@ int Processor::image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::s
     return RAD_OK;
 }
 
+/* The official PIL processor: cap the longest edge without enlarging, floor the aspect-ratio
+ * resize, then ceil both sides to patch * merge. Patch rows are raster order, (channel, y, x).
+ * The merger needs that order; merge-block ordering here would silently rotate the wrong grid. */
+int Processor::image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    if (!out || f.h <= 0 || f.w <= 0 || (int64_t)f.h * f.w > c.max_source_pixels ||
+        f.rgb.size() != (uint64_t)f.h * f.w * 3) {
+        if (why) *why = "invalid Pixtral RGB frame or source pixel limit exceeded";
+        return RAD_E_INVAL;
+    }
+    const double ratio =
+        std::max((double)f.h / c.pixtral_longest_edge, (double)f.w / c.pixtral_longest_edge);
+    int64_t h = f.h, w = f.w;
+    if (ratio > 1) {
+        h = (int64_t)std::floor(h / ratio);
+        w = (int64_t)std::floor(w / ratio);
+    }
+    const int64_t factor = c.factor();
+    h = ((h + factor - 1) / factor) * factor;
+    w = ((w + factor - 1) / factor) * factor;
+    if (h <= 0 || w <= 0 || (h / c.patch) * (w / c.patch) > c.max_patches) {
+        if (why) *why = "Pixtral image is empty after resize or exceeds one encoder pass";
+        return RAD_E_INVAL;
+    }
+    Frame resized;
+    resize_bicubic(f, (int32_t)w, (int32_t)h, &resized);
+    auto it = std::make_shared<Item>();
+    it->grid_t = 1;
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    it->rope_1d = true;
+    it->patch_raster = true;
+    finish_item(c, it.get());
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v) {
+            const float scaled = (float)((double)v * (1.0 / 255));
+            lut[ch][v] = rad_f32_to_bf16((scaled - c.mean[ch]) / c.stdv[ch]);
+        }
+    it->pixels.resize((size_t)it->n_patch * it->patch_dim);
+    auto* dst = it->pixels.data();
+    for (int py = 0; py < it->grid_h; ++py)
+        for (int px = 0; px < it->grid_w; ++px)
+            for (int ch = 0; ch < 3; ++ch)
+                for (int y = 0; y < c.patch; ++y)
+                    for (int x = 0; x < c.patch; ++x)
+                        *dst++ = lut[ch][resized.rgb[
+                            ((size_t)(py * c.patch + y) * w + px * c.patch + x) * 3 + ch]];
+    it->seg_at.push_back(0);
+    for (int y = 0; y < it->rows_h; ++y) {
+        for (int x = 0; x < it->rows_w; ++x) {
+            it->row_tokens.push_back((int32_t)it->expand.size());
+            it->expand.push_back(c.tok_image);
+        }
+        it->expand.push_back(y + 1 == it->rows_h ? c.tok_end : c.tok_break);
+    }
+    content_key(*it, &it->key_hi, &it->key_lo);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
                           const ImageMode& mode) const {
     const VisionConfig& c = cfg_;
@@ -1595,6 +1720,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
         return RAD_E_UNSUPPORTED;
     }
     if (c.family == Family::Gemma4) return image_gemma4(f, c.image_soft_tokens, out, why);
+    if (c.family == Family::Pixtral) return image_pixtral(f, out, why);
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
     if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
     if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
@@ -1690,7 +1816,7 @@ int Processor::video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::str
 int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return video_gemma4(v, out, why);
-    if (c.family == Family::Glm5Next) {
+    if (c.family == Family::Glm5Next || c.family == Family::Pixtral) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
     }
@@ -1941,7 +2067,8 @@ std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
 
 int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
-    if (cfg_.family == Family::Lfm2 || cfg_.family == Family::Glm5Next) {
+    if (cfg_.family == Family::Lfm2 || cfg_.family == Family::Glm5Next ||
+        cfg_.family == Family::Pixtral) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
     }

@@ -21,6 +21,7 @@ plugin claims.
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
+| `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B and 8B: native BF16 bidirectional text/image encoders with a Pixtral tower, retrieval formatting and normalized mean pooling, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
@@ -860,6 +861,79 @@ Traps:
 - **An audio clip's tokens are ceil(real frames / 4)**, real frames being those whose last sample
   is real; the processor stages exactly those plus zero frames to whole rows, which reproduces
   every row the reference keeps.
+
+---
+
+# `nemotron35_embed`: embedding models
+
+Native BF16 [Nemotron 3.5 Embed 1B](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16)
+and [8B](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) are bidirectional multimodal
+encoders, selected by `(mistral3, "")` with noncausal Mistral3/Ministral3 checks. They declare
+pooled output and no language-generation head. CPU (`libavx`, with `libref` as the oracle) and
+RDNA4 (`libr4d`) serve BF16 at TP1; quantized planes, TP>1, drafting and audio are rejected.
+[GUIDE §5.6](GUIDE.md#56-completions-embeddings-images-tokenising) covers serving and retrieval inputs.
+
+| Checkpoint | Pinned revision | Text geometry | Default vector |
+|---|---|---|---:|
+| 1B BF16 | `e24ca1e346bcc53572bd7bdc02b3e8ebf66c197c` | 16 layers, hidden 2048, FFN 6144, 24 Q / 8 KV heads | 2048 |
+| 8B BF16 | `781e779ee4ca9c2d2a4f38321993556baeab49a1` | 34 layers, hidden 4096, FFN 14336, 32 Q / 8 KV heads | 4096 |
+
+Both have 128-wide text heads. The 1B query width is 3072, independently of its hidden width.
+Each uses its own checkpoint weights and embedding space. The vision tower is Pixtral: 24 layers,
+hidden 1024, 16 heads of width 64, 14-pixel patches and a learned 2x2 patch merger/projector.
+
+**Numerical contracts.** Native safetensors mapping fuses QKV and gate/up without changing
+precision. Attention is bidirectional over each complete input and isolated across inputs.
+Pooling is the valid-token mean; dimensional truncation precedes L2 normalization.
+
+Ministral rounds the weightless norm before applying its BF16 gain. Its rotary rounds cos/sin
+and individual products to BF16, with model-local YaRN magnitude and position-dependent query
+scaling, including the position-16384 seam. Shared rotary defaults remain unchanged. Pixtral
+preserves axial height/width rotary, channel-major patch merging, exact GELU and BF16 seams.
+Only actual `[IMG]` rows receive image embeddings; separator embeddings remain ordinary tokens
+and participate in pooling. The model-specific operation laws are in [OPS.md](OPS.md).
+
+**Context and images.** The maximum is 32768 total encoded tokens per input, including prefixes,
+image placeholders and separators. The backbone's 262144 positional slots do not establish a
+larger supported embedding context. Inputs are never silently truncated. Configured per-input,
+combined-token, sequence-slot and image-pass budgets remain separate limits.
+
+The default longest edge is 1120, without initial enlargement. Reference PIL bicubic resizing
+aligns dimensions to 28, followed by CLIP normalization and raster 14x14 patches. The default
+maximum square has 6400 patches and must fit one encoder pass. The published 1540-pixel option
+and larger image settings are not validated by this port.
+
+**Verification.** Stored tiny fixtures cover issued graphs, exact preprocessing/token identity,
+BF16 seams, ragged multimodal inputs, invalid shapes and both head geometries. The regular C++
+suite needs neither Python nor downloaded checkpoints. Opt-in R9700 entries are
+`nemotron35_device_test_card` and `r4d_bf16_capacity_test_card`; the latter uses over 8 GiB VRAM
+to cross actual activation-offset boundaries, with bounded host staging.
+
+The offline native oracle uses CPU torch 2.14.1, matching torchvision 0.29.1, Transformers 5.20.0
+and Pillow 13.0.0, explicitly selecting PIL preprocessing and never running remote model code:
+
+```sh
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python tests/mknemotron35realreference.py \
+  /models/Nemotron-3.5-Embed-1B-BF16 /tmp/nemotron-reference.json --extended
+RAD_NEMOTRON_REAL_FIXTURE=/tmp/nemotron-reference.json RAD_NEMOTRON_DEVICE=1 \
+  RADIANCE_HOME="$PWD/build/radiance_home" RAD_TEST_CPU_BUDGET=0 OMP_WAIT_POLICY=passive \
+  build/tests/engine_e2e_test nemotron35_real
+```
+
+Use the corresponding native checkpoint for 8B; omit `RAD_NEMOTRON_DEVICE` for CPU execution.
+`RAD_NEMOTRON_DEVICE_INDEX=1` selects another physical card. Run large checks sequentially; 8B
+needs roughly 20 GB available host memory. Tiny gates are relative L2 <=.01 and cosine >=.9995.
+Native gates are cosine >=.9995, normalized L2 <=.032, norm error <=1e-5 and pairwise-score error
+<=.005, fixed before candidate evaluation. The full-model bound accounts for audited BF16
+backend sensitivity: eager-vs-SDPA alone reached 2.805% normalized L2 on the 8B samples.
+Individual/batched vectors must agree within L2 <=1e-5; native ranking margins >.01 must retain
+their ordering. These gates are not bitwise or broad retrieval-quality guarantees.
+
+CPU/R9700 comparisons cover both variants; the extended 1B corpus reaches 1924 tokens with
+English/Spanish/Japanese retrieval groups. Separate synthetic capacity checks cover a complete
+32768-token input, four full 1B inputs in one 131072-token step and a default maximum image.
+They do not establish native accuracy at maximum context/resolution. Native INT8/Q8, GGUF and
+TP2 remain unimplemented.
 
 ---
 

@@ -157,3 +157,14 @@ Community License 1.0 -- data/vectors/LICENSE.qwen-community-1.0.txt -- which ca
 every copy of it, including its condition that a Model-as-a-Service or AI-work-assistant business
 needs a separate license from Qwen to use it commercially. radiance's Apache-2.0 grant covers the
 code that loads and applies the file; it does not cover the file or its directions.
+
+Nemotron 3.5 input fixtures
+--------------------------
+
+tests/data/chat/nemotron35/template.jinja and tokenizer-subset.json come from NVIDIA's
+Nemotron-3.5-Embed-8B-BF16 checkpoint, revision
+781e779ee4ca9c2d2a4f38321993556baeab49a1:
+https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16/tree/781e779ee4ca9c2d2a4f38321993556baeab49a1
+The checkpoint's governing license is OpenMDW-1.1, retained in
+tests/data/chat/nemotron35/LICENSE. The tokenizer fixture is a subset preserving source token
+IDs and the BPE entries needed by the test corpus; it is not the complete serving tokenizer.

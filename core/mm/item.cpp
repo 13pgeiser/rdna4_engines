@@ -61,6 +61,32 @@ void PromptMedia::layout() {
     for (size_t pi = 0; pi < items.size(); ++pi) {
         const Placed& p = items[pi];
         const Item& it = *p.item;
+        if (!it.row_tokens.empty()) {
+            /* Explicit image placeholders form flat runs separated by ordinary vocabulary
+             * tokens. The scheduler already maps each run through row0; separators get no row. */
+            for (size_t first = 0; first < it.row_tokens.size();) {
+                size_t end = first + 1;
+                while (end < it.row_tokens.size() &&
+                       it.row_tokens[end] == it.row_tokens[end - 1] + 1)
+                    ++end;
+                const int64_t run_tok = (int64_t)p.tok + it.row_tokens[first];
+                pos += run_tok - tok;
+                RopeLayout::Run r;
+                r.tok = (int32_t)run_tok;
+                r.n = (int32_t)(end - first);
+                r.w = r.n;
+                r.base = (int32_t)pos;
+                r.flat = true;
+                r.item = (int32_t)pi;
+                r.row0 = (int32_t)first;
+                pos += r.n;
+                tok = run_tok + r.n;
+                r.shift = (int32_t)(pos - tok);
+                rope.runs.push_back(r);
+                first = end;
+            }
+            continue;
+        }
         const int32_t m = it.rows_h > 0 ? it.grid_h / it.rows_h : 1;
         for (int32_t s = 0; s < it.n_seg; ++s) {
             const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];

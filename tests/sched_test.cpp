@@ -6188,6 +6188,33 @@ TEST(an_embedding_input_longer_than_the_checkpoint_interval_is_admitted_whole) {
     CHECK(whole);
 }
 
+/* The shared context check serves every embedding architecture. Exact-limit inputs need no
+ * following generation slot, while generation keeps that slot and both refuse an overflow. */
+TEST(the_context_boundary_distinguishes_embeddings_from_generation) {
+    for (bool embed : {false, true}) {
+        for (int length : {169, 170, 171}) {
+            Fixture f;
+            f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/170,
+                    /*windowed=*/false, /*linear=*/false);
+            REQUIRE_EQ(f.start(), RAD_OK);
+            auto r = f.request(length, 1);
+            r->embed = embed;
+            const uint64_t id = f.add(std::move(r));
+            REQUIRE(id != 0);
+            const RadBatch* batch = f.sch.step();
+            const bool fits = length < 170 || (embed && length == 170);
+            if (fits) {
+                REQUIRE(batch != nullptr);
+                CHECK_EQ(batch->n_tok, length);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Running);
+            } else {
+                CHECK(batch == nullptr);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+            }
+        }
+    }
+}
+
 /* ================================================================== speculation gates */
 /* A request that may not speculate (a constraining grammar that cannot snapshot) gets no draft
  * from either drafter: set_draft takes nothing and prompt lookup proposes nothing, though its

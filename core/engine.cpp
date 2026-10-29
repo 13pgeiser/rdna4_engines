@@ -2529,11 +2529,19 @@ int Engine::run_server() {
             return v ? std::string(v) : std::string();
         }
         server::IChatTemplate* message_template() const override { return tpl; }
+        const RadModelMeta* metadata() const override { return meta; }
     } embed_info;
     embed_info.d = pooled_dim_;
     embed_info.n = cfg_.max_tok;
     embed_info.meta = &meta_;
     if (embedding_) d.embed = &embed_info;
+    std::string embed_why;
+    const int embed_rc = server::check_embedding_template(
+        d.embed, !cfg_.override_chat_template.empty(), &embed_why);
+    if (embed_rc < 0) {
+        RAD_ERR("%s", embed_why.c_str());
+        return embed_rc;
+    }
 
     /* The template loader warns on its own about a missing or broken template; this only decides
      * whether the chat endpoint exists. The reply format is the architecture plugin's when it

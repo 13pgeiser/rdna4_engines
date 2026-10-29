@@ -13,6 +13,19 @@
 #include "r4d_args.h"
 
 
+extern "C" {
+int r4d_rad_pixtral_patch(const RadArgs*, RadStream);
+int r4d_rad_position_scale(const RadArgs*, RadStream);
+int r4d_rad_ministral_rope(const RadArgs*, RadStream);
+int r4d_rad_pixtral_rope(const RadArgs*, RadStream);
+int r4d_rad_pixtral_merge(const RadArgs*, RadStream);
+int r4d_rad_embed_attn(const RadArgs*, RadStream);
+int64_t r4d_nemotron_scratch(const RadArgs*);
+int r4d_ministral_init(const RadParam*, int, int, int, void**);
+int r4d_pixtral_init(const RadParam*, int, int, int, void**);
+void r4d_rotary_fini(void*);
+}
+
 /* ================================================================== the priority ladder
  *
  * The selector ranks candidate rows by an integer priority (spec §2.1); where two rows of one op

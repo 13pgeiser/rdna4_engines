@@ -159,6 +159,11 @@ int ref_kv_store           (const RadArgs*, RadStream);
 /* the store of a streamed group: the host mirror always, the ring slot when the block is resident */
 int ref_kv_store_streamed  (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
+int ref_position_scale     (const RadArgs*, RadStream);
+int ref_embed_attn         (const RadArgs*, RadStream);
+int ref_ministral_rope     (const RadArgs*, RadStream);
+int ref_pixtral_rope       (const RadArgs*, RadStream);
+int ref_pixtral_merge      (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
@@ -423,6 +428,11 @@ REF_SHAPE_FN(ref_sam_attn);
 REF_SHAPE_FN(ref_kv_store);
 REF_SHAPE_FN(ref_kv_store_streamed);
 REF_SHAPE_FN(ref_rope);
+REF_SHAPE_FN(ref_position_scale);
+REF_SHAPE_FN(ref_embed_attn);
+REF_SHAPE_FN(ref_ministral_rope);
+REF_SHAPE_FN(ref_pixtral_rope);
+REF_SHAPE_FN(ref_pixtral_merge);
 REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);

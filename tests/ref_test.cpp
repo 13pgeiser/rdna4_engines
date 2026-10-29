@@ -1059,6 +1059,7 @@ TEST(op_vocabulary) {
         "sam_attn",
         /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
         "sub_i32",
+        "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -9604,6 +9605,15 @@ struct Geo {
 #define G(op, key, r, body) { op, key, r, [](A& a, int64_t R) { body; } }
 std::vector<Geo> geometries() {
     return {
+        G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
+                                       .d("beta", 0.1).s("dtype", "f32")),
+        G("embed_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("gqa", 2)
+                                    .i("causal", 0).s("dtype", "f32")),
+        G("ministral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                       .i("n_head_kv", 1).d("theta", 1e6).s("dtype", "f32")),
+        G("pixtral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                     .d("theta", 10000.0).s("dtype", "f32")),
+        G("pixtral_merge", "M", 4, a.i("M", R).i("n", 8).i("merge", 2).s("dtype", "f32")),
         G("rmsnorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_p", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_add", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
@@ -9949,8 +9959,10 @@ std::vector<Geo> geometries() {
  * cannot be drawn; ref_shapes.cpp says why). The sweeps skip them; their hand cases above cover
  * them. */
 bool undrawable(const char* op) {
+    // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2");
+           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+           !std::strcmp(op, "pixtral_merge");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

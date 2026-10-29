@@ -90,6 +90,8 @@ int         avx_par_force(int threads);
     X(seg_mean)             X(mul_weight)           X(pool_rows)            X(pool_cols)          \
     X(relu)                 X(clamp)                X(conv2d)               X(conv1d_dw)          \
     X(rel_sinusoid)         X(seg_sinusoid)         X(conv2d_unfold)                              \
+    X(position_scale)                                                                            \
+    X(embed_attn)           X(ministral_rope)        X(pixtral_rope)         X(pixtral_merge)      \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
     X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \

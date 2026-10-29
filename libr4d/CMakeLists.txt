@@ -75,6 +75,7 @@ set(R4D_UNITS
   # Unlimited-OCR's SAM tower: windowed attention with decomposed relative position.
   "r4d_sam_attn_bf16|"
   "r4d_encoder_bf16|"
+  "r4d_nemotron_bf16|"
   # The image generator: attention over a paged prefix plus the pass's own rows, the causal
   # head_dim-128 dense form and the 1152-wide decoder head; plus the sampler, adaptive norm,
   # implicit-GEMM convolution and pixel ops.

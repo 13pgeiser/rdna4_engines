@@ -19,6 +19,8 @@
 #include <string_view>
 #include <vector>
 
+struct RadModelMeta;
+
 namespace rad {
 namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket; }
 namespace mm { struct Frame; struct Item; }
@@ -539,6 +541,8 @@ public:
     virtual std::string default_prompt() const { return std::string(); }
     /* The chat template a `messages` input renders through, or null. */
     virtual IChatTemplate* message_template() const { return nullptr; }
+    /* Read-only checkpoint metadata for the server's input formatter; null when unknown. */
+    virtual const RadModelMeta* metadata() const { return nullptr; }
 };
 
 /* Multimodal preprocessing (spec §11). The server pulls the bytes out of a content part; the

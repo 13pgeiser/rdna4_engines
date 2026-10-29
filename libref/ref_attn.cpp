@@ -807,6 +807,34 @@ static int rope_ladder(const RadArgs* a, int64_t rot, int64_t head_dim, int64_t*
 
 }  /* namespace */
 
+/* Ministral 3's query multiplier, applied after rotary and rounded to the activation dtype
+ * before the product. Only the supplied query slice is changed; keys and values stay intact. */
+int ref_position_scale(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pos = &a->t[1];
+    // M in the resolved geometry is a capacity band; issued views carry the active rows.
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t n = p_int(a, "n", 0), orig = p_int(a, "original", 0);
+    const float beta = p_f32(a, "beta", -1);
+    if (M <= 0 || M > p_int(a, "M", 0) || n <= 0 || orig <= 0 || !std::isfinite(beta) || beta < 0 ||
+        x->rank != 2 || x->shape[0] < M || x->shape[1] != n || pos->rank != 1 || numel(pos) < M)
+        return RAD_E_SHAPE;
+    if (pos->dtype != RAD_I32 || (x->dtype != RAD_BF16 && x->dtype != RAD_F32)) return RAD_E_DTYPE;
+    /* Validate all positions before writing: an invalid batch must not leave a partial result. */
+    for (int64_t r = 0; r < M; ++r)
+        if (ld_int(pos->dtype, pos->data, offlin(pos, r)) < 0) return RAD_E_INVAL;
+    REF_PAR_FOR(M * n)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t p = ld_int(pos->dtype, pos->data, offlin(pos, r));
+        const float scale = round_dt(x->dtype, 1.0f + beta * std::log(1.0f + (float)(p / orig)));
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t at = rowoff(x, r, n) + j * laststride(x);
+            stt(x, at, ldt(x, at) * scale);
+        }
+    }
+    return RAD_OK;
+}
+
 int ref_rope(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *qkv = &a->t[0], *pos = &a->t[1];

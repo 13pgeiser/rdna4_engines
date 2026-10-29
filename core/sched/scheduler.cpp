@@ -1884,11 +1884,11 @@ const RadBatch* Scheduler::step() {
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
-            /* A sequence the context cannot hold never runs: its prompt alone reaches the last
-             * addressable position, so prefilling it would write positions the block and rotary
-             * tables lack. The server refuses such prompts; this is the scheduler's own bound.
-             * close_request removes it from waiting_, so `at` now names the next request. */
-            if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
+            /* Generation reserves one position after the prompt. An embedding consumes just
+             * the prompt, so its exact context boundary fits without a generation slot.
+             * close_request removes a refused input from waiting_, so `at` names the next one. */
+            if (ctx_limit_ > 0 &&
+                (s.seq_len() > ctx_limit_ || (!s.req->embed && s.seq_len() == ctx_limit_))) {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
                          (unsigned long long)s.req->id, (long long)s.seq_len(),
                          (long long)ctx_limit_);

@@ -2,7 +2,7 @@
 //
 // C[M,N] = A[M,K] @ W[N,K]^T, bf16 in and out, fp32 accumulate.
 //
-// General in M up to R4D_GEMM64_MAX_M: MT row tiles per block, grid.y covers the rest. The 64 is
+// General in M: MT row tiles per block, bounded grids with rebased row launches. The 64 is
 // the registry band, not a kernel limit; the M <= 16 row forwards here too.
 //
 // A scalar kernel (one wave per output column, M accumulators) costs one weight load and M
@@ -18,13 +18,13 @@
 // results are never stored.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
+#include "r4d_bf16_gemm_rows.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <stdexcept>
 
-#define R4D_GEMM64_MAX_M 65536
 #define WAVE32 32
 
 // A fragment from a base pointer plus a compile-time k step. With fragGo's 32-bit element offset,
@@ -155,30 +155,55 @@ void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, i
 /* `chain`: the chained form (r4d_rad_gemm_bf16_m64 passes the row's parameter; M <= 64 always). */
 static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
                                  int MB, long stream, bool chain) {
-  if (M < 1 || M > R4D_GEMM64_MAX_M) throw std::runtime_error("r4d gemm_bf16_nt_m64: M out of range");
-  if (K % (SK * 16)) throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
-  if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_bf16_nt_m64: threads/block > 1024");
-  const int ntiles = (N + 15) / 16, mtiles = (M + 15) / 16;
+  if (WV < 1 || SK < 1 || (int64_t)WV * SK > 1024 / WAVE32)
+    throw std::runtime_error("r4d gemm_bf16_nt_m64: invalid threads/block");
+  if (K % ((int64_t)SK * 16))
+    throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
   if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_bf16_nt_m64: MB must be 1..4");
-  dim3 grid((ntiles + WV - 1) / WV, (mtiles + MB - 1) / MB), block(WV * SK * WAVE32);
+  const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, MB * 16, WV * 16);
+  if (!chunk) throw std::runtime_error("r4d gemm_bf16_nt_m64: invalid dimensions or weight span");
+  // A chained op must publish one completion, not one per rebased launch. Existing chained
+  // decode shapes (M <= 64) fit one launch; do not silently change their synchronization law.
+  if (chain && chunk < M)
+    throw std::runtime_error("r4d gemm_bf16_nt_m64: chained rows need one launch");
+  const int ntiles = (N + 15) / 16;
+  dim3 block(WV * SK * WAVE32);
   size_t smem = (size_t)WV * SK * 256 * sizeof(float);
-  auto Ap = (const unsigned short*)a; auto Wp = (const unsigned short*)w;
-  auto Cp = (__hip_bfloat16*)c;
+  auto Wp = (const unsigned short*)w;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MT) hipLaunchKernelGGL((chain ? r4dchain_gemm_bf16_nt_m64<MT>                  \
-                                             : r4d_gemm_bf16_nt_m64_kernel<MT>),              \
-                                      grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK)
-  switch (MB) {
-    case 1: LAUNCH(1); break;
-    case 2: LAUNCH(2); break;
-    case 3: LAUNCH(3); break;
-    case 4: LAUNCH(4); break;
-    default: throw std::runtime_error("r4d gemm_bf16_nt_m64: MB unsupported");
+#define LAUNCH(MT)                                                                                 \
+  hipLaunchKernelGGL((chain ? r4dchain_gemm_bf16_nt_m64<MT> : r4d_gemm_bf16_nt_m64_kernel<MT>),    \
+                     grid, block, smem, st, Ap, Wp, Cp, mm, K, N, WV, SK)
+  for (int64_t m0 = 0; m0 < M; m0 += chunk) {
+    const int mm = (int)std::min<int64_t>(chunk, M - m0), mtiles = (mm + 15) / 16;
+    dim3 grid((ntiles + WV - 1) / WV, (mtiles + MB - 1) / MB);
+    auto Ap = (const unsigned short*)a + m0 * K;
+    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    switch (MB) {
+    case 1:
+      LAUNCH(1);
+      break;
+    case 2:
+      LAUNCH(2);
+      break;
+    case 3:
+      LAUNCH(3);
+      break;
+    case 4:
+      LAUNCH(4);
+      break;
+    default:
+      throw std::runtime_error("r4d gemm_bf16_nt_m64: MB unsupported");
+    }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
   }
 #undef LAUNCH
 }
 
-int r4d_gemm_bf16_nt_m64_max_m(void) { return R4D_GEMM64_MAX_M; }
+int r4d_gemm_bf16_nt_m64_max_m(void) {
+  return INT_MAX;
+}
 
 // ============================================================== the plugin ABI entry points
 //
@@ -187,14 +212,16 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 0);
     if (rc != RAD_OK) return rc;
-    if (g.M > r4d_gemm_bf16_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 16, 16)) return R4D_NO(RAD_E_SHAPE);
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    if (chain && r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, c.mb * 16, c.wv * 16) < g.M)
+      return R4D_NO(RAD_E_UNSUPPORTED);
     R4D_TRY("gemm_bf16_nt_m64",
-        gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
-                             (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb,
-                             (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0));
+            gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M, (int)g.K,
+                                 (int)g.N, c.wv, c.sk, c.mb, (long)(uintptr_t)s, chain));
     return RAD_OK;
 }
 

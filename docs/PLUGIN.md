@@ -397,9 +397,10 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
   step (`rad_block_dflash2.h` does). Appended in ABI 27.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
-  expansion and positions, in five processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
-  GLM-5.3) chosen by the container's `vision_config.model_type` (Unlimited-OCR's by its
-  `model_type`). A vision model with another pipeline needs a core change.
+  expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
+  GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`
+  and owning-model checks (Unlimited-OCR's by its `model_type`). A vision model with another
+  pipeline needs a core change.
   Audio goes through one of two feature extractors, Gemma 4's and Qwen3-ASR's (Whisper's), chosen
   by `audio_config.model_type`.
 - **A speech model says how it hears**, through the optional
