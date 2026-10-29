@@ -13,6 +13,7 @@
  * collapsing while the pooled acceptance rate stays plausible.
  */
 #include "server.h"
+#include "oai.h"
 
 #include "rad_internal.h"
 
@@ -57,8 +58,10 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     if (req.method == "POST") {
         /* The default applies to every client's requests that name no choice, so a server
          * started without --api-key takes the change from a loopback client only, as it does a
-         * runtime adapter load. */
-        if (opt_.api_key.empty() && !req.peer_is_loopback()) {
+         * runtime adapter load. A browser page on another origin does not qualify even when the
+         * victim's own browser makes it loopback: that is the drive-by this guard must refuse.
+         */
+        if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin())) {
             ApiError e;
             e.status  = 403;
             e.type    = "permission_error";
@@ -67,12 +70,12 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
                         "elsewhere";
             return error_response(e, req.peer);
         }
-        json body;
-        try {
-            body = json::parse(req.body.empty() ? "{}" : req.body);
-        } catch (const std::exception& e) {
-            return error_response(err_bad("body", std::string("not JSON: ") + e.what()), req.peer);
-        }
+        bool over = false, deep = false;
+        json body = parse_json_bounded(req.body.empty() ? "{}" : req.body, 0, &over, &deep);
+        if (body.is_discarded()) return error_response(err_bad("body", "not JSON"), req.peer);
+        if (over || deep)
+            return error_response(err_bad("body", "expected {\"enabled\": true|false} and "
+                                                  "nothing deeper than that"), req.peer);
         const auto it = body.find("enabled");
         if (it == body.end() || !it->is_boolean())
             return error_response(err_bad("enabled", "a boolean is required"), req.peer);
@@ -3669,6 +3672,17 @@ HttpResponse Server::handle_dashboard(const HttpRequest&) {
     /* No caching: the page must match the binary's /stats shape, and a stale copy shows only
      * blank panels. */
     r.set_header("Cache-Control", "no-store");
+    /* The page is fixed markup that talks only to its own origin, and CSP is how that promise
+     * becomes enforceable: even a future markup bug could not phone an injected payload's
+     * findings home, and could not reach the key beyond this origin. script/style 'unsafe-inline'
+     * is the cost of shipping as one compiled-in literal with its own <style> and <script>;
+     * frame-ancestors keeps a hostile page from framing the Model view and clickjacking its
+     * guardrail toggle. */
+    r.set_header("Content-Security-Policy",
+                 "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                 "connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+                 "form-action 'none'");
+    r.set_header("X-Frame-Options", "DENY");
     return r;
 }
 

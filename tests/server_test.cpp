@@ -4747,6 +4747,10 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         CHECK(!def);
         /* Refuses a body that names no boolean rather than guessing. */
         CHECK_EQ(f.post("/admin/control-vector", R"({"enabled":"yes"})").status, 400);
+        /* And a body that is brackets alone: valid JSON, nested deeper than any stack wants to
+         * tear down, parsed bounded and refused. */
+        CHECK_EQ(f.post("/admin/control-vector",
+                        std::string(20000, '[') + std::string(20000, ']')).status, 400);
         /* Without --api-key a change comes from loopback only; reading it is not restricted. */
         HttpRequest q;
         q.method = "POST";
@@ -4758,6 +4762,21 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         q.peer = "127.0.0.1:50122";
         CHECK_EQ(f.srv->router().dispatch(q).status, 200);
         CHECK(def);
+        /* A browser page on another origin is not a loopback client, even though its own
+         * browser makes the request arrive loopback: defeating the guard that way is exactly
+         * what the drive-by would do. Same-origin browser traffic still passes. */
+        HttpRequest x;
+        x.method = "POST";
+        x.path = "/admin/control-vector";
+        x.body = R"({"enabled":false})";
+        x.peer = "127.0.0.1:50122";
+        x.headers["Origin"] = "http://evil.test";
+        x.headers["Host"]   = "127.0.0.1:8080";
+        CHECK_EQ(f.srv->router().dispatch(x).status, 403);
+        CHECK(def);
+        x.headers["Origin"] = "http://127.0.0.1:8080";
+        CHECK_EQ(f.srv->router().dispatch(x).status, 200);
+        CHECK(!def);
         HttpRequest g2;
         g2.path = "/admin/control-vector";
         g2.peer = "192.168.1.20:50122";
