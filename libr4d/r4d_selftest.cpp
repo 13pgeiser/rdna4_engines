@@ -1051,6 +1051,56 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
  * band's upper bound (RadArgs.p), so `trim` here is 4096 while the issued count, and `tail`'s
  * extent, is 1024. 90ede42 read the parameter, trimmed a 2048-key context to 0, and the attention
  * over slice A's rows wrote nothing. */
+/* The full-attention decode split law (r4d_decode_splits), read through the scratch hook's declare
+ * path, where the depth is the declared max_ctx: the region the law sizes over the region at one
+ * forced segment is the law's segment count (the region is the worst over 1..max_seqs sequences,
+ * which is the last count wherever n * splits(n) peaks there or ties, as in every batch below).
+ * Qwen3.8-27B's TP2 rank: 12 query heads over 2 KV heads, head_dim 256. An 8-row verify (three
+ * waves at gqa 6) splits by depth: up to 16384 tokens 128 / units (x4: 16), then at least 64, and
+ * past 65536 512 / units capped at 256 (x1: 256, x2: 128, x4 and more: 64). A plain decode and
+ * the short block's 4-row verify keep the 256-workgroup target, and the two-tiles-a-segment cap
+ * still binds a short context (1024 tokens: 64 tiles of 16, at most 32 segments). */
+static void decode_split_law_case(const Plugin& pl) {
+    const char* name = "attn_decode_h256_gqa6_bf16kv";
+    if (!sel(name)) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r || !r->scratch) { ok("decode split law", false, "row or its scratch hook absent"); return; }
+    auto bytes = [&](int64_t seqs, int64_t q_len, int64_t ctx, int64_t splits) {
+        std::vector<RadParam> ps = {
+            PI("n_head", 12), PI("gqa", 6), PI("head_dim", 256), PI("block_size", 16),
+            PI("max_seqs", seqs), PI("q_len", q_len), PI("max_ctx", ctx),
+        };
+        if (splits > 0) ps.push_back(PI("splits", splits));
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        return r->scratch(&a);
+    };
+    struct Want { int64_t seqs, q_len, ctx, splits; };
+    const Want want[] = {
+        { 1, 8, 100000, 256 }, { 2, 8, 100000, 128 }, { 4, 8, 100000, 64 }, { 6, 8, 100000, 64 },
+        { 8, 8, 100000, 64 },  { 2, 8, 65536, 64 },   { 2, 8, 65552, 128 }, { 1, 8, 65536, 64 },
+        { 2, 8, 32768, 64 },   { 4, 8, 32768, 64 },   { 7, 8, 32768, 64 },  { 4, 8, 16400, 64 },
+        { 4, 8, 16384, 16 },   { 2, 8, 16384, 32 },   { 4, 8, 1024, 16 },   { 1, 8, 1024, 32 },
+        { 4, 8, 640, 16 },     { 8, 4, 100000, 16 },  { 16, 4, 100000, 8 }, { 4, 1, 100000, 32 },
+        { 1, 1, 100000, 128 },
+    };
+    int bad = 0;
+    for (const Want& w : want) {
+        const int64_t law = bytes(w.seqs, w.q_len, w.ctx, 0), one = bytes(w.seqs, w.q_len, w.ctx, 1);
+        const int64_t got = one > 0 && law > 0 ? law / one : -1;
+        if (got != w.splits) {
+            std::printf("  FAIL  decode split law: %lld x %lld rows over %lld: %lld segments, want %lld\n",
+                        (long long)w.seqs, (long long)w.q_len, (long long)w.ctx, (long long)got,
+                        (long long)w.splits);
+            ++bad;
+        }
+    }
+    g_fail += bad;
+    if (!bad) std::printf("  ok    decode split law: %zu batches\n", sizeof(want) / sizeof(want[0]));
+}
+
 static void kv_len_trim_case(const Plugin& pl) {
     const char* name = "kv_len_trim";
     if (!sel(name)) return;
@@ -28660,6 +28710,7 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 1);
     /* The 31B's prefill overlap at tp 4: sliding h256 gqa 2 (4 kv heads a rank, window 1024) and
      * global h512 gqa 8 (1 kv head), a 2048-row chunk cut at 1024, first chunk and a later one. */
+    decode_split_law_case(pl);
     kv_len_trim_case(pl);
     for (const int64_t ctx : { (int64_t)2048, (int64_t)4096 }) {
         attn_slice_case(pl, "attn_prefill_h256_gqa2_fp8kv", 256, 2, 4, 2048, 1024, ctx, 1024);

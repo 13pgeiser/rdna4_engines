@@ -1004,12 +1004,55 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // target were worse than 2x). At three waves (an 8-row verify) more workgroups only add
 // contention (+9 %). The split count already moves with the batch, so the merge sees no new
 // partition.
+//
+// Except that a three-wave workgroup reads the step's depth (r4d_decode_depth): past
+// kVerifyMinFrom it keeps at least kVerifySplitsMin segments, what 128 gives one sequence of two
+// KV heads, and past kVerifyDeepFrom it targets 512 workgroups (at most kVerifyDeepMax segments).
+// At depth the 128 target starves an 8-row verify, each segment walking 2-18k tokens. Qwen3.8-27B
+// at TP2 on the R9700, k6_v4, speculation 7, ms a decode step, forced segment counts
+// (RADIANCE_TUNE=attn_paged:splits), the 128 target (16-21 at x3-x4, 10 at x6) -> 64: x3 45k
+// 27.83 -> 27.56, 90k 32.61 -> 31.79, 180k 42.31 -> 40.47; x4 45k 29.96 -> 29.48, 90k 36.03 ->
+// 34.89, 180k 48.74 -> 46.26; x6 45k 37.39 -> 36.11, 90k 47.74 -> 44.70. Deeper still two
+// sequences want 128 (90k 26.73 -> 26.36, 180k 33.00 -> 32.01) and one 256 (180k 25.25 -> 24.93,
+// 90k level), while four stay at 64 (128: 180k 45.94 vs 46.32, 90k 35.06 vs 35.00) and six lose at
+// 128 (90k 44.91 vs 44.70): about 512 workgroups. Shallow the minimum costs up to half a percent
+// (1k: x2 20.98 -> 21.01, x4 24.01 -> 24.15, x6 28.71 -> 28.86; x4 16k 25.80 -> 25.85), hence
+// the floor. The kernel benchmark above (+9 % at x2) did not carry to the server. 64 is also the
+// vectorised merge's limit and the count one sequence already splits at.
+// Served against the 128 target, ms a decode step: x1 90k 22.07 -> 22.03, 180k 25.35 -> 24.88;
+// x2 90k 26.83 -> 26.36, 180k 33.18 -> 31.99; x3 180k 42.41 -> 40.33; x4 90k 36.20 -> 34.96. A
+// plain decode, the 4-row short block (16k x16 38.94 -> 38.90) and a verify up to 16k (1k x1-x8)
+// keep their segment count. Greedy output is unchanged.
+static constexpr int kVerifySplitsMin = 64;
+static constexpr int kVerifyMinFrom   = 16384;
+static constexpr int kVerifyDeepFrom  = 65536;
+static constexpr int kVerifyDeepMax   = 256;
+
+// The deepest context the step can reach. At issue the block table is the step's: its width moves
+// with the batch's longest sequence, rounded up (core/sched/batch.cpp, bound_bucket), while
+// `max_ctx` is the declared bound, the model's context. Declare passes no table (max_blocks 0), so
+// the scratch is sized at the declared bound, the deepest the law can be asked for; the law grows
+// with depth, so an issue never needs more.
+static inline int r4d_decode_depth(const R4DArgs* a) {
+    if (a->max_blocks > 0 && a->block_size > 0) {
+        const long long t = (long long)a->max_blocks * a->block_size;
+        if (t < a->max_ctx) return (int)t;
+    }
+    return a->max_ctx;
+}
+
 static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
     if (a->splits > 0) return a->splits;
     const int tiles = (a->max_ctx + tile - 1) / tile;
     const int units = std::max(1, a->kv_heads * a->num_seqs);
     const int gqa = a->kv_heads > 0 ? std::max(1, a->q_heads / a->kv_heads) : 1;
-    int s = (a->q_len * gqa <= 32 ? 256 : 128) / units;
+    int s = 256 / units;
+    if (a->q_len * gqa > 32) {
+        const int depth = r4d_decode_depth(a);
+        s = (depth > kVerifyDeepFrom ? 512 : 128) / units;
+        if (s > kVerifyDeepMax) s = kVerifyDeepMax;
+        if (depth > kVerifyMinFrom && s < kVerifySplitsMin) s = kVerifySplitsMin;
+    }
     const int cap = tiles / 2;
     if (s > cap) s = cap;
     if (s > tiles) s = tiles;
