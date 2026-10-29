@@ -2320,8 +2320,8 @@ int Engine::run_server() {
                 s.experts.n_experts = n_expert;
                 s.experts.tier.assign((size_t)n_layer * (size_t)n_expert, (uint8_t)Tier::VRAM);
                 /* The live tier when the heat engine runs, else the plan's (where a unit started).
-                 * HeatEngine::tier is a plain vector written by the dispatch thread at step
-                 * boundaries, so a racing read sees either side of a single store. */
+                 * tier_published is the HTTP-readable mirror HeatEngine::set_tier keeps; reading
+                 * the dispatch thread's own tier_ here would be a data race. */
                 const HeatEngine& heat = ranks_[0]->heat;
                 const bool live_tier = heat.enabled();
                 s.experts.heat_enabled = live_tier;
@@ -2330,7 +2330,7 @@ int Engine::run_server() {
                 for (size_t u = 0; u < p.units.size(); ++u) {
                     const MoveUnit& mu = p.units[u];
                     if (mu.expert < 0 || mu.layer < 0) continue;
-                    const Tier t = live_tier ? heat.tier((int32_t)u) : mu.tier;
+                    const Tier t = live_tier ? heat.tier_published((int32_t)u) : mu.tier;
                     s.experts.tier[(size_t)mu.layer * (size_t)n_expert + (size_t)mu.expert]
                         = (uint8_t)t;
                     /* Count residency over units, not plane cells: the plane is a rectangle a

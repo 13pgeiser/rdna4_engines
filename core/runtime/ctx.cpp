@@ -1392,7 +1392,9 @@ void Ctx::flush_issued() {
     for (size_t r = 0; r < unflushed_.size(); ++r) {
         const uint32_t i = unflushed_[r];
         if (i < plans_.size() && i < program_->ops.size() && plans_[i].issued)
-            program_->ops[i].issued = true;
+            /* /graph reads this same bool from the HTTP thread: an atomic_ref store keeps that
+             * pair a relaxed exchange rather than a data race (ctx.h OpInfo::issued). */
+            std::atomic_ref<bool>(program_->ops[i].issued).store(true, std::memory_order_relaxed);
         else
             unflushed_[w++] = i;
     }
