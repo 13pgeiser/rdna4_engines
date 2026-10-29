@@ -1671,6 +1671,50 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 }
 
 /* ================================================================== the step batch */
+/* A PREEMPTED PREFILL WAITS FOR ROOM FOR THE WHOLE RECOMPUTE plus one block per running
+ * sequence. Admitting it on a shortfall is what makes the prefill loop: the next decode takes
+ * the block it just reserved, its next chunk is refused, and preempt_back() resets it again. */
+TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
+    Fixture f;
+    f.build(/*blocks=*/30, /*states=*/64);   /* 30 x 16 = 480 tokens */
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(320, 64, /*priority=*/5);
+    uint64_t b = f.submit(160, 64, /*priority=*/0);
+
+    /* A takes 256 tokens (16 blocks), B 160 (10): the pool is full. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+
+    /* A's next chunk cannot fit; B is the lower-priority victim and is reset. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain();
+
+    /* B stays in the queue while A runs; it must not be admitted into a pool that has no room
+     * for its whole prompt plus A's next block. */
+    uint64_t q[8];
+    CHECK_EQ(f.sch.queue_snapshot(q, 8), 1);
+    CHECK_EQ(q[0], b);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* A's blocks are back; B can now prefill its whole prompt. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain();
+}
+
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
     f.build();

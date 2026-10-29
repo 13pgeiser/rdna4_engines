@@ -451,6 +451,12 @@ public:
      * the request is failed rather than deadlocking the engine (spec §17). */
     bool can_ever_fit(int64_t n_tokens) const;
 
+    /* Whether `seq` can grow to `n_tokens` without taking blocks from another sequence. */
+    bool can_grow(uint64_t seq, int64_t n_tokens) const;
+
+    /* Blocks a paged group can still hand out, including the lendable part. */
+    int64_t available_blocks(int32_t group) const;
+
     /* ---------------- the loan ----------------
      *
      * The paged groups lend unheld blocks to the expert slab in place. The carve fixes and backs
@@ -722,8 +728,6 @@ private:
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
     std::vector<std::vector<int32_t>> held_hist_;   /* per group, per bucket: held blocks */
 
-    int64_t available_blocks(int32_t g) const;
-    /* The buffer this group wants in hand, in blocks. See buffer_bytes(). */
     int64_t  buf_blocks(size_t i) const;
     /* One past the highest held block, rounded up to a bucket. */
     int64_t  held_top(size_t i) const;

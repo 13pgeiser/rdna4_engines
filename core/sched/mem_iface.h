@@ -79,6 +79,13 @@ struct IKVManager {
      * instead of deadlocking the engine (spec §17). */
     virtual bool can_ever_fit(int64_t n_tokens) const = 0;
 
+    /* Whether `seq` can be grown to `n_tokens` without taking blocks from another sequence. */
+    virtual bool can_grow(uint64_t seq, int64_t n_tokens) const = 0;
+
+    /* How many blocks a paged group can still hand out, including those lent to the expert slab
+     * and recallable on demand. */
+    virtual int64_t available_blocks(int32_t group) const = 0;
+
     virtual const std::vector<int32_t>& block_table(uint64_t seq, int32_t group) const = 0;
     virtual int32_t state_slot(uint64_t seq, int32_t group) const = 0;
 
@@ -335,6 +342,7 @@ struct KVBinding final : IKVManager {
     }
     int  preempt(uint64_t s) override               { return m->preempt(s); }
     bool can_ever_fit(int64_t n) const override     { return m->can_ever_fit(n); }
+    bool can_grow(uint64_t s, int64_t n) const override { return m->can_grow(s, n); }
     const std::vector<int32_t>& block_table(uint64_t s, int32_t g) const override {
         return m->block_table(s, g);
     }
@@ -344,6 +352,7 @@ struct KVBinding final : IKVManager {
     }
     int64_t state_index_width(int32_t g) const override { return m->state_index_width(g); }
     int64_t free_blocks(int32_t g) const override   { return m->free_blocks(g); }
+    int64_t available_blocks(int32_t g) const override { return m->available_blocks(g); }
     int64_t total_blocks(int32_t g) const override  { return m->total_blocks(g); }
     int64_t held_blocks(int32_t g) const override   { return m->held_blocks(g); }
     int64_t held_top_blocks(int32_t g) const override { return m->held_top_blocks(g); }

@@ -988,6 +988,36 @@ bool KVManager::can_ever_fit(int64_t n_tokens) const {
     return true;
 }
 
+/* Read-only counterpart of ensure(): can `seq` grow to n_tokens without taking blocks from
+ * another sequence? Used by the scheduler's preempted-prefill admission gate, which must not
+ * reserve anything or it would perturb the very pool it is trying to protect. */
+bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
+    const Seq* s = find(id);
+    if (!s) return false;
+    if (n_tokens <= s->n_tokens) return true;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        if (p.paged()) {
+            const int64_t first = s->first_block_pos[g] / p.block_size;
+            const int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t need = want - (int64_t)s->blocks[g].size();
+            if (need < 0) need = 0;
+            /* ensure() takes one copy-on-write block for a partially filled block; include it
+             * here so the gate does not admit a sequence that then has to steal from another. */
+            if (s->n_tokens > 0 && s->n_tokens % p.block_size != 0) {
+                const int64_t bi = s->n_tokens / p.block_size - first;
+                if (bi >= 0 && bi < (int64_t)s->blocks[g].size() &&
+                    refcount_[g][(size_t)s->blocks[g][(size_t)bi]] > 1)
+                    ++need;
+            }
+            if (need > available_blocks((int32_t)g)) return false;
+        } else if (p.stateful() && s->state[g] < 0) {
+            if (free_states_[g].empty()) return false;
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ sequences */
 
 KVManager::Seq* KVManager::find(uint64_t s) {

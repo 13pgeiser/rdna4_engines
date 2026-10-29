@@ -1154,6 +1154,12 @@ void Scheduler::preempt_back() {
 int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     Request& r = *s.req;
 
+    /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
+     * headroom for every sequence already running. Admitting it on a shortfall is what turns
+     * preemption into a loop: it prefills a chunk, the pool refuses the next step, it is taken
+     * back to zero, and the same chunk is attempted again. */
+    if (r.state == ReqState::Preempted && !preempted_can_prefill(s)) return kAdmitWait;
+
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
     /* R-SWA: the visible set becomes [0, prompt) plus a ring of W once the prompt is placed. The
@@ -1420,6 +1426,41 @@ void Scheduler::undo_hit(SchedReq& s) {
     r.n_cached = 0;
     s.ckpt_src = -1;
     s.hit_attn = 0;
+}
+
+/* Whether a preempted request can be admitted without becoming the next victim. The first
+ * requirement is the whole recompute's blocks; the second is one block per running sequence for
+ * the step after this one. Without that headroom, a decode step takes the block this prefill
+ * just reserved, the pool refuses the next chunk, and preempt_back() puts it back to zero again. */
+bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len();
+
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (!gg.paged) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const int64_t next = rs.req->n_computed + 1;
+            const int64_t rows = (next + gg.block_size - 1) / gg.block_size;
+            const int64_t extra = rows - (int64_t)kv_->block_table(rs.req->id, (int32_t)g).size();
+            if (extra > 0) need += extra;
+        }
+        if (need > kv_->available_blocks((int32_t)g)) return false;
+    }
+
+    /* Stateful groups: the recompute needs its state slots back, and every running sequence must
+     * keep the slot it already holds. */
+    if (!kv_->can_grow(r.id, target)) return false;
+    for (int32_t slot : running_) {
+        const SchedReq& rs = *reqs_[(size_t)slot];
+        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ the step */
@@ -1713,6 +1754,7 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             const int as = admit_one(s, budget, areserve);
+            if (as == kAdmitWait) { ++at; continue; }
             if (as < 0) break;                     /* head of line: do not admit behind it */
             if (admit_full_ > s.sched_tokens && capped_at < 0) {
                 capped_at = (int32_t)plan_.e.size();

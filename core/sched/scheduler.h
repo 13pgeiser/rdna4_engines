@@ -764,12 +764,19 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
+    /* A preempted request waits until the pool can hold its WHOLE remaining recompute plus one
+     * block of headroom for every running sequence; otherwise admitting it now just gets it
+     * preempted again next step and the prefill loops. */
+    bool preempted_can_prefill(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
     int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    /* Positive sentinel from admit_one: the request waits (its context is still being read off
+     * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
+    static constexpr int kAdmitWait = 1;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
     /* A step's prefill entries while step() moves its decode entries first; reserved at init,
