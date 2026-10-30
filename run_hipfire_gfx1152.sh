@@ -151,6 +151,11 @@ HOME_VOLUME=hipfire-home
 echo "setting reasoning_effort=$REASONING_EFFORT, idle_timeout=$IDLE_TIMEOUT_SECONDS in $HOME_VOLUME"
 docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT" \
     && docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set idle_timeout "$IDLE_TIMEOUT_SECONDS"
+# per-model kill switch: the registry sets dflash=auto for the 27B tier and a request
+# for 27B against a serve started on ANOTHER model loads it on demand with those
+# defaults (serve-level --spec off does not apply to on-demand swaps) and 400s on
+# the gfx1152 lm_head admission. Setting it per model covers every load path.
+docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config qwen3.8:27b-mq4-xts set dflash_mode off
 
 # -------------------------------
 # run (no power cap: APU, not the discrete R9700)
