@@ -10,6 +10,7 @@
  * accumulate in f32; rmsnorm reads that stream and writes bf16 for the linear projections.
  */
 #include <arch/rad_arch.h>
+#include "chat.h"
 
 #include <cmath>
 #include <sstream>
@@ -315,7 +316,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+static const RadChatFormat* chat_format(const RadModelMeta*) { return spark_chat_format(); }
 }
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(spark25_bf16, "spark25", "", "0.1.0", "Spark X2.6 BF16")
+RAD_ARCH_CHAT_FORMAT(spark25_bf16)
 #endif

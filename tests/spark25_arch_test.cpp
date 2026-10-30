@@ -35,6 +35,7 @@ TEST(layer_schedule_rope_and_window_follow_the_checkpoint) {
     RadBuilder b;
     RadBuildCtx ctx = build_ctx();
     REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+    CHECK(spark25_bf16::chat_format(k.meta()) != nullptr);
     REQUIRE_EQ(count_op(b, "attn_paged"), 4);
     REQUIRE_EQ(count_op(b, "rope"), 8);
     REQUIRE_EQ(b.binds.size(), (size_t)4);
