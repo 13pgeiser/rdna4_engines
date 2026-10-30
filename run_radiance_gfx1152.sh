@@ -163,9 +163,13 @@ fi
 # run (no power cap: APU, not the discrete R9700)
 # -------------------------------
 docker rm -f radiance_server
+# GIDs, not names: a rootless/namespace daemon may not resolve "video"/"render"
+# against its own group file even when they exist on the host ("Unable to find
+# group video: no matching entries in group file"); numeric IDs skip that lookup.
 docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
-    --group-add video --group-add render \
+    --group-add "$(getent group render | cut -d: -f3)" \
+    --group-add "$(getent group video | cut -d: -f3)" \
     -v "$MODEL_DIR":/models:ro \
     -e RADIANCE_LOG=info \
     "$IMAGE" --model /models/"$MODEL_FILE" \
