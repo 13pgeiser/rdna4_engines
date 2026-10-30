@@ -117,7 +117,9 @@ else
 fi
 MODEL_FILE="${FILES[$IDX]}"
 REPO="${REPOS[$IDX]}"
-EXTRA_FLAGS="${EXTRAS[$IDX]}"
+# RADIANCE_EXTRA adds ad-hoc serve args for A/B tests without editing the menu:
+# RADIANCE_EXTRA="--num-speculative-tokens 0" ./run_radiance_gfx1152.sh 1
+EXTRA_FLAGS="${EXTRAS[$IDX]} ${RADIANCE_EXTRA:-}"
 echo "serving $MODEL_FILE with EXTRA_FLAGS=$EXTRA_FLAGS"
 
 # -------------------------------
