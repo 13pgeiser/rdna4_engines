@@ -1,0 +1,321 @@
+/* Spark X2.6 (Spark2_5ForCausalLM), BF16 weights and activations.
+ *
+ * The checkpoint has one [q | k | v] projection per layer. Conversion splits its rows into
+ * contiguous matrices because paged attention needs a contiguous query. The MLP's two matrices
+ * are concatenated as [gate | up]; act_mul with exact erf GELU matches the reference, unlike
+ * gelu_mul (which is the tanh approximation). The attention gate is one sigmoid per head, not
+ * per channel. Local and full layers have different NeoX rotary dimensions and theta values.
+ *
+ * This first implementation is deliberately single-card. As in the HF reference, residuals
+ * accumulate in f32; rmsnorm reads that stream and writes bf16 for the linear projections.
+ */
+#include <arch/rad_arch.h>
+
+#include <cmath>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace spark25_bf16 {
+using namespace rad::arch;
+
+struct Layer {
+    rad_kvgroup kv = 0;
+    rad_weight an = 0, q = 0, k = 0, v = 0, gate = 0, o = 0, fn = 0, gu = 0, down = 0;
+    rad_op anorm = 0, qp = 0, kp = 0, vp = 0, gp = 0, rq = 0, rk = 0, store = 0, attn = 0;
+    rad_op sigmoid = 0, gate_heads = 0, op = 0, widen_attn = 0, add_attn = 0;
+    rad_op fnorm = 0, gup = 0, act = 0, dp = 0, widen_ffn = 0, add_ffn = 0;
+};
+
+struct Model {
+    Names nm{""};
+    Geom g{};
+    rad_kvgroup kv = 0;
+    rad_buf x = 0, delta = 0, h = 0, q = 0, k = 0, v = 0, gate = 0, attn = 0, gu = 0, ff = 0;
+    rad_buf hout = 0, logits = 0;
+    rad_weight tok = 0, norm = 0, head = 0;
+    rad_op embed = 0, widen = 0, final_norm = 0, gather = 0, logits_op = 0;
+    std::vector<Layer> layers;
+};
+static Model models[MAX_RANKS];
+
+/* The HF config names every layer. Do not infer a periodic schedule: it changes the mask and
+ * rotary of a layer and would silently produce a different model. */
+static int schedule(const RadModelMeta* meta, int64_t n, std::vector<bool>& local) {
+    const char* s = rad_meta_gets(meta, "layer_types", nullptr);
+    if (!s) {
+        fprintf(stderr, "radiance: spark25: layer_types is required\n");
+        return RAD_E_INVAL;
+    }
+    std::istringstream in(s);
+    std::string word;
+    while (in >> word) {
+        if (word != "sliding_attention" && word != "full_attention") {
+            fprintf(stderr, "radiance: spark25: unknown layer type '%s'\n", word.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        local.push_back(word == "sliding_attention");
+    }
+    if ((int64_t)local.size() != n) {
+        fprintf(stderr, "radiance: spark25: layer_types has %zu entries for %lld layers\n",
+                local.size(), (long long)n);
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
+static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
+    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->world_size > 1) {
+        fprintf(stderr, "radiance: spark25: this BF16 implementation needs --tp 1\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    Model& m = models[ctx->rank];
+    m = Model{};
+    m.nm = Names(ctx->scope);
+    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
+    Geom& g = m.g;
+    Names& nm = m.nm;
+    if (g.n_head_kv <= 0 || g.n_head % g.n_head_kv || g.head_dim % 2 || meta->n_expert ||
+        rad_meta_geti(meta, "attention_bias", 0) || rad_meta_geti(meta, "mlp_bias", 0) ||
+        !rad_meta_geti(meta, "tie_word_embeddings", 0) ||
+        !rad_meta_geti(meta, "headwise_attn_output_gate", 0) ||
+        std::strcmp(rad_meta_gets(meta, "gate_attn_act_mode", "sigmoid"), "sigmoid") ||
+        std::strcmp(rad_meta_gets(meta, "hidden_act", "gelu"), "gelu")) {
+        fprintf(stderr, "radiance: spark25: requires a dense, bias-free, tied model with headwise "
+                        "sigmoid gates, exact GELU and divisible attention heads\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    /* A single global override cannot describe this model's two rotary ladders. */
+    RAD_ARCH_TRY(yarn_from(g, meta, "", g.head_dim));
+    if (g.yarn.factor != 0.0f || g.rope_scale != 1.0f || g.rope_mc) {
+        fprintf(stderr, "radiance: spark25: rotary scaling overrides are not supported\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    std::vector<bool> local;
+    RAD_ARCH_TRY(schedule(meta, g.n_layer, local));
+    const int64_t window = rad_meta_geti(meta, "sliding_window", 0);
+    if (window <= 0) {
+        fprintf(stderr, "radiance: spark25: a positive sliding_window is required\n");
+        return RAD_E_INVAL;
+    }
+    double theta[2]{};
+    int64_t rot[2]{};
+    const char* kinds[] = {"full_attention", "sliding_attention"};
+    for (int j = 0; j < 2; ++j) {
+        theta[j] = rad_meta_getf(meta, nm.f("rope_parameters.%s.rope_theta", kinds[j]), 10000.0);
+        const double factor = rad_meta_getf(meta,
+            nm.f("rope_parameters.%s.partial_rotary_factor", kinds[j]), 1.0);
+        const char* type = rad_meta_gets(meta, nm.f("rope_parameters.%s.rope_type", kinds[j]), "default");
+        if (std::strcmp(type, "default")) {
+            fprintf(stderr, "radiance: spark25: %s rotary type '%s' is not supported\n", kinds[j], type);
+            return RAD_E_UNSUPPORTED;
+        }
+        const double r = g.head_dim * factor;
+        if (!std::isfinite(theta[j]) || !(theta[j] > 0) || !(factor > 0 && factor <= 1) || !std::isfinite(r) ||
+            std::floor(r) != r || (int64_t)r % 2) {
+            fprintf(stderr, "radiance: spark25: invalid %s rotary theta %g or factor %g\n",
+                    kinds[j], theta[j], factor);
+            return RAD_E_INVAL;
+        }
+        rot[j] = (int64_t)r;
+    }
+
+    /* A full cache for both kinds keeps prefix caching valid. The local attention op enforces
+     * its own window (q - k < window); the full layers read all past positions. */
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = rad_kv_cache_dtype(ctx, RAD_BF16);
+    kd.n_head_kv = g.n_head_kv;
+    kd.head_dim = g.head_dim;
+    m.kv = rad_decl_kv_group(b, nm.f("kv_attn"), &kd);
+    if (!m.kv) return RAD_E_INVAL;
+    g.kv_dtype = rad_dtype_name(kd.dtype);
+
+    const int64_t T = g.max_tok, E = g.n_embd, Q = g.q_dim(), K = g.kv_dim(), F = g.n_ff;
+    m.x = decl_b(b, nm.f("x"), RAD_F32, {T, E});
+    m.delta = decl_b(b, nm.f("delta"), RAD_F32, {T, E});
+    m.h = decl_b(b, nm.f("h"), RAD_BF16, {T, E});
+    m.q = decl_b(b, nm.f("q"), RAD_BF16, {T, Q});
+    m.k = decl_b(b, nm.f("k"), RAD_BF16, {T, K});
+    m.v = decl_b(b, nm.f("v"), RAD_BF16, {T, K});
+    m.gate = decl_b(b, nm.f("gate"), RAD_BF16, {T, g.n_head});
+    m.attn = decl_b(b, nm.f("attn"), RAD_BF16, {T, Q});
+    m.gu = decl_b(b, nm.f("gate_up"), RAD_BF16, {T, 2 * F});
+    m.ff = decl_b(b, nm.f("ff"), RAD_BF16, {T, F});
+    m.hout = decl_b(b, nm.f("h_out"), RAD_BF16, {g.max_logit_rows, E});
+    m.logits = decl_b(b, nm.f("logits"), RAD_F32, {g.max_logit_rows, g.n_vocab});
+    if (!m.x || !m.delta || !m.h || !m.q || !m.k || !m.v || !m.gate || !m.attn || !m.gu || !m.ff ||
+        !m.hout || !m.logits) return RAD_E_INVAL;
+    RAD_ARCH_TRY(rad_declare_logits(b, m.logits));
+
+    auto weight = [&](const char* name, const char* src, uint32_t dt,
+                      std::initializer_list<int64_t> shape, RadWeightGroup group,
+                      int access = RAD_ACCESS_PER_TOKEN) {
+        if (map_copy(b, name, src) != RAD_OK) return (rad_weight)0;
+        return decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, group);
+    };
+    m.tok = weight(nm.f("token_embd.weight"), nm.ckpt("model.embedding.weight"), RAD_BF16,
+                   {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB);
+    m.head = weight(nm.f("output.weight"), nm.ckpt("model.embedding.weight"), RAD_BF16,
+                    {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB);
+    m.norm = weight(nm.f("output_norm.weight"), nm.ckpt("model.norm.weight"), RAD_F32,
+                    {E}, grp_model());
+    if (!m.tok || !m.head || !m.norm) return RAD_E_INVAL;
+
+    auto norm = [&](rad_weight w, rad_buf x, rad_buf y) {
+        return rw(b, RAD_OP(b, "rmsnorm", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
+            RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0), RAD_STR("dtype", "bf16")),
+            RAD_WEIGHTS(w)), {x}, {y});
+    };
+    auto gemm = [&](int64_t n, int64_t k, rad_weight w, rad_buf x, rad_buf y) {
+        return rw(b, RAD_OP(b, "gemm_nt", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("N", n),
+            RAD_INT("K", k), RAD_STR("dtype", "bf16")), RAD_WEIGHTS(w)), {x}, {y});
+    };
+    auto add = [&]() {
+        return rw(b, RAD_OP(b, "add", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
+            RAD_STR("dtype", "f32")), RAD_NOWEIGHTS), {m.x, m.delta}, {m.x});
+    };
+    m.embed = rw(b, RAD_OP(b, "embed_lookup", RAD_PARAMS(RAD_RANGE("M", 1, T),
+        RAD_INT("n_embd", E), RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", "bf16"),
+        RAD_INT("vocab_offset", 0)), RAD_WEIGHTS(m.tok)), {}, {m.h});
+    auto widen = [&](rad_buf output) {
+        return rw(b, RAD_OP(b, "cast", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
+            RAD_STR("from", "bf16"), RAD_STR("to", "f32")), RAD_NOWEIGHTS), {m.h}, {output});
+    };
+    m.widen = widen(m.x);
+
+    m.layers.resize((size_t)g.n_layer);
+    for (int l = 0; l < g.n_layer; ++l) {
+        Layer& a = m.layers[(size_t)l];
+        auto src = [&](const char* suffix) { return nm.ckpt("model.layers.%d.%s", l, suffix); };
+        auto w = [&](const char* suffix, const char* s, uint32_t dt,
+                     std::initializer_list<int64_t> shape) {
+            return weight(nm.f("blk.%d.%s", l, suffix), src(s), dt, shape, grp_layer(l));
+        };
+        a.an = w("attn_norm.weight", "input_layernorm.weight", RAD_F32, {E});
+        a.gate = w("attn_gate.weight", "self_attn.g_proj.weight", RAD_BF16, {g.n_head, E});
+        a.o = w("attn_output.weight", "self_attn.out_proj.weight", RAD_BF16, {E, Q});
+        a.fn = w("ffn_norm.weight", "post_attention_layernorm.weight", RAD_F32, {E});
+        a.down = w("ffn_down.weight", "mlp.down_proj.weight", RAD_BF16, {E, F});
+        const char* qkv = src("self_attn.q_k_v_proj.weight");
+        auto part = [&](const char* name, int first, int64_t rows) {
+            const char* target = nm.f("blk.%d.attn_%s.weight", l, name);
+            if (map_rows(b, target, {{qkv, first, rows}}) != RAD_OK) return (rad_weight)0;
+            return decl_w(b, target, RAD_BF16, {rows, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                          grp_layer(l));
+        };
+        a.q = part("q", 0, Q);
+        a.k = part("k", (int)Q, K);
+        a.v = part("v", (int)(Q + K), K);
+        const char* gu = nm.f("blk.%d.ffn_gate_up.weight", l);
+        RAD_ARCH_TRY(map_concat(b, gu, {src("mlp.gate_proj.weight"), src("mlp.up_proj.weight")}));
+        a.gu = decl_w(b, gu, RAD_BF16, {2 * F, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                      grp_layer(l));
+        if (!a.an || !a.q || !a.k || !a.v || !a.gate || !a.o || !a.fn || !a.gu || !a.down)
+            return RAD_E_INVAL;
+        a.kv = m.kv;
+        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, a.kv));
+        a.anorm = norm(a.an, m.x, m.h);
+        a.qp = gemm(Q, E, a.q, m.h, m.q);
+        a.kp = gemm(K, E, a.k, m.h, m.k);
+        a.vp = gemm(K, E, a.v, m.h, m.v);
+        a.gp = gemm(g.n_head, E, a.gate, m.h, m.gate);
+        Geom rope = g;
+        const int kind = local[(size_t)l] ? 1 : 0;
+        rope.theta = (float)theta[kind];
+        a.rq = rw(b, decl_rope(b, rope, T, g.head_dim, g.n_head, 0, rot[kind], "neox"), {m.q}, {m.q});
+        a.rk = rw(b, decl_rope(b, rope, T, g.head_dim, g.n_head_kv, 0, rot[kind], "neox"), {m.k}, {m.k});
+        a.attn = rw(b, decl_attn(b, g, "attn_paged",
+            RAD_PARAMS(RAD_RANGE("q_len", 1, T), RAD_INT("head_dim", g.head_dim),
+                RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1), RAD_INT("window", kind ? window : 0),
+                RAD_INT("n_head", g.n_head), RAD_INT("block_size", RAD_KV_BLOCK),
+                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                RAD_STR("q_dtype", "bf16"), RAD_STR("kv_dtype", g.kv_dtype)), RAD_NOWEIGHTS),
+            {m.q}, {m.attn});
+        a.store = rw(b, RAD_OP(b, "kv_store", RAD_PARAMS(RAD_RANGE("M", 1, T),
+            RAD_INT("head_dim", g.head_dim), RAD_INT("n_head_kv", g.n_head_kv),
+            RAD_INT("block_size", rad_kv_block_size(b, a.kv)), RAD_STR("kv_dtype", g.kv_dtype)),
+            RAD_NOWEIGHTS), {m.k, m.v}, {});
+        a.sigmoid = rw(b, RAD_OP(b, "sigmoid", RAD_PARAMS(RAD_RANGE("M", 1, T),
+            RAD_INT("n", g.n_head), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.gate}, {m.gate});
+        /* View dense [tokens, heads * dim] and [tokens, heads] as one row per head. */
+        a.gate_heads = rw(b, RAD_OP(b, "scale_rows", RAD_PARAMS(RAD_RANGE("M", 1, T * g.n_head),
+            RAD_INT("n", g.head_dim), RAD_STR("act", "none"), RAD_STR("dtype", "bf16")),
+            RAD_NOWEIGHTS), {m.attn, m.gate}, {m.attn});
+        a.op = gemm(E, Q, a.o, m.attn, m.h);
+        a.widen_attn = widen(m.delta);
+        a.add_attn = add();
+        a.fnorm = norm(a.fn, m.x, m.h);
+        a.gup = gemm(2 * F, E, a.gu, m.h, m.gu);
+        a.act = rw(b, RAD_OP(b, "act_mul", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", F),
+            RAD_STR("act", "gelu"), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.gu}, {m.ff});
+        a.dp = gemm(E, F, a.down, m.ff, m.h);
+        a.widen_ffn = widen(m.delta);
+        a.add_ffn = add();
+    }
+    m.final_norm = norm(m.norm, m.x, m.h);
+    m.gather = rw(b, RAD_OP(b, "gather_rows", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+        RAD_INT("n", E), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.h}, {m.hout});
+    m.logits_op = rw(b, RAD_OP(b, "logits_gemm", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+        RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
+        RAD_WEIGHTS(m.head)), {m.hout}, {m.logits});
+    rad_note(b, "spark25: %lld layers, %lld query / %lld KV heads x %lld, local window %lld",
+             (long long)g.n_layer, (long long)g.n_head, (long long)g.n_head_kv,
+             (long long)g.head_dim, (long long)window);
+    return RAD_OK;
+}
+
+static void step(RadCtx* c, const RadBatch* batch) {
+    const Model& m = models[rad_rank(c)];
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok;
+    const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    RAD_ISSUE(c, m.embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tok), brows(m.h, T));
+    RAD_ISSUE(c, m.widen, brows(m.h, T), brows(m.x, T));
+    for (size_t i = 0; i < m.layers.size(); ++i) {
+        const Layer& a = m.layers[i];
+        const RadKVGroupBatch* kvb = kv_batch(batch, a.kv);
+        const int32_t* slot = kvb ? kvb->slot_mapping : nullptr;
+        const int32_t* table = kvb ? kvb->block_table : nullptr;
+        const int32_t* used = kvb ? kvb->seqused : nullptr;
+        RAD_ISSUE(c, a.anorm, brows(m.x, T), RAD_W(a.an), brows(m.h, T));
+        RAD_ISSUE(c, a.qp, brows(m.h, T), RAD_W(a.q), brows(m.q, T));
+        RAD_ISSUE(c, a.kp, brows(m.h, T), RAD_W(a.k), brows(m.k, T));
+        RAD_ISSUE(c, a.vp, brows(m.h, T), RAD_W(a.v), brows(m.v, T));
+        RAD_ISSUE(c, a.gp, brows(m.h, T), RAD_W(a.gate), brows(m.gate, T));
+        RAD_ISSUE(c, a.rq, brows(m.q, T), pos);
+        RAD_ISSUE(c, a.rk, brows(m.k, T), pos);
+        RAD_ISSUE(c, a.store, brows(m.k, T), brows(m.v, T), praw(slot, RAD_I32, T),
+                  kv_cache(a.kv, (int)i));
+        RAD_ISSUE_N(c, a.attn, batch->max_q_len, brows(m.q, T), kv_cache(a.kv, (int)i),
+            praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+            praw(used, RAD_I32, batch->n_seq), RAD_NONE, RAD_NONE,
+            praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(m.attn, T));
+        RAD_ISSUE(c, a.sigmoid, brows(m.gate, T), brows(m.gate, T));
+        const RadOperand heads = RAD_P_T2(rad_buf_ptr(c, m.attn), RAD_BF16, T * g.n_head, g.head_dim);
+        const RadOperand gates = RAD_P_T2(rad_buf_ptr(c, m.gate), RAD_BF16, T * g.n_head, 1);
+        RAD_ISSUE_N(c, a.gate_heads, T * g.n_head, heads, gates, RAD_NONE, heads);
+        RAD_ISSUE(c, a.op, brows(m.attn, T), RAD_W(a.o), brows(m.h, T));
+        RAD_ISSUE(c, a.widen_attn, brows(m.h, T), brows(m.delta, T));
+        RAD_ISSUE(c, a.add_attn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
+        RAD_ISSUE(c, a.fnorm, brows(m.x, T), RAD_W(a.fn), brows(m.h, T));
+        RAD_ISSUE(c, a.gup, brows(m.h, T), RAD_W(a.gu), brows(m.gu, T));
+        RAD_ISSUE(c, a.act, bcol(m.gu, 0, g.n_ff, T), bcol(m.gu, g.n_ff, g.n_ff, T), brows(m.ff, T));
+        RAD_ISSUE(c, a.dp, brows(m.ff, T), RAD_W(a.down), brows(m.h, T));
+        RAD_ISSUE(c, a.widen_ffn, brows(m.h, T), brows(m.delta, T));
+        RAD_ISSUE(c, a.add_ffn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
+    }
+    RAD_ISSUE(c, m.final_norm, brows(m.x, T), RAD_W(m.norm), brows(m.h, T));
+    if (batch->n_out > 0) {
+        RAD_ISSUE_N(c, m.gather, batch->n_out, brows(m.h, T),
+                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.hout, batch->n_out));
+        RAD_ISSUE_N(c, m.logits_op, batch->n_out, brows(m.hout, batch->n_out), RAD_W(m.head),
+                    brows(m.logits, batch->n_out));
+    }
+}
+
+}
+#ifndef RAD_ARCH_NO_EXPORTS
+RAD_ARCH_PLUGIN(spark25_bf16, "spark25", "", "0.1.0", "Spark X2.6 BF16")
+#endif
