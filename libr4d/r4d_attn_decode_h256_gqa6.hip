@@ -1062,6 +1062,12 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // plain decode, the 4-row short block (16k x16 38.94 -> 38.90) and a verify up to 16k (1k x1-x8)
 // keep their segment count. Greedy output is unchanged.
 static constexpr int kVerifySplitsMin = 64;
+// The floor is also bounded by the batch: at most kVerifyFloorWorkgroups workgroups (segments x KV
+// heads x sequences). The declared scratch is the worst over every sequence count up to max_seqs,
+// and 64 a sequence at 256 sequences made it 64x the law's (h256/gqa12 at max_ctx 200000: 7.62 ->
+// 487.5 MiB a card, issue #342). Up to eight sequences of two KV heads the floor stays 64; at 16 it
+// is 32, at 256 two, and the region stays at what eight sequences need.
+static constexpr int kVerifyFloorWorkgroups = 1024;
 static constexpr int kVerifyMinFrom   = 16384;
 static constexpr int kVerifyDeepFrom  = 65536;
 static constexpr int kVerifyDeepMax   = 256;
@@ -1089,7 +1095,10 @@ static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
         const int depth = r4d_decode_depth(a);
         s = (depth > kVerifyDeepFrom ? 512 : 128) / units;
         if (s > kVerifyDeepMax) s = kVerifyDeepMax;
-        if (depth > kVerifyMinFrom && s < kVerifySplitsMin) s = kVerifySplitsMin;
+        if (depth > kVerifyMinFrom) {
+            const int floor = std::min(kVerifySplitsMin, kVerifyFloorWorkgroups / units);
+            if (s < floor) s = floor;
+        }
     }
     const int cap = tiles / 2;
     if (s > cap) s = cap;

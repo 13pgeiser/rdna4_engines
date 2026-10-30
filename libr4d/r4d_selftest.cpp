@@ -1091,6 +1091,9 @@ static void decode_split_law_case(const Plugin& pl) {
         { 4, 8, 16384, 16, 20 },    { 2, 8, 16384, 32, 40 },    { 4, 8, 1024, 16, 20 },
         { 1, 8, 1024, 32, 32 },     { 4, 8, 640, 16, 16 },      { 8, 4, 100000, 16, 16 },
         { 16, 4, 100000, 8, 8 },    { 4, 1, 100000, 32, 32 },   { 1, 1, 100000, 128, 128 },
+        /* Past eight sequences the floor shrinks to kVerifyFloorWorkgroups over the batch, so the region
+         * stays at what eight sequences need (issue #342: 64 a sequence at max_seqs 256 made it 64x). */
+        { 16, 8, 100000, 32, 32 },  { 16, 8, 32768, 32, 32 },   { 256, 8, 100000, 2, 2 },
     };
     int bad = 0;
     for (const Want& w : want) {
