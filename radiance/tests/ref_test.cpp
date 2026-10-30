@@ -982,6 +982,8 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
+        "dflash_tree", "attn_paged_tree",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant",
@@ -1057,6 +1059,7 @@ TEST(op_vocabulary) {
         "sam_attn",
         /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
         "sub_i32",
+        "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -1064,15 +1067,17 @@ TEST(op_vocabulary) {
     }
     CHECK_EQ(api().kernel_count(), (int)(sizeof(kOps) / sizeof(kOps[0])));
 
-    /* The two structural constraints, and only those; everything else must match anything. */
+    /* The structural constraint on the paged block, and only that; everything else must match
+     * anything. attn_paged_tree is attn_paged's row with the tree operand, the same constraint. */
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
+    CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 2);
+    CHECK_EQ(constrained, 3);
 }
 
 /* ================================================================== the numerics
@@ -9600,6 +9605,15 @@ struct Geo {
 #define G(op, key, r, body) { op, key, r, [](A& a, int64_t R) { body; } }
 std::vector<Geo> geometries() {
     return {
+        G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
+                                       .d("beta", 0.1).s("dtype", "f32")),
+        G("embed_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("gqa", 2)
+                                    .i("causal", 0).s("dtype", "f32")),
+        G("ministral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                       .i("n_head_kv", 1).d("theta", 1e6).s("dtype", "f32")),
+        G("pixtral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                     .d("theta", 10000.0).s("dtype", "f32")),
+        G("pixtral_merge", "M", 4, a.i("M", R).i("n", 8).i("merge", 2).s("dtype", "f32")),
         G("rmsnorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_p", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_add", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
@@ -9670,6 +9684,8 @@ std::vector<Geo> geometries() {
                                      .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
+        G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
+                                 .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
@@ -9681,6 +9697,10 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for
@@ -9939,8 +9959,10 @@ std::vector<Geo> geometries() {
  * cannot be drawn; ref_shapes.cpp says why). The sweeps skip them; their hand cases above cover
  * them. */
 bool undrawable(const char* op) {
+    // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2");
+           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+           !std::strcmp(op, "pixtral_merge");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

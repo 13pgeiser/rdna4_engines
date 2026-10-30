@@ -166,6 +166,7 @@ void Metrics::sample(const SchedMetrics& m) {
         draft_adapt_on_.store(true, std::memory_order_release);
     }
     c_preemptions_.advance_to(m.preemptions);
+    c_preempt_forced_.advance_to(m.preempt_forced);
     c_steps_.advance_to(m.steps);
     c_steps_prefill_.advance_to(m.steps_prefill);
     c_steps_mixed_.advance_to(m.steps_mixed);
@@ -182,6 +183,10 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_accepted_.advance_to(m.draft_accepted);
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
+    c_lookup_proposals_.advance_to(m.lookup_proposals);
+    c_lookup_held_.advance_to(m.lookup_held);
+    c_lookup_held_drafts_.advance_to(m.lookup_held_drafts);
+    c_lookup_held_hits_.advance_to(m.lookup_held_hits);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_checkpoints_.advance_to(m.checkpoints_written);
@@ -308,6 +313,9 @@ std::string Metrics::render() const {
               "Number of generation tokens processed.", L, c_generation_tokens_.get());
     w.counter("vllm:num_preemptions_total",
               "Cumulative number of preemptions from the engine.", L, c_preemptions_.get());
+    w.counter("radiance:preempt_forced_total",
+              "Preempted prefill waits that ended by reclaiming cache blocks and forcing a "
+              "lowest-priority running victim (--preempt-wait-ms).", L, c_preempt_forced_.get());
 
     w.help("vllm:request_success_total",
            "Count of successfully processed requests.", "counter");
@@ -416,6 +424,18 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_refill_tokens_total",
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
+    w.counter("radiance:lookup_proposals_total",
+              "Prompt-lookup proposals made, with prompt lookup the only drafter.",
+              L, c_lookup_proposals_.get());
+    w.counter("radiance:lookup_held_total",
+              "Prompt-lookup proposals held back unverified: not expected to pay for their "
+              "verify rows at the measured step cost.", L, c_lookup_held_.get());
+    w.counter("radiance:lookup_held_drafts_total",
+              "Drafts in the held-back proposals.", L, c_lookup_held_drafts_.get());
+    w.counter("radiance:lookup_held_hits_total",
+              "Of the held-back proposals scored against the text that followed, the drafts "
+              "that came true: what verifying them would have accepted.",
+              L, c_lookup_held_hits_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

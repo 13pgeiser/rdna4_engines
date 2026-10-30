@@ -59,6 +59,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_fetches_rows: it reads a mapped table's rows itself, so the engine does not read
+     * them ahead through the page cache (runtime/rowprefetch.h). */
+    bool                 fetches_rows = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -214,6 +217,9 @@ struct WeightInfo {
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Each selected plane's offset in the container (file_offset is plane_offset[0]), for a
+     * file-tier weight the loader relayouts on every read (weight_file_relaid). */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
@@ -367,6 +373,10 @@ public:
      * encoder-only or embedding-only plugin does; the engine refuses to serve such a program at
      * startup. */
     rad_buf logits_buf = 0;
+    /* Scored steps (rad_declare_scores): the final-normed hidden rows and the bf16 head table.
+     * Zero when the plugin declared none. */
+    rad_buf    score_hidden = 0;
+    rad_weight score_table  = 0;
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;
@@ -400,6 +410,10 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
+     * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
+    bool           drafter_tree = false;
+    rad_buf        drafter_parents = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -523,6 +537,30 @@ public:
     OpInfo*     op(rad_op h)         { return h && h < ops.size()     ? &ops[h] : nullptr; }
 
 };
+
+/* The kernel whose layout hook settled `w`'s stored form, or null when it is stored as is or
+ * widened. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.identity || w.widen || w.lay_op < 0 || (size_t)w.lay_op >= prog.ops.size()) return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if (w.lay_band < 0 || (size_t)w.lay_band >= op.bands.size() || w.lay_dom < 0 ||
+        w.lay_dom >= RAD_N_DOMAINS)
+        return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
+ * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
+ * of the container), not widened, and a kernel that relayouts. The selected planes are read from
+ * the container and the kernel's relayout writes the stored form into the pinned stage the copy
+ * to the card reads. The mapped tier cannot do this: it hands kernels the container's bytes. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
 
 /* ================================================================== requests */
 
@@ -708,6 +746,9 @@ struct Request {
      * (SchedReq owns this Request, so it outlives it) and is written alongside n_draft. Null when
      * n_draft is 0. */
     const int32_t*       draft = nullptr;
+    /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
+     * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
+    const int32_t*       draft_parent = nullptr;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -803,6 +844,10 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
+     * before the scheduler evicts cache blocks and preempts a lower-priority running request to
+     * make room for it. 0 = fall back on the next step; default 5000 ms. */
+    int64_t preempt_wait_ms = 5000;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
@@ -848,6 +893,14 @@ struct Config {
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
      * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
+    /* --row-prefetch on|off: a host gather's rows on the mapped tier (a table on disk, read
+     * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
+     * CtxDesc::row_prefetch). Output-neutral; on is the default. */
+    bool    row_prefetch = true;
+    /* --mapped-rewarm on|off: at startup, the mapped tier's pages an earlier run left in the page
+     * cache and the load's allocations reclaimed are asked for again, at most half of
+     * MemAvailable (RadFile::rewarm). Output-neutral; on is the default. */
+    bool    mapped_rewarm = true;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their
@@ -858,6 +911,9 @@ struct Config {
     TablePlacement embedding_placement = TablePlacement::Ram;
     bool           embedding_placement_given = false;
     TablePlacement ngram_placement     = TablePlacement::Auto;
+    /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
+     * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
+    std::string    ngram_share_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
@@ -898,6 +954,16 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* --prefix-resume exact|nearest.
+     * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
+     *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
+     *   where its last chunk starts. The hit recomputes the cold run's own chunks, so its output
+     *   is the cold run's bit for bit even where a kernel rounds a row differently at another
+     *   chunk length.
+     * - nearest: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is
+     *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
+     *   differ from a cold run in the last bits (a near-tie in greedy text). */
+    bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
@@ -934,10 +1000,24 @@ struct Config {
      * and rad-tune read the same operating point; defaulting to off would pay for the head in
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
+    /* --spec-ngram K: speculate by prompt lookup alone, K drafts a step (core/sched/ngram.h), each
+     * proposal verified only when it pays for its verify rows (core/sched/lookup.h).
+     * Sets the window to K and tells the plugin to declare no draft head
+     * (RadBuildCtx::draft_head_off), so a head the container carries costs no memory. 0 (the
+     * default) is off: a deployment that speculates still uses prompt lookup for any sequence its
+     * head declines, and a container without a head speculates by prompt lookup at
+     * --num-speculative-tokens N. */
+    int     spec_ngram = 0;
+    /* The pattern lengths prompt lookup tries, longest first (--spec-ngram-min/--spec-ngram-max),
+     * wherever it runs. */
+    int     spec_ngram_min = 2;
+    int     spec_ngram_max = 4;
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
-     * the step just run; 0 never. Ignored without a drafter that declares one. */
-    int64_t draft_short_from = 0;       /* --draft-short-from */
+     * the step just run; 0 never. -1, auto: never for a chain, and from two for a tree
+     * (rad_drafter_tree), whose nodes are verify rows every drafting sequence pays for. Ignored
+     * without a drafter that declares a short block. */
+    int64_t draft_short_from = -1;      /* --draft-short-from */
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify
@@ -1066,10 +1146,31 @@ struct Config {
     bool    debug_graph = false;
     bool    debug_selection = false;
     bool    debug_placement = false;
+    /* --debug-tape-dump: each rank lists the dispatches of the first recorded pass of each kind
+     * (CtxDesc::tape_dump). */
+    bool    debug_tape_dump = false;
+    /* --debug-draft-oracle FILE: prompt lookup proposes from these token ids, 30% of its drafts
+     * corrupted -- the verify path's test harness (Scheduler::draft_ngram). Empty is off. */
+    std::string debug_draft_oracle;
     bool    profile_ops = false;
     /* --expert-stats FILE: count the routed experts every layer selects, by step kind, and write
      * the counts to FILE as JSON every 30 s and at shutdown (place/xstats.h). Empty is off. */
     std::string expert_stats;
+    /* --expert-profile FILE: a radiance-expert-stats JSON (place/xstats.h) whose `decode` counts
+     * rank the expert plane, instead of the container's activation profile. Empty serves the
+     * container's profile. */
+    std::string expert_profile;
+    bool    expert_profile_given = false;
+    /* --expert-pin-top F: pin the hottest F of the routed experts (0 < F <= 1) by the profile's
+     * share, keeping them resident: heat never demotes them. 0 is off. */
+    float   expert_pin_top = 0.0f;
+    bool    expert_pin_top_given = false;
+    /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
+     * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
+     * beside a trunk that already fills the card. `auto` (the default) leaves them to the
+     * strategy. */
+    std::string draft_expert_placement = "auto";
+    bool    draft_expert_placement_given = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 

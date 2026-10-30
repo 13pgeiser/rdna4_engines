@@ -11,6 +11,7 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -166,6 +167,10 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        /* The fixture runs --prefix-resume nearest (a tail snapshot at the last quantum
+         * boundary, a hit at any snapshot or block); the exact-resume tests set prefix_exact
+         * (--prefix-resume exact, the engine's default) themselves. */
+        cfg.prefix_exact = false;
         /* Config::n_spec defaults to -1 (`auto`), which engine_bringup resolves; this fixture
          * skips that, and DraftController::configure refuses a negative depth. Speculation tests
          * set their own depth. */
@@ -310,8 +315,8 @@ TEST(chunk_geometry_rounds_the_checkpoint_interval_up_to_a_legal_chunk) {
 }
 
 /* A model with no linear state checkpoints only for a trunk window: the snapshot of the window
- * behind a prompt's tail is what a prefix hit resumes from. A drafter's own window is recomputed
- * by draft refill, so it takes no checkpoint and leaves the hit at any block. */
+ * behind a prompt's tail is what a prefix hit resumes from. A drafter's own window alone takes no
+ * checkpoint and leaves the hit at any block: draft refill recomputes it. */
 TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
     for (int drafter = 0; drafter < 2; ++drafter) {
         Program prog;
@@ -339,6 +344,12 @@ TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
         CHECK_OK(chunk_geometry_resolve(prog, cfg, &g));
         CHECK_EQ(g.checkpoint_interval, drafter ? 0ll : 256ll);
         CHECK(g.window_ckpt == !drafter);
+        /* Bring-up asks the same before the geometry is resolved (window_snapshots), and puts a
+         * block drafter's window in the snapshot only where it answers yes: a full-attention
+         * trunk takes no snapshot for its drafter's window alone. */
+        CHECK(window_snapshots(prog, cfg) == g.window_ckpt);
+        cfg.prefix_cache = false;
+        CHECK(!window_snapshots(prog, cfg));
     }
 }
 
@@ -375,7 +386,9 @@ TEST(window_prefill_writes_interval_snapshots_before_the_tail) {
             REQUIRE(n > 0);
             pos += n;
             if (ckpt > 0) {
-                CHECK_EQ(ckpt, pos);
+                /* An interval snapshot ends its chunk; the tail's rides inside the last one. */
+                CHECK(ckpt == pos || pos == 1100);
+                CHECK(ckpt > pos - n);
                 snapshots.push_back(ckpt);
             }
         }
@@ -383,9 +396,10 @@ TEST(window_prefill_writes_interval_snapshots_before_the_tail) {
         CHECK(snapshots == expected);
 
         /* An aligned prompt must still snapshot before its last block: that block's
-         * generation marker changes when the client replays the assistant reply. */
+         * generation marker changes when the client replays the assistant reply. The snapshot
+         * is taken inside the chunk, which is not split for it. */
         int64_t ckpt = -1;
-        CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 240ll);
+        CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 256ll);
         CHECK_EQ(ckpt, 1008ll);
         /* A shared step may end before the boundary; the next chunk must reach it. */
         CHECK_EQ(f.sch.plan_chunk(0, 1100, 160, &ckpt), 160ll);
@@ -415,12 +429,12 @@ TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     CHECK_EQ(ckpt, -1ll);
     CHECK_EQ(f.sch.plan_chunk(512, 1100, 512, &ckpt), 512ll);
     CHECK_EQ(ckpt, -1ll);
-    CHECK_EQ(f.sch.plan_chunk(1024, 1100, 512, &ckpt), 48ll);
+    CHECK_EQ(f.sch.plan_chunk(1024, 1100, 512, &ckpt), 76ll);
     CHECK_EQ(ckpt, 1072ll);
     CHECK_EQ(f.sch.plan_chunk(1072, 1100, 512, &ckpt), 28ll);
     CHECK_EQ(ckpt, -1ll);
 
-    CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 240ll);
+    CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 256ll);
     CHECK_EQ(ckpt, 1008ll);
     CHECK_EQ(f.sch.plan_chunk(0, 256, 512, &ckpt), 256ll);
     CHECK_EQ(ckpt, -1ll);
@@ -795,6 +809,347 @@ TEST(a_span_needs_an_interval_grid) {
     CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
 }
 
+/* A Gemma-like model (a sliding window over a full-attention trunk, no linear state) resumes a
+ * prefix hit only from a window snapshot at an earlier prompt's tail. One is taken wherever that
+ * position, a block short of the prompt's end, is kWindowSnapshotMin or more, at the default
+ * 2048-token interval too, so a short conversation's next turn resumes: the shortest prompt takes
+ * its snapshot at the floor and one token less takes none, and a prompt past an interval takes the
+ * one it always did. An interval under the floor is the floor. A 1000-token prompt runs whole, its
+ * snapshot taken inside the chunk: the window's rows are still held when it ends, so unlike linear
+ * state nothing makes the prompt split there. */
+TEST(a_window_snapshot_is_taken_at_the_tail_of_a_short_prompt_too) {
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/2048, 4096, /*windowed=*/true, /*linear=*/false);
+    f.cfg.checkpoint_interval = 2048;
+    CHECK_OK(f.start());
+    CHECK(f.sch.geometry().window_ckpt);
+    const int64_t Q = f.sch.geometry().quantum, back = std::max<int64_t>(Q, 16);
+    const int64_t floor = Scheduler::kWindowSnapshotMin, shortest = floor + back;
+    CHECK_EQ(floor % Q, (int64_t)0);
+    CHECK_EQ(f.sch.tail_checkpoint(shortest), floor);
+    CHECK_EQ(f.sch.tail_checkpoint(shortest - 1), (int64_t)-1);
+    CHECK_EQ(f.sch.tail_checkpoint(400), (int64_t)-1);
+    CHECK_EQ(f.sch.tail_checkpoint(3000), (3000 - back) / Q * Q);
+    const int64_t t = (1000 - back) / Q * Q;
+    CHECK_EQ(f.sch.tail_checkpoint(1000), t);
+    f.submit(1000, 8);
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK_EQ(b->n_tok, 1000);
+    CHECK_EQ(b->n_checkpoints, 1);
+    CHECK_EQ(b->checkpoint_tok[0], t - 1);
+
+    Fixture g;
+    g.build(4096, 64, /*max_tok=*/2048, 4096, /*windowed=*/true, /*linear=*/false);
+    g.cfg.checkpoint_interval = 256;
+    CHECK_OK(g.start());
+    const int64_t I = g.sch.geometry().checkpoint_interval;
+    CHECK_EQ(I, (int64_t)256);
+    CHECK_EQ(g.sch.tail_checkpoint(I + back), I);
+    CHECK_EQ(g.sch.tail_checkpoint(I + back - 1), (int64_t)-1);
+}
+
+/* A prompt longer than the step budget takes its window snapshot inside its last chunk: the chunks
+ * before it are the budget's, and the last runs to the prompt's end with the snapshot at its tail
+ * row. */
+TEST(a_long_prompt_takes_its_window_snapshot_inside_its_last_chunk) {
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/512, 4096, /*windowed=*/true, /*linear=*/false);
+    f.cfg.checkpoint_interval = 2048;
+    CHECK_OK(f.start());
+    const int64_t Q = f.sch.geometry().quantum, back = std::max<int64_t>(Q, 16);
+    const int64_t t = (1000 - back) / Q * Q;
+    f.submit(1000, 8);
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK_EQ(b->n_tok, 512);
+    CHECK_EQ(b->n_checkpoints, 0);
+    f.commit_plain();
+    b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK_EQ(b->n_tok, 1000 - 512);
+    CHECK_EQ(b->n_checkpoints, 1);
+    CHECK_EQ(b->checkpoint_tok[0], t - 512 - 1);
+}
+
+/* Under load a prompt's chunks are held back for the speculating decode rows behind it. Every prompt
+ * takes its window snapshot once, at its tail row, in whichever chunk carries that row: the final
+ * one, or a held-back one cut short of the prompt's end on a quantum. */
+TEST(a_window_snapshot_under_load_lands_at_the_tail_whatever_chunk_carries_it) {
+    for (int64_t n = 600; n <= 1000; n += 24) {
+        Fixture f;
+        f.build(4096, 64, /*max_tok=*/256, 8192, /*windowed=*/true, /*linear=*/false);
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.n_spec = 7;
+        f.cfg.busy_prefill_chunk = -1;
+        CHECK_OK(f.start());
+        const int64_t Q = f.sch.geometry().quantum, back = std::max<int64_t>(Q, 16);
+        const int64_t t = (n - back) / Q * Q;
+        for (int d = 0; d < 4; ++d) f.submit(40, 4000);
+        for (int k = 0; k < 2; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(11); }
+        const uint64_t p = f.submit(n, 8);
+        int snaps = 0;
+        for (int k = 0; k < 64 && f.sch.find(p) && f.sch.find(p)->n_computed < n; ++k) {
+            CHECK(f.sch.step() != nullptr);
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq != p || e.ckpt_slot < 0) continue;
+                ++snaps;
+                if (!(e.ctx_len < t && e.ctx_len + e.n_tokens >= t && e.ctx_len + e.ckpt_tok + 1 == t))
+                    fprintf(stderr, "    n %lld: chunk [%d, %d), snapshot at %d, tail %lld\n",
+                            (long long)n, (int)e.ctx_len, (int)(e.ctx_len + e.n_tokens),
+                            (int)(e.ctx_len + e.ckpt_tok + 1), (long long)t);
+                CHECK((int64_t)e.ctx_len < t && (int64_t)e.ctx_len + e.n_tokens >= t);
+                CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, t);
+            }
+            f.commit_plain(11);
+        }
+        if (snaps != 1) fprintf(stderr, "    n %lld: %d snapshots\n", (long long)n, snaps);
+        CHECK_EQ(snaps, 1);
+    }
+}
+
+/* ================================================================== exact resume */
+/* --prefix-resume exact (the default): a hit resumes only where an idle server's cold prefill of
+ * the same prompt starts a chunk, and a prompt's tail snapshot is where its last chunk starts. A
+ * kernel may round a row differently at another chunk length (spec §17: the split-K count is
+ * chosen from M), so a hit is bit-identical to a cold run only when it recomputes the cold run's
+ * own chunks. */
+
+/* The chunk ends and checkpoints an idle server plans for an `L`-token prompt from `from`. */
+struct Cut { std::vector<int64_t> ends, ckpts; };
+static Cut cut_from(const Scheduler& s, int64_t from, int64_t L, int64_t budget) {
+    Cut c;
+    for (int64_t pos = from; pos < L;) {
+        int64_t ck = -1;
+        const int64_t n = s.plan_chunk(pos, L, budget, &ck);
+        if (n <= 0) break;
+        pos += n;
+        c.ends.push_back(pos);
+        if (ck > 0) c.ckpts.push_back(ck);
+    }
+    return c;
+}
+static std::vector<int64_t> ends_after(const Cut& c, int64_t from) {
+    std::vector<int64_t> v;
+    for (int64_t e : c.ends) if (e > from) v.push_back(e);
+    return v;
+}
+
+/* Which geometry: 0 the GDN hybrid at interval 256 / budget 512 (chunks split at the interval);
+ * 1 interval 1024 past a 512 budget; 2 a span of 2; 3 a sliding-window model with periodic
+ * snapshots; 4 the same, tip-only (no interval split); 5 full attention alone (no snapshots). */
+static void exact_fixture(Fixture& f, int kind) {
+    const bool window = kind == 3 || kind == 4, attn_only = kind == 5;
+    f.build(4096, 64, 512, 8192, window, !attn_only);
+    if (window) {
+        /* As the window tests above: drop the GDN hybrid's linear and conv groups and its scan. */
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        if (kind == 4) f.cfg.checkpoint_policy = "tip-only";
+    }
+    if (kind == 1) f.cfg.checkpoint_interval = 1024;
+    if (kind == 2) f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+}
+
+TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
+    struct Want { int kind; int64_t interval, grid, origin; };
+    for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },
+                          Want{ 3, 256, 256, 0 }, Want{ 4, 256, 512, 0 }, Want{ 5, 0, 512, 0 } }) {
+        Fixture f;
+        exact_fixture(f, w.kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        CHECK(g.exact);
+        CHECK_EQ(g.checkpoint_interval, w.interval);
+        CHECK_EQ(g.grid, w.grid);
+        CHECK_EQ(g.grid_origin, w.origin);
+    }
+    /* Nearest, or no prefix cache: no grid, every position its own floor. */
+    for (int off = 0; off < 2; ++off) {
+        Fixture f;
+        exact_fixture(f, 0);
+        if (off) f.cfg.prefix_cache = false; else f.cfg.prefix_exact = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.geometry().exact);
+        CHECK_EQ(f.sch.geometry().grid_floor(300), 300);
+    }
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    const ChunkGeometry& g = f.sch.geometry();   /* 0, 256, 768, 1280, ... */
+    CHECK_EQ(g.grid_floor(255), 0);
+    CHECK_EQ(g.grid_floor(256), 256);
+    CHECK_EQ(g.grid_floor(767), 256);
+    CHECK_EQ(g.grid_floor(1000), 768);
+    CHECK(!g.on_grid(512));
+}
+
+/* An interval past the budget that is not a multiple of the budget's chunk would put the chunk
+ * after every checkpoint off the cold run's grid: exact rounds it up, with a warning that names
+ * both ways out; nearest keeps it. */
+TEST(exact_rounds_an_interval_off_the_chunk_up_to_a_multiple_of_it) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        f.build();                            /* quantum 64 */
+        f.cfg.checkpoint_interval = 768;      /* past the 512 budget, not a multiple of it */
+        f.cfg.prefix_exact = exact != 0;
+        log_set_level(Log::Error);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.geometry().checkpoint_interval, exact ? 1024 : 768);
+        if (exact) CHECK_EQ(f.sch.geometry().grid, 512);
+    }
+    /* A budget off the quantum chunks at the quantum below it: 500 -> 448, and the interval goes
+     * to the next multiple of 448. */
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/500);
+    f.cfg.checkpoint_interval = 1024;
+    f.cfg.prefix_exact = true;
+    log_set_level(Log::Error);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.geometry().checkpoint_interval, 1344);
+    CHECK_EQ(f.sch.geometry().grid, 448);
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(0, 5000, 500, &ck), 448);
+    CHECK_EQ(f.sch.plan_chunk(896, 5000, 500, &ck), 448);
+    CHECK_EQ(ck, 1344);
+}
+
+/* The tail snapshot is where the prompt's last chunk starts, a boundary an idle chunk already
+ * ends on: no extra step, and an exact repeat re-prefills that last chunk whole. */
+TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
+    Fixture f;
+    exact_fixture(f, 1);                      /* interval 1024, chunks of 512 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    Cut c = cut_from(f.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536 }));
+    /* Its last chunk starting on the interval: that checkpoint is the tail's. */
+    c = cut_from(f.sch, 0, 1100, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1100 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024 }));
+    /* One ending on the grid: the last chunk is [1536, 2048), and its end is an interval. */
+    c = cut_from(f.sch, 0, 2048, 512);
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536, 2048 }));
+    /* Inside the first interval nothing (as under nearest: cheap to prefill again). */
+    c = cut_from(f.sch, 0, 900, 512);
+    CHECK(c.ckpts.empty());
+    /* A step sharing its budget may straddle the tail: split there, the snapshot written. */
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(1400, 1800, 512, &ck), 136);
+    CHECK_EQ(ck, 1536);
+    /* A budget short of a quantum boundary past it leaves it for the next chunk. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 1800, 100, &ck), 64);
+    CHECK_EQ(ck, -1);
+
+    /* Nearest cuts the same prompt's last chunk at its last quantum boundary instead. */
+    Fixture n;
+    n.build();
+    n.cfg.checkpoint_interval = 1024;
+    REQUIRE_EQ(n.start(), RAD_OK);
+    c = cut_from(n.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1792, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1792 }));
+}
+
+/* The property itself, over every geometry and many prompt lengths: every checkpoint is on the
+ * grid and is a chunk start of the cold run of the prompt that wrote it and of any longer prompt
+ * it prefixes (an agent's next turn), and from it the hit cuts exactly the cold run's chunks. */
+TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
+    for (int kind = 0; kind < 6; ++kind) {
+        Fixture f;
+        exact_fixture(f, kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        int checked = 0;
+        for (int64_t L = 100; L <= 3000; L += 37) {
+            const Cut cold = cut_from(f.sch, 0, L, 512);
+            for (int64_t c : cold.ckpts) {
+                CHECK(g.on_grid(c));
+                if (c >= L) continue;
+                CHECK(std::find(cold.ends.begin(), cold.ends.end(), c) != cold.ends.end());
+                CHECK(cut_from(f.sch, c, L, 512).ends == ends_after(cold, c));
+                for (int64_t L2 : { L + 1, L + 300, L + 1500 }) {
+                    const Cut cold2 = cut_from(f.sch, 0, L2, 512);
+                    CHECK(std::find(cold2.ends.begin(), cold2.ends.end(), c) != cold2.ends.end());
+                    CHECK(cut_from(f.sch, c, L2, 512).ends == ends_after(cold2, c));
+                }
+                ++checked;
+            }
+        }
+        CHECK(kind == 5 ? checked == 0 : checked > 20);
+    }
+    /* What nearest gives up: its tail snapshot at a 1000-token prompt's last quantum boundary
+     * (960) is no chunk start of the 1500-token turn after it, which a cold run cuts at 768 and
+     * 1024, so a hit there recomputes [960, 1024) as a chunk of its own. */
+    Fixture n;
+    n.build();
+    REQUIRE_EQ(n.start(), RAD_OK);
+    const Cut c1000 = cut_from(n.sch, 0, 1000, 512);
+    CHECK(std::find(c1000.ckpts.begin(), c1000.ckpts.end(), 960) != c1000.ckpts.end());
+    const Cut c1500 = cut_from(n.sch, 0, 1500, 512);
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 960) == c1500.ends.end());
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 768) != c1500.ends.end());
+    CHECK_EQ(cut_from(n.sch, 960, 1500, 512).ends.front(), 1024);
+}
+
+/* At admission: a hit at a snapshot resumes there (plan_chunk put it on the grid); a hit with no
+ * snapshot to resume from (full attention alone) steps back to the grid, the blocks above it
+ * left to the cache and recomputed in the cold run's chunk. */
+TEST(an_exact_hit_steps_back_to_the_grid_and_prefills_the_cold_chunks) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        exact_fixture(f, 5);                  /* chunks of 512, no snapshots */
+        f.cfg.prefix_exact = exact != 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(784);                       /* 49 blocks */
+        const uint64_t a = f.submit(1300, 8);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, exact ? 512 : 784);
+        CHECK_EQ(b->ctx_lens[0], exact ? 512 : 784);
+        CHECK_EQ(b->n_tok, 512);              /* [512, 1024) as the cold run, or [784, 1296) */
+        CHECK_EQ((int)f.kv.block_table(a, 0).size(), exact ? 64 : 81);
+        CHECK_EQ(f.sch.metrics().hit_cut_tokens, exact ? 272 : 0);
+    }
+    /* With snapshots the hit is at one: kept as is, restored from its slot. */
+    Fixture f;
+    exact_fixture(f, 1);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.pc.seed(1600);
+    f.pc.lin = 1536;                          /* a tail snapshot, on the 512 grid */
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1800, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 1536);
+    CHECK_EQ(b->n_tok, 264);                  /* the cold run's last chunk, whole */
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+}
+
+/* A cold prompt at the scheduler: the last chunk is not split at the end, and an exact repeat's
+ * hit at the tail snapshot is that chunk. */
+TEST(an_exact_cold_prefill_keeps_its_last_chunk_whole) {
+    Fixture f;
+    exact_fixture(f, 0);                      /* interval 256, chunks of 256 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.submit(1000, 1);
+    std::vector<int64_t> toks, ckpts;
+    for (int i = 0; i < 8; ++i) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        toks.push_back(b->n_tok);
+        for (int k = 0; k < b->n_checkpoints; ++k)
+            ckpts.push_back(b->ctx_lens[0] + b->checkpoint_tok[k] + 1);
+        f.commit_plain();
+    }
+    CHECK((toks == std::vector<int64_t>{ 256, 256, 256, 232 }));
+    CHECK((ckpts == std::vector<int64_t>{ 256, 512, 768 }));
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();
@@ -1117,6 +1472,121 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     CHECK_EQ(m.linear_cached_tokens, 0);
 }
 
+/* The same model with the trunk's window in the checkpoint slot (KVGroupPlan::win_snap beside
+ * linear state, as DeepSeek-V4.1's sliding layers beside its compressor state): the hit resumes at
+ * the snapshot, which restores the linear state and the window together, and the cached group's
+ * blocks are adopted. */
+TEST(a_hit_on_a_hybrid_whose_slot_carries_the_window_resumes_at_the_snapshot) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    const int32_t swa = 3;
+    f.kv.snap = { swa };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+
+    const uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    CHECK_EQ(b->ctx_lens[0], 256);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+    CHECK_EQ(f.kv.block_table(a, 0)[0], f.pc.seeded[0][0]);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.linear_cached_tokens, 256);
+    CHECK_EQ(m.hit_cut_window, 0);
+
+    /* A hit with no snapshot under it still reuses nothing: the window has nowhere to come from. */
+    Fixture g;
+    g.build(4096, 64, 512, 4096, /*windowed=*/true);
+    g.kv.snap = { swa };
+    g.pc.groups = { 0 };
+    CHECK_OK(g.start());
+    g.pc.seed(304);
+    g.pc.lin = 0;
+    g.pc.src = -1;
+    const uint64_t c = g.submit(300, 8);
+    REQUIRE(g.sch.step() != nullptr);
+    CHECK_EQ(g.sch.find(c)->n_computed, 0);
+}
+
+/* A trunk group the cache does not index and no slot carries is a hole no snapshot fills: a full
+ * group left out refuses the hit even where the window is in the slot. */
+TEST(a_trunk_group_neither_cached_nor_in_the_slot_refuses_the_hit) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 16;
+    k.layers = { 3 };
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(300, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().hit_cut_window, 1);
+}
+
+/* Groups at two block sizes: a hit adopts each group's own blocks (the 8-token group twice as
+ * many), and the cache's reserve is asked for in entries, from the group furthest short. */
+TEST(a_hit_over_mixed_block_sizes_adopts_each_groups_own_blocks) {
+    Fixture f;
+    f.build(4096, 64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    const int32_t fine = 3;
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0, fine };
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().quantum % 16, 0ll);
+    f.pc.seed(304);                                   /* 19 blocks of 16, 38 of 8 */
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1000, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    const std::vector<int32_t> t0 = f.kv.block_table(a, 0), t1 = f.kv.block_table(a, fine);
+    CHECK_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
+    CHECK_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
+    for (int i = 0; i < 16; ++i) CHECK_EQ(t0[(size_t)i], f.pc.seeded[0][(size_t)i]);
+    for (int i = 0; i < 32; ++i) CHECK_EQ(t1[(size_t)i], f.pc.seeded[1][(size_t)i]);
+}
+
+TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+    f.pc.groups = { 0, 3 };
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 1 << 20;
+    f.submit(160, /*max_tokens=*/1);                 /* 10 + 20 blocks, finishes on the first commit */
+    f.submit(176, /*max_tokens=*/64);                /* 11 + 22 each, still running after it */
+    f.submit(176, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.held_blocks(0), 32ll);             /* 32 free against a reserve of 16 */
+    CHECK_EQ(f.kv.held_blocks(3), 64ll);             /* none free against 16: 8 entries of 2 */
+    f.commit_plain();
+    REQUIRE(f.pc.trims.size() == 1u);
+    CHECK_EQ(f.pc.trims[0], 8ll);
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */
@@ -1202,6 +1672,116 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 }
 
 /* ================================================================== the step batch */
+/* A PREEMPTED PREFILL WAITS FOR ROOM FOR THE WHOLE RECOMPUTE plus one block per running
+ * sequence. Admitting it on a shortfall is what makes the prefill loop: the next decode takes
+ * the block it just reserved, its next chunk is refused, and preempt_back() resets it again. */
+TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 60000;           /* old gate test: no fallback in its 80 steps */
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+
+    /* A takes 287 tokens (18 blocks), B 128 (8): the pool is full. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+
+    /* B's next token needs a new block; it is the lowest-priority victim and is reset. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain();
+
+    /* One block the fake pool has free and no sequence holds: the victim's own blocks plus one.
+     * The gate still wants one block of headroom beside the running A. */
+    f.kv.total[0] += 1;
+    f.kv.refcnt[0].push_back(0);
+    f.kv.freelist[0].push_back(26);
+
+    /* B stays in the queue while A runs; it must not be admitted into a pool that has no room
+     * for its whole prompt plus A's next block. */
+    uint64_t q[8];
+    CHECK_EQ(f.sch.queue_snapshot(q, 8), 1);
+    CHECK_EQ(q[0], b);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+        CHECK_EQ(f.sch.find(b)->n_computed, 0);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* A's blocks are back; B can now prefill its whole prompt. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain();
+}
+
+/* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
+ * preempting the lowest-priority running request before the step is planned, so it cannot queue
+ * forever behind a long decode (the 710 s stall in the daily's log). */
+TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;               /* fallback on the next step */
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+
+    /* A and B fill the pool; B's next token needs a block and B is the victim. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    /* B's blocks are back in the pool; the old gate wants B's whole prompt plus one block of
+     * headroom beside A's next token, so it cannot admit B without a victim. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, 2);
+    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    f.commit_plain();
+}
+
+/* Several overdue preempted prefills: reclaiming for the head alone is not enough. Keep forcing
+ * the lowest-priority runner until one overdue request can prefill, so the rest of the queue
+ * cannot sit in Preempted behind a head that still does not fit. */
+TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);   /* 20 x 16 = 320 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, 16, /*priority=*/5);
+    uint64_t b = f.submit(80, 16, /*priority=*/3);
+    uint64_t c = f.submit(48, 16, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+
+    /* Fill until the pool refuses someone. Then the overdue path must not leave every preempted
+     * request waiting while a runner keeps the blocks. */
+    for (int i = 0; i < 8; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK(f.sch.metrics().preempted_waiting == 0 || f.sch.metrics().preempt_forced > 0);
+    CHECK(f.sch.metrics().running + f.sch.metrics().preempted_waiting > 0);
+    (void)a; (void)b; (void)c;
+}
+
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
     f.build();
@@ -1595,6 +2175,28 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
 }
 }  /* namespace */
 
+TEST(the_refill_window_is_the_retention_policys_drafter_floor) {
+    /* tip-only keeps a snapshot this deep below the tip, or a refill-capped hit has nothing to end
+     * on and the request decodes without drafts (KeepTipOnly). Without a refill the floor is 0. */
+    for (int spec : { 7, 0 }) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+        f.cfg.n_spec = spec;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.window = 512;
+        KVGroupInfo w;
+        w.name = "draft";
+        w.decl.kind = RAD_KV_WINDOW;
+        w.decl.window = 512;
+        w.block_size = 16;
+        f.prog.kv_groups.push_back(w);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        CHECK_OK(f.start());
+        CHECK_EQ(f.pc.drafter_floor, spec ? (int64_t)512 : (int64_t)0);
+    }
+}
+
 TEST(a_prefix_hit_ends_a_drafter_window_before_the_prompt_and_the_drafter_drafts_at_once) {
     const RefillRun r = refill_run(/*prompt=*/1100, /*seeded=*/1024);
     /* The cap is 1100 - 512 = 588: attention 576, and the checkpoint under it 512. */
@@ -1620,6 +2222,51 @@ TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
     CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
     CHECK_EQ(r.rows, 0);
+}
+
+/* A Gemma-like model: a full-attention trunk with a sliding window and no linear state, so a hit
+ * resumes from the window snapshot taken at an earlier prompt's tail (ChunkGeometry::window_ckpt),
+ * and a windowed block drafter. When that snapshot carries the trunk's window only, draft refill
+ * cannot cut the hit (no snapshot a window back), the whole hit stands and the drafter waits for
+ * its window; when it carries the drafter's window too (a block drafter on the card's driver,
+ * KVManager::set_drafter_window_snapshot), there is no hole, no refill, and the drafter drafts from
+ * the first decode. */
+TEST(a_prefix_hit_whose_window_snapshot_carries_the_drafters_window_drafts_at_once) {
+    for (int with_drafter = 0; with_drafter < 2; ++with_drafter) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192,
+                /*windowed=*/true, /*linear=*/false);
+        f.cfg.n_spec = 7;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.window = 512;
+        KVGroupInfo w;
+        w.name = "draft";
+        w.decl.kind = RAD_KV_WINDOW;
+        w.decl.window = 512;
+        w.block_size = 16;
+        f.prog.kv_groups.push_back(w);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        const int32_t swa = 1, draft = 2;
+        f.kv.snap = with_drafter ? std::vector<int32_t>{ swa, draft } : std::vector<int32_t>{ swa };
+        f.pc.groups = { 0 };
+        f.pc.ckpt_lo = 2048;          /* the earlier prompt's tail snapshot, none below it */
+        CHECK_OK(f.start());
+        CHECK(f.sch.geometry().window_ckpt);
+        f.pc.seed(2048); f.pc.lin = 2048; f.pc.src = 3;
+        const uint64_t a = f.submit(2200, 64);
+        Scheduler::BlockRow rows[4];
+        int n_rows = -1;
+        for (int st = 0; st < 40; ++st) {
+            CHECK(f.sch.step() != nullptr);
+            if (st == 0) CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)2048);
+            f.commit_plain(11);
+            const int n = f.sch.block_begin(8, 7, 512, 99, rows, 4);
+            f.sch.block_end();
+            if (!f.sch.find(a)->output.empty()) { n_rows = n; break; }
+        }
+        CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
+        CHECK_EQ(n_rows, with_drafter ? 1 : 0);
+    }
 }
 
 /* z-lab's DFlash on the Gemma 4 31B: a full-attention block drafter (no window), whose own group the
@@ -1663,6 +2310,23 @@ TEST(a_full_attention_drafter_drafts_at_once_after_a_hit_the_window_snapshot_res
         CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
         CHECK_EQ(n_rows, counted ? 1 : 0);
     }
+}
+
+/* The short block's switch (--draft-short-from): on from the threshold, off again two below, and
+ * off at one decoding sequence whatever the threshold, where the long block pays. From 2 (a tree's
+ * auto) a load of 2, 1, 1 runs it, then not; from 8, 8 then 7 keeps it and 6 drops it. */
+TEST(the_short_block_switches_off_at_one_sequence) {
+    bool on = false;
+    on = Scheduler::short_block_on(on, 2, 2); CHECK(on);
+    on = Scheduler::short_block_on(on, 1, 2); CHECK(!on);
+    on = Scheduler::short_block_on(on, 1, 2); CHECK(!on);
+    on = Scheduler::short_block_on(on, 0, 2); CHECK(!on);
+    on = Scheduler::short_block_on(false, 8, 8); CHECK(on);
+    on = Scheduler::short_block_on(on, 7, 8); CHECK(on);
+    on = Scheduler::short_block_on(on, 6, 8); CHECK(!on);
+    on = Scheduler::short_block_on(on, 7, 8); CHECK(!on);
+    CHECK(Scheduler::short_block_on(false, 1, 1));   /* from 1: every sequence runs it */
+    CHECK(!Scheduler::short_block_on(true, 0, 1));
 }
 
 TEST(no_prefix_hit_gives_nothing_back) {
@@ -2708,9 +3372,9 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* The flag, for a drafting head (serial or block). --draft-window adaptive with prompt lookup
- * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
- * then reaches the step uncut. The default is the fixed window. */
+/* The flag, for a drafting head (serial or block) or prompt lookup alone. --draft-window adaptive
+ * with no speculation keeps the configured depth and says so at startup. The default is the fixed
+ * window. */
 TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
     {
         Fixture f;
@@ -2763,6 +3427,8 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
         CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
     }
+    /* Prompt lookup as the only drafter takes the policy as a block drafter does: each of its
+     * drafts is a verify row (prompt_lookup_alone_follows_its_own_acceptance). */
     {
         Fixture f;
         adaptive_fixture(f, 4);
@@ -2771,9 +3437,9 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int st = RAD_E_STATE;
         const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
-        CHECK(!f.sch.draft().adaptive());
-        CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
-        CHECK(log.find("prompt lookup only") != std::string::npos);
+        CHECK(f.sch.draft().adaptive());
+        CHECK(log.find("--draft-window adaptive with prompt lookup only") != std::string::npos);
+        CHECK(log.find("the window is fixed") == std::string::npos);
 
         const uint64_t a = f.submit(160, 64);
         CHECK(f.sch.step() != nullptr);
@@ -2781,7 +3447,7 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int32_t draft[4] = { 21, 22, 23, 24 };
         CHECK_OK(f.sch.set_draft(a, draft, 4));
         CHECK_EQ(f.sch.find(a)->n_draft, 4);
-        CHECK(!f.sch.metrics().draft_adaptive);
+        CHECK(f.sch.metrics().draft_adaptive);
     }
     {
         Fixture f;
@@ -2979,6 +3645,423 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
         f.commit_plain(100 + (t + 1) % 8);
     }
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* With prompt lookup the only drafter, its drafts are what the adaptive window measures: refused
+ * lookups bring each sequence's window, and the lookup's proposals, down to one draft. */
+TEST(prompt_lookup_alone_follows_its_own_acceptance) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+
+    int first = 0, last = 0, lookups = 0;
+    for (int t = 0; t < 6 * DraftController::kHold; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            /* What the pattern says comes next, the period continued. */
+            CHECK_EQ(e.draft[0], 100 + (t + 1) % 8);
+            if (!first) first = e.n_spec;
+            last = e.n_spec;
+            ++lookups;
+        }
+        f.commit_plain(100 + (t + 1) % 8);             /* every lookup refused */
+    }
+    CHECK_EQ(lookups, 6 * DraftController::kHold);
+    CHECK_EQ(first, 4);
+    CHECK_EQ(last, 1);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* ------------------------------------------------------------------ prompt lookup's verify gate */
+/* A held proposal is scored against the text that follows, as a verify would have scored it: its
+ * accepted count is the common prefix. One proposal at a time; the next is taken once it ends. */
+TEST(the_lookup_gate_scores_a_held_proposal_against_the_text_that_follows) {
+    LookupGate g;
+    g.configure(4);
+    LookupSeq q;
+    /* The priors: a short match waits, a long one drafts. */
+    CHECK_NEAR(g.expect(q, 0, 4), 4 * LookupGate::kPriorShort, 1e-6);
+    CHECK_NEAR(g.expect(q, 1, 4), 4 * LookupGate::kPriorLong, 1e-6);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch - 1), 0);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch), 1);
+
+    std::vector<int32_t> text(10, 1);                  /* the sequence so far: 10 tokens */
+    TokenSeq ts;
+    auto view = [&]() {
+        ts.a = text.data();
+        ts.na = (int64_t)text.size();
+    };
+    const int32_t prop[4] = { 5, 6, 7, 8 };
+    g.offer(q, 10, prop, 4, 2);
+    g.held(q, 4);
+    const int32_t other[4] = { 40, 41, 42, 43 };
+    g.offer(q, 10, other, 4, 9);                       /* pending already: counted, not taken */
+    CHECK_EQ(q.proposed, (int64_t)2);
+    CHECK_EQ(q.pend_cls, 0);
+
+    text.push_back(5);                                 /* the first came true; no verdict yet */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos >= 0);
+    CHECK_NEAR(q.s[0][0], 0.0, 1e-6);
+    text.push_back(6);
+    text.push_back(9);                                 /* two came true, the third did not */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    /* The prior weighs two proposals: the first evaluated moves each position a third. */
+    const double w = 1.0 / (LookupGate::kPriorWeight + 1.0);
+    CHECK_NEAR(q.s[0][0], w, 1e-6);
+    CHECK_NEAR(q.s[0][1], w, 1e-6);
+    CHECK_NEAR(q.s[0][2], 0.0, 1e-6);
+    CHECK_NEAR(q.s[0][3], 0.0, 1e-6);
+    CHECK_NEAR(q.s[1][0], LookupGate::kPriorLong, 1e-6);   /* the other class untouched */
+    CHECK_EQ(q.held_hits, (int64_t)2);
+    CHECK_EQ(g.held_hits(), (int64_t)2);
+    CHECK_EQ(g.held_count(), (int64_t)1);
+    CHECK_EQ(g.held_drafts(), (int64_t)4);
+
+    /* A proposal that comes true whole ends at its last token; a verified one counts no held
+     * hits but feeds the estimate the same way. */
+    const int64_t at = (int64_t)text.size();
+    const int32_t whole[4] = { 11, 12, 13, 14 };
+    g.offer(q, at, whole, 4, 3);
+    for (int32_t t : whole) text.push_back(t);
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    CHECK(q.s[0][3] > 0.0f);
+    CHECK_EQ(q.held_hits, (int64_t)2);
+
+    /* Evidence is what moves a short match into drafting: a run of proposals that come true. */
+    LookupGate g2;
+    g2.configure(4);
+    LookupSeq r;
+    CHECK(!g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+    std::vector<int32_t> s2(4, 1);
+    for (int i = 0; i < 6; ++i) {
+        const int32_t p2[4] = { 2, 3, 4, 5 };
+        g2.offer(r, (int64_t)s2.size(), p2, 4, 2);
+        for (int32_t t : p2) s2.push_back(t);
+        TokenSeq t2;
+        t2.a = s2.data();
+        t2.na = (int64_t)s2.size();
+        g2.advance(r, t2);
+    }
+    CHECK(g2.expect(r, 0, 4) > 2.9);   /* 6 / (6 + 2) a position */
+    CHECK(g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+}
+
+/* What a verify costs: the measured step time at the step's rows with the drafts against without
+ * them; between timed row counts a line, outside them the nearest scaled by the prior's shape. */
+TEST(the_lookup_gate_prices_a_verify_by_measured_step_times) {
+    LookupGate g;
+    g.configure(4);
+    /* Untimed: the prior shape, 6% a row, so a whole window pays at a quarter of a token. */
+    CHECK_NEAR(g.step_cost(5) / g.step_cost(1), 1.0 + 4 * LookupGate::kRowCost, 1e-9);
+    CHECK(g.pays(0.3, 4, 1, 1.0));
+    CHECK(!g.pays(0.2, 4, 1, 1.0));
+    CHECK(!g.pays(0.0, 4, 1, 1.0));
+
+    /* One row timed: a verify is priced off it on the prior's shape. */
+    for (int i = 0; i < 8; ++i) g.step_time(1, 10.0);
+    CHECK_EQ(g.cost_samples(1), (int64_t)8);
+    CHECK_NEAR(g.step_cost(5), 10.0 * (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+
+    /* Both timed: 2.5x for four drafts (a MoE reading each row's experts). 1 + E must beat it. */
+    for (int i = 0; i < 8; ++i) g.step_time(5, 25.0);
+    CHECK_NEAR(g.step_cost(5), 25.0, 1e-9);
+    CHECK_NEAR(g.step_cost(3), 17.5, 1e-9);            /* between: the line */
+    CHECK(!g.pays(1.4, 4, 1, 1.0));
+    CHECK(g.pays(1.6, 4, 1, 1.0));
+    /* Past the last timed count: the prior's shape from there. */
+    CHECK_NEAR(g.step_cost(9), 25.0 * (1.0 + 8 * LookupGate::kRowCost) /
+                                   (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+    /* In a step of eight rows already expecting eight tokens, the same drafts weigh against the
+     * whole step: marginal cost over the step's rate. */
+    for (int i = 0; i < 8; ++i) g.step_time(8, 30.0);
+    for (int i = 0; i < 8; ++i) g.step_time(12, 36.0);
+    CHECK(!g.pays(1.5, 4, 8, 8.0));                    /* 1.5 / 8 < 36 / 30 - 1 */
+    CHECK(g.pays(1.7, 4, 8, 8.0));
+
+    /* A step that waited on something else counts as at most four times the mean. */
+    g.step_time(1, 1000.0);
+    CHECK(g.step_cost(1) < 10.0 + 40.0 / 8.0);
+    /* Junk is ignored. */
+    g.step_time(0, 5.0);
+    g.step_time(2, -1.0);
+    CHECK_EQ(g.cost_samples(2), (int64_t)0);
+    /* Wide steps share keys in bands of 32 rows past 128. */
+    g.step_time(200, 80.0);
+    g.step_time(210, 90.0);
+    CHECK_EQ(g.cost_samples(205), (int64_t)2);
+}
+
+/* The index says how far the match behind a proposal runs back, up to the cap. */
+TEST(prompt_lookup_reports_how_far_its_match_runs_back) {
+    NgramIndex ix;
+    /* 1 2 3 4 5 6 7 8 9 | 30 31 | 5 6 7 8 9: the last four match 5 6 7 8 9 at its first place,
+     * which runs five back; 30 31 then follows. */
+    std::vector<int32_t> s = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 30, 31, 5, 6, 7, 8, 9 };
+    TokenSeq ts;
+    ts.a = s.data();
+    ts.na = (int64_t)s.size();
+    int32_t out[4];
+    int m = -1;
+    CHECK_EQ(ix.propose(ts, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 30);
+    CHECK_EQ(m, 5);
+    /* A copy that runs back further is cut at the cap. */
+    std::vector<int32_t> c;
+    for (int i = 0; i < 20; ++i) c.push_back(100 + i);
+    for (int i = 0; i < 12; ++i) c.push_back(100 + i);
+    TokenSeq tc;
+    tc.a = c.data();
+    tc.na = (int64_t)c.size();
+    NgramIndex ic;
+    CHECK_EQ(ic.propose(tc, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 112);
+    CHECK_EQ(m, 8);
+    /* Without the out-parameter nothing changes. */
+    NgramIndex id;
+    CHECK_EQ(id.propose(tc, 2, 4, 4, out), 4);
+}
+
+namespace {
+/* A lookup-only deployment (no draft head) at window `depth`, the fixed window (the default). */
+void lookup_fixture(Fixture& f, int depth) {
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = depth;
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+}
+}  /* namespace */
+
+/* Prompt lookup alone, the gate on by default. Text that copies a stretch it has seen drafts at
+ * once and keeps drafting while its drafts come true; text that only repeats bigrams it has seen,
+ * whose proposals do not come true, is never verified, yet every proposal is still scored; and a
+ * reply that turns from the second kind into the first drafts as soon as it does. The text is
+ * the same either way: the emitted token is the fixture's, whatever was verified. */
+TEST(prompt_lookup_alone_holds_back_proposals_that_do_not_pay) {
+    Fixture f;
+    lookup_fixture(f, 4);
+    std::string log = info_of([&]() { CHECK_OK(f.start()); });
+    CHECK(log.find("prompt lookup: a proposal is verified when") != std::string::npos);
+    CHECK(!f.sch.draft().adaptive());
+
+    /* A copy: an 8-token period, 160 tokens of it; the reply goes on with it. */
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    f.sch.step_finished();                               /* a prefill step: not a sample */
+    for (int64_t rows = 1; rows <= 5; ++rows)
+        CHECK_EQ(f.sch.lookup_gate().cost_samples(rows), (int64_t)0);
+    int64_t pos = 161;                                   /* the next token's place in the period */
+    auto truth = [&](int64_t p) { return (int32_t)(100 + p % 8); };
+    int verified = 0;
+    for (int t = 0; t < 24; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            ++verified;
+            while (a < e.n_spec && e.draft[a] == truth(pos + a)) ++a;
+        }
+        CHECK_OK(f.commit(truth(pos + a), 0, [a](const StepEntry&) { return a; }));
+        f.sch.step_finished();                           /* a decode step of 1 + 4 rows, timed */
+        pos += a + 1;
+    }
+    CHECK_EQ(verified, 24);
+    CHECK_EQ(f.sch.lookup_gate().cost_samples(5), (int64_t)24);
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.lookup_held, (int64_t)0);
+    CHECK_EQ(m.lookup_proposals, (int64_t)24);
+    CHECK_EQ(m.draft_accepted, m.draft_tokens);
+
+    /* Recurring bigrams: the prompt holds every pair of the reply 200, 201, 202, ... followed by
+     * a 50, so after each token the lookup proposes 50 on a two-token match, and it never comes
+     * true. */
+    Fixture g;
+    lookup_fixture(g, 4);
+    CHECK_OK(g.start());
+    auto q = std::make_unique<Request>();
+    q->id = g.next_id++;
+    q->max_tokens = 2000;
+    for (int i = 0; i < 60; ++i) {
+        q->prompt.push_back(200 + i);
+        q->prompt.push_back(201 + i);
+        q->prompt.push_back(50);
+    }
+    q->prompt.push_back(199);
+    CHECK_OK(g.sch.add(std::move(q)));
+    REQUIRE(g.sch.step() != nullptr);
+    g.commit_plain(200);
+    int proposals = 0;
+    for (int t = 0; t < 40; ++t) {
+        REQUIRE(g.sch.step() != nullptr);
+        CHECK_EQ(g.sch.plan().e[0].n_spec, 0);           /* held, every one */
+        g.commit_plain(201 + t);
+        ++proposals;
+    }
+    m = g.sch.metrics();
+    CHECK_EQ(m.draft_tokens, (int64_t)0);
+    CHECK(m.lookup_proposals >= proposals - 1);
+    CHECK_EQ(m.lookup_held, m.lookup_proposals);
+    CHECK_EQ(m.lookup_held_drafts, 4 * m.lookup_held);
+    CHECK_EQ(m.lookup_held_hits, (int64_t)0);
+
+    /* The reply now copies its own stretch 201.. from the start: a long match, drafted at once. */
+    std::vector<int32_t> copy;
+    for (int i = 0; i < 40; ++i) copy.push_back(200 + i);
+    size_t k = 0;
+    int drafted_steps = 0, steps = 0;
+    while (k < copy.size() && steps < 40) {
+        REQUIRE(g.sch.step() != nullptr);
+        const StepEntry& e = g.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            ++drafted_steps;
+            while (a < e.n_spec && k + (size_t)a < copy.size() &&
+                   e.draft[a] == copy[k + (size_t)a])
+                ++a;
+        }
+        CHECK_OK(g.commit(copy[std::min(k + (size_t)a, copy.size() - 1)], 0,
+                          [a](const StepEntry&) { return a; }));
+        k += (size_t)a + 1;
+        ++steps;
+    }
+    CHECK(drafted_steps > 0);
+    CHECK(g.sch.metrics().draft_accepted > 0);
+}
+
+namespace {
+/* Prompt lookup by scanning: the longest pattern first, its latest earlier occurrence, the
+ * proposal continued past the end with its own tokens. The index must answer exactly this. */
+int scan_propose(const std::vector<int32_t>& s, int nmin, int nmax, int depth, int32_t* out) {
+    const int64_t L = (int64_t)s.size();
+    if (L < 2) return 0;
+    for (int n = (int)std::min<int64_t>(nmax, L - 1); n >= nmin; --n)
+        for (int64_t e = L - 2; e >= n - 1; --e) {
+            bool ok = true;
+            for (int k = 0; k < n && ok; ++k) ok = s[(size_t)(e - k)] == s[(size_t)(L - 1 - k)];
+            if (!ok) continue;
+            for (int d = 0; d < depth; ++d) {
+                const int64_t i = e + 1 + d;
+                out[d] = i < L ? s[(size_t)i] : out[i - L];
+            }
+            return depth;
+        }
+    return 0;
+}
+}  /* namespace */
+
+/* The index against the scan, over sequences grown a few tokens at a time across the prompt /
+ * output seam, on alphabets small enough to repeat often and large enough to miss, at several
+ * pattern ranges; then a change of range and a shorter sequence, which rebuild it. */
+TEST(prompt_lookup_index_answers_what_a_scan_answers) {
+    uint32_t rng = 12345;
+    auto next = [&](uint32_t mod) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % mod; };
+    const int kRanges[][2] = { { 1, 1 }, { 1, 4 }, { 2, 4 }, { 3, 7 }, { 15, 15 } };
+    int64_t hits = 0, misses = 0;
+    for (const uint32_t alphabet : { 2u, 5u, 40u, 3000u }) {
+        for (const auto& rg : kRanges) {
+            std::vector<int32_t> seq;
+            const int64_t np = 50 + next(200);
+            NgramIndex ix;
+            ix.reset(7);
+            while (seq.size() < 1500) {
+                const int add = 1 + (int)next(6);
+                for (int k = 0; k < add; ++k) {
+                    /* Runs and copies as well as noise, so long patterns recur. */
+                    if (seq.size() > 20 && next(4) == 0) {
+                        const size_t from = next((uint32_t)seq.size() - 10);
+                        for (int c = 0; c < 6; ++c) seq.push_back(seq[from + (size_t)c]);
+                    } else {
+                        seq.push_back((int32_t)next(alphabet));
+                    }
+                }
+                TokenSeq ts;
+                ts.a = seq.data();
+                ts.na = std::min<int64_t>(np, (int64_t)seq.size());
+                ts.b = seq.data() + ts.na;
+                ts.nb = (int64_t)seq.size() - ts.na;
+                int32_t want[8] = {}, got[8] = {};
+                const int depth = 1 + (int)next(8);
+                const int w = scan_propose(seq, rg[0], rg[1], depth, want);
+                const int g = ix.propose(ts, rg[0], rg[1], depth, got);
+                CHECK_EQ(g, w);
+                if (g == w) CHECK(std::memcmp(got, want, sizeof(int32_t) * (size_t)w) == 0);
+                (w ? hits : misses) += 1;
+            }
+            CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
+            CHECK(ix.bytes() <= (size_t)(16 * (rg[1] - rg[0] + 1)) * seq.size() + 8192);
+        }
+    }
+    CHECK(hits > 100);
+    CHECK(misses > 100);
+
+    /* Another range, then a shorter sequence (another request in the slot): both rebuild. */
+    std::vector<int32_t> a = { 1, 2, 3, 9, 1, 2, 3 };
+    TokenSeq ta{ a.data(), (int64_t)a.size(), nullptr, 0 };
+    NgramIndex ix;
+    int32_t out[4] = {};
+    CHECK_EQ(ix.propose(ta, 2, 4, 2, out), 2);
+    CHECK_EQ(out[0], 9);
+    CHECK_EQ(out[1], 1);
+    CHECK_EQ(ix.propose(ta, 4, 4, 2, out), 0);         /* no 4-gram recurs */
+    std::vector<int32_t> b = { 5, 6, 5 };
+    TokenSeq tb{ b.data(), (int64_t)b.size(), nullptr, 0 };
+    CHECK_EQ(ix.propose(tb, 1, 4, 3, out), 3);         /* period 2, continued: 6 5 6 */
+    CHECK_EQ(out[0], 6);
+    CHECK_EQ(out[1], 5);
+    CHECK_EQ(out[2], 6);
+}
+
+/* A lookup costs the n-grams the last commit added, not a pass over the context: over a 400k-token
+ * prompt that never repeats a 2-gram, the first lookup indexes it once and the next thousand
+ * lookups, a token apart, together take a small fraction of that. */
+TEST(prompt_lookup_does_not_scan_the_context) {
+    std::vector<int32_t> seq;
+    seq.reserve(401000);
+    for (int i = 0; i < 400000; ++i) seq.push_back(i);   /* every token distinct: always a miss */
+    NgramIndex ix;
+    int32_t out[8];
+    TokenSeq ts{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(ix.propose(ts, 2, 4, 8, out), 0);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) {
+        seq.push_back(1000000 + i);
+        TokenSeq t2{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+        CHECK_EQ(ix.propose(t2, 2, 4, 8, out), 0);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const double build = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double steps = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    fprintf(stderr, "    index 400k tokens: %.1f ms; 1000 lookups after: %.3f ms (%.1f MiB)\n", build,
+            steps, (double)ix.bytes() / 1048576.0);
+    CHECK(steps < build);
+    CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
 }
 
 /* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest
@@ -5103,6 +6186,33 @@ TEST(an_embedding_input_longer_than_the_checkpoint_interval_is_admitted_whole) {
     for (const StepEntry& x : f.sch.plan().e)
         if (x.seq == e) whole = x.n_tokens == 300 && x.produces_token && x.ckpt_slot < 0;
     CHECK(whole);
+}
+
+/* The shared context check serves every embedding architecture. Exact-limit inputs need no
+ * following generation slot, while generation keeps that slot and both refuse an overflow. */
+TEST(the_context_boundary_distinguishes_embeddings_from_generation) {
+    for (bool embed : {false, true}) {
+        for (int length : {169, 170, 171}) {
+            Fixture f;
+            f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/170,
+                    /*windowed=*/false, /*linear=*/false);
+            REQUIRE_EQ(f.start(), RAD_OK);
+            auto r = f.request(length, 1);
+            r->embed = embed;
+            const uint64_t id = f.add(std::move(r));
+            REQUIRE(id != 0);
+            const RadBatch* batch = f.sch.step();
+            const bool fits = length < 170 || (embed && length == 170);
+            if (fits) {
+                REQUIRE(batch != nullptr);
+                CHECK_EQ(batch->n_tok, length);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Running);
+            } else {
+                CHECK(batch == nullptr);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+            }
+        }
+    }
 }
 
 /* ================================================================== speculation gates */

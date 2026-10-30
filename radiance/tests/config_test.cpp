@@ -101,6 +101,21 @@ TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_E_INVAL);
 }
 
+/* --draft-short-from takes a count, 0 for never, or auto (the default): the engine resolves auto to
+ * never for a chain and to two decoding sequences for a tree drafter. */
+TEST(draft_short_from_takes_a_count_never_or_auto) {
+    Config c;
+    CHECK_EQ(c.draft_short_from, -1ll);
+    CHECK_OK(parse({ "--draft-short-from", "4" }, &c));
+    CHECK_EQ(c.draft_short_from, 4ll);
+    CHECK_OK(parse({ "--draft-short-from", "0" }, &c));
+    CHECK_EQ(c.draft_short_from, 0ll);
+    CHECK_OK(parse({ "--draft-short-from", "auto" }, &c));
+    CHECK_EQ(c.draft_short_from, -1ll);
+    CHECK_EQ(parse_fresh({ "--draft-short-from", "-2" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-short-from", "some" }), RAD_E_INVAL);
+}
+
 /* KL mode records or scores, never both, and requires that direction's inputs. Guessing between
  * them could make a quantised model the reference. */
 TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
@@ -425,6 +440,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
@@ -433,11 +449,16 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
+        { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
+        { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
-        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
+        { "--prefix-resume", { "nearest" } },
+        { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
+        { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
+        { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
@@ -466,6 +487,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--video-max-frame-tokens", { "70" } }, { "--image-tokens", { "280" } },
         { "--max-source-pixels", { "1000000" } },
         { "--expert-stats", { "/s/experts.json" } },
+        { "--expert-profile", { "/p.json" } }, { "--expert-pin-top", { "0.2" } },
+        { "--draft-expert-placement", { "host" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
@@ -789,6 +812,25 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
+/* ram=DIR is ram whose pinned copy is a shared file in DIR; a later plain placement drops the
+ * directory, and no other tier takes one. */
+TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.ngram_share_dir.empty());
+    Config s;
+    CHECK_EQ(parse({ "--ngram-placement", "ram=/tmp/x" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK_EQ(s.ngram_share_dir, std::string("/tmp/x"));
+    CHECK_EQ(parse({ "--ngram-placement", "ram=/tmp/x", "--ngram-placement", "ram" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK(s.ngram_share_dir.empty());
+    Config c;
+    for (const char* bad : { "ram=", "vram=/tmp/x", "disk=/tmp/x", "auto=/tmp/x" })
+        CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "ram=/tmp/x" }, &c), RAD_E_INVAL);
+}
+
 /* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
  * also states. Whether the window can adapt (a serial drafter, depth above zero) is decided by the
  * scheduler with the program in hand, not the parser. */
@@ -861,6 +903,20 @@ TEST(expert_stats_is_off_until_it_names_a_file) {
     CHECK_EQ(row(c).value, std::string("/s/experts.json"));
     CHECK_EQ(row(c).source, std::string("command line"));
     CHECK(parse_fresh({ "--expert-stats" }) < 0);
+}
+
+/* A prefix hit resumes on the cold run's chunk grid unless the operator trades that for a shorter
+ * re-prefill; any other word is refused. */
+TEST(prefix_resume_is_exact_unless_nearest_is_asked_for) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.prefix_exact);
+    Config c;
+    CHECK_EQ(parse({ "--prefix-resume", "nearest" }, &c), RAD_OK);
+    CHECK(!c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "exact" }, &c), RAD_OK);
+    CHECK(c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "deepest" }, &c), RAD_E_INVAL);
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;
@@ -1210,6 +1266,39 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.n_spec, -1);                /* auto is also the default */
+}
+
+/* --spec-ngram K is prompt lookup alone at window K: it sets the window, agrees with a matching
+ * --num-speculative-tokens and refuses another; the pattern range must be a range. Off by
+ * default, at the lengths 2..4. */
+TEST(spec_ngram_sets_the_window_and_refuses_another) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.spec_ngram, 0);
+    CHECK_EQ(d.spec_ngram_min, 2);
+    CHECK_EQ(d.spec_ngram_max, 4);
+    Config c;
+    CHECK_EQ(parse({ "--spec-ngram", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.spec_ngram, 5);
+    CHECK_EQ(c.n_spec, 5);
+    Config e;
+    CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "5" }, &e), RAD_OK);
+    CHECK_EQ(e.n_spec, 5);
+    Config f;
+    {
+        LogGuard lg;
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "auto" }, &f),
+                 RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-min", "5", "--spec-ngram-max", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-max", "16" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "65" }, &f), RAD_E_INVAL);
+    }
+    Config g;
+    CHECK_EQ(parse({ "--spec-ngram-min", "1", "--spec-ngram-max", "8" }, &g), RAD_OK);
+    CHECK_EQ(g.spec_ngram_min, 1);
+    CHECK_EQ(g.spec_ngram_max, 8);
+    CHECK_EQ(g.n_spec, -1);              /* the range alone changes no window */
 }
 
 /* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */

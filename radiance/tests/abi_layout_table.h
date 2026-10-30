@@ -80,6 +80,7 @@
 { "RadBatch", "control_vector", 336, 4 },
 { "RadBatch", "enc_seg_h", 344, 8 },
 { "RadBatch", "enc_seg_w", 352, 8 },
+{ "RadBatch", "score_only", 360, 4 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },

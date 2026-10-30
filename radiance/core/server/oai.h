@@ -303,6 +303,8 @@ int decode_media_url(const std::string& url, const std::string& field,
 int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
                         std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
                         const MediaOpts& opts, PromptInput* out, ApiError* err);
+/* Startup policy for a model-owned embedding formatter: never silently ignore an override. */
+int check_embedding_template(const IEmbedder* embed, bool overridden, std::string* why);
 /* Embeddings: fills `out->prompts` with one entry per input. */
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err);

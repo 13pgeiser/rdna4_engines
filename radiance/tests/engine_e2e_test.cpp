@@ -205,6 +205,14 @@ struct World {
     std::string qwen35_spec;
     /* Qwen3-ASR: an audio tower over a Qwen3 decoder, served from the checkpoint. */
     std::string qwen3asr;
+    /* The 31B's shape at toy sizes (five sliding layers and a global one, a 64-token window) with
+     * a DFlash2 drafter on a 64-token window (tiny_model.h: DFlash2), converted as
+     * data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe converts the 31B: served by gemma4_bf16,
+     * the trunk w4a8 and the drafter block fp8. */
+    std::string g31, g31_draft, g31_df2;
+    /* The same with a 1024-token window, the 31B's own: a snapshot at 512-1023 lies inside it and
+     * holds every row from position 0. */
+    std::string g31w, g31w_df2;
     std::string corpus;        /* six documents, two sharing a 300-token head; 1820 tokens */
     std::string corpus_short;  /* four documents, 760 tokens */
     std::string corpus_tiny;   /* two documents, 300 tokens, for libref's slow fp8 GEMMs */
@@ -230,8 +238,13 @@ struct World {
         gemma4_kv = dir / "gemma4_kv";
         qwen35_spec = dir / "qwen35_spec";
         qwen3asr = dir / "qwen3asr";
+        g31 = dir / "g31";
+        g31_draft = dir / "g31_draft";
+        g31_df2 = dir / "g31_df2.rad";
+        g31w = dir / "g31w";
+        g31w_df2 = dir / "g31w_df2.rad";
         for (const std::string* d : { &qwen35, &lfm2, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
-                                      &qwen35_spec, &qwen3asr, &llama_int4 })
+                                      &qwen35_spec, &qwen3asr, &llama_int4, &g31, &g31_draft, &g31w })
             if (mkdir(d->c_str(), 0755) != 0) return;
         tiny::Qwen35 qkv;
         qkv.head_dim = 128;
@@ -242,6 +255,17 @@ struct World {
         gkv.head_dim = 64;
         gkv.global_kv_heads = 2;
         gkv.global_head_dim = 128;
+        tiny::Gemma4 g31s;
+        g31s.layers = 6;
+        g31s.interval = 6;
+        g31s.hidden = 256;
+        g31s.ffn = 512;
+        g31s.heads = 2;
+        g31s.head_dim = 128;
+        g31s.global_head_dim = 256;
+        g31s.window = 64;
+        tiny::Gemma4 g31ws = g31s;
+        g31ws.window = 1024;
         if (!tiny::write_qwen35(qwen35, {}) || !tiny::write_lfm2(lfm2, {}) ||
             !tiny::write_gemma4(gemma4, {}) || !tiny::write_llama(llama, {}) ||
             !tiny::write_qwen35(qwen35_kv, qkv) || !tiny::write_gemma4(gemma4_kv, gkv) ||
@@ -253,7 +277,9 @@ struct World {
                               std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule) ||
             !tiny::write_llama_ct_int4(llama_int4, {}, true) ||
             !tiny::write_text(dir / "llama_int4.recipe", tiny::kInt4ImportRecipe) ||
-            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe))
+            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe) ||
+            !tiny::write_gemma4(g31, g31s) || !tiny::write_gemma4(g31w, g31ws) ||
+            !tiny::write_dflash2(g31_draft, {}))
             return;
 
         tiny::Rng r(11);
@@ -280,6 +306,22 @@ struct World {
         for (const auto& [out, recipe, ckpt] : kConverts) {
             const int st = tiny::run({ RAD_E2E_CONVERT, *ckpt, "-o", out, "--recipe",
                                        dir / recipe },
+                                     engine_env(), &convert_log);
+            if (st != 0) {
+                fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(convert_log).c_str());
+                return;
+            }
+        }
+        std::string recipes = __FILE__;
+        recipes = recipes.substr(0, recipes.find_last_of('/')) + "/../data/recipes/";
+        /* Checked against libref, which serves it here: a card's library serves none of these
+         * toy shapes. */
+        for (const auto& [ckpt, out] : { std::pair<std::string, std::string>{ g31, g31_df2 },
+                                         std::pair<std::string, std::string>{ g31w, g31w_df2 } }) {
+            const int st = tiny::run({ RAD_E2E_CONVERT, ckpt, "--draft-model", g31_draft, "-o", out,
+                                       "--recipe", recipes + "gemma4-31b-dense-bf16-w4a8-df2.recipe",
+                                       "--set", "quantization_config.quant_method=compressed-tensors",
+                                       "--kernels", "libref" },
                                      engine_env(), &convert_log);
             if (st != 0) {
                 fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(convert_log).c_str());
@@ -768,13 +810,13 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
 TEST(the_coupling_flag_refuses_what_it_cannot_serve_at_startup) {
     World& w = world();
     REQUIRE(w.ok);
-    /* qwen35's tiny checkpoint declares no draft head: no serial chain to couple. The spechub
+    /* qwen35's tiny checkpoint declares no draft head: no chain to couple. The spechub
      * kernels are loaded beside libref, so the refusal is the drafter's shape and not a missing
      * coupling kernel. */
     const Ran on = radiance(w.qwen35, { "--kernels", "libref,spechub", "--draft-coupling", "on" },
                             {}, 120);
-    const std::string want = "--draft-coupling on requires the linear serial draft chain "
-                             "(RAD_DRAFT_SERIAL with depth > 0)";
+    const std::string want = "--draft-coupling on requires a linear draft chain (a serial head or "
+                             "a block drafter with a coupled walk, depth > 0)";
     if (on.status == 0 || on.status == 124 || !has(on.log, want))
         fprintf(stderr, "    --draft-coupling on exited %d:\n%s\n", on.status,
                 tail(on.log, 20).c_str());
@@ -1792,6 +1834,144 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* What a -v server's block drafter proposed ("drafter 'dflash2': sequence N proposes t1 .. tk"),
+ * by request in the order they were sent: the server numbers requests consecutively, and the
+ * first one proposes in every case below. Read after stop(), so every line is in. */
+std::vector<std::vector<std::string>> proposals(const std::string& log, size_t n_req) {
+    std::map<uint64_t, std::vector<std::string>> by_id;
+    static const std::string kSeq = ": sequence ", kProp = " proposes";
+    for (size_t at = log.find(kProp); at != std::string::npos; at = log.find(kProp, at + 1)) {
+        const size_t sol = log.rfind('\n', at) + 1, eol = log.find('\n', at);
+        const size_t s = log.find(kSeq, sol);
+        if (s == std::string::npos || s > at || log.find("drafter '", sol) > s) continue;
+        const uint64_t id = std::strtoull(log.c_str() + s + kSeq.size(), nullptr, 10);
+        by_id[id].push_back(log.substr(at, eol == std::string::npos ? std::string::npos : eol - at));
+    }
+    std::vector<std::vector<std::string>> out(n_req);
+    if (by_id.empty()) return out;
+    const uint64_t first = by_id.begin()->first;
+    for (size_t i = 0; i < n_req; ++i) {
+        auto it = by_id.find(first + i);
+        if (it != by_id.end()) out[i] = it->second;
+    }
+    return out;
+}
+
+/* A block drafter after a prefix hit, on the tiny 31B with its DFlash2 drafter: a follow-up turn
+ * and a repeat of a prompt each resume from the window snapshot taken at the earlier prompt's tail,
+ * and add fewer tokens than the drafter's 64-token window. The drafter's window rides in that
+ * snapshot, saved behind the drafter's context pass, so the hit is kept whole, and the drafter
+ * drafts from the first decode step and proposes, draft by draft, what a cold run's does. Without
+ * its window in the snapshot the hit leaves a hole in the drafter's own cache, and draft refill
+ * ends it at an interval snapshot at least that window before the prompt's end, recomputing what
+ * the hit had cached: the drafts are a cold run's, but the hit is not whole. With the snapshot
+ * saved before the context pass, it would propose from rows that pass had not yet written; the
+ * drafts would differ and, rejected, change no token. The warm server runs --prefix-resume
+ * nearest, which takes the tail snapshot a block short of the prompt's end; exact takes it where
+ * the prompt's last chunk starts, more than the drafter's window short here. */
+TEST(a_block_drafter_after_a_prefix_hit_proposes_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> first = prompt_ids(41, 300), repeat = prompt_ids(43, 200);
+    std::vector<int32_t> follow = first;
+    json warm[2], cold[2];
+    std::vector<std::vector<std::string>> warm_p, cold_p;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7",
+                                           "--checkpoint-interval", "64", "--max-num-seqs", "4",
+                                           "--prefix-resume", "nearest", "-v" }));
+        for (int32_t t : tokens_of(post(s.port, "/completion", completion(first, 16))))
+            follow.push_back(t);
+        for (int32_t t : prompt_ids(42, 8)) follow.push_back(t);
+        (void)post(s.port, "/completion", completion(repeat, 16));
+        warm[0] = post(s.port, "/completion", completion(follow, 24));
+        warm[1] = post(s.port, "/completion", completion(repeat, 24));
+        CHECK_EQ(s.stop(), 0);
+        warm_p = proposals(s.output(), 4);
+    }
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache",
+                                           "--max-num-seqs", "4", "-v" }));
+        cold[0] = post(s.port, "/completion", completion(follow, 24));
+        cold[1] = post(s.port, "/completion", completion(repeat, 24));
+        CHECK_EQ(s.stop(), 0);
+        cold_p = proposals(s.output(), 2);
+    }
+    /* The warm server's third and fourth requests are the cold one's first and second. */
+    const char* what[2] = { "follow-up turn", "repeated prompt" };
+    const int64_t n_prompt[2] = { (int64_t)follow.size(), (int64_t)repeat.size() };
+    for (int i = 0; i < 2; ++i) {
+        const int64_t cached = timing(warm[i], "cache_n");
+        /* Whole: draft refill would end the hit at least the drafter's 64-token window short. */
+        const bool whole = cached > n_prompt[i] - 64;
+        const int64_t d = timing(warm[i], "draft_n"), dc = timing(cold[i], "draft_n");
+        const std::vector<std::string>& wp = warm_p[(size_t)i + 2];
+        const std::vector<std::string>& cp = cold_p[(size_t)i];
+        if (!(whole && dc > 0 && d == dc && wp == cp))
+            fprintf(stderr, "    %s: %lld of %lld tokens cached, %lld drafted (cold %lld), %zu "
+                    "proposals (cold %zu), %s\n", what[i], (long long)cached,
+                    (long long)n_prompt[i], (long long)d, (long long)dc, wp.size(), cp.size(),
+                    wp == cp ? "the same" : "not the same");
+        CHECK(whole);
+        CHECK(dc > 0);
+        CHECK_EQ(d, dc);
+        CHECK(wp == cp);
+        CHECK(tokens_of(warm[i]) == tokens_of(cold[i]));
+    }
+}
+
+/* A prompt resumed from a window snapshot, on the tiny 31B: gemma4_bf16 declares the sliding layers
+ * windowed, and the cache does not index them (arch/gemma4's tiny model declares them full and takes
+ * no snapshot). A 600-token prompt takes a snapshot a block short of its end at the default
+ * 2048-token interval, and a longer prompt that shares it resumes there: the sliding layers from
+ * the snapshot, the global ones from the cached blocks, the rest of the prompt as a prefill from the
+ * snapshot. The reply, and every probability in it, equals a cold run's; so does a repeat of the
+ * longer prompt, which resumes from its own snapshot. Under a 64-token window the snapshot holds the
+ * window behind its position, and under a 1024-token one (the 31B's) every row from 0; with the
+ * drafter off and on. The snapshot floor (Scheduler::kWindowSnapshotMin) is --prefix-resume
+ * nearest's: under exact, a prompt shorter than one prefill chunk takes no tail snapshot. */
+TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> a = prompt_ids(51, 600);
+    std::vector<int32_t> b = a;
+    for (int32_t t : prompt_ids(52, 60)) b.push_back(t);
+    for (const std::string* model : { &world().g31_df2, &world().g31w_df2 }) {
+        for (const char* spec : { "0", "7" }) {
+            json cold;
+            {
+                Server s;
+                REQUIRE(s.start(*model, { "--num-speculative-tokens", spec, "--no-prefix-cache" }));
+                cold = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+                CHECK_EQ(s.stop(), 0);
+            }
+            Server s;
+            REQUIRE(s.start(*model, { "--num-speculative-tokens", spec,
+                                      "--prefix-resume", "nearest" }));
+            (void)post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+            const json shared = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+            const json again = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+            const int64_t c1 = timing(shared, "cache_n"), c2 = timing(again, "cache_n");
+            /* The snapshot sits at Scheduler::kWindowSnapshotMin (512) or above. */
+            const bool same = tokens_of(shared) == tokens_of(cold) &&
+                              tokens_of(again) == tokens_of(cold) &&
+                              shared["completion_probabilities"] == cold["completion_probabilities"] &&
+                              again["completion_probabilities"] == cold["completion_probabilities"];
+            if (!(c1 >= 512 && c1 < 600 && c2 > c1 && same))
+                fprintf(stderr, "    %s, %s drafts: cached %lld then %lld, %s a cold run's\n",
+                        model->c_str(), spec, (long long)c1, (long long)c2,
+                        same ? "equal to" : "NOT equal to");
+            CHECK(c1 >= 512);
+            CHECK(c1 < 600);
+            CHECK(c2 > c1);
+            REQUIRE(cold.contains("completion_probabilities"));
+            CHECK_EQ(tokens_of(cold).size(), (size_t)24);
+            CHECK(same);
+            CHECK_EQ(s.stop(), 0);
+        }
+    }
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
@@ -2159,6 +2339,527 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
     const Picture conv = generate(q.bf16, { "libavx" }, false, 7, 3);
     REQUIRE(!direct.rgba.empty() && !conv.rgba.empty());
     CHECK(direct.png == conv.png);
+}
+
+namespace {
+json nemotron_fixture(const char* name) {
+    return json::parse(tiny::read_text(std::string(RAD_GOLDEN_FIXTURES) + "/" + name));
+}
+
+/* The same BF16 parameters as the component oracle, now read by the real checkpoint loader.
+ * Extra vocabulary rows only make the byte tokenizer usable for HTTP input; the oracle cases
+ * use the original 32 rows. No test executor or media adapter participates in these tests. */
+bool write_nemotron(const std::string& dir) {
+    json weights = nemotron_fixture("nemotron35.json")["weights"];
+    weights.update(nemotron_fixture("nemotron35_vision.json")["weights"]);
+    std::vector<tiny::Tensor> ts;
+    for (auto it = weights.begin(); it != weights.end(); ++it) {
+        auto shape = it.value()["shape"].get<std::vector<int64_t>>();
+        auto bits = it.value()["bf16"].get<std::vector<uint16_t>>();
+        if (it.key() == "language_model.embed_tokens.weight") {
+            shape[0] = 320;
+            const auto original = bits;
+            for (int row = 32; row < 320; ++row)
+                bits.insert(bits.end(), original.begin() + row % 32 * 16,
+                            original.begin() + (row % 32 + 1) * 16);
+        }
+        tiny::Tensor t{it.key(), "BF16", shape, {}};
+        t.bytes.resize(bits.size() * 2);
+        std::memcpy(t.bytes.data(), bits.data(), t.bytes.size());
+        ts.push_back(std::move(t));
+    }
+    json rope = {{"rope_type", "yarn"},
+                 {"rope_theta", 1e6},
+                 {"factor", 16.0},
+                 {"original_max_position_embeddings", 16384},
+                 {"beta_fast", 32.0},
+                 {"beta_slow", 1.0},
+                 {"mscale", 1.0},
+                 {"mscale_all_dim", 1.0},
+                 {"llama_4_scaling_beta", 0.1}};
+    json tc = {{"model_type", "ministral3"},
+               {"hidden_size", 16},
+               {"intermediate_size", 32},
+               {"num_hidden_layers", 2},
+               {"num_attention_heads", 4},
+               {"num_key_value_heads", 1},
+               {"head_dim", 128},
+               {"vocab_size", 320},
+               {"max_position_embeddings", 262144},
+               {"rms_norm_eps", 1e-5},
+               {"hidden_act", "silu"},
+               {"is_causal", false},
+               {"use_cache", false},
+               {"sliding_window", nullptr},
+               {"rope_parameters", rope},
+               {"bos_token_id", 1},
+               {"eos_token_id", 2},
+               {"pad_token_id", 11}};
+    json vc = {{"model_type", "pixtral"},
+               {"hidden_size", 64},
+               {"intermediate_size", 96},
+               {"num_hidden_layers", 2},
+               {"num_attention_heads", 1},
+               {"head_dim", 64},
+               {"patch_size", 14},
+               {"image_size", 1540},
+               {"num_channels", 3},
+               {"hidden_act", "silu"},
+               {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 10000.0}}}};
+    json config = {{"architectures", {"Mistral3Model"}},
+                   {"model_type", "mistral3"},
+                   {"is_causal", false},
+                   {"text_config", tc},
+                   {"vision_config", vc},
+                   {"image_token_index", 10},
+                   {"spatial_merge_size", 2},
+                   {"multimodal_projector_bias", false},
+                   {"projector_hidden_act", "gelu"},
+                   {"vision_feature_layer", -1}};
+    json tok = json::parse(tiny::tokenizer_json());
+    json vocab = json::object();
+    for (int c = 0; c < 256; ++c)
+        vocab[tiny::byte_symbol(c)] = 32 + c;
+    vocab[tiny::byte_symbol(' ')] = 5;
+    const int letter_ids[] = {3, 4, 7, 8, 9, 6};
+    for (int i = 0; i < 6; ++i)
+        vocab[std::string(1, 'A' + i)] = letter_ids[i];
+    tok["added_tokens"] = json::array();
+    for (const auto& [s, id] : std::vector<std::pair<std::string, int>>{{"<s>", 1},
+                                                                        {"</s>", 2},
+                                                                        {"<pad>", 11},
+                                                                        {"[IMG]", 10},
+                                                                        {"[IMG_BREAK]", 12},
+                                                                        {"[IMG_END]", 13}}) {
+        vocab[s] = id;
+        tok["added_tokens"].push_back({{"id", id},
+                                       {"content", s},
+                                       {"special", true},
+                                       {"single_word", false},
+                                       {"lstrip", false},
+                                       {"rstrip", false},
+                                       {"normalized", false}});
+    }
+    tok["model"]["vocab"] = std::move(vocab);
+    return tiny::write_text(dir + "/config.json", config.dump()) &&
+           tiny::write_safetensors(dir + "/model.safetensors", ts) &&
+           tiny::write_text(dir + "/tokenizer.json", tok.dump()) &&
+           tiny::write_text(dir + "/config_sentence_transformers.json",
+                            R"({"prompts":{"query":"AB","document":"CE"}})");
+}
+
+// Opt-in hardware checks reuse the same endpoint fixtures and gates. The default suite stays
+// on CPU; no unrelated test sees this switch.
+bool nemotron_device() {
+    const char* e = std::getenv("RAD_NEMOTRON_DEVICE");
+    return e && *e && *e != '0';
+}
+std::vector<const char*> nemotron_kernels() {
+    return nemotron_device() ? std::vector<const char*>{"libr4d,libavx"}
+                             : std::vector<const char*>{"libref", "libavx"};
+}
+std::string nemotron_device_env() {
+    const char* index = std::getenv("RAD_NEMOTRON_DEVICE_INDEX");
+    return std::string("ROCR_VISIBLE_DEVICES=") + (index && *index ? index : "0");
+}
+std::vector<std::string> nemotron_env() {
+    return nemotron_device() ? std::vector<std::string>{nemotron_device_env()}
+                             : std::vector<std::string>{};
+}
+
+const std::vector<std::string> nemotron_args = {
+    "--max-num-seqs",  "4",  "--max-num-batched-tokens", "64",
+    "--max-model-len", "64", "--mm-max-patches",         "64"};
+
+std::vector<float> embedding_reply(int port, const json& body, int row = 0) {
+    int status = 0;
+    const auto reply = post(port, "/v1/embeddings", body, &status);
+    if (status != 200) fprintf(stderr, "    embedding HTTP %d: %s\n", status, reply.dump().c_str());
+    CHECK_EQ(status, 200);
+    if (status != 200 || !reply.contains("data") || row >= (int)reply["data"].size()) return {};
+    return reply["data"][row]["embedding"].get<std::vector<float>>();
+}
+
+void check_embedding(const std::vector<float>& got, std::vector<float> want, int dims = 16,
+                     double max_l2 = 0.01) {
+    REQUIRE_EQ(got.size(), (size_t)dims);
+    want.resize((size_t)dims);
+    double n = 0, dot = 0, err = 0, gn = 0;
+    for (float v : want)
+        n += (double)v * v;
+    for (int i = 0; i < dims; ++i) {
+        want[(size_t)i] /= (float)std::sqrt(n);
+        dot += (double)got[(size_t)i] * want[(size_t)i];
+        const double d = got[(size_t)i] - want[(size_t)i];
+        err += d * d;
+        gn += (double)got[(size_t)i] * got[(size_t)i];
+    }
+    CHECK(std::abs(gn - 1) < 1e-5);
+    if (dot / std::sqrt(gn) < 0.9995 || std::sqrt(err) > max_l2)
+        fprintf(stderr, "    embedding cosine %.9g, normalized L2 error %.9g\n",
+                dot / std::sqrt(gn), std::sqrt(err));
+    CHECK(dot / std::sqrt(gn) >= 0.9995);
+    CHECK(std::sqrt(err) <= max_l2);
+}
+
+json nemotron_image(const json& spec) {
+    const int f = spec["f"], h = spec["h"], w = spec["w"];
+    std::vector<uint8_t> rgb((size_t)h * w * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c) {
+                uint64_t z = (uint64_t)f * 0x9E3779B97F4A7C15ull +
+                             (uint64_t)y * 0xBF58476D1CE4E5B9ull +
+                             (uint64_t)x * 0x94D049BB133111EBull +
+                             (uint64_t)c * 0x2545F4914F6CDD1Dull + 12345ull;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                rgb[((size_t)y * w + x) * 3 + c] = (uint8_t)((z ^ (z >> 31)) & 255);
+            }
+    std::vector<uint8_t> png;
+    std::string why;
+    if (rad::mm::encode_image(rgb.data(), w, h, 3, "png", 0, &png, &why) < 0) return nullptr;
+    return {
+        {"type", "image_url"},
+        {"image_url",
+         {{"url", "data:image/png;base64," + rad::server::base64_encode(png.data(), png.size())}}}};
+}
+} // namespace
+
+TEST(nemotron35_endpoint_refuses_custom_template_overrides) {
+    tiny::TempDir d("e2e_nemotron_template");
+    REQUIRE(d.ok());
+    REQUIRE(write_nemotron(d.path));
+    const std::string path = d.path + "/override.jinja";
+    REQUIRE(tiny::write_text(path, "{{ messages[0]['content'] }}"));
+    for (const char* kernels : nemotron_kernels()) {
+#if !defined(__x86_64__)
+        if (std::string(kernels) == "libavx") continue;
+#endif
+        Server s;
+        s.quiet = true;
+        auto args = nemotron_args;
+        args.insert(args.end(), {"--kernels", kernels, "--override-chat-template", path});
+        CHECK(!s.start(d.path, args, nemotron_env()));
+        CHECK(s.output().find("--override-chat-template is not supported for this model") !=
+              std::string::npos);
+        CHECK(s.stop() != 0);
+    }
+}
+
+TEST(nemotron35_endpoint_loads_the_oracle_weights_and_pools_ragged_inputs) {
+    tiny::TempDir d("e2e_nemotron");
+    REQUIRE(d.ok());
+    REQUIRE(write_nemotron(d.path));
+    const auto fixture = nemotron_fixture("nemotron35.json");
+    for (const char* kernels : nemotron_kernels()) {
+#if !defined(__x86_64__)
+        if (std::string(kernels) == "libavx") continue;
+#endif
+        Server s;
+        auto args = nemotron_args;
+        args.insert(args.end(), {"--kernels", kernels});
+        if (!s.start(d.path, args, nemotron_env())) {
+            fprintf(stderr, "    complete Nemotron startup log:\n%s\n", s.output().c_str());
+            REQUIRE(false);
+        }
+        for (const auto& c : fixture["cases"]) {
+            if (c["name"] == "q_scale_boundary")
+                continue; // HTTP starts each input at position zero
+            const json req = {{"input", c["inputs"]}};
+            for (int row = 0; row < (int)c["inputs"].size(); ++row)
+                check_embedding(embedding_reply(s.port, req, row), c["pooled"][row]);
+        }
+        const auto raw = embedding_reply(s.port, {{"input", {3, 4, 5, 7}}});
+        check_embedding(embedding_reply(s.port, {{"input", "C"}, {"prompt_name", "query"}}), raw);
+        const json messages = {{{"role", "system"}, {"content", "AB   "}},
+                               {{"role", "user"}, {"content", "C"}}};
+        check_embedding(embedding_reply(s.port, {{"messages", messages}}), raw);
+        check_embedding(embedding_reply(s.port, {{"input", {3, 4, 5, 7}}, {"dimensions", 8}}), raw,
+                        8);
+        int status = 0;
+        // Whole-input encoders need no generation slot after the last encoded token.
+        const auto boundary =
+            post(s.port, "/v1/embeddings", {{"input", std::vector<int>(64, 3)}}, &status);
+        REQUIRE_EQ(status, 200);
+        const auto values = boundary["data"][0]["embedding"].get<std::vector<float>>();
+        CHECK_EQ(values.size(), (size_t)16);
+        double norm = 0;
+        for (float v : values) {
+            CHECK(std::isfinite(v));
+            norm += (double)v * v;
+        }
+        CHECK_NEAR(norm, 1.0, 1e-5);
+        post(s.port, "/v1/embeddings", {{"input", std::vector<int>(65, 3)}}, &status);
+        CHECK_EQ(status, 400);
+        post(s.port, "/v1/chat/completions", {{"messages", {{{"role", "user"}, {"content", "A"}}}}},
+             &status);
+        CHECK_EQ(status, 501);
+        REQUIRE_EQ(s.stop(), 0);
+    }
+}
+
+// Small model dimensions isolate configured engine capacity from the available model-weight VRAM.
+TEST(nemotron35_configured_combined_capacity_exceeds_old_gemm_ceiling) {
+    if (!nemotron_device()) SKIP("explicit RAD_NEMOTRON_DEVICE capacity validation only");
+    tiny::TempDir d("e2e_nemotron_capacity");
+    REQUIRE(d.ok());
+    REQUIRE(write_nemotron(d.path));
+    Server s;
+    const std::vector<std::string> args = {"--kernels",
+                                           "libr4d,libavx",
+                                           "--max-num-seqs",
+                                           "512",
+                                           "--max-num-batched-tokens",
+                                           "131073",
+                                           "--max-model-len",
+                                           "257",
+                                           "--mm-max-patches",
+                                           "64"};
+    if (!s.start(d.path, args, nemotron_env())) {
+        fprintf(stderr, "    capacity startup log:\n%s\n", s.output().c_str());
+        REQUIRE(false);
+    }
+    std::vector<int> a(256), b(257);
+    for (size_t i = 0; i < a.size(); ++i)
+        a[i] = 3 + i % 6;
+    for (size_t i = 0; i < b.size(); ++i)
+        b[i] = 8 - i % 6;
+    const auto alone_a = embedding_reply(s.port, {{"input", a}});
+    const auto alone_b = embedding_reply(s.port, {{"input", b}});
+    json inputs = json::array();
+    for (int i = 0; i < 511; ++i)
+        inputs.push_back(a);
+    inputs.push_back(b);
+    auto stats = [&]() {
+        Call c;
+        std::string body;
+        if (!c.send(s.port, "GET", "/stats", "") || c.read(&body) != 200) return json();
+        return json::parse(body);
+    };
+    const auto before = stats();
+    int status = 0;
+    const auto reply = post(s.port, "/v1/embeddings", {{"input", inputs}}, &status);
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(reply["data"].size(), (size_t)512);
+    const auto after = stats();
+    CHECK_EQ(after["steps"].get<int64_t>() - before["steps"].get<int64_t>(), 1);
+    CHECK_EQ(reply["usage"]["prompt_tokens"].get<int64_t>(), 131073);
+    double worst = 0;
+    for (int r = 0; r < 512; ++r) {
+        const auto got = reply["data"][r]["embedding"].get<std::vector<float>>();
+        const auto& expected = r == 511 ? alone_b : alone_a;
+        REQUIRE_EQ(got.size(), expected.size());
+        double err = 0;
+        for (size_t j = 0; j < got.size(); ++j)
+            err += std::pow((double)got[j] - expected[j], 2);
+        worst = std::max(worst, std::sqrt(err));
+    }
+    fprintf(
+        stderr,
+        "    131073 combined tokens / 512 sequences / one completed step; worst individual L2 %.9g\n",
+        worst);
+    CHECK(worst <= 1e-5);
+    post(s.port, "/v1/embeddings", {{"input", std::vector<int>(258, 3)}}, &status);
+    CHECK_EQ(status, 400);
+    if (const char* path = std::getenv("RAD_NEMOTRON_CAPACITY_SERVER_LOG"))
+        tiny::write_text(path, s.output());
+    REQUIRE_EQ(s.stop(), 0);
+}
+
+TEST(nemotron35_endpoint_decodes_images_and_matches_the_multimodal_oracle) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    tiny::TempDir d("e2e_nemotron_mm");
+    REQUIRE(d.ok());
+    REQUIRE(write_nemotron(d.path));
+    const auto vision = nemotron_fixture("nemotron35_vision.json");
+    const auto mm = nemotron_fixture("nemotron35_multimodal.json");
+    const json im1 = nemotron_image(vision["images"][1]);
+    REQUIRE(im1.is_object());
+    const json im2 = nemotron_image(vision["images"][2]);
+    REQUIRE(im2.is_object());
+    const json im3 = nemotron_image(vision["images"][3]);
+    REQUIRE(im3.is_object());
+    for (const char* kernels : nemotron_kernels()) {
+#if !defined(__x86_64__)
+        if (std::string(kernels) == "libavx") continue;
+#endif
+        Server s;
+        auto args = nemotron_args;
+        args.insert(args.end(), {"--kernels", kernels});
+        if (!s.start(d.path, args, nemotron_env())) {
+            fprintf(stderr, "    complete Nemotron startup log:\n%s\n", s.output().c_str());
+            REQUIRE(false);
+        }
+        const json only = {{"input", json::array({im1})}};
+        // Text originally before its image must reach the reference's image-before-text order.
+        const json combined = {{"input", json::array({{{"type", "text"}, {"text", "CDF"}}, im2})}};
+        const json messages = {
+            {{"role", "system"}, {"content", "AB"}},
+            {{"role", "user"},
+             {"content", json::array({{{"type", "text"}, {"text", "CE"}}, im1, im3})}}};
+        for (const auto& c : mm["cases"]) {
+            json req;
+            if (c["name"] == "image_only")
+                req = only;
+            else if (c["name"] == "http_image_text")
+                req = combined;
+            else if (c["name"] == "http_two_images")
+                req = {{"messages", messages}};
+            else
+                continue;
+            check_embedding(embedding_reply(s.port, req), c["pooled"][0]);
+        }
+        const auto alone = embedding_reply(s.port, only);
+        const json mixed = {{"input", json::array({"ABC", json::array({im1})})}};
+        check_embedding(embedding_reply(s.port, mixed, 1), alone);
+        REQUIRE_EQ(s.stop(), 0);
+    }
+}
+
+/* Opt-in for native 1B/8B checkpoints; weights remain external assets. The offline Python oracle writes this JSON;
+ * neither the ordinary suite nor the engine downloads models or invokes Python. */
+TEST(nemotron35_real_weights_match_the_offline_transformers_reference) {
+    const char* fixture = std::getenv("RAD_NEMOTRON_REAL_FIXTURE");
+    if (!fixture || !*fixture)
+        SKIP("set RAD_NEMOTRON_REAL_FIXTURE to the offline real-weight oracle JSON");
+#if !defined(__x86_64__)
+    SKIP("this real-weight check uses libavx on x86-64");
+#endif
+    const auto reference = json::parse(tiny::read_text(fixture));
+    const int dims = reference.value("dimensions", (int)reference["cases"][0]["embedding"].size());
+    REQUIRE(dims == 2048 || dims == 4096);
+    const auto validation = reference.value("validation", json::object());
+    REQUIRE(rad::mm::decoder_available());
+    Server s;
+    REQUIRE(
+        s.start(reference["checkpoint"],
+                {"--kernels", nemotron_device() ? "libr4d,libavx" : "libavx", "--max-num-seqs", "4",
+                 "--max-model-len", std::to_string(validation.value("context", 128)),
+                 "--max-num-batched-tokens", std::to_string(validation.value("batch_tokens", 256)),
+                 "--mm-max-patches", std::to_string(validation.value("patches", 64))},
+                {"RADIANCE_HOST_VRAM_MIB=24576", "OMP_NUM_THREADS=8",
+                 nemotron_device() ? nemotron_device_env() : "ROCR_VISIBLE_DEVICES=99"}));
+    json actual = json::array();
+    for (const auto& c : reference["cases"]) {
+        int status = 0;
+        const auto reply = post(s.port, "/v1/embeddings", c["request"], &status);
+        if (status != 200)
+            fprintf(stderr, "    %s HTTP %d: %s\n", c["name"].get<std::string>().c_str(), status,
+                    reply.dump().c_str());
+        REQUIRE_EQ(status, 200);
+        const auto got = reply["data"][0]["embedding"].get<std::vector<float>>();
+        actual.push_back({{"name", c["name"]}, {"embedding", got}, {"usage", reply["usage"]}});
+        const auto want = c["embedding"].get<std::vector<float>>();
+        double dot = 0, err = 0, n = 0;
+        REQUIRE_EQ(want.size(), (size_t)dims);
+        REQUIRE_EQ(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            dot += (double)got[i] * want[i];
+            n += (double)got[i] * got[i];
+            const double d = got[i] - want[i];
+            err += d * d;
+        }
+        fprintf(stderr, "    %s: %zu tokens, cosine %.9g, normalized L2 %.9g\n",
+                c["name"].get<std::string>().c_str(), c["tokens"].size(), dot / std::sqrt(n),
+                std::sqrt(err));
+        CHECK_EQ(reply["usage"]["prompt_tokens"].get<size_t>(), c["tokens"].size());
+        // Full-model gates differ from tiny fixtures: PyTorch eager vs SDPA alone reaches
+        // 2.8% normalized L2 on these weights. 3.2% corresponds to the 0.9995 cosine gate.
+        check_embedding(got, want, (int)want.size(), 0.032);
+    }
+    auto cosine = [](const std::vector<float>& x, const std::vector<float>& y) {
+        double dot = 0, xn = 0, yn = 0;
+        for (size_t i = 0; i < x.size(); ++i) {
+            dot += (double)x[i] * y[i];
+            xn += (double)x[i] * x[i];
+            yn += (double)y[i] * y[i];
+        }
+        return dot / std::sqrt(xn * yn);
+    };
+    double score_error = 0;
+    for (size_t i = 0; i < actual.size(); ++i)
+        for (size_t j = 0; j < i; ++j) {
+            const double got = cosine(actual[i]["embedding"], actual[j]["embedding"]);
+            const double want =
+                cosine(reference["cases"][i]["embedding"], reference["cases"][j]["embedding"]);
+            score_error = std::max(score_error, std::abs(got - want));
+        }
+    fprintf(stderr, "    maximum pairwise similarity score error %.9g\n", score_error);
+    CHECK(score_error <= 0.005);
+    for (const auto& group : reference.value("ranking_groups", json::array())) {
+        const int q = group["query"], a = group["documents"][0], b = group["documents"][1];
+        const double native =
+            cosine(reference["cases"][q]["embedding"], reference["cases"][a]["embedding"]) -
+            cosine(reference["cases"][q]["embedding"], reference["cases"][b]["embedding"]);
+        const double candidate = cosine(actual[q]["embedding"], actual[a]["embedding"]) -
+                                 cosine(actual[q]["embedding"], actual[b]["embedding"]);
+        fprintf(stderr, "    retrieval %s native margin %.9g candidate %.9g\n",
+                group["language"].get<std::string>().c_str(), native, candidate);
+        if (std::abs(native) > .01) CHECK(native * candidate > 0);
+    }
+
+    // The real scheduler must preserve a ragged mixed text/image batch's row identities.
+    const auto& cases = reference["cases"];
+    const json mixed = {
+        {"input", json::array({cases[1]["request"]["input"], cases[3]["request"]["input"]})}};
+    check_embedding(embedding_reply(s.port, mixed, 0), cases[1]["embedding"], dims, 0.032);
+    check_embedding(embedding_reply(s.port, mixed, 1), cases[3]["embedding"], dims, 0.032);
+    if (nemotron_device()) {
+        auto stats = [&]() {
+            Call c;
+            std::string body;
+            if (!c.send(s.port, "GET", "/stats", "") || c.read(&body) != 200) return json();
+            return json::parse(body);
+        };
+        const auto before = stats();
+        int status = 0;
+        const auto reply =
+            post(s.port, "/v1/embeddings",
+                 {{"input", json::array({cases[0]["tokens"], cases[2]["tokens"]})}}, &status);
+        REQUIRE_EQ(status, 200);
+        check_embedding(reply["data"][0]["embedding"], cases[0]["embedding"], dims, 0.032);
+        check_embedding(reply["data"][1]["embedding"], cases[2]["embedding"], dims, 0.032);
+        const auto after = stats();
+        REQUIRE(before.is_object() && after.is_object());
+        fprintf(stderr, "    whole-input batch: steps %lld -> %lld, prompt_tokens %zu\n",
+                before["steps"].get<long long>(), after["steps"].get<long long>(),
+                reply["usage"]["prompt_tokens"].get<size_t>());
+        CHECK_EQ(after["steps"].get<long long>() - before["steps"].get<long long>(), 1);
+        CHECK_EQ(reply["usage"]["prompt_tokens"].get<size_t>(),
+                 cases[0]["tokens"].size() + cases[2]["tokens"].size());
+        // A disconnected client must not poison the next embedding, including pooled-row reuse.
+        Call abandoned;
+        REQUIRE(abandoned.send(s.port, "POST", "/v1/embeddings",
+                               json({{"input", std::vector<int>(120, 3)}}).dump()));
+        ::close(abandoned.fd);
+        abandoned.fd = -1;
+        check_embedding(embedding_reply(s.port, cases[0]["request"]), cases[0]["embedding"], dims,
+                        0.032);
+    }
+    // Repeated identical geometry reaches cold, recording, audit and playback paths. Changing
+    // input contents at that geometry catches a tape retaining stale metadata or image rows.
+    if (nemotron_device()) {
+        for (int repeat = 0; repeat < 6; ++repeat)
+            for (int i : {0, 1, 3, 4})
+                check_embedding(embedding_reply(s.port, cases[i]["request"]), cases[i]["embedding"],
+                                dims, 0.032);
+    }
+    if (nemotron_device()) {
+        Call c;
+        std::string stats;
+        REQUIRE(c.send(s.port, "GET", "/stats", ""));
+        REQUIRE_EQ(c.read(&stats), 200);
+        const auto state = json::parse(stats);
+        fprintf(stderr, "    device stats: %s\n", stats.c_str());
+        if (const char* output = std::getenv("RAD_NEMOTRON_STATS_OUTPUT"))
+            REQUIRE(tiny::write_text(output, state.dump(2) + "\n"));
+    }
+    if (const char* output = std::getenv("RAD_NEMOTRON_REAL_OUTPUT"))
+        REQUIRE(tiny::write_text(output, actual.dump(2) + "\n"));
+    REQUIRE_EQ(s.stop(), 0);
+    if (const char* output = std::getenv("RAD_NEMOTRON_SERVER_LOG"))
+        REQUIRE(tiny::write_text(output, s.output()));
 }
 
 RAD_TEST_MAIN()

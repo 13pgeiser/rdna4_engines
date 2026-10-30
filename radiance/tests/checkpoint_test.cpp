@@ -7,6 +7,7 @@
  * back.
  */
 #include "rad_test.h"
+#include "gguf_writer.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
 #include "rad_plugin.h"
@@ -151,7 +152,9 @@ TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
 
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
  * --set: a bf16 checkpoint converted to block fp8 states that format and selects the fp8 plugin,
- * so the container never names one format and selects another's plugin. */
+ * so the container never names one format and selects another's plugin. transformers' fp8 states
+ * no fmt and is E4M3 (Qwen3.8-Flash-Next-FP8), so it is the same descriptor; another method
+ * without a fmt is its name alone. */
 TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
                                              "{\"model_type\":\"qwen3_5\",\"hidden_size\":256}");
@@ -160,9 +163,12 @@ TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     CHECK_EQ(ck.meta().quant, std::string());
     MetaOwn m = ck.meta();
     m.set("quantization_config.quant_method", "fp8");
-    CHECK_EQ(quant_descriptor(m), std::string("fp8"));
+    CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
     m.set("quantization_config.fmt", "e4m3");
     CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
+    MetaOwn ct = ck.meta();
+    ct.set("quantization_config.quant_method", "compressed-tensors");
+    CHECK_EQ(quant_descriptor(ct), std::string("compressed-tensors"));
 }
 
 /* Google's bf16 E2B needs no `--set quantization_config.quant_method`: its per-layer embeddings
@@ -2054,60 +2060,9 @@ TEST(a_concat_declared_in_pieces_joins_every_piece_in_order) {
  * shape everything else uses; the legacy and Q4_K/Q6_K block types decode by their definitions. */
 namespace {
 
-struct GKv {
-    std::string key;
-    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array of strings */
-    double num = 0;
-    std::vector<std::string> strs;
-};
-struct GTensor { std::string name; uint32_t type; std::vector<uint64_t> ne; std::vector<uint8_t> bytes; };
-
-void put_bytes(std::string* b, const void* p, size_t n) { b->append((const char*)p, n); }
-void put_str(std::string* b, const std::string& s) {
-    const uint64_t n = s.size();
-    put_bytes(b, &n, 8);
-    b->append(s);
-}
-
-/* A GGUF v3 file of `kvs` and `ts`, every tensor at a 32-byte aligned offset. */
-void write_gguf(const std::string& path, const std::vector<GKv>& kvs, const std::vector<GTensor>& ts) {
-    std::string b = "GGUF";
-    const uint32_t ver = 3;
-    const uint64_t nt = ts.size(), nk = kvs.size();
-    put_bytes(&b, &ver, 4);
-    put_bytes(&b, &nt, 8);
-    put_bytes(&b, &nk, 8);
-    for (const GKv& kv : kvs) {
-        put_str(&b, kv.key);
-        put_bytes(&b, &kv.type, 4);
-        if (kv.type == 4) { const uint32_t v = (uint32_t)kv.num; put_bytes(&b, &v, 4); }
-        else if (kv.type == 6) { const float v = (float)kv.num; put_bytes(&b, &v, 4); }
-        else if (kv.type == 8) put_str(&b, kv.strs.at(0));
-        else {
-            const uint32_t et = 8;
-            const uint64_t n = kv.strs.size();
-            put_bytes(&b, &et, 4);
-            put_bytes(&b, &n, 8);
-            for (const std::string& s : kv.strs) put_str(&b, s);
-        }
-    }
-    uint64_t off = 0;
-    for (const GTensor& t : ts) {
-        put_str(&b, t.name);
-        const uint32_t nd = (uint32_t)t.ne.size();
-        put_bytes(&b, &nd, 4);
-        for (uint64_t d : t.ne) put_bytes(&b, &d, 8);
-        put_bytes(&b, &t.type, 4);
-        put_bytes(&b, &off, 8);
-        off += (t.bytes.size() + 31) / 32 * 32;
-    }
-    while (b.size() % 32) b.push_back('\0');
-    for (const GTensor& t : ts) {
-        b.append((const char*)t.bytes.data(), t.bytes.size());
-        while (b.size() % 32) b.push_back('\0');
-    }
-    write_file(path, b);
-}
+using ggufw::GKv;
+using ggufw::GTensor;
+using ggufw::write_gguf;
 
 uint16_t h16(float v) { return rad_f32_to_f16(v); }
 
@@ -2306,6 +2261,213 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         REQUIRE_EQ(c2.open(p2), RAD_OK);
         CHECK_EQ(c2.meta().quant, std::string());
     }
+}
+
+namespace {
+
+/* `rows` x `cols` blocks of Q4_K (type 12) or Q6_K (type 14) with arbitrary quants and scales and
+ * finite f16 super-scales: random bits there would make NaNs, which equal nothing. */
+GTensor k_blocks(const char* name, uint32_t type, int64_t rows, int64_t cols, uint32_t seed) {
+    GTensor t{ name, type, { (uint64_t)cols, (uint64_t)rows }, {} };
+    uint32_t x = seed;
+    auto fill = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            x = x * 1664525u + 1013904223u;
+            t.bytes.push_back((uint8_t)(x >> 24));
+        }
+    };
+    auto push16 = [&](float v) {
+        const uint16_t h = h16(v);
+        t.bytes.push_back((uint8_t)h);
+        t.bytes.push_back((uint8_t)(h >> 8));
+    };
+    for (int64_t b = 0; b < rows * cols / 256; ++b) {
+        const float d = 0.0625f * (float)(1 + (b + seed) % 7);
+        if (type == 12) {
+            push16(d);
+            push16(d / 2);
+            fill(12 + 128);
+        } else {
+            fill(128 + 64 + 16);
+            push16(d);
+        }
+    }
+    return t;
+}
+
+/* Every plane of `w` through ckpt_plane_rows, and the weight those planes decode to. */
+void read_planes(const CkptWeight& w, std::vector<std::vector<uint8_t>>* planes,
+                 std::vector<float>* values) {
+    std::string why;
+    planes->assign((size_t)w.enc.n_planes, {});
+    const void* data[RAD_ENC_MAX_PLANES] = { nullptr };
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+        (*planes)[(size_t)k].resize((size_t)(pr * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)));
+        CHECK_EQ(ckpt_plane_rows(w, k, 0, pr, (*planes)[(size_t)k].data(), &why), (int)RAD_OK);
+        data[k] = (*planes)[(size_t)k].data();
+    }
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, data, &v);
+    values->assign((size_t)(w.rows * w.cols), 0.0f);
+    CHECK_EQ(enc_decode_rows(v, 0, w.rows, values->data(), &why), (int)RAD_OK);
+}
+
+/* The planes of `w` decode to exactly what the block definition gives (ckpt_rows_f32). */
+void check_planes_decode_by_definition(const CkptWeight& w) {
+    std::vector<std::vector<uint8_t>> planes;
+    std::vector<float> got, want((size_t)(w.rows * w.cols));
+    std::string why;
+    read_planes(w, &planes, &got);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, w.rows, want.data(), &why), (int)RAD_OK);
+    int bad = 0, nonzero = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        bad += !(got[i] == want[i]);
+        nonzero += want[i] != 0.0f;
+    }
+    if (bad) std::fprintf(stderr, "    %d of %zu value(s) differ\n", bad, want.size());
+    CHECK_EQ(bad, 0);
+    CHECK(nonzero > (int)want.size() / 2);
+}
+
+}  /* namespace */
+
+TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
+    const std::string path = fresh_dir() + "/m.gguf";
+    std::vector<float> w8;
+    const GTensor q8 = legacy_blocks("t.q8_0", 8, &w8);
+    const GTensor g = k_blocks("g", 12, 2, 512, 1), u = k_blocks("u", 12, 3, 512, 2);
+    const GTensor s = k_blocks("s", 12, 2, 256, 3), k6 = k_blocks("k6", 14, 2, 256, 4);
+    const GTensor q5{ "t.q5_k", 13, { 256, 1 }, std::vector<uint8_t>(176, 0) };
+    write_gguf(path, llama_kvs(15), { q8, g, u, s, k6, q5 });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("t.q8_0", RAD_MAP_COPY, { "t.q8_0" }));
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g", "u" }));
+    prog.name_map.push_back(map("s", RAD_MAP_COPY, { "s" }));
+    prog.name_map.push_back(map("k6", RAD_MAP_COPY, { "k6" }));
+    prog.name_map.push_back(map("mix", RAD_MAP_CONCAT, { "s", "k6" }));
+    prog.name_map.push_back(map("across", RAD_MAP_CONCAT, { "g", "s" }, {}, 1));
+    prog.name_map.push_back(map("t.q5_k", RAD_MAP_COPY, { "t.q5_k" }));
+    std::string why;
+
+    /* Q8_0: the codes plane is each block's quants and the scale plane its d, byte for byte. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q8_0", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "GGUF"));
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 2);
+        std::vector<std::vector<uint8_t>> planes;
+        std::vector<float> f;
+        read_planes(w, &planes, &f);
+        REQUIRE_EQ(planes[0].size(), (size_t)(8 * 32));
+        REQUIRE_EQ(planes[1].size(), (size_t)(8 * 2));
+        int bad = 0;
+        for (int b = 0; b < 8; ++b) {
+            bad += std::memcmp(planes[0].data() + 32 * b, q8.bytes.data() + 34 * b + 2, 32) != 0;
+            bad += std::memcmp(planes[1].data() + 2 * b, q8.bytes.data() + 34 * b, 2) != 0;
+        }
+        CHECK_EQ(bad, 0);
+        int differ = 0;
+        for (size_t i = 0; i < w8.size(); ++i) differ += f[i] != w8[i];
+        CHECK_EQ(differ, 0);
+    }
+
+    /* Q4_K, gate and up joined along rows: the planes decode to the block definition, and a
+     * range that starts in the first piece and ends in the second is the same bytes. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        CHECK_EQ(w.rows, (int64_t)5);
+        CHECK_EQ(w.cols, (int64_t)512);
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 5);
+        check_planes_decode_by_definition(w);
+        std::vector<std::vector<uint8_t>> planes;
+        std::vector<float> f;
+        read_planes(w, &planes, &f);
+        for (int k = 0; k < w.enc.n_planes; ++k) {
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+            const int64_t rb = rad_enc_row_bytes(w.enc.plane[k].dtype, pc);
+            std::vector<uint8_t> part((size_t)(3 * rb));
+            REQUIRE_EQ(ckpt_plane_rows(w, k, 1, 3, part.data(), &why), RAD_OK);
+            CHECK_EQ(std::memcmp(part.data(), planes[(size_t)k].data() + rb, part.size()), 0);
+        }
+    }
+
+    /* A row of one block ends its 6-bit planes mid-word. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "s", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        check_planes_decode_by_definition(w);
+    }
+
+    /* Q6_K. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "k6", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 3);
+        check_planes_decode_by_definition(w);
+    }
+
+    /* What it does not import keeps the GGUF reason. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "mix", false, &w, &why), RAD_OK);
+        CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
+        CHECK(has(w.why, "different block types"));
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "across", false, &w, &why), RAD_OK);
+        CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
+        CHECK(has(w.why, "joined along a column"));
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q5_k", false, &w, &why), RAD_OK);
+        CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
+        CHECK(has(w.why, "GGUF"));
+    }
+}
+
+/* llama.cpp stacks an MoE's experts in one rank-3 tensor of blocks, and an expert's gate|up is two
+ * dim-0 slices joined along rows: their planes are those of the same blocks stored on their own. */
+TEST(a_slice_of_a_stacked_gguf_block_tensor_is_imported_as_its_planes) {
+    const std::string path = fresh_dir() + "/m.gguf";
+    const int64_t E = 4, N = 3, K = 512;
+    GTensor gate = k_blocks("gate_exps", 12, E * N, K, 5);
+    GTensor up = k_blocks("up_exps", 12, E * N, K, 6);
+    gate.ne = up.ne = { (uint64_t)K, (uint64_t)N, (uint64_t)E };
+    const size_t eb = gate.bytes.size() / E;
+    GTensor own{ "gu2", 12, { (uint64_t)K, (uint64_t)(2 * N) }, {} };
+    own.bytes.assign(gate.bytes.begin() + 2 * eb, gate.bytes.begin() + 3 * eb);
+    own.bytes.insert(own.bytes.end(), up.bytes.begin() + 2 * eb, up.bytes.begin() + 3 * eb);
+    write_gguf(path, llama_kvs(15), { gate, up, own });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "gate_exps", "up_exps" }, { 2, 2 }));
+    prog.name_map.push_back(map("gu2", RAD_MAP_COPY, { "gu2" }));
+    std::string why;
+    CkptWeight w, o;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu2", false, &o, &why), RAD_OK);
+    CHECK(w.imported && w.ggml_blocks);
+    CHECK_EQ(w.rows, 2 * N);
+    CHECK_EQ(w.cols, K);
+    REQUIRE(rad_enc_equal(&w.enc, &o.enc));
+    std::vector<std::vector<uint8_t>> got, want;
+    std::vector<float> fg, fo;
+    read_planes(w, &got, &fg);
+    read_planes(o, &want, &fo);
+    for (int k = 0; k < w.enc.n_planes; ++k) CHECK(got[(size_t)k] == want[(size_t)k]);
 }
 
 TEST(hyv3_gguf_metadata_normalizes_architecture_and_config_fields) {
@@ -2884,6 +3046,45 @@ TEST(a_compressed_tensors_fp8_release_reads_stock_with_no_import_refusal) {
     std::vector<float> f(128);
     REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, f.data(), &why), RAD_OK);
     CHECK_EQ(f[5], (float)((128 + 5) % 7 - 3) * -2.0f);
+}
+
+/* Qwen3.8-Flash-Next-FP8 ships its n-gram table as FP8 shards, `X.shard_<i>.weight`, under one
+ * scale, `X.weight_scale`. Joined along rows they are one table with one scale, byte for byte:
+ * `fp8_e4m3*bf16[*x*]`, the scale plane its single element, and the rows decode by it. */
+TEST(fp8_shards_under_one_shared_scale_are_one_table_with_one_scale) {
+    T sc{ "t.weight_scale", "BF16", { 1 }, {} };
+    sc.bytes.resize(2);
+    rad_store_f32(sc.bytes.data(), RAD_BF16, 0, 0.5f);
+    const std::string dir = write_checkpoint(
+        { fp8("t.shard_0.weight", { 3, 128 }), fp8("t.shard_1.weight", { 2, 128 }), sc }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("t", RAD_MAP_CONCAT, { "t.shard_0.weight", "t.shard_1.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "t", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && !w.imported);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)0);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)0);
+    CHECK_EQ(w.rows, (int64_t)5);
+    std::vector<float> f(128);
+    REQUIRE_EQ(ckpt_rows_f32(w, 3, 1, f.data(), &why), RAD_OK);   /* shard 1's row 0 */
+    CHECK_EQ(f[5], (float)(5 % 7 - 3) * 0.5f);
+    std::vector<uint16_t> sp(1);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 1, sp.data(), &why), RAD_OK);
+    CHECK_EQ(rad_load_f32(sp.data(), RAD_BF16, 0), 0.5f);
+    std::vector<uint8_t> raw(128);
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 3, 1, raw.data(), &why), RAD_OK);
+    CHECK_EQ(rad_load_f32(raw.data(), RAD_F8E4M3, 5), (float)(5 % 7 - 3));
+
+    /* One shard alone is the same table, and a scale of another name is not borrowed. */
+    prog.name_map.push_back(map("u", RAD_MAP_COPY, { "t.shard_1.weight" }));
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "u", false, &w, &why), RAD_OK);
+    CHECK(w.trivial);
 }
 
 /* Per-row FP8 is `fp8_e4m3*<s>[1x*]` whether the scale ships as [N, 1] (compressed-tensors'

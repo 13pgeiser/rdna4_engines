@@ -16,11 +16,12 @@ plugin claims.
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
-| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
+| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
+| `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B and 8B: native BF16 bidirectional text/image encoders with a Pixtral tower, retrieval formatting and normalized mean pooling, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
@@ -345,8 +346,11 @@ Architecture tests cover geometry, GGUF tensor maps, dense-to-MoE scheduling, TP
 and FP32 combine order; checkpoint tests cover Q4_K/Q6_K block decoding. Numerical parity against Tencent/llama.cpp
 remains untested.
 
-See [HYV3 W4 decode optimizations](benchmarks/hyv3-w4-decode.md) for affected paths,
-historical measurements, validation limits and the remaining benchmark/quality gates.
+Decode on the full-GPTQ W4 model, TP1 on one R9700 (10,030-token prompt, 2,000 generated tokens,
+greedy, no drafter): 76.6 tok/s before the per-128 I4 expert packing, the one-row W4/W5 epilogue,
+the in-GEMM BF16 narrowing, the fused Q/K norm + RoPE + KV store and the residual and shared-expert
+folds; 109.6 tok/s with them, prefill unchanged (7,876 to 7,927 tok/s). The answer is byte-identical,
+and on an eight-document teacher-forced corpus the two builds agree at every top-1 (mean KL 7.6e-8).
 
 ## `qwen35_w8a8`
 
@@ -414,6 +418,13 @@ plugin reads each weight's encoding from the container and declares the op that 
 - the lm_head: whatever a `logits_gemm` kernel reads;
 - bf16: every norm gain, `A_log`, `dt_bias`, `conv1d`, `in_proj_a` and `in_proj_b` (48 rows is not
   a whole scale block), the router, `shared_expert_gate` and `embed_tokens`.
+
+Qwen's own `Qwen3.8-Flash-Next-FP8` converts without a recipe too. Its `quantization_config`
+(`quant_method: fp8`, no `fmt`) is block-scaled E4M3, descriptor `fp8_e4m3`; no `qwen4exp` plugin
+claims it, so each weight is read as it ships and this plugin serves it: the routed experts (MTP
+head's included) at block FP8 with their bf16 `weight_scale_inv`, the n-gram table's 128 FP8
+shards under its one `ngram_embedding.weight_scale`, and every other weight bf16. A recipe applies
+to it as to the bf16 checkpoint, with each FP8 weight read through its scales.
 
 **The attention cache takes `--kv-cache-dtype fp8_v4` or `k6_v4`.** The QSA layers' cache (and the
 MTP head's layer, which shares it) is then declared at head_dim 200 or 176, a token's quantised row
@@ -853,6 +864,79 @@ Traps:
 
 ---
 
+# `nemotron35_embed`: embedding models
+
+Native BF16 [Nemotron 3.5 Embed 1B](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16)
+and [8B](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) are bidirectional multimodal
+encoders, selected by `(mistral3, "")` with noncausal Mistral3/Ministral3 checks. They declare
+pooled output and no language-generation head. CPU (`libavx`, with `libref` as the oracle) and
+RDNA4 (`libr4d`) serve BF16 at TP1; quantized planes, TP>1, drafting and audio are rejected.
+[GUIDE §5.6](GUIDE.md#56-completions-embeddings-images-tokenising) covers serving and retrieval inputs.
+
+| Checkpoint | Pinned revision | Text geometry | Default vector |
+|---|---|---|---:|
+| 1B BF16 | `e24ca1e346bcc53572bd7bdc02b3e8ebf66c197c` | 16 layers, hidden 2048, FFN 6144, 24 Q / 8 KV heads | 2048 |
+| 8B BF16 | `781e779ee4ca9c2d2a4f38321993556baeab49a1` | 34 layers, hidden 4096, FFN 14336, 32 Q / 8 KV heads | 4096 |
+
+Both have 128-wide text heads. The 1B query width is 3072, independently of its hidden width.
+Each uses its own checkpoint weights and embedding space. The vision tower is Pixtral: 24 layers,
+hidden 1024, 16 heads of width 64, 14-pixel patches and a learned 2x2 patch merger/projector.
+
+**Numerical contracts.** Native safetensors mapping fuses QKV and gate/up without changing
+precision. Attention is bidirectional over each complete input and isolated across inputs.
+Pooling is the valid-token mean; dimensional truncation precedes L2 normalization.
+
+Ministral rounds the weightless norm before applying its BF16 gain. Its rotary rounds cos/sin
+and individual products to BF16, with model-local YaRN magnitude and position-dependent query
+scaling, including the position-16384 seam. Shared rotary defaults remain unchanged. Pixtral
+preserves axial height/width rotary, channel-major patch merging, exact GELU and BF16 seams.
+Only actual `[IMG]` rows receive image embeddings; separator embeddings remain ordinary tokens
+and participate in pooling. The model-specific operation laws are in [OPS.md](OPS.md).
+
+**Context and images.** The maximum is 32768 total encoded tokens per input, including prefixes,
+image placeholders and separators. The backbone's 262144 positional slots do not establish a
+larger supported embedding context. Inputs are never silently truncated. Configured per-input,
+combined-token, sequence-slot and image-pass budgets remain separate limits.
+
+The default longest edge is 1120, without initial enlargement. Reference PIL bicubic resizing
+aligns dimensions to 28, followed by CLIP normalization and raster 14x14 patches. The default
+maximum square has 6400 patches and must fit one encoder pass. The published 1540-pixel option
+and larger image settings are not validated by this port.
+
+**Verification.** Stored tiny fixtures cover issued graphs, exact preprocessing/token identity,
+BF16 seams, ragged multimodal inputs, invalid shapes and both head geometries. The regular C++
+suite needs neither Python nor downloaded checkpoints. Opt-in R9700 entries are
+`nemotron35_device_test_card` and `r4d_bf16_capacity_test_card`; the latter uses over 8 GiB VRAM
+to cross actual activation-offset boundaries, with bounded host staging.
+
+The offline native oracle uses CPU torch 2.14.1, matching torchvision 0.29.1, Transformers 5.20.0
+and Pillow 13.0.0, explicitly selecting PIL preprocessing and never running remote model code:
+
+```sh
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python tests/mknemotron35realreference.py \
+  /models/Nemotron-3.5-Embed-1B-BF16 /tmp/nemotron-reference.json --extended
+RAD_NEMOTRON_REAL_FIXTURE=/tmp/nemotron-reference.json RAD_NEMOTRON_DEVICE=1 \
+  RADIANCE_HOME="$PWD/build/radiance_home" RAD_TEST_CPU_BUDGET=0 OMP_WAIT_POLICY=passive \
+  build/tests/engine_e2e_test nemotron35_real
+```
+
+Use the corresponding native checkpoint for 8B; omit `RAD_NEMOTRON_DEVICE` for CPU execution.
+`RAD_NEMOTRON_DEVICE_INDEX=1` selects another physical card. Run large checks sequentially; 8B
+needs roughly 20 GB available host memory. Tiny gates are relative L2 <=.01 and cosine >=.9995.
+Native gates are cosine >=.9995, normalized L2 <=.032, norm error <=1e-5 and pairwise-score error
+<=.005, fixed before candidate evaluation. The full-model bound accounts for audited BF16
+backend sensitivity: eager-vs-SDPA alone reached 2.805% normalized L2 on the 8B samples.
+Individual/batched vectors must agree within L2 <=1e-5; native ranking margins >.01 must retain
+their ordering. These gates are not bitwise or broad retrieval-quality guarantees.
+
+CPU/R9700 comparisons cover both variants; the extended 1B corpus reaches 1924 tokens with
+English/Spanish/Japanese retrieval groups. Separate synthetic capacity checks cover a complete
+32768-token input, four full 1B inputs in one 131072-token step and a default maximum image.
+They do not establish native accuracy at maximum context/resolution. Native INT8/Q8, GGUF and
+TP2 remain unimplemented.
+
+---
+
 # `nomicbert`: an embedding model
 
 `arch/nomicbert` declares a pooled output (`rad_declare_pooled`) and no logits, so it is an
@@ -872,9 +956,9 @@ text      12 layers, hidden 768, ffn 3072, vocab 250048, 12 heads of 64, type vo
           mean over every real token, cast to the f32 pooled buffer; the server L2-normalises
 ```
 
-The block order is the one the verified variant uses: attention on the raw stream, then LN1, the
-feed-forward on LN1's output, then LN2 over that output plus the feed-forward's. The checkpoint's
-shared `experts.bias` is not applied, and the plugin does not map it. A container that sets
+Block order: attention on the raw stream, then LN1, the feed-forward on LN1's output, then LN2
+over that output plus the feed-forward's. The checkpoint's shared `experts.bias` is not applied,
+and the plugin does not map it. A container that sets
 `prenorm`, `causal`, interleaved, partial or scaled rotary, a gelu variant, renormalised routing
 or a shared expert is refused at declare.
 
@@ -895,10 +979,10 @@ reads a bf16 table. The token embedding, linears, router and expert tables are b
 | `blk.N.ffn_exp_w2.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w2` | [768, 3072] | slice E, transpose |
 | not declared (odd N) | `encoder.layers.N.mlp.experts.bias` | [768] | not mapped |
 
-The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; `E` takes the
-expert's dim-0 slice, and `w2` is transposed to `[768, 3072]` for the grouped GEMM. Every expert
-has two group slots, one for each projection. Nothing else is mapped: there is no final norm, no
-pooler, no position table and no output head.
+The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; expert `E` is rows
+`[E * 3072, (E + 1) * 3072)`, and `w2`'s block is transposed to `[768, 3072]` for the grouped GEMM.
+Every expert has two group slots, one for each projection. Nothing else is mapped: there is no
+final norm, no pooler, no position table and no output head.
 
 **The recipe.** The checkpoint is f32 (1.9 GB).
 
@@ -907,15 +991,14 @@ rad-convert <checkpoint dir> --recipe data/recipes/nomic-embed-v2-moe-bf16.recip
     -o nomic-embed-v2-moe-bf16.rad
 ```
 
-It takes 3.5 s and writes a 959 MB container (907 MiB of weights). The checkpoint directory must
-contain `tokenizer.json`. The recipe casts the token embedding, the token-type table, the
-attention, dense MLP and expert weights to bf16 and leaves the norms and biases f32.
+It writes a 959 MB container (907 MiB of weights). The checkpoint directory must contain
+`tokenizer.json`. The recipe casts the token embedding, the token-type table, the attention,
+dense MLP and expert weights to bf16 and leaves the norms and biases f32.
 
-**Verified.** 20 texts against a pure-float32 reference: mean cosine 0.99995, min 0.99983 on a
-gfx1201 card, with libavx and libref the same to 4 decimals. Against a Q6_K quantisation of the
-same model the mean is 0.9944 (min 0.990); the Q8_0 one agrees with the reference at 0.9994, so
-the Q6_K quantisation is the outlier, about 0.006 off the true model, and stored vectors from a
-Q6_K server drift by about that much.
+**Verified.** On 20 texts against a pure-float32 reference, on a gfx1201 card: mean cosine
+0.99995, min 0.99983; libavx and libref agree with it to 4 decimals. Against the same reference a
+Q8_0 quantisation of the model scores a mean of 0.9994 and a Q6_K one 0.9944 (min 0.990), so
+vectors stored from a Q6_K server differ by about 0.006.
 
 **Measured.** On one gfx1201 card, short texts take 2 ms a request at one client, 3854 requests/s
 at 64 concurrent clients and 4400 texts/s for a batch of 32 in one request; a 1354-character text

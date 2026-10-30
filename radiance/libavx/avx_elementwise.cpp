@@ -597,6 +597,33 @@ AVX_KERNEL(pool_cols) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ position_scale */
+/* Ministral 3's query multiplier is rounded before multiplication, as in libref. */
+AVX_KERNEL(position_scale) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pos = &a->t[1];
+    // M in the resolved geometry is a capacity band; issued views carry the active rows.
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t n = p_int(a, "n", 0), orig = p_int(a, "original", 0);
+    const float beta = p_f32(a, "beta", -1);
+    if (M <= 0 || M > p_int(a, "M", 0) || n <= 0 || orig <= 0 || !std::isfinite(beta) || beta < 0 ||
+        x->rank != 2 || x->shape[0] < M || x->shape[1] != n || pos->rank != 1 || numel(pos) < M)
+        return RAD_E_SHAPE;
+    if (pos->dtype != RAD_I32 || (x->dtype != RAD_BF16 && x->dtype != RAD_F32)) return RAD_E_DTYPE;
+    for (int64_t r = 0; r < M; ++r)
+        if (ldi(pos, offlin(pos, r)) < 0) return RAD_E_INVAL;
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t p = ldi(pos, offlin(pos, r));
+        const float scale = narrow1(x->dtype, 1.0f + beta * std::log(1.0f + (float)(p / orig)));
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t at = rowoff(x, r, n) + j * laststride(x);
+            stt(x, at, ldt(x, at) * scale);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ scale_rows */
 /* y[m, i] = x[m, i] * act(s[m]), plus add[m, i] when the optional residual is passed.
  *

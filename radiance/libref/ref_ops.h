@@ -126,6 +126,7 @@ int ref_rmsnorm_quant_fp8  (const RadArgs*, RadStream);
 int ref_gated_quant_fp8    (const RadArgs*, RadStream);
 int ref_gemm_nt_q_gated    (const RadArgs*, RadStream);
 int ref_dflash_select      (const RadArgs*, RadStream);
+int ref_dflash_tree        (const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
@@ -146,6 +147,7 @@ int ref_logits_gemm        (const RadArgs*, RadStream);
 
 /* ---- attention */
 int ref_attn_paged         (const RadArgs*, RadStream);
+int ref_attn_paged_tree    (const RadArgs*, RadStream);
 int ref_attn_dense         (const RadArgs*, RadStream);
 int ref_attn_cross         (const RadArgs*, RadStream);
 int ref_table_add          (const RadArgs*, RadStream);
@@ -157,6 +159,11 @@ int ref_kv_store           (const RadArgs*, RadStream);
 /* the store of a streamed group: the host mirror always, the ring slot when the block is resident */
 int ref_kv_store_streamed  (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
+int ref_position_scale     (const RadArgs*, RadStream);
+int ref_embed_attn         (const RadArgs*, RadStream);
+int ref_ministral_rope     (const RadArgs*, RadStream);
+int ref_pixtral_rope       (const RadArgs*, RadStream);
+int ref_pixtral_merge      (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
@@ -393,6 +400,7 @@ REF_SHAPE_FN(ref_rmsnorm_quant_fp8);
 REF_SHAPE_FN(ref_gated_quant_fp8);
 REF_SHAPE_FN(ref_gemm_nt_q_gated);
 REF_SHAPE_FN(ref_dflash_select);
+REF_SHAPE_FN(ref_dflash_tree);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);
@@ -410,6 +418,7 @@ REF_SHAPE_FN(ref_embed_lookup_q);
 REF_SHAPE_FN(ref_logits_gemm);
 
 REF_SHAPE_FN(ref_attn_paged);
+REF_SHAPE_FN(ref_attn_paged_tree);
 REF_SHAPE_FN(ref_attn_dense);
 REF_SHAPE_FN(ref_attn_cross);
 REF_SHAPE_FN(ref_table_add);
@@ -419,6 +428,11 @@ REF_SHAPE_FN(ref_sam_attn);
 REF_SHAPE_FN(ref_kv_store);
 REF_SHAPE_FN(ref_kv_store_streamed);
 REF_SHAPE_FN(ref_rope);
+REF_SHAPE_FN(ref_position_scale);
+REF_SHAPE_FN(ref_embed_attn);
+REF_SHAPE_FN(ref_ministral_rope);
+REF_SHAPE_FN(ref_pixtral_rope);
+REF_SHAPE_FN(ref_pixtral_merge);
 REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);

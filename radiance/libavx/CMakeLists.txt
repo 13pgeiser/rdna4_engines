@@ -47,6 +47,7 @@ set(AVX_KERNEL_SRC
   avx_lora.cpp
   avx_attn.cpp
   avx_kvstream.cpp
+  avx_pixtral.cpp
   avx_sam_attn.cpp
   avx_qsa.cpp
   avx_moe.cpp

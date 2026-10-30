@@ -75,12 +75,19 @@ struct KvDyn  {
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
+/* attn_paged_tree's ninth operand, `spec_parent` (RadBatch::spec_parent, rad_drafter_tree), is
+ * read here too: a row whose entry is -2 is an ordinary causal row; any other row is a node of its
+ * sequence's verify block, whose entry is its parent's row within the sequence's rows (-1 for the
+ * root, the block's first row). Inside the block such a row sees itself and its ancestors only,
+ * and its window is measured from the block's first position plus its depth -- the position its
+ * token has if its path is committed -- rather than from its row. */
 int ref_attn_paged(const RadArgs* a, RadStream) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
     const RadTensor* kdes = t_in(a, 4);
     const RadTensor* vdes = t_in(a, 5);
     const RadTensor* cus  = t_in(a, 6);
+    const RadTensor* tpar = a->n_t > 8 ? t_in(a, 8) : nullptr;
     if (!q->data || !kv->data || !bt->data || !su->data || !o->data) return RAD_E_INVAL;
 
     const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
@@ -162,6 +169,27 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                 const int64_t qb  = tok * q_rs + h * q_hs;
                 const int64_t ob  = tok * o_rs + h * o_hs;
 
+                /* A tree row: its ancestors inside the block (a bit per row) and its depth. */
+                const int64_t base = ctx - qlen;
+                bool tree = false;
+                uint64_t tmask = 0;
+                int64_t tdep = 0;
+                if (tpar) {
+                    const int64_t first = tok - i;
+                    int64_t pj = ld_int(tpar->dtype, tpar->data, offlin(tpar, tok));
+                    if (pj != -2 && i < 64) {
+                        tree  = true;
+                        tmask = 1ull << i;
+                        for (int64_t at = i; pj >= 0 && pj < at; ) {
+                            tmask |= 1ull << pj;
+                            ++tdep;
+                            at = pj;
+                            pj = ld_int(tpar->dtype, tpar->data, offlin(tpar, first + pj));
+                        }
+                    }
+                }
+                const int64_t wpos = tree ? base + tdep : pos;
+
                 const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
                 const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
 
@@ -171,8 +199,9 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                  * unmapped. */
                 auto key_at = [&](int64_t j) -> int64_t {
                     if (causal && j > pos) return -1;
+                    if (tree && j >= base && !((tmask >> (j - base)) & 1)) return -1;
                     if (window > 0) {
-                        const int64_t d = pos - j;
+                        const int64_t d = wpos - j;
                         if (causal ? (d >= window) : (d >= window || d <= -window)) return -1;
                     }
                     const int64_t blk =
@@ -245,6 +274,14 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+/* attn_paged with its tree operand present: ref_attn_paged reads it (see there). Refused without
+ * one, and for a non-causal layer, whose two-sided window has no tree reading here. */
+int ref_attn_paged_tree(const RadArgs* a, RadStream s) {
+    if (a->n_t < 9 || !t_in(a, 8)) return RAD_E_INVAL;
+    if (p_int(a, "causal", 1) != 1) return RAD_E_UNSUPPORTED;
+    return ref_attn_paged(a, s);
 }
 
 /* ------------------------------------------------------------------ attn_dense */
@@ -769,6 +806,34 @@ static int rope_ladder(const RadArgs* a, int64_t rot, int64_t head_dim, int64_t*
 }
 
 }  /* namespace */
+
+/* Ministral 3's query multiplier, applied after rotary and rounded to the activation dtype
+ * before the product. Only the supplied query slice is changed; keys and values stay intact. */
+int ref_position_scale(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pos = &a->t[1];
+    // M in the resolved geometry is a capacity band; issued views carry the active rows.
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t n = p_int(a, "n", 0), orig = p_int(a, "original", 0);
+    const float beta = p_f32(a, "beta", -1);
+    if (M <= 0 || M > p_int(a, "M", 0) || n <= 0 || orig <= 0 || !std::isfinite(beta) || beta < 0 ||
+        x->rank != 2 || x->shape[0] < M || x->shape[1] != n || pos->rank != 1 || numel(pos) < M)
+        return RAD_E_SHAPE;
+    if (pos->dtype != RAD_I32 || (x->dtype != RAD_BF16 && x->dtype != RAD_F32)) return RAD_E_DTYPE;
+    /* Validate all positions before writing: an invalid batch must not leave a partial result. */
+    for (int64_t r = 0; r < M; ++r)
+        if (ld_int(pos->dtype, pos->data, offlin(pos, r)) < 0) return RAD_E_INVAL;
+    REF_PAR_FOR(M * n)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t p = ld_int(pos->dtype, pos->data, offlin(pos, r));
+        const float scale = round_dt(x->dtype, 1.0f + beta * std::log(1.0f + (float)(p / orig)));
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t at = rowoff(x, r, n) + j * laststride(x);
+            stt(x, at, ldt(x, at) * scale);
+        }
+    }
+    return RAD_OK;
+}
 
 int ref_rope(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;

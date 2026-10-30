@@ -1,5 +1,6 @@
 /* checkpoint.cpp -- see checkpoint.h. */
 #include "checkpoint.h"
+#include "ggml_planes.h"
 #include "rad_plugin.h"
 
 #include <nlohmann/json.hpp>
@@ -236,8 +237,8 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
 
     RadModelMeta& m = out->m;
     /* Nomic BERT states its geometry with n_layer, n_embd, n_head, n_inner, n_positions and
-     * moe_top_k. They are fallbacks in the same chain, so a config carrying both spellings keeps
-     * the HuggingFace one and every existing checkpoint reads byte for byte as before. */
+     * moe_top_k. They are the last fallbacks in each chain, so a config carrying both spellings
+     * reads the HuggingFace one. */
     m.n_layers    = gi("num_hidden_layers", gi("n_layer", 0));
     m.n_embd      = gi("hidden_size", gi("n_embd", 0));
     m.n_head      = gi("num_attention_heads", gi("n_head", 0));
@@ -273,18 +274,21 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
 
 /* The quantisation descriptor, which with the architecture selects the plugin (spec §2.4): the
  * quant_method plus its fmt ("fp8_e4m3"), so the checkpoint, not a flag, distinguishes fp8 from
- * bf16 releases.
+ * bf16 releases. transformers' fine-grained FP8 states no fmt (Qwen3.8-Flash-Next-FP8's config)
+ * and is always E4M3, so a bare "fp8" is "fp8_e4m3", as a release that states it is.
  *
- * A Gemma 4 E2B/E4B checkpoint states no quantization_config: it is the bf16 release that
- * arch/gemma4_bf16 serves as compressed-tensors, which is what rad-convert's
- * `--set quantization_config.quant_method=compressed-tensors` said by hand. Its per-layer
- * embeddings or shared KV layers name the E form; arch/gemma4 serves only the 26B-A4B/31B shape
- * and refuses those two keys, so the bare (gemma4, "") descriptor must not win. */
+ * A Gemma 4 E2B/E4B checkpoint states no quantization_config: it is a bf16 release that
+ * arch/gemma4_bf16 serves under "compressed-tensors", so it needs no
+ * `--set quantization_config.quant_method=compressed-tensors`. Its per-layer embeddings or shared
+ * KV layers name the E form; arch/gemma4 serves only the 26B-A4B/31B shape and refuses those two
+ * keys, so the bare (gemma4, "") descriptor must not win. */
 std::string quant_descriptor(const MetaOwn& m) {
     std::string q;
     if (const char* qm = m.get("quantization_config.quant_method")) {
         q = qm;
-        if (const char* fm = m.get("quantization_config.fmt")) { q += "_"; q += fm; }
+        const char* fm = m.get("quantization_config.fmt");
+        if (!fm && q == "fp8") fm = "e4m3";
+        if (fm) { q += "_"; q += fm; }
         return q;
     }
     if (m.arch == "gemma4") {
@@ -2400,6 +2404,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
      *   RAD_MAP_COPY     alternatives, first present wins (a tied lm_head is output.weight when
      *                    shipped, else the embedding). */
     const bool alternatives = maps.front()->mode == RAD_MAP_COPY && srcs.size() > 1;
+    /* Pieces whose scale is one `X.weight_scale` their shards share (below). */
+    bool shard_scaled = false;
     for (const Src1& s1 : srcs) {
         const SrcTensor* st = ck.find(s1.name);
         /* An FP8 weight's scale plane: `X.weight_scale_inv` (block-scaled releases) or
@@ -2409,6 +2415,17 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         const SrcTensor* sc = st ? ck.find(std::string(s1.name) + "_scale_inv") : nullptr;
         if (!sc && st && (st->rad_dtype == RAD_F8E4M3 || st->rad_dtype == RAD_F8E5M2))
             sc = ck.find(std::string(s1.name) + "_scale");
+        /* A table split into shards, `X.shard_<i>.weight`, under one scale for all of them,
+         * `X.weight_scale` (Qwen3.8-Flash-Next-FP8's n-gram table). */
+        if (!sc && st && (st->rad_dtype == RAD_F8E4M3 || st->rad_dtype == RAD_F8E5M2)) {
+            const std::string n = s1.name;
+            const size_t at = n.rfind(".shard_");
+            const size_t end = n.size() >= 7 ? n.size() - 7 : 0;
+            if (at != std::string::npos && end > at + 7 && n.compare(end, 7, ".weight") == 0 &&
+                std::all_of(n.begin() + (long)at + 7, n.begin() + (long)end,
+                            [](char c) { return c >= '0' && c <= '9'; }))
+                if ((sc = ck.find(n.substr(0, at) + ".weight_scale"))) shard_scaled = true;
+        }
         /* A weight shipped in an imported form is read through that form's views. */
         {
             const SrcTensor *ic = nullptr, *is = nullptr;
@@ -2499,6 +2516,26 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (dt == RAD_DT_INVALID) {
         out->why = std::string("'") + p0.name + "' is a GGUF " +
                    (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
+        /* Q8_0, Q4_K and Q6_K become their planes when every piece is of that type and they join
+         * along rows, so each row of the weight is one source row of blocks. rad-convert imports
+         * them; the loader refuses them, since the blocks interleave what the planes hold apart. */
+        bool one_type = true;
+        for (const SrcTensor* pk : out->pieces) one_type = one_type && pk->ggml == p0.ggml;
+        RadEncoding enc;
+        if (!one_type) {
+            out->why = "its GGUF pieces are of different block types";
+        } else if (ggml_plane_encoding(p0.ggml, &enc)) {
+            if (out->pieces.size() > 1 && (d != 0 || out->rank < 2)) {
+                out->why = "its GGUF pieces are joined along a column, across their blocks";
+            } else {
+                out->imported = true;
+                out->ggml_blocks = true;
+                out->enc = enc;
+                out->why = std::string("it is a GGUF ") + gguf_dtype(p0.ggml)->name +
+                           " tensor, which rad-convert imports as its planes -- serve the "
+                           "container it writes";
+            }
+        }
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
     } else if (p0.pbits) {
@@ -2672,7 +2709,18 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             bad = true;
             out->why = "its FP8 pieces are joined along a column, across their scale planes";
         }
-        if (!bad) {
+        /* Shards under the one scale they share are one tensor with one scale, byte for byte:
+         * `fp8_e4m3*<s>[*x*]`. */
+        bool one_scale = !bad && shard_scaled && n_one == (int)out->pieces.size();
+        for (size_t k = 1; one_scale && k < out->scales.size(); ++k)
+            one_scale = out->scales[k] == out->scales[0];
+        if (one_scale) {
+            out->trivial = out->why.empty();
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", sdt, 0, 0);
+        } else if (!bad) {
             out->trivial = out->why.empty() && n_one == 0;
             /* A per-tensor scale is written once a row (ckpt_plane_rows). */
             if (n_one) {
@@ -3392,6 +3440,31 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
                 }
             }
             base += N;
+        }
+        return RAD_OK;
+    }
+    if (w.ggml_blocks) {
+        /* GGUF blocks, split one row at a time into every plane's row: a call pays the whole row
+         * for the one plane it keeps, and rad-convert asks plane by plane. */
+        int64_t at[RAD_ENC_MAX_PLANES + 1] = { 0 };
+        for (int i = 0; i < w.enc.n_planes; ++i) {
+            int64_t qr = 0, qc = 0;
+            rad_enc_plane_dims(&w.enc.plane[i], 1, w.cols, &qr, &qc);
+            at[i + 1] = at[i] + rad_enc_row_bytes(w.enc.plane[i].dtype, qc);
+        }
+        std::vector<uint8_t> split((size_t)at[w.enc.n_planes]);
+        uint8_t* row[RAD_ENC_MAX_PLANES] = { nullptr };
+        for (int i = 0; i < w.enc.n_planes; ++i) row[i] = split.data() + at[i];
+        int64_t base = 0;
+        for (const SrcTensor* piece : w.pieces) {
+            const int64_t prows = piece->numel() / w.cols, rb = piece->bytes / prows;
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + prows); ++r) {
+                ggml_plane_row(piece->ggml, (const uint8_t*)piece->data + (r - base) * rb, w.cols,
+                               row);
+                std::memcpy(o, row[k], (size_t)(at[k + 1] - at[k]));
+                o += at[k + 1] - at[k];
+            }
+            base += prows;
         }
         return RAD_OK;
     }

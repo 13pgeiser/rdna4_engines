@@ -20,6 +20,7 @@
 // and their results are never stored.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
+#include "r4d_bf16_gemm_rows.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
@@ -173,7 +174,7 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
 enum { kBtLargeGrid = 32 };
 
 int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
-  const long long g = (long long)((N + 127) / 128) * ((M + 127) / 128);
+  const long long g = ((N + 127ll) / 128) * ((M + 127ll) / 128);
   return g >= kBtLargeGrid ? 1 : 2;
 }
 
@@ -181,23 +182,40 @@ int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
 int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
                            long stream) {
   if (M < 1 || N < 1 || K < BT_BK || K % BT_BK) return -1;
-  if (SK < 1 || K % (SK * 16)) return -1;
+  if (SK < 1 || K % ((int64_t)SK * 16)) return -1;
   if (tile != 1 && tile != 2) return -1;
-  // 32-bit element offsets: the last row of either operand has to be addressable.
-  if ((long long)M * K >= (1ll << 32) || (long long)N * K >= (1ll << 32)) return -1;
   const int spk = K / SK / 16;
   const int bt = tile == 1 ? 128 : 64;
-  dim3 grid((N + bt - 1) / bt, (M + bt - 1) / bt), block(256);
-  auto Ap = (const unsigned short*)a; auto Wp = (const unsigned short*)w;
-  auto Cp = (__hip_bfloat16*)c;
+  const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, bt, bt);
+  if (!chunk) return -1;
+  dim3 block(256);
+  auto Wp = (const unsigned short*)w;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(TM, TN, S) hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S>), grid, \
-                                             block, 0, st, Ap, Wp, Cp, M, K, N, spk)
+#define LAUNCH(TM, TN, S)                                                                          \
+  hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S>), grid, block, 0, st, Ap, Wp, Cp,   \
+                     mm, K, N, spk)
   const bool split = SK > 1;
-  if (tile == 1) { if (split) LAUNCH(4, 2, true); else LAUNCH(4, 2, false); }
-  else           { if (split) LAUNCH(2, 1, true); else LAUNCH(2, 1, false); }
+  for (int64_t m0 = 0; m0 < M; m0 += chunk) {
+    const int mm = (int)std::min<int64_t>(chunk, M - m0);
+    dim3 grid((N + bt - 1) / bt, (mm + bt - 1) / bt);
+    auto Ap = (const unsigned short*)a + m0 * K;
+    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    if (tile == 1) {
+      if (split)
+        LAUNCH(4, 2, true);
+      else
+        LAUNCH(4, 2, false);
+    } else {
+      if (split)
+        LAUNCH(2, 1, true);
+      else
+        LAUNCH(2, 1, false);
+    }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return (int)e;
+  }
 #undef LAUNCH
-  return (int)hipGetLastError();
+  return 0;
 }
 
 // ============================================================== the plugin ABI entry point
@@ -205,6 +223,7 @@ extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
   int rc = gemm_ops(a, &g, 0);
   if (rc != RAD_OK) return rc;
+  if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 64, 64)) return R4D_NO(RAD_E_SHAPE);
   // The skinny row's split rule with the same arguments keeps the two rows' outputs identical.
   Cfg c;
   rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);

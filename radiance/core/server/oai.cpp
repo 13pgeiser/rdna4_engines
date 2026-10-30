@@ -3,6 +3,7 @@
 #include "json_partial.h"
 #include "rad_internal.h"
 #include "mm/processor.h"
+#include "server/nemotron35.h"
 
 #include <nlohmann/json.hpp>
 
@@ -163,7 +164,11 @@ std::string ApiError::dump() const {
     if (n_ctx >= 0) e["n_ctx"] = n_ctx;
     json o;
     o["error"] = e;
-    return o.dump();
+    /* A message can carry raw request text (a URL-decoded label, an echoed field name): dump
+     * must survive invalid UTF-8 by replacing it rather than throwing and turning a 404 into
+     * a 500. The JSON parsers refuse invalid UTF-8 in bodies, but URL-decoded params do not
+     * pass through one. */
+    return o.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 ApiError err_bad(const std::string& param, const std::string& why) {
@@ -431,13 +436,16 @@ std::string str_or(const json& o, const char* k, const std::string& def = std::s
 }
 
 /* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
- * because the label is serialised into JSON. */
+ * because the label is serialised into JSON. Control bytes are dropped at the door: the label
+ * is logged on release and shown on the dashboard, and an embedded ESC sequence would drive
+ * whatever terminal renders it. */
 std::string session_label_of(const std::string& s) {
+    std::string t = log_sanitize(s);
     constexpr size_t kMax = 128;
-    if (s.size() <= kMax) return s;
+    if (t.size() <= kMax) return t;
     size_t cut = kMax;
-    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
-    return s.substr(0, cut);
+    while (cut > 0 && ((unsigned char)t[cut] & 0xC0) == 0x80) --cut;
+    return t.substr(0, cut);
 }
 
 /* One field under several spellings (OpenAI's, vLLM's, llama.cpp's), read as a number (double)
@@ -1053,8 +1061,11 @@ void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
     if (lim.reasoning_effort_map.empty()) return;
     auto it = opt->template_kwargs.find("reasoning_effort");
     if (it == opt->template_kwargs.end()) return;
-    const json v = json::parse(it->second, nullptr, false);
-    if (!v.is_string()) return;
+    /* The kwarg is client text re-parsed as JSON: bound it like a body, a string of brackets
+     * would overflow this worker's stack when the tree comes down. */
+    bool over = false, deep = false;
+    const json v = parse_json_bounded(it->second, 0, &over, &deep);
+    if (over || deep || !v.is_string()) return;
     auto m = lim.reasoning_effort_map.find(v.get<std::string>());
     if (m == lim.reasoning_effort_map.end()) return;
     if (m->second == "none" || m->second == "minimal") {
@@ -1071,9 +1082,11 @@ ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, in
      * variable was in the render. The set is more actionable than the template's traceback. */
     auto it = opt.template_kwargs.find("reasoning_effort");
     if (it != opt.template_kwargs.end() && !lim.reasoning_efforts.empty()) {
-        const json v = json::parse(it->second, nullptr, false);
+        bool over = false, deep = false;
+        const json v = parse_json_bounded(it->second, 0, &over, &deep);
         const std::vector<std::string>& set = lim.reasoning_efforts;
-        if (v.is_string() && std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
+        if (!over && !deep && v.is_string() &&
+            std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
             std::string list;
             for (size_t i = 0; i < set.size(); ++i)
                 list += (i ? (i + 1 == set.size() ? " and " : ", ") : "") + ("'" + set[i] + "'");
@@ -2374,6 +2387,80 @@ static int embedding_input(const std::string& text,
     return RAD_OK;
 }
 
+/* Keep model-owned image blocks typed: sending an internal sentinel through this template
+ * turns it into escaped user text. Adjacent text is joined before tokenization, preserving BPE
+ * boundaries, and no implicit BOS/EOS is added to the retrieval template's output. */
+static int nemotron35_embedding_input(const json& messages, const OaiDeps& d, const OaiLimits& lim,
+                                      int32_t image_tokens, const char* field, OaiRequest* out,
+                                      ApiError* err) {
+    std::vector<Nemotron35Piece> pieces;
+    std::string why;
+    if (nemotron35_format(messages, &pieces, &why) < 0) {
+        *err = err_bad(field, why);
+        return RAD_E_INVAL;
+    }
+    size_t n_images = 0;
+    for (const auto& piece : pieces)
+        n_images += piece.image ? 1 : 0;
+    PromptInput p;
+    auto media = std::make_shared<mm::PromptMedia>();
+    for (const auto& piece : pieces) {
+        if (!piece.image) {
+            p.text += piece.text;
+            const auto ids = d.tok->encode(piece.text, false, /*parse_special=*/true);
+            p.tokens.insert(p.tokens.end(), ids.begin(), ids.end());
+            continue;
+        }
+        MediaKind kind;
+        std::vector<uint8_t> bytes;
+        std::string type = piece.content["type"].get<std::string>();
+        if (type == "image")
+            type = "image_url"; // template spelling; transport still requires a data URL
+        const char* part_field =
+            !std::strcmp(field, "messages") ? "messages[].content[]" : "input[]";
+        const int rc = read_media_part(piece.content, type, part_field, d, lim, &kind, &bytes, err);
+        if (rc < 0) return rc;
+        if (rc == 0 || kind != MediaKind::Image) {
+            *err = err_bad(part_field,
+                           "Nemotron retrieval inputs support only text and image data URLs");
+            return RAD_E_INVAL;
+        }
+        MediaOpts opts;
+        opts.image_tokens = image_tokens;
+        opts.several_pictures = n_images > 1;
+        std::shared_ptr<mm::Item> item;
+        const int status = d.mm->prepare(kind, bytes, opts, &item, &why);
+        if (status < 0 || !item) {
+            *err = err_bad(part_field, "the image could not be used: " +
+                                           (why.empty() ? std::string(rad_strerror(status)) : why));
+            return status < 0 ? status : RAD_E_INVAL;
+        }
+        p.text += "[IMG]";
+        mm::Placed pl;
+        pl.item = std::move(item);
+        pl.tok = (int32_t)p.tokens.size();
+        p.tokens.insert(p.tokens.end(), pl.item->expand.begin(), pl.item->expand.end());
+        media->items.push_back(std::move(pl));
+    }
+    if (!media->items.empty()) {
+        media->layout();
+        p.media = std::move(media);
+    }
+    out->prompts.push_back(std::move(p));
+    return RAD_OK;
+}
+
+int check_embedding_template(const IEmbedder* embed, bool overridden, std::string* why) {
+    if (overridden && embed && nemotron35_retrieval_meta(embed->metadata())) {
+        if (why)
+            *why = "Nemotron 3.5 uses its reference retrieval formatter; "
+                   "--override-chat-template is not supported for this model. "
+                   "Use a system prefix or prompt_name.";
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+}
+
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err) {
     json b;
@@ -2438,6 +2525,41 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         }
     }
 
+    const bool nemotron35 =
+        d.embed && nemotron35_retrieval_meta(d.embed->metadata());
+    auto finish_inputs = [&]() -> int {
+        int64_t cap = lim.max_ctx;
+        if (nemotron35) {
+            cap = cap > 0 ? std::min<int64_t>(cap, 32768) : 32768;
+            if (d.embed->max_input() > 0) cap = std::min(cap, d.embed->max_input());
+        }
+        for (size_t i = 0; i < out->prompts.size(); ++i) {
+            const int64_t n = (int64_t)out->prompts[i].tokens.size();
+            if (n == 0) {
+                *err = err_bad("input", "tokenised to nothing");
+                return RAD_E_INVAL;
+            }
+            if (cap > 0 && n > cap) {
+                *err = err_bad("input",
+                               "input " + std::to_string(i) + " is " + std::to_string(n) +
+                                   (nemotron35 ? " tokens, more than the embedding input limit of "
+                                               : " tokens, more than the model context of ") +
+                                   std::to_string(cap));
+                err->code = "context_length_exceeded";
+                err->n_prompt_tokens = n;
+                err->n_ctx = cap;
+                return RAD_E_INVAL;
+            }
+        }
+        return RAD_OK;
+    };
+    auto retrieval = [&](const json& content) -> int {
+        json messages = json::array();
+        if (!prefix.empty()) messages.push_back({{"role", "system"}, {"content", prefix}});
+        messages.push_back({{"role", "user"}, {"content", content}});
+        return nemotron35_embedding_input(messages, d, lim, out->image_tokens, "input", out, err);
+    };
+
     /* vLLM's chat embedding (`messages`): one input rendered by the model's chat template
      * (EmbeddingGemma 2's concatenates the system text, then each message's text and media
      * placeholders), with the tokenizer's special tokens around the whole. */
@@ -2450,6 +2572,11 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
             *err = err_bad("prompt_name", "a `messages` input is rendered by the chat template "
                                           "and takes no prompt");
             return RAD_E_INVAL;
+        }
+        if (nemotron35) {
+            RAD_TRY(nemotron35_embedding_input(b.at("messages"), d, lim, out->image_tokens,
+                                               "messages", out, err));
+            return finish_inputs();
         }
         IChatTemplate* tpl = d.embed ? d.embed->message_template() : nullptr;
         if (!tpl) {
@@ -2488,6 +2615,7 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
     };
     /* Control tokens are parsed as for a /v1/completions prompt: no template wraps the input. */
     auto push_text = [&](const std::string& s) {
+        if (nemotron35) return retrieval(s);
         std::vector<std::pair<MediaKind, std::vector<uint8_t>>> none;
         return embedding_input(prefix + s, none, d, out->image_tokens, out, err);
     };
@@ -2497,6 +2625,7 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
      * tokenizer's special tokens go around the whole, matching what HuggingFace's processor feeds
      * the model (EmbeddingGemma 2's template concatenates text and placeholders). */
     auto push_parts = [&](const json& parts, ApiError* e) -> int {
+        if (nemotron35) return retrieval(parts);
         std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
         std::string rendered = prefix;
         for (const auto& part : parts) {
@@ -2569,20 +2698,7 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_INVAL;
     }
 
-    for (size_t i = 0; i < out->prompts.size(); ++i) {
-        const int64_t n = (int64_t)out->prompts[i].tokens.size();
-        if (n == 0) { *err = err_bad("input", "tokenised to nothing"); return RAD_E_INVAL; }
-        if (lim.max_ctx > 0 && n > lim.max_ctx) {
-            *err = err_bad("input", "input " + std::to_string(i) + " is " + std::to_string(n) +
-                                        " tokens, more than the model context of " +
-                                        std::to_string(lim.max_ctx));
-            err->code = "context_length_exceeded";
-            err->n_prompt_tokens = n;
-            err->n_ctx = lim.max_ctx;
-            return RAD_E_INVAL;
-        }
-    }
-    return RAD_OK;
+    return finish_inputs();
 }
 
 /* ================================================================== responses */
@@ -3782,7 +3898,7 @@ std::string anthropic_error_body(const ApiError& e) {
     json o;
     o["type"] = "error";
     o["error"] = json{ { "type", anthropic_error_type(e.status) }, { "message", e.message } };
-    return o.dump();
+    return o.dump(-1, ' ', false, json::error_handler_t::replace);  /* see ApiError::dump */
 }
 
 AnthropicStream::AnthropicStream(const OaiRequest& r, int index, const IReplyParser* parser)

@@ -1,0 +1,67 @@
+{# nemo-mistral-retrieval-v1
+   Derived from the Mistral Ministral-3 instruct chat template render_content
+   macro and its image-before-text canonicalization. Retrieval adaptation:
+   system content is the retrieval prefix; generation wrappers and BOS/EOS are
+   deliberately omitted so message inference matches training token for token.
+#}
+{%- macro mark_user_text(text) -%}
+{{- text | replace("[", "[‌") | replace("<", "<‌") -}}
+{%- endmacro -%}
+{%- macro render_text_content(content, context_name) -%}
+{%- if content is string -%}
+    {{- content -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ "\n\n" }}{% endif -%}
+            {{- block["text"] -}}
+            {%- set ns.has_output = true -%}
+        {%- else -%}
+            {{- raise_exception(context_name + " may contain only text blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception(context_name + " must be a string or a list of text blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_user_content(content) -%}
+{%- if content is string -%}
+    {{- mark_user_text(content) -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] in ["image", "image_url"] -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- "[IMG]" -}}
+            {%- set ns.has_output = true -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- mark_user_text(block["text"]) -}}
+            {%- set ns.has_output = true -%}
+        {%- elif block["type"] not in ["image", "image_url"] -%}
+            {{- raise_exception("User content supports only text and image blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception("User content must be a string or a list of text and image blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- if not ((messages | length == 1 and messages[0]["role"] == "user")
+    or (messages | length == 2
+        and messages[0]["role"] == "system"
+        and messages[1]["role"] == "user")) -%}
+    {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
+{%- endif -%}
+{# Iterate messages so vLLM can trace message.content into the rendering macros. #}
+{%- for message in messages -%}
+    {%- if message["role"] == "system" -%}
+        {%- set prefix = render_text_content(message["content"], "System content") -%}
+        {{- prefix.rstrip(" ") ~ " " -}}
+    {%- else -%}
+        {{- render_user_content(message["content"]) -}}
+    {%- endif -%}
+{%- endfor -%}

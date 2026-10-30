@@ -38,6 +38,30 @@ int64_t prefill_shared_tok(const Config& cfg) {
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
 }
 
+/* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.
+ * Only the trunk's window makes a model take window snapshots; a block drafter's rides in them
+ * where they exist (KVManager::set_drafter_window_snapshot) and is recomputed by draft refill
+ * where they do not. A RAD_KV_RING group has no snapshot at all
+ * (KVManager::declare_runtime_window): its window is each sequence's own prompt length, which no
+ * slot could describe, so it is sized for the context plus a ring and is never checkpointed. */
+static void restored_state(const Program& prog, bool* linear, bool* window) {
+    *linear = *window = false;
+    for (const KVGroupInfo& kg : prog.kv_groups) {
+        if (kg.decl.kind != RAD_KV_FULL && kg.decl.kind != RAD_KV_WINDOW &&
+            kg.decl.kind != RAD_KV_RING)
+            *linear = true;
+        else if (kg.decl.kind == RAD_KV_WINDOW && kg.block_size > 0 && !kg.layers.empty() &&
+                 !kg.drafter)
+            *window = true;
+    }
+}
+
+bool window_snapshots(const Program& prog, const Config& cfg) {
+    bool linear = false, window = false;
+    restored_state(prog, &linear, &window);
+    return !linear && window && cfg.prefix_cache && cfg.checkpoint_interval > 0;
+}
+
 int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out) {
     if (!out) return RAD_E_INVAL;
     ChunkGeometry g;
@@ -46,22 +70,12 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     /* lcm across every paged group. libr4d uses 16 for all of them, but a sliding-window group
      * served by a different kernel may differ (§7.2). */
     bool has_linear = false, has_window = false;
+    restored_state(prog, &has_linear, &has_window);
     for (const KVGroupInfo& kg : prog.kv_groups) {
-        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
-            kg.decl.kind == RAD_KV_RING) {
-            if (kg.block_size > 0) {
-                g.attn_block = lcm64(g.attn_block, kg.block_size);
-                note(g.why, "attn_block", kg.block_size, kg.name.c_str());
-                /* A drafter's window is recomputed by draft refill; only the trunk's needs a
-                 * snapshot for a prefix hit to resume. A RAD_KV_RING group has no snapshot at all
-                 * (KVManager::declare_runtime_window): its window is each sequence's own prompt
-                 * length, which no slot could describe, so it is sized for the context plus a ring
-                 * and is never checkpointed. */
-                if (kg.decl.kind == RAD_KV_WINDOW && !kg.layers.empty() && !kg.drafter)
-                    has_window = true;
-            }
-        } else {
-            has_linear = true;
+        if ((kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
+             kg.decl.kind == RAD_KV_RING) && kg.block_size > 0) {
+            g.attn_block = lcm64(g.attn_block, kg.block_size);
+            note(g.why, "attn_block", kg.block_size, kg.name.c_str());
         }
     }
 
@@ -143,14 +157,48 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * checkpoints land wherever a step ends (§7.3). */
     g.min_max_tok = g.quantum;
 
-    *out = g;
-
     if (cfg.max_tok < g.min_max_tok) {
+        *out = g;
         RAD_ERR("--max-num-batched-tokens is %lld but this model's chunk geometry needs at least "
                 "%lld, so a chunk can end on a linear-state boundary: %s",
                 (long long)cfg.max_tok, (long long)g.min_max_tok, g.why.c_str());
         return RAD_E_INVAL;
     }
+
+    /* The resume grid (--prefix-resume exact): where an idle server's prefill chunks start. A
+     * prefill alone in its step takes the budget, rounded down to the quantum. Where chunks split
+     * at the interval (linear state, or periodic window snapshots) it stops at every interval
+     * boundary it reaches, and a span carries h intervals from the second one on. An interval past
+     * the budget must be a multiple of the budget's chunk, or the chunk after a checkpoint would
+     * start off the cold run's grid; it is rounded up, as the quantum rounds it, since a longer
+     * interval costs only retention. */
+    const int64_t I0 = g.checkpoint_interval;
+    const bool splits = I0 > 0 && (!g.window_ckpt || g.window_periodic);
+    const int64_t budget_chunk = cfg.max_tok / g.quantum * g.quantum;
+    g.exact = cfg.prefix_exact && cfg.prefix_cache;
+    if (g.exact && splits && I0 > budget_chunk && I0 % budget_chunk != 0) {
+        g.checkpoint_interval = align_up(I0, budget_chunk);
+        RAD_WARN("--checkpoint-interval %lld resolves to %lld: --prefix-resume exact needs it a "
+                 "multiple of the %lld-token prefill chunk (--max-num-batched-tokens %lld) so "
+                 "every checkpoint is where a cold prefill's chunk ends; give a multiple of %lld, "
+                 "or --prefix-resume nearest to keep %lld", (long long)cfg.checkpoint_interval,
+                 (long long)g.checkpoint_interval, (long long)budget_chunk, (long long)cfg.max_tok,
+                 (long long)budget_chunk, (long long)I0);
+    }
+    if (g.exact) {
+        const int64_t I = g.checkpoint_interval;
+        if (splits && I <= budget_chunk) {
+            const int64_t h = g.span > 1 ? std::max<int64_t>(1, std::min(g.span, cfg.max_tok / I))
+                                         : 1;
+            g.grid = h * I;
+            g.grid_origin = h > 1 ? I : 0;
+        } else {
+            g.grid = budget_chunk;
+            g.grid_origin = 0;
+        }
+    }
+
+    *out = g;
 
     /* Log the effective chunk length. `plan_chunk` splits at the checkpoint interval first, so
      * when the interval is below --max-num-batched-tokens, raising the budget does not change the
@@ -167,6 +215,13 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
              eff >= cfg.max_tok ? ""
              : g.span > 1 ? " (the checkpoint interval times the span, not the budget)"
                           : " (the checkpoint interval, not the budget)");
+    if (g.exact)
+        RAD_INFO("prefix resume: exact -- a hit resumes only where an idle server's cold prefill "
+                 "of the same prompt starts a chunk (every %lld tokens%s) and a prompt's tail "
+                 "snapshot is taken where its last chunk starts, so the hit recomputes the cold "
+                 "run's own chunks and answers bit-identically; a turn re-prefills up to one chunk "
+                 "more than --prefix-resume nearest", (long long)g.grid,
+                 g.grid_origin > 0 ? fmt(" from %lld", (long long)g.grid_origin).c_str() : "");
     if (cfg.prefill_span > 1) {
         /* What the span does here, said once: the intervals the budget holds can be fewer than
          * the flag asks for, and a model without an interval grid spans nothing. */

@@ -122,6 +122,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
+    o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
+    o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
@@ -139,6 +141,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
          d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
     o.preemptions = m.preemptions;
+    o.preempt_forced = m.preempt_forced;
     o.total_requests = m.admitted;
     o.steps = m.steps;
     o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
