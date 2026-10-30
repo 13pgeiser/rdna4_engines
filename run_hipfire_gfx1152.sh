@@ -58,6 +58,7 @@ esac
 # parallel arrays, one entry per model, indexed together:
 #   TAGS  - registry tag (`hipfire serve`/`pull` take this)
 #   FILES - main model file under /models/hipfire (present = pulled)
+#   EXTRAS- extra serve args for this model
 TAGS=(
       "qwen3.5:9b"
       "qwen3.5:4b"
@@ -67,6 +68,14 @@ FILES=(
       "qwen3.5-9b.mq4"
       "qwen3.5-4b.mq4"
       "qwen3.8-27b.mq4-xts"
+)
+EXTRAS=(
+      ""
+      ""
+      "--spec off"         # the registry auto-arms DFlash for the 27B (paired draft pulled),
+                           # but its batched lm_head verify (MQ4G256V2 qt44) is not validated
+                           # on gfx1152; every request 400s with that admission error.
+                           # AR decode is unaffected and is the supported route here.
 )
 
 resolve_tag() {    # $1 -> model index on stdout; rc!=0 if no unique match
@@ -103,7 +112,8 @@ else
 fi
 TAG="${TAGS[$IDX]}"
 FILE="${FILES[$IDX]}"
-echo "serving $TAG"
+EXTRA_FLAGS="${EXTRAS[$IDX]}"
+echo "serving $TAG with EXTRA_FLAGS=$EXTRA_FLAGS"
 
 # -------------------------------
 # docker image (build only if missing)
@@ -141,5 +151,5 @@ docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_
 # run (no power cap: APU, not the discrete R9700)
 # -------------------------------
 docker rm -f hipfire_server
-docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931
+docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" serve "$TAG" 0.0.0.0:9931 $EXTRA_FLAGS
 #docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" -v "$MODELS_DIR":"$HIPFIRE_HOME_DIR/models" -v hipfire-kcache:/var/cache/hipfire -e HIPFIRE_NGRAM_STORAGE=system -e HIPFIRE_VISION_MODE=off "$IMAGE" run "$TAG" "Explain FFT in one line"
