@@ -96,7 +96,9 @@ TEST(refuses_unimplemented_variants) {
                               std::pair{"gate_attn_act_mode", "silu"},
                               std::pair{"hidden_act", "silu"},
                               std::pair{"attention_bias", "1"},
+                              std::pair{"mlp_bias", "1"},
                               std::pair{"layer_types", "sliding_attention"},
+                              std::pair{"rope_parameters.full_attention.rope_type", "dynamic"},
                               std::pair{"rope_parameters.full_attention.partial_rotary_factor", "0.3"}}) {
         MetaKV k = spark_meta();
         k.set(change.first, change.second);
@@ -104,6 +106,10 @@ TEST(refuses_unimplemented_variants) {
         CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) != RAD_OK);
     }
     MetaKV k = spark_meta();
+    k.set("rope_scaling.rope_type", "linear").set("rope_scaling.factor", "2");
+    RadBuilder scaled;
+    CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&scaled, k.meta(), &ctx); }) == RAD_E_UNSUPPORTED);
+    k = spark_meta();
     RadBuilder b;
     ctx.world_size = 2;
     CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) == RAD_E_UNSUPPORTED);

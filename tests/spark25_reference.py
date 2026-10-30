@@ -3,7 +3,8 @@
 
 Requires torch, transformers and safetensors. It creates a tiny two-layer random checkpoint,
 converts and serves it on the host, then compares prefill and cached decode with the HF reference.
-No model weights are copied from the reference checkpoint, and no GPU is visible to either process.
+No model weights are copied from the reference checkpoint, and GPUs are hidden from both processes.
+ROCm may still open device nodes when probing; use a GPU-denying device cgroup on shared machines.
 """
 import argparse
 import importlib.util

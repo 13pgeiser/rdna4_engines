@@ -101,8 +101,10 @@ SPARK25_REFERENCE_TEMPLATE=/path/to/XHToken-Spark-X2.6-4B/chat_template.jinja \
 ```
 
 The first builds a small deterministic checkpoint and compares prefill, chunked prefill and cached
-decode against the reference without a GPU. The second also exercises the checkpoint's actual chat
-template, which is not redistributed in this tree.
+decode against the reference with GPUs hidden. ROCm may still open GPU device nodes while probing
+even with visibility masks; on a shared machine run the CPU comparison in a device cgroup that
+denies access to `/dev/kfd` and the GPU render nodes. The second also exercises the checkpoint's
+actual chat template, which is not redistributed in this tree.
 
 ---
 
