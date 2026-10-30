@@ -7,8 +7,10 @@ CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # - builds --target full: the slim runtime image has no hipcc, and gfx1152
 #   ships no prebuilt kernel pack, so runtime-only dies with "no usable
 #   cached kernel image exists ... hipcc is unavailable" (docs/CONTAINER.md).
-# - precompiles the exact-source gfx1152 registry pack (HIPFIRE_GPU_ARCHES)
-#   so the first request doesn't pay a full JIT; hipcc stays as fallback.
+# - no prebuilt kernel pack exists for gfx1152: the registry pack builder's
+#   SUPPORTED_ARCHES is gfx1201/gfx1100/gfx1151/gfx906/gfx942 (kernel_registry.rs:83)
+#   and refuses anything else. Kernels therefore JIT-compile via hipcc on
+#   first use and land in the hipfire-kcache volume; the first request is slow.
 # - writes NO power cap: the 210 W sysfs line targets the discrete R9700;
 #   capping the APU would throttle the whole SoC (CPU included).
 # - small models by default: gfx1152 is an 8-CU UMA iGPU drawing from
@@ -114,9 +116,7 @@ mkdir -p "$MODELS_DIR"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     (
 	cd "$CURDIR/hipfire" || exit
-	docker build -f Containerfile --target full \
-	    --build-arg HIPFIRE_GPU_ARCHES="gfx1152" \
-	    -t "$IMAGE" .
+	docker build --progress=plain -f Containerfile --target full -t "$IMAGE" .
     )
 else
     echo "image $IMAGE already present, skipping build"
