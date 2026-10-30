@@ -143,9 +143,14 @@ fi
 # default reasoning effort (persistent config)
 # -------------------------------
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
+# schema default idle_timeout is 300 s: benching over ssh easily outpaces it, and
+# the first request after an unload pays a ~10 s cold reload that blows client
+# timeouts (llm-bench's is compiled in; 0.3.1 has no timeout flag). 0 disables.
+IDLE_TIMEOUT_SECONDS="${IDLE_TIMEOUT_SECONDS:-3600}"
 HOME_VOLUME=hipfire-home
-echo "setting reasoning_effort=$REASONING_EFFORT in $HOME_VOLUME"
-docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT"
+echo "setting reasoning_effort=$REASONING_EFFORT, idle_timeout=$IDLE_TIMEOUT_SECONDS in $HOME_VOLUME"
+docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set reasoning_effort "$REASONING_EFFORT" \
+    && docker run --rm --device /dev/kfd --device /dev/dri -v "$HOME_VOLUME":"$HIPFIRE_HOME_DIR" "$IMAGE" config set idle_timeout "$IDLE_TIMEOUT_SECONDS"
 
 # -------------------------------
 # run (no power cap: APU, not the discrete R9700)
