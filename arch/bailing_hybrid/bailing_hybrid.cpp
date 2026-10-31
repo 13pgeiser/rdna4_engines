@@ -788,6 +788,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
 /* ============================== step ============================== */
 
+/* RADIANCE_LING_DUMP=DIR: the residual stream after each layer's attention and feed-forward, every
+ * row of every step, as `<DIR>/s<step>.t<rows>.l<layer>.<attn|ffn>.r<rank>.bf16` ([rows, n_embd]
+ * bf16). A diagnostic for comparing against a reference model layer by layer; it synchronises the
+ * stream. */
+static void dump(RadCtx* c, const RadBatch* batch, rad_buf x, int64_t E, int layer,
+                 const char* site) {
+    static const char* dir = std::getenv("RADIANCE_LING_DUMP");
+    if (!dir || !*dir) return;
+    const int64_t T = batch->n_tok;
+    void* p = rad_buf_ptr(c, x);
+    if (!p) return;
+    std::vector<uint16_t> h((size_t)(T * E));
+    if (rad_memcpy_async(h.data(), p, T * E * 2, rad_stream(c)) < 0) return;
+    rad_stream_sync(rad_stream(c));
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/s%d.t%lld.l%d.%s.r%d.bf16", dir, batch->step,
+                  (long long)T, layer, site, rad_rank(c));
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(h.data(), 2, h.size(), f);
+        std::fclose(f);
+    }
+}
+
 /* A draft pass as GLM-5.3's (glm5next.cpp): the head's inputs, its MLA layer over every row (a
  * history pass fills the draft layer's latent cache for all of them), then on the proposal rows the
  * residual join, the routed feed-forward and the head. */
@@ -828,10 +851,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
         else
             l.kda.step(c, batch);
         RAD_ISSUE_N(c, l.op_add, T, brows(m.x, T), brows(m.y, T), brows(m.x, T));
+        dump(c, batch, m.x, E, (int)i, "attn");
         if (l.dense)
             l.mlp.step(c, batch);
         else
             l.moe.step(c, batch);
+        dump(c, batch, m.x, E, (int)i, "ffn");
     }
     RAD_ISSUE_N(c, m.norm, T, brows(m.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
     if (batch->n_out > 0) {
