@@ -101,12 +101,14 @@ The FFN splits by channels, whole 128-column blocks where the width has them, an
 `[gate | up]` keeps both parts the same width. Every split dimension is covered exactly once at
 every world from 1 to 8, asserted in `spark25_arch_test`.
 
-Column-sharded outputs are partial sums, and the residual stream is f32, so the plugin reduces the
-*f32* delta rather than the bf16 projection output: one exact `all_reduce` over the widened rows
-after the embedding (whose ranks hold disjoint token rows) and two per layer, all issued on the
-residual's own buffer. The accumulation order then matches the single-card graph. libr4d serves
-that row at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a general
-`all_reduce` (libref), so a card deployment is limited to those worlds.
+Column-sharded projection outputs are partial sums. Each layer issues two exact bf16
+`all_reduce`s on the projection buffer, rounding the merged output to bf16 **before** widening it
+and adding it to the f32 residual. This preserves the reference's BF16 projection-output boundary
+without rounding away the residual's low bits. Sharding still changes the dot-product reduction
+order, so it does not promise bitwise parity with one card. The embedding uses one exact f32
+`all_reduce` over its widened, disjoint token rows. libr4d serves these collectives at 2, 3, 4 and 8
+ranks; other widths resolve only on a library with a general `all_reduce` (libref), so a card
+deployment is limited to those worlds.
 
 The initial implementation serves BF16 with tied embeddings, headwise sigmoid gates and the
 checkpoint's own rotary parameters. It does not implement DSpark, quantisation recipes, other gate

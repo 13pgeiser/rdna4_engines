@@ -256,15 +256,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_STR("from", "bf16"), RAD_STR("to", "f32")), RAD_NOWEIGHTS), {m.h}, {output});
     };
     m.widen = widen(m.x);
-    /* Reducing the widened projection outputs retains the f32 residual stream. The exact f32
-     * wire is also needed for the embedding, where only one vocabulary shard contributes. */
-    auto reduce = [&](rad_buf x) {
+    /* Embedding shards contribute disjoint rows, so their widened sum is exact. Projection
+     * shards must instead reduce in bf16, rounding the merged output before it is widened and
+     * added to the f32 residual, as in the reference's BF16 linear layers. */
+    auto reduce = [&](rad_buf x, const char* dtype) {
         if (g.world <= 1) return (rad_op)0;
         return rw(b, RAD_OP(b, "all_reduce", RAD_PARAMS(RAD_INT("world_size", g.world),
-            RAD_RANGE("numel", E, T * E), RAD_STR("dtype", "fp32"), RAD_INT("exact", 1)),
+            RAD_RANGE("numel", E, T * E), RAD_STR("dtype", dtype), RAD_INT("exact", 1)),
             RAD_NOWEIGHTS), {x}, {x});
     };
-    m.reduce_embed = reduce(m.x);
+    m.reduce_embed = reduce(m.x, "fp32");
 
     m.layers.resize((size_t)g.n_layer);
     for (int l = 0; l < g.n_layer; ++l) {
@@ -345,16 +346,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_INT("n", g.head_dim), RAD_STR("act", "none"), RAD_STR("dtype", "bf16")),
             RAD_NOWEIGHTS), {m.attn, m.gate}, {m.attn});
         a.op = gemm(E, Q, a.o, m.attn, m.h);
+        a.reduce_attn = reduce(m.h, "bf16");
         a.widen_attn = widen(m.delta);
-        a.reduce_attn = reduce(m.delta);
         a.add_attn = add();
         a.fnorm = norm(a.fn, m.x, m.h);
         a.gup = gemm(2 * F, E, a.gu, m.h, m.gu);
         a.act = rw(b, RAD_OP(b, "act_mul", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", F),
             RAD_STR("act", "gelu"), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.gu}, {m.ff});
         a.dp = gemm(E, F, a.down, m.ff, m.h);
+        a.reduce_ffn = reduce(m.h, "bf16");
         a.widen_ffn = widen(m.delta);
-        a.reduce_ffn = reduce(m.delta);
         a.add_ffn = add();
     }
     m.final_norm = norm(m.norm, m.x, m.h);
@@ -403,15 +404,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const RadOperand gates = RAD_P_T2(rad_buf_ptr(c, m.gate), RAD_BF16, T * g.n_head, 1);
         RAD_ISSUE_N(c, a.gate_heads, T * g.n_head, heads, gates, RAD_NONE, heads);
         RAD_ISSUE(c, a.op, brows(m.attn, T), RAD_W(a.o), brows(m.h, T));
+        if (a.reduce_attn) RAD_ISSUE_N(c, a.reduce_attn, T * g.n_embd, brows(m.h, T), RAD_NONE);
         RAD_ISSUE(c, a.widen_attn, brows(m.h, T), brows(m.delta, T));
-        if (a.reduce_attn) RAD_ISSUE_N(c, a.reduce_attn, T * g.n_embd, brows(m.delta, T), RAD_NONE);
         RAD_ISSUE(c, a.add_attn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
         RAD_ISSUE(c, a.fnorm, brows(m.x, T), RAD_W(a.fn), brows(m.h, T));
         RAD_ISSUE(c, a.gup, brows(m.h, T), RAD_W(a.gu), brows(m.gu, T));
         RAD_ISSUE(c, a.act, bcol(m.gu, 0, g.n_ff, T), bcol(m.gu, g.n_ff, g.n_ff, T), brows(m.ff, T));
         RAD_ISSUE(c, a.dp, brows(m.ff, T), RAD_W(a.down), brows(m.h, T));
+        if (a.reduce_ffn) RAD_ISSUE_N(c, a.reduce_ffn, T * g.n_embd, brows(m.h, T), RAD_NONE);
         RAD_ISSUE(c, a.widen_ffn, brows(m.h, T), brows(m.delta, T));
-        if (a.reduce_ffn) RAD_ISSUE_N(c, a.reduce_ffn, T * g.n_embd, brows(m.delta, T), RAD_NONE);
         RAD_ISSUE(c, a.add_ffn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
     }
     RAD_ISSUE(c, m.final_norm, brows(m.x, T), RAD_W(m.norm), brows(m.h, T));
