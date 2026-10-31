@@ -85,7 +85,30 @@ attention head's output is multiplied by its own sigmoid gate before the output 
 10000; full layers use 64 rotary dimensions at theta 5000000. Both use the full KV group, with the
 window applied by the local attention op, so prefix caching remains valid.
 
-The initial implementation serves BF16 at TP1, tied embeddings, headwise sigmoid gates and the
+## Tensor parallelism
+
+A rank's attention slice is whole GQA groups, so a world that does not divide 4 KV heads still
+shards cleanly: the three ranks of a 3-rank world take 2, 1 and 1 KV heads with the query heads
+that belong to them. Above the KV-head count the KV heads are replicated and one group's query
+heads are split between the ranks sharing its KV head, so every query head still attends the KV
+head the checkpoint gave it -- a rank's own `gqa` can then be smaller than the checkpoint's, while
+the KV cache it stores is a replica of its peer's. The gate and output projections take the
+matching row and column spans, and the tied embedding and lm_head take the contiguous vocabulary
+shard `rad_arch.h`'s `shard_begin` describes, because that is the split the sampler's candidate
+merge assumes.
+
+The FFN splits by channels, whole 128-column blocks where the width has them, and a rank's
+`[gate | up]` keeps both parts the same width. Every split dimension is covered exactly once at
+every world from 1 to 8, asserted in `spark25_arch_test`.
+
+Column-sharded outputs are partial sums, and the residual stream is f32, so the plugin reduces the
+*f32* delta rather than the bf16 projection output: one exact `all_reduce` over the widened rows
+after the embedding (whose ranks hold disjoint token rows) and two per layer, all issued on the
+residual's own buffer. The accumulation order then matches the single-card graph. libr4d serves
+that row at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a general
+`all_reduce` (libref), so a card deployment is limited to those worlds.
+
+The initial implementation serves BF16 with tied embeddings, headwise sigmoid gates and the
 checkpoint's own rotary parameters. It does not implement DSpark, quantisation recipes, other gate
 activations or rotary-scaling overrides. The tokenizer and its template come from the checkpoint;
 the architecture declares the `<think>`/`</think>` reasoning markers and the
@@ -96,15 +119,17 @@ For a CPU differential against the reference implementation's `configuration_spa
 
 ```sh
 python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build
+python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build --tp 3
 SPARK25_REFERENCE_TEMPLATE=/path/to/XHToken-Spark-X2.6-4B/chat_template.jinja \
   build/tests/spark25_chat_test
 ```
 
 The first builds a small deterministic checkpoint and compares prefill, chunked prefill and cached
-decode against the reference with GPUs hidden. ROCm may still open GPU device nodes while probing
-even with visibility masks; on a shared machine run the CPU comparison in a device cgroup that
-denies access to `/dev/kfd` and the GPU render nodes. The second also exercises the checkpoint's
-actual chat template, which is not redistributed in this tree.
+decode against the reference with GPUs hidden; `--tp` runs the same fixture over that many fake host
+ranks, which is how the sharding and the collectives are checked without cards. ROCm may still open
+GPU device nodes while probing even with visibility masks; on a shared machine run the CPU
+comparison in a device cgroup that denies access to `/dev/kfd` and the GPU render nodes. The last
+also exercises the checkpoint's actual chat template, which is not redistributed in this tree.
 
 ---
 

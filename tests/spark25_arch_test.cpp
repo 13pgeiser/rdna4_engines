@@ -89,6 +89,67 @@ TEST(prefill_and_decode_issue_a_liveness_safe_graph) {
     }
 }
 
+TEST(tensor_parallel_covers_heads_and_ffn_without_changing_gqa) {
+    for (int world = 1; world <= 8; ++world) {
+        std::vector<int> query_owners(16, 0), ffn_owners(10240, 0), vocab_owners(131072, 0);
+        for (int rank = 0; rank < world; ++rank) {
+            MetaKV k = spark_meta();
+            RadBuilder b;
+            RadBuildCtx ctx = build_ctx();
+            ctx.world_size = world;
+            ctx.rank = rank;
+            REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+            const auto& g = spark25_bf16::models[rank].g;
+            const RecWeight* q = find_w(b, "blk.0.attn_q.weight");
+            const RecWeight* key = find_w(b, "blk.0.attn_k.weight");
+            const RecWeight* gate = find_w(b, "blk.0.attn_gate.weight");
+            const RecWeight* out = find_w(b, "blk.0.attn_output.weight");
+            const RecWeight* gu = find_w(b, "blk.0.ffn_gate_up.weight");
+            const RecWeight* down = find_w(b, "blk.0.ffn_down.weight");
+            const RecWeight* tok = find_w(b, "token_embd.weight");
+            REQUIRE(q && key && gate && out && gu && down && tok);
+            CHECK_EQ(q->d.shard, RAD_SHARD_ROW);
+            CHECK_EQ(gate->d.shard, RAD_SHARD_ROW);
+            CHECK_EQ(out->d.shard, RAD_SHARD_COL);
+            CHECK_EQ(gu->d.shard, RAD_SHARD_ROW);
+            CHECK_EQ(down->d.shard, RAD_SHARD_COL);
+            CHECK_EQ(gu->d.n_row_parts, 2);
+            CHECK_EQ(gu->d.row_parts[0], g.n_ff);
+            CHECK_EQ(gu->d.row_parts[1], g.n_ff);
+            const int64_t q0 = q->span_set ? q->span_lo / g.head_dim : rank * g.n_head;
+            const int64_t k0 = key->span_set ? key->span_lo / g.head_dim : rank * g.n_head_kv;
+            const int64_t f0 = gu->span_set ? gu->span_lo : rank * g.n_ff;
+            const int64_t v0 = tok->span_set ? tok->span_lo : rank * g.n_vocab;
+            CHECK_EQ(gate->span_set ? gate->span_lo : rank * g.n_head, q0);
+            CHECK_EQ(out->span_set ? out->span_lo : rank * g.q_dim(), q0 * g.head_dim);
+            CHECK_EQ(down->span_set ? down->span_lo : rank * g.n_ff, f0);
+            CHECK_EQ(v0, g.vocab_off);
+            for (int64_t h = 0; h < g.n_head; ++h) {
+                REQUIRE(q0 + h < (int64_t)query_owners.size());
+                ++query_owners[(size_t)(q0 + h)];
+                CHECK_EQ(k0 + h / g.gqa(), (q0 + h) / 4);
+            }
+            for (int64_t i = 0; i < g.n_ff; ++i) ++ffn_owners[(size_t)(f0 + i)];
+            for (int64_t i = 0; i < g.n_vocab; ++i) ++vocab_owners[(size_t)(v0 + i)];
+            CHECK_EQ(count_op(b, "all_reduce"), world == 1 ? 0 : 9);
+            for (const auto& op : b.ops) if (op.op == "all_reduce") {
+                CHECK_EQ(pstr(&op, "dtype"), std::string("fp32"));
+                CHECK_EQ(pint(&op, "exact"), 1);
+                CHECK_EQ(pint(&op, "world_size"), world);
+            }
+            RadBatch batch = decode_batch();
+            batch.n_tok = batch.max_q_len = 8;
+            RadCtx c{.b = &b, .batch = &batch, .rank = rank, .world = world};
+            spark25_bf16::step(&c, &batch);
+            CHECK_LINT(b, &c);
+            CHECK(c.step_fail.empty());
+        }
+        CHECK(std::all_of(query_owners.begin(), query_owners.end(), [](int n) { return n == 1; }));
+        CHECK(std::all_of(ffn_owners.begin(), ffn_owners.end(), [](int n) { return n == 1; }));
+        CHECK(std::all_of(vocab_owners.begin(), vocab_owners.end(), [](int n) { return n == 1; }));
+    }
+}
+
 TEST(refuses_unimplemented_variants) {
     RadBuildCtx ctx = build_ctx();
     for (const auto& change : {std::pair{"tie_word_embeddings", "0"},
@@ -111,8 +172,8 @@ TEST(refuses_unimplemented_variants) {
     CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&scaled, k.meta(), &ctx); }) == RAD_E_UNSUPPORTED);
     k = spark_meta();
     RadBuilder b;
-    ctx.world_size = 2;
-    CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) == RAD_E_UNSUPPORTED);
+    ctx.world_size = 17;  /* more ranks than query heads */
+    CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) == RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

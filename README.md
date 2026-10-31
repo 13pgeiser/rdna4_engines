@@ -34,7 +34,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
-| Spark X2.6 4B bf16: thinking and tool calls, one card | `spark-x2.6-4b-bf16.rad` (8.3 GiB) | [convert](#convert-a-checkpoint) | — |
+| Spark X2.6 4B bf16: thinking and tool calls, one to four cards | `spark-x2.6-4b-bf16.rad` (8.3 GiB) | [convert](#convert-a-checkpoint) | — |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
@@ -323,8 +323,9 @@ reads it: NVFP4 (compressed-tensors' and NVIDIA ModelOpt's) to the MXFP4 kernels
 Flash-Next's int4 block projections to int8. [docs/GUIDE.md](docs/GUIDE.md) names the recipes of record
 with their `rad-convert` commands.
 
-Spark X2.6 currently runs at `--tp 1` without a drafter or quantisation recipe. Its checkpoint's
-chat template enables thinking by default; replies return reasoning in `reasoning_content`. Set
+Spark X2.6 runs BF16 at `--tp 1`, `2`, `3` or `4` -- and `8`, the worlds libr4d has an exact
+all-reduce for -- without a drafter or quantisation recipe. Its checkpoint's chat template enables
+thinking by default; replies return reasoning in `reasoning_content`. Set
 `chat_template_kwargs.enable_thinking` to `false` for a non-thinking request. Tool calls use the
 checkpoint's tagged format and are returned as OpenAI `tool_calls`.
 

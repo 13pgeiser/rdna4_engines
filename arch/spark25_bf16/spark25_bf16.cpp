@@ -6,12 +6,14 @@
  * gelu_mul (which is the tanh approximation). The attention gate is one sigmoid per head, not
  * per channel. Local and full layers have different NeoX rotary dimensions and theta values.
  *
- * This first implementation is deliberately single-card. As in the HF reference, residuals
- * accumulate in f32; rmsnorm reads that stream and writes bf16 for the linear projections.
+ * Tensor parallelism splits attention by whole KV groups, replicating KV heads when ranks
+ * outnumber them. As in the HF reference, residuals accumulate in f32; rmsnorm reads that stream
+ * and writes bf16 for the linear projections.
  */
 #include <arch/rad_arch.h>
 #include "chat.h"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <string>
@@ -24,8 +26,8 @@ struct Layer {
     rad_kvgroup kv = 0;
     rad_weight an = 0, q = 0, k = 0, v = 0, gate = 0, o = 0, fn = 0, gu = 0, down = 0;
     rad_op anorm = 0, qp = 0, kp = 0, vp = 0, gp = 0, rq = 0, rk = 0, store = 0, attn = 0;
-    rad_op sigmoid = 0, gate_heads = 0, op = 0, widen_attn = 0, add_attn = 0;
-    rad_op fnorm = 0, gup = 0, act = 0, dp = 0, widen_ffn = 0, add_ffn = 0;
+    rad_op sigmoid = 0, gate_heads = 0, op = 0, widen_attn = 0, reduce_attn = 0, add_attn = 0;
+    rad_op fnorm = 0, gup = 0, act = 0, dp = 0, widen_ffn = 0, reduce_ffn = 0, add_ffn = 0;
 };
 
 struct Model {
@@ -35,7 +37,7 @@ struct Model {
     rad_buf x = 0, delta = 0, h = 0, q = 0, k = 0, v = 0, gate = 0, attn = 0, gu = 0, ff = 0;
     rad_buf hout = 0, logits = 0;
     rad_weight tok = 0, norm = 0, head = 0;
-    rad_op embed = 0, widen = 0, final_norm = 0, gather = 0, logits_op = 0;
+    rad_op embed = 0, widen = 0, reduce_embed = 0, final_norm = 0, gather = 0, logits_op = 0;
     std::vector<Layer> layers;
 };
 static Model models[MAX_RANKS];
@@ -65,17 +67,82 @@ static int schedule(const RadModelMeta* meta, int64_t n, std::vector<bool>& loca
     return RAD_OK;
 }
 
+struct Span {
+    int64_t first = 0, count = 0;
+};
+
+/* Remainder-first contiguous slices, in whole units. */
+static Span split(int64_t n, int parts, int rank) {
+    const int64_t base = n / parts, rem = n % parts;
+    return {base * rank + std::min<int64_t>(rank, rem), base + (rank < rem ? 1 : 0)};
+}
+
+struct Shards {
+    Span q, kv, ff;  /* q and kv in heads; ff in channels */
+};
+
+/* A rank's attention heads must describe whole GQA groups, or a slice of a single group with
+ * that group's KV head replicated. This also covers non-divisible worlds such as 3 ranks over
+ * the checkpoint's 4 KV heads. Projection and FFN spans below give the loader those exact cuts. */
+static int shard_geometry(Geom& g, const RadBuildCtx* ctx, Shards& s) {
+    g.world = ctx->world_size > 0 ? ctx->world_size : 1;
+    g.rank = ctx->rank;
+    if (g.rank >= g.world || g.world > g.n_head_all || g.n_head_kv_all <= 0 ||
+        g.n_head_all % g.n_head_kv_all || g.world > g.n_ff_all) {
+        fprintf(stderr, "radiance: spark25: cannot shard %lld query heads, %lld KV heads and "
+                        "%lld FFN channels over %d ranks\n", (long long)g.n_head_all,
+                (long long)g.n_head_kv_all, (long long)g.n_ff_all, g.world);
+        return RAD_E_INVAL;
+    }
+    const int64_t group = g.n_head_all / g.n_head_kv_all;
+    if (g.world <= g.n_head_kv_all) {
+        s.kv = split(g.n_head_kv_all, g.world, g.rank);
+        s.q = {s.kv.first * group, s.kv.count * group};
+    } else {
+        int first_rank = 0;
+        for (int64_t k = 0; k < g.n_head_kv_all; ++k) {
+            const int n = (int)split(g.world, (int)g.n_head_kv_all, (int)k).count;
+            if (g.rank < first_rank + n) {
+                const Span q = split(group, n, g.rank - first_rank);
+                s.kv = {k, 1};
+                s.q = {k * group + q.first, q.count};
+                break;
+            }
+            first_rank += n;
+        }
+    }
+    /* Prefer whole 128-channel blocks for a ragged split, keeping device GEMMs aligned. */
+    const int64_t unit = g.n_ff_all % 128 == 0 && g.n_ff_all / 128 >= g.world ? 128 : 1;
+    s.ff = split(g.n_ff_all / unit, g.world, g.rank);
+    s.ff.first *= unit;
+    s.ff.count *= unit;
+    g.n_head = s.q.count;
+    g.n_head_kv = s.kv.count;
+    g.n_ff = s.ff.count;
+    g.n_vocab = shard_extent(g.n_vocab_all, g.world, g.rank);
+    g.vocab_off = shard_begin(g.n_vocab_all, g.world, g.rank);
+    return g.n_head > 0 && g.n_head_kv > 0 && g.n_ff > 0 && g.n_vocab > 0 ? RAD_OK : RAD_E_INVAL;
+}
+
+static bool needs_span(const Span& s, int64_t total, const Geom& g) {
+    return total % g.world != 0 || s.first != g.rank * (total / g.world) ||
+           s.count != total / g.world;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    if (ctx->world_size > 1) {
-        fprintf(stderr, "radiance: spark25: this BF16 implementation needs --tp 1\n");
-        return RAD_E_UNSUPPORTED;
-    }
     Model& m = models[ctx->rank];
     m = Model{};
     m.nm = Names(ctx->scope);
-    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
+    /* geom_from's even-only split cannot express a ragged GQA/FFN world. Read the whole geometry,
+     * then give each rank a group-preserving shard and state its spans on the weights. */
+    RadBuildCtx whole = *ctx;
+    whole.rank = 0;
+    whole.world_size = 1;
+    RAD_ARCH_TRY(geom_from(m.g, meta, &whole, "bf16", RAD_BF16));
     Geom& g = m.g;
+    Shards shards;
+    RAD_ARCH_TRY(shard_geometry(g, ctx, shards));
     Names& nm = m.nm;
     if (g.n_head_kv <= 0 || g.n_head % g.n_head_kv || g.head_dim % 2 || meta->n_expert ||
         rad_meta_geti(meta, "attention_bias", 0) || rad_meta_geti(meta, "mlp_bias", 0) ||
@@ -152,17 +219,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     auto weight = [&](const char* name, const char* src, uint32_t dt,
                       std::initializer_list<int64_t> shape, RadWeightGroup group,
-                      int access = RAD_ACCESS_PER_TOKEN) {
+                      int access = RAD_ACCESS_PER_TOKEN, int shard = RAD_SHARD_NONE) {
         if (map_copy(b, name, src) != RAD_OK) return (rad_weight)0;
-        return decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, group);
+        return decl_w(b, name, dt, shape, access, shard, group);
     };
     m.tok = weight(nm.f("token_embd.weight"), nm.ckpt("model.embedding.weight"), RAD_BF16,
-                   {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB);
+                   {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB, RAD_SHARD_ROW);
     m.head = weight(nm.f("output.weight"), nm.ckpt("model.embedding.weight"), RAD_BF16,
-                    {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB);
+                    {g.n_vocab, E}, grp_model(), RAD_ACCESS_VOCAB, RAD_SHARD_ROW);
     m.norm = weight(nm.f("output_norm.weight"), nm.ckpt("model.norm.weight"), RAD_F32,
                     {E}, grp_model());
     if (!m.tok || !m.head || !m.norm) return RAD_E_INVAL;
+    if (g.world > 1 && g.n_vocab_all % g.world) {
+        RAD_ARCH_TRY(rad_weight_shard_span(b, m.tok, g.vocab_off, g.vocab_off + g.n_vocab));
+        RAD_ARCH_TRY(rad_weight_shard_span(b, m.head, g.vocab_off, g.vocab_off + g.n_vocab));
+    }
 
     auto norm = [&](rad_weight w, rad_buf x, rad_buf y) {
         return rw(b, RAD_OP(b, "rmsnorm", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
@@ -179,42 +250,71 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     };
     m.embed = rw(b, RAD_OP(b, "embed_lookup", RAD_PARAMS(RAD_RANGE("M", 1, T),
         RAD_INT("n_embd", E), RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", "bf16"),
-        RAD_INT("vocab_offset", 0)), RAD_WEIGHTS(m.tok)), {}, {m.h});
+        RAD_INT("vocab_offset", g.vocab_off)), RAD_WEIGHTS(m.tok)), {}, {m.h});
     auto widen = [&](rad_buf output) {
         return rw(b, RAD_OP(b, "cast", RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
             RAD_STR("from", "bf16"), RAD_STR("to", "f32")), RAD_NOWEIGHTS), {m.h}, {output});
     };
     m.widen = widen(m.x);
+    /* Reducing the widened projection outputs retains the f32 residual stream. The exact f32
+     * wire is also needed for the embedding, where only one vocabulary shard contributes. */
+    auto reduce = [&](rad_buf x) {
+        if (g.world <= 1) return (rad_op)0;
+        return rw(b, RAD_OP(b, "all_reduce", RAD_PARAMS(RAD_INT("world_size", g.world),
+            RAD_RANGE("numel", E, T * E), RAD_STR("dtype", "fp32"), RAD_INT("exact", 1)),
+            RAD_NOWEIGHTS), {x}, {x});
+    };
+    m.reduce_embed = reduce(m.x);
 
     m.layers.resize((size_t)g.n_layer);
     for (int l = 0; l < g.n_layer; ++l) {
         Layer& a = m.layers[(size_t)l];
         auto src = [&](const char* suffix) { return nm.ckpt("model.layers.%d.%s", l, suffix); };
         auto w = [&](const char* suffix, const char* s, uint32_t dt,
-                     std::initializer_list<int64_t> shape) {
-            return weight(nm.f("blk.%d.%s", l, suffix), src(s), dt, shape, grp_layer(l));
+                     std::initializer_list<int64_t> shape, int shard = RAD_SHARD_NONE) {
+            return weight(nm.f("blk.%d.%s", l, suffix), src(s), dt, shape, grp_layer(l),
+                          RAD_ACCESS_PER_TOKEN, shard);
         };
         a.an = w("attn_norm.weight", "input_layernorm.weight", RAD_F32, {E});
-        a.gate = w("attn_gate.weight", "self_attn.g_proj.weight", RAD_BF16, {g.n_head, E});
-        a.o = w("attn_output.weight", "self_attn.out_proj.weight", RAD_BF16, {E, Q});
+        a.gate = w("attn_gate.weight", "self_attn.g_proj.weight", RAD_BF16, {g.n_head, E}, RAD_SHARD_ROW);
+        a.o = w("attn_output.weight", "self_attn.out_proj.weight", RAD_BF16, {E, Q}, RAD_SHARD_COL);
         a.fn = w("ffn_norm.weight", "post_attention_layernorm.weight", RAD_F32, {E});
-        a.down = w("ffn_down.weight", "mlp.down_proj.weight", RAD_BF16, {E, F});
+        a.down = w("ffn_down.weight", "mlp.down_proj.weight", RAD_BF16, {E, F}, RAD_SHARD_COL);
         const char* qkv = src("self_attn.q_k_v_proj.weight");
-        auto part = [&](const char* name, int first, int64_t rows) {
+        auto part = [&](const char* name, int first, int64_t all_rows, int64_t rows) {
             const char* target = nm.f("blk.%d.attn_%s.weight", l, name);
-            if (map_rows(b, target, {{qkv, first, rows}}) != RAD_OK) return (rad_weight)0;
-            return decl_w(b, target, RAD_BF16, {rows, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+            if (map_rows(b, target, {{qkv, first, all_rows}}) != RAD_OK) return (rad_weight)0;
+            return decl_w(b, target, RAD_BF16, {rows, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,
                           grp_layer(l));
         };
-        a.q = part("q", 0, Q);
-        a.k = part("k", (int)Q, K);
-        a.v = part("v", (int)(Q + K), K);
+        const int64_t qall = g.n_head_all * g.head_dim, kall = g.n_head_kv_all * g.head_dim;
+        a.q = part("q", 0, qall, Q);
+        a.k = part("k", (int)qall, kall, K);
+        a.v = part("v", (int)(qall + kall), kall, K);
         const char* gu = nm.f("blk.%d.ffn_gate_up.weight", l);
         RAD_ARCH_TRY(map_concat(b, gu, {src("mlp.gate_proj.weight"), src("mlp.up_proj.weight")}));
-        a.gu = decl_w(b, gu, RAD_BF16, {2 * F, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                      grp_layer(l));
+        a.gu = decl_w(b, gu, RAD_BF16, {2 * F, E}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,
+                      grp_layer(l), 0, {F, F});
         if (!a.an || !a.q || !a.k || !a.v || !a.gate || !a.o || !a.fn || !a.gu || !a.down)
             return RAD_E_INVAL;
+        if (g.world > 1 && needs_span(shards.q, g.n_head_all, g)) {
+            RAD_ARCH_TRY(rad_weight_shard_span(b, a.q, shards.q.first * g.head_dim,
+                                               (shards.q.first + shards.q.count) * g.head_dim));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, a.gate, shards.q.first,
+                                               shards.q.first + shards.q.count));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, a.o, shards.q.first * g.head_dim,
+                                               (shards.q.first + shards.q.count) * g.head_dim));
+        }
+        if (g.world > 1 && needs_span(shards.kv, g.n_head_kv_all, g)) {
+            for (rad_weight h : {a.k, a.v})
+                RAD_ARCH_TRY(rad_weight_shard_span(b, h, shards.kv.first * g.head_dim,
+                                                   (shards.kv.first + shards.kv.count) * g.head_dim));
+        }
+        if (g.world > 1 && needs_span(shards.ff, g.n_ff_all, g)) {
+            for (rad_weight h : {a.gu, a.down})
+                RAD_ARCH_TRY(rad_weight_shard_span(b, h, shards.ff.first,
+                                                   shards.ff.first + shards.ff.count));
+        }
         a.kv = m.kv;
         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, a.kv));
         a.anorm = norm(a.an, m.x, m.h);
@@ -246,6 +346,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_NOWEIGHTS), {m.attn, m.gate}, {m.attn});
         a.op = gemm(E, Q, a.o, m.attn, m.h);
         a.widen_attn = widen(m.delta);
+        a.reduce_attn = reduce(m.delta);
         a.add_attn = add();
         a.fnorm = norm(a.fn, m.x, m.h);
         a.gup = gemm(2 * F, E, a.gu, m.h, m.gu);
@@ -253,6 +354,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_STR("act", "gelu"), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.gu}, {m.ff});
         a.dp = gemm(E, F, a.down, m.ff, m.h);
         a.widen_ffn = widen(m.delta);
+        a.reduce_ffn = reduce(m.delta);
         a.add_ffn = add();
     }
     m.final_norm = norm(m.norm, m.x, m.h);
@@ -261,9 +363,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.logits_op = rw(b, RAD_OP(b, "logits_gemm", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
         RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
         RAD_WEIGHTS(m.head)), {m.hout}, {m.logits});
-    rad_note(b, "spark25: %lld layers, %lld query / %lld KV heads x %lld, local window %lld",
+    rad_note(b, "spark25 rank %d/%d: %lld layers, %lld query / %lld KV heads x %lld, "
+                "FFN %lld, vocab [%lld, %lld), local window %lld", g.rank, g.world,
              (long long)g.n_layer, (long long)g.n_head, (long long)g.n_head_kv,
-             (long long)g.head_dim, (long long)window);
+             (long long)g.head_dim, (long long)g.n_ff, (long long)g.vocab_off,
+             (long long)(g.vocab_off + g.n_vocab), (long long)window);
     return RAD_OK;
 }
 
@@ -274,6 +378,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     RAD_ISSUE(c, m.embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tok), brows(m.h, T));
     RAD_ISSUE(c, m.widen, brows(m.h, T), brows(m.x, T));
+    if (m.reduce_embed) RAD_ISSUE_N(c, m.reduce_embed, T * g.n_embd, brows(m.x, T), RAD_NONE);
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& a = m.layers[i];
         const RadKVGroupBatch* kvb = kv_batch(batch, a.kv);
@@ -299,12 +404,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, a.gate_heads, T * g.n_head, heads, gates, RAD_NONE, heads);
         RAD_ISSUE(c, a.op, brows(m.attn, T), RAD_W(a.o), brows(m.h, T));
         RAD_ISSUE(c, a.widen_attn, brows(m.h, T), brows(m.delta, T));
+        if (a.reduce_attn) RAD_ISSUE_N(c, a.reduce_attn, T * g.n_embd, brows(m.delta, T), RAD_NONE);
         RAD_ISSUE(c, a.add_attn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
         RAD_ISSUE(c, a.fnorm, brows(m.x, T), RAD_W(a.fn), brows(m.h, T));
         RAD_ISSUE(c, a.gup, brows(m.h, T), RAD_W(a.gu), brows(m.gu, T));
         RAD_ISSUE(c, a.act, bcol(m.gu, 0, g.n_ff, T), bcol(m.gu, g.n_ff, g.n_ff, T), brows(m.ff, T));
         RAD_ISSUE(c, a.dp, brows(m.ff, T), RAD_W(a.down), brows(m.h, T));
         RAD_ISSUE(c, a.widen_ffn, brows(m.h, T), brows(m.delta, T));
+        if (a.reduce_ffn) RAD_ISSUE_N(c, a.reduce_ffn, T * g.n_embd, brows(m.delta, T), RAD_NONE);
         RAD_ISSUE(c, a.add_ffn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
     }
     RAD_ISSUE(c, m.final_norm, brows(m.x, T), RAD_W(m.norm), brows(m.h, T));

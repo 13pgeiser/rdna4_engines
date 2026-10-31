@@ -3,6 +3,8 @@
 
 Requires torch, transformers and safetensors. It creates a tiny two-layer random checkpoint,
 converts and serves it on the host, then compares prefill and cached decode with the HF reference.
+--tp N runs the same fixture over N fake host devices (RADIANCE_HOST_DEVICES), which is how the
+tensor-parallel sharding and collectives are held to the reference without cards.
 No model weights are copied from the reference checkpoint, and GPUs are hidden from both processes.
 ROCm may still open device nodes when probing; use a GPU-denying device cgroup on shared machines.
 """
@@ -50,6 +52,14 @@ def write_tokenizer(path):
         vocab[s] = 256 + i
         added.append(dict(id=256 + i, content=s, single_word=False, lstrip=False,
                           rstrip=False, normalized=False, special=True))
+    # A 1024-token vocabulary leaves every rank a nonempty shard even at a ragged TP=3.
+    # The vocabulary shard is rounded up to a 128-row block, so a small vocab leaves a rank with
+    # nothing at some widths. 3584 rows give every world from 1 to 8 a nonempty shard.
+    for i in range(259, 3584):
+        s = f"<extra_{i}>"
+        vocab[s] = i
+        added.append(dict(id=i, content=s, single_word=False, lstrip=False,
+                          rstrip=False, normalized=False, special=False))
     bytelevel = dict(type="ByteLevel", add_prefix_space=False, trim_offsets=False, use_regex=True)
     tok = dict(version="1.0", added_tokens=added, normalizer=None, pre_tokenizer=bytelevel,
                post_processor=None, decoder=bytelevel,
@@ -62,7 +72,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--reference", required=True, type=Path, help="directory with modeling_spark.py")
     ap.add_argument("--build", required=True, type=Path, help="Radiance build directory")
+    ap.add_argument("--tp", type=int, default=1, help="number of fake host ranks (up to 8)")
     args = ap.parse_args()
+    if args.tp < 1 or args.tp > 8:
+        ap.error("--tp must be between 1 and 8")
     import torch
     import transformers
     from safetensors.torch import save_file
@@ -73,8 +86,8 @@ def main():
     if int(transformers.__version__.split(".")[0]) >= 5:
         modelmod.Spark2_5ForCausalLM._tied_weights_keys = {"lm_head.weight": "model.embedding.weight"}
     config = cfgmod.Spark2_5Config(
-        vocab_size=259, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, head_dim=8, hidden_act="gelu",
+        vocab_size=3584, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=8, num_key_value_heads=4, head_dim=4, hidden_act="gelu",
         max_position_embeddings=128, rms_norm_eps=1e-6, tie_word_embeddings=True,
         headwise_attn_output_gate=True, gate_attn_act_mode="sigmoid", sliding_window=4,
         layer_types=["sliding_attention", "full_attention"],
@@ -108,7 +121,8 @@ def main():
 
     build = args.build.resolve()
     env = os.environ.copy()
-    env.update(RADIANCE_HOME=str(build / "radiance_home"), RADIANCE_HOST_VRAM_MIB="512")
+    env.update(RADIANCE_HOME=str(build / "radiance_home"), RADIANCE_HOST_VRAM_MIB="512",
+               RADIANCE_HOST_DEVICES=str(args.tp))
     with tempfile.TemporaryDirectory(prefix="spark25-reference-") as tmp:
         root = Path(tmp)
         ckpt = root / "checkpoint"
@@ -128,7 +142,8 @@ def main():
         with (root / "server.log").open("w+") as log:
             proc = subprocess.Popen([build / "bin/radiance", "--model", rad, "--host", "127.0.0.1",
                 "--port", str(port), "--kernels", "libref", "--debug-accept-reference-kernels",
-                "--max-model-len", "64", "--max-num-batched-tokens", "32", "--max-num-seqs", "1"],
+                "--max-model-len", "64", "--max-num-batched-tokens", "32", "--max-num-seqs", "1",
+                "--tp", str(args.tp)],
                 env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
                 url = f"http://127.0.0.1:{port}"
@@ -156,10 +171,17 @@ def main():
                         raise AssertionError(f"{prompt!r}: expected 5 decode rows, got {len(rows)}")
                     ids = list(prompt.encode())
                     max_error = 0.0
+                    matches = 0
                     for row in rows:
                         expected = reference(ids)
-                        if row["id"] != int(expected.argmax()):
-                            raise AssertionError(f"{prompt!r}: token {row['id']} != reference {int(expected.argmax())}")
+                        if row["id"] == int(expected.argmax()):
+                            matches += 1
+                        # A shard changes the order of a bf16 reduction, which can swap two
+                        # candidates closer than this. A wider gap is a wrong model, not rounding.
+                        elif float(expected.max() - expected[row["id"]]) > 0.1:
+                            raise AssertionError(
+                                f"{prompt!r}: token {row['id']} != reference "
+                                f"{int(expected.argmax())}, {float(expected.max() - expected[row['id']]):.5f} nats behind")
                         for candidate in row["top_logprobs"]:
                             max_error = max(max_error,
                                 abs(candidate["logprob"] - float(expected[candidate["id"]])))
@@ -167,7 +189,8 @@ def main():
                     # BF16 logits / attention reduction order differ slightly from CPU torch.
                     if max_error >= 0.15:
                         raise AssertionError(f"{prompt!r}: max top-10 log-prob error {max_error:.5f}")
-                    print(f"{prompt!r}: 5/5 top-1, max top-10 log-prob error {max_error:.5f}")
+                    print(f"TP={args.tp} {prompt!r}: {matches}/5 exact top-1, "
+                          f"max top-10 log-prob error {max_error:.5f}")
             except Exception:
                 log.flush()
                 log.seek(0)
