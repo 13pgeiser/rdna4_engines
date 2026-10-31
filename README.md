@@ -34,6 +34,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
 | Gemma 4 31B: int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-i8g) | `gemma4-31b-i8g.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-heretic-ara-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-i8g) | `gemma4-31b-heretic-ara-i8g.yaml` |
