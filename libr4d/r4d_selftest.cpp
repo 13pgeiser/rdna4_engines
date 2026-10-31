@@ -1563,6 +1563,132 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     dfree_all();
 }
 
+/* Whether a query row's rounding is its own. The prefill kernel tiles queries: a workgroup holds
+ * 384 / gqa query positions (96 at gqa 4), a wave 16 / gqa of them (4 at gqa 4) and each half of a
+ * wave a different run of keys, and one wave's rescale branch is a wave-wide vote. If that vote let
+ * one row's growth rescale its wave-mates, a row's bits would depend on the other rows sharing the
+ * launch: chunked prefill would not reproduce an unchunked one, and a quantised model -- whose
+ * scores differ from the reference's by its own error -- would differ by more than that error,
+ * because the rows beside a row decide how it rounds. The row's scale is its own, so this must not.
+ *
+ * The same rows over the same keys at two launch lengths: `rows` rows at context `rows`, then the
+ * first `rows` rows of a launch of `q_long` rows at context `q_long`. Row i is position i in both,
+ * so it sees keys 0..i in both and its own max moves the same way; only the rows past `rows` join
+ * the longer launch. The first `rows` rows must come out bit for bit.
+ *
+ * Where it would show: a row's max climbs as the ordinary keys pass (they grow with position, so a
+ * row's max is its newest key), and the vote only matters at a tile where some wave-mate crosses
+ * the format's growth threshold while the row itself merely climbs. So the keys of the extra rows,
+ * positions `rows` to `rows` + 3 -- the wave-mates of the last row the short launch ends at, and
+ * causal to none of the rows being compared -- are strong, each past the threshold by an octave or
+ * two. Rows below them see only their climb. `splits` is forced to 1 for both launches, since the
+ * split law counts the launch's own rows and the two lengths need not agree on a segment count (a
+ * split's merge against its unsplit run is attn_split_case's). */
+static void attn_prefill_rows_case(const Plugin& pl, const SplitGeo& g, const char* name) {
+    if (!sel(name) && !sel("attn_prefill_rows")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    /* The three put the short launch's last row at the first, second and third quarter of a
+     * workgroup's 96 rows, so its wave has mates at every wave width: 57 leaves the last row one
+     * from the bottom (a wave of two, at gqa 8), 58 two (a wave of four, at gqa 4), 105 one from
+     * the bottom of the second workgroup's first wave (a wave of eight, at gqa 2). */
+    static const int64_t kPairs[][2] = { { 58, 128 }, { 57, 96 }, { 105, 176 } };
+    const int64_t head_dim = 256, gqa = g.gqa, kv_heads = g.kv_heads, bs = g.bs;
+    const int64_t q_heads = kv_heads * gqa, rowe = 2 * head_dim, q_max = 192;
+    const int64_t mb = (q_max + bs - 1) / bs;
+    /* One query for every row, so an ordinary key's score is its own magnitude; that magnitude
+     * grows with the position, so every tile climbs. */
+    std::vector<uint16_t> qh((size_t)q_max * q_heads * head_dim, h_to_bf16(0.5f));
+    const size_t on = (size_t)q_max * q_heads * head_dim;
+    void* d_q  = dalloc(on * 2);
+    void* d_kv = dalloc((size_t)mb * kv_heads * bs * rowe * 2);
+    void* d_a  = dalloc(on * 2);
+    void* d_b  = dalloc(on * 2);
+    if (!d_q || !d_kv || !d_a || !d_b) {
+        ok(name, false, fmt("%s kv%lld rows: hipMalloc failed", name, (long long)kv_heads).c_str());
+        dfree_all(); return;
+    }
+    st_memcpy(d_q, qh.data(), on * 2, hipMemcpyHostToDevice);
+
+    auto run = [&](int64_t n, void* out) {
+        st_memset(out, 0xff, (size_t)n * q_heads * head_dim * 2);
+        const std::vector<int32_t> bt = iota_i32((n + bs - 1) / bs), used = { (int32_t)n };
+        std::vector<RadTensor> ts = {
+            T(d_q,  RAD_BF16, { n, q_heads, head_dim }),
+            T(d_kv, RAD_BF16, { (int64_t)bt.size(), kv_heads, bs, rowe }),
+            TI32({ 1, (int64_t)bt.size() }, bt),
+            TI32({ 1 }, used),
+            TF32({ 1, kv_heads }, 1.0f),
+            TF32({ 1, kv_heads }, 1.0f),
+            T(nullptr, RAD_I32, { 2 }),
+            T(out, RAD_BF16, { n, q_heads, head_dim }),
+        };
+        absent(ts[4]); absent(ts[5]); absent(ts[6]);   /* bf16 cache, one sequence */
+        std::vector<RadParam> ps = {
+            PI("q_len", n), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", 0), PI("splits", 1),
+            PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+        };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int64_t need = r->scratch ? r->scratch(&a) : 0;
+        if (need > 0) {
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (a.scratch) st_memset(a.scratch, 0x7f, (size_t)need);
+        }
+        const int rc = r->launch(&a, nullptr);
+        return rc == RAD_OK && (hipError_t)st_stream_sync(nullptr) == hipSuccess;
+    };
+
+    std::vector<uint16_t> ha(on), hb(on);
+    for (const auto& pair : kPairs) {
+        const int64_t rows = pair[0], q_long = pair[1];
+        const std::string tag = fmt("%s kv%lld rows: %lld of %lld bit-identical to the same rows "
+                                    "of %lld", name, (long long)kv_heads, (long long)rows,
+                                    (long long)rows, (long long)q_long);
+        /* [block, kv head, slot, k | v]: V noise, K growing, and the extra rows' keys strong. */
+        std::vector<uint16_t> kv((size_t)mb * kv_heads * bs * rowe);
+        for (int64_t p = 0; p < mb * bs; ++p)
+            for (int64_t h = 0; h < kv_heads; ++h)
+                for (int64_t d = 0; d < rowe; ++d) {
+                    const bool key = d < head_dim;
+                    const float v = (key && p >= rows && p < rows + 4) ? 8.0f * (float)(1 + p / 4)
+                                  : key ? 0.25f * (1.0f + (float)p / 16.0f)
+                                  : h_bf16(st_rand_bf16((uint32_t)(p * 131 + h * 17 + d)));
+                    kv[((size_t)((p / bs) * kv_heads + h) * bs + p % bs) * rowe + (size_t)d] =
+                        h_to_bf16(v);
+                }
+        st_memcpy(d_kv, kv.data(), kv.size() * 2, hipMemcpyHostToDevice);
+        const bool ok_a = run(rows, d_a);
+        const bool ok_b = run(q_long, d_b);
+        if (!ok_a || !ok_b) {
+            ok(tag.c_str(), false, fmt("launch %s", ok_a ? (ok_b ? "" : "2") : "1").c_str());
+            continue;
+        }
+        st_memcpy(ha.data(), d_a, (size_t)rows * q_heads * head_dim * 2, hipMemcpyDeviceToHost);
+        st_memcpy(hb.data(), d_b, (size_t)q_long * q_heads * head_dim * 2, hipMemcpyDeviceToHost);
+        int ndiff = 0, nan = 0;
+        float max_diff = 0.0f;
+        const size_t shared = (size_t)rows * q_heads * head_dim;
+        const size_t long_end = (size_t)q_long * q_heads * head_dim;
+        for (size_t i = 0; i < shared; ++i) {
+            if (ha[i] == hb[i]) continue;
+            ++ndiff;
+            const float d = std::fabs(h_bf16(hb[i]) - h_bf16(ha[i]));
+            if (!(d <= max_diff)) max_diff = d;
+        }
+        /* The rows only the long launch carried: written, and not the poisoned pattern. */
+        for (size_t i = shared; i < long_end; ++i) nan += hb[i] == 0xffffu;
+        ok(tag.c_str(), ndiff == 0 && nan == 0,
+           fmt("%d/%d elements differ, max abs %.3g, %d of the long launch's own rows unwritten",
+               ndiff, (int)shared, max_diff, nan));
+    }
+    dfree_all();
+}
+
 /* A mixed step's attention as the engine issues it (AttnGatedFP8::step's per-band issue) at
  * geometry `g` (Qwen3.8-27B's per-rank production geometry for kSplitG6): `nd` decode sequences of
  * the widest verify blocks the decode row holds (64 / gqa query rows and the two below: 8-10 at
@@ -29783,6 +29909,9 @@ static void device_phase(const Plugin& pl) {
         attn_split_case(pl, g, n, kv, { { 53, 12000 } }, 16, true, 8, 0);
         attn_split_case(pl, g, n, kv, { { 64, 9000 }, { 11, 8192 } }, 6, true, 3, 0);
         attn_split_scratch_case(pl, g, n, kv);
+        /* A row's softmax scale is its own, whatever else the launch carries. bf16 only: the
+         * cache layout does not enter the softmax, and the case costs two small launches. */
+        if (!std::strcmp(kv, "bf16")) attn_prefill_rows_case(pl, g, n);
     }
     /* A mixed step's two halves at each geometry's production shape, each with only its band's
      * declared scratch: up to 15 verify blocks beside chunks of 1 to 640 rows. */

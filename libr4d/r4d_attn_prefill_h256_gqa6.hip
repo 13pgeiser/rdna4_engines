@@ -593,13 +593,13 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             float smax = sc[0];
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
-            // The rescale is the wave's, so a row's bits depend on the rows sharing its wave. Only
-            // live rows decide it: a row past qlen limits its keys at its own qpos, past ctx, so it
-            // scores whatever the cache's last block held before (another request's KV), and the
-            // last query rows of a sequence's final block would round by that.
-            if (wave_any(live && smax > m_ref + PGROW)) {
-                const float rmax  = fmaxf(smax, swap16(smax));
-                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
+            // Both half-waves hold the same query and different keys. The branch must be
+            // wave-uniform, but each query may change scale only on its own growth threshold;
+            // otherwise other live query rows change its rounding when the chunk length changes.
+            const float rmax = fmaxf(smax, swap16(smax));
+            const bool row_grow = live && rmax > m_ref + PGROW;
+            if (wave_any(row_grow)) {
+                const float mnew = row_grow ? fmaxf(fmaxf(m_ref, rmax), -3.0e38f) : m_ref;
                 const float alpha = ex2(m_ref - mnew);
                 #pragma unroll
                 for (int dt = 0; dt < NKS; ++dt)
