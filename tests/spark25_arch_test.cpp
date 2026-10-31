@@ -1,6 +1,7 @@
 /* Spark's declaration and step, without a GPU or checkpoint. */
 #define RAD_ARCH_NO_EXPORTS 1
 #include "arch_fakes.h"
+#include "rad_plugin.h"
 #include "../arch/spark25_bf16/spark25_bf16.cpp"
 
 using namespace rad_fake;
@@ -132,8 +133,9 @@ TEST(tensor_parallel_covers_heads_and_ffn_without_changing_gqa) {
             for (int64_t i = 0; i < g.n_ff; ++i) ++ffn_owners[(size_t)(f0 + i)];
             for (int64_t i = 0; i < g.n_vocab; ++i) ++vocab_owners[(size_t)(v0 + i)];
             CHECK_EQ(count_op(b, "all_reduce"), world == 1 ? 0 : 9);
+            int reductions = 0;
             for (const auto& op : b.ops) if (op.op == "all_reduce") {
-                CHECK_EQ(pstr(&op, "dtype"), std::string("fp32"));
+                CHECK_EQ(pstr(&op, "dtype"), std::string(reductions++ == 0 ? "fp32" : "bf16"));
                 CHECK_EQ(pint(&op, "exact"), 1);
                 CHECK_EQ(pint(&op, "world_size"), world);
             }
@@ -147,6 +149,68 @@ TEST(tensor_parallel_covers_heads_and_ffn_without_changing_gqa) {
         CHECK(std::all_of(query_owners.begin(), query_owners.end(), [](int n) { return n == 1; }));
         CHECK(std::all_of(ffn_owners.begin(), ffn_owners.end(), [](int n) { return n == 1; }));
         CHECK(std::all_of(vocab_owners.begin(), vocab_owners.end(), [](int n) { return n == 1; }));
+    }
+}
+
+TEST(tp_projection_rounds_to_bf16_before_the_fp32_residual_add) {
+    MetaKV k = spark_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.world_size = 2;
+    REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+    const auto& m = spark25_bf16::models[0];
+    RadBatch batch = decode_batch();
+    RadCtx c{.b = &b, .batch = &batch, .world = 2};
+    spark25_bf16::step(&c, &batch);
+    CHECK_LINT(b, &c);
+    REQUIRE(c.step_fail.empty());
+
+    /* Both partials are exactly bf16. Their sum is halfway between 1 and the next bf16 value,
+     * so the merged projection must round to 1. The residual's low bits must survive the add. */
+    constexpr float partial = 0.5f, peer = 0.50390625f, residual = 0.0009765625f;
+    const float merged = rad_bf16_to_f32(rad_f32_to_bf16(partial + peer));
+    REQUIRE_EQ(merged, 1.0f);
+    auto rounded = [&](rad_buf buf, float value) {
+        const uint32_t dtype = b.bufs.at(buf - 1).d.dtype;
+        CHECK(dtype == RAD_BF16 || dtype == RAD_F32);
+        return dtype == RAD_BF16 ? rad_bf16_to_f32(rad_f32_to_bf16(value)) : value;
+    };
+    for (const auto& layer : m.layers) {
+        for (const auto& tail : {std::pair{layer.op, layer.add_attn},
+                                 std::pair{layer.dp, layer.add_ffn}}) {
+            std::map<rad_buf, float> values{{m.h, partial}, {m.x, residual}};
+            bool active = false, added = false;
+            int reductions = 0;
+            /* Evaluate one channel of the tail the real step issued, not a separately spelled
+             * cast/reduce/add sequence. The collective's peer contributes its projection shard. */
+            for (const auto& issue : c.issues) {
+                if (!active) { active = issue.op == tail.first; continue; }
+                const RecOp* op = b.op_of(issue.op);
+                REQUIRE(op != nullptr);
+                REQUIRE_EQ(op->writes.size(), (size_t)1);
+                REQUIRE(!op->reads.empty());
+                REQUIRE(values.count(op->reads[0]) != 0);
+                float value = values.at(op->reads[0]);
+                if (op->op == "all_reduce") {
+                    CHECK_EQ(rad_dtype_parse(pstr(op, "dtype").c_str()),
+                             b.bufs.at(op->writes[0] - 1).d.dtype);
+                    value += peer;
+                    ++reductions;
+                } else if (op->op == "add") {
+                    REQUIRE_EQ(op->reads.size(), (size_t)2);
+                    REQUIRE(values.count(op->reads[1]) != 0);
+                    value += values.at(op->reads[1]);
+                } else {
+                    REQUIRE_EQ(op->op, std::string("cast"));
+                }
+                values[op->writes[0]] = rounded(op->writes[0], value);
+                if (issue.op == tail.second) { added = true; break; }
+            }
+            REQUIRE(added);
+            CHECK_EQ(reductions, 1);
+            CHECK_EQ(values.at(m.x), residual + merged);
+            CHECK(values.at(m.x) != residual + partial + peer);
+        }
     }
 }
 
