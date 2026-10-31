@@ -597,7 +597,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
     if (x0 != x0) {                                /* topk_next's seed, as in row_topk */
         for (uint32_t r = 0; r < n_cand; ++r) {
             if (r >= k) { hole(r); continue; }
-            ir[r] = vocab_off;
+            ir[r] = 0;                              /* cand_idx is local: the NaN logit's column */
             vr[r] = x0;
             if (pp) { pp[2 * r] = vocab_off; pp[2 * r + 1] = *(const int32_t*)&x0; }
         }
@@ -788,8 +788,11 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
                 if (s_ev[i] * inv >= th) { cnt += 1.0f; last = (float)i; }
             }
             /* Count and last index are order-free (a sum of small integers and a max), so no serial
-             * loop is needed; candidates are re-tested below from the same `s_ev`. */
+             * loop is needed; candidates are re-tested below from the same `s_ev`. The two
+             * reductions share the `red` scratch: block_sum ends on a read of it and block_max
+             * begins on a write, so the barrier between them is the read/write fence. */
             const float n_above = block_sum<kThreads>(cnt, red);
+            __syncthreads();
             const float hi = block_max(last, red);
             if (n_above < 2.0f) return;           /* needs two to exclude all but the least likely */
             const int32_t keep = (int32_t)hi;

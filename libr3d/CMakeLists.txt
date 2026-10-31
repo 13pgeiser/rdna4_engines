@@ -1,8 +1,10 @@
-# libr3d serves RDNA3 only; this file is the one place that says so. Its kernels rely on wave32 and
-# on RDNA3 instructions: v_dot2acc_f32_f16 for the matrix work, v_cvt_pkrtz_f16_f32, DPP16 and
-# v_permlanex16. They do not use the WMMA fragment layouts (RDNA3's 16x16x16 wave-matrix family
-# needs a different lane map than dot2) or gfx12-only instructions such as global_load_tr_b128,
-# and they decode every quantised weight in software because of that lane map.
+# libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
+# instructions RDNA3 has: v_dot2acc_f32_f16 and the 16x16x16 v_wmma wave-matrix family for the
+# matrix work, v_cvt_pkrtz_f16_f32, DPP16 and v_permlanex16. The GEMM rows carry two arms each,
+# the dot2 pairs and the wave matrix, points of the row's `impl` axis the tune cache picks per
+# shape per machine. The kernels do not use gfx12-only instructions such as global_load_tr_b128,
+# and they decode every quantised weight in software: the lane map, not a missing instruction, is
+# the reason.
 #
 # A build targeting other cards skips libr3d. Without a device kernel library the engine refuses ops
 # only a reference library implements, unless --debug-accept-reference-kernels is passed (spec §17).
@@ -58,12 +60,20 @@ set(R3D_UNITS
   "r3d_gemm_nt_q_w2a8|"
   # The vocabulary projection at both heights: the head streamed for M <= 16, tiled above it.
   "r3d_vocab_bf16|"
+  # The tiled GEMM on the wave-matrix: the compute-dual of the ALU fdot2 tile above.
+  "r3d_vocab_bf16_wmma|"
   # The quantised GEMM at prefill heights.
   "r3d_gemm_fp8a8_tiled|"
   # The OCP-MXFP4 weight against the fp8 activation, both heights: e2m1 codes with one e8m0 scale
   # per 32 of K, the block's partials scaled at the block boundary.
   "r3d_gemm_mxfp4a8|"
   "r3d_gemm_inta8|"
+  # The wave-matrix arm of the w8a8 grid: V_WMMA_I32_16X16X16_IU8 chains an exact i32 group
+  # sub-sum, the group term the reference's. The `impl` point of the dot2 arm's row.
+  "r3d_gemm_inta8_wmma|"
+  # The w8a8 wave-matrix arm at prefill heights (17 <= M <= 127): two 16-row tiles a wave, the
+  # weight column reused over the tiles, the group term the reference.
+  "r3d_gemm_w8a8_nt_m64|"
   # Paged attention at head_dim 128: the decode leg (one head group a workgroup, 16-token tiles,
   # split-KV) and the prefill leg (a 16-token query tile staged in LDS), over a bf16 or an E4M3
   # cache. The walk is shared; the tile is what a workgroup stages once and every wave consumes.
@@ -74,9 +84,68 @@ set(R3D_UNITS
   # Activation quantisation: per-(row, group) symmetric E4M3 and int8, the gated form that
   # quantises a silu-gated pair, and the dequantise that reads a container's own quantised weights.
   "r3d_quant_fp8|"
+  "r3d_had_quant_act_i8|"
+  "r3d_gelu_mul_quant_i8|"
+  "r3d_kv_len_trim|"
+  "r3d_qsa_tail_store|"
+  "r3d_gated_had_quant_i8|"
+  "r3d_had_quant_act_fp8|"
+  "r3d_gated_had_quant_fp8|"
+  "r3d_quant_cols_fp8|"
+  "r3d_had_quant_act_i8g|"
+  "r3d_gated_had_quant_i8g|"
+  "r3d_rmsnorm_quant_i8|"
   # The skinny bf16 GEMM for decode, M <= 16: one output element a lane, k ascending, so the
   # accumulation order is libref's.
   "r3d_gemm_bf16_nt_m16|"
+  # The wave-matrix arm of the skinny bf16 GEMM: V_WMMA_F32_16X16X16_BF16 over a 16x16x16 tile, a
+  # wave a tile, the `impl` point of the dot2 arm's row.
+  "r3d_gemm_bf16_nt_m16_wmma|"
+   # The wave-matrix bf16 GEMM for the M = 17..127 band: MT 16-row tiles a block, the B-fragment
+   # reused over the tiles so the weight stream is read once per 16-column tile.
+   "r3d_gemm_bf16_nt_m64_wmma|"
+  # The same shape over an f16 checkpoint: the bytes are the dot's native pair, so the stage is a
+  # straight copy and the weight streams into the fold with no widening.
+  "r3d_gemm_f16_nt_m16|"
+  # The wave-matrix arm of the skinny f16 GEMM: V_WMMA_F32_16X16X16_F16 over a 16x16x16 tile, the
+  # `impl` point of its row.
+  "r3d_gemm_f16_nt_m16_wmma|"
+  # The 4-bit weight against an f16 activation, M up to 64: the codes through the tile's f16 on a
+  # 1024 offset, the zero a packed f16 add, the group scale on the f32 accumulator. The weight's
+  # fragment-order permute is the row's own relayout hook, at load.
+  "r3d_gemm_w4a16_nt_m64|"
+  "r3d_gemm_w5a16_nt_m64|"
+  # The gated-delta-net chunk preamble: the gram and the blocked inverse of I + the strictly
+  # lower decayed gram, one 64-chunk a workgroup, the gram per k head.
+  "r3d_gdn_kkt_solve_c64|"
+  # The gated-delta-net chunked scan: the chunk's output and its closing state, the recurrent
+  # state in wave-matrix accumulators across the chunk loop.
+  "r3d_gdn_chunk_scan_k128_v128_c64|"
+  "r3d_gdn_gated_rmsnorm_h128|"
+  "r3d_gdn_gated_norm_had_quant_i8|"
+  "r3d_gdn_conv_w4_h128|"
+  "r3d_gdn_recurrent_update_k128_v128|"
+  # Mixture of experts: each routing weight times its expert's own scale, in place.
+  "r3d_expert_scale_bf16|"
+  # The router: softmax over the expert logits, the top_k by value, renormalised if `norm`.
+  "r3d_moe_router_topk_bf16|"
+  # The routed slots' stable counting sort (the small form, one workgroup).
+  "r3d_moe_scatter|"
+  # Fold the expert outputs back to the token (the gather, and the inverse-table form).
+  "r3d_moe_gather|"
+  # The grouped w4a8 GEMM core: int8 activation x two's-complement 4-bit weight, widened to f16 and
+  # run on the f16 wave-matrix, a per-(row, 128-of-K) scale fold. Phase 1: dense rows, no gather.
+  "r3d_moe_gemm_w4a8|"
+  # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
+  # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
+  "r3d_moe_gemm_q|"
+  # The grouped GEMM with unquantised bf16 experts: the same run-walk / gather as moe_gemm_q, the
+  # bf16 operands loaded straight into the bf16 wave-matrix fragments (f32 accumulate), no decode.
+  "r3d_moe_gemm_bf16|"
+  # The grouped GEMM with canonical MXFP4 experts: E2M1 codes (two a byte) decoded exactly to E4M3
+  # and run on the f16 wave-matrix, the E8M0 scales folded in f32 per 32 of K.
+  "r3d_moe_gemm_mxfp4a8|"
+  "r3d_moe_gemm_fp8_f32scale|"
   # The same shape over a block-scaled fp8 weight, decoded to f16 exactly (E4M3's four exponent bits
   # and three mantissa bits are a subset of f16's), and over int8 codes.
   "r3d_gemm_fp8a16_nt_m1|"

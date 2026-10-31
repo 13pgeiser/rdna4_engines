@@ -537,8 +537,9 @@ __device__ __forceinline__ long long slot_k_off(const Args& A, int blk, int kh, 
  *   the table row      by the columns the walk can name, ceil(jcap / block_size) with
  *                      jcap = min(ctx, bt_cols * block_size), which the shim proved the table
  *                      covers; the row is `M.s * bt_rs` with `M.s` a clamped sequence index.
- *   the cache          by block ids the table names; the shim requires every index the walk can
- *                      reach to be inside the cache plane (`0 <= id < num_blocks`, dense strides).
+ *   the cache          by block ids the table names; the shim proves the table's strides and that
+ *                      its rows cover the walk, but the ids themselves are device data -- 0 <= id <
+ *                      num_blocks is the caller's contract, shared with the reference.
  *                      The fold reads kv-head 0's slot-0 K row at the `stage()` offset, kHeadDim
  *                      elements (256 bytes bf16, 128 fp8), inside a slot's 2*kHeadDim. A negative
  *                      id (an unmapped block, printed -1) folds to 0 and is not dereferenced. */
@@ -1499,7 +1500,9 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     const int block_size = (int)r3d_geti_or(a, "block_size", r3d_dim(KV, 2));
     if (block_size != kBlock) return R3D_NO(RAD_E_SHAPE);
     if (r3d_dim(KV, 1) != kv_heads) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_dim(KV, 3) < 2 * kHeadDim) return R3D_NO(RAD_E_SHAPE);
+    /* The slot stride is hardcoded to 2 * kHeadDim in fill() (K then V in one slot), so a
+     * wider-last-dim cache would be read at the wrong stride: exact, not a lower bound. */
+    if (r3d_dim(KV, 3) != 2 * kHeadDim) return R3D_NO(RAD_E_SHAPE);
     const long long nb = r3d_dim(KV, 0);
     const int max_ctx = (int)(nb * block_size);
     const int max_blocks = (int)((max_ctx + block_size - 1) / block_size);

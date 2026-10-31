@@ -346,6 +346,114 @@ int r3d_shape_quant_act_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* 
 }
 
 /* The per-group int8 the i8a8 GEMM reads: the fp8 quantiser's extents with int8 codes. */
+/* The Hadamard-rotated int8: the same three planes as quant_act_i8 (x, q, scale), no row sums. */
+int r3d_shape_had_quant_act_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, 1) };
+    R3D_PICK(list);
+}
+
+/* The GELU-gated product quantiser: gate_up [M, 2n], q [M, n] i8, scale [M], out_bf16 [M, n]. */
+int r3d_shape_gelu_mul_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, 2 * n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, 1), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
+/* The prefill-overlap length trim: seqused [max_seqs], tail [trim] (extent carries the count),
+ * out [max_seqs]. */
+int r3d_shape_kv_len_trim(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t n = gi(p, n_p, "max_seqs", 0), trim = gi(p, n_p, "trim", 0);
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_I32, n, 1), opd((uint32_t)RAD_I32, trim, 1),
+                                opd((uint32_t)RAD_I32, n, 1) };
+    R3D_PICK(list);
+}
+
+/* The QSA tail: k [M, n], pos [M], cu [seqs+1], state [seqs, 1, ring, n] (inout), sidx [seqs]. */
+int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ring = gi(p, n_p, "ring", 0), seqs = gi(p, n_p, "seqs", 0);
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_I32, M, 1),
+                                opd((uint32_t)RAD_I32, seqs + 1, 1),
+                                opd((uint32_t)RAD_BF16, seqs, 1, ring, n),
+                                opd((uint32_t)RAD_I32, seqs, 1) };
+    R3D_PICK(list);
+}
+
+/* The gated Hadamard int8: a [M, n], b [M, n] (optional, fused gate_up when absent), q [M, n] i8,
+ * scale [M]. */
+int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, 1) };
+    R3D_PICK(list);
+}
+
+/* The rotated fp8: x [M, n], q [M, n] E4M3, scale [M, n/group]. */
+int r3d_shape_had_quant_act_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, n), opd((uint32_t)RAD_F8E4M3, M, n),
+                                opd((uint32_t)RAD_F32, M, ng) };
+    R3D_PICK(list);
+}
+
+/* The gated rotated fp8: gate_up [M, 2n], q [M, n] E4M3, scale [M, n/group], out_bf16 [M, n]. */
+int r3d_shape_gated_had_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, 2 * n), opd((uint32_t)RAD_F8E4M3, M, n),
+                                opd((uint32_t)RAD_F32, M, ng), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
+/* The column fp8: x [M, n], y [M, n] E4M3, scale [n] (one per column). */
+int r3d_shape_quant_cols_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, n), opd((uint32_t)RAD_F8E4M3, M, n),
+                                opd((uint32_t)RAD_F32, n, 1) };
+    R3D_PICK(list);
+}
+
+/* The rotated grouped int8: x [M, n], q [M, n] i8 (row-major), scale [M, n/group]. */
+int r3d_shape_had_quant_act_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, ng) };
+    R3D_PICK(list);
+}
+
+/* The gated rotated grouped int8: gate_up [M, 2n], q [M, n] i8 (row-major), scale [M, n/group]. */
+int r3d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, 2 * n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, ng), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
+/* The RMS norm + per-row int8: x [M, n], residual [M, n] (optional), w [n], q [M, n] i8,
+ * scale [M], out_bf16 [M, n] (optional), w_post [n] (optional), scalar [1] (optional). */
+int r3d_shape_rmsnorm_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n), opd(D, n, 1), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, 1), opd(D, M, n), opd(D, n, 1),
+                                opd(D, 1, 1) };
+    R3D_PICK(list);
+}
+
 int r3d_shape_quant_act_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

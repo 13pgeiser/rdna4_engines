@@ -120,46 +120,6 @@ __device__ __forceinline__ float e8_scale(uint8_t e)
     return (e == 0 || e == 255) ? 0.0f : ldexpf(1.0f, (int)e - 127);
 }
 
-/* Four e4m3 bytes (one dword, low byte first) as two f16x2, through the block's table. The
- * table entries are f16 bit patterns, so the words are moves, not conversions. */
-__device__ __forceinline__ void e4m3x4_to_f16x2(const uint16_t* tbl, uint32_t w, uint32_t* o)
-{
-    o[0] = (uint32_t)tbl[w & 0xffu] | ((uint32_t)tbl[(w >> 8) & 0xffu] << 16);
-    o[1] = (uint32_t)tbl[(w >> 16) & 0xffu] | ((uint32_t)tbl[(w >> 24) & 0xffu] << 16);
-}
-
-/* code * scale, in f16 arithmetic: one v_mul_f16, round to nearest, subnormals kept. Not
- * f16x2_pack, which truncates. */
-__device__ __forceinline__ uint32_t fold_pair(uint32_t w, float sc)
-{
-    const uint16_t lo16 = (uint16_t)(w & 0xffffu), hi16 = (uint16_t)(w >> 16);
-    const _Float16 a = __builtin_bit_cast(_Float16, lo16);
-    const _Float16 b = __builtin_bit_cast(_Float16, hi16);
-    const _Float16 s = (_Float16)sc;
-    const _Float16 rl = a * s, rh = b * s;
-    return (uint32_t)__builtin_bit_cast(uint16_t, rl)
-         | ((uint32_t)__builtin_bit_cast(uint16_t, rh) << 16);
-}
-
-/* Eight codes -> eight f16, through the table. gfx11 has no E4M3 convert, so the 256-entry
- * f16 table stands in for the instruction. */
-__device__ __forceinline__ void codes8(const uint2 c, const uint16_t* tbl, uint32_t* w)
-{
-    r3d_e4m3x8_ld(tbl, c, w);
-}
-
-template <int NT>
-__device__ __forceinline__ uint2 loadc8s(const uint8_t* p)
-{
-    typedef uint32_t __attribute__((ext_vector_type(2))) u8v;
-    u8v v;
-    if (NT) v = __builtin_nontemporal_load((const u8v*)p);
-    else __builtin_memcpy(&v, p, 8);
-    uint2 r;
-    __builtin_memcpy(&r, &v, 8);
-    return r;
-}
-
 /* ================================================================== the tiled row */
 
 struct ActQ {
@@ -182,7 +142,7 @@ struct MxWQ {
  * are staged as f16 with their scale folded in. The weight's e2m1 nibbles unpack to e4m3 and are
  * staged as f16 without the block scale, which is applied to the partials at the chunk's end.
  */
-template <int NT>
+template <int NT, int ALU>   /* ALU: 1 decode in registers, 0 through the LDS table */
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(2)
 mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __restrict__ y,
                      int M, int N, int K, int a_ld, int y_ld)
@@ -193,7 +153,7 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
     __shared__ uint8_t sE8[kTN];         /* the chunk's e8, one per tile row */
 
     const int tid = (int)threadIdx.x;
-    r3d_e4m3_f16_init(sTbl, tid, kBlockThreads);
+    if (!ALU) r3d_e4m3_f16_init(sTbl, tid, kBlockThreads);
 
     const int m0 = (int)blockIdx.y * kTM;
     const int n0 = (int)blockIdx.x * kTN;
@@ -220,9 +180,9 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
             if (m < M) {
                 const float sa = aq.scale[(long long)m * aq.row + (aq.gmode ? g : 0)];
                 uint32_t w[4];
-                codes8(loadc8s<NT>(a + (long long)m * a_ld + k), sTbl, w);
-                staged = make_uint4(fold_pair(w[0], sa), fold_pair(w[1], sa),
-                                    fold_pair(w[2], sa), fold_pair(w[3], sa));
+                r3d_e4m3x8_decode<ALU>(sTbl, r3d_loadc8<NT>(a + (long long)m * a_ld + k), w);
+                staged = make_uint4(r3d_fold_pair(w[0], sa), r3d_fold_pair(w[1], sa),
+                                    r3d_fold_pair(w[2], sa), r3d_fold_pair(w[3], sa));
             }
             *(uint4*)&sA[srow(mm, c8, kKC)] = staged;
         }
@@ -244,8 +204,8 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
                 for (int q = 0; q < 4; ++q) {
                     uint32_t lo, hi;
                     mxfp4_unpack8(d[q], &lo, &hi);
-                    e4m3x4_to_f16x2(sTbl, lo, w + 4 * q);
-                    e4m3x4_to_f16x2(sTbl, hi, w + 4 * q + 2);
+                    r3d_e4m3x4_decode<ALU>(sTbl, lo, w + 4 * q);
+                    r3d_e4m3x4_decode<ALU>(sTbl, hi, w + 4 * q + 2);
                 }
                 st[0] = make_uint4(w[0], w[1], w[2], w[3]);
                 st[1] = make_uint4(w[4], w[5], w[6], w[7]);
@@ -317,7 +277,7 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
  * a bijection on 16-quad groups. */
 __device__ __forceinline__ int p_ix(int q) { return q ^ ((q >> 4) & 15); }
 
-template <int MT>
+template <int MT, int ALU>   /* ALU: 1 decode in registers, 0 through the LDS table */
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(2)
 gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__ sa, int sa_stride,
                         const uint8_t* __restrict__ b, const uint8_t* __restrict__ e8,
@@ -342,7 +302,7 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
     const int kl = lane / MT;
     const int nchunk = K / chunk;
 
-    r3d_e4m3_f16_init(sTbl, threadIdx.x, kBlockThreads);
+    if (!ALU) r3d_e4m3_f16_init(sTbl, threadIdx.x, kBlockThreads);
 
     float acc = 0.0f;
     for (int ch = 0; ch < nchunk; ++ch) {
@@ -358,9 +318,9 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
                 const uint32_t w = *(const uint32_t*)(a + (long long)r * a_pitch + k0);
                 const float s = sa[(long long)r * sa_stride + k0 / kGroup];
                 uint32_t w2[2];
-                e4m3x4_to_f16x2(sTbl, w, w2);
-                lo = fold_pair(w2[0], s);
-                hi = fold_pair(w2[1], s);
+                r3d_e4m3x4_decode<ALU>(sTbl, w, w2);
+                lo = r3d_fold_pair(w2[0], s);
+                hi = r3d_fold_pair(w2[1], s);
             }
             const int q = r * (chunk >> 2) + c;
             sA[p_ix(q)] = make_uint2(lo, hi);
@@ -386,7 +346,7 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
                     uint32_t w2[2];
-                    e4m3x4_to_f16x2(sTbl, e ? ehi : elo, w2);
+                    r3d_e4m3x4_decode<ALU>(sTbl, e ? ehi : elo, w2);
                     const uint2 av = sA[p_ix(qb + 2 * v + e)];
                     p = dot4_f16x4(av.x, av.y, w2[0], w2[1], p);
                 }
@@ -439,7 +399,7 @@ static int mt_for(int M)
 
 extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_scale, long y,
                                          int M, int N, int K, int group, int a_ld, int y_ld,
-                                         long long e8_row, long stream)
+                                         long long e8_row, long stream, int alu = 1)
 {
     if (!a || !a_scale || !b || !b_scale || !y) return -1;
     if (M < 1 || N < 1 || K < 1) return -2;
@@ -460,20 +420,19 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
     if (((uintptr_t)a & 3u) || ((uintptr_t)b & 15u)) return -5;
 
     const dim3 grid((N + kWaves - 1) / kWaves), block(kBlockThreads);
-#define R3D_MXFP4A8_M16(MT)                                                                          \
+ #define R3D_MXFP4A8_M16(MT)                                                                          \
     do {                                                                                             \
-        R3D_KLAUNCH(R3D_KNAME((gemm_mxfp4a8_m16_kernel<MT>)), grid, block, (hipStream_t)stream,      \
-                    (const uint8_t*)a, (const float*)a_scale, K / kGroup, (const uint8_t*)b,         \
-                    (const uint8_t*)b_scale, (int)e8_row, (uint16_t*)y, M, N, K, chunk, a_ld,        \
-                    y_ld);                                                                            \
+        if (alu)                                                                                     \
+            R3D_KLAUNCH(R3D_KNAME((gemm_mxfp4a8_m16_kernel<MT, 1>)), grid, block, (hipStream_t)stream, \
+                        (const uint8_t*)a, (const float*)a_scale, K / kGroup, (const uint8_t*)b,      \
+                        (const uint8_t*)b_scale, (int)e8_row, (uint16_t*)y, M, N, K, chunk, a_ld,      \
+                        y_ld);                                                                        \
+        else                                                                                         \
+            R3D_KLAUNCH(R3D_KNAME((gemm_mxfp4a8_m16_kernel<MT, 0>)), grid, block, (hipStream_t)stream, \
+                        (const uint8_t*)a, (const float*)a_scale, K / kGroup, (const uint8_t*)b,      \
+                        (const uint8_t*)b_scale, (int)e8_row, (uint16_t*)y, M, N, K, chunk, a_ld,      \
+                        y_ld);                                                                        \
     } while (0)
-    switch (mt) {
-        case 1:  R3D_MXFP4A8_M16(1);  break;
-        case 2:  R3D_MXFP4A8_M16(2);  break;
-        case 4:  R3D_MXFP4A8_M16(4);  break;
-        case 8:  R3D_MXFP4A8_M16(8);  break;
-        default: R3D_MXFP4A8_M16(16); break;
-    }
 #undef R3D_MXFP4A8_M16
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -489,7 +448,7 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
 
 int launch_mxfp4a8_tiled(long av, long asv, long bvc, long bsv, long yv, int M, int N, int K,
                          int group, int a_ld, long long b_row, int as_ld, long long e8_row,
-                         int y_ld, int nt, long stream)
+                         int y_ld, int nt, long stream, int alu = 1)
 {
     if (!av || !asv || !bvc || !bsv || !yv) return -1;
     if (M < kMMin || N < 1 || K < 1) return -2;
@@ -516,20 +475,27 @@ int launch_mxfp4a8_tiled(long av, long asv, long bvc, long bsv, long yv, int M, 
     ActQ aq{(const float*)(uintptr_t)asv, (long long)as_ld, 1};
     MxWQ h{(const uint8_t*)(uintptr_t)bvc, (const uint8_t*)(uintptr_t)bsv, b_row, e8_row};
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
-    if (nt) mxfp4a8_tiled_kernel<1><<<grd, blk, 0, s>>>(
-        (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
-    else mxfp4a8_tiled_kernel<0><<<grd, blk, 0, s>>>(
-        (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
+    if (alu) {
+        if (nt) mxfp4a8_tiled_kernel<1,1><<<grd, blk, 0, s>>>(
+            (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
+        else mxfp4a8_tiled_kernel<0,1><<<grd, blk, 0, s>>>(
+            (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
+    } else {
+        if (nt) mxfp4a8_tiled_kernel<1,0><<<grd, blk, 0, s>>>(
+            (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
+        else mxfp4a8_tiled_kernel<0,0><<<grd, blk, 0, s>>>(
+            (const uint8_t*)(uintptr_t)av, aq, h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 extern "C" int r3d_gemm_nt_q_mxfp4a8_tiled(long a, long a_scale, long b_codes, long b_scale, long y,
                                            int M, int N, int K, int group, int a_ld,
                                            long long b_row, int as_ld, long long e8_row,
-                                           int y_ld, int nt, long stream)
+                                           int y_ld, int nt, long stream, int alu)
 {
     return launch_mxfp4a8_tiled(a, a_scale, b_codes, b_scale, y, M, N, K, group, a_ld, b_row,
-                                as_ld, e8_row, y_ld, nt, stream);
+                                as_ld, e8_row, y_ld, nt, stream, alu);
 }
 
 /* ================================================================== the shims
@@ -560,7 +526,7 @@ static bool e8_scan_once(const void* p, long long n)
     return true;
 }
 
-extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16(const RadArgs* a, RadStream s)
+static int r3d_mxfp4a8_m16_dispatch(const RadArgs* a, RadStream s, int alu)
 {
     if (!a) return R3D_NO(RAD_E_INVAL);
     const char* dt = r3d_gets(a, "dtype");
@@ -620,7 +586,7 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16(const RadArgs* a, RadStream s)
     const int rc = r3d_gemm_nt_q_mxfp4a8_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                              r3d_addr(Y), (int)M, (int)N, (int)K, kGroup,
                                              (int)ap, (int)yp, (long long)r3d_row_pitch(BS),
-                                             (long)s);
+                                             (long)s, alu);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);
@@ -629,7 +595,7 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16(const RadArgs* a, RadStream s)
     return RAD_OK;
 }
 
-extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
+static int r3d_mxfp4a8_tiled_dispatch(const RadArgs* a, RadStream s, int alu)
 {
     if (!a) return R3D_NO(RAD_E_INVAL);
     const char* dt = r3d_gets(a, "dtype");
@@ -708,7 +674,7 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
     const int rc = r3d_gemm_nt_q_mxfp4a8_tiled(r3d_addr(A), r3d_addr(AS), r3d_addr(B),
                                                r3d_addr(BS), r3d_addr(Y), (int)M, (int)N,
                                                (int)K, kGroup, (int)ap, cp, (int)as_p, e8p,
-                                               (int)yp, nt, (long)s);
+                                               (int)yp, nt, (long)s, alu);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);
@@ -716,5 +682,24 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
     if (rc == -4) return R3D_NO(RAD_E_DEVICE);
     return RAD_OK;
 }
+
+/* The rows' impl axis picks the E4M3 decode: the LDS table (0) and the per-byte ALU formula (1).
+ * The _alu entry points stay for a checker that names them directly. */
+extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16(const RadArgs* a, RadStream s)
+{
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    return r3d_mxfp4a8_m16_dispatch(a, s, c.impl);
+}
+extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16_alu(const RadArgs* a, RadStream s)
+{ return r3d_mxfp4a8_m16_dispatch(a, s, 1); }
+extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
+{
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    return r3d_mxfp4a8_tiled_dispatch(a, s, c.impl);
+}
+extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled_alu(const RadArgs* a, RadStream s)
+{ return r3d_mxfp4a8_tiled_dispatch(a, s, 1); }
 
 }  // namespace

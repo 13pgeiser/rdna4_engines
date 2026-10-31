@@ -199,38 +199,20 @@ __device__ __forceinline__ float zero_at_w(const WQ h, int n, int g)
 
 /* code * scale in f16: one v_mul_f16, round to nearest, subnormals kept. Not f16x2_pack, which
  * truncates (see the header). */
-__device__ __forceinline__ uint32_t fold_pair(uint32_t w, float sc)
-{
-    const uint16_t lo16 = (uint16_t)(w & 0xffffu), hi16 = (uint16_t)(w >> 16);
-    const _Float16 a = __builtin_bit_cast(_Float16, lo16);
-    const _Float16 b = __builtin_bit_cast(_Float16, hi16);
-    const _Float16 s = (_Float16)sc;
-    const _Float16 rl = a * s, rh = b * s;
-    return (uint32_t)__builtin_bit_cast(uint16_t, rl) |
-           ((uint32_t)__builtin_bit_cast(uint16_t, rh) << 16);
-}
-
-/* Eight codes -> four f16 pairs: E4M3 through the table, int8 through the codec's hardware
- * convert (two v_cvt_f32_i8 and a pack). */
+/* Eight codes -> four f16 pairs. E4M3 through the ALU decode (ALU=1) or the LDS table (ALU=0);
+ * int8 through the codec's hardware convert (two v_cvt_f32_i8 and a pack). ALU is a template
+ * parameter so the two rows (the table and the ALU decode) share the kernel and the tune picks. */
+template <int ALU>
 __device__ __forceinline__ void codes8(const uint2 c, int cdt, const uint16_t* tbl, uint32_t* w)
 {
-    if (!cdt) { r3d_e4m3x8_ld(tbl, c, w); return; }
+    if (!cdt) {
+        r3d_e4m3x8_decode<ALU>(tbl, c, w);
+        return;
+    }
     const uint32_t d[2] = { c.x, c.y };
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         w[j] = i8x2_to_f16x2((d[j >> 1] >> (16 * (j & 1))) & 0xffffu);
-}
-
-template <int NT>
-__device__ __forceinline__ uint2 loadc8s(const uint8_t* p)
-{
-    typedef uint32_t __attribute__((ext_vector_type(2))) u8v;
-    u8v v;
-    if (NT) v = __builtin_nontemporal_load((const u8v*)p);
-    else __builtin_memcpy(&v, p, 8);
-    uint2 r;
-    __builtin_memcpy(&r, &v, 8);
-    return r;
 }
 
 /*
@@ -242,19 +224,20 @@ __device__ __forceinline__ uint2 loadc8s(const uint8_t* p)
  * ARM 0 is fp8a8 (E4M3 or int8 weight codes); ARM 1 is the zero-point grid (U2 or U4 codes against
  * an int8 activation in step order).
  */
-template <int NT, int ARM, int CDT>   /* CDT: 0 E4M3, 1 int8, 2 U2, 3 U4 */
+template <int NT, int ARM, int CDT, int ALU>   /* CDT: 0 E4M3, 1 int8, 2 U2, 3 U4; ALU: 1 decode
+                                                * in registers, 0 through the LDS table */
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(2)
 fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __restrict__ b, WQ h,
                    void* __restrict__ y, int M, int N, int K, int a_ld, int y_ld)
 {
-    __shared__ __align__(16) uint16_t sA[kTM * kKC];
-    __shared__ __align__(16) uint16_t sB[kTN * kKC];
+    __shared__ __align__(16) uint16_t sA[2][kTM * kKC];
+    __shared__ __align__(16) uint16_t sB[2][kTN * kKC];
     __shared__ __align__(16) uint16_t sTbl[R3D_E4M3_TBL];
 
     const int tid = (int)threadIdx.x;
-    if (ARM == 0) {
-        r3d_e4m3_f16_init(sTbl, tid, kBlockThreads);        /* E4M3 -> f16 decoder table */
-    } else {
+    if (ARM == 0 && !ALU) {
+        r3d_e4m3_f16_init(sTbl, tid, kBlockThreads);   /* E4M3 -> f16 decoder table (ALU=0) */
+    } else if (ARM != 0) {
         /* U2 and U4 codes are unsigned integers (at most 16 values): the table holds f16(i). */
         for (int i = tid; i < 16; i += kBlockThreads) sTbl[i] = f32_to_f16((float)i);
         __syncthreads();
@@ -288,14 +271,17 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
      * plane, so each row costs a whole 64-byte sector, 8x the bytes used. A wider k-chunk (64: 4x,
      * 128: 2x) would cut that, at a cost in LDS and occupancy. */
 
-    for (int k0 = 0; k0 < K; k0 += kKC) {
-        const int g = k0 / kGroup;                           /* one group a chunk: 32 divides 128 */
+    /* Stage slab KS into the BUF-th LDS plane: the A rows and the B rows (or the sub-byte weight
+     * codes) for k in [KS, KS + kKC), decoded and scale-folded to f16. The double-buffered walk
+     * calls it for slab k+1 into the other plane while slab k's dot runs, so the global codes load
+     * overlaps the multiply. */
+    auto stage_slab = [&](int BUF, int KS) {
+        const int g = KS / kGroup;                           /* one group a chunk: 32 divides 128 */
         const float sb = scale_w(h, nb, g);                  /* one scale for the whole tile */
-
 #pragma unroll
         for (int j = tid; j < kTM * (kKC / 8); j += kBlockThreads) {
             const int mm = j / (kKC / 8), c8 = j % (kKC / 8);
-            const int m = m0 + mm, k = k0 + c8 * 8;
+            const int m = m0 + mm, k = KS + c8 * 8;
             uint4 staged = make_uint4(0, 0, 0, 0);
             if (m < M) {
                 if (ARM == 0) {
@@ -303,9 +289,9 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
                      * (`aq.gmode` 0) the group term is selected away without a branch. */
                     const float sa = aq.scale[(long long)m * aq.row + (aq.gmode ? g : 0)];
                     uint32_t w[4];
-                    codes8(loadc8s<NT>(a + (long long)m * a_ld + k), 0, sTbl, w);
-                    staged = make_uint4(fold_pair(w[0], sa), fold_pair(w[1], sa),
-                                        fold_pair(w[2], sa), fold_pair(w[3], sa));
+                    codes8<ALU>(r3d_loadc8<NT>(a + (long long)m * a_ld + k), 0, sTbl, w);
+                    staged = make_uint4(r3d_fold_pair(w[0], sa), r3d_fold_pair(w[1], sa),
+                                        r3d_fold_pair(w[2], sa), r3d_fold_pair(w[3], sa));
                 } else {
                     /* int8 codes in quant_act_i8's step order, read a dword at the permuted
                      * address (i8_dw), with one scale per row (ZP_I8_ROW). */
@@ -319,31 +305,31 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
 #pragma unroll
                     for (int q = 0; q < 4; ++q)
                         w[q] = i8x2_to_f16x2((d[q >> 1] >> (16 * (q & 1))) & 0xffffu);
-                    staged = make_uint4(fold_pair(w[0], sa), fold_pair(w[1], sa),
-                                        fold_pair(w[2], sa), fold_pair(w[3], sa));
+                    staged = make_uint4(r3d_fold_pair(w[0], sa), r3d_fold_pair(w[1], sa),
+                                        r3d_fold_pair(w[2], sa), r3d_fold_pair(w[3], sa));
                 }
             }
-            *(uint4*)&sA[srow(mm, c8, kKC)] = staged;
+            *(uint4*)&sA[BUF][srow(mm, c8, kKC)] = staged;
         }
         if (ARM == 0) {
 #pragma unroll
             for (int j = tid; j < kTN * (kKC / 8); j += kBlockThreads) {
                 const int nn = j / (kKC / 8), c8 = j % (kKC / 8);
-                const int n = n0 + nn, k = k0 + c8 * 8;
+                const int n = n0 + nn, k = KS + c8 * 8;
                 uint4 staged = make_uint4(0, 0, 0, 0);
                 if (n < N) {
                     uint32_t w[4];
-                    codes8(loadc8s<NT>(h.codes + (long long)n * h.code_row + k), h.cdt, sTbl, w);
-                    staged = make_uint4(fold_pair(w[0], sb), fold_pair(w[1], sb),
-                                        fold_pair(w[2], sb), fold_pair(w[3], sb));
+                    codes8<ALU>(r3d_loadc8<NT>(h.codes + (long long)n * h.code_row + k), h.cdt, sTbl, w);
+                    staged = make_uint4(r3d_fold_pair(w[0], sb), r3d_fold_pair(w[1], sb),
+                                        r3d_fold_pair(w[2], sb), r3d_fold_pair(w[3], sb));
                 }
-                *(uint4*)&sB[srow(nn, c8, kKC)] = staged;
+                *(uint4*)&sB[BUF][srow(nn, c8, kKC)] = staged;
             }
         } else {
             /* The sub-byte weight: w2a8 (U2, four codes a byte, K>>2 bytes a row) or w4a8_asym
              * (U4, two a byte, K>>1). A thread loads a row's whole 32-code chunk at once, 8 bytes
-             * of U2 or 16 of U4, aligned because k0 is a multiple of 32. Scale and zero are per
-             * (row, group), prefetched above. */
+             * of U2 or 16 of U4, aligned because KS is a multiple of 32. Scale and zero are per
+             * (row, group), prefetched one slab ahead. */
             constexpr int BITS = (CDT == 2) ? 2 : 4;
             constexpr int FIELD = 2 * BITS;                 /* bits a pair of codes occupies */
 #pragma unroll
@@ -353,14 +339,14 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
                                 make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0) };
                 if (n < N) {
                     const _Float16 s = s_cur, zf = zf_cur;   /* the group's pair, prefetched */
-                    if (b_has && k0 + kKC < K && (k0 + kKC) / kGroup != g) {
-                        const int gn = (k0 + kKC) / kGroup;
+                    if (b_has && KS + kKC < K && (KS + kKC) / kGroup != g) {
+                        const int gn = (KS + kKC) / kGroup;
                         s_cur  = (_Float16)scale_at_w(h, b_row, gn);
                         zf_cur = (_Float16)zero_at_w(h, b_row, gn);
                     }
                     uint32_t d[4] = { 0, 0, 0, 0 };
                     const uint8_t* cp = h.codes + (long long)n * h.code_row
-                                        + (k0 >> (CDT == 2 ? 2 : 1));
+                                        + (KS >> (CDT == 2 ? 2 : 1));
                     if (CDT == 2) { uint2 v; __builtin_memcpy(&v, cp, 8); d[0] = v.x; d[1] = v.y; }
                     else { u16v v; __builtin_memcpy(&v, cp, 16);
                            d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
@@ -379,26 +365,36 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
                     st[3] = make_uint4(w[12], w[13], w[14], w[15]);
                 }
 #pragma unroll
-                for (int q = 0; q < 4; ++q) *(uint4*)&sB[srow(nn, q, kKC)] = st[q];
+                for (int q = 0; q < 4; ++q) *(uint4*)&sB[BUF][srow(nn, q, kKC)] = st[q];
             }
         }
-        __syncthreads();
+    };
 
+    /* The double-buffered k-walk: slab 0 is staged before the loop; each iteration stages slab
+     * k+1 into the other LDS plane while slab k's dot runs from the current plane, then dots. One
+     * barrier a slab, after the dot, keeps the next slab's stage clear of the dot's LDS reads. */
+    int tbuf = 0;
+    stage_slab(0, 0);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += kKC) {
+        const int k1 = k0 + kKC;
+        if (k1 < K) stage_slab(1 - tbuf, k1);
 #pragma unroll
         for (int kc = 0; kc < kKC; kc += 2) {
             uint32_t af[8], bf[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                af[i] = *(const uint32_t*)&sA[srow_pair(rg * 8 + i, kc, kKC)];
+                af[i] = *(const uint32_t*)&sA[tbuf][srow_pair(rg * 8 + i, kc, kKC)];
 #pragma unroll
             for (int j = 0; j < 8; ++j)
-                bf[j] = *(const uint32_t*)&sB[srow_pair(cg * 8 + j, kc, kKC)];
+                bf[j] = *(const uint32_t*)&sB[tbuf][srow_pair(cg * 8 + j, kc, kKC)];
 #pragma unroll
             for (int i = 0; i < 8; ++i)
 #pragma unroll
                 for (int j = 0; j < 8; ++j) acc[i][j] = dot2_f16x2(af[i], bf[j], acc[i][j]);
         }
         __syncthreads();
+        tbuf = 1 - tbuf;
     }
 
     /* y is bf16: one narrowing, 16-byte runs of eight columns. Rows past M write nothing. */
@@ -438,7 +434,8 @@ fp8a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, const uint8_t* __rest
 
 int launch(long av, long asv, long bvc, long bsv, long yv, int M, int N, int K, int group,
            int a_ld, long long b_row, int as_ld, long long bs_row, int y_ld, int nt, long stream,
-           int sdt, int cdt, long zv = 0, long long z_row = 0, int srows = 0, int arm = 0)
+           int sdt, int cdt, long zv = 0, long long z_row = 0, int srows = 0, int arm = 0,
+           int alu = 1)
 {
     if (!av || !asv || !bvc || !bsv || !yv) return -1;
     if (M < 1 || N < 1 || K < 1) return -2;
@@ -474,18 +471,19 @@ int launch(long av, long asv, long bvc, long bsv, long yv, int M, int N, int K, 
     WQ h{ (const uint8_t*)(uintptr_t)bvc, (const uint8_t*)(uintptr_t)bsv,
           (const uint8_t*)(uintptr_t)zv, b_row, bs_row, z_row, sdt, cdt, srows };
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
-#define R3D_RUN(ARM, CD)                                                        \
+#define R3D_RUN(NT, ARM, CD, AL)                                                \
+    fp8a8_tiled_kernel<NT, ARM, CD, AL><<<grd, blk, 0, s>>>(                   \
+        (const uint8_t*)(uintptr_t)av, aq, (const uint8_t*)(uintptr_t)bvc,      \
+        h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld)
+#define R3D_LAUNCH(ARM, CD)                                                     \
     do {                                                                        \
-        if (nt) fp8a8_tiled_kernel<1, ARM, CD><<<grd, blk, 0, s>>>(             \
-            (const uint8_t*)(uintptr_t)av, aq, (const uint8_t*)(uintptr_t)bvc,   \
-            h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);                       \
-        else fp8a8_tiled_kernel<0, ARM, CD><<<grd, blk, 0, s>>>(                \
-            (const uint8_t*)(uintptr_t)av, aq, (const uint8_t*)(uintptr_t)bvc,   \
-            h, (void*)(uintptr_t)yv, M, N, K, a_ld, y_ld);                       \
+        if (alu) { if (nt) R3D_RUN(1, ARM, CD, 1); else R3D_RUN(0, ARM, CD, 1); } \
+        else     { if (nt) R3D_RUN(1, ARM, CD, 0); else R3D_RUN(0, ARM, CD, 0); } \
     } while (0)
-    if (arm == 0) { if (cdt == 1) R3D_RUN(0, 1); else R3D_RUN(0, 0); }
-    else          { if (cdt == 3) R3D_RUN(1, 3); else R3D_RUN(1, 2); }
+    if (arm == 0) { if (cdt == 1) R3D_LAUNCH(0, 1); else R3D_LAUNCH(0, 0); }
+    else          { if (cdt == 3) R3D_LAUNCH(1, 3); else R3D_LAUNCH(1, 2); }
 #undef R3D_RUN
+#undef R3D_LAUNCH
     const hipError_t le = hipGetLastError();
     if (le != hipSuccess) {
         if (r3d_trace_on())
@@ -627,7 +625,7 @@ static bool gemm_plan_once(long long M, long long N, long long K, unsigned a_ran
     return true;
 }
 
-extern "C" int r3d_rad_gemm_nt_q_fp8_tiled(const RadArgs* args, RadStream s)
+static int r3d_fp8a8_tiled_dispatch(const RadArgs* args, RadStream s, int alu)
 {
     if (!args || args->n_t < 5) return R3D_NO(RAD_E_INVAL);
     const RadTensor* A = r3d_opt(args, 0);
@@ -814,7 +812,7 @@ extern "C" int r3d_rad_gemm_nt_q_fp8_tiled(const RadArgs* args, RadStream s)
     const int nt = (int)r3d_geti_or(args, "nt", 0);
     const int st = launch(r3d_addr(A), r3d_addr(AS), (long)(uintptr_t)bvc, (long)(uintptr_t)bsv,
                           r3d_addr(Y), (int)M, (int)N, (int)K, (int)group, (int)a_ld, b_row,
-                          (int)as_ld, bs_row, (int)y_ld, nt, (long)s, sdt, cdt);
+                          (int)as_ld, bs_row, (int)y_ld, nt, (long)s, sdt, cdt, 0, 0, 0, 0, alu);
     if (st == -1) return R3D_NO(RAD_E_INVAL);
     if (st == -2) return R3D_NO(RAD_E_SHAPE);
     if (st == -3) return R3D_NO(RAD_E_STRIDE);
@@ -978,3 +976,14 @@ extern "C" int r3d_rad_gemm_nt_q_w2a8_tiled(const RadArgs* args, RadStream s)
     if (st == -4) return R3D_NO(RAD_E_DEVICE);
     return RAD_OK;
 }
+
+/* The row's impl axis picks the decode: the table (0) and the ALU formula (1). The _alu entry
+ * point stays for a checker that names it directly. */
+extern "C" int r3d_rad_gemm_nt_q_fp8_tiled(const RadArgs* a, RadStream s)
+{
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    return r3d_fp8a8_tiled_dispatch(a, s, c.impl);
+}
+extern "C" int r3d_rad_gemm_nt_q_fp8_tiled_alu(const RadArgs* a, RadStream s)
+{ return r3d_fp8a8_tiled_dispatch(a, s, 1); }

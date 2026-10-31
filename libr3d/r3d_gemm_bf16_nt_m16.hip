@@ -81,6 +81,11 @@
 
 #include <algorithm>
 
+/* The wave-matrix arm's launcher, in r3d_gemm_bf16_nt_m16_wmma.hip: the row's `impl` point 1. */
+extern "C" int r3d_gemm_nt_bf16_m16_wmma(long a, long b, long y, int M, int N, int K, int a_ld,
+                                         int y_ld, int sk, int wv, int nt, long scratch,
+                                         long stream);
+
 namespace {
 
 constexpr int kBlockThreads = 256;           // eight waves, the default
@@ -331,6 +336,18 @@ extern "C" int r3d_rad_gemm_nt_bf16_m16(const RadArgs* a, RadStream s)
 
     R3dGemmCfg c;
     r3d_cfg_gemm(a, &c);
+    if (c.impl == 1) {
+        /* The wave-matrix arm: same contract, the slab's law at 16 k, its own launcher. The
+         * alignment and pitch checks above are the arm's too. `c.sk` is the unresolved value
+         * here -- the arm resolves 0 to its widest legal split and checks its own scratch, so
+         * the arena goes across whenever the row asked for one. */
+        const int e = r3d_gemm_nt_bf16_m16_wmma(r3d_addr(A), r3d_addr(B), r3d_addr(Y), (int)M,
+                                                (int)N, (int)K, (int)a_ld, (int)y_ld, c.sk, c.wv,
+                                                c.nt, (long)(uintptr_t)a->scratch, (long)(uintptr_t)s);
+        if (e == 0) return RAD_OK;
+        return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
+                                        : e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+    }
     int wv = c.wv > 0 ? c.wv : kWaves;
     if (wv > kWaves) wv = kWaves;
     if (wv != 1 && wv != 2 && wv != 4 && wv != kWaves) return R3D_NO(RAD_E_SHAPE);

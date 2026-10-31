@@ -220,6 +220,36 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 __device__ __forceinline__ void sched_barrier() { __builtin_amdgcn_sched_barrier(0); }
 __device__ __forceinline__ void group_barrier() { __syncthreads(); }
 
+/* --- WMMA fragment types and wrappers (shared by every wave-matrix GEMM). ---
+ *
+ * The fragment types: v16half (f16 codes), v16short (bf16 codes, the truncated-f32 bit pattern),
+ * v4int (int8 codes), and the v8float / v8int accumulators. The wrappers are thin around the gfx11
+ * wave-matrix builtins; w32 is the only width gfx11 exposes. Shared so a kernel never re-defines
+ * the fragment types or re-wraps the builtin. */
+using v16half  = _Float16 [[clang::ext_vector_type(16)]];
+using v16short = short    [[clang::ext_vector_type(16)]];
+using v8float  = float    [[clang::ext_vector_type(8)]];
+using v4int    = int      [[clang::ext_vector_type(4)]];
+using v8int    = int      [[clang::ext_vector_type(8)]];
+
+__device__ __forceinline__ v8float wmma_f16(const v16half& a, const v16half& b, const v8float& c)
+{ return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c); }
+__device__ __forceinline__ v8float wmma_bf16(const v16short& a, const v16short& b, const v8float& c)
+{ return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c); }
+__device__ __forceinline__ v8int wmma_i8(const v4int& a, const v4int& b, const v8int& c)
+{ return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, 0); }
+
+/* The half-precision-accumulate builtins. The accumulator is a 16-element vector (8 VGPRs x 2);
+ * `opsel` (a compile-time constant) selects which half holds the 8 live elements (false = the
+ * even indices 0,2,..,14, true = the odd). The non-selected half is untouched, so an epilogue
+ * that reads all 16 sees stale values in the dead half -- read only the selected half. */
+template <bool OSEL>
+__device__ __forceinline__ v16half wmma_f16acc(const v16half& a, const v16half& b, const v16half& c)
+{ return __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c, OSEL); }
+template <bool OSEL>
+__device__ __forceinline__ v16short wmma_bf16acc(const v16short& a, const v16short& b, const v16short& c)
+{ return __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32(a, b, c, OSEL); }
+
 /* ================================================================== the geometry constants
  *
  * A gfx11 GPU's wave slots: a CU has 4 SIMDs and a SIMD holds 16 wave32s, so 64 slots a CU. HIP's

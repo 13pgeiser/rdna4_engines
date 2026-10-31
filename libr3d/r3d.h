@@ -237,10 +237,11 @@ int r3d_gemm_nt_q_fp8_tiled(long a, long a_scale, long b_codes, long b_scale, lo
  * takes the m16 launcher, M >= 17 the tiled one.
  */
 int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_scale, long y, int M, int N,
-                              int K, int group, int a_ld, int y_ld, long long e8_row, long stream);
+                              int K, int group, int a_ld, int y_ld, long long e8_row, long stream,
+                               int alu);
 int r3d_gemm_nt_q_mxfp4a8_tiled(long a, long a_scale, long b_codes, long b_scale, long y, int M,
                                 int N, int K, int group, int a_ld, long long b_row, int as_ld,
-                                long long e8_row, int y_ld, int nt, long stream);
+                                long long e8_row, int y_ld, int nt, long stream, int alu);
 
 /* ================================================================== r3d_gemm_inta8.hip
  *
