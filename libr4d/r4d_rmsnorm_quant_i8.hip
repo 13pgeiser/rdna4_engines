@@ -64,10 +64,7 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 // depend on the block's width. `row` holds the row's bf16 values; when the block's threads wrote
 // it, the caller issues the barrier first.
 __device__ __forceinline__ float lanes_sumsq(const uint16_t* row, uint32_t n) {
-    float ss = 0.0f;
-    if (threadIdx.x < kR4dSumLanes)
-        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) { const float f = bf2f(row[i]); ss += f * f; }
-    return ss;
+    return r4d_lanes_sumsq(row, n, [](uint16_t h) { return bf2f(h); });
 }
 
 __device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {

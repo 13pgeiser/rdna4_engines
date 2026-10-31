@@ -82,10 +82,7 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 // row's bits do not depend on the block's width. When the block's threads stored `row`, the
 // caller issues the barrier first, as add_rmsnorm does.
 __device__ __forceinline__ float lanes_sumsq(const uint16_t* row, uint32_t n) {
-    float ss = 0.0f;
-    if (threadIdx.x < kR4dSumLanes)
-        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) { const float v = bf2f(row[i]); ss += v * v; }
-    return ss;
+    return r4d_lanes_sumsq(row, n, [](uint16_t h) { return bf2f(h); });
 }
 
 // Quantise one 128-column group from the four bf16-rounded values a lane owns. The clamp in

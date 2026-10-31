@@ -246,12 +246,7 @@ __device__ __forceinline__ void rmsnorm_body(
     const TX* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
 
-    float ss = 0.0f;
-    if (threadIdx.x < kR4dSumLanes)
-        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) {
-            const float v = act_f32(xr[i]);
-            ss += v * v;
-        }
+    float ss = r4d_lanes_sumsq(xr, n, [](TX h) { return act_f32(h); });
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += THR) {
@@ -305,11 +300,7 @@ __device__ __forceinline__ void add_rmsnorm_body(
         for (uint32_t i = threadIdx.x; i < n; i += THR)
             xr[i] = f32_to_bf16(bf16_to_f32(xr[i]) + bf16_to_f32(ar[i]));
         __syncthreads();
-        if (threadIdx.x < kR4dSumLanes)
-            for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) {
-                const float v = bf16_to_f32(xr[i]);
-                ss += v * v;
-            }
+        ss = r4d_lanes_sumsq(xr, n, [](uint16_t h) { return bf16_to_f32(h); });
     }
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);

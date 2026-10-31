@@ -299,6 +299,27 @@ __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
 // width, so a launch at it keeps the order it always had.
 constexpr uint32_t kR4dSumLanes = 256;
 
+// A row's sum of squares in kR4dSumLanes' partition: lane v < kR4dSumLanes adds f(row[v])^2,
+// f(row[v + 256])^2, ... in column order; the lanes past it return 0. The reads go out eight at a
+// time before their adds: one at a time, a row the block has just written and now reads back costs
+// a memory latency a column (21 in a row for a 5376-wide Gemma 3 hidden state, twice a sandwich
+// norm). The adds keep their order, so the bits are the one-at-a-time loop's.
+template <typename T, typename F>
+__device__ __forceinline__ float r4d_lanes_sumsq(const T* row, uint32_t n, F f) {
+    float ss = 0.0f;
+    if (threadIdx.x >= kR4dSumLanes) return ss;
+    uint32_t i = threadIdx.x;
+    for (; i + 7 * kR4dSumLanes < n; i += 8 * kR4dSumLanes) {
+        float v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v[k] = f(row[i + k * kR4dSumLanes]);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) ss += v[k] * v[k];
+    }
+    for (; i < n; i += kR4dSumLanes) { const float v = f(row[i]); ss += v * v; }
+    return ss;
+}
+
 // The full-card cliff of the R9700 (gfx1201, 64 CUs). A launch whose wavefront count falls in
 // the last 32 before a multiple of 2048 runs about five times slower than the same work one
 // workgroup wider, whatever the kernel does: 256-thread workgroups take 27.6 us at 253 to 256 of
