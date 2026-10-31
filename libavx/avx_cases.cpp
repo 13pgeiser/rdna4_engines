@@ -139,6 +139,7 @@ std::vector<Case> build_cases() {
     for (const char* dt : { "f32", "bf16" }) {
         add("hc_enter",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
         add("swiglu_clamped", { HI("M", 5), HI("n", 259), HF("limit", 0.5), HS("dtype", dt) });
+        add("swiglu_step", { HI("M", 5), HI("n", 259), HF("limit", 0.5), HS("dtype", dt) });
         if (!std::strcmp(dt, "bf16"))
             add("dsa_pool", { HI("M", 7), HI("n", 128), HI("ratio", 4), HS("dtype", "bf16") });
         if (!std::strcmp(dt, "bf16"))
@@ -165,6 +166,13 @@ std::vector<Case> build_cases() {
               HF("hc_eps", 1e-6), HI("chunk", 129), HS("dtype", dt) });
         add("mhc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
         add("mhc_contract", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        for (int norm : { 0, 1 })
+            add("router_sigmoid_group_topk",
+                { HI("M", 5), HI("n_expert", 512), HI("top_k", 8), HI("n_group", 8),
+                  HI("topk_group", 4), HI("norm", norm), HF("route_scale", 2.5), HS("dtype", dt) });
+        add("mla_attn_paged", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64), HI("rope_dim", 16),
+                                HI("block_size", 4), HF("scale", 0.0721687836), HI("ctx", 23),
+                                HS("dtype", dt) });
         add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
                           HI("block_size", 4), HF("scale", 0.125), HS("dtype", dt) });
         for (const char* mode : { "prefill", "verify" })
