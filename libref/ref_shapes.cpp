@@ -773,6 +773,24 @@ int ref_router_sigmoid_topk_shape(const RadParam* p, int n_p, int operand, RadOp
     o.t(D, { M, k });
     return o.finish("router_sigmoid_topk", operand, out);
 }
+int ref_swiglu_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_silu_mul_shape(p, n_p, operand, out);
+}
+int ref_router_sigmoid_group_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), ne = gi(p, n_p, "n_expert", 0),
+                  k = gi(p, n_p, "top_k", 0), ng = gi(p, n_p, "n_group", 0),
+                  kg = gi(p, n_p, "topk_group", 0);
+    if (M < 1 || ne < 1 || ne > 512 || k < 1 || ng < 1 || ne % ng || ne / ng < 2 || kg < 1 ||
+        kg > ng || k > kg * (ne / ng))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });
+    o.t(RAD_F32, { ne });
+    o.t_idx({ M, k }, ne, -1, 0);
+    o.t(D, { M, k });
+    return o.finish("router_sigmoid_group_topk", operand, out);
+}
 int ref_mla_project_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), d = gi(p, n_p, "head_dim", 0),
                   l = gi(p, n_p, "latent_dim", 0);
@@ -839,6 +857,28 @@ int ref_mla_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ M }, 0, B * bs, 0);
     o.t(dtype, { M, H, D });
     return o.finish("mla_attn", operand, out);
+}
+/* One sequence whose context is its query (a prefill chunk), as attn_paged describes itself; a
+ * harness passes `ctx` for a deeper history. */
+int ref_mla_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0),
+                  bs = gi(p, n_p, "block_size", 0);
+    if (M < 1 || L < 1 || L > 2048 || R < 1 || H < 1 || bs < 1) return RAD_E_UNSUPPORTED;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const uint32_t dtype = act_dt(p, n_p);
+    Opd o;
+    o.t(dtype, { M, H, L });                          /* q */
+    o.t(dtype, { M, H, R });                          /* q_rope */
+    o.t(dtype, { blocks, 1, bs, L + R });             /* kv */
+    o.t_idx({ 1, blocks }, blocks, -1, 0);            /* block_table */
+    o.t_idx({ 1 }, 0, ctx, 0);                        /* seqused */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens: [0, M], one sequence */
+    o.skip();                                         /* gate */
+    o.t(dtype, { M, H, L });                          /* out */
+    return o.finish("mla_attn_paged", operand, out);
 }
 int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);

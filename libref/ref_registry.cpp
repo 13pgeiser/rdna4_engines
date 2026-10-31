@@ -170,6 +170,10 @@ static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT(
 static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
+static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPaged[] = { OPD("q"), OPD_O("q_rope"), OPD("kv"),
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), OPD_O("gate"), OUT("out") };
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
     P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
@@ -179,6 +183,8 @@ static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT(
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
+static const RadParamSpec pRouterSigmoidGroup[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("n_group"), P_INT("topk_group"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `div` divides the rounded sum, rounded again (default 1, the plain sum): a mean of branches
  * summed pairwise, as a vocoder averages its residual blocks. */
@@ -1240,6 +1246,10 @@ static const RadOpSchema kSchemas[] = {
   "rounding." },
 { "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
   "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
+{ "mla_attn_paged", ARR(pMlaAttnPaged), ARR(oMlaAttnPaged),
+  "Dense causal latent attention over a paged cache whose token row is the latent then the rotated "
+  "key part: score = scale * (q . latent + q_rope . rope), value = the latent; sequences as in "
+  "attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
@@ -1248,6 +1258,8 @@ static const RadOpSchema kSchemas[] = {
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
   "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
+{ "swiglu_step", ARR(pSwigluClamped), ARR(oGateUp),
+  "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half." },
 { "swiglu_clamped", ARR(pSwigluClamped), ARR(oGateUp),
   "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
@@ -1563,6 +1575,9 @@ static const RadOpSchema kSchemas[] = {
   "when rows == n. `act` is \"sigmoid\" or \"none\", and it applies to the SCALAR. With `add` "
   "present the form is y = bf16(x * act(s)) + add -- the product NARROWED before the sum, which "
   "is what makes the fused form bit-identical to the pair it replaces." },
+{ "router_sigmoid_group_topk", ARR(pRouterSigmoidGroup), ARR(oRouterSigmoid),
+  "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, selection "
+  "runs over the topk_group best groups; correction bias selects, original scores weight." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_topk", ARR(pRouter), ARR(oRouter),
@@ -2270,6 +2285,10 @@ SIMPLE("ref_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_
        ref_dsa_query),
 SIMPLE("ref_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        ref_gemm_nt_f32),
+SIMPLE("ref_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
+       DT_FLOAT, ref_mla_attn_paged),
+SIMPLE("ref_swiglu_step", "swiglu_step", "elem", "SwiGLU clipped after the SiLU", DT_FLOAT,
+       ref_swiglu_step),
 SIMPLE("ref_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
        ref_mla_project),
 SIMPLE("ref_swiglu_clamped", "swiglu_clamped", "elem", "asymmetrically clipped SwiGLU", DT_FLOAT,
@@ -2454,6 +2473,8 @@ SIMPLE("ref_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary
 
 SIMPLE("ref_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
        DT_FLOAT, ref_scale_rows),
+SIMPLE("ref_router_sigmoid_group_topk", "router_sigmoid_group_topk", "moe",
+       "group-limited sigmoid correction-bias routing", DT_FLOAT, ref_router_sigmoid_group_topk),
 SIMPLE("ref_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        ref_router_sigmoid_topk),
 SIMPLE("ref_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
