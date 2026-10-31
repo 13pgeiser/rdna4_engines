@@ -564,7 +564,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mc.shared_ungated = 1;
     mc.swiglu_step = 1;
     mc.rows = g.max_tok;
-    /* GPTQ calibration (RADIANCE_CALIB_DIR): the tap writes each expert's down Hessians. */
+    /* GPTQ calibration (RADIANCE_CALIB_DIR): the tap writes each expert's down Hessian over its
+     * whole width, so a calibration run gives every rank whole experts (below). */
     mc.calib = calib_dir() != nullptr ? 1 : 0;
     mc.probed_expert = (int64_t)g.rank * (s.experts / world);
     const int64_t eb = s.ff_exp / RAD_FP8_BLOCK, sb = s.ff_shared / RAD_FP8_BLOCK;
@@ -620,6 +621,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, ms, &ms.cfg));
         if (ms.cfg.expert_rot) mc.expert_rot = 1;
         if (ms.cfg.expert_bf16) mc.expert_bf16 = 1;
+    }
+    /* ---- whole experts per rank for a calibration run and for bf16 experts (a slice of a bf16
+     * expert is not one container run), as qwen4exp does: rank r owns experts [r E/W, (r+1) E/W).
+     * Served to calibrate and compare, not for decode speed. */
+    if (world > 1 && (mc.calib || mc.expert_bf16)) {
+        int64_t per = 0;
+        RAD_ARCH_TRY(divide_or_fail(s.experts, world, "num_experts", &per));
+        for (int l = (int)s.dense_layers; l < (int)s.n_layer + (mtp ? 1 : 0); ++l) {
+            auto& c = msrc[(size_t)l].cfg;
+            c.n_expert = per;
+            c.expert_base = (int64_t)g.rank * per;
+            c.n_ff_exp = s.ff_exp;
+            for (int q = 0; q < 4; ++q) c.ff_lo4[q] = c.ff_hi4[q] = 0;
+        }
+        mc.n_expert = per;
+        mc.expert_base = (int64_t)g.rank * per;
+        mc.n_ff_exp = s.ff_exp;
+        rad_note(b, "%s: rank %d owns experts [%lld, %lld) of %lld whole",
+                 mc.calib ? "calibration (each expert's Hessian is over its whole width)"
+                          : "bf16 experts",
+                 g.rank, (long long)mc.expert_base, (long long)(mc.expert_base + per),
+                 (long long)s.experts);
     }
     RAD_ARCH_TRY(buffers(b, m));
     RAD_ARCH_TRY(moe_buffers(b, m, mc));
