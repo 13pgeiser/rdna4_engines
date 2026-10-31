@@ -1875,6 +1875,17 @@ static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P
                                          P_STR("dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
+static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+                                              P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPaged[] = { { "q", RAD_OPD_IN, 0 },
+                                                { "q_rope", RAD_OPD_IN, 1 },
+                                                { "kv", RAD_OPD_IN, 0 },
+                                                { "block_table", RAD_OPD_IN, 0 },
+                                                { "seqused", RAD_OPD_IN, 0 },
+                                                { "cu_seqlens", RAD_OPD_IN, 0 },
+                                                { "gate", RAD_OPD_IN, 1 },
+                                                { "out", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "kv", RAD_OPD_IN, 0 },
                                            { "bt", RAD_OPD_IN, 0 },
@@ -1895,6 +1906,8 @@ static const RadOperandSpec oDsaPool[] = {
 };
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
+static const RadParamSpec pRouterSigmoidGroup[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("n_group"), P_INT("topk_group"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = {
     { "logits", RAD_OPD_IN, 0 }, { "bias", RAD_OPD_WEIGHT, 0 },
     { "ids", RAD_OPD_OUT, 0 }, { "weights", RAD_OPD_OUT, 0 }
@@ -3003,6 +3016,10 @@ static const RadOpSchema kSchemas[] = {
            "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once."),
     SCHEMA("mla_attn", pMlaAttn, oMlaAttn,
            "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths."),
+    SCHEMA("mla_attn_paged", pMlaAttnPaged, oMlaAttnPaged,
+           "Dense causal latent attention over a paged cache whose token row is the latent then the "
+           "rotated key part: score = scale * (q . latent + q_rope . rope), value = the latent; "
+           "sequences as in attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))."),
     SCHEMA("mla_project", pMlaProject, oGemmNt,
            "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
     SCHEMA("dsa_score", pDsaScore, oDsaScore,
@@ -3013,6 +3030,8 @@ static const RadOpSchema kSchemas[] = {
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
     SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
            "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("swiglu_step", pSwigluClamped, oGateUp,
+           "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
            "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped_quant_fp8", pSwigluClampedQuant, oGatedQuantFp8,
@@ -3399,6 +3418,10 @@ static const RadOpSchema kSchemas[] = {
            "With `add` present the form is y = bf16(x * act(s)) + add: the product is NARROWED "
            "before the sum, which is what makes the fused form bit-identical to the two ops it "
            "stands in for rather than merely close to them."),
+    SCHEMA("router_sigmoid_group_topk", pRouterSigmoidGroup, oRouterSigmoid,
+           "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, "
+           "selection runs over the topk_group best groups; correction bias selects, original "
+           "scores weight."),
     SCHEMA("router_sigmoid_topk", pRouterSigmoid, oRouterSigmoid,
            "Single-group sigmoid routing; correction bias selects experts, original scores weight them."),
     SCHEMA("router_sigmoid_topk_scatter", pRouterSigmoidScatter, oRouterSigmoidScatter,
@@ -4719,11 +4742,16 @@ static const RadConstraint cMlaAttn[] = {
     C_GE("M", 1),      C_LE("M", 65535),  C_EQ("latent_dim", 512), C_GE("heads", 1),
     C_LE("heads", 64), C_GE("blocks", 1), C_EQ("block_size", 4),   C_IN("dtype", "bf16")
 };
+static const RadConstraint cMlaAttnPaged[] = {
+    C_GE("M", 1),       C_LE("M", 65535),     C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
+    C_GE("heads", 1),   C_LE("heads", 64),    C_GE("block_size", 1),   C_LE("block_size", 256),
+    C_IN("dtype", "bf16")
+};
 static const RadConstraint cMlaProject[] = { C_GE("M", 1),
                                              C_LE("M", 65535),
                                              C_GE("heads", 1),
                                              C_LE("heads", 64),
-                                             C_EQ("head_dim", 256),
+                                             C_IN("head_dim", "128 256"),
                                              C_EQ("latent_dim", 512),
                                              C_IN("mode", "absorb expand"),
                                              C_IN("dtype", "bf16") };
@@ -4773,6 +4801,11 @@ static const RadConstraint cRouterSigmoid[] = { C_GE("M", 1),        C_LE("M", 6
                                                 C_GE("n_expert", 1), C_LE("n_expert", 512),
                                                 C_GE("top_k", 1),    C_LE("top_k", 32),
                                                 C_IN("dtype", "f32") };
+static const RadConstraint cRouterSigmoidGroup[] = { C_GE("M", 1),        C_LE("M", 65535),
+                                                     C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                     C_GE("top_k", 1),    C_LE("top_k", 32),
+                                                     C_GE("n_group", 1),  C_LE("n_group", 32),
+                                                     C_IN("dtype", "f32") };
 /* The sort's single-workgroup form bounds M * top_k at 1024, which the shim checks. */
 static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE("M", 1024),
                                                        C_GE("n_expert", 1), C_LE("n_expert", 512),
@@ -6276,8 +6309,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScore), NOTUNE,
   nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
   r4d_shape_dsa_score },
+{ "mla_attn_paged_bf16", "mla_attn_paged", "attn",
+  "dense causal latent attention with a rotary part, a wave a (row, head), split history",
+  "latent_dim=512, rope_dim=64, heads<=64, block_size<=256; one page table a sequence",
+  "bf16 Q/rotary/cache/gate/output, f32 softmax and partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPaged), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_paged, r4d_rad_mla_attn_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn_paged },
 { "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
-  "head_dim=256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",
+  "head_dim 128 or 256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProject), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_project, nullptr, nullptr, nullptr,
   r4d_shape_mla_project },
@@ -6296,6 +6336,12 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaPool), NOTUNE,
   nullptr, nullptr, r4d_rad_dsa_pool, nullptr, nullptr, nullptr,
   r4d_shape_dsa_pool },
+{ "swiglu_step_bf16", "swiglu_step", "elem",
+  "SwiGLU clipped after the SiLU", "positive finite limit; pitched rows",
+  "bf16 in and out, fp32 arithmetic", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_step, nullptr, nullptr, nullptr,
+  r4d_shape_silu_mul },
 { "swiglu_clamped_bf16", "swiglu_clamped", "elem",
   "asymmetrically clipped SwiGLU", "positive finite limit; pitched rows",
   "bf16 in and out, fp32 arithmetic", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -8512,6 +8558,12 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_scale_rows, nullptr, nullptr, nullptr,
   r4d_shape_scale_rows },
 
+{ "router_sigmoid_group_topk_f32", "router_sigmoid_group_topk", "moe",
+  "group-limited sigmoid correction-bias routing, one wave a row", "experts <=512, groups <=32, top_k<=32",
+  "f32 logits, bias and weights; i32 ids", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterSigmoidGroup), NOTUNE,
+  nullptr, nullptr, r4d_rad_router_sigmoid_group_topk, nullptr, nullptr, nullptr,
+  r4d_shape_router_sigmoid_group_topk },
 { "router_sigmoid_topk_f32", "router_sigmoid_topk", "moe",
   "sigmoid correction-bias routing", "single group, experts <=512, top_k<=32",
   "f32 logits, bias and weights; i32 ids", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,

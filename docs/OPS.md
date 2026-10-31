@@ -272,6 +272,7 @@ libr4d's `swiglu_clamped_bf16` serves bf16 in and out at any width, pitched rows
 SiLU is taken first and its value clipped above, so a gate far past `limit` gives exactly `limit`
 where `swiglu_clamped` gives `silu(limit)` (3.93 at a limit of 4). HF's reference model for Ling-3.0
 ignores the clamp; the served form is the one checkpoints are evaluated with.
+libr4d's `swiglu_step_bf16` serves it as `swiglu_clamped_bf16` does.
 
 **`add` and `mul`** broadcast a `b` of exactly `n` elements along the rows of a taller output (a
 bias add). Nothing else broadcasts, in these or any other elementwise op. `add`'s `div` divides
@@ -2215,6 +2216,10 @@ groups of at least two; a group's rank is the sum of its two largest `p + bias`;
 best groups are kept, ties to the lower group; the selection is `router_sigmoid_topk`'s over the
 kept groups' experts only, and the weights are the same. `top_k` is at most the kept experts.
 
+libr4d's `router_sigmoid_group_topk_f32` is `router_sigmoid_topk_f32`'s wave with the groups ranked
+first, a lane a group: up to 512 experts in up to 32 groups, `top_k` up to 32, pitched rows, `M` up
+to 65535.
+
 **`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
 `ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with
 1 (GLM-5.3's shared expert has no gate, and the gather reads one). `n_expert`, `n_local`,
@@ -3322,6 +3327,11 @@ With `gate` `[M, >= heads]` (a head's gate logit) the output is
 `bf16(bf16(out) * bf16(sigmoid(gate)))`, Ling's head-wise attention gate taken on the latent, ahead
 of the expansion. The softmax is f32 and `out` rounded once before the gate.
 
+libr4d's `mla_attn_paged_bf16` serves `latent_dim` 512 and `rope_dim` 64, up to 64 heads, pages of
+up to 256 tokens: a wave a (query row, head), its lanes holding 16 latent and 2 rotary columns each,
+so a score is one wave sum. A short batch splits each row's history over waves and joins the f32
+partials.
+
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.
 `mode=absorb` multiplies `a` `[M, heads, head_dim]` by the head's key block as stored,
@@ -3331,10 +3341,10 @@ accumulate in f32 and round once to bf16. The KV cache stays latent; only this w
 per-head width. Its rows are head-major, so a tensor-parallel slice of whole heads is a row range.
 `a` and `y` may also be `[M, heads*width]`, heads contiguous, with their own token pitch.
 
-libr4d's `mla_project_bf16` serves `head_dim` 256 and `latent_dim` 512, up to 64 heads, pitched
-tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each weight
-element once for them, with every row's sum in the same order whatever the group, so a row's bytes
-do not depend on the batch.
+libr4d's `mla_project_bf16` serves `head_dim` 128 or 256 and `latent_dim` 512, up to 64 heads,
+pitched tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each
+weight element once for them, with every row's sum in the same order whatever the group, so a row's
+bytes do not depend on the batch.
 
 ## Draft heads
 
