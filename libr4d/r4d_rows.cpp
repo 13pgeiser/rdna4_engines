@@ -6314,7 +6314,7 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, rope_dim=64, heads<=64, block_size<=256; one page table a sequence",
   "bf16 Q/rotary/cache/gate/output, f32 softmax and partials",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPaged), NOTUNE,
-  nullptr, nullptr, r4d_rad_mla_attn_paged, r4d_rad_mla_attn_scratch, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_mla_attn_paged, r4d_rad_mla_attn_paged_scratch, nullptr, nullptr,
   r4d_shape_mla_attn_paged },
 { "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
   "head_dim 128 or 256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",

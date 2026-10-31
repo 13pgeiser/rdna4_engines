@@ -326,6 +326,18 @@ __global__ __launch_bounds__(128) void merge_paged(const float* scratch, const u
     }
     paged_store(out, gate, m, r, head, lane, value, den);
 }
+/* Splits of a (row, head) job's history. A row's bytes must not depend on the batch it is in: a
+ * speculative verify scores the k + 1 rows of a sequence in one launch, and greedy output equals
+ * the run without speculation only if each row gives the single-row decode at its position bit for
+ * bit. So the count is a function of the head count alone, not of the launch's rows or its longest
+ * table. A history shorter than the count leaves splits empty; they exit at once and merge_paged
+ * skips them. */
+/* The rows the scratch serves at full split: a verify at depth 31. */
+constexpr long kPagedRows = 32;
+int paged_splits(long heads) { return (int)std::min(16l, (256 + heads - 1) / heads); }
+int64_t paged_scratch_bytes(long rows, long heads) {
+    return std::min(rows, kPagedRows) * heads * paged_splits(heads) * PART * 4;
+}
 /* Operands: q [M, heads, 512], q_rope [M, heads, 64], kv [pages, 1, bs, >= 576], block_table
  * [seqs, blocks], seqused [seqs], cu_seqlens [seqs + 1], gate [M, >= heads] (optional), out
  * [M, heads, 512]. */
@@ -371,10 +383,11 @@ int paged_body(const RadArgs* a, RadStream stream) {
         (gate && (gate->rank != 2 || gate->shape[0] != q.shape[0] || gate->shape[1] < heads ||
                   gate->stride[1] != 1)))
         return RAD_E_SHAPE;
-    const long jobs = q.shape[0] * heads;
-    int splits = (int)std::min(16l, (256 + jobs - 1) / jobs);
-    splits = (int)std::max(1l, std::min((long)splits, (bt.shape[1] * bs + 63) / 64));
-    if (!a->scratch || a->scratch_bytes < scratch_bytes) splits = 1;
+    /* The split comes from the head count alone (paged_splits). Only a batch whose partials the
+     * scratch cannot hold takes fewer, as many as fit. */
+    const long rows = q.shape[0], slots = a->scratch ? a->scratch_bytes / (PART * 4) : 0;
+    int splits = paged_splits(heads);
+    if (rows * heads * splits > slots) splits = (int)std::max(1l, slots / (rows * heads));
     const PagedMeta m{ q.stride[0],  q.stride[1],     qr.stride[0],       qr.stride[1],
                        kv.stride[0], kv.stride[2],    bt.stride[0],       bt.stride[1],
                        o.stride[0],  o.stride[1],     gate ? (long)gate->stride[0] : 0L,
@@ -1071,6 +1084,12 @@ extern "C" int r4d_rad_mla_attn_paged(const RadArgs* a, RadStream stream) {
     return paged_body(a, stream);
 }
 extern "C" int64_t r4d_rad_mla_attn_scratch(const RadArgs*) { return scratch_bytes; }
+/* Sized at the band's top row count, at most kPagedRows (paged_splits). */
+extern "C" int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs* a) {
+    const long heads = r4d_geti_or(a, "heads", 0), rows = r4d_geti_or(a, "M", kPagedRows);
+    if (heads < 1 || heads > 64 || rows < 1) return RAD_E_SHAPE;
+    return paged_scratch_bytes(rows, heads);
+}
 extern "C" int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*) { return matrix_scratch_bytes; }
 extern "C" void r4d_mla_matrix_pin_form(int form) { g_mla_matrix_form = form; }
 extern "C" void r4d_mla_rows_pin_form(int form) { g_mla_rows_form = form; }

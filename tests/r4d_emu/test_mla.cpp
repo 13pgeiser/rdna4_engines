@@ -714,6 +714,79 @@ int periodic_report() {
     return ok ? 0 : 1;
 }
 
+/* mla_attn_paged (Ling-3.0's MLA) under speculation: the k + 1 rows of a verify, launched
+ * together, against k + 1 single-row decodes at the same positions, each with the table its own
+ * step carries and scratch as the hook sizes it. Greedy output equals the run without
+ * speculation only if they agree bit for bit; a split taken from the launch's rows (16, 16 and
+ * 11 ways at eight heads for one, two and three rows) or from its longest table does not. */
+int run_paged_verify(int heads, int context, std::mt19937& rng) {
+    constexpr int PB = 16, RD = 64, W = D + RD, kMaxRows = 32;
+    const int pages = (context + kMaxRows + PB - 1) / PB;
+    std::normal_distribution<float> nrm(0.f, 1.f);
+    std::vector<uint16_t> kvb((size_t)pages * PB * W), qb((size_t)kMaxRows * heads * D),
+        rb((size_t)kMaxRows * heads * RD), gb((size_t)kMaxRows * heads);
+    for (auto& v : kvb) v = rad_f32_to_bf16(nrm(rng));
+    for (auto& v : qb) v = rad_f32_to_bf16(0.25f * nrm(rng));
+    for (auto& v : rb) v = rad_f32_to_bf16(0.25f * nrm(rng));
+    for (auto& v : gb) v = rad_f32_to_bf16(nrm(rng));
+    std::vector<int> page(pages);
+    for (int i = 0; i < pages; ++i) page[i] = i;
+    std::shuffle(page.begin(), page.end(), rng);
+    /* Rows [row0, row0 + rows) of one sequence whose context after the step is `used`. */
+    auto launch = [&](int row0, int rows, int used, std::vector<uint16_t>& out) {
+        const int blocks = (used + PB - 1) / PB;
+        std::vector<int> bt(page.begin(), page.begin() + blocks), su = { used }, cu = { 0, rows };
+        RadTensor t[8] = { tens(qb.data() + (size_t)row0 * heads * D, RAD_BF16, { rows, heads, D }),
+                           tens(rb.data() + (size_t)row0 * heads * RD, RAD_BF16,
+                                { rows, heads, RD }),
+                           tens(kvb.data(), RAD_BF16, { pages, 1, PB, W }),
+                           tens(bt.data(), RAD_I32, { 1, blocks }),
+                           tens(su.data(), RAD_I32, { 1 }),
+                           tens(cu.data(), RAD_I32, { 2 }),
+                           tens(gb.data() + (size_t)row0 * heads, RAD_BF16, { rows, heads }),
+                           tens(out.data() + (size_t)row0 * heads * D, RAD_BF16,
+                                { rows, heads, D }) };
+        RadParam p[6]{};
+        const char* keys[5] = { "M", "heads", "latent_dim", "rope_dim", "block_size" };
+        const long long vals[5] = { rows, heads, D, RD, PB };
+        for (int i = 0; i < 5; ++i) {
+            p[i].key = keys[i];
+            p[i].kind = RAD_P_INT;
+            p[i].ival = vals[i];
+        }
+        p[5].key = "scale";
+        p[5].kind = RAD_P_F64;
+        p[5].dval = 1.0 / std::sqrt(192.0);
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 8;
+        a.p = p;
+        a.n_p = 6;
+        const int64_t need = r4d_rad_mla_attn_paged_scratch(&a);
+        if (need < 0) return (int)need;
+        std::vector<char> scratch((size_t)need + 16, 0);
+        a.scratch = scratch.data() + ((16 - ((uintptr_t)scratch.data() & 15)) & 15);
+        a.scratch_bytes = need;
+        return r4d_rad_mla_attn_paged(&a, nullptr);
+    };
+    int fails = 0;
+    for (int rows : { 2, 3, 4, 5, 8, kMaxRows }) {
+        std::vector<uint16_t> verify((size_t)rows * heads * D), single(verify.size());
+        int rc = launch(0, rows, context + rows, verify);
+        for (int i = 0; i < rows && rc == RAD_OK; ++i) rc = launch(i, 1, context + i + 1, single);
+        int same = 0;
+        for (int i = 0; i < rows; ++i)
+            same += !std::memcmp(&verify[(size_t)i * heads * D], &single[(size_t)i * heads * D],
+                                 (size_t)heads * D * 2);
+        const bool ok = rc == RAD_OK && same == rows;
+        std::printf("paged verify: %2d heads, context %4d, %2d rows: %2d/%2d rows equal the "
+                    "single-row decode bit for bit  %s\n",
+                    heads, context, rows, same, rows, ok ? "PASS" : "FAIL");
+        fails += !ok;
+    }
+    return fails;
+}
+
 }   // namespace
 
 int main(int argc, char** argv) {
@@ -782,6 +855,13 @@ int main(int argc, char** argv) {
         if (filter && !std::strstr(splits[i].name, filter)) continue;
         std::mt19937 rng(20261021u + (unsigned)i);
         fails += run_split(splits[i].name, splits[i].world, splits[i].fresh, rng);
+    }
+    /* Eight heads is a TP4 rank of Ling-3.0, 32 one card; a context of 40 is under the old
+     * clamp by table length, 700 past it. */
+    if (!filter || std::strstr("paged verify", filter)) {
+        std::mt19937 rng(20261031u);
+        for (int heads : { 8, 32 })
+            for (int context : { 40, 700 }) fails += run_paged_verify(heads, context, rng);
     }
     if (!filter) fails += periodic_report();
     std::printf("%d failure(s)\n", fails);

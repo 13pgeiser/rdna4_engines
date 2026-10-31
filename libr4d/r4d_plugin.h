@@ -832,6 +832,7 @@ int r4d_rad_mla_attn(const RadArgs*, RadStream);
 int r4d_rad_mla_attn_paged(const RadArgs*, RadStream);
 int r4d_shape_mla_attn_paged(const RadParam*, int, int, RadOpdDesc*);
 int64_t r4d_rad_mla_attn_scratch(const RadArgs*);
+int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs*);
 int r4d_rad_mla_attn_matrix(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*);
 int r4d_rad_mla_attn_rows(const RadArgs*, RadStream);

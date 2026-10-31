@@ -3330,7 +3330,11 @@ of the expansion. The softmax is f32 and `out` rounded once before the gate.
 libr4d's `mla_attn_paged_bf16` serves `latent_dim` 512 and `rope_dim` 64, up to 64 heads, pages of
 up to 256 tokens: a wave a (query row, head), its lanes holding 16 latent and 2 rotary columns each,
 so a score is one wave sum. A short batch splits each row's history over waves and joins the f32
-partials.
+partials. The split count comes from the head count alone, never from the rows of the launch or
+its longest table, so a row's bytes do not depend on its batch: a speculative verify of `k + 1`
+rows must give, bit for bit, the single-row decodes at the same positions, or greedy output
+differs from the run without speculation. That holds up to 32 rows a launch, the rows the scratch
+hook sizes for; a larger batch takes as many splits as its scratch holds.
 
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.
