@@ -29,6 +29,11 @@
  * the latent, gated per head; kv_b's value rows expand it. The cache row is stored as one KV head
  * of 288, the latent's first 288 values in the K slot and the rest in the V slot.
  *
+ * ============================== THE DRAFTER ==============================
+ *
+ * The MTP layer (checkpoint layer 42: an MLA layer with the full routed feed-forward) is a serial
+ * drafter around GlmMtp, declared when the deployment speculates.
+ *
  * docs/ARCHITECTURES.md describes the model and its traps. */
 #include <cmath>
 #include <cstdio>
@@ -38,6 +43,7 @@
 
 #include <arch/rad_arch.h>
 #include <arch/rad_block_glm_kda.h>
+#include <arch/rad_block_glm_mtp.h>
 #include <arch/rad_block_mlp_fp8.h>
 #include <arch/rad_block_moe_fp8.h>
 
@@ -312,6 +318,10 @@ struct Model {
     MoeFP8::Wire mw{};
     rad_weight token = 0, head = 0, final_gain = 0;
     rad_op embed = 0, embed_ar = 0, norm = 0, gather = 0, head_op = 0;
+    /* The draft head and its layer, declared only when the deployment speculates. */
+    bool have_mtp = false;
+    GlmMtp mtp{};
+    Layer draft{};
 };
 
 static Model g_model[MAX_RANKS];
@@ -593,9 +603,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     g.n_ff = s.ff_dense / world;
 
     /* ---- each routed layer's expert format, read before any buffer is declared: rotated experts
-     * need the rotated activation pair, sized here. */
-    std::vector<MoeFP8::Src> msrc((size_t)s.n_layer);
-    for (int l = (int)s.dense_layers; l < (int)s.n_layer; ++l) {
+     * need the rotated activation pair, sized here. The MTP layer follows the trunk's. */
+    const bool mtp = ctx->max_spec > 0 && cfg(meta, "num_nextn_predict_layers", 0) == 1;
+    std::vector<MoeFP8::Src> msrc((size_t)s.n_layer + 1);
+    for (int l = (int)s.dense_layers; l < (int)s.n_layer + (mtp ? 1 : 0); ++l) {
         const char* pre = nm.ckpt("model.layers.%d", l);
         MoeFP8::Src& ms = msrc[(size_t)l];
         ms.cfg = mc;
@@ -715,22 +726,73 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
            { m.logit_input }, { m.logits });
     if (!m.embed || !m.norm || !m.gather || !m.head_op) return RAD_E_INVAL;
 
+    /* ---- the drafter: GlmMtp at Ling's width and checkpoint names around one more MLA layer
+     * with the routed feed-forward. It shares the trunk's buffers, latent cache, embedding and
+     * head. */
+    if (mtp) {
+        const int l = (int)s.n_layer;
+        auto& mt = m.mtp;
+        mt.width = g.n_embd;
+        mt.prefix = nm.ckpt("model.layers.%d", l);
+        mt.layer = l;
+        mt.norm_src = "final_layernorm.weight";
+        const GlmMtp::Wire tw{ m.final_hidden, m.logits, m.token, m.head };
+        RAD_ARCH_TRY(mt.declare_inputs(b, g, tw, false));
+        Layer& d = m.draft;
+        d.mla = true;
+        const char* pre = mt.prefix;
+        const char* nn = nm.f("blk.%d.attn_norm.weight", l);
+        RAD_ARCH_TRY(map_copy(b, nn, nm.ckpt("%s.input_layernorm.weight", pre)));
+        d.gain = decl_w(b, nn, RAD_F32, { g.n_embd }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                        grp_layer(l));
+        RAD_ARCH_TRY(d.norm.declare(b, g, d.gain, mt.x, m.act, g.n_embd));
+        RAD_ARCH_TRY(d.attn.declare(b, nm, g, s, l, m.aw, nm.ckpt("%s.attention", pre), m.latent));
+        RAD_ARCH_TRY(mt.declare_join(b, m.y));
+        auto mw = m.mw;
+        mw.x = mt.x;
+        RAD_ARCH_TRY(d.moe.declare(b, nm, g, l, mw, msrc[(size_t)l]));
+        RAD_ARCH_TRY(mt.declare_head(b));
+        m.have_mtp = true;
+    }
     rad_note(b,
              "Ling-3.0 (bailing_hybrid): TP%d, %lld layers, %lld KDA + %lld dense MLA, %lld experts "
-             "top-%lld in %lld groups (%lld kept)",
+             "top-%lld in %lld groups (%lld kept), MTP %s",
              world, (long long)s.n_layer, (long long)(s.n_layer - s.n_layer / s.group_size),
              (long long)(s.n_layer / s.group_size), (long long)s.experts, (long long)s.top_k,
-             (long long)s.groups, (long long)s.topk_groups);
+             (long long)s.groups, (long long)s.topk_groups, m.have_mtp ? "enabled" : "not declared");
     return RAD_OK;
 }
 
 /* ============================== step ============================== */
 
+/* A draft pass as GLM-5.3's (glm5next.cpp): the head's inputs, its MLA layer over every row (a
+ * history pass fills the draft layer's latent cache for all of them), then on the proposal rows the
+ * residual join, the routed feed-forward and the head. */
+static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
+    if (!m.have_mtp || batch->draft_pass == 1) {
+        rad_step_fail(c, "bailing_hybrid MTP pass is not declared or has invalid round 1");
+        return;
+    }
+    const int64_t T = batch->n_tok;
+    m.mtp.step_inputs(c, batch);
+    auto& l = m.draft;
+    l.norm.step(c, T);
+    l.attn.step(c, batch);
+    if (batch->draft_pass < 0 && batch->n_draft_out <= 0) return;
+    m.mtp.step_join(c, batch, m.y);
+    l.moe.step_rows(c, GlmMtp::head_rows(batch));
+    m.mtp.step_head(c, batch);
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
     const int64_t T = batch->n_tok, E = m.g.n_embd;
-    if (batch->enc || batch->draft_pass) {
-        rad_step_fail(c, "bailing_hybrid serves text without a drafter");
+    if (batch->enc) {
+        rad_step_fail(c, "bailing_hybrid serves text");
+        return;
+    }
+    if (batch->draft_pass) {
+        draft_pass(c, m, batch);
         return;
     }
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x, T));
@@ -757,8 +819,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+/* The default draft depth for `--num-speculative-tokens auto`: GlmMtp's operating point, when the
+ * checkpoint carries its one MTP layer. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    if (cfg(meta, "num_nextn_predict_layers", 0) == 1) out->draft_depth = GlmMtp::kDepth;
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
     return RAD_OK;
 }
