@@ -2434,8 +2434,15 @@ function update(s, dt) {
 
   /* ---- devices, in the same panel as the cache meter: they are one question. */
   const cards = s.cards || [];
-  if (devs.length !== cards.length)
+  if (devs.length !== cards.length) {
+    /* Rebuild means REPLACE. The old rows must leave the panel: a card-count change -- a
+     * TP flip, a card swap -- otherwise stacks a fresh set on the stale one, and the panel
+     * grows by the old count every time until the page is reloaded. Per-row removal rather
+     * than the sibling guards' container-clear: #mem is shared with the KV and prefix
+     * meters, which are built once and must survive. Same shape as the request rows above. */
+    devs.forEach((d) => d.wrap.remove());
     devs = cards.map((c) => meter($("mem"), "dev", c.name, c.index));
+  }
   cards.forEach((c, i) => {
     setBar(devs[i].i, c.vram_total ? c.vram_used / c.vram_total : 0, false);
     devs[i].v.textContent = hbOf(c.vram_used, c.vram_total, " / ");
