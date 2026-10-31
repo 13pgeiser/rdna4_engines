@@ -533,9 +533,11 @@ struct GateQuantFP8 {
      * quantises its input itself (an int8 linear's op_q). */
     bool silu_only = false;
 
+    /* `step`: with `limit`, clip after the SiLU (`swiglu_step`, Ling-3.0) rather than before it
+     * (`swiglu_clamped`, GLM-5.3). It has no fused quantiser, so the pair runs. */
     int  declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act, int64_t n,
                  const char* act_name = "silu", int64_t max_rows = 0, bool bf16_out = true,
-                 bool rot = false, double limit = 0);
+                 bool rot = false, double limit = 0, bool step = false);
     void step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
@@ -544,7 +546,7 @@ struct GateQuantFP8 {
  * bf16 output is unrotated either way. */
 inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act,
                                  int64_t n, const char* act_name, int64_t max_rows,
-                                 bool bf16_out, bool rot, double limit) {
+                                 bool bf16_out, bool rot, double limit, bool step) {
     a = act;
     want_x = bf16_out;
     op_quant = 0;
@@ -562,7 +564,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
             std::strcmp(act_name, "silu"))
             return RAD_E_INVAL;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
-        if (fuse_clamped && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
+        if (fuse_clamped && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
             op =
                 RAD_OP(b, "swiglu_clamped_quant_fp8",
@@ -579,7 +581,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         }
         want_x = true;
         op = rw(b,
-                RAD_OP(b, "swiglu_clamped",
+                RAD_OP(b, step ? "swiglu_step" : "swiglu_clamped",
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
                                   RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS),
