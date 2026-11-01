@@ -85,7 +85,9 @@ console.log("== the prune is the SHIPPED setMetric, actually called ==");
 function shippedPrune(seed, nowSVal, value) {
   const Mm = { m: { n: { firstChild: { nodeValue: "" } }, line: { setAttribute: () => {} } } };
   const hh = { m: seed.slice() };
-  new Function("M", "hist", "nowS", "spark", "HIST_S", SETMETRIC + "\nsetMetric('m', " + value + ", 'x');\nreturn hist;")(Mm, hh, nowSVal, () => {}, HS);
+  /* v is passed as a parameter, not interpolated into the source: interpolating the string
+     "null" and the literal null produce the same text, so the null case would not be null. */
+  new Function("M", "hist", "nowS", "spark", "HIST_S", "v", SETMETRIC + "\nsetMetric('m', v, 'x');\nreturn hist;")(Mm, hh, nowSVal, () => {}, HS, value);
   return hh.m;
 }
 let fast = []; for (let i = 0; i < 600; i++) fast.push({ t: i * 0.1, v: 1 });
@@ -99,7 +101,7 @@ eq(r[0].t, 3000 - HS, "the oldest survivor is the first sample inside the window
 let edge = []; for (let i = 0; i < 5; i++) edge.push({ t: 1000 + i, v: 1 });
 eq(shippedPrune(edge, 1000 + HS, 1).length, 6, "a sample exactly at nowS-HIST_S survives (exclusive <)");
 eq(shippedPrune(edge, 1001 + HS, 1).length, 5, "one second later that same sample is pruned");
-r = shippedPrune([{ t: 10, v: 1 }], 1005, "null");
+r = shippedPrune([{ t: 10, v: 1 }], 1005, null);
 eq(r.length, 1, "a null reading records nothing and prunes nothing");
 eq(r[0].t, 10, "the earlier sample is untouched");
 console.log(fails ? "\n" + fails + " FAILURE(S) of " + checks : "\nALL " + checks + " CHECKS PASS on the shipped page JS");
