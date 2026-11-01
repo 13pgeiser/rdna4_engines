@@ -7373,3 +7373,45 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
         CHECK_EQ(h, c.want);
     }
 }
+
+/* A recycled slot keeps its struct: add_locked only allocates when the slot's pointer is null, so
+ * every field it does not list survives from the request before. admitted_us is the one such field
+ * with no backstop where it is read -- the prefill figure is computed from it whenever it is
+ * non-zero, and a stamp left by an earlier request is always older, so the interval is inflated and
+ * reads as a slow prefill rather than as missing data. Admission cannot precede arrival, so
+ * prefill_s may never exceed ttft_s: that is the invariant that catches a stamp carried over from
+ * another request. */
+TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(8, 4);
+    REQUIRE(a != 0);
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_OK(f.sch.reap(a));
+
+    /* A's slot is on the free list, so B takes the slot and the struct that came with it. */
+    const uint64_t b = f.submit(8, 4);
+    REQUIRE(b != 0);
+    for (int i = 0; i < 80; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) {
+            if (st[(size_t)j].id != b) continue;
+            if (st[(size_t)j].ttft_s < 0) break;   /* no first token yet */
+            /* Both figures describe this request alone, so prefill -- admission to first token --
+             * is bounded by ttft, arrival to first token. */
+            CHECK(st[(size_t)j].prefill_s >= 0);
+            CHECK(st[(size_t)j].prefill_s <= st[(size_t)j].ttft_s);
+            return;
+        }
+    }
+    CHECK(!"the second request never reached its first token");
+}

@@ -385,6 +385,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             j["slot"]      = q.slot;
             j["age_s"]     = q.age_s;
             if (q.ttft_s >= 0) j["ttft_s"] = q.ttft_s;
+            if (q.prefill_s >= 0) j["prefill_s"] = q.prefill_s;
             j["tps"]       = q.decode_tps;
             reqs.push_back(std::move(j));
         }
@@ -594,6 +595,13 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
    inset a little too, so it does not start on the same edge as the row it belongs to. */
 .cvrow { display:flex; align-items:center; gap:8px; }
 #cvnote { margin-top:9px; padding-left:4px; }
+
+.pollrow { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--fg); }
+.pollrow + .pollnote { margin-top:6px; }
+.pollnote { max-width:74ch; }
+.pollrow input[type=number] { width:11ch; font:400 15px/1.4 var(--mono); color:var(--fg);
+                              background:var(--track); border:1px solid var(--edge);
+                              border-radius:5px; padding:7px 10px; }
 
 /* ------------------------------------------------ THE FIRST ROW IS FIXED, THE REST FIT THEIR CONTENT
    A card whose content changes LENGTH moves every card under it while it is being read, and one
@@ -1167,6 +1175,7 @@ nav button.on { color:var(--fg); background:var(--track); }
       <button id="tab-dash" class="on">Dashboard</button>
       <button id="tab-sess">Sessions</button>
       <button id="tab-model">Model</button>
+      <button id="tab-adv">Advanced</button>
     </nav>
     <input id="key" type="password" placeholder="API key" autocomplete="off" hidden>
     <span class="ver" id="ver"></span>
@@ -1224,7 +1233,7 @@ nav button.on { color:var(--fg); background:var(--track); }
           </div>
           <div id="hist">
             <div class="hhead"><span class="cap">history</span>
-              <span class="hsum" id="hsum"></span>
+              <span class="hsum" id="hsum" title="mean of the per-request figures over all captured rows; each request counts once, so this is not the pooled rate the DECODE tile shows. last 20 and last 5 are the same mean over the most recent 20 and 5 requests. prefill is fresh prompt tokens over the time from admission to first token, so queue wait is not charged to it; on an engine that reports no admission time it falls back to time to first token, which does include queue wait. ttft is the median time to first token, including queue wait."></span>
               <span class="hbtn" id="hjson" title="copy the stored rows as JSON">json</span>
               <span class="hbtn" id="hclr" title="clear the stored history">clear</span></div>
             <div class="hlist">
@@ -1359,6 +1368,25 @@ nav button.on { color:var(--fg); background:var(--track); }
 
   </div>
 
+  <!-- CHOSEN ONCE AND THEN LEFT ALONE. A view of its own, reached from the header like the others:
+       these settings are not read alongside the figures, and at the foot of the dashboard column
+       they sat under everything a reader scrolls past to get to them. -->
+  <div id="view-adv" hidden>
+    <section class="panel">
+      <div class="phead"><span class="cap">Advanced</span>
+                         <span class="aside" id="advsum"></span></div>
+      <div class="pbody">
+        <label class="pollrow" for="pollidle">Idle interval
+          <input id="pollidle" type="number" min="100" max="5000" step="50"> ms</label>
+        <label class="pollrow" style="margin-top:12px" for="pollbusy">Busy interval
+          <input id="pollbusy" type="number" min="100" max="5000" step="50"> ms</label>
+        <div class="aside pollnote">Idle is how often the page fetches when no request is running;
+          busy is how often while one is in flight. Set them equal for a single fixed rate.
+          100&ndash;5000 ms each.</div>
+      </div>
+    </section>
+  </div>
+
   <!-- WHAT HAPPENS IF A STORED CONVERSATION COMES BACK. The strip says how well the cache is
        serving and where what it holds is; the tables say, a conversation a row, what its next
        turn reuses and what it prefills. Every figure is tokens or bytes. -->
@@ -1477,7 +1505,7 @@ $("key").addEventListener("change", (e) => {
    * tab is left and re-opened. */
   loadControlVector();
 });
-const HIST = 120;                                    /* 60s of history at the 500ms poll */
+const HIST_S = 60;   /* the sparkline's window in SECONDS: the span it draws and prunes to */
 
 const el = (t, c, x) => { const e = document.createElement(t);
                           if (c) e.className = c; if (x !== undefined) e.textContent = x;
@@ -1594,6 +1622,10 @@ const stepTime = (ms) => !finite(ms) ? { n: DASH, u: "ms" }
 /* The caption and the unit live in the document beside the cell they label. Holding a second
  * copy of them here would be holding a copy that can differ. */
 const METRICS = ["step", "decode", "prefill", "flight", "kv", "accept"];
+/* One monotonic stamp per poll: every ring is pruned and drawn against it, so a window means
+ * the same span of seconds whatever interval the browser polls at. performance.now() so a wall
+ * clock adjustment cannot stretch or shrink a window. */
+let nowS = 0;
 const M = {}, hist = {};
 for (const k of METRICS) {
   hist[k] = [];
@@ -1608,9 +1640,10 @@ for (const k of METRICS) {
  * rare spike owns the box and the typical variation is squeezed into a pixel. A spike past the
  * 95th draws pinned to the top; the number above carries the level and the detail line the
  * extremes. The stroke is 1.25 units wide, so a one-unit inset keeps it off the edge. */
-function spark(key, vals) {
+function spark(key, pts) {
   const s = M[key], w = 200, h = 22;
-  if (vals.length < 3) { s.line.setAttribute("d", ""); return; }
+  if (pts.length < 3) { s.line.setAttribute("d", ""); return; }
+  const vals = pts.map(p => p.v);
   const q = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)))];
   const sorted = [...vals].sort((a, b) => a - b);
   let lo = q(sorted, 0.05), hi = q(sorted, 0.95);
@@ -1618,18 +1651,28 @@ function spark(key, vals) {
    * extremes then serve, so the spikes still show. */
   if (!(hi > lo)) { lo = sorted[0]; hi = sorted[sorted.length - 1]; }
   const span = hi - lo;
-  const dx = w / (vals.length - 1);
+  /* X IS TIME, NOT SAMPLE INDEX. Index spacing is only honest while every sample is the same age
+   * apart; once the poll rate varies -- adaptive, or a browser throttling a busy tab -- a busy
+   * stretch of 100 ms samples would be drawn five times wider than the seconds it took. The newest
+   * sample sits on the right edge and the window spans HIST_S back from it, so a stretch gets the
+   * room its seconds deserve and a gap in the samples shows as a gap in the line. */
+  const t1 = pts[pts.length - 1].t;
   let d = "";
-  for (let i = 0; i < vals.length; i++) {
+  for (let i = 0; i < pts.length; i++) {
     let t = span > Math.abs(hi) * 1e-3 ? (vals[i] - lo) / span : 0.5;
     if (t < 0) t = 0; else if (t > 1) t = 1;
-    d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," + (h - 1 - (h - 2) * t).toFixed(1);
+    const x = Math.min(w, Math.max(0, w * (1 - (t1 - pts[i].t) / HIST_S)));
+    d += (i ? "L" : "M") + x.toFixed(1) + "," + (h - 1 - (h - 2) * t).toFixed(1);
   }
   s.line.setAttribute("d", d);
 }
 function setMetric(key, value, text) {
   M[key].n.firstChild.nodeValue = text;
-  if (value != null) { hist[key].push(value); if (hist[key].length > HIST) hist[key].shift(); }
+  if (value != null) {
+    const r = hist[key];
+    r.push({ t: nowS, v: value });
+    while (r.length && r[0].t < nowS - HIST_S) r.shift();
+  }
   spark(key, hist[key]);
 }
 
@@ -1638,7 +1681,7 @@ function setMetric(key, value, text) {
  * figure per poll, so the three figures are the page's own:
  *   best / highest - the extreme this page has seen at the current concurrency; it resets on
  *                    reload, not on a server restart. "highest" where more is not better.
- *   recent         - the mean of the last RECENT samples at that concurrency.
+ *   recent         - the mean of the last RECENT_S seconds at that concurrency.
  *   now            - the current value as a percentage of that extreme.
  * Figures are kept per concurrency ("@cN" past one), because a batched rate read against the
  * single-stream best reports a batch arriving as a level change. Requests in flight keeps one
@@ -1647,13 +1690,12 @@ function setMetric(key, value, text) {
  * without a now clause. There is no ~99 cap as on the decode step: the extreme comes from the
  * same series as `now`, so 100% is exact.
  *
- * RECENT is shorter than the sparkline's 60 s: a 60 s mean still shows a burst long after the lane
+ * RECENT_S is shorter than the sparkline's HIST_S: a 60 s mean still shows a burst long after the lane
  * went quiet, and 15 s decays within a quarter-minute while still tracking the mean mid-burst.
  * Prefill's window is 5 s, so `recent` follows a prefill of several seconds while it runs instead
  * of diluting it; the engine's prefill rate is itself already windowed. */
-const RECENT = 30;   /* 15 s at the 500 ms poll for a figure sampled every poll; acceptance is
-                        sampled only on polls that drafted, so its 30 samples can span minutes */
-const RECENT_PREFILL = 10;   /* 5 s */
+const RECENT_S = 15;       /* the `recent` window in seconds, for a figure sampled every poll */
+const RECENT_PREFILL_S = 5;   /* prefill's is shorter, so a several-second prefill shows up in it */
 const extAt = {}, winAt = {};
 let lastActiveC = 0;
 /* Whether the server streams its KV (--kv-resident). Settled at bringup, so it cannot change under
@@ -1661,14 +1703,16 @@ let lastActiveC = 0;
 let kvStreamOn = false;
 /* `win` false records the extreme only: acceptance pools its window in accPool and reads only
  * `highest` from extAt. */
-function noteSample(key, c, value, cap, win) {
+function noteSample(key, c, value, capS, win) {
   if (value == null || !finite(value)) return;
   const e = extAt[key] || (extAt[key] = {});
   if (!(c in e) || value > e[c]) e[c] = value;
   if (win === false) return;
   const w = winAt[key] || (winAt[key] = {});
   const s = w[c] || (w[c] = []);
-  s.push(value); if (s.length > (cap || RECENT)) s.shift();
+  const lim = capS || RECENT_S;
+  s.push({ t: nowS, v: value });
+  while (s.length && s[0].t < nowS - lim) s.shift();
 }
 function triple(key, c, label, fmt, showNow) {
   /* `recent` is a window mean: a window maximum would equal `best` on any steady lane. */
@@ -1676,13 +1720,18 @@ function triple(key, c, label, fmt, showNow) {
   if (!e || !(c in e)) return "";
   /* A bucket whose extreme is zero still renders (requests in flight before the first request);
    * only the `now` clause needs a nonzero extreme to divide by. */
-  const s = winAt[key][c];
-  let sum = 0;
-  for (const v of s) sum += v;
-  const recent = sum / s.length;
-  const now = s[s.length - 1];
+  /* The extreme is a property of the session and outlives a cleared window (a gap, a restart);
+   * `recent` and `now` are properties of the window, so they are dropped until it fills again.
+   * Rendering the extreme alone keeps the line's one surviving figure rather than blanking it. */
+  const s = (winAt[key] || {})[c];
   const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
-  let out = label + " " + fmt(e[c]) + " · recent " + fmt(recent);
+  let out = label + " " + fmt(e[c]);
+  if (!s || !s.length) return out;
+  let sum = 0;
+  for (const p of s) sum += p.v;
+  const recent = sum / s.length;
+  const now = s[s.length - 1].v;
+  out += " · recent " + fmt(recent);
   /* No `now` clause while nothing runs, as on the decode step: a zero rate is an idle lane, and
    * "now 0% of best" would read as a fault. */
   if (showNow !== false && e[c] > 0) out += " · now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
@@ -1693,13 +1742,15 @@ function triple(key, c, label, fmt, showNow) {
 function acceptTriple(c, showNow) {
   const e = extAt["accept"];
   const ring = accPool[c];
-  if (!e || !(c in e) || !ring || !ring.length) return "";
+  if (!e || !(c in e)) return "";
+  const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
+  let out = "highest " + pct(e[c], 0);
+  if (!ring || !ring.length) return out;
   let R = 0, A = 0;
   for (const d of ring) { R += d.dr; A += d.da; }
-  if (R <= 0) return "";
+  if (R <= 0) return out;
   const last = ring[ring.length - 1];
-  const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
-  let out = "highest " + pct(e[c], 0) + " \u00b7 recent " + pct(A / R, 0);
+  out += " \u00b7 recent " + pct(A / R, 0);
   if (showNow !== false && e[c] > 0 && last.dr > 0)
     out += " \u00b7 now " + Math.round(100 * (last.da / last.dr) / e[c]) + "% of highest" + tag;
   return out;
@@ -1925,15 +1976,20 @@ function lines(svgId, series) {
     }
   }
   let hi = 0;
-  for (const s of series) for (const v of s.vals) if (v > hi) hi = v;
+  for (const s of series) for (const p of s.pts) if (p.v > hi) hi = p.v;
+  /* X IS TIME, as on the sparklines: both series share one window, so a busy stretch is the width
+   * of its seconds in both and the two lines stay comparable to each other. */
+  let t1 = 0;
+  for (const s of series) if (s.pts.length) t1 = Math.max(t1, s.pts[s.pts.length - 1].t);
   series.forEach((s, k) => {
     const p = svg.childNodes[k + 1];
-    if (s.vals.length < 2) { p.setAttribute("d", ""); return; }
-    const dx = w / (s.vals.length - 1);
+    if (s.pts.length < 2) { p.setAttribute("d", ""); return; }
     let d = "";
-    for (let i = 0; i < s.vals.length; i++)
-      d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," +
-           (h - 1 - (h - 4) * (hi > 0 ? s.vals[i] / hi : 0)).toFixed(1);
+    for (const q of s.pts) {
+      const x = Math.min(w, Math.max(0, w * (1 - (t1 - q.t) / HIST_S)));
+      d += (d ? "L" : "M") + x.toFixed(1) + "," +
+           (h - 1 - (h - 4) * (hi > 0 ? q.v / hi : 0)).toFixed(1);
+    }
     p.setAttribute("d", d);
   });
   return hi;
@@ -2075,9 +2131,15 @@ function histSave() {
 /* Prefill rate: the prompt tokens computed (not from the prefix cache) over the time to first
  * token; none for a fully cached prompt. */
 function histPrefill(r) {
-  if (!finite(r.prompt) || !finite(r.ttft_s) || r.ttft_s <= 0) return null;
+  if (!finite(r.prompt)) return null;
   const fresh = r.prompt - (r.cached || 0);
-  return fresh > 0 ? fresh / r.ttft_s : null;
+  if (fresh <= 0) return null;
+  /* GUIDE: prefill speed is the prefill's own duration, not the prompt over time to
+   * first token -- the latter charges the admission queue to the prefill. Fall back to
+   * ttft for a server that does not report prefill_s. */
+  const t = finite(r.prefill_s) && r.prefill_s > 0 ? r.prefill_s
+          : (finite(r.ttft_s) && r.ttft_s > 0 ? r.ttft_s : null);
+  return t ? fresh / t : null;
 }
 function histFinish(r, run) {
   if (!r || !r.id) return;
@@ -2130,7 +2192,17 @@ const HCOLS = [
   { h: "tok/s",         f: (h) => tps(h.tps) },
   { h: "age",           f: null },     /* rewritten in place every poll */
 ];
-for (const c of HCOLS) $("hhead").appendChild(el("th", null, c.h));
+const HTITLE = {
+  "id": "this browser's history id; 0 again after a clear",
+  "prompt": "prompt tokens",
+  "out": "output tokens",
+  "ctx": "context tokens, prompt plus output",
+  "ttft": "time to first token, measured from arrival, so it includes queue wait",
+  "prefill tok/s": "fresh prompt tokens over the time from admission to first token, so queue wait is not charged to it; a mostly-cached prompt scores low",
+  "tok/s": "this request's own decode rate since its first token",
+  "age": "how long ago this request finished",
+};
+for (const c of HCOLS) { const th = el("th", null, c.h); if (HTITLE[c.h]) th.title = HTITLE[c.h]; $("hhead").appendChild(th); }
 
 function histRender(missed) {
   const mean = (a) => a.length ? a.reduce((p, c) => p + c, 0) / a.length : null;
@@ -2138,8 +2210,13 @@ function histRender(missed) {
    * the headline, and the recent window is what a change in the workload shows up in first. */
   const group = (vals, fmt, label) => {
     const all = mean(vals), a20 = mean(vals.slice(-20)), a5 = mean(vals.slice(-5));
-    return label + " avg " + fmt(all) +
-           (a20 != null ? " (20: " + fmt(a20) + ", 5: " + fmt(a5) + ")" : "");
+    /* A window whose rows are a subset of a wider one shown is the same mean twice: show
+     * "last 20" only once 20 requests exist and "last 5" only once 5 do, so every figure on
+     * the line is a different question. */
+    const w = [];
+    if (vals.length >= 20) w.push("last 20: " + fmt(a20));
+    if (vals.length >= 5) w.push("last 5: " + fmt(a5));
+    return label + " mean " + fmt(all) + (w.length ? " · " + w.join(" · ") : "");
   };
   const tpsV = hRows.map((h) => h.tps).filter((v) => v != null);
   const pfV  = hRows.map((h) => h.pf).filter((v) => v != null);
@@ -2147,7 +2224,7 @@ function histRender(missed) {
   const parts = [hRows.length + " done"];
   if (tpsV.length) parts.push(group(tpsV, tps, "tok/s"));
   if (pfV.length)  parts.push(group(pfV, cnt3, "prefill"));
-  if (tfs.length)  parts.push("ttft " + dur(tfs[Math.floor(tfs.length / 2)]));
+  if (tfs.length)  parts.push("ttft median " + dur(tfs[Math.floor(tfs.length / 2)]));
   $("hsum").textContent = parts.join(" · ");
 
   /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
@@ -2202,10 +2279,11 @@ let lastStepMs = null;
  * lane is doing, so a restart priced against it would not pay back. Until the engine's first
  * window completes, the fastest single-stream step this tab has seen stands in. */
 let c1hist = [];
-const C1CAP = 7200;                       /* an hour at 2 polls/s of single-stream samples */
+const C1CAP_S = 3600;   /* the fallback floor's horizon in seconds */
 const bestAt = {};                        /* fastest step seen at each concurrency, this process */
 
 function update(s, dt) {
+  nowS = performance.now() / 1000;
   $("ver").textContent = s.version + "  ·  up " + dur(s.uptime_s);
 
   /* THE DECODE STEP TIME, OUT OF THE ENGINE'S OWN CLOCK, and deliberately not out of the
@@ -2228,10 +2306,14 @@ function update(s, dt) {
 
   /* Single-stream steps only: the floor is a single-sequence window, and a batched step read
    * against it would report a batch arriving as a slowdown. */
-  if (s.running === 1 && stepMs != null) { c1hist.push(stepMs); if (c1hist.length > C1CAP) c1hist.shift(); }
+  if (s.running === 1 && stepMs != null) {
+    c1hist.push({ t: nowS, v: stepMs });
+    while (c1hist.length && c1hist[0].t < nowS - C1CAP_S) c1hist.shift();
+  }
   const engBestMs = s.step_ns_decode_best > 0 ? s.step_ns_decode_best / 1e6 : 0;
   const engRecentMs = s.step_ns_decode_recent > 0 ? s.step_ns_decode_recent / 1e6 : 0;
-  const floorMs = engBestMs > 0 ? engBestMs : (c1hist.length ? Math.min(...c1hist) : 0);
+  const floorMs = engBestMs > 0 ? engBestMs
+                : (c1hist.length ? Math.min(...c1hist.map(x => x.v)) : 0);
   let det = "";
   if (floorMs > 0) {
     det = "best " + floorMs.toFixed(2) + "ms";
@@ -2256,10 +2338,15 @@ function update(s, dt) {
   setMetric("prefill", s.prefill_tps, tps(s.prefill_tps));
   setMetric("flight",  s.in_flight,   String(s.in_flight));
   const busy = s.running > 0;
-  if (busy) {
-    lastActiveC = s.running;
-    noteSample("decode", s.running, s.decode_tps);
-    noteSample("prefill", s.running, s.prefill_tps, RECENT_PREFILL);
+  if (busy) lastActiveC = s.running;
+  /* Sampled every poll, idle included. The engine decays its own rate toward zero on idle, so
+   * feeding that decayed value into the last active concurrency's window lets `recent` wind down
+   * with the engine. Gating this on busy froze the detail line at the last busy mean, so it read
+   * "recent 214" beside a headline of 0. Skipped before any activity (lastActiveC 0) so a fresh
+   * idle page shows no figures rather than a column of zeros. */
+  if (lastActiveC > 0) {
+    noteSample("decode", lastActiveC, s.decode_tps);
+    noteSample("prefill", lastActiveC, s.prefill_tps, RECENT_PREFILL_S);
   }
   noteSample("flight", "*", s.in_flight);
   const cNow = busy ? s.running : lastActiveC;
@@ -2321,7 +2408,8 @@ function update(s, dt) {
   if (aw != null && aw.dr > 0) {
     const c = s.running > 0 ? s.running : lastActiveC;
     const ring = accPool[c] || (accPool[c] = []);
-    ring.push(aw); if (ring.length > RECENT) ring.shift();
+    ring.push({ t: nowS, dr: aw.dr, da: aw.da });
+    while (ring.length && ring[0].t < nowS - RECENT_S) ring.shift();
   }
   /* The headline is this poll's conditional acceptance, as every other tile's big number is the
    * current value; the lifetime ratio stays in the Speculation panel, on /stats and on /metrics.
@@ -2671,11 +2759,13 @@ function update(s, dt) {
     const rdn = prev && prev.experts && dt > 0
               ? Math.max(0, (ex.demotions - prev.experts.demotions) / dt) : 0;
     if (prev && prev.experts && dt > 0) {
-      moveHist.up.push(rup);   if (moveHist.up.length > HIST)   moveHist.up.shift();
-      moveHist.down.push(rdn); if (moveHist.down.length > HIST) moveHist.down.shift();
+      for (const pair of [[moveHist.up, rup], [moveHist.down, rdn]]) {
+        pair[0].push({ t: nowS, v: pair[1] });
+        while (pair[0].length && pair[0][0].t < nowS - HIST_S) pair[0].shift();
+      }
     }
-    const peak = lines("movechart", [{ ink: INK_UP, vals: moveHist.up },
-                                     { ink: INK_DOWN, vals: moveHist.down, dash: true }]);
+    const peak = lines("movechart", [{ ink: INK_UP, pts: moveHist.up },
+                                     { ink: INK_DOWN, pts: moveHist.down, dash: true }]);
     $("mvr_n").firstChild.nodeValue = num3(rup + rdn);
     /* TWO FIGURES, because the column is a fixed width and their digit count is the data; the
        window's peak is the chart's scale and sits on its axis. */
@@ -3460,22 +3550,28 @@ $("gq").addEventListener("input", (e) => highlight(e.target.value));
 
 /* ---------------------------------------------------------------- tabs */
 function show(which) {
-  const model = which === "model", sess = which === "sess";
-  $("view-dash").hidden  = model || sess;
+  const model = which === "model", sess = which === "sess", adv = which === "adv";
+  /* The Advanced view holds no live figures, so the dashboard's poll pauses while it is open, as
+   * it does for the Model view. Returning to the dashboard after more than a window there clears
+   * the sampled windows, which is what poll() already does for a backgrounded tab. */
+  $("view-dash").hidden  = model || sess || adv;
   $("view-sess").hidden  = !sess;
   $("view-model").hidden = !model;
-  $("tab-dash").className  = (model || sess) ? "" : "on";
+  $("view-adv").hidden   = !adv;
+  $("tab-dash").className  = (model || sess || adv) ? "" : "on";
   $("tab-sess").className  = sess ? "on" : "";
   $("tab-model").className = model ? "on" : "";
+  $("tab-adv").className   = adv ? "on" : "";
   if (model) { loadGraph(); loadControlVector(); }
   if (sess) loadSessions();
   window.scrollTo(0, 0);
-  const h = model ? "#model" : sess ? "#sessions" : "#";
+  const h = model ? "#model" : sess ? "#sessions" : adv ? "#advanced" : "#";
   if (location.hash !== h) history.replaceState(null, "", h);
 }
 $("tab-dash").addEventListener("click", () => show("dash"));
 $("tab-sess").addEventListener("click", () => show("sess"));
 $("tab-model").addEventListener("click", () => show("model"));
+$("tab-adv").addEventListener("click", () => show("adv"));
 
 /* WHAT THE ENGINE IS STILL HOLDING BETWEEN TURNS. Polled on its own schedule and only while the
    view is open: a stored session changes on the scale of its idle thresholds -- tens of seconds at
@@ -3683,13 +3779,72 @@ $("cvbox").addEventListener("change", async (e) => {
   }
 });
 
-/* The poll runs every 100 ms while a request is in flight, so the history sees most finished
- * requests before they leave /stats, and every 500 ms otherwise. */
+/* THE POLL CADENCE, SET BY THIS BROWSER. Held in localStorage, not on the server: the cadence is
+ * a property of who is reading, not of what is serving, and browser storage outlives an image swap
+ * or an engine restart that a file beside the engine would not. Two intervals, both editable: the
+ * page fetches at the idle interval while nothing runs and the busy interval while a request is in
+ * flight. Set them equal for one fixed rate. One key holds both, so a change is one write. */
+const POLL_K = "radiance.poll";
+const POLL_MIN = 100, POLL_MAX = 5000;
+const clampMs = (v, d) => Math.min(POLL_MAX, Math.max(POLL_MIN, Math.round(+v || d)));
+let pollIdleMs = 500, pollBusyMs = 300;
+try {
+  const raw = lsGet(POLL_K);
+  if (raw) {
+    const p = JSON.parse(raw) || {};
+    if (typeof p.idle === "number") pollIdleMs = clampMs(p.idle, 500);
+    if (typeof p.busy === "number") pollBusyMs = clampMs(p.busy, pollIdleMs);
+    else if (typeof p.ms === "number") { pollIdleMs = clampMs(p.ms, 500); pollBusyMs = pollIdleMs; }
+  }
+} catch (e) { /* the defaults */ }
+const pollCadence = (inFlight) => inFlight > 0 ? pollBusyMs : pollIdleMs;
+function pollSummary() {
+  $("advsum").textContent = pollIdleMs === pollBusyMs ? pollIdleMs + " ms"
+    : pollIdleMs + " ms idle \u00b7 " + pollBusyMs + " ms busy";
+}
+function pollSave() {
+  lsSet(POLL_K, JSON.stringify({ idle: pollIdleMs, busy: pollBusyMs }));
+  pollSummary();
+}
+$("pollidle").value = pollIdleMs;
+$("pollbusy").value = pollBusyMs;
+pollSummary();
+$("pollidle").addEventListener("change", (e) => {
+  pollIdleMs = clampMs(e.target.value, 500);
+  e.target.value = pollIdleMs;   /* show what was stored, not what was typed */
+  pollSave();
+  schedulePoll(pollIdleMs);
+});
+$("pollbusy").addEventListener("change", (e) => {
+  pollBusyMs = clampMs(e.target.value, 300);
+  e.target.value = pollBusyMs;
+  pollSave();
+  schedulePoll(pollIdleMs);
+});
 let pollTimer = null;
 function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
+/* Past one window's length of not polling, the sampled windows hold only pre-gap samples and the
+ * first poll back would charge the whole span to a single sample. There is nothing to keep, so
+ * the windows and the poll's baseline clear and the page refills from the return, rather than
+ * presenting the pre-gap lane as current. The session's extremes (extAt) and the single-stream
+ * floor (c1hist) survive: a fastest-ever and a floor are properties of the session, not of the
+ * last minute. Checked in poll(), not on the visibility event, so a view switch, a backgrounded
+ * tab and a laptop sleep all take the same path. */
+const GAP_S = HIST_S;   /* the same span the sparklines draw: past it there is nothing to keep */
+let lastPollAt = 0;
+function resetWindows() {
+  for (const k in hist) hist[k].length = 0;
+  for (const k in winAt) delete winAt[k];
+  for (const k in accPool) delete accPool[k];
+  moveHist.up.length = 0; moveHist.down.length = 0;
+  prev = null; prevAt = 0; accPrev = null;
+}
 async function poll() {
   /* A background tab watches nothing, and neither does the Model view -- which is static. */
-  if (document.hidden || $("view-dash").hidden) { schedulePoll(500); return; }
+  if (document.hidden || $("view-dash").hidden) { schedulePoll(pollIdleMs); return; }
+  const wall = Date.now();
+  if (lastPollAt && (wall - lastPollAt) / 1000 > GAP_S) resetWindows();
+  lastPollAt = wall;
   try {
     const r = await api("stats");
     if (!r.ok) throw new Error(r.status);
@@ -3699,15 +3854,16 @@ async function poll() {
     prev = s; prevAt = now;
     $("view-dash").classList.remove("boot");
     $("dot").className = "dot";
-    schedulePoll((s.in_flight || 0) > 0 ? 100 : 500);
+    schedulePoll(pollCadence(s.in_flight || 0));
   } catch (e) {
     $("dot").className = "dot stale";
-    schedulePoll(500);
+    schedulePoll(pollIdleMs);
   }
 }
 identify();
 if (location.hash === "#model") show("model");
 else if (location.hash === "#sessions") show("sess");
+else if (location.hash === "#advanced") show("adv");
 /* A server that never answers still gets its frame drawn, rather than an empty page that gives
  * the reader nothing to tell "starting up" apart from "broken". */
 setTimeout(() => $("view-dash").classList.remove("boot"), 1500);

@@ -375,6 +375,11 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
     s.preempted_us = 0;
+    /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
+     * whenever it is non-zero: left standing, it would date this request's first token to the
+     * admission of whichever request held the slot before. The re-admission guard below needs
+     * it zero for the same reason -- a stale stamp would read as an earlier admission. */
+    s.admitted_us = 0;
     s.slot = slot;
     s.card = -1;
     s.running = false;
@@ -901,6 +906,8 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         o.slot            = s.slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
         o.ttft_s          = s.first_tok_us ? (double)(s.first_tok_us - s.arrived_us) / 1e6 : -1.0;
+        o.prefill_s       = (s.first_tok_us && s.admitted_us)
+                            ? (double)(s.first_tok_us - s.admitted_us) / 1e6 : -1.0;
         /* Since the first token, not admission, so time spent queued does not read as slow
          * decode. */
         const double dec = s.first_tok_us ? (double)(now - s.first_tok_us) / 1e6 : 0.0;
@@ -1522,6 +1529,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 
     if (s.card < 0) { s.card = free_cards_.back(); free_cards_.pop_back(); }
     r.state = ReqState::Running;
+    if (!s.admitted_us) s.admitted_us = mono_us();   /* first admission; a re-admit after
+                                                     * preemption keeps the original stamp */
     s.preempted_us = 0;
     s.running = true;
     server::sink_admitted(r.sink);
