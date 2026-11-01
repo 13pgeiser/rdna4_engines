@@ -150,16 +150,18 @@ await p.poll(); eq(p.calls.run, 0, "the first poll is a baseline, not a restart"
 await p.poll(); eq(p.calls.run, 0, "same started_at with a rising uptime is the same process");
 await p.poll(); eq(p.calls.run, 1, "a changed started_at clears the extremes");
 
-console.log("== poll() catches a restart that lands in the SAME second ==");
-/* started_at is a whole-second clock, so a restart inside the same second leaves it unchanged.
-   Without the uptime comparison the dead process's extremes render WITH A TRUE AGE, which reads
-   as honest provenance and is worse than not labelling it at all. */
+console.log("== uptime_s is derived, so it is not a restart signal ==");
+/* uptime_s is unix_now() - started_at_, both whole seconds, so started_at + uptime_s is exactly
+   the wall clock at that poll. A later poll of the SAME process therefore always reports a
+   larger uptime; a smaller one means the wall clock moved backwards, which is an NTP adjustment
+   and not a new process. Clearing on it would throw away the session's extremes on a clock
+   correction, so nothing here treats it as a restart. */
 p = makePoller([
   { started_at: 100, uptime_s: 40 },
   { started_at: 100, uptime_s: 2 },   /* same started_at, uptime went backwards */
 ], fixed);
 await p.poll(); await p.poll();
-eq(p.calls.run, 1, "a same-second restart is caught by the uptime comparison");
+eq(p.calls.run, 0, "a backward uptime with an unchanged started_at is a clock step, not a restart");
 
 console.log("== poll() takes the GAP path, not the restart path, when only the clock moved ==");
 const slow = { wall: 1000 };
