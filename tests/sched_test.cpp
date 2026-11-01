@@ -7393,6 +7393,18 @@ TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
         f.commit_plain();
     }
     REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* The slot A held, read while its row is still published. The whole case rests on B landing
+     * in this same slot: if the reap ever defers, or the free list is pre-populated, B gets a
+     * fresh struct, the stale stamp is gone by construction, and the invariant below would hold
+     * with the bug unpatched. So the precondition is asserted rather than trusted. */
+    int slot_a = -1;
+    {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) if (st[(size_t)j].id == a) slot_a = st[(size_t)j].slot;
+    }
+    REQUIRE(slot_a >= 0);
     CHECK_OK(f.sch.reap(a));
 
     /* A's slot is on the free list, so B takes the slot and the struct that came with it. */
@@ -7408,6 +7420,7 @@ TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
             if (st[(size_t)j].ttft_s < 0) break;   /* no first token yet */
             /* Both figures describe this request alone, so prefill -- admission to first token --
              * is bounded by ttft, arrival to first token. */
+            CHECK_EQ(st[(size_t)j].slot, slot_a);   /* the reuse this case is about */
             CHECK(st[(size_t)j].prefill_s >= 0);
             CHECK(st[(size_t)j].prefill_s <= st[(size_t)j].ttft_s);
             return;
