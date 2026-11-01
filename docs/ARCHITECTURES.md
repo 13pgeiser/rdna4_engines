@@ -20,7 +20,7 @@ plugin claims.
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
-| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, one rank ([geometry](#spark25-spark-x26)) |
+| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)) |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
@@ -106,9 +106,11 @@ Column-sharded projection outputs are partial sums. Each layer issues two exact 
 and adding it to the f32 residual. This preserves the reference's BF16 projection-output boundary
 without rounding away the residual's low bits. Sharding still changes the dot-product reduction
 order, so it does not promise bitwise parity with one card. The embedding uses one exact f32
-`all_reduce` over its widened, disjoint token rows. libr4d serves these collectives at 2, 3, 4 and 8
-ranks; other widths resolve only on a library with a general `all_reduce` (libref), so a card
-deployment is limited to those worlds.
+`all_reduce` over its widened, disjoint token rows. TP1 declares no collectives. At TP>1, declaration
+requires the exact fp32 embedding reduction and every exact bf16 projection reduction to resolve;
+otherwise it fails with `RAD_E_UNSUPPORTED` rather than running rank-local partial outputs. libr4d
+serves these collectives at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a
+general `all_reduce` (libref), so a card deployment is limited to those worlds.
 
 The initial implementation serves BF16 with tied embeddings, headwise sigmoid gates and the
 checkpoint's own rotary parameters. It does not implement DSpark, quantisation recipes, other gate
