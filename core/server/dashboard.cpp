@@ -1697,7 +1697,7 @@ function setMetric(key, value, text) {
 const RECENT_S = 15;       /* the `recent` window in seconds, for a figure sampled every poll */
 const RECENT_PREFILL_S = 5;   /* prefill's is shorter, so a several-second prefill shows up in it */
 const extAt = {}, winAt = {}, extAtS = {};   /* extAtS: the poll at which each extreme was set */
-let lastActiveC = 0, lastStart = null;
+let lastActiveC = 0, lastStart = null, lastUp = -1;
 /* A new engine process is a different discontinuity from a quiet minute: the previous run's
  * requests are gone and its configuration may differ, so nothing from it carries over. Every
  * other figure already refuses to pool across a restart -- accWindow drops its rings, histIngest
@@ -3877,11 +3877,19 @@ async function poll() {
     const r = await api("stats");
     if (!r.ok) throw new Error(r.status);
     const s = await r.json();
-    /* A new engine process: started_at is its identity, so a change is a discontinuity rather
-     * than a new measurement. Checked before update() so the new run's samples land in fresh
-     * windows. */
-    if (lastStart !== null && s.started_at !== lastStart) newEngineRun();
+    /* A new engine process is a discontinuity, not a new measurement. started_at names it, but
+     * it is a whole-second clock, so a restart landing in the same second as the previous start
+     * leaves it unchanged -- and the previous run's extremes would then render WITH A TRUE AGE,
+     * which reads as honest provenance and is not. uptime_s resets to about zero on any new
+     * process and catches that; it is the same signal accWindow already trusts for the same
+     * purpose, with the same accepted risk: it is wall-clock derived, so a backward NTP step
+     * reads as a restart and clears the extremes. Checked before update() so the new run's
+     * samples land in fresh windows. */
+    const up = s.uptime_s;
+    if (lastStart !== null && (s.started_at !== lastStart ||
+                               (typeof up === "number" && up < lastUp))) newEngineRun();
     lastStart = s.started_at;
+    if (typeof up === "number") lastUp = up;
     const now = performance.now();
     update(s, prevAt ? (now - prevAt) / 1000 : 0);
     prev = s; prevAt = now;
