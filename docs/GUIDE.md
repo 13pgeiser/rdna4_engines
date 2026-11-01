@@ -709,7 +709,8 @@ radiance --model m.rad --debug-placement    # the placement plan only
 
 The card is split into resident weights and the paged KV pool. The engine derives the split from the
 card and the model; no flag states either pool. Its inputs: `--gpu-headroom-mib` leaves card space
-alone, `--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
+alone, `--gpu-memory-mib` claims a size (headroom is the card less that; give one of the two),
+`--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
 experts must stay on the card. The startup receipt prints every term. With no visible card (the host
 backend) half of RAM stands in for the card and is split the same way; the weights pool is then host
 memory, holding the weights a host kernel cannot read where the container stores them.
@@ -785,6 +786,7 @@ Related flags:
 
 ```sh
 --gpu-headroom-mib 96         # VRAM left unclaimed on every card
+# --gpu-memory-mib 28000      # the same knob as a claim; not with --gpu-headroom-mib
 --kv-cache-dtype fp8          # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192          # pinned host tier for weights
 --embedding-placement vram    # keep the token embedding on the card (below)
@@ -885,9 +887,10 @@ plane grows into what it releases, so a model whose experts do not fit never str
 for unused cache.
 
 **Headroom.** `--gpu-headroom-mib` is kept for allocations the engine does not make, chiefly a
-kernel's code object, which HIP loads at the kernel's first launch. With too little left, the first
-kernel that has never run (a draft head's, a sampler chain's) fails its load and faults inside the
-HIP runtime: a segfault in a correct kernel on a server that had been serving.
+kernel's code object, which HIP loads at the kernel's first launch. `--gpu-memory-mib N` is the same
+knob written as a claim: headroom is the card less N. The two flags cannot be combined. With too
+little left, the first kernel that has never run (a draft head's, a sampler chain's) fails its load
+and faults inside the HIP runtime: a segfault in a correct kernel on a server that had been serving.
 
 Once everything is allocated, startup logs `card N settled at ... free`. Memory taken after the budget
 read the card (another process such as a desktop, or a driver allocation) comes out of the headroom,
@@ -2058,6 +2061,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
+| `--gpu-memory-mib N` | 0 (use `--gpu-headroom-mib`) | VRAM claimed on every card; inverse of `--gpu-headroom-mib`. Give one (§4.3) |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |

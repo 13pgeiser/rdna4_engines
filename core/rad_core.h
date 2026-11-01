@@ -859,6 +859,9 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
+     * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
+    int64_t gpu_memory_mib = 0;
     /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
      * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
      * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),

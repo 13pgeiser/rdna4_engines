@@ -507,7 +507,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
-        { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },
+        { "--kv-cache-dtype", { "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
@@ -1385,6 +1386,26 @@ TEST(gpu_headroom_parses_under_both_spellings) {
     CHECK_EQ(b.gpu_headroom_mib, 256ll);
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.gpu_headroom_mib, 96ll);
+}
+
+/* --gpu-memory-mib is the inverse of --gpu-headroom-mib; they cannot be combined. The default
+ * headroom is not "given", so memory alone is legal and leaves the default until the resolver. */
+TEST(gpu_memory_mib_parses_and_excludes_headroom) {
+    Config a;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000" }, &a), RAD_OK);
+    CHECK_EQ(a.gpu_memory_mib, 28000ll);
+    CHECK_EQ(a.gpu_headroom_mib, 96ll);
+    CHECK(a.given.count("--gpu-memory-mib"));
+    CHECK(!a.given.count("--gpu-headroom-mib"));
+
+    Config z;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "0" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "-1" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "8x" }, &z), RAD_E_INVAL);
+
+    Config b, c;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom-mib", "96" }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom", "96" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {

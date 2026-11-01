@@ -524,8 +524,8 @@ int KVManager::carve_into(Pool& kv_pool) {
                 "  vram_kv            %10s\n"
                 "  short by           %10s\n"
                 "Lower --max-num-seqs, or give the cache more of the card: a smaller "
-                "--gpu-headroom-mib or a larger --host-pool-mib. The engine will not shrink one of "
-                "them for you (spec §6).",
+                "--gpu-headroom-mib, a larger --gpu-memory-mib, or a larger --host-pool-mib. The "
+                "engine will not shrink one of them for you (spec §6).",
                 humanb(fixed).c_str(), (long long)max_seqs_, humanb(budget_bytes).c_str(),
                 humanb(fixed - budget_bytes + 1).c_str());
         return RAD_E_NOMEM;
@@ -554,8 +554,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         }
         if (p.n_blocks <= 0) {
             RAD_ERR("KV group '%s': a %s KV pool leaves 0 blocks (%s a page) after the fixed "
-                    "linear/conv costs of %s. Raise --host-pool-mib or lower --gpu-headroom-mib, or "
-                    "lower --max-num-seqs.",
+                    "linear/conv costs of %s. Raise --host-pool-mib or --gpu-memory-mib, or lower "
+                    "--gpu-headroom-mib or --max-num-seqs.",
                     p.name.c_str(), humanb(budget_bytes).c_str(),
                     humanb(p.bytes_per_block).c_str(), humanb(fixed).c_str());
             return RAD_E_NOMEM;
