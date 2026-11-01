@@ -99,6 +99,7 @@ struct RadBuilder {
     /* Ops the fake kernel hierarchy refuses, to drive the fused-op fallback; and ops no loaded
      * library declares (rad_op_declared), as without an optional library. */
     std::set<std::string> refuse;
+    std::set<std::pair<std::string, std::string>> refuse_dtype;  /* (op, dtype) forms */
     std::set<std::string> undeclared;
     /* When set, the only ops any loaded library declares (a CPU-only engine's: libref's
      * vocabulary); every other op is undeclared. */
@@ -217,7 +218,10 @@ extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* par
         r.p.push_back(p);
     }
     for (int i = 0; i < n_weights; ++i) r.w.push_back(weights[i]);
-    r.resolved = b->refuse.count(r.op) == 0;
+    bool dtype_refused = false;
+    for (const auto& p : r.p)
+        if (p.key == "dtype" && b->refuse_dtype.count({r.op, p.sval})) dtype_refused = true;
+    r.resolved = b->refuse.count(r.op) == 0 && !dtype_refused;
     b->ops.push_back(r);
     /* Declare always completes. An unresolved op is RAD_NULL_HANDLE, an error only if the plugin
      * issues it (rad_builder.h). */

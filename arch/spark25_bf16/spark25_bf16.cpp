@@ -266,6 +266,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_NOWEIGHTS), {x}, {x});
     };
     m.reduce_embed = reduce(m.x, "fp32");
+    if (g.world > 1 && !m.reduce_embed) {
+        fprintf(stderr, "radiance: spark25 requires an exact fp32 all-reduce for TP=%d\n", g.world);
+        return RAD_E_UNSUPPORTED;
+    }
 
     m.layers.resize((size_t)g.n_layer);
     for (int l = 0; l < g.n_layer; ++l) {
@@ -355,6 +359,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_STR("act", "gelu"), RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS), {m.gu}, {m.ff});
         a.dp = gemm(E, F, a.down, m.ff, m.h);
         a.reduce_ffn = reduce(m.h, "bf16");
+        if (g.world > 1 && (!a.reduce_attn || !a.reduce_ffn)) {
+            fprintf(stderr, "radiance: spark25 requires exact bf16 all-reduces for TP=%d\n", g.world);
+            return RAD_E_UNSUPPORTED;
+        }
         a.widen_ffn = widen(m.delta);
         a.add_ffn = add();
     }

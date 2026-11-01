@@ -214,6 +214,70 @@ TEST(tp_projection_rounds_to_bf16_before_the_fp32_residual_add) {
     }
 }
 
+TEST(tp2_refuses_without_the_exact_fp32_embedding_collective) {
+    MetaKV k = spark_meta();
+    RadBuilder b;
+    b.refuse_dtype.insert({"all_reduce", "fp32"});
+    RadBuildCtx ctx = build_ctx();
+    ctx.world_size = 2;
+    CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+             RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(count_op(b, "all_reduce"), 1);
+    const RecOp* embedding = find_op(b, "all_reduce");
+    REQUIRE(embedding);
+    CHECK_EQ(pstr(embedding, "dtype"), std::string("fp32"));
+    CHECK_EQ(pint(embedding, "exact"), 1);
+    CHECK_EQ(pint(embedding, "world_size"), 2);
+    CHECK(!embedding->resolved);
+}
+
+TEST(tp2_refuses_without_the_exact_bf16_projection_collective) {
+    MetaKV k = spark_meta();
+    RadBuilder b;
+    b.refuse_dtype.insert({"all_reduce", "bf16"});
+    RadBuildCtx ctx = build_ctx();
+    ctx.world_size = 2;
+    CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+             RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(count_op(b, "all_reduce"), 3);
+    const RecOp* embedding = find_op(b, "all_reduce");
+    const RecOp* attn = find_op(b, "all_reduce", 1);
+    const RecOp* ffn = find_op(b, "all_reduce", 2);
+    REQUIRE(embedding && attn && ffn);
+    CHECK_EQ(pstr(embedding, "dtype"), std::string("fp32"));
+    CHECK(embedding->resolved);
+    CHECK_EQ(pstr(attn, "dtype"), std::string("bf16"));
+    CHECK_EQ(pstr(ffn, "dtype"), std::string("bf16"));
+    CHECK_EQ(pint(attn, "exact"), 1);
+    CHECK_EQ(pint(ffn, "exact"), 1);
+    CHECK_EQ(pint(attn, "world_size"), 2);
+    CHECK_EQ(pint(ffn, "world_size"), 2);
+    CHECK(!attn->resolved);
+    CHECK(!ffn->resolved);
+}
+
+TEST(tp1_works_without_collectives) {
+    MetaKV k = spark_meta();
+    RadBuilder b;
+    b.refuse.insert("all_reduce");
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "all_reduce"), 0);
+    const auto& m = spark25_bf16::models[ctx.rank];
+    CHECK_EQ(m.reduce_embed, (rad_op)0);
+    for (const auto& layer : m.layers) {
+        CHECK_EQ(layer.reduce_attn, (rad_op)0);
+        CHECK_EQ(layer.reduce_ffn, (rad_op)0);
+    }
+    RadBatch batch = decode_batch();
+    RadCtx c{.b = &b, .batch = &batch};
+    spark25_bf16::step(&c, &batch);
+    CHECK_LINT(b, &c);
+    CHECK(c.step_fail.empty());
+    const auto issued = issued_ops(b, c);
+    CHECK(std::find(issued.begin(), issued.end(), "all_reduce") == issued.end());
+}
+
 TEST(refuses_unimplemented_variants) {
     RadBuildCtx ctx = build_ctx();
     for (const auto& change : {std::pair{"tie_word_embeddings", "0"},
