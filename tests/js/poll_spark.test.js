@@ -53,7 +53,7 @@ eq(m.idle(), 500, "corrupt storage falls back to the default");
 eq(m.busy(), 300, "corrupt storage keeps the busy default");
 eq(cadence(JSON.stringify({ idle: 50 })).idle(), 100, "a stored sub-floor value is clamped on read");
 console.log("== the summary label never lies about what is set ==");
-eq(c.sum(), "500 ms idle \u00b7 300 ms busy", "two values shown when they differ");
+eq(c.sum(), "500 ms idle | 300 ms busy", "two values shown when they differ");
 eq(cadence(JSON.stringify({ idle: 500, busy: 500 })).sum(), "500 ms", "one value shown when equal");
 
 let lastD = null;

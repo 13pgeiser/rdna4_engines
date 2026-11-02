@@ -54,7 +54,7 @@ ok(!out.includes("ago"), "window full: no age clause (got " + JSON.stringify(out
 ok(out.includes("recent"), "and the window figures still render");
 b.resetWindows(); b.setNow(150);
 out = b.triple("dec", 1, "best", F);
-ok(/best 500 t\/s · 50\.0 s ago$/.test(out), "extreme alone: age names the span (got " + JSON.stringify(out) + ")");
+ok(/best 500 t\/s \| 50\.0 s ago$/.test(out), "extreme alone: age names the span (got " + JSON.stringify(out) + ")");
 b.setNow(100.4);
 ok(!b.triple("dec", 1, "best", F).includes("ago"), "an extreme set 0.4s ago is current: no clause");
 
@@ -87,7 +87,7 @@ b.setNow(100.5);
 ok(!b.acceptTriple(1).includes("ago"), "an acceptance extreme set 0.5s ago is current: no clause (got " + JSON.stringify(b.acceptTriple(1)) + ")");
 b.setNow(400);
 out = b.acceptTriple(1);
-ok(/^highest 75% · 5m 00s ago$/.test(out), "once it stands alone it names its age (got " + JSON.stringify(out) + ")");
+ok(/^highest 75% \| 5m 00s ago$/.test(out), "once it stands alone it names its age (got " + JSON.stringify(out) + ")");
 b.accPool[1] = [{ dr: 10, da: 8 }, { dr: 10, da: 6 }];
 out = b.acceptTriple(1);
 ok(out.includes("recent") && !out.includes("ago"), "with a ring: window figures, no age clause (got " + JSON.stringify(out) + ")");

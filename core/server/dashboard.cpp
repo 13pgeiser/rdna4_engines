@@ -1748,17 +1748,17 @@ function triple(key, c, label, fmt, showNow) {
     const t = (extAtS[key] || {})[c];
     /* Only once it is actually stale: an extreme set on this poll is current, and "0 ms ago"
      * would be noise. A second is the resolution dur() itself reports below. */
-    if (typeof t === "number" && nowS - t >= 1) out += " \u00b7 " + dur(nowS - t) + " ago";
+    if (typeof t === "number" && nowS - t >= 1) out += " | " + dur(nowS - t) + " ago";
     return out;
   }
   let sum = 0;
   for (const p of s) sum += p.v;
   const recent = sum / s.length;
   const now = s[s.length - 1].v;
-  out += " · recent " + fmt(recent);
+  out += " | recent " + fmt(recent);
   /* No `now` clause while nothing runs, as on the decode step: a zero rate is an idle lane, and
    * "now 0% of best" would read as a fault. */
-  if (showNow !== false && e[c] > 0) out += " · now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
+  if (showNow !== false && e[c] > 0) out += " | now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
   return out;
 }
 /* The acceptance tile's detail line. `highest` is the session's extreme of per-poll ratios;
@@ -1771,16 +1771,16 @@ function acceptTriple(c, showNow) {
   let out = "highest " + pct(e[c], 0);
   if (!ring || !ring.length) {
     const t = (extAtS["accept"] || {})[c];
-    if (typeof t === "number" && nowS - t >= 1) out += " \u00b7 " + dur(nowS - t) + " ago";
+    if (typeof t === "number" && nowS - t >= 1) out += " | " + dur(nowS - t) + " ago";
     return out;
   }
   let R = 0, A = 0;
   for (const d of ring) { R += d.dr; A += d.da; }
   if (R <= 0) return out;
   const last = ring[ring.length - 1];
-  out += " \u00b7 recent " + pct(A / R, 0);
+  out += " | recent " + pct(A / R, 0);
   if (showNow !== false && e[c] > 0 && last.dr > 0)
-    out += " \u00b7 now " + Math.round(100 * (last.da / last.dr) / e[c]) + "% of highest" + tag;
+    out += " | now " + Math.round(100 * (last.da / last.dr) / e[c]) + "% of highest" + tag;
   return out;
 }
 
@@ -2244,7 +2244,7 @@ function histRender(missed) {
     const w = [];
     if (vals.length >= 20) w.push("last 20: " + fmt(a20));
     if (vals.length >= 5) w.push("last 5: " + fmt(a5));
-    return label + " mean " + fmt(all) + (w.length ? " · " + w.join(" · ") : "");
+    return label + " mean " + fmt(all) + (w.length ? " | " + w.join(" | ") : "");
   };
   const tpsV = hRows.map((h) => h.tps).filter((v) => v != null);
   const pfV  = hRows.map((h) => h.pf).filter((v) => v != null);
@@ -2255,7 +2255,7 @@ function histRender(missed) {
   if (tfs.length)  parts.push("ttft median " + dur(tfs[Math.floor(tfs.length / 2)]));
   /* The wide dot is the page's major-break separator (the KV and version lines use it); the
    * tight dot inside each group stays tight, so group edges read heavier than window edges. */
-  $("hsum").textContent = parts.join("  ·  ");
+  $("hsum").textContent = parts.join("  |  ");
 
   /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
   const body = $("hbody");
@@ -2314,7 +2314,7 @@ const bestAt = {};                        /* fastest step seen at each concurren
 
 function update(s, dt) {
   nowS = performance.now() / 1000;
-  $("ver").textContent = s.version + "  ·  up " + dur(s.uptime_s);
+  $("ver").textContent = s.version + "  |  up " + dur(s.uptime_s);
 
   /* THE DECODE STEP TIME, OUT OF THE ENGINE'S OWN CLOCK, and deliberately not out of the
    * browser's. Wall time over step count is wrong in two directions at once, both of them silent:
@@ -2347,7 +2347,7 @@ function update(s, dt) {
   let det = "";
   if (floorMs > 0) {
     det = "best " + floorMs.toFixed(2) + "ms";
-    if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
+    if (engRecentMs > 0) det += " | recent " + engRecentMs.toFixed(2) + "ms";
   }
   /* The step as a percentage of the fastest at this concurrency (`@cN` above one). `now` is a
    * ~500 ms poll mean and `best` a 32-step window mean, so a short fast stretch can beat the
@@ -2360,7 +2360,7 @@ function update(s, dt) {
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
     const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
     const shown = ref > 0 ? Math.min(99, Math.round(100 * ref / lastStepMs)) : 0;
-    if (ref > 0) det += " · now " + (shown === 99 ? "~99" : shown) + "% of best" + (k === 1 ? "" : "@c" + k);
+    if (ref > 0) det += " | now " + (shown === 99 ? "~99" : shown) + "% of best" + (k === 1 ? "" : "@c" + k);
   }
   $("m-stepdet").textContent = det;
 
@@ -2425,11 +2425,11 @@ function update(s, dt) {
   $("m-kvcap").textContent = kvStream ? "kv cache in ram" : "kv cache in vram";
   $("m-kvdet").textContent = s.kv_bytes_total > 0
       ? (kvStream
-          ? "of " + hb(s.kv_bytes_total) + " in host mirror  ·  " + cnt3(s.kv_tokens_used) + " tok"
-            + "  ·  " + hb(s.kv_bytes_carved || 0) + " VRAM ring"
-          : "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  ·  "
+          ? "of " + hb(s.kv_bytes_total) + " in host mirror  |  " + cnt3(s.kv_tokens_used) + " tok"
+            + "  |  " + hb(s.kv_bytes_carved || 0) + " VRAM ring"
+          : "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  |  "
             + cnt3(s.kv_tokens_used) + " tok"
-            + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : ""))
+            + (kvGave > 0 ? "  |  " + hb(kvGave) + " lent to experts" : ""))
       : "";
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
@@ -2457,7 +2457,7 @@ function update(s, dt) {
   const list = s.requests || [];
   renderRequests(list, s.kv_tokens_total || 0);
   renderBatch(list, s);
-  $("reqaside").textContent = list.length ? s.running + " running · " + s.waiting + " waiting" : "";
+  $("reqaside").textContent = list.length ? s.running + " running | " + s.waiting + " waiting" : "";
   histRender(histIngest(s));
 
   totals["Requests"].textContent    = cnt(s.total_requests);
@@ -2473,7 +2473,7 @@ function update(s, dt) {
   const kvCached = Math.min(s.kv_tokens_cached || 0, s.kv_tokens_used || 0);
   const kvLive = Math.max(0, (s.kv_tokens_used || 0) - kvCached);
   const kvCachedShare = (s.kv_tokens_used || 0) > 0 ? kvCached / s.kv_tokens_used : 0;
-  mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  ·  " + pct(kvFrac);
+  mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  |  " + pct(kvFrac);
   /* The two shares are FRACTIONS OF THE FILL, not of the track: spent as widths against a total
    * of 1 they would draw a full bar for a pool holding 29 KiB. */
   setSplit(mKv, (1 - kvCachedShare) * kvFrac, kvCachedShare * kvFrac, 1);
@@ -2481,14 +2481,14 @@ function update(s, dt) {
      self-explanatory. The split is by who references the blocks: the first part is context a
      request on the card is reading, the second context nothing reads and the next eviction frees. */
   mKvSub.textContent = s.kv_tokens_used > 0
-      ? cnt3(kvLive) + " tok read by running requests  ·  " + cnt3(kvCached) + " kept for reuse"
+      ? cnt3(kvLive) + " tok read by running requests  |  " + cnt3(kvCached) + " kept for reuse"
       : "";
   mKvMax.textContent = kvStream
       ? (s.kv_tokens_max > 0
           ? "a miss streams the missing blocks from the mirror into the ring"
           : "")
       : (s.kv_tokens_max > 0
-          ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  ·  " + cnt3(s.kv_tokens_max)
+          ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  |  " + cnt3(s.kv_tokens_max)
             + " tok, with what the experts borrowed taken back"
           : "");
   mPc.v.textContent = pct(s.prefix_hit_rate); setBar(mPc.i, s.prefix_hit_rate, false);
@@ -2584,8 +2584,8 @@ function update(s, dt) {
       name: t.name, ink: TIER_INK[i] || TIER_INK[3], w: t.units,
       a: cnt(t.units), b: hb(t.bytes) })));
     const res = ex.tiers && ex.tiers.length ? ex.tiers[0].units : 0;
-    $("expaside").textContent = cnt(ex.n_units) + " units · " + hb(ex.bytes) +
-        (ex.heat ? "  ·  heat engine on" : "  ·  static plan");
+    $("expaside").textContent = cnt(ex.n_units) + " units | " + hb(ex.bytes) +
+        (ex.heat ? "  |  heat engine on" : "  |  static plan");
 
     /* THE HIT RATE, WHICH IS NOT THE RESIDENCY. Residency is a property of the PLAN -- how many
      * units sit in VRAM -- and this is a property of the TRAFFIC: how often the router asked for
@@ -2602,7 +2602,7 @@ function update(s, dt) {
      * it, or the figure labelled a second is the count over however long the poll happened to
      * take. */
     $("hitv").textContent = (dr > 0 || ex.routed > 0)
-        ? pct(hf) + "  ·  " + (dr > 0 ? num3((dr - drr) / dt) + " missed/s"
+        ? pct(hf) + "  |  " + (dr > 0 ? num3((dr - drr) / dt) + " missed/s"
                                       : cnt3(ex.routed - ex.routed_res) + " missed")
         : DASH;
     setBar($("hiti"), hf, false);
@@ -2624,7 +2624,7 @@ function update(s, dt) {
       const b = layerBars[i];
       b.style.height = Math.max(2, 100 * f).toFixed(1) + "%";
       b.className = f >= 0.999 ? "full" : "";
-      b.title = "layer " + i + ": " + lr[i] + " of " + n + " resident  ·  " + pct(f);
+      b.title = "layer " + i + ": " + lr[i] + " of " + n + " resident  |  " + pct(f);
     });
     /* Only when there IS a weakest layer. Every layer fully resident is the answer this panel
      * most wants to be able to give, and colouring an arbitrary one of them amber says the
@@ -2632,7 +2632,7 @@ function update(s, dt) {
     if (worst >= 0 && wf < 0.999) layerBars[worst].className = "min";
     $("layv").textContent = !lu.length ? DASH
         : wf >= 0.999 ? "all resident"
-        : pct(sum / lu.length) + " mean  ·  worst L" + worst + " " + pct(wf);
+        : pct(sum / lu.length) + " mean  |  worst L" + worst + " " + pct(wf);
     /* Residency, not capability: every bucket says where units are, and the buckets add up to
      * the plan. The old "N movable" read as if cold disk experts could not move -- deposits and
      * the stager move them constantly; what they lack is an address heat can relocate without
@@ -2642,7 +2642,7 @@ function update(s, dt) {
         cnt(t.units) + " " + (t.name === "pinned" ? "in host pool"
                             : t.name === "ssd" ? "on the file tier" : t.name));
     $("planev").textContent = cnt(res) + " of " + cnt(ex.n_units) + " in VRAM" +
-        (rest.length ? "  ·  " + rest.join("  ·  ") : "  ·  fully resident");
+        (rest.length ? "  |  " + rest.join("  |  ") : "  |  fully resident");
 
     /* ---- the plane itself.
      *
@@ -2772,7 +2772,7 @@ function update(s, dt) {
     /* THE CAVEAT SITS ON THE BAR IT QUALIFIES. Run along the panel's title it was a third line
        of heading, and it describes one element rather than the panel. */
     $("linkaside").textContent = lk.world > 1
-        ? lk.world + " cards  ·  " + cnt3(lk.ar_calls) + " collectives" : "single rank";
+        ? lk.world + " cards  |  " + cnt3(lk.ar_calls) + " collectives" : "single rank";
     $("linkhint").textContent = live
         ? "shares below are the rate over the last poll"
         : "idle — shares below are lifetime totals, not rates";
@@ -2799,7 +2799,7 @@ function update(s, dt) {
     $("mvr_n").firstChild.nodeValue = num3(rup + rdn);
     /* TWO FIGURES, because the column is a fixed width and their digit count is the data; the
        window's peak is the chart's scale and sits on its axis. */
-    $("movev").textContent = peak > 0 ? num3(rup) + " up · " + num3(rdn) + " down" : "settled";
+    $("movev").textContent = peak > 0 ? num3(rup) + " up | " + num3(rdn) + " down" : "settled";
     $("movepk").textContent = num3(peak);
 
     moveKv["Promotions"].textContent  = cnt(ex.promotions);
@@ -2808,7 +2808,7 @@ function update(s, dt) {
      * arrive back where it started; the share of promotions that are re-admissions is the number
      * that says whether the guards are set right. */
     moveKv["Re-admitted"].textContent = ex.promotions > 0
-        ? cnt(ex.readmits) + "  ·  " + pct(ex.readmits / ex.promotions, 0)
+        ? cnt(ex.readmits) + "  |  " + pct(ex.readmits / ex.promotions, 0)
         : cnt(ex.readmits);
     moveKv["Refused"].textContent      = ex.dispatches > 0
         ? pct(ex.refused / ex.dispatches, 0) + " of " + cnt3(ex.dispatches) : DASH;
@@ -2816,7 +2816,7 @@ function update(s, dt) {
     /* THE MOVER HAVING NOWHERE TO PUT THE BYTES, which is a different failure from the guard
      * declining and reads identically in a move count: both are "nothing moved". */
     moveKv["Starved"].textContent = cnt(ex.starved_slab + ex.starved_pool + ex.no_record);
-    moveKv["SSD reads"].textContent = lk ? cnt(lk.ssd_reads) + "  ·  " + hb(lk.ssd_bytes) : DASH;
+    moveKv["SSD reads"].textContent = lk ? cnt(lk.ssd_reads) + "  |  " + hb(lk.ssd_bytes) : DASH;
     /* WHAT THE SLAB TOOK FROM THE CACHE. The cache's own line says what it released; this says
      * how much of it is actually holding experts, and the two are read against each other --
      * released-but-not-taken is VRAM in neither pool and a boundary that is not moving. */
@@ -3075,7 +3075,7 @@ function laneLabels(lanes) {
     if (l.length !== 1) return "spelled out";
     const g = geoms[i];
     const bits = differing.map((k) => k + " " + (g[k] === undefined ? "—" : g[k]));
-    return bits.length ? bits.join(" · ") : "fused";
+    return bits.length ? bits.join(" | ") : "fused";
   });
 }
 
@@ -3182,7 +3182,7 @@ function highlight(q) {
       }
   }
   $("gcount").textContent = needle ? hit + " of " + nodes.length + " nodes match"
-                                   : cnt(graph.order.length) + " declared ops  ·  " +
+                                   : cnt(graph.order.length) + " declared ops  |  " +
                                      graph.ops.length + " distinct";
 }
 
@@ -3258,7 +3258,7 @@ function drawKernel(host, p) {
   if (p.shape)   kvRow(dl, "compiled for", p.shape);
   if (p.dtypes)  kvRow(dl, "dtypes", p.dtypes);
   if (p.variant) kvRow(dl, "variant", p.variant,
-                       p.variant_source + " · " + p.n_variants + " offered");
+                       p.variant_source + " | " + p.n_variants + " offered");
   if (p.scratch) kvRow(dl, "scratch", hb(p.scratch));
   if (dl.children.length) host.appendChild(dl);
 
@@ -3344,7 +3344,7 @@ function drawBand(host, b) {
     const s = el("div", "msub");
     s.appendChild(el("div", "sh", "host domain — the placement planner may run it here"));
     const t = el("div", "mtags");
-    t.appendChild(el("span", "mtag", b.host.kernel + " · " + b.host.plugin));
+    t.appendChild(el("span", "mtag", b.host.kernel + " | " + b.host.plugin));
     s.appendChild(t);
     bb.appendChild(s);
   }
@@ -3371,7 +3371,7 @@ function drawWeights(host, o) {
     add("dtype", w.dtype);
     if (w.shape) add("shape", w.shape);
     add("layout", w.layout);
-    add("lives", w.tier + " · " + w.site);
+    add("lives", w.tier + " | " + w.site);
     if (w.layer >= 0) add("layer", String(w.layer));
     if (w.expert != null) add("expert", String(w.expert));
     it.appendChild(m);
@@ -3416,7 +3416,7 @@ function select(gi) {
                            " of " + cnt(graph.order.length)
                          : "position " + cnt(o.first_at + 1) + " of " + cnt(graph.order.length));
   where.push(o.bands.length === 1 ? "one band" : o.bands.length + " bands");
-  head.appendChild(el("div", "gwhere", where.join("  ·  ")));
+  head.appendChild(el("div", "gwhere", where.join("  |  ")));
   if (o.schema && o.schema.doc) head.appendChild(el("div", "gdoc", o.schema.doc));
 
   drawGeometry(host, o);
@@ -3463,7 +3463,7 @@ function drawSummary() {
   s.appendChild(cell(cnt(fusedLaunches), "", "fused launches"));
   s.appendChild(cell(cnt(fusedOps - fusedLaunches), "", "launches removed"));
   s.appendChild(cell(ab.n, ab.u, "activation arena"));
-  s.appendChild(cell(String(m.n_layers), "", "layers · rank " + m.rank + "/" + m.world));
+  s.appendChild(cell(String(m.n_layers), "", "layers | rank " + m.rank + "/" + m.world));
 
   const gl = $("glibs");
   gl.textContent = "";
@@ -3479,7 +3479,7 @@ function drawSummary() {
     d.appendChild(el("span", "n", pl.name));
     const used = libs[pl.name] || 0;
     d.appendChild(el("span", "c", pl.kernels + " kernels" +
-                                 (used ? "  ·  " + cnt(used) + " launches" : "  ·  unused")));
+                                 (used ? "  |  " + cnt(used) + " launches" : "  |  unused")));
     gl.appendChild(d);
   }
   $("gsum").textContent = missing ? cnt(missing) + " op(s) with no device kernel"
@@ -3497,9 +3497,9 @@ function drawMeta() {
   host.className = "gmeta";
   const dm = (graph.misses || []).filter((m) => m.domain !== "host").length;
   $("gmetasum").textContent =
-    (graph.notes ? graph.notes.length : 0) + " notes from the architecture plugin  ·  " +
-    (graph.kv_groups ? graph.kv_groups.length : 0) + " kv groups  ·  " +
-    (graph.drafter ? graph.drafter.name + " drafter  ·  " : "") +
+    (graph.notes ? graph.notes.length : 0) + " notes from the architecture plugin  |  " +
+    (graph.kv_groups ? graph.kv_groups.length : 0) + " kv groups  |  " +
+    (graph.drafter ? graph.drafter.name + " drafter  |  " : "") +
     (dm ? dm + " unresolved device band(s)" : "no unresolved device band");
   const block = (title, cls) => {
     const se = el("section", cls);
@@ -3517,15 +3517,15 @@ function drawMeta() {
     const ul = block("kv groups — sized by the resolved attention kernels");
     for (const g of graph.kv_groups)
       ul.appendChild(el("li", null,
-        g.name + " · " + g.kind + " · " + g.layers + " layer" + (g.layers === 1 ? "" : "s") +
-        (g.block_size ? " · block " + g.block_size + " tokens, " + hb(g.bytes_per_block)
-                      : " · " + hb(g.bytes_per_state) + " a sequence")));
+        g.name + " | " + g.kind + " | " + g.layers + " layer" + (g.layers === 1 ? "" : "s") +
+        (g.block_size ? " | block " + g.block_size + " tokens, " + hb(g.bytes_per_block)
+                      : " | " + hb(g.bytes_per_state) + " a sequence")));
   }
   if (graph.drafter) {
     const ul = block("draft head");
-    ul.appendChild(el("li", null, graph.drafter.name + " · " + graph.drafter.kind + " · " +
+    ul.appendChild(el("li", null, graph.drafter.name + " | " + graph.drafter.kind + " | " +
                                   graph.drafter.depth + " token(s) a step" +
-                                  (graph.drafter.window ? " · window " + graph.drafter.window
+                                  (graph.drafter.window ? " | window " + graph.drafter.window
                                                         : "")));
   }
   /* ABSENCE IS ASYMMETRIC (spec 2.1), and so is this list. No DEVICE kernel for a band is a hole
@@ -3640,7 +3640,7 @@ function sessRow(r, hybrid, manyModels) {
   const reuse = reuseOf(r, hybrid), ret = tr.appendChild(el("td", "l ret"));
   if (reuse > 0) {
     ret.appendChild(el("b", null, "reuses " + cnt3(reuse)));
-    ret.appendChild(document.createTextNode("  ·  prefills " + cnt3(r.tokens - reuse)));
+    ret.appendChild(document.createTextNode("  |  prefills " + cnt3(r.tokens - reuse)));
   } else {
     ret.textContent = "prefills all " + cnt3(r.tokens);
   }
@@ -3653,7 +3653,7 @@ function sessRow(r, hybrid, manyModels) {
   for (const [k, f, name] of TIERS) {
     if (!(r[f] > 0)) continue;
     bar.appendChild(el("i", "t-" + k)).style.width = (100 * r[f] / held).toFixed(1) + "%";
-    if (parts.length) wh.appendChild(document.createTextNode("  ·  "));
+    if (parts.length) wh.appendChild(document.createTextNode("  |  "));
     wh.appendChild(el("span", "tn-" + k, name));
     wh.appendChild(document.createTextNode(" " + pct(r[f] / held, 0)));
     parts.push(name);
@@ -3766,8 +3766,8 @@ async function loadControlVector() {
     $("cvbox").disabled = false;
     $("cvbox").checked = !!p.default;
     /* The family the loader validated the file against, then its range and scale. */
-    $("cvsum").textContent = (p.arch ? p.arch + " \u00b7 " : "") + "layers " + p.first +
-                               "\u2013" + p.last + " \u00b7 " + p.mode + " \u00b7 scale " + p.scale;
+    $("cvsum").textContent = (p.arch ? p.arch + " | " : "") + "layers " + p.first +
+                               "\u2013" + p.last + " | " + p.mode + " | scale " + p.scale;
     /* A running request keeps the choice it was admitted with, and a refusal already in a
      * session's context is in the prompt the next turn reads. */
     $("cvnote").textContent = "New requests only. A session with a refusal already in its " +
@@ -3830,7 +3830,7 @@ try {
 const pollCadence = (inFlight) => inFlight > 0 ? pollBusyMs : pollIdleMs;
 function pollSummary() {
   $("advsum").textContent = pollIdleMs === pollBusyMs ? pollIdleMs + " ms"
-    : pollIdleMs + " ms idle \u00b7 " + pollBusyMs + " ms busy";
+    : pollIdleMs + " ms idle | " + pollBusyMs + " ms busy";
 }
 function pollSave() {
   lsSet(POLL_K, JSON.stringify({ idle: pollIdleMs, busy: pollBusyMs }));

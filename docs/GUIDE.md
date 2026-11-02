@@ -3679,7 +3679,7 @@ from the total fill, since a full pool causes preemption.
 The decode step tile carries two figures and a percentage under the big number:
 
 ```
-best 14.79ms · recent 15.21ms · now 97% of best
+best 14.79ms | recent 15.21ms | now 97% of best
 ```
 
 Both are window means of single-sequence decode steps, measured by the engine:
@@ -3723,7 +3723,7 @@ The decode, prefill, requests-in-flight and draft-acceptance tiles carry a line 
 which the page computes from its own polls:
 
 ```
-best 58 · recent 54 · now 93% of best@c4
+best 58 | recent 54 | now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
