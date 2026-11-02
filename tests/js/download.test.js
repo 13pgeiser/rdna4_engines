@@ -24,6 +24,16 @@ ok(/title="Download JSON file"/.test(btn), "the tooltip says 'Download JSON file
 ok(/aria-label="Download JSON file"/.test(btn), "and is labelled for assistive tech");
 ok(/<svg[\s\S]*<\/svg>/.test(btn), "it holds an icon, not a text label");
 ok(!/>\s*json\s*</.test(btn), "no leftover 'json' text label inside the button");
+/* The glyph must sit ON the baseline, not float above it. The header aligns items on the text
+   baseline, and an inline SVG's baseline is its box bottom -- so the tray bar's STROKE bottom
+   has to land on the viewBox bottom. An inset bar (the original sat at 13.5 of 16) leaves dead
+   space below it and the icon floats a hair above the caps, which is what this replaced. */
+const vb = +(btn.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/) || [, , 0])[2];
+const sw = +(btn.match(/stroke-width="([\d.]+)"/) || [, 0])[1];
+const bar = +(btn.match(/M[\d.]+ ([\d.]+)h/) || [, 0])[1];
+ok(vb > 0 && sw > 0 && bar > 0, "parsed the glyph geometry (viewBox " + vb + ", stroke " + sw + ", bar " + bar + ")");
+eq(Math.round((bar + sw / 2) * 1000) / 1000, vb,
+   "the tray bar's stroke bottom is flush with the box bottom, so it sits on the baseline");
 /* It must sit in the Requests header, in the LEFT group, before the right-hand aside. Index
    ordering is sturdier than a regex across the whole block. */
 const iLeft = page.indexOf('class="pleft"');

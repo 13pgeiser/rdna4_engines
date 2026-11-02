@@ -1238,7 +1238,10 @@ nav button.on { color:var(--fg); background:var(--track); }
                            <button type="button" class="pbtn" id="reqjson"
                                    title="Download JSON file" aria-label="Download JSON file">
                              <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
-                               <path d="M8 1.5v8m0 0L4.6 6.1M8 9.5l3.4-3.4M2.2 13.5h11.6"
+                               <!-- The tray bar's stroke bottom lands exactly on the viewBox
+                                    bottom, so baseline alignment puts the bar on the text
+                                    baseline. An inset bar floats a hair above the caps. -->
+                               <path d="M8 2v9m0 0L4.6 7.6M8 11l3.4-3.4M2.2 15.2h11.6"
                                      fill="none" stroke="currentColor" stroke-width="1.6"
                                      stroke-linecap="round" stroke-linejoin="round"/>
                              </svg></button></span>
