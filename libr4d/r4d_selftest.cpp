@@ -1371,7 +1371,8 @@ static const SplitGeo kSplitG6 = { 6, 2, 16, "r4d_attn_prefill_h256_gqa6" };
 struct SplitSeq { int64_t q, ctx; };
 static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* name,
                             const char* kv_dtype, const std::vector<SplitSeq>& seqs, int force,
-                            bool law_splits, int64_t lead = 0, int64_t tail = 0) {
+                            bool law_splits, int64_t lead = 0, int64_t tail = 0,
+                            int64_t decl_max_ctx = 0) {
     if (!sel(name) && !sel("attn_prefill_split")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
@@ -1473,6 +1474,7 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
             PI("block_size", bs), PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
             PS("kv_dtype", kv_dtype),
         };
+        if (decl_max_ctx > 0) ps.push_back(PI("max_ctx", decl_max_ctx));
         if (sp > 0) ps.push_back(PI("splits", sp));
         /* run_case, with the scratch poisoned: 0x7f7f7f7f is m = 3.4e38, so a segment the merge
          * reads but nobody wrote outweighs every real one and the row comes out wrong. Fresh
@@ -1498,8 +1500,14 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     const int s_un = run(1, d_o[0]);
     const int s_fo = run(force, d_o[1]);
     const int s_lw = run(0, d_o[2]);
+    int law_ctx = (int)(mb * bs);
+    if (decl_max_ctx > 0) {
+        law_ctx = 0;
+        for (const SplitSeq& s : seqs)
+            if ((int)s.ctx > law_ctx) law_ctx = (int)s.ctx;
+    }
     const int want = law((int)(ragged ? std::min<int64_t>(2048, total_q) : qmax), (int)total_q,
-                         (int)ns, (int)kv_heads, (int)(mb * bs));
+                         (int)ns, (int)kv_heads, law_ctx);
     ok((tag + ": splits 1 / forced / law").c_str(),
        s_un == 1 && s_fo == force && s_lw == want && (!law_splits || want > 1),
        fmt("launched %d / %d / %d, the law says %d%s", s_un, s_fo, s_lw, want,
@@ -29941,6 +29949,8 @@ static void device_phase(const Plugin& pl) {
         attn_split_case(pl, g, n, kv, { { 345, 345 } }, 16, false);
         attn_split_case(pl, g, n, kv, { { 345, 1000 } }, 16, true);
         attn_split_case(pl, g, n, kv, { { 640, 2000 } }, 5, true);
+        /* Model max_ctx 2048 with a 128-token KV: occupancy would split, live seqused must not. */
+        attn_split_case(pl, g, n, kv, { { 128, 128 } }, 4, false, 0, 0, 2048);
         attn_split_case(pl, g, n, kv, { { 53, 12000 }, { 1, 20000 } }, 16, true);
         attn_split_case(pl, g, n, kv, { { 11, 8192 }, { 64, 9000 }, { 1, 12000 } }, 6, true);
         attn_split_case(pl, g, n, kv, { { 300, 600 }, { 1, 10000 } }, 16, true);

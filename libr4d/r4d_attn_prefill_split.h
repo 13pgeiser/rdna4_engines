@@ -36,8 +36,11 @@ static inline int r4d_prefill_wgps() {
 // rounds / S walks, so take one round (S1 = wgps / units) or two (S2 = 2 wgps / units), whichever
 // is faster, the smaller S on a tie (fewer partials). At 32 WGPs, gqa 6 with 2 KV heads: 53 rows
 // -> 16 splits, 80 -> 8, 345 -> 5, 576 -> 3, 1024 and up -> 1; gqa 12 with 1 KV head: up to 32
-// rows -> 32, 53 -> 16, 345 -> 5. Each split keeps at least 8 tiles of max_ctx, the only context
-// the host sees. At most 64, the vectorised merge's limit.
+// rows -> 32, 53 -> 16, 345 -> 5. Each split keeps at least 8 tiles of the launch's live KV
+// (seqused_k, falling back to max_ctx). Using the model bound here over-splits short prefills:
+// a 128-token chunk at max_ctx 2048 became 4 splits of ~32 keys, while a 977-token unsplit
+// launch of the same prompt did not, and the different reduction order moved logits. At most 64,
+// the vectorised merge's limit.
 static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_q, int num_seqs,
                                          int kv_heads, int max_ctx, int wgps) {
     const long n  = std::max(1, num_seqs);
@@ -56,14 +59,42 @@ static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_
 // tells r4d_selftest a split launch from an unsplit one with the same bytes. Not atomic.
 static int g_prefill_last_splits = 0;
 
+/* Live KV length for the 8-tile floor. seqused_k is device-side (r4d_attn_args.h); max_ctx is
+ * the model bound and is too wide for a short chunk. A failed copy keeps max_ctx, which only
+ * over-splits. Occupancy already returned 1 skips the copy. */
+static inline int r4d_prefill_used_ctx(const R4DArgs* r) {
+    if (!r->seqused_k || r->num_seqs <= 0) return 0;
+    const int n = r->num_seqs;
+    int used = 0;
+    int chunk[64];
+    for (int off = 0; off < n; off += 64) {
+        const int m = n - off < 64 ? n - off : 64;
+        if (hipMemcpy(chunk, r->seqused_k + off, (size_t)m * sizeof(int),
+                      hipMemcpyDefault) != hipSuccess) {
+            (void)hipGetLastError();
+            return 0;
+        }
+        for (int i = 0; i < m; ++i)
+            if (chunk[i] > used) used = chunk[i];
+    }
+    return used;
+}
+
 /* The KV split's count before the scratch bound: the case's `splits` parameter when it names one
  * (r4d_selftest; the prefill rows declare no such axis, so the engine passes none), else the law,
- * at most 64. */
+ * at most 64. The 8-tile floor uses live seqused_k, not the model max_ctx. */
 static inline int r4d_prefill_splits_want(const RadArgs* a, const R4DArgs* r, int bq, int tile) {
-    const int sp = split_of(a);
-    if (sp > 0) return std::min(sp, 64);
-    return r4d_prefill_splits_law(bq, tile, r->q_len, r4d_q_total(*r), r->num_seqs, r->kv_heads,
-                                  r->max_ctx, r4d_prefill_wgps());
+    const int sp0 = split_of(a);
+    if (sp0 > 0) return std::min(sp0, 64);
+    const int wgps = r4d_prefill_wgps();
+    const int qtot = r4d_q_total(*r);
+    int sp = r4d_prefill_splits_law(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads, r->max_ctx,
+                                    wgps);
+    if (sp <= 1) return 1;
+    const int used = r4d_prefill_used_ctx(r);
+    if (used > 0 && (r->max_ctx <= 0 || used < r->max_ctx))
+        sp = r4d_prefill_splits_law(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads, used, wgps);
+    return sp;
 }
 
 /* The launch's split count, 1 for the plain form: what r4d_prefill_splits_want asks, cut to the
