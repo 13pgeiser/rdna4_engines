@@ -3668,7 +3668,7 @@ The KV cache meter splits what it holds into two segments:
 ```
 KV cache   3.3 / 4.5 GiB  ·  75.5%
 ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-20.8k tok read by running requests  ·  369.3k kept for reuse
+20.8k tok read by running requests  |  369.3k kept for reuse
 ```
 
 The full-strength segment is context running requests are reading; the dim segment is prefix cache,
@@ -3723,7 +3723,7 @@ The decode, prefill, requests-in-flight and draft-acceptance tiles carry a line 
 which the page computes from its own polls:
 
 ```
-best 58 | recent 54 | now 93% of best@c4
+best 58.0 | recent 54.0 | now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
@@ -3731,7 +3731,9 @@ current concurrency, `recent` the mean of the last 15 s there (5 s for prefill),
 current value as a share of the extreme. The windows are kept by elapsed time rather than sample
 count, so a span means the same span whatever rate is set on Advanced. Past one sequence the line
 names its concurrency (`@c4`); requests in flight keeps a single set. Reloading the page resets these
-figures, a server restart does not. While nothing runs, the big figure reads 0 and the line keeps its
+figures, and so does a server restart: the page notices the engine's new start time and
+inherits nothing from the run before it. While nothing runs, the big figure reads 0 and the line
+keeps its
 last figures without `now`.
 
 Draft acceptance is reported as two ratios with different denominators. A draft position is
@@ -3760,10 +3762,12 @@ a grey row so the total still adds up. **clear** empties it, and the marker it l
 timestamp every tab honours, so a clear in one window is a clear in all of them.
 
 The line above the table summarises those rows: how many are done, then decode rate, prefill rate
-and time to first token. Each of the three carries its mean over all the rows and, where enough
-rows exist, the same mean over the last 20 and the last 5. A window appears only once enough rows
+and time to first token. The first two carry their mean over all the rows and, where enough
+rows exist, the same mean over the last 20 and the last 5; time to first token is a median
+over all the rows, with no windows. A window appears only once enough rows
 exist for it to be a different question: with 12 rows stored, the mean over the last 20 would just
-be the mean over all 12, so only *last 5* shows; both appear from 20 rows up.
+be the mean over all 12, so only *last 5* shows. At exactly 20 rows *last 20* repeats the overall
+mean; from 21 up the three figures are three different questions.
 These are means of per-request rates, not the pooled rate the tiles above show: one long request
 does not get to decide the headline. A dot separates one category from the next; a pipe separates
 the windows within a category.
@@ -3783,9 +3787,11 @@ scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's 
 
 **Advanced**: two editable poll intervals -- *Idle interval* while nothing runs and *Busy interval*
 while a request is in flight, each clamped to 100-5000 ms. Set them equal for one fixed rate; the
-line under the fields names what is set. The values live in the browser, not on the server, so they
+summary beside the panel title names what is set. The values live in the browser, not on the
+server, so they
 survive a restart and apply to this browser only. Polling pauses on every view but Dashboard, so
-the figures hold while you are reading another page.
+the figures hold while you are reading another page -- for about a minute. Past 60 s the
+next poll drops the windows, since there is nothing left to compare them against.
 
 ### 6.2 The JSON behind it
 

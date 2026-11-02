@@ -1707,7 +1707,8 @@ function setMetric(key, value, text) {
  * publishes a floor and a recent window only for the decode step; for these it publishes one
  * figure per poll, so the three figures are the page's own:
  *   best / highest - the extreme this page has seen at the current concurrency; it resets on
- *                    reload, not on a server restart. "highest" where more is not better.
+ *                    reload AND on a server restart (a new started_at runs newEngineRun()).
+ *                    "highest" where more is not better.
  *   recent         - the mean of the last RECENT_S seconds at that concurrency.
  *   now            - the current value as a percentage of that extreme.
  * Figures are kept per concurrency ("@cN" past one), because a batched rate read against the

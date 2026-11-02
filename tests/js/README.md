@@ -16,7 +16,7 @@ which has already happened once here.
 
 | file | the shipped code it drives |
 | --- | --- |
-| `poll_spark.test.js` | `poll()`'s restart decision, the cadence fields, the sparkline |
+| `poll_spark.test.js` | the cadence fields, the sparkline |
 | `extremes.test.js` | `noteSample`, `triple`, `acceptTriple`, `resetWindows`, `newEngineRun` |
 | `history.test.js` | the history summary line: how it groups, and how it wraps |
 | `download.test.js` | the Requests-header JSON export: its markup and its handler |
