@@ -482,8 +482,18 @@ int launch_mxfp4a8_tiled(long av, long asv, long bvc, long bsv, long yv, int M, 
 
     const dim3 blk(kBlockThreads);
     const dim3 grd((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
-    ActQ aq{(const float*)(uintptr_t)asv, (long long)as_ld, 1};
-    MxWQ h{(const uint8_t*)(uintptr_t)bvc, (const uint8_t*)(uintptr_t)bsv, b_row, e8_row};
+    /* Value-init so the ActQ's 4-byte padding hole is deterministic: the tape audit byte-compares
+     * the serialized kernel arguments, and aggregate-init leaves that padding indeterminate, which
+     * reads as "the key does not carry" the argument and stops the engine. See fp8a8's launcher. */
+    ActQ aq{};
+    aq.scale = (const float*)(uintptr_t)asv;
+    aq.row = as_ld;
+    aq.gmode = 1;
+    MxWQ h{};
+    h.codes = (const uint8_t*)(uintptr_t)bvc;
+    h.e8 = (const uint8_t*)(uintptr_t)bsv;
+    h.code_row = b_row;
+    h.e8_row = e8_row;
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
     if (alu) {
         if (nt) mxfp4a8_tiled_kernel<1,1><<<grd, blk, 0, s>>>(
