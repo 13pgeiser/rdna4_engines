@@ -88,6 +88,7 @@
 #include <vector>
 
 #include <arch/rad_arch.h>
+#include <rad_prefill_split.h>
 #include <arch/rad_block_attn_gated_fp8.h>
 #include <arch/rad_block_gdn_fp8.h>
 #include <arch/rad_block_hc.h>
@@ -1696,6 +1697,44 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * acceptance stays high at every depth, but each extra verify row costs real time because the
  * weights do not fit device memory (more experts streamed, more n-gram rows faulted from the
  * mapped table). */
+uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
+    if (!c || !batch) return 0;
+    if (batch->enc) return 1;
+    /* MTP owns another attention path on the same KV group. The present batch key cannot prove
+     * whether that head's attention row takes a split grid, so keep only those passes live. */
+    if (batch->draft_pass != 0) return 0;
+    if (batch->phase != RAD_PHASE_PREFILL) return 1;
+
+    Model& m = g_model[rad_rank(c)];
+    bool has_full_attention = false;
+    for (const Layer& layer : m.layers) {
+        if (!layer.full) continue;
+        if (layer.attn.kv_block != 4) return 0;
+        has_full_attention = true;
+    }
+    if (!has_full_attention) return 1;
+    if (m.g.head_dim != 256 || (m.g.gqa() != 6 && m.g.gqa() != 12) || !m.kv_full ||
+        !used_max_h || !batch->kv || batch->n_kv_groups <= 0)
+        return 0;
+
+    int group = -1;
+    for (int i = 0; i < batch->n_kv_groups; ++i)
+        if (batch->kv[i].group == m.kv_full) { group = i; break; }
+    if (group < 0) return 0;
+
+    const int q_len = (int)batch->max_q_len;
+    const int total_q = (int)batch->n_tok;
+    const int num_seqs = (int)batch->n_seq;
+    const int kv_heads = (int)m.g.n_head_kv;
+    const int used = used_max_h[group];
+    const int wgps = rad_ctx_wgp_count(c);
+    constexpr int tile = 48, nwarps = 24;
+    const int bq = nwarps * 16 / m.g.gqa();
+    const int splits = rad_prefill_splits_for_live(bq, tile, q_len, total_q, num_seqs,
+                                                    kv_heads, batch->max_ctx_len, used, wgps);
+    return rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
+}
+
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     /* The gated attention block declares the streamed store and the resolve
@@ -1728,4 +1767,8 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
                 "Qwen4-Exp (Qwen3.8-Flash-Next): hybrid Gated DeltaNet / gated attention, a gated "
                 "residual four streams wide and 512 routed experts, from a dense bf16 checkpoint "
                 "quantised ahead of time by a recipe")
+extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch,
+                                      const int32_t* used_max_h) {
+    return qwen4exp_fp8::pass_key(c, batch, used_max_h);
+}
 #endif

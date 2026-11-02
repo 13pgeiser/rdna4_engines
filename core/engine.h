@@ -169,6 +169,7 @@ private:
     std::vector<const char*> meta_kv_kp_, meta_kv_vp_;
 
     void (*arch_step_)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
 
     int load_plugins();
     int read_metadata();

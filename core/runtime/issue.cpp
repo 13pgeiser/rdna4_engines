@@ -1280,6 +1280,9 @@ int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
 }
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
+int             rad_ctx_wgp_count(RadCtx* c) {
+    return c ? static_cast<rad::Ctx*>(c)->wgp_count() : 32;
+}
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
 
 /* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`

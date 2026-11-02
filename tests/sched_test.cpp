@@ -2060,6 +2060,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     CHECK_EQ(g0.block_table[128], btb[0]);
     CHECK_EQ(g0.seqused[0], 101);
     CHECK_EQ(g0.seqused[1], 64);
+    CHECK_EQ(s2->kv_used_max_h[0], std::max(g0.seqused[0], g0.seqused[1]));
 
     /* The linear group is per sequence, not per token: every token of a sequence maps to its one
      * state instance, and the block table row is that slot. */
@@ -6972,8 +6973,14 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
      * nothing. */
     int64_t at = 0;
     for (int k = 0; k < 8 && at < 160; ++k) {
-        REQUIRE(f.sch.step() != nullptr);
+        const RadBatch* chunk = f.sch.step();
+        REQUIRE(chunk != nullptr);
         REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        const RadKVGroupBatch& paged = chunk->kv[0];
+        int32_t used_max = 0;
+        for (int64_t i = 0; i < chunk->n_seq; ++i)
+            used_max = std::max(used_max, paged.seqused[i]);
+        CHECK_EQ(chunk->kv_used_max_h[0], used_max);
         CHECK_EQ(f.sch.plan().e[0].ctx_len, at);
         at += f.sch.plan().e[0].n_tokens;
         CHECK(at <= 160);
@@ -6985,6 +6992,7 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
     /* The replayed output token on its own, which samples the next. */
     const RadBatch* rb = f.sch.step();
     REQUIRE(rb != nullptr);
+    CHECK_EQ(rb->kv_used_max_h[0], rb->kv[0].seqused[0]);
     CHECK_EQ(f.sch.plan().e[0].ctx_len, 160);
     CHECK_EQ(f.sch.plan().e[0].n_tokens, 1);
     CHECK(f.sch.plan().e[0].produces_token);

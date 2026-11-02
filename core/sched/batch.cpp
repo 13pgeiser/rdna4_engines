@@ -245,6 +245,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
         o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
+        o.kv_used_max_h.assign(s.groups.size(), 0);
         o.seqs.clear();
         o.seqs.reserve((size_t)max_seqs_);   /* a build fills it without allocating */
         o.has_seqs = false;
@@ -814,6 +815,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                                    (int)g.sidx_pitch);
             }
         }
+        int32_t group_used = 0;
+        for (int64_t i = 0; i < n_seq; ++i)
+            group_used = std::max(group_used, g.h_used[i]);
+        o.kv_used_max_h[gi] = group_used;
         /* A state group's rows are one slot per sequence: n_seq words, restaged whole. */
         if (!L.paged) {
             stage(g.bt_fix, np, n_seq);
@@ -1226,6 +1231,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.max_q_len_decode = max_q_dec;
         B.max_q_len_prefill = max_q_pf;
         B.max_ctx_len = (int32_t)ctx_bound;
+        B.kv_used_max_h = o.kv_used_max_h.data();
         B.n_kv_groups = (int)o.kv[r].size();
         B.kv = o.kv[r].data();
         B.draft_pass = plan.draft_pass;

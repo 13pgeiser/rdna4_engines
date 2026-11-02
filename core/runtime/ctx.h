@@ -192,6 +192,7 @@ struct CtxDesc {
     RadStream       stream      = nullptr;  /* null: the Ctx creates its own compute stream */
     ResidencyTable* residency   = nullptr;  /* null in the all-in-VRAM case */
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
+    uint64_t        (*arch_pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
@@ -256,6 +257,7 @@ public:
     }
     /* This rank's device ordinal, for the calls that name a card rather than a stream. */
     int             device()     const { return device_; }
+    int             wgp_count() const { return wgp_count_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
     Program*        program()    const { return program_; }
@@ -653,6 +655,8 @@ private:
     bool            staging_ = false;     /* the stager armed for the pass being issued */
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;
+    uint64_t        (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
+    int             wgp_count_ = 32;
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;

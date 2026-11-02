@@ -11,6 +11,7 @@
  */
 #include "rad_test.h"
 #include "host_kargs_main.h"
+#include "rad_prefill_split.h"
 
 #include "device/device.h"
 #include "runtime/arena.h"
@@ -234,12 +235,14 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
-    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false) {
+    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false,
+              uint64_t (*pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr) {
         CtxDesc d;
         d.program     = &P;
         d.rank        = 1;
         d.world_size  = 2;
         d.arch_step   = arch_step_trampoline;
+        d.arch_pass_key = pass_key;
         d.residency   = res;
         d.profile_ops = profile;
         d.kv          = kv;
@@ -2328,6 +2331,48 @@ TEST(a_program_with_a_calibration_tap_records_no_passes) {
  * and runtime state a pass's shape or arguments read, and must not change with the step number
  * alone. A field missing from the key replays stale arguments until the next audit. A pass that
  * cannot be recorded (encoder, generator, encoder rows) keys to 0. */
+static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const int32_t* used) {
+    if (!c || !b || !used) return 0;
+    const int bq = 192, tile = 48, kv_heads = 4, threads = 768;
+    const int wgps = rad_ctx_wgp_count(c);
+    const int splits = rad_prefill_splits_for_live(bq, tile, (int)b->max_q_len,
+                                                    (int)b->n_tok, (int)b->n_seq, kv_heads,
+                                                    b->max_ctx_len, used[0], wgps);
+    return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
+}
+
+TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    attach_host_row(f, op, k_host_read, "host_read");
+    CHECK_OK(f.start(nullptr, false, false, test_prefill_geometry_key));
+
+    RadKVGroupBatch kv{};
+    kv.group = 3;
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL; b.n_tok = 128; b.n_seq = 1;
+    b.max_q_len = 128; b.max_ctx_len = 4096; b.n_kv_groups = 1; b.kv = &kv;
+    int32_t used[1] = {2304};
+    b.kv_used_max_h = used;
+    const int split6 = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    const uint64_t k6 = f.ctx.pass_key(&b);
+    used[0] = 2305;
+    const int same_split = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    CHECK_EQ(split6, 6);
+    CHECK_EQ(same_split, 6);
+    CHECK_EQ(f.ctx.pass_key(&b), k6);
+
+    used[0] = 3072;
+    const int split8 = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    const uint64_t k8 = f.ctx.pass_key(&b);
+    CHECK_EQ(split8, 8);
+    CHECK(k8 != k6);
+    CHECK_EQ(((128 + 192 - 1) / 192) * split6 * 768, 4608);
+    CHECK_EQ(((128 + 192 - 1) / 192) * split8 * 768, 6144);
+    CHECK_EQ(rad_ctx_wgp_count((RadCtx*)&f.ctx), 32);
+}
+
 TEST(the_pass_key_changes_with_every_field_a_pass_depends_on) {
     Fixture f;
     f.add_buffer("x", RAD_BF16, 64, 4, 0);
@@ -2343,7 +2388,8 @@ TEST(the_pass_key_changes_with_every_field_a_pass_depends_on) {
         std::memset(&b, 0, sizeof b);
         std::memset(kv, 0, sizeof kv);
         b.phase = RAD_PHASE_DECODE; b.step = 5; b.n_tok = 4; b.n_seq = 2; b.n_out = 2;
-        b.max_q_len = 2; b.max_ctx_len = 1024; b.n_kv_groups = 2; b.kv = kv; b.n_spec = 1;
+        b.max_q_len = 2; b.max_ctx_len = 1024;
+        b.n_kv_groups = 2; b.kv = kv; b.n_spec = 1;
         b.n_seq_decode = 2; b.n_tok_decode = 4; b.max_q_len_decode = 2;
         int k = 0;
         b.token_ids = arr[k++]; b.positions = arr[k++]; b.cu_seqlens = arr[k++];

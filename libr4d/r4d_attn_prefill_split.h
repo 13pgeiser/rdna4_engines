@@ -13,6 +13,8 @@
 // Such launches split the KV and finish in the split-KV merge.
 #pragma once
 
+#include "rad_prefill_split.h"
+
 // Workgroups the card runs at once: one a WGP. HIP's multiProcessorCount counts WGPs on RDNA (32 on
 // the R9700, see want_wg in r4d_hc_bf16.hip); 32 if it cannot be read.
 static inline int r4d_prefill_wgps() {
@@ -43,16 +45,7 @@ static inline int r4d_prefill_wgps() {
 // the vectorised merge's limit.
 static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_q, int num_seqs,
                                          int kv_heads, int max_ctx, int wgps) {
-    const long n  = std::max(1, num_seqs);
-    const long qt = std::min(n * ((std::max(1, q_len) + bq - 1) / bq),
-                             (std::max(1, total_q) + (long)(bq - 1) * n) / bq);
-    const long units = (long)std::max(1, kv_heads) * std::max(1L, qt);
-    if (units >= wgps) return 1;
-    const int s1 = (int)(wgps / units), s2 = (int)(2L * wgps / units);
-    int sp = s2 > 2 * s1 ? s2 : s1;
-    const int cap = ((max_ctx > 0 ? max_ctx : (1 << 30) - 1) + tile - 1) / tile / 8;
-    sp = std::min(sp, std::max(1, cap));
-    return std::max(1, std::min(sp, 64));
+    return rad_prefill_splits_law(bq, tile, q_len, total_q, num_seqs, kv_heads, max_ctx, wgps);
 }
 
 // The split count of this unit's last prefill launch, 1 unsplit: read by the unit's test hook, which
@@ -92,8 +85,9 @@ static inline int r4d_prefill_splits_want(const RadArgs* a, const R4DArgs* r, in
                                     wgps);
     if (sp <= 1) return 1;
     const int used = r4d_prefill_used_ctx(r);
-    if (used > 0 && (r->max_ctx <= 0 || used < r->max_ctx))
-        sp = r4d_prefill_splits_law(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads, used, wgps);
+    if (used > 0)
+        sp = rad_prefill_splits_for_live(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads,
+                                         r->max_ctx, used, wgps);
     return sp;
 }
 

@@ -968,6 +968,7 @@ int Engine::load_plugins() {
 
     const Plugin* ap = rad_tools_registry().plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
@@ -3866,6 +3867,7 @@ int Engine::start() {
         /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
+        d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();

@@ -31,11 +31,15 @@ int Ctx::init(const CtxDesc& d) {
     registry_ = d.registry;
     kv_        = d.kv;
     arch_step_ = d.arch_step;
+    arch_pass_key_ = d.arch_pass_key;
     profiling_ = d.profile_ops;
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
     RAD_TRY(rad_dev_set(device_));
+    RadDeviceProps props{};
+    if (rad_dev_props(device_, &props) >= 0 && !props.is_host_backend && props.n_cu > 0)
+        wgp_count_ = props.n_cu;
 
     if (d.stream) {
         stream_     = d.stream;
@@ -944,7 +948,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are never
  * recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 416,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 424,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -988,6 +992,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
         /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
         mix(kvstream_view_key(k.stream));
+    }
+    if (arch_pass_key_) {
+        const uint64_t geometry = arch_pass_key_(const_cast<Ctx*>(this), b, b->kv_used_max_h);
+        if (!geometry) return 0;
+        mix(geometry);
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);

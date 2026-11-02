@@ -330,6 +330,10 @@ typedef struct RadBatch {
     /* A shape generator's pass (rad_declare_shape_generator; `gen` is one of its
      * RAD_GEN_PASS_S*): its payload. Null on every other step. */
     const struct RadShapeGenBatch* sgen_b;
+
+    /* ---- appended in ABI 34: host-side max seqused per entry of kv[], for an architecture's
+     * optional recorded-pass geometry key. Null when the batch has no host summary. */
+    const int32_t* kv_used_max_h;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -904,6 +908,9 @@ int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGrou
 int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
 int             rad_world_size(RadCtx* c);
+/* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
+ * 32 on the host backend or when the backend has no positive count). */
+int             rad_ctx_wgp_count(RadCtx* c);
 RadStream       rad_stream(RadCtx* c);
 
 /* The routing result for a MoE layer, resolved on device against the current residency table.
