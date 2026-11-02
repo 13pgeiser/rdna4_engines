@@ -742,6 +742,12 @@ th + th, td + td { padding-left:14px; }
         margin-top:14px; padding-top:12px; border-top:1px solid var(--rule); }
 #hist .hhead { display:flex; align-items:baseline; gap:10px; margin-bottom:8px; }
 #hist .hsum { flex:1; font-family:var(--mono); font-size:11px; color:var(--dim); line-height:1.5; }
+/* Each category is one atomic unit: if it cannot fit on the line it moves whole, rather than
+ * breaking mid-figure and orphaning a unit -- "810" at the end of one line, "ms" on the next.
+ * The separator is its own element with padding because HTML collapses runs of spaces, so
+ * spacing in the string could never have widened the category break. */
+#hist .hgrp { white-space:nowrap; }
+#hist .hsep { color:var(--faint); padding:0 9px; }
 #hist .hbtn { font-family:var(--mono); font-size:10px; color:var(--faint); cursor:pointer;
               user-select:none; padding:0 4px; }
 #hist .hbtn:hover { color:var(--bad); }
@@ -2253,9 +2259,19 @@ function histRender(missed) {
   if (tpsV.length) parts.push(group(tpsV, tps, "tok/s"));
   if (pfV.length)  parts.push(group(pfV, cnt3, "prefill"));
   if (tfs.length)  parts.push("ttft median " + dur(tfs[Math.floor(tfs.length / 2)]));
-  /* The wide dot is the page's major-break separator (the KV and version lines use it); the
-   * tight dot inside each group stays tight, so group edges read heavier than window edges. */
-  $("hsum").textContent = parts.join("  ·  ");
+  /* One element per category so it wraps whole, and the dot between them is its own element so
+   * its spacing survives. The dot marks a category change; the pipe inside each group marks a
+   * different question about the same category. */
+  const hsum = $("hsum");
+  hsum.textContent = "";
+  parts.forEach((p, i) => {
+    const g = el("span", "hgrp");
+    /* The dot travels WITH the category it introduces: as a sibling it could be left stranded
+     * at the end of a line when the category wrapped, which is the orphan this avoids. */
+    if (i) g.appendChild(el("span", "hsep", "\u00b7"));
+    g.appendChild(document.createTextNode(p));
+    hsum.appendChild(g);
+  });
 
   /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
   const body = $("hbody");
