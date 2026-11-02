@@ -1,0 +1,21 @@
+# FastFlowLM portable runtime for the Ryzen AI XDNA2 NPU.
+# The release linux.tar.gz is self-contained: flm wrapper + flm-real, every model
+# engine, and the XRT/XDNA libraries (libxrt* 2.25, libxrt_driver_xdna). The base
+# image only needs to provide the C runtime; nothing AMD-side is installed here.
+ARG FLM_VERSION=1.0.11
+FROM debian:13
+
+ARG FLM_VERSION
+# The tarball does not bundle the base runtime libs (the .deb's Depends):
+# libcurl4, libstdc++, libgomp, libuuid (boost is bundled under lib/)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+        libcurl4t64 libstdc++6 libgomp1 libuuid1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL --retry 3 -o /tmp/flm.tar.gz "https://github.com/ROCm/FastFlowLM/releases/download/v${FLM_VERSION}/fastflowlm_${FLM_VERSION}_linux.tar.gz" \
+    && mkdir -p /opt/fastflowlm \
+    && tar -xzf /tmp/flm.tar.gz -C /opt/fastflowlm \
+    && rm /tmp/flm.tar.gz
+
+ENV PATH=/opt/fastflowlm:$PATH
+ENV FLM_MODEL_PATH=/models

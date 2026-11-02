@@ -1,0 +1,51 @@
+# FastFlowLM runtime built from the FastFlowLM/ subtree (XRT portable build).
+# Mirrors the XRT-portable leg of CI (.github/workflows/lin-build.yml): compile
+# in the public build-environment image with the linux-portable preset, install
+# into /opt/fastflowlm, then rename flm -> flm-real and flm-wrapper.sh -> flm,
+# as the release tarballs do.
+# Build context: the FastFlowLM/ subtree; this Dockerfile lives in the repo root.
+FROM ghcr.io/rocm/fastflowlm/build-environment:debian13
+
+# Pinned revisions of the two third_party submodules: gitlinks in the super
+# project that arrive empty, cloned here at exactly those commits.
+ARG TOKENIZERS_REVISION
+ARG XGRAMMAR_REVISION
+
+# The build-environment image is rebuilt nightly from the subtree's Dockerfile;
+# install whatever this copy still lacks (same conditional as CI).
+RUN need=""; \
+    for tool in ccache curl nasm patchelf zstd; do command -v "$tool" >/dev/null || need="$need $tool"; done; \
+    for pkg in ca-certificates libedit-dev uuid-dev; do dpkg -s "$pkg" >/dev/null 2>&1 || need="$need $pkg"; done; \
+    if [ -n "$need" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends $need && rm -rf /var/lib/apt/lists/*; \
+    fi; \
+    if ! command -v rustup >/dev/null; then \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path; \
+    fi
+
+WORKDIR /workspace
+COPY src/ src/
+# the install rule also ships the repo-root license files
+COPY LICENSE_RUNTIME.txt LICENSE_BINARY.txt THIRD_PARTY_NOTICES.txt ./
+# --recursive like CI: tokenizers-cpp pins nested submodules (msgpack-c, sentencepiece)
+RUN git clone https://github.com/mlc-ai/tokenizers-cpp third_party/tokenizers-cpp \
+    && git -C third_party/tokenizers-cpp checkout "$TOKENIZERS_REVISION" \
+    && git -C third_party/tokenizers-cpp submodule update --init --recursive \
+    && git clone https://github.com/mlc-ai/xgrammar third_party/xgrammar \
+    && git -C third_party/xgrammar checkout "$XGRAMMAR_REVISION" \
+    && git -C third_party/xgrammar submodule update --init --recursive \
+    && find third_party -name .git -exec rm -rf {} +
+
+RUN cd src \
+    && cmake --preset linux-portable \
+    && cmake --build build --parallel "$(nproc)" \
+    && cmake --install build \
+    && cd /opt/fastflowlm \
+    && mv flm flm-real \
+    && mv flm-wrapper.sh flm \
+    && chmod +x flm \
+    && strip --strip-debug flm-real
+
+ENV PATH=/opt/fastflowlm:$PATH
+ENV FLM_MODEL_PATH=/models

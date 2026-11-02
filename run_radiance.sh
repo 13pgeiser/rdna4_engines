@@ -2,45 +2,12 @@
 # radiance .rad containers: 27b MXFP4 + DFlash2 drafter, flash-next fp8 trunk + 4-bit codebook MoE, or a 35B-A3B MoE (qwen3.6 / ornith).
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_DIR="/models/rad"
+source "$CURDIR/common.sh" || exit 1
 
 # -------------------------------
-# GPU arch gate: gfx1201 or gfx1152 only (early exit)
-# Card identity by PCI ID from /sys; the amdgpu dmesg GFX IP block version
-# ("amdgpu <bdf>: ... <gfx_vX_Y_Z> ...") is a family fallback for unknown IDs.
+# GPU arch gate: gfx1201 or gfx1152 only (early exit; detection in common.sh)
 # -------------------------------
-DMSGS="$( { dmesg 2>/dev/null || sudo dmesg 2>/dev/null; } 2>/dev/null)"
-SUPPORTED_ARCHES=""
-AMD_IDS=""
-for dev in /sys/class/drm/card*/device; do
-    [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1002" ] || continue
-    id="$(cat "$dev/device" 2>/dev/null)"
-    case " $AMD_IDS " in *" $id "*) ;; *) AMD_IDS="$AMD_IDS $id" ;; esac
-    bdf="$(basename "$(readlink -f "$dev")")"
-    ip="$(printf '%s\n' "$DMSGS" | awk -v b="amdgpu $bdf:" 'index($0, b) && match($0, /gfx_v[0-9]+_[0-9]+_[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }')"
-    case "$id" in
-        0x7551) arch=gfx1201 ;;        # Radeon AI PRO R9700
-        0x1114) arch=gfx1152 ;;        # Ryzen AI 7 350 (Krackan Point)
-        *)
-            case "$ip" in
-                gfx_v12_0_*) arch=gfx1201 ;;   # RDNA4 family
-                gfx_v11_5_*) arch=gfx1152 ;;   # RDNA3.5 family (e.g. RX 9060)
-                *) continue ;;
-            esac ;;
-    esac
-    case " $SUPPORTED_ARCHES " in *" $arch "*) ;; *) SUPPORTED_ARCHES="$SUPPORTED_ARCHES $arch" ;; esac
-done
-SUPPORTED_ARCHES="${SUPPORTED_ARCHES# }"
-AMD_IDS="${AMD_IDS# }"
-if [ -z "$SUPPORTED_ARCHES" ]; then
-    echo "no supported GPU: run_radiance.sh needs gfx1201 or gfx1152 (AMD cards found: ${AMD_IDS:-none})" >&2
-    exit 1
-fi
-if [ "$(echo $SUPPORTED_ARCHES | wc -w)" -gt 1 ]; then
-    echo "ambiguous: multiple supported GPUs found ($SUPPORTED_ARCHES); narrow to one first" >&2
-    exit 1
-fi
-GPU_ARCH="$SUPPORTED_ARCHES"
-echo "GPU arch: $GPU_ARCH"
+gpu_arch_gate run_radiance.sh gfx1201 gfx1152
 
 # -------------------------------
 # model selection (multiple choice)
@@ -82,44 +49,14 @@ ENV=(
       "RADIANCE_TUNE=attn_paged:splits=64"
 )
 
-resolve_model() {    # $1 -> model index on stdout; rc!=0 if no unique match
-      local sel="$1" i hits=()
-      if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#FILES[@]} )); then
-           printf '%s\n' $((sel-1)); return 0
-      fi
-      for i in "${!FILES[@]}"; do
-           [[ "${FILES[$i]}" == *"$sel"* ]] && hits+=("$i")
-      done
-      if (( ${#hits[@]} == 1 )); then
-           printf '%s\n' "${hits[0]}"; return 0
-      fi
-      return 1
-}
-
-if [ -n "$1" ]; then
-      # positional arg bypasses the menu (index or name)
-      IDX="$(resolve_model "$1")" || {
-           echo "no model matching '$1'; options:" >&2
-           for i in "${!FILES[@]}"; do echo "     $((i+1))) ${FILES[$i]}" >&2; done
-           exit 1
-      }
-elif [ ! -t 0 ]; then
-      # non-interactive, no arg: keep the current default
-      IDX=0
-else
-      echo "Available radiance models in $MODEL_DIR:"
-      for i in "${!FILES[@]}"; do echo "     $((i+1))) ${FILES[$i]}"; done
-      read -rp "Select model [1-${#FILES[@]}] (default 1): " pick
-      pick=${pick:-1}
-      IDX="$(resolve_model "$pick")" || { echo "invalid selection: $pick" >&2; exit 1; }
-fi
-MODEL_FILE="${FILES[$IDX]}"
-REPO="${REPOS[$IDX]}"
-EXTRA_FLAGS="${EXTRAS[$IDX]}"
+select_model "Available radiance models in $MODEL_DIR:" "$1" "${FILES[@]}"
+MODEL_FILE="${FILES[$MODEL_IDX]}"
+REPO="${REPOS[$MODEL_IDX]}"
+EXTRA_FLAGS="${EXTRAS[$MODEL_IDX]}"
 EXTRA_ENV=()
-[ -n "${ENV[$IDX]}" ] && EXTRA_ENV=(-e "${ENV[$IDX]}")
+[ -n "${ENV[$MODEL_IDX]}" ] && EXTRA_ENV=(-e "${ENV[$MODEL_IDX]}")
 echo "serving $MODEL_FILE with EXTRA_FLAGS=$EXTRA_FLAGS"
-[ -n "${ENV[$IDX]}" ] && echo "with ${ENV[$IDX]}"
+[ -n "${ENV[$MODEL_IDX]}" ] && echo "with ${ENV[$MODEL_IDX]}"
 
 # -------------------------------
 # docker image (build only if missing or wrong target)
