@@ -61,8 +61,9 @@ const nBtn = (page.match(/id="reqjson"/g) || []).length;
 eq(nBtn, 1, "exactly one reqjson control (a duplicate id would leave one dead)");
 /* And it is inside the Requests panel, not some other phead: the phead that opens with
    class="pleft" is the Requests one (only that header gained the group). */
-ok(page.indexOf('<span class="cap">Requests</span>') < iBtn,
-   "the button is in the Requests header, after its title");
+const iCap = page.indexOf('<span class="cap">Requests</span>');
+ok(iCap >= 0, "the Requests caption exists (indexOf -1 would make the order check vacuous)");
+ok(iCap >= 0 && iCap < iBtn, "the button is in the Requests header, after its title");
 
 console.log("== the shipped handler builds a real download ==");
 const si = L.findIndex((x) => x.startsWith('$("reqjson").addEventListener'));
@@ -74,14 +75,15 @@ const HANDLER = L.slice(si, ei + 1).join("\n");
 
 /* Stubs: capture the click handler, then invoke it and watch what it builds. */
 let clickHandler = null;
+const seq = [];   /* one ordered log: the ORDER of DOM ops is the bug class, not the counts */
 const fakeEl = (tag) => ({ tag, href: "", download: "", clicked: 0, removed: 0,
-  click() { this.clicked++; }, remove() { this.removed++; } });
+  click() { this.clicked++; seq.push("click"); }, remove() { this.removed++; seq.push("remove"); } });
 const anchors = [];
 const el = (t) => { const a = fakeEl(t); anchors.push(a); return a; };
-const body = { appended: [], appendChild(n) { this.appended.push(n); } };
+const body = { appended: [], appendChild(n) { this.appended.push(n); seq.push("append"); } };
 const created = [];
 const URL = { createObjectURL(b) { const u = "blob:fake/" + created.length; created.push({ b, u }); return u; },
-              revoked: [], revokeObjectURL(u) { this.revoked.push(u); } };
+              revoked: [], revokeObjectURL(u) { this.revoked.push(u); seq.push("revoke"); } };
 class Blob { constructor(parts, opts) { this.parts = parts; this.type = opts && opts.type; } }
 let timeoutFn = null;
 const setTimeout = (fn, ms) => { timeoutFn = fn; return 1; };
@@ -102,6 +104,13 @@ ok(a.href.startsWith("blob:"), "href is a blob URL: " + a.href);
 eq(a.clicked, 1, "the anchor was clicked (that is what triggers the save)");
 eq(body.appended.length, 1, "the anchor was attached to the document (Firefox needs it in the DOM)");
 eq(a.removed, 1, "the anchor was removed afterwards");
+/* Order, not just occurrence: Firefox ignores a click on an anchor that is not yet in the DOM, so
+   appendChild MUST precede click, and remove must follow it. Counts alone let a reordered handler
+   pass while the button is dead in the browser. */
+const iApp = seq.indexOf("append"), iClick = seq.indexOf("click"), iRem = seq.indexOf("remove");
+ok(iApp >= 0 && iClick >= 0 && iApp < iClick,
+   "the anchor is in the DOM BEFORE it is clicked (Firefox needs it): " + JSON.stringify(seq));
+ok(iClick >= 0 && iRem > iClick, "the anchor is removed only AFTER the click: " + JSON.stringify(seq));
 eq(created[0].b.type, "application/json", "the blob is typed application/json");
 const payload = JSON.parse(created[0].b.parts[0]);
 ok(Array.isArray(payload) && payload.length === 2, "the file holds the stored rows as JSON");

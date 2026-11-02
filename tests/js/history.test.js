@@ -40,8 +40,9 @@ ok(grpCss, "#hist .hgrp rule exists");
 ok(/white-space:\s*nowrap/.test(grpCss ? grpCss[1] : ""), "a category cannot break mid-figure");
 const sepCss = css.match(/#hist \.hsep \{([^}]*)\}/);
 ok(sepCss, "#hist .hsep rule exists");
-ok(/padding:\s*0\s+\d+px/.test(sepCss ? sepCss[1] : ""), "the category break gets width from padding, not spaces");
-const pad = sepCss ? +sepCss[1].match(/padding:0 (\d+)px/)[1] : 0;
+const padM = sepCss ? sepCss[1].match(/padding:\s*0\s+(\d+)px/) : null;
+ok(padM, "the category break gets width from padding, not spaces");
+const pad = padM ? +padM[1] : 0;
 ok(pad >= 4, "the padding is wide enough to read as a break (" + pad + "px, want >= 4)");
 
 console.log("== the shipped summary assembly builds one atomic group per category ==");
@@ -69,11 +70,22 @@ function mk(tag, cls, txt) {
 const hsum = mk("span", "hsum");
 const el = (t, c, x) => mk(t, c, x);
 const doc = { createTextNode: (t) => ({ tag: "#text", cls: null, txt: t }) };
-const rows = [];
-for (let i = 0; i < 24; i++) rows.push({ tps: 200 + (i % 9), pf: 690 + (i % 5), ttft: 810, age: i * 3 });
+/* The formatters come from the SHIPPED source, not re-typed here: a guard that asserts against a
+   stub's own " ms" tests the stub. Slice DASH..dur (self-contained: ladder, sig3, cnt, pctn all
+   inside) and drive the real tps/cnt3/dur. */
+/* lines() is INCLUSIVE of the end anchor, which would leave a dangling `const stepTime =` and
+   throw a SyntaxError inside new Function. Slice to the line BEFORE it instead. */
+const fi = L.findIndex((x) => x.startsWith("const DASH = "));
+const fj = L.findIndex((x) => x.startsWith("const stepTime = "));
+if (fi < 0 || fj < 0 || fj <= fi) throw new Error("formatter block not located");
+const FMT = L.slice(fi, fj).join("\n");
+const { tps: tpsF, cnt3: cnt3F, dur: durF } = new Function(FMT + "\nreturn { tps, cnt3, dur };")();
+/* Fixture with DISTINCT means: the old cycling values made mean(all) == mean(last 20) by
+   coincidence, so a window mutation could not show up in the figures. */
+const mkRows = (n) => Array.from({ length: n }, (_, i) => ({ tps: 100 + i, pf: 600 + 2 * i, ttft: 0.5 + 0.1 * i, age: i * 3 }));
+const rows = mkRows(24);
 new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
-  el, doc, () => hsum, rows,
-  (v) => Math.round(v) + " t/s", (v) => String(Math.round(v)), (v) => v + " ms");
+  el, doc, () => hsum, rows, tpsF, cnt3F, durF);
 
 /* #hsum now holds the four category groups AND the zero-width-space break points between them,
    so select by class rather than assuming every child is a group. */
@@ -112,6 +124,16 @@ const tpsOwn = ownText(groups[1]);
 ok(tpsGroup.includes("|"), "tok/s separates mean / last 20 / last 5 with pipes: " + JSON.stringify(tpsGroup));
 ok(!tpsOwn.includes("\u00b7"), "no dot among a category's own figures (the dot means category change): " + JSON.stringify(tpsOwn));
 ok(/last 20:.*\|.*last 5:/.test(tpsGroup), "both windows present and pipe-separated");
+console.log("== each figure is the mean of the rows its label names ==");
+/* Computed independently of the shipped group(): if the shipped slice or threshold drifts
+   (slice(-20) -> slice(-100) survived the old suite), rendered and expected diverge. */
+const mean = (a) => a.reduce((p, c) => p + c, 0) / a.length;
+const tv = rows.map((r) => r.tps), pv = rows.map((r) => r.pf);
+const wantTps = "tok/s mean " + tpsF(mean(tv)) + " | last 20: " + tpsF(mean(tv.slice(-20))) + " | last 5: " + tpsF(mean(tv.slice(-5)));
+ok(tpsOwn === wantTps, "tok/s figures are the means of all / last 20 / last 5: " + JSON.stringify(tpsOwn) + " want " + JSON.stringify(wantTps));
+const pfOwn = ownText(groups[2]);
+const wantPf = "prefill mean " + cnt3F(mean(pv)) + " | last 20: " + cnt3F(mean(pv.slice(-20))) + " | last 5: " + cnt3F(mean(pv.slice(-5)));
+ok(pfOwn === wantPf, "prefill figures are the means of all / last 20 / last 5: " + JSON.stringify(pfOwn) + " want " + JSON.stringify(wantPf));
 console.log("== nothing can orphan a unit ==");
 /* The failure this exists to prevent: "ttft median 810" ending a line and "ms" starting the next.
  * That happens when the value and its unit are separate wrap opportunities. */
@@ -119,6 +141,19 @@ const ttft = textOf(groups[3]);
 const ttftGroup = groups[3];
 const textNodes = ttftGroup.kids.filter((k) => k.cls !== "hsep");
 eq(textNodes.length, 1, "the ttft category is a single text node, so value and unit cannot split");
-ok(/ttft median \d+ ms$/.test(textNodes[0].txt), "value and unit are one string: " + JSON.stringify(textNodes[0].txt));
+const tfsSorted = rows.map((r) => r.ttft).sort((a, b) => a - b);
+const wantTtft = "ttft median " + durF(tfsSorted[Math.floor(tfsSorted.length / 2)]);
+ok(textNodes[0].txt === wantTtft,
+   "value and unit are one string, rendered by the shipped dur(): " + JSON.stringify(textNodes[0].txt) + " want " + JSON.stringify(wantTtft));
+console.log("== the window thresholds: last 20 needs 20 rows, last 5 needs 5 ==");
+/* 12 is the discriminating count: it kills a threshold lowered to <=12 as well as one raised. */
+for (const [n, want20, want5] of [[7, false, true], [12, false, true], [24, true, true]]) {
+  const box = mk("span", "hsum");
+  new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
+    el, doc, () => box, mkRows(n), tpsF, cnt3F, durF);
+  const t = box.kids.filter((k) => k.cls === "hgrp").map((g) => g.kids.map((k) => k.txt || "").join("")).join(" ");
+  eq(t.includes("last 20:"), want20, n + " rows: last 20 " + (want20 ? "shows" : "stays hidden (it would repeat the overall mean)"));
+  eq(t.includes("last 5:"), want5, n + " rows: last 5 " + (want5 ? "shows" : "stays hidden"));
+}
 console.log(fails ? "\n" + fails + " FAILURE(S) of " + checks : "\nALL " + checks + " CHECKS PASS on the shipped history line");
 process.exit(fails ? 1 : 0);
