@@ -91,6 +91,58 @@ TEST(a_retired_flag_is_refused) {
     CHECK_EQ(parse({ "--kv-host-cache-mib", "4096" }, &c), RAD_E_INVAL);
 }
 
+/* An empty key is no key: --api-key "" -- or --api-key "$UNSET_VAR" in a unit file whose variable
+ * was typo'd -- must not start a server that looks guarded on its command line and answers every
+ * route keyless. The shipped compose files fail closed on ${RADIANCE_API_KEY:?}; this is the
+ * refusal for every other way the binary meets an empty value. */
+TEST(an_empty_api_key_is_refused) {
+    CHECK_EQ(parse_fresh({ "--api-key", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--api-key", "k" }, &c), 0);
+    CHECK(c.api_key == "k");
+}
+
+/* --api-key-env reads the key where `ps` cannot: the empty-value refusal's sibling is the
+ * never-set one -- a compose environment: or unit Environment= line with a typo'd name must
+ * refuse at startup, not serve keyless under a guarded-looking command line. */
+TEST(an_api_key_env_that_is_unset_is_refused_and_one_that_is_set_is_the_key) {
+    unsetenv("RAD_TEST_KEY_ENV");
+    CHECK_EQ(parse_fresh({ "--api-key-env", "RAD_TEST_KEY_ENV" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--api-key-env", "" }), RAD_E_INVAL);
+    setenv("RAD_TEST_KEY_ENV", "s3cret", 1);
+    Config c;
+    CHECK_EQ(parse({ "--api-key-env", "RAD_TEST_KEY_ENV" }, &c), 0);
+    CHECK(c.api_key == "s3cret");
+    CHECK(c.api_key_env == "RAD_TEST_KEY_ENV");
+    unsetenv("RAD_TEST_KEY_ENV");
+}
+
+/* --allow-host repeats: the loopback-only routes take the set of names, and an empty one is
+ * a hole cut by a typo, so it is refused like the empty key. */
+TEST(allow_host_repeats_and_refuses_the_empty_name) {
+    CHECK_EQ(parse_fresh({ "--allow-host", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--allow-host", "box", "--allow-host", "box.example" }, &c), 0);
+    CHECK(c.allow_hosts.size() == 2);
+    CHECK(c.allow_hosts[0] == "box" && c.allow_hosts[1] == "box.example");
+}
+
+/* --trusted-proxy repeats: the sockets inside these networks may name the client behind them
+ * for the log. Anything but a numeric network with a prefix is refused at startup, because a
+ * typo there silently unvouches a proxy -- the server would keep answering through it and log
+ * the proxy on every line, with nothing to show for the flag. */
+TEST(trusted_proxy_repeats_and_refuses_anything_but_a_cidr) {
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.1" }), RAD_E_INVAL);        /* no prefix */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.0/33" }), RAD_E_INVAL);     /* out of family */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "::1/129" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "proxy.internal/32" }), RAD_E_INVAL);/* not numeric */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "[::1]/128" }), RAD_E_INVAL);        /* URL form, not CIDR */
+    Config c;
+    CHECK_EQ(parse({ "--trusted-proxy", "127.0.0.0/8", "--trusted-proxy", "::1/128" }, &c), 0);
+    CHECK(c.trusted_proxies.size() == 2);
+    CHECK(c.trusted_proxies[0] == "127.0.0.0/8" && c.trusted_proxies[1] == "::1/128");
+}
+
 /* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
@@ -141,6 +193,14 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-ref", "/r", "--kld-corpus", "/c" }, &f), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kld-out", "/o.json" }, &f), RAD_E_INVAL);            /* nothing to report */
     CHECK_EQ(parse({ "--kld-ref" }, &f), RAD_E_INVAL);
+
+    /* --kld-top is the recording's form; a scoring run reads it from the reference. */
+    Config g;
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c.jsonl", "--kld-top", "512" }, &g), RAD_OK);
+    CHECK_EQ(g.kld_top, 512);
+    CHECK_EQ(parse({ "--kld-ref", "/r", "--kld-top", "512" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "9000" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "-1" }, &f), RAD_E_INVAL);
 }
 
 /* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
@@ -312,16 +372,19 @@ TEST(the_boolean_flags_are_off_until_they_are_given) {
     CHECK(!d.debug_selection);
     CHECK(!d.debug_placement);
     CHECK(!d.accept_reference_kernels);
+    CHECK(!d.proceed_incompatible);
     CHECK(!d.profile_ops);
     CHECK(!d.live_view);
 
     Config c;
     CHECK_EQ(parse({ "--deterministic", "--no-prefix-cache", "--debug-placement",
-                     "--debug-accept-reference-kernels", "--profile-ops", "--live" }, &c), RAD_OK);
+                     "--debug-accept-reference-kernels", "--profile-ops", "--live",
+                     "--proceed-with-incompatible-configuration" }, &c), RAD_OK);
     CHECK(c.deterministic);
     CHECK(!c.prefix_cache);
     CHECK(c.debug_placement);
     CHECK(c.accept_reference_kernels);
+    CHECK(c.proceed_incompatible);
     CHECK(c.profile_ops);
     CHECK(c.live_view);
 }
@@ -435,6 +498,7 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
+        { "--model-revision", { "v1.2" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
@@ -449,7 +513,6 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
-        { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
@@ -461,6 +524,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
+        { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
+        { "--allow-host", { "box" } },
+        { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
@@ -492,6 +558,12 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
+        { "--kld-top", { "512", "--kld-record", "/r", "--kld-corpus", "/c.jsonl" } },
+        { "--calib-corpus", { "/c.jsonl", "--calib-dir", "/d" } },
+        { "--calib-dir", { "/d", "--calib-corpus", "/c.jsonl" } },
+        { "--calib-layers", { "0:32", "--calib-corpus", "/c.jsonl", "--calib-dir", "/d" } },
+        { "--image-gen-max-pixels", { "1048576" } },
+        { "--image-gen-max-refs", { "2" } },
         { "--lora", { "a=/adapters/a" } },
         { "--lora-dir", { "/" } },
         { "--max-loras", { "2", "--lora-target-modules", "q_proj" } },
@@ -511,6 +583,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
  * setting. */
 TEST(every_listed_option_parses_and_is_reported_as_given) {
     LogGuard lg;
+    /* --api-key-env resolves at parse time and fails closed on an unset name, so the inventory
+     * needs the variable it names to exist. */
+    setenv("RAD_KEY_ENV_INVENTORY", "inventory-key", 1);
     const auto opts = usage_options();
     CHECK(opts.size() > 90);
     const std::vector<std::string> names = diag::config_option_names();

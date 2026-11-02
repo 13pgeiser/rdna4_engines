@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -98,7 +99,9 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 512;
+        /* Above the 1000 + i the requests below spell: admission refuses ids past the
+         * vocabulary, and these prompts must be admissible. */
+        prog.meta.n_vocab = 65536;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -1281,6 +1284,53 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
     CHECK(!kept->may_speculate);
 }
 
+/* The candidate COUNT is capped as well as their values: a scored step stages the union of
+ * these lists as pinned host rows, so their size must not be a client's choice at the seam.
+ * 4096 is orders above what a decision request names (its written answers, a few dozen), so
+ * exactly the cap admits and one past it is refused by name. */
+TEST(a_scored_request_names_at_most_the_candidate_cap) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    std::unique_ptr<Request> rs[2];
+    for (int i = 0; i < 2; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt.assign(16, 7);
+        rs[i]->token_scores = std::make_shared<TokenScores>();
+        rs[i]->token_scores->tokens.assign(4096 + i, 1);
+    }
+    int rc[2] = { -1, -1 };
+    f.sch.add_all(rs, 2, rc);
+    CHECK_EQ(rc[0], RAD_OK);         /* exactly the cap */
+    CHECK_EQ(rc[1], RAD_E_INVAL);    /* one past it */
+}
+
+/* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
+ * request body, and an id past the embedding table must die at admission, never staged into a
+ * pass -- the embedding gather would fail the step, a failed step is a device fault, and a
+ * device fault stops the engine (spec §17). One bad number must not be a server kill. */
+TEST(a_prompt_names_real_vocabulary_rows) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    std::unique_ptr<Request> rs[5];
+    const std::vector<std::vector<int32_t>> ids = { { 1, 2, n_vocab - 1 }, { n_vocab }, { -1 },
+                                                    { 7, INT32_MAX }, { 0, 1, 2, n_vocab + 9 } };
+    int rc[5] = { -1, -1, -1, -1, -1 };
+    for (int i = 0; i < 5; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt = ids[(size_t)i];
+    }
+    f.sch.add_all(rs, 5, rc);
+    CHECK_EQ(rc[0], RAD_OK);
+    for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
+}
+
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     Fixture f;
     f.build();
@@ -1725,7 +1775,175 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     f.commit_plain();
 }
 
+/* The whole-recompute predicate counts blocks the cache can lend back, not entries it already
+ * holds. With nothing running, the old gate never entered its victim loop, so a pool filled by
+ * finished conversations kept an overdue preempted request in Preempted forever -- the daily's
+ * "deadlocked at preempted" incident. The overdue pass reclaims cache entries before judging fit. */
+TEST(a_preempted_prefill_reclaims_cache_blocks_with_no_running_request) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+
+    /* Both prompts fill the pool; B's next token is refused and B is preempted. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)2);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    f.commit_plain();
+
+    /* Nothing runs after A goes: B is the only sequence, at zero, overdue. Put the pool's free
+     * blocks in the cache so B's whole recompute no longer fits the free list alone. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    f.pc.seed(160);                          /* 10 blocks cached, 16 left free */
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls > 0);
+    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    f.commit_plain();
+}
+
+/* A leaked state slot (held by nobody, missing from the free list) used to make can_grow false
+ * forever once nothing was running. The overdue pass puts the slot back and admits. */
+TEST(an_idle_overdue_prefill_reclaims_a_leaked_state_slot) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/4);
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+
+    for (size_t i = 0; i < f.kv.gs.size(); ++i)
+        if (!f.kv.geom.g[i].paged) f.kv.state_free[i].clear();
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    f.commit_plain();
+}
+
+/* can_grow on an id the manager has forgotten is false. That must not park an idle engine:
+ * admit adds the sequence. */
+TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/4);
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    f.kv.seqs.erase(b);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK(f.kv.has_sequence(b));
+    f.commit_plain();
+}
+
+/* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can
+ * start just swaps who is at zero, and the higher one is admitted again. The higher one must
+ * finish its prompt and keep it. */
+TEST(a_preempted_prefill_does_not_reset_a_higher_priority_prefill) {
+    Fixture f;
+    f.build(/*blocks=*/18, /*states=*/64, /*max_tok=*/256);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 6;
+    f.pc.seed(96);
+
+    const uint64_t a = f.submit(192, 16, /*priority=*/5);
+    const uint64_t b = f.submit(128, 16, /*priority=*/0);
+
+    int64_t a_peak = 0;
+    bool a_reset = false;
+    for (int i = 0; i < 8; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+        const Request* ra = f.sch.find(a);
+        if (!ra) continue;
+        if (ra->n_computed < a_peak) a_reset = true;
+        if (ra->n_computed > a_peak) a_peak = ra->n_computed;
+    }
+    CHECK(!a_reset);
+    CHECK(a_peak >= 192);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+}
+
+/* Every program carries a sentinel KV group at index 0: decl.kind 0 (RAD_KV_FULL), block size 1, no
+ * layers, and the manager's plan for it pages nothing, so it holds no blocks. The gate must not ask
+ * that group for the prompt's blocks: it has none to give, and the preempted request would wait
+ * for ever (engine_e2e_test's preemption case hung on it, with nothing left running). Here the
+ * group is appended, not at index 0, so the fixture's bindings stay where they are. */
+TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    KVGroupInfo none;                        /* as the sentinel: kind 0, no block size, no layers */
+    none.name = "none";
+    f.prog.kv_groups.push_back(none);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 26, 64);
+    const size_t ng = f.prog.kv_groups.size() - 1;
+    f.kv.geom.g[ng].paged = false;           /* the manager pages nothing there ... */
+    f.kv.total[ng] = 0;                      /* ... and owns no block of it */
+    f.kv.freelist[ng].clear();
+    f.kv.refcnt[ng].clear();
+    for (int k = 63; k >= 0; --k) f.kv.state_free[ng].push_back(k);
+    f.cfg.preempt_wait_ms = 60000;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);                /* B's next block: B is preempted */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* A's blocks are back and nothing runs: B prefills its whole prompt again. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    f.commit_plain();
+}
+
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
+
  * preempting the lowest-priority running request before the step is planned, so it cannot queue
  * forever behind a long decode (the 710 s stall in the daily's log). */
 TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
@@ -1745,19 +1963,19 @@ TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
     f.commit_plain();
 
-    /* B's blocks are back in the pool; the old gate wants B's whole prompt plus one block of
-     * headroom beside A's next token, so it cannot admit B without a victim. */
+    /* B is the lower priority. Making room for it by resetting A just swaps who is at zero, and
+     * A is re-admitted at once. B stays queued; A keeps what it has built. */
     CHECK(f.sch.step() != nullptr);
-    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
-    CHECK_EQ(f.sch.metrics().preemptions, 2);
-    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    CHECK(f.sch.find(a)->n_computed > 0);
     f.commit_plain();
 }
 
-/* Several overdue preempted prefills: reclaiming for the head alone is not enough. Keep forcing
- * the lowest-priority runner until one overdue request can prefill, so the rest of the queue
- * cannot sit in Preempted behind a head that still does not fit. */
+/* A lower-priority overdue prefill may stay queued while a higher-priority runner keeps its
+ * blocks. Forcing that runner off just swaps who is at zero. The priority-5 request must not be
+ * the one left in Preempted while someone else still runs. */
 TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);   /* 20 x 16 = 320 tokens */
@@ -1777,9 +1995,11 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
         if (!f.sch.step()) break;
         f.commit_plain();
     }
-    CHECK(f.sch.metrics().preempted_waiting == 0 || f.sch.metrics().preempt_forced > 0);
+    const Request* ra = f.sch.find(a);
+    CHECK(ra);
+    CHECK(ra->state != ReqState::Preempted || f.sch.metrics().running == 0);
     CHECK(f.sch.metrics().running + f.sch.metrics().preempted_waiting > 0);
-    (void)a; (void)b; (void)c;
+    (void)b; (void)c;
 }
 
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
@@ -4509,6 +4729,34 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     CHECK(checked > 100);
 }
 
+/* A streamed group's prefill stage copies what the step's own sequences' tables name
+ * (kvstream/stage.h, "Volume"), so the engine reads the step's sequences off the batch it is about
+ * to run: the build's rows in order, for that batch only. */
+TEST(a_built_batch_names_its_own_sequences_in_row_order) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+    f.submit(40, 9);
+    f.submit(70, 20);
+    int checked = 0;
+    for (int step = 0; step < 12; ++step) {
+        if (step == 3) f.submit(33, 12);
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        const std::vector<uint64_t>* seqs = f.sch.step_seqs(b);
+        REQUIRE(seqs != nullptr);
+        REQUIRE_EQ(seqs->size(), p.e.size());
+        for (size_t i = 0; i < p.e.size(); ++i) CHECK_EQ((*seqs)[i], p.e[i].seq);
+        ++checked;
+        CHECK_OK(f.commit(0, 0));
+    }
+    CHECK(checked > 5);
+    RadBatch other{};
+    CHECK(f.sch.step_seqs(&other) == nullptr);
+    CHECK(f.sch.step_seqs(nullptr) == nullptr);
+}
+
 /* A streamed group's residency map and ring bookkeeping live in each rank's KV pool,
  * but the manager the builder is given is rank 0's, so its pointers are rank 0's addresses. A
  * two-rank batch must name rank r's own copies or device r resolves through device 0's memory
@@ -4578,6 +4826,82 @@ TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mi
         for (int gi = 1; gi < b->n_kv_groups; ++gi)
             CHECK(b->kv[gi].stream == nullptr);
     }
+    bb.fini();
+}
+
+/* A request's words for the plugin (Request::plugin_words) ride the prefill step that samples
+ * its first token, with that row's index in word 0; a sequence without words, or one not at that
+ * step, has an empty range. A request past the declared bound fails the build. */
+TEST(a_requests_plugin_words_ride_the_step_that_samples_its_first_token) {
+    Fixture f;
+    f.build();
+    f.prog.plugin_words = 8;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    for (uint64_t id = 1; id <= 3; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 80));
+    }
+    Request r1, r2, r3;
+    r1.prompt.assign(8, 1);
+    r2.prompt.assign(8, 1);
+    r2.plugin_words = { 0, 7, 8, 9 };
+    r3.prompt.assign(8, 1);
+    r3.plugin_words = { 0, 5 };
+
+    StepPlan p;
+    p.reset();
+    auto entry = [&](uint64_t id, const Request* r, bool last) {
+        StepEntry e;
+        e.seq = id;
+        e.card = (int32_t)id - 1;
+        e.req = r;
+        e.n_tokens = 8;
+        e.ctx_len = 0;
+        e.is_prefill = true;
+        e.produces_token = last;
+        p.e.push_back(e);
+        p.n_tok += 8;
+    };
+    entry(1, &r1, true);     /* no words */
+    entry(2, &r2, true);     /* words, sampled this step */
+    entry(3, &r3, false);    /* words, but a mid-prompt chunk */
+    const RadBatch* b = bb.build(p, f.kv, 0);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)4);
+    REQUIRE(b->plugin_cu_h != nullptr);
+    CHECK_EQ(b->plugin_cu_h[0], 0);
+    CHECK_EQ(b->plugin_cu_h[1], 0);
+    CHECK_EQ(b->plugin_cu_h[2], 4);
+    CHECK_EQ(b->plugin_cu_h[3], 4);
+    /* Sequence 1 took logits row 0, so sequence 2's words open with row 1. */
+    CHECK_EQ(b->plugin_words_h[0], 1);
+    CHECK_EQ(b->plugin_words_h[1], 7);
+    CHECK_EQ(b->plugin_words_h[3], 9);
+    CHECK(b->plugin_words != nullptr && b->plugin_cu != nullptr);
+
+    /* No sequence carries words: every field is null. */
+    p.reset();
+    entry(1, &r1, true);
+    b = bb.build(p, f.kv, 1);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)0);
+    CHECK(b->plugin_words == nullptr && b->plugin_cu_h == nullptr);
+
+    /* Past the bound: the build fails rather than overrun the slab. */
+    r3.plugin_words.assign(9, 0);
+    p.reset();
+    entry(3, &r3, true);
+    CHECK(bb.build(p, f.kv, 2) == nullptr);
     bb.fini();
 }
 
@@ -6321,6 +6645,49 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     CHECK_EQ((int)f.sch.find(a)->output.size(), 2);   /* the step ahead emitted nothing */
 }
 
+/* A SCORED row (Request::token_scores) the step in flight brings to max_tokens gets no step issued
+ * ahead: it would be a forward pass for a request that finishes at the commit. The step after the
+ * commit is planned as usual. */
+TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    r->token_scores = std::make_shared<TokenScores>();
+    r->token_scores->tokens = { 1, 2 };
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() == nullptr);
+    f.commit_plain();                              /* the second token: finished */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);
+    CHECK(f.sch.step() == nullptr);
+}
+
+/* A row without token_scores whose step in flight leaves a token to decode is an ordinary decode:
+ * the step ahead is issued. (A request any step in flight finishes gets none, scored or not.) */
+TEST(a_non_scored_row_keeps_the_step_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto r = f.request(40, /*max_tokens=*/3);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() != nullptr);
+    f.commit_plain();
+    f.sch.promote_next();
+    f.commit_plain();                              /* the step ahead: the third token */
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 3);
+}
+
 /* ================================================================== terminal paths */
 /* A lone request that outgrows the whole pool fails with the reason the client sees and gives its
  * blocks back; nothing is preempted, since there is nobody to preempt and preempting itself would
@@ -6989,12 +7356,12 @@ uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_
 /* Without a span the scheduler plans and stages the pinned steps: the fingerprints of a scripted
  * workload's every step (plan entries and RadBatch arrays) at budgets of one, two and four
  * intervals, with --busy-prefill-chunk auto, off and fixed, taken from the scheduler as it was
- * before --prefill-span. */
+ * before --prefill-span with batch.cpp's two read-ahead chunks (k_ahead_chunks). */
 TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     struct Case { int64_t max_tok, interval, busy; uint64_t want; };
     const Case cases[] = {
-        { 256, 256, -1, 0x9b2fe92b1919355cull }, { 512, 256, -1, 0xdae73489249b5339ull }, { 1024, 256, -1, 0x44975a352e78619aull },
-        { 1024, 256, 0, 0x44975a352e78619aull }, { 1024, 256, 128, 0x3c0b9b1a1f864e4aull }, { 2048, 512, -1, 0xd6c184d0563159eeull },
+        { 256, 256, -1, 0x5a54a247b5ba614eull }, { 512, 256, -1, 0x82a560f95b47a8a1ull }, { 1024, 256, -1, 0x5336de4e63911e26ull },
+        { 1024, 256, 0, 0x5336de4e63911e26ull }, { 1024, 256, 128, 0xd14e26bf5be5aa5dull }, { 2048, 512, -1, 0x740799e030270f82ull },
     };
     for (const Case& c : cases) {
         int n = 0;

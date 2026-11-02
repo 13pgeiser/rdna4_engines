@@ -82,6 +82,15 @@ struct HeatParams {
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
     int warmup_dispatches = 0;
+
+    /* The hot VRAM cache's admission bar: the heat at which the file stager
+     * may read a routed expert into a slab slot permanently instead of its per-pass buffer.
+     * Absolute, not relative to a victim: admission happens when the unit is read anyway, and the
+     * shadow slots are the budget. A value near min_gain (1.5) admits anything routed twice
+     * lately and churns; 8 is roughly two consistently-routed steps of the verify union at
+     * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
+     * container is ground truth), so the cost of an admission mistake is one future re-read. */
+    float admit_heat = 8.0f;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
@@ -113,76 +122,55 @@ struct HeatStats {
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
 };
 
-/* The live twin of HeatStats: every counter an atomic, so the HTTP thread's /stats and LiveView
- * reads are relaxed loads beside the dispatch thread's writes rather than a data race. Written
- * as plain counters are (++ and +=), read through snapshot(). See MoverCounters, same reasoning.
- */
-struct HeatCounters {
-    std::atomic<uint64_t> dispatches{0};
-    std::atomic<uint64_t> proposed{0}, promotions{0}, demotions{0};
-    std::atomic<uint64_t> refused{0}, no_candidate{0};
-    std::atomic<uint64_t> distinct_promoted{0}, readmits{0};
-    std::atomic<uint64_t> routed{0}, routed_resident{0}, stream_bytes{0};
-
-    /* HeatEngine is copyable — place_test snapshots engines — so its counters must copy too.
-     * A copy takes the current values: relaxed loads into the copy's own atomics. */
-    HeatCounters() = default;
-    HeatCounters(const HeatCounters& o) { *this = o; }
-    HeatCounters& operator=(const HeatCounters& o) {
-        dispatches.store(o.dispatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        proposed.store(o.proposed.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        promotions.store(o.promotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        demotions.store(o.demotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        refused.store(o.refused.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        no_candidate.store(o.no_candidate.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-        distinct_promoted.store(o.distinct_promoted.load(std::memory_order_relaxed),
-                                std::memory_order_relaxed);
-        readmits.store(o.readmits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        routed.store(o.routed.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        routed_resident.store(o.routed_resident.load(std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-        stream_bytes.store(o.stream_bytes.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
+/* A counter one thread writes while another reads it (the HTTP thread's /stats and LiveView):
+ * a relaxed atomic, so the reader sees a whole value from one side of a write or the other.
+ * Copyable, a copy taking the current value, so a struct of them copies and resets by
+ * assignment. */
+template <class T>
+class Relaxed {
+public:
+    Relaxed(T v = 0) : v_(v) {}
+    Relaxed(const Relaxed& o) : v_(o.load()) {}
+    Relaxed& operator=(const Relaxed& o) {
+        v_.store(o.load(), std::memory_order_relaxed);
         return *this;
     }
+    operator T() const { return load(); }
+    T load() const { return v_.load(std::memory_order_relaxed); }
+    Relaxed& operator++() { v_.fetch_add(1, std::memory_order_relaxed); return *this; }
+    Relaxed& operator+=(T d) { v_.fetch_add(d, std::memory_order_relaxed); return *this; }
 
-    void reset() {
-        /* Field by field: atomics are not copy-assignable. */
-        dispatches.store(0, std::memory_order_relaxed);
-        proposed.store(0, std::memory_order_relaxed);
-        promotions.store(0, std::memory_order_relaxed);
-        demotions.store(0, std::memory_order_relaxed);
-        refused.store(0, std::memory_order_relaxed);
-        no_candidate.store(0, std::memory_order_relaxed);
-        distinct_promoted.store(0, std::memory_order_relaxed);
-        readmits.store(0, std::memory_order_relaxed);
-        routed.store(0, std::memory_order_relaxed);
-        routed_resident.store(0, std::memory_order_relaxed);
-        stream_bytes.store(0, std::memory_order_relaxed);
-    }
+private:
+    std::atomic<T> v_;
+};
+
+/* HeatStats as the engine counts it, readable from the HTTP thread; snapshot() is the plain copy
+ * the readers take. */
+struct HeatCounters {
+    Relaxed<uint64_t> dispatches, proposed, promotions, demotions, refused, no_candidate,
+                      distinct_promoted, readmits, routed, routed_resident, stream_bytes;
 
     HeatStats snapshot() const {
         HeatStats s;
-        s.dispatches        = dispatches.load(std::memory_order_relaxed);
-        s.proposed          = proposed.load(std::memory_order_relaxed);
-        s.promotions        = promotions.load(std::memory_order_relaxed);
-        s.demotions         = demotions.load(std::memory_order_relaxed);
-        s.refused           = refused.load(std::memory_order_relaxed);
-        s.no_candidate      = no_candidate.load(std::memory_order_relaxed);
-        s.distinct_promoted = distinct_promoted.load(std::memory_order_relaxed);
-        s.readmits          = readmits.load(std::memory_order_relaxed);
-        s.routed            = routed.load(std::memory_order_relaxed);
-        s.routed_resident   = routed_resident.load(std::memory_order_relaxed);
-        s.stream_bytes      = stream_bytes.load(std::memory_order_relaxed);
+        s.dispatches        = dispatches;
+        s.proposed          = proposed;
+        s.promotions        = promotions;
+        s.demotions         = demotions;
+        s.refused           = refused;
+        s.no_candidate      = no_candidate;
+        s.distinct_promoted = distinct_promoted;
+        s.readmits          = readmits;
+        s.routed            = routed;
+        s.routed_resident   = routed_resident;
+        s.stream_bytes      = stream_bytes;
         return s;
     }
 };
 
 /* The per-unit tier mirror HeatEngine keeps for the HTTP thread: one relaxed atomic byte per
  * unit, written by set_tier and read by tier_published. A type of its own because it must be
- * copyable — HeatEngine is copyable, and a copy takes the tier values into an array of its
- * own — which a bare unique_ptr of atomics is not. */
+ * copyable -- HeatEngine is copyable, and a copy takes the tier values into an array of its
+ * own -- which a bare unique_ptr of atomics is not. */
 struct TierMirror {
     std::unique_ptr<std::atomic<uint8_t>[]> a;
     size_t n = 0;
@@ -248,6 +236,28 @@ public:
         return (Tier)tier_pub_.get((size_t)unit);
     }
     bool busy(int32_t unit) const { return busy_[(size_t)unit] != 0; }
+
+    /* ---- the hot VRAM cache ----------------------------------------------
+     *
+     * A unit the file stager admitted keeps heat's history and, while resident, joins the
+     * demotion ranking as an evictable victim — but never the promotion ranking: its admission
+     * is the stager's own decision (it is read anyway; the slot is the only extra cost), and
+     * once evicted it has no address to promote from (the container, read by the stager).
+     *
+     * set_evictable marks a unit the mover has admitted or may admit. admit_hot is the
+     * admission test: heat past the bar and not already in flight. */
+    void set_evictable(int32_t unit, bool evictable);
+    /* A deposit's plan says Tier::SSD -- non-movable --
+     * but its pool slot makes it a PCIe-speed promotion candidate all the same. The deposit
+     * flips movability here, keeping the plan's word for everything else. */
+    void set_movable(int32_t unit, bool movable);
+    bool evictable(int32_t unit) const { return evictable_[(size_t)unit] != 0; }
+    bool admit_hot(int32_t unit) const {
+        return enabled_ && unit >= 0 && (size_t)unit < tier_.size() &&
+               tier_[(size_t)unit] == Tier::SSD && !busy_[(size_t)unit] &&
+               pos_[(size_t)unit] >= 0 &&
+               heat_[(size_t)pos_[(size_t)unit]] >= params_.admit_heat;
+    }
 
     /* The best swap available, or false when the guards refuse. */
     bool pick(Swap* out) const;
@@ -317,6 +327,10 @@ private:
      * lock-free and the mirror one byte per unit. */
     TierMirror tier_pub_;
     std::vector<uint8_t> busy_;
+    /* Per unit, whether heat may rank it as a demotion victim though the plan called it
+     * unmovable: the mover admitted it into the hot VRAM cache. Never a
+     * promotion candidate: with no pool slot, only the stager can bring the unit back. */
+    std::vector<uint8_t> evictable_;
     std::vector<uint8_t> movable_;
     /* --expert-pin-top: a decode-hot resident the planner pinned is never a demotion candidate,
      * even where a later pass made its unit movable again. */

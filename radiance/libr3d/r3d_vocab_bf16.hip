@@ -205,14 +205,15 @@ __device__ __forceinline__ uint32_t cvt_pk_f16_fp8(uint32_t b)
 #endif
 }
 
+template <int ALU>   /* ALU=1: the per-byte ALU decode (no table); ALU=0: the LDS table */
 __device__ __forceinline__ void codes8_to_f16x4(const uint2 c, int cdt, const uint16_t* tbl,
-                                               uint32_t* w)
+                                                uint32_t* w)
 {
     const uint32_t d[2] = { c.x, c.y };
-    if (tbl && !cdt) {
-        /* The LDS table: eight reads for eight codes, built from the codec below, so the results
-         * are identical (r3d_fp8_dequant.h). A null tbl selects the codec. */
-        r3d_e4m3x8_ld(tbl, c, w);
+    if (!cdt && (ALU || tbl)) {
+        /* The shared E4M3 decode: ALU=1 the per-byte formula, ALU=0 the LDS table
+         * (r3d_fp8_dequant.h). A null tbl with ALU=0 selects the codec below. */
+        r3d_e4m3x8_decode<ALU>(tbl, c, w);
         return;
     }
     if (!cdt) {
@@ -302,7 +303,7 @@ __device__ __forceinline__ uint2 loadc8(const uint8_t* p)
  *
  * y is f32 for logits_gemm and bf16 for gemm_nt (`YF32`). WQ reads the quantised head through h.
  */
-template <bool YF32, bool WQ>
+template <bool YF32, bool WQ, int ALU>
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(2)
 gemm_tiled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, HeadQ h,
                   void* __restrict__ y, int M, int N, int K, int a_ld, int y_ld)
@@ -314,7 +315,7 @@ gemm_tiled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b
     const int tid = (int)threadIdx.x;
     __shared__ __align__(16) uint16_t sTbl[R3D_E4M3_TBL];   /* the E4M3 decoder, 512 bytes */
     if (WQ) r3d_e4m3_f16_init(sTbl, tid, kBlockThreads);    /* fills, then barriers */
-    const uint16_t* const r3d_tbl = WQ ? sTbl : (const uint16_t*)nullptr;
+    const uint16_t* const r3d_tbl = (WQ && !ALU) ? sTbl : (const uint16_t*)nullptr;
     const int m0 = (int)blockIdx.y * kTM;
     const int n0 = (int)blockIdx.x * kTN;
     const int rg = tid >> 4, cg = tid & 15;           /* this lane's 8x8 square */
@@ -349,7 +350,7 @@ gemm_tiled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b
                      * the scale is indexed by this staged row n, not the lane's output row. */
                     const uint2 c = *(const uint2*)(h.codes + (long long)n * h.code_row + k);
                     uint32_t w[4];
-                    codes8_to_f16x4(c, h.cdt, r3d_tbl, w);
+                    codes8_to_f16x4<ALU>(c, h.cdt, r3d_tbl, w);
                     const float sc = scale_at(h, n, k);
                     staged = make_uint4(scale_pair(w[0], sc), scale_pair(w[1], sc),
                                         scale_pair(w[2], sc), scale_pair(w[3], sc));
@@ -421,7 +422,7 @@ gemm_tiled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b
  * ascending order. The activation tile is block-wide, so every thread stages it, including lanes
  * whose weight row is past the vocabulary; those lanes skip the dot and the store.
  */
-template <int MT, bool YF32, int NT, bool WQ>
+template <int MT, bool YF32, int NT, bool WQ, int ALU>
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(4)
 logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, HeadQ h,
                      void* __restrict__ y, int M, int N, int K, int x_ld, int y_ld)
@@ -431,8 +432,8 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
 
     __shared__ __align__(16) uint16_t sX[MT * kChunkK];   /* f16, MT rows x chunk, swizzled */
     __shared__ __align__(16) uint16_t sTbl[R3D_E4M3_TBL];
-    if (WQ) r3d_e4m3_f16_init(sTbl, (int)threadIdx.x, kBlockThreads);
-    const uint16_t* const r3d_tbl = WQ ? sTbl : (const uint16_t*)nullptr;
+    if (WQ && !ALU) r3d_e4m3_f16_init(sTbl, (int)threadIdx.x, kBlockThreads);
+    const uint16_t* const r3d_tbl = (WQ && !ALU) ? sTbl : (const uint16_t*)nullptr;
 
     const int lane = (int)threadIdx.x & (kWave - 1);
     const int warp = (int)threadIdx.x / kWave;
@@ -467,7 +468,7 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
                 uint32_t w0, w1, w2, w3;
                 if (WQ) {
                     uint32_t q[4];
-                    codes8_to_f16x4(loadc8<NT>(cp + kc), h.cdt, r3d_tbl, q);
+                    codes8_to_f16x4<ALU>(loadc8<NT>(cp + kc), h.cdt, r3d_tbl, q);
                     w0 = scale_pair(q[0], sc); w1 = scale_pair(q[1], sc);
                     w2 = scale_pair(q[2], sc); w3 = scale_pair(q[3], sc);
                 } else {
@@ -498,7 +499,7 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
  */
 template <bool YF32>
 int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_ld, int sk, int kb,
-                int nt, long stream, const HeadQ* hq = nullptr)
+                int nt, long stream, const HeadQ* hq = nullptr, int alu = 1)
 {
     if (!xv || !wv || !yv) return -1;
     if (M < 1 || N < 1 || K < 1) return -2;
@@ -538,18 +539,22 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
     }
 
     if (M <= kSkinnyMax) {
-#define R3D_SKINNY(MTV, NTV, WQV)                                                                \
+#define R3D_SKINNY(MTV, NTV, WQV, ALUV)                                                                \
     do {                                                                                         \
         const int klw = kWave / (MTV);                                                           \
         const int per = kWaves * klw;                                                            \
         const dim3 grid((unsigned)((N + per - 1) / per)), block(kBlockThreads);                  \
-        R3D_KLAUNCH(R3D_KNAME((logits_skinny_kernel<MTV, YF32, NTV, WQV>)), grid, block, s, x, w, \
+        R3D_KLAUNCH(R3D_KNAME((logits_skinny_kernel<MTV, YF32, NTV, WQV, ALUV>)), grid, block, s, x, w, \
                     h, y, M, N, K, x_ld, y_ld);                                                  \
     } while (0)
 #define R3D_SKINNY_MT(MTV)                                                                       \
     do {                                                                                         \
-        if (wq) { if (nt) R3D_SKINNY(MTV, 1, 1); else R3D_SKINNY(MTV, 0, 1); }                     \
-        else    { if (nt) R3D_SKINNY(MTV, 1, 0); else R3D_SKINNY(MTV, 0, 0); }                     \
+        if (wq) {                                                                                 \
+            if (alu) { if (nt) R3D_SKINNY(MTV, 1, 1, 1); else R3D_SKINNY(MTV, 0, 1, 1); }         \
+            else     { if (nt) R3D_SKINNY(MTV, 1, 1, 0); else R3D_SKINNY(MTV, 0, 1, 0); }         \
+        } else {                                                                                  \
+            if (nt) R3D_SKINNY(MTV, 1, 0, 0); else R3D_SKINNY(MTV, 0, 0, 0);                      \
+        }                                                                                        \
     } while (0)
         if (M == 1) R3D_SKINNY_MT(1);
         else if (M <= 2) R3D_SKINNY_MT(2);
@@ -561,11 +566,15 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
     } else {
         const dim3 grid((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
         const dim3 block(kBlockThreads);
-        if (wq)
-            R3D_KLAUNCH(R3D_KNAME((gemm_tiled_kernel<YF32, true>)), grid, block, s, x, w, h, y, M,
-                        N, K, x_ld, y_ld);
-        else
-            R3D_KLAUNCH(R3D_KNAME((gemm_tiled_kernel<YF32, false>)), grid, block, s, x, w, h, y, M,
+        if (wq) {
+            if (alu)
+                R3D_KLAUNCH(R3D_KNAME((gemm_tiled_kernel<YF32, true, 1>)), grid, block, s, x, w, h, y, M,
+                            N, K, x_ld, y_ld);
+            else
+                R3D_KLAUNCH(R3D_KNAME((gemm_tiled_kernel<YF32, true, 0>)), grid, block, s, x, w, h, y, M,
+                            N, K, x_ld, y_ld);
+        } else
+            R3D_KLAUNCH(R3D_KNAME((gemm_tiled_kernel<YF32, false, 0>)), grid, block, s, x, w, h, y, M,
                         N, K, x_ld, y_ld);
     }
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -574,7 +583,7 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
 /* The shim body both ops share (ref_logits_gemm is gemm_nt_impl with the axes renamed).
  * `y_is_f32` is the op's output dtype; nkey/kkey are libref's axis names ("n_vocab"/"n_embd" or
  * "N"/"K"). */
-int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, const char* kkey)
+int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, const char* kkey, int alu)
 {
     if (a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data)
         return R3D_NO(RAD_E_INVAL);
@@ -663,9 +672,9 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
     const HeadQ* hp = joined ? &h : nullptr;
     const int e = y_is_f32
         ? gemm_launch<true>(r3d_addr(x), r3d_addr(w), r3d_addr(y), (int)M, (int)N, (int)K,
-                            (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp)
+                            (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp, alu)
         : gemm_launch<false>(r3d_addr(x), r3d_addr(w), r3d_addr(y), (int)M, (int)N, (int)K,
-                             (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp);
+                             (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp, alu);
     if (e == 0) return RAD_OK;
     return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
                         : e == -3 ? RAD_E_STRIDE : e == -5 ? RAD_E_ALIGN : RAD_E_DEVICE);
@@ -714,15 +723,35 @@ extern "C" int r3d_gemm_nt_bf16_tiled(long a, long b, long y, int M, int N, int 
     return gemm_launch<false>(a, b, y, M, N, K, a_ld, y_ld, sk, kb, nt, stream);
 }
 
+static int r3d_logits_gemm_bf16_dispatch(const RadArgs* a, RadStream s, int alu)
+{ return rad_gemm_run(a, s, 1, "n_vocab", "n_embd", alu); }
+static int r3d_gemm_nt_bf16_tiled_dispatch(const RadArgs* a, RadStream s, int alu)
+{ return rad_gemm_run(a, s, 0, "N", "K", alu); }
+
+extern "C" int r3d_rad_gemm_nt_bf16_tiled_wmma(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_bf16_m64_wmma(const RadArgs*, RadStream);
+
+/* The rows' impl axis picks the kernel: the table decode (0) and the ALU decode (1) share the
+ * dispatch, and the bf16 tiled row's two wave-matrix arms (2 = the 128x128 tile, 3 = the
+ * 16-column-tile kernel) run through their own shims, which stay as entry points. */
 extern "C" int r3d_rad_logits_gemm_bf16(const RadArgs* a, RadStream s)
 {
-    return rad_gemm_run(a, s, 1, "n_vocab", "n_embd");
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    return r3d_logits_gemm_bf16_dispatch(a, s, c.impl);
 }
-
+extern "C" int r3d_rad_logits_gemm_bf16_alu(const RadArgs* a, RadStream s)
+{ return r3d_logits_gemm_bf16_dispatch(a, s, 1); }
 extern "C" int r3d_rad_gemm_nt_bf16_tiled(const RadArgs* a, RadStream s)
 {
-    return rad_gemm_run(a, s, 0, "N", "K");
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    if (c.impl <= 1) return r3d_gemm_nt_bf16_tiled_dispatch(a, s, c.impl);
+    if (c.impl == 2) return r3d_rad_gemm_nt_bf16_tiled_wmma(a, s);
+    return r3d_rad_gemm_nt_bf16_m64_wmma(a, s);
 }
+extern "C" int r3d_rad_gemm_nt_bf16_tiled_alu(const RadArgs* a, RadStream s)
+{ return r3d_gemm_nt_bf16_tiled_dispatch(a, s, 1); }
 
 /* The head's relayout writer. A layout query that answers RAD_OK promises the loader that
  * relayout will produce the described form (rad_abi.h). The container stores the quantiser's

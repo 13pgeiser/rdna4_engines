@@ -399,6 +399,9 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
         if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        /* The drafter's own weights (the "mtp." namespace) run on every draft pass of every
+         * decode step; the expert fill pins them in the host pool ahead of everything ranked. */
+        if (wi.name.rfind("mtp.", 0) == 0) mu.draft_head = true;
         if (wi.first_use_op >= 0 && (mu.first_use_op < 0 || wi.first_use_op < mu.first_use_op))
             mu.first_use_op = wi.first_use_op;
         if (wi.last_use_op > mu.last_use_op) mu.last_use_op = wi.last_use_op;
@@ -466,6 +469,10 @@ void Planner::rank_units(Plan* p, std::vector<int32_t>* order) const {
     std::stable_sort(order->begin(), order->end(), [&](int32_t a, int32_t b) {
         const MoveUnit& ua = p->units[(size_t)a];
         const MoveUnit& ub = p->units[(size_t)b];
+        /* The drafter's weights run on every draft pass of every decode step -- more often than
+         * anything the profile could rank -- so they take the pool first, before heat or the
+         * share order gets a vote. */
+        if (ua.draft_head != ub.draft_head) return ua.draft_head > ub.draft_head;
         if (ua.profile_share != ub.profile_share) return ua.profile_share > ub.profile_share;
         /* Expert-major tie-break, which is the whole policy without a profile (every share is
          * 0.0). Layer-major would fill layer 0, then layer 1, and leave the layers past the
@@ -691,6 +698,10 @@ int Planner::assign_expert_tiered(Plan* p) {
         Cost k;
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
+            /* A PREPLACED UNIT IS ALREADY PLACED: pin_mapped put it in the container's mapping
+             * (host-only op) and build_classes gave it no class and a 0-byte slot. Re-tiering it
+             * here would strand it -- VRAM tier with no slab slot behind it -- and the mover
+             * would find no address for it at init. */
             if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
             mu.tier = Tier::VRAM;
             mu.site = Site::Device;
@@ -735,26 +746,38 @@ int Planner::assign_expert_tiered(Plan* p) {
         }
 
         /* Slots used per class, which sizes the spares. A static plan reserves no shadow slots. */
-        std::vector<int64_t> resident(p->classes.size(), 0), staged(p->classes.size(), 0);
+        std::vector<int64_t> resident(p->classes.size(), 0), staged(p->classes.size(), 0),
+            on_disk(p->classes.size(), 0);
         for (const MoveUnit& mu : p->units) {
             if (mu.slab_class < 0) continue;
             if (mu.movable && mu.tier == Tier::VRAM) ++resident[(size_t)mu.slab_class];
+            if (mu.tier == Tier::SSD) ++on_disk[(size_t)mu.slab_class];
             /* The staging ring is slab memory too. finish() sizes it from the staged units,
              * known only after the fill, so it is reserved the same two-pass way as the shadow
              * slots. Routed file-tier units are excluded; the file stager has its own buffers. */
             if (mu.site == Site::DeviceStaged && mu.access != RAD_ACCESS_CONDITIONAL)
                 ++staged[(size_t)mu.slab_class];
         }
+        /* The hot VRAM cache's budget: with file-tier units in a class, the shadow slots
+         * may be filled with hot experts — read a routed expert into a shadow slab slot
+         * permanently, instead of the stager's per-pass buffer, when heat says the expert
+         * keeps routing. Eviction is bookkeeping (the container is ground truth). The
+         * budget is the full shadow cap rather than the swap formula's resident/4 share.
+         * Bounded by the class's residents so the two-pass fill converges — a later pass
+         * with fewer residents reserves fewer — and charged to the weights budget through
+         * k.spare like any shadow slot. */
         for (size_t c = 0; c < p->classes.size(); ++c) {
             const int64_t ring = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
             const int64_t shadow = (p->dynamic && resident[c] > 0)
                 ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, std::max<int64_t>(1, resident[c] / 4))
                 : 0;
-            p->classes[c].n_shadow = shadow;
-            if (shadow + ring <= 0) continue;
+            const int64_t hot = (p->dynamic && on_disk[c] > 0 && resident[c] > 0)
+                ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, resident[c]) : 0;
+            p->classes[c].n_shadow = std::max(shadow, hot);
+            if (p->classes[c].n_shadow + ring <= 0) continue;
             /* Plus the slab's tail pad: a kernel assembling a packed code window from a wide read
              * reads a few bytes past the last slot, which would fault at the allocation's end. */
-            k.spare += (shadow + ring) * p->classes[c].stride + RAD_ALIGN_UNIT;
+            k.spare += (p->classes[c].n_shadow + ring) * p->classes[c].stride + RAD_ALIGN_UNIT;
         }
 
         /* The file stager's two buffers, each the largest routed layer's file-tier units at the

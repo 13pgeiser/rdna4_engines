@@ -13,6 +13,8 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <system_error>
@@ -47,10 +49,12 @@ std::string HttpRequest::param(const std::string& k, const std::string& def) con
 }
 
 bool HttpRequest::peer_is_loopback() const {
-    if (peer.empty()) return true;
+    /* The socket, never the attributed peer: `peer` is whatever a vouched proxy said, and a
+     * guard that read it would let a proxy hand out loopback to the world. */
+    if (raw_peer.empty()) return true;
     /* "addr:port", where an IPv6 address carries colons of its own: the port is after the last. */
-    const size_t colon = peer.rfind(':');
-    std::string addr = colon == std::string::npos ? peer : peer.substr(0, colon);
+    const size_t colon = raw_peer.rfind(':');
+    std::string addr = colon == std::string::npos ? raw_peer : raw_peer.substr(0, colon);
     if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']')
         addr = addr.substr(1, addr.size() - 2);
     in_addr v4{};
@@ -59,6 +63,115 @@ bool HttpRequest::peer_is_loopback() const {
     if (inet_pton(AF_INET6, addr.c_str(), &v6) != 1) return false;
     if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
     return IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127;
+}
+
+/* The parsed form of one "--trusted-proxy CIDR": network, prefix length, family. */
+namespace {
+struct Cidr {
+    bool      ok = false;
+    bool      v6 = false;
+    uint8_t   net[16] = {};
+    int       bits = 0;
+};
+
+Cidr parse_cidr(const std::string& cidr) {
+    Cidr c;
+    const size_t slash = cidr.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= cidr.size()) return c;
+    const std::string net = cidr.substr(0, slash);
+    const std::string pfx = cidr.substr(slash + 1);
+    if (pfx.find_first_not_of("0123456789") != std::string::npos || pfx.size() > 3) return c;
+    const long bits = std::strtol(pfx.c_str(), nullptr, 10);
+    in_addr v4{};
+    in6_addr v6{};
+    if (inet_pton(AF_INET, net.c_str(), &v4) == 1) {
+        if (bits < 0 || bits > 32) return c;
+        c.ok = true; c.v6 = false; c.bits = (int)bits;
+        std::memcpy(c.net, &v4, 4);
+        return c;
+    }
+    if (inet_pton(AF_INET6, net.c_str(), &v6) == 1) {
+        if (bits < 0 || bits > 128) return c;
+        c.ok = true; c.v6 = true; c.bits = (int)bits;
+        std::memcpy(c.net, &v6, 16);
+    }
+    return c;
+}
+
+/* Numeric address (no port, no zone) into its bytes; false if it is anything else. */
+bool parse_addr(const std::string& addr, bool* v6, uint8_t* out) {
+    in_addr a4{};
+    if (inet_pton(AF_INET, addr.c_str(), &a4) == 1) {
+        *v6 = false;
+        std::memcpy(out, &a4, 4);
+        return true;
+    }
+    in6_addr a6{};
+    if (inet_pton(AF_INET6, addr.c_str(), &a6) == 1) {
+        *v6 = true;
+        std::memcpy(out, &a6, 16);
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+bool cidr_valid(const std::string& cidr) { return parse_cidr(cidr).ok; }
+
+bool ip_in_cidr(const std::string& addr, const std::string& cidr) {
+    const Cidr c = parse_cidr(cidr);
+    uint8_t a[16];
+    bool v6 = false;
+    if (!c.ok || !parse_addr(addr, &v6, a) || v6 != c.v6) return false;
+    /* Families must agree. inet_pton does not map: an IPv4 socket is not inside an IPv6
+     * network that happens to embed the same bytes, so a vouched ::ffff:0:0/96 does not
+     * vouch for 1.2.3.4 -- an operator who means both writes both. */
+    int left = c.bits;
+    const int len = v6 ? 16 : 4;
+    for (int i = 0; i < len && left > 0; ++i) {
+        const int b = left >= 8 ? 8 : left;
+        const unsigned mask = (0xffu << (8 - b)) & 0xffu;
+        if (((a[i] ^ c.net[i]) & mask) != 0) return false;
+        left -= b;
+    }
+    return true;
+}
+
+std::string attributed_client(const std::string& raw_addr, const std::string& xff,
+                              const std::vector<std::string>& trusted) {
+    if (xff.empty() || trusted.empty()) return raw_addr;
+    /* The socket first: a peer no operator vouched for gets no say in who it claims to be. */
+    bool vouched = false;
+    for (const std::string& cidr : trusted)
+        if (ip_in_cidr(raw_addr, cidr)) { vouched = true; break; }
+    if (!vouched) return raw_addr;
+
+    /* Split the chain; a request may carry the header once with a comma list, and this reads
+     * the first copy (a duplicate X-Forwarded-For is two chains and no honest reading). */
+    std::vector<std::string> hops;
+    size_t i = 0;
+    while (i <= xff.size()) {
+        size_t comma = xff.find(',', i);
+        if (comma == std::string::npos) comma = xff.size();
+        size_t b = xff.find_first_not_of(" \t", i);
+        size_t e = xff.find_last_not_of(" \t", comma ? comma - 1 : 0);
+        if (b != std::string::npos && e != std::string::npos && b < comma)
+            hops.push_back(xff.substr(b, e - b + 1));
+        i = comma + 1;
+    }
+    if (hops.empty()) return raw_addr;
+
+    /* Right to left: each vouched hop is one more proxy the operator named, and its neighbour
+     * to the left is who that proxy saw. The first name no vouched CIDR covers is the caller;
+     * a chain of only vouched hops bottoms out at the leftmost, the original client as the
+     * outermost proxy saw it. */
+    for (size_t h = hops.size(); h-- > 0;) {
+        bool covered = false;
+        for (const std::string& cidr : trusted)
+            if (ip_in_cidr(hops[h], cidr)) { covered = true; break; }
+        if (!covered) return hops[h];
+    }
+    return hops.front();
 }
 
 int idle_workers(int n_threads) {
@@ -441,6 +554,31 @@ bool HttpRequest::is_cross_origin() const {
     return lower_ascii(auth) != lower_ascii(header("Host"));
 }
 
+std::string HttpRequest::host_authority() const {
+    std::string h = lower_ascii(header("Host"));
+    if (h.empty()) return h;
+    if (h.front() == '[') {
+        /* "[::1]:8000": the address is what the brackets hold. */
+        const size_t close = h.find(']');
+        return close == std::string::npos ? h.substr(1) : h.substr(1, close - 1);
+    }
+    const size_t colon = h.rfind(':');
+    if (colon != std::string::npos && h.find(':') == colon &&
+        h.find_first_not_of("0123456789", colon + 1) == std::string::npos)
+        h.erase(colon);   /* "localhost:8000" -> "localhost"; a bare "::1" keeps its colons */
+    return h;
+}
+
+bool HttpRequest::host_is_loopback() const {
+    const std::string h = host_authority();
+    if (h.empty()) return peer.empty();   /* no Host: an in-process dispatch, never a socket */
+    if (h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback") return true;
+    in_addr v4{};
+    if (inet_pton(AF_INET, h.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
+    in6_addr v6{};
+    return inet_pton(AF_INET6, h.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
+}
+
 /* The API key a browser's socket carries. A browser cannot set a header on a WebSocket, so
  * OpenAI's browser clients offer it as a subprotocol, `openai-insecure-api-key.<key>`, beside
  * `realtime`; the subprotocol chosen is never that one. Compared in constant time, as the header
@@ -508,15 +646,36 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         catch (const std::exception& e) { what = e.what(); }
         catch (...) {}
         /* e.what() can carry request text (a path, a header): keep it off the log as an
-         * escape-sequence vector. */
+         * escape-sequence vector, and off the wire entirely -- the message a 500 carries back
+         * must not echo the request or name how the server broke; that is what the log is for. */
         RAD_ERR("server: %s", log_sanitize(what).c_str());
         res.status = 500;
-        res.set_content(error_body(req.path, 500, "internal_server_error", what),
+        res.set_content(error_body(req.path, 500, "internal_server_error",
+                                   "the server faulted on this request; the reason is in its log"),
                         "application/json");
     });
 
     const std::string api_key = o.api_key;
     const bool cors = o.cors;
+    const std::vector<std::string> trusted = o.trusted_proxies;
+    /* The two addresses every bridged request carries: the socket as the kernel saw it, and
+     * the caller the vouched chain names. Only the first is ever read for authority. The
+     * attributed name arrives in a header, so it is sanitized where it is made — `peer` is
+     * log-facing text by construction, and a guard must never meet it anyway. */
+    auto fill_peers = [trusted](HttpRequest& req, const httplib::Request& hreq) {
+        req.raw_peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
+        req.peer = log_sanitize(attributed_client(hreq.remote_addr,
+                                                  hreq.get_header_value("X-Forwarded-For"),
+                                                  trusted))
+                   + ":" + std::to_string(hreq.remote_port);
+    };
+    /* The same identity for refusals answered before any HttpRequest exists (the key gate, the
+     * duplicated security header): one audit trail, whoever the socket belongs to. */
+    auto who = [trusted](const httplib::Request& q) {
+        return log_sanitize(attributed_client(q.remote_addr,
+                                              q.get_header_value("X-Forwarded-For"), trusted))
+               + ":" + std::to_string(q.remote_port);
+    };
     /* The headers a cross-origin client sends: the body type, either form of the API key, and the
      * anthropic-version and anthropic-beta headers of Anthropic's clients, which nothing reads. */
     static const char* const kCorsHeaders =
@@ -539,8 +698,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     };
 
     /* What a request must pass before its body is read, so a refused one never has it buffered. */
-    auto gate = [api_key, cors, key_ok](const httplib::Request& hreq,
-                                        httplib::Response& hres) -> bool {
+    auto gate = [api_key, cors, key_ok, who](const httplib::Request& hreq,
+                                             httplib::Response& hres) -> bool {
         if (cors) {
             hres.set_header("Access-Control-Allow-Origin", "*");
             hres.set_header("Access-Control-Allow-Headers", kCorsHeaders);
@@ -551,8 +710,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
          * data and sends the key on every data fetch. Everything else is guarded, including
          * /tokenize, which vLLM leaves open (it only guards /v1).
          *
-         * The exemption follows the methods those paths actually answer — reads, plus the POST
-         * /ping of the health-check convention — so it cannot ride a method the router might
+         * The exemption follows the methods those paths actually answer -- reads, plus the POST
+         * /ping of the health-check convention -- so it cannot ride a method the router might
          * one day put behind one of these paths. */
         const std::string& p = hreq.path;
         const std::string& m = hreq.method;
@@ -562,8 +721,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         if (!api_key.empty() && !exempt) {
             if (!key_ok(hreq)) {
                 /* Logged in Server::error_response's format; the gate answers before the router. */
-                RAD_INFO("req refused from %s:%d -> 401 authentication_error: invalid api key",
-                         hreq.remote_addr.c_str(), hreq.remote_port);
+                RAD_INFO("req refused from %s -> 401 authentication_error: invalid api key",
+                         who(hreq).c_str());
                 hres.status = 401;
                 hres.set_content(error_body(p, 401, "authentication_error", "invalid api key"),
                                  "application/json");
@@ -573,7 +732,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         return true;
     };
 
-    auto bridge = [&router](const httplib::Request& hreq, std::string body,
+    auto bridge = [&router, fill_peers](const httplib::Request& hreq, std::string body,
                             httplib::Response& hres, std::vector<FormPart> form = {}) {
         HttpRequest req;
         /* HEAD is GET without the body, which httplib leaves off the wire. */
@@ -581,7 +740,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         req.path = hreq.path;
         req.body = std::move(body);
         req.form = std::move(form);
-        req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
+        fill_peers(req, hreq);
         req.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         for (auto& h : hreq.headers) req.headers[h.first] = h.second;
@@ -604,9 +763,10 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         hres.set_chunked_content_provider(
             st->content_type,
             [st](size_t /*offset*/, httplib::DataSink& sink) -> bool {
-                /* In the vendored 0.46 an exception escaping the provider unwinds the task queue
-                 * and aborts the process (upstream's 0.54.0 serve_guarded fixed exactly this);
-                 * until the lift moves, a throwing next() ends this response, not the server. */
+                /* The vendored 0.64 wraps this whole side of the socket in serve_guarded, so a
+                 * throwing next() can no longer unwind the task queue; the catch stays as the
+                 * place this file says what happened -- guarded or not, an unlogged stream
+                 * death is one nobody can debug. */
                 std::string chunk;
                 bool more = true;
                 try {
@@ -631,24 +791,64 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
             [st](bool ok) { if (st->on_close) st->on_close(ok); });
     };
 
+    /* The sum of buffered bodies across all connections, and its budget. Bodies are buffered
+     * whole before parse, admission or any accounting sees them, so the per-request cap alone
+     * bounds none of the total: a few hundred concurrent large POSTs is an OOM that reaches the
+     * engine before any 429 does. Over budget, the body is refused mid-read with a 429. */
+    const size_t inflight_limit =
+        o.max_inflight_body_bytes ? o.max_inflight_body_bytes : 8 * o.max_body_bytes;
+    auto inflight = std::make_shared<std::atomic<size_t>>(0);
+
     /* A body is read straight into the string the handler parses. httplib's own Request hands
      * it out only const, so it would be copied and held twice. A multipart body (an image
      * upload) is read part by part, each into its own string, under the same limit. */
-    auto read_and_bridge = [bridge](const httplib::Request& q, httplib::Response& s,
-                                    const httplib::ContentReader& read) {
+    auto read_and_bridge = [bridge, inflight, inflight_limit](const httplib::Request& q,
+                                                              httplib::Response& s,
+                                                              const httplib::ContentReader& read) {
         std::string body;
         std::vector<FormPart> form;
+        /* Every byte appended is held against the budget until the handler is done with the
+         * body it belongs to; the guard releases the whole reservation on any exit. */
+        size_t held = 0;
+        struct Releaser {
+            std::shared_ptr<std::atomic<size_t>> n;
+            size_t* held;
+            ~Releaser() { n->fetch_sub(*held); }
+        } releaser{inflight, &held};
+        bool over = false;
+        auto room = [&](size_t n) {
+            held += n;
+            if (inflight->fetch_add(n) + n <= inflight_limit) return true;
+            over = true;
+            return false;
+        };
         const bool ok = q.is_multipart_form_data()
             ? read([&form](const httplib::FormData& f) {
                        form.push_back(FormPart{ f.name, f.filename, f.content_type, {} });
                        return true;
                    },
-                   [&form](const char* p, size_t n) {
+                   [&form, &room](const char* p, size_t n) {
+                       if (!room(n)) return false;
                        if (!form.empty()) form.back().data.append(p, n);
                        return true;
                    })
-            : read([&body](const char* p, size_t n) { body.append(p, n); return true; });
+            : read([&body, &room](const char* p, size_t n) {
+                       if (!room(n)) return false;
+                       body.append(p, n);
+                       return true;
+                   });
         if (!ok) {
+            if (over) {
+                /* The summed budget, not the per-request cap: name it so the client reads the
+                 * retry for what it is, not as its own file having grown too large. */
+                s.status = 429;
+                s.set_header("Retry-After", "5");
+                s.set_content(error_body(q.path, 429, "rate_limit_error",
+                                         "the server is holding more request bodies than its "
+                                         "total buffering budget allows; retry shortly"),
+                              "application/json");
+                return;
+            }
             /* httplib has already set 413 for a body over the limit; anything else is a peer
              * that stopped sending partway. */
             if (s.status < 0) {
@@ -680,10 +880,10 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * ways a socket client can carry it, and, with CORS off, by its Origin: a browser lets any
      * page open a socket to any host, and CORS is what would otherwise keep another site's page
      * out. True when the upgrade may proceed; false with the refusal in `s`. */
-    auto socket_gate = [api_key, cors, key_ok](const httplib::Request& q,
-                                               httplib::Response& s) -> bool {
+    auto socket_gate = [api_key, cors, key_ok, who](const httplib::Request& q,
+                                                    httplib::Response& s) -> bool {
         auto refuse = [&](int status, const char* type, const std::string& why) {
-            RAD_INFO("req refused from %s:%d -> %d %s: %s", q.remote_addr.c_str(), q.remote_port,
+            RAD_INFO("req refused from %s -> %d %s: %s", who(q).c_str(),
                      status, type, why.c_str());
             s.status = status;
             s.set_content(error_body(q.path, status, type, why), "application/json");
@@ -706,18 +906,21 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         const SocketHandler h = *router.socket_for(path);
         svr.WebSocket(
             path,
-            [h](const httplib::Request& hreq, httplib::ws::WebSocket& ws) {
+            [h, fill_peers](const httplib::Request& hreq, httplib::ws::WebSocket& ws) {
                 HttpRequest req;
                 req.method = hreq.method;
                 req.path = hreq.path;
-                req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
+                fill_peers(req, hreq);
                 for (auto& hd : hreq.headers) req.headers[hd.first] = hd.second;
                 for (auto& p : hreq.params) req.query[p.first] = p.second;
                 HttplibConn conn(ws);
                 try {
                     h(req, conn);
                 } catch (const std::exception& e) {
-                    RAD_ERR("server: %s on %s", e.what(), req.path.c_str());
+                    /* The path is client text and e.what() can carry some: both are log
+                     * vectors until sanitized, exactly as in the exception handler above. */
+                    RAD_ERR("server: %s on %s", log_sanitize(e.what()).c_str(),
+                            log_sanitize(req.path).c_str());
                     conn.close(1011, "internal error");
                 }
             },
@@ -735,8 +938,25 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * it with a body to read: httplib hands its body reader only to a route's handler, so those
      * routes are registered below and left to it. A request no route takes is answered without
      * its body being read. */
-    svr.set_pre_routing_handler([&router, gate, socket_gate, bridge,
+    svr.set_pre_routing_handler([&router, gate, socket_gate, bridge, who,
                                  preflight](const httplib::Request& q, httplib::Response& s) {
+        /* A security-relevant header sent twice is a request built to be read two ways: this
+         * server reads the first copy, a proxy in front may read the last or join them, and any
+         * disagreement over a key, an Origin or the Host the keyless routes pin to depends on
+         * which reader you ask. Refuse the whole request rather than pick a reader.
+         * (Duplicated Content-Length is httplib's own rejection, in read_headers.) The lookup
+         * is case-insensitive, so `Authorization` beside `authorization` counts as two. */
+        for (const char* h : {"Host", "Authorization", "X-Api-Key", "Origin"}) {
+            if (q.get_header_value_count(h) > 1) {
+                RAD_INFO("req refused from %s -> 400 invalid_request_error: duplicate %s header",
+                         who(q).c_str(), h);
+                s.status = 400;
+                s.set_content(error_body(q.path, 400, "invalid_request_error",
+                                         std::string("the ") + h + " header was sent twice"),
+                              "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
         /* A WebSocket upgrade to a socket route is left to httplib, which then answers 101 and
          * runs the route's socket handler. */
         if (is_socket_upgrade(q) && router.socket_for(q.path))

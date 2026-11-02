@@ -677,6 +677,11 @@ int  r4d_gemm_fp8a8_nt_m16_max_m(void);
 // output element, not the order of the K tiles it accumulates, and the split derives from
 // `gx * mw`, which the rule keeps invariant. r4d_selftest compares bytes at every legal count.
 void r4d_gemm_fp8a8_pin_mw(int mw);
+// Test hook: pins the waves the narrow tiles' K split aims for (fp8a8 and i8a8 128, the IQR narrow
+// tile 512) for every subsequent call on every thread; 0 restores each caller's own. Not for
+// serving; r4d_selftest holds it at the IQR tile's target around the i8a8 reference, so the two
+// split K alike and their bytes compare.
+void r4d_gemm_i8a8_pin_split_waves(int waves);
 // Test hook: pins the QSA score's form. 0 is the launcher's rule, 1 the scalar decode form, 2 the
 // matrix form (which refuses a shape it is not built for). The two sum in different orders, so
 // r4d_selftest --perfqsa compares them to a tolerance.
@@ -787,6 +792,14 @@ int  r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N, int a_ld, 
 int  r4d_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                          long stream);
+// The same at a weight scale constant over 8 or 32 rows (a tcq_rb trellis), folded as the fp8
+// tile.
+int  r4d_gemm_i8a8_rb8_tiled(long a, long ascale, long wq, long ws, long c,
+                             int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                             long stream);
+int  r4d_gemm_i8a8_rb32_tiled(long a, long ascale, long wq, long ws, long c,
+                              int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                              long stream);
 int  r4d_gemm_fp8a8_block(void);
 
 // Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation, read by the fp8a8 GEMMs.
@@ -854,12 +867,13 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
-// GEMM's per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch.
+// GEMM's per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch. `grp`
+// takes quant_act_i8g's quantiser instead (ar_rmsnorm_quant_i8g): `s` [M][n / 128], n % 128 == 0.
 int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                              long seq_ctrs, long slot_stride16, long x, long res, long w, long wp,
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                             int drain, int acq, long stage = 0);
+                             int drain, int acq, int grp, long stage = 0);
 // ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
 // arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
 // engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with

@@ -1,21 +1,23 @@
 # libr3d
 
 libr3d is radiance's kernel library for RDNA3 and RDNA3.5, the gfx11xx family: `gfx1100`,
-`gfx1101`, `gfx1102`, `gfx1103`, `gfx1150`, `gfx1151`, and `gfx11-generic`, the code object for a
-gfx11 card the build did not name. It is HIP kernels behind a plain C ABI ([`r3d.h`](r3d.h)) plus
+`gfx1101`, `gfx1102`, `gfx1103`, `gfx1150`, `gfx1151`, `gfx1152`, `gfx1153`, and `gfx11-generic`,
+the code object for a gfx11 card the build did not name. It is HIP kernels behind a plain C ABI
+([`r3d.h`](r3d.h)) plus
 the kernel-plugin rows the engine selects from (`r3d_rows.cpp`); `libr3d/CMakeLists.txt` names
 every unit and its flags.
 
 It claims `^gfx11` where [`libr4d`](../libr4d/README.md) claims `^gfx12`; a card gets one device
-library, chosen by the rows, not by the name. The kernels are not ports of libr4d's. The matrix
-work runs on the dot2 path (RDNA3's 16x16 wave-matrix family uses a fragment layout these lane
-maps do not, and gfx11 has no bf16 pack and no VOPD), so every arithmetic path is its own:
-`v_dot2acc_f32_f16` for products, software codecs for every format, and weights read in the order
-the container stores them. The contract is shared with libr4d: the same op schemas (copied slot
-for slot from libref, as the loader requires), the same numerics rules and the same geometry in
-constraints. Parts of the family differ in CU count and clock, never in these instructions, so one
-code object per family suffices. Numbers in this document are quoted with their geometry, and with
-the class of part where the part's size matters.
+library, chosen by the rows, not the name. The kernels are not ports of libr4d's: gfx11 has no
+bf16 pack and no VOPD, and a different integer instruction set, so every arithmetic path is its
+own. The matrix work splits by dtype: the bf16/f16 GEMM rows (the m64 band and the prefill-tiled
+form) and every MoE GEMM row run on the 16x16x16 wave-matrix (WMMA) builtins retiled onto a 16x128
+block tile, as do the quantised m64 prefill rows; the integer rows (an int8 activation against
+int8/int4/int2 weights) and the one-to-sixteen-row GEMMs run the dot2 path,
+`v_dot2acc_f32_f16`, with software codecs for every format. The contract is shared with libr4d:
+the same op schemas (copied slot for slot from libref, as the loader requires), the same numerics
+rules, the same geometry in constraints. Family parts differ in CU count and clock, never in these
+instructions, so one code object per family suffices.
 
 ## Naming
 
@@ -54,15 +56,18 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `norm` | `rmsnorm_bf16` (optional residual add and multiplier), `rmsnorm_f32`, `layernorm_bf16` |
 | `elem` | `add` (with `div`, and the broadcast band), `mul`, `silu`, `gelu`, `sigmoid`, `act_mul_{silu,gelu,sigmoid}`, `softmax`, `scale`, `fill` (bf16/f32/i32/i64), `gather_rows`, `scatter_rows`, bf16 and f32 where the op has both, plus seven `cast` pairs and `silu_mul_bf16` |
 | `attn` | `rope_bf16` (neox and gptj, in place over packed QKV), `kv_store_{bf16,f16,fp8}`, `attn_paged_{bf16,fp8}_{decode,prefill}`: head_dim 128, split-KV combined in the same launch |
-| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w8a8_m16` (signed int8 weight, decode band), `gemm_nt_q_gated_fp8a8` |
-| `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block |
-| `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `gated_quant_fp8_bf16`, `rmsnorm_quant_fp8_bf16` (norm and quantiser in one pass), `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
-| `sample` | pre-filters `sample_{penalties,dry,ngram_ban,mask,logprobs}_f32`; spine `sample_{argmax,temp,topk,pick,topp,minp,typical,xtc}_f32` |
-| `moe` | `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too) |
+| `kv` | `kv_len_trim_i32` (per-sequence context lengths less `trim`, the QSA slice's own last row), `qsa_tail_store_bf16` (the QSA indexer's tail into a per-layer linear KV state, ring addressed by position) |
+| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_gated_fp8a8` |
+| `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block; the `impl` axis picks the decode (the LDS table, the per-byte ALU formula) |
+| `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `had_quant_act_{i8,fp8}_bf16` and `had_quant_act_i8g_bf16` (the same with a block Walsh-Hadamard rotation), `gated_had_quant_{i8,i8g,fp8}_bf16`, `gelu_mul_quant_i8_bf16`, `quant_cols_fp8_bf16`, `rmsnorm_quant_{fp8,i8}_bf16` (norm and quantiser in one pass), `gated_quant_fp8_bf16`, `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
+| `sample` | pre-filters `sample_{penalties,dry,ngram_ban,mask,logprobs}_f32`; spine `sample_{argmax,temp,topk,pick,topp,minp,typical,xtc}_f32` — f32 logits in and out, the draw the reference's in its order, the top-R scan single-pass (the plane read once) |
+| `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort; histogram in LDS, T ≤ 1024), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too). `r3d_rad_moe_gemm_w4a8` is an exported WIP launcher (packed int4 weights, the i32 wave matrix) that is not a row: no `r3d_rows.cpp` entry, no selftest, per its kernel header |
+| `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
 
-The table holds 78 rows over 44 schemas; `r3d_selftest` checks every schema slot for slot against
-the `libref.so` beside the plugin. GEMM rows carry tunables (`sk`, `wv`, `nt`); the rest have none.
+The table holds 109 rows over 70 schemas; `r3d_selftest` checks every schema slot for slot against
+the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
+[Tunable params](#tunable-params)); the rest are single-implementation.
 
 There are two int8 activation rows because the reference has two ops and they are not
 interchangeable. `quant_act_i8` writes one scale per row, with codes in the order an int8 matrix
@@ -72,32 +77,29 @@ row-major codes; that is what this library's `i8a8` GEMM reads and `dequant` inv
 order belongs to the op: the oracle compares the plane element by element, and it is the one place
 in libr3d where a store address carries a permutation.
 
-## Constraints as data
+## Tunable params
 
-Constraints are data in the rows the engine reads, because a further copy of a geometry in each
-caller would drift. `r3d_selftest` checks every constraint key against the op's declared
-parameters, so a key renamed in one place only is caught instead of producing a row that matches
-nothing. Three engine rules decide what goes in a table:
+A row's tune axes are `RAD_P_INT` parameters the engine's `rad-tune` walks and the selftest
+checks (each default among its ascending values). An axis value the kernel cannot serve is
+refused by the launcher, not clamped. `rad-tune` merges its findings into the tune cache keyed by
+machine, so a row's shipped number is the tuned default for the part; `rad-kbench --all-rows`
+measures the arms a tuned default never reaches.
 
-* **A constraint on a key the band does not carry does not hold.** A band carries the parameters
-  its graph set and nothing else, so a row that constrains an optional parameter serves only
-  graphs that state it: binding `rotary_dim` (optional on `rope`) would resolve the row to nothing
-  for every graph that rotates a whole head, and binding `pb1`/`pb2` on the quantised GEMMs would
-  send a whole model's bands to the host. The selftest's reachability phase names every row that
-  narrows itself this way.
-* **A band's `dtype` is the activation's.** A row whose dtype lives in the weight does not
-  constrain it: `logits_gemm` carries no `dtype` constraint, because the head's dtype is a
-  property of the operand, checked on the tensor. `gemm_nt_q` is the opposite case: there `dtype`
-  is the operand scheme, so `C_IN` filters on it. Each table states which case it is.
-* **A row's floor is its sibling's declared ceiling + 1.** The tiled rows begin at `M >= 17`
-  because `gemm_nt_bf16_m16` declares `C_LE("M", 16)`, read from the constraint and not from the
-  name. A floor reasoned from prose ("the decode heights") leaves 17..64, the batched-decode
-  heights, unserved.
+| axis | rows | what it selects |
+| --- | --- | --- |
+| `impl` | `gemm_nt_bf16_m16` / `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16` / `gemm_nt_q_fp8a8_m16`, `gemm_nt_q_mxfp4a8_{m16,tiled}`, `gemm_nt_q_w8a8_m16`, `gemm_nt_q_fp8a8_tiled`, `logits_gemm_bf16`, `gemm_nt_bf16_tiled`, `moe_gemm_q_e4m3` | the kernel arm. On the m16 rows: the dot2 pairs vs the 16x16x16 wave matrix. On `logits_gemm_bf16`: the LDS table decode vs the per-byte ALU decode. On `gemm_nt_bf16_tiled` the four arms are the fdot2 tile, the same tile with the ALU decode, the 128x128 wave matrix (the compute-dual, above) and the 16-column-tile m64 kernel. On `moe_gemm_q_e4m3`: the 16x16 table-decode tile, the 16x16 ALU-decode tile, the 16x128 block with the F32 scales folded |
+| `mrows` | `moe_gemm_bf16` | the block's row count (16 / 32 / 64). The compiled points are the legal ones (the `moe_bf16_tune_valid` table); the rest refuse |
+| `vgpr` | `moe_gemm_bf16`, `moe_gemm_q_e4m3` (arm 2 only) | the per-lane register budget the kernel is compiled at — the occupancy knob: on the 1024-VGPR/SIMD file, 128 is the 8-wave cap and 512 the natural allocation; each budget is a separate kernel emission, and the win is height-specific (extra waves only pay on latency-bound shapes, where spills can cost more than they buy) |
+| `acc` | `moe_gemm_bf16`, `moe_gemm_q_e4m3` (arm 2 only), `gemm_nt_q_w4a16asym_m64` / `gemm_nt_q_w5a16_m64` | 0 = f32 accumulate (the default); 1 = the 16-bit-accumulate WMMA form. A precision knob, not a speed one: no throughput gain, a documented low-precision mode (the [wave-matrix builtins](#what-the-family-provides-and-what-it-lacks)) |
+| `sk` | the m16 and m64 GEMM rows | the split-K count |
+| `wv` | the m16 and m64 GEMM rows | waves per workgroup |
+| `nt` | the m16 and m64 GEMM rows | the streaming-load form of the weight fetch |
+| `mb` | the m64 GEMM rows | the m-block (row-tile) count per workgroup |
+| `npw` | the m64 GEMM rows | n-per-wave (columns per wave) |
 
-What the kernel cannot read goes in the constraints as well as the launch check: `n_vocab >= 4` is
-the store's granularity (rows are written in 16-byte runs); `n_cand <= 1024` is the candidate
-kernels' LDS budget (five f32 arrays of `n_cand` = 20 KiB of the 64 KiB); `K % 32` and `K % 128`
-are the tile's k-chunk and the container's scale block.
+The `vgpr` and `acc` axes are arm 2's on `moe_gemm_q_e4m3` because only the 16x128 block is
+compiled in more than one register budget and in both accumulator forms; the 16x16 tiles are
+single-variant.
 
 ## Building
 
@@ -119,253 +121,312 @@ libr4d's under the same `RAD_HIP_FOUND` guard.
 
 `R3D_UNITS` lists the units as `"file|extra flags"`, each named after the entry point it provides;
 the shared headers (`r3d_common.h`, `r3d_codecs.h`, `r3d_args.h`, `r3d_launch.h`, `r3d_tiling.h`,
-`r3d_fp8_dequant.h`) provide no kernel. Every unit is compiled `-ffp-contract=off`, which
-`rad_hipify` puts on all HIP sources; it is a correctness flag (see [Numerics](#numerics)).
-`r3d_rows.cpp` and `r3d_shapes.cpp` include neither `r3d.h` nor the HIP runtime, so the tables
-compile without ROCm. Occupancy is set per kernel: `__launch_bounds__` and `amdgpu_waves_per_eu`
-(`R3D_WAVES`) are written against this family's register file, not RDNA4's.
+`r3d_fp8_dequant.h`, `r3d_fwht.h`) provide no kernel. Every unit is compiled `-ffp-contract=off`,
+which `rad_hipify` puts on all HIP sources; it is a correctness flag (see [Numerics](#numerics)).
+`r3d_selftest.cpp` is a host-only CMake target that dlopens the built `.so`; it needs no HIP
+toolchain to compile, so a build machine runs its static phases without a card.
 
 ## Adding a kernel
 
-1. Write the `.hip`, named after the entry point it provides, geometry included.
-2. Declare the launcher in [`r3d.h`](r3d.h) and the shim in [`r3d_plugin.h`](r3d_plugin.h).
-3. Add the unit to `R3D_UNITS` in `libr3d/CMakeLists.txt`, with any per-unit flags.
-4. Add a `RadKernelInfo` row in `r3d_rows.cpp` with its constraint table. If its `op` is one
-   libref declares, copy libref's schema slot for slot (names and doc strings are free, roles are
-   not); if the op is new, declare the schema in the same file.
-5. Add the operand description to `r3d_shapes.cpp` if the row's operands are not the schema's
-   plain reading, and a geometry to the selftest's list.
-6. The selftest walks the table, so a new row runs with no new test code; its geometry comes from
-   its constraints.
-7. Measure it: `r3d_selftest <home>/kernels/libr3d.so --case <row>`, then
+1. A unit named after its entry point, `r3d_<op>[_<geometry>].hip`, in `R3D_UNITS`.
+2. The launcher in [`r3d.h`](r3d.h) and the shim in the unit, both under `extern "C"`.
+3. The row in `r3d_rows.cpp`: the geometry, the dtypes, the constraints, and the tune axes only
+   if the kernel has them. A geometry the kernel cannot serve is a constraint, not a check.
+4. The selftest fixture for the row (the `Case` builder in `r3d_selftest.cpp`), with a geometry
+   to the selftest's list.
+5. The row runs with no new test code: the selftest walks the table, so a new row runs with no new
+   test code; its geometry comes from the row's own `opd_shape`.
+6. Measure it: `r3d_selftest <home>/kernels/libr3d.so --case <row>`, then
    `rad-kbench --home "$RADIANCE_HOME" --kernels libref:libr3d --op <op>`.
 
-A row naming an entry point that does not exist is an undefined symbol at `dlopen`, which refuses
-the library and every row in it. A row therefore lands in the same change as its kernel, and a
-constraint array whose kernel has not landed stays out of the table.
+The constraints are the row's declaration of what it serves, read by the engine as a single source
+of truth (the selftest checks every key against the op's declared parameters). Three rules: a
+constraint on a key the band does not carry narrows the row to the graphs that state it (bind an
+optional parameter and the row matches nothing for the graphs that omit it); a band's `dtype` is
+the activation's, so a row whose dtype is a weight property (`logits_gemm`) constrains no dtype;
+and a row's floor is its sibling's declared ceiling + 1 (the tiled rows open at `M >= 17` because
+the m16 row declares `C_LE("M", 16)`). Hardware limits the kernel cannot violate (`n_vocab >= 4`,
+`n_cand <= 1024`, `K % 32`/`K % 128`) go in the constraints too, checked at launch.
 
 ## What the family provides, and what it lacks
 
-These facts come from emitted assembly for the gfx11 targets (`__has_builtin` under
-`--offload-device-only`, `llvm-mc -show-encoding` per target) with the ROCm this tree builds
-against; a claim checked on one chip names it. None of them differs between gfx110x and gfx115x,
-which is what makes the family one code object.
+**The wave-matrix builtins.** All of them are wave32, 16x16x16: f16, bf16, int8 and int4 inputs,
+accumulating in f32, f16, bf16, i32. The fragment layout is `idx = lane % 16`,
+`k = 8*(e>>2) + 4*(lane>>4) + (e&3)`; both A and B want K-contiguous rows, so swapping the
+operands of a WMMA transposes the result. The 16-bit-accumulate forms
+(`v_wmma_f16_16x16x16_f16`, `v_wmma_bf16_16x16x16_bf16`) exist as selectable variants on the
+quantised m64 rows (w4a16/w5a16) and both MoE wave-matrix rows, the tune's `acc` axis; they are a
+documented low-precision mode (the f32 form is the default) — the precision floor and the two
+codegen traps are in [Numerics](#numerics).
 
-**The dot2 path, and the wave-matrix instructions it does not use.** RDNA3 has six wave-matrix
-instructions, all 16x16x16 wave32: f16, bf16, int8 and int4 inputs, accumulating in f32, f16, bf16
-or i32, and the toolchain emits them on every gfx11 target. They are not a separate matrix unit:
-the ISA states that the WMMA ops run over multiple cycles on the DOT pipeline. A MAC-core
-measurement (512 waves, K depth 4096, operands preloaded) agrees: f32-acc f16 19.11, f32-acc bf16
-19.24, f16-acc f16 19.44, i32-acc i8 19.29 and paired `v_dual_dot2acc_f32_f16` 18.86 TFLOP/s, all
-within three percent. The i32-acc i4 tile reaches 25.68 TFLOP/s, but it takes i4 in both operands,
-and the grids this library serves pair i8 activations with i4 or i2 weights; RDNA3 has no
-mixed-precision integer WMMA, so that pipe is unreachable from the w4a8 and w2a8 rows. At the
-decode band the integer rows are bound by weight bytes, not arithmetic: w8a8 m16 runs 0.850 TFLOP/s
-and w4a8 m16 0.789 (M=16, N=11008, K=4096, weights in device memory), about 22x below the i8
-tile's MAC rate, so a re-tile onto WMMA would not move them.
+Every feature RDNA3 lacks is emulated in software:
 
-The kernels therefore run the dot2 path: one wave per weight row, a k-split per lane, the group's
-exact sub-sum folded with one shfl. Moving to the WMMA fragment layout (lanes 0..15 replicated into
-16..31, A one row per lane, B one column per lane, accumulator row i at lane (i%2)*16+j VGPR i/2)
-would be a re-tile, not a drop-in. Products go through `__builtin_amdgcn_fdot2` ->
-`v_dot2acc_f32_f16` on every gfx11 target, paired as `v_dual_dot2acc_f32_f16` where the scheduler
-can, about a quarter of RDNA4's matrix rate. With no fragment layouts there are no repacked
-weights, and no layout hook except where the container's own planes require one.
+| absent on gfx11 | software substitute |
+| --- | --- |
+| int8 dot (`s32sd4`, `s32ud4`, `__dp4a`, `madocx`) | widen codes to f16, dot on `dot4_f16x4` — ≈22-bit mantissa on integer operands, so the w2a8 rows carry a documented one-ulp tail |
+| fp8 convert (`v_cvt_pk_f16_fp8`) | e4m3 bit maths in [`r3d_codecs.h`](r3d_codecs.h); the tiled rows' decode is a 256-entry f16 LDS table, the `impl` arms a per-byte ALU formula |
+| bf16 pack (`v_cvt_pk_bf16_f32`, RDNA4) | two adds plus a `v_perm_b32` |
+| vector f64 | soft-float at 1:64 (sets the sampler's draw path, the [Numerics](#numerics) divergence table) |
+| transposed loads, VOPD (`global_load_tr_b128`, `ds_read_b64_tr_b16`) | transposes in registers |
 
-**No int8 dot.** `__builtin_amdgcn_s32sd4`, `__builtin_amdgcn_s32ud4`, `__dp4a` and
-`__builtin_amdgcn_madocx_i32_i8` / `_u32_u8` are all undeclared for gfx1102. Codes widen to f16
-and the dot runs on `dot4_f16x4`. For 2-bit codes the widening uses the fact that the f16 bits of
-`128 + x` are `0x5800 + 8x` for `0 <= x < 8`: a code becomes an f16 with a mask, two shifts and
-an add, and the dot's result carries `128 * sum(a)`, which is the plane the op already has for the
-zero point, so the de-bias is one exact f32 subtraction per (row, group).
+**LLVM single-buffers LDS** and drains before a dependent read unless told otherwise: the dot2
+rows have nothing to overlap a load with, so the plain barrier is the one they need, while the
+wave-matrix rows double-buffer the k tile (the next tile stages while the current one multiplies).
 
-**`v_fdot2_f32_f16` carries about 22 bits of mantissa on integer operands, not 24.** "Products
-and partials are integers below 2^24, so the dot is exact" holds for f32 and not for this
-instruction. `probe_dot_kernel` in `r3d_gemm_nt_q_w2a8.hip` measures it: one 64-code dot per lane,
-its f32 result beside the exact integer. Over 262144 dots, a bias of 1024 leaves 71027 inexact
-with worst error 0.125 (every one a dot whose magnitude reached 2^20); a bias of 128 leaves 70115
-with worst error 0.015625. The worst error relative to magnitude is about 2^-22, so a smaller bias
-shrinks the error without removing it. The same work as four `__fmaf_rn` per quad in f32 is exact
-on all 262144 samples. `gemm_nt_q` at `w2a8` therefore ships with a documented one-ulp tail.
+## The GEMM rows
 
-**No fp8 conversion instructions.** On gfx1102 a build calling `v_cvt_pk_f16_fp8` contains no such
-instruction; it expands to software, about 100 instructions per 8 codes against the four that widen
-bf16. `v_cvt_pk_fp8_f32` / `v_cvt_pk_f32_fp8` need `fp8-conversion-insts`, which no gfx11 target
-has; their builtins are declared for gfx11, so a `__has_builtin` guard passes, and they fail at
-instruction selection. Both directions of e4m3 are bit maths in [`r3d_codecs.h`](r3d_codecs.h),
-mirroring `rad_plugin.h` line for line and checked over every code.
+The GEMM rows follow a **dual-variant principle**: most families ship two implementations the
+tune picks per geometry, along two independent axes.
 
-**The E4M3 decode is a table.** The arithmetic decode costs about ten VALU per code, and a
-weight-stationary row decodes every code it multiplies (twice where a lane owns two chains). A
-256-entry f16 table in LDS (512 bytes), built once per block by the arithmetic path and therefore
-exact, costs two `ds_read_u16` and a pack per pair, at no register cost: the gated row's tall arm
-is 109 registers per lane, four waves per SIMD, no spills. On the gated band (N=12288 K=2048
-group=128, codes resident) the table takes M=64 from 8395.3 us to 2786.5 us. Two invariants:
+| axis | variant 0 | variant 1 |
+| --- | --- | --- |
+| **decode** (E4M3 weight) | the 256-entry f16 LDS table | the per-byte ALU formula |
+| **compute** (the multiply pipe) | the ALU `fdot2`/`dot2` lane-per-element path | the 16x16x16 wave matrix |
 
-* The table builder's codec argument is a pair (low code in the low byte), not an index. Passing
-  the index decodes code 0 into every odd entry, which zeroes half the products without producing
-  a NaN (`rel_l2` 9.6e-01 on the code-enumeration case).
-* Decoded pairs go from the table into the dot inline. Materialising a step's eight pairs into an
-  array on the way miscomputes on the tall arm (`rel_l2` 6.6e-01 at M=7, NaN at M=64) even though
-  the table itself is exact on the device. Do not restore the array form.
+The compute axis is the **compute-dual**, and it is the one that matters at prefill. On
+`gemm_nt_bf16_tiled` (the 128x128 tile) the two arms are:
 
-**`f16x2_pack` is `v_cvt_pkrtz_f16_f32`: it rounds toward zero and flushes subnormal f16.** Only
-values f16 represents exactly may go through it (widened bf16, widened E4M3), never a code times a
-scale. Folding `code * scale` through the pack biases every product toward zero (`rel_l2` 2.8e-4
-against the fold's law, 53% of outputs within 2 ulps). Folding with `v_mul_f16` (round to nearest,
-subnormals kept) is one instruction and one correct rounding (4.5e-06, all outputs within 2 ulps,
-none beyond six). Every scale fold here uses `v_mul_f16`.
+| | arm 0 (ALU) | arm 2 (wave matrix) |
+| --- | --- | --- |
+| multiply pipe | VALU: f16 FMA / `v_dot2acc_f32_f16` | the 16x16x16 wave matrix |
+| accumulators | 8x8 f32 a lane | 64 f32 a wave (eight 16x16 tiles) |
+| k order | 32-code chunks | 32-code chunks |
+| data movement | load, stage, barrier, store — **identical** | load, stage, barrier, store — **identical** |
 
-**`v_cvt_pk_bf16_f32` does not exist** on gfx1100, gfx1102 or gfx1151: a bf16 pair is rounded by
-hand and packed with `v_perm_b32`.
+The two are duals in the literal sense: they share the entire data-movement skeleton and differ
+only in the pipe that performs the multiply, so a number measured on one is a bound on the other's
+data movement. The arm that wins is the one on the faster pipe for the shape's mix: the f16 matrix
+core runs about twice the ALU FMA rate (512 vs ~256 FLOPS/clk/CU), so at prefill heights, where the
+tile is compute-bound, the WMMA twin is the faster, and at decode heights, where the row is
+latency- and bytes-bound, the two are close and the ALU form's lighter register pressure can win.
 
-**The dot's bf16 selector does not select bf16.** `__builtin_amdgcn_fdot2` takes a `sel` operand
-for the bf16 form; the compiler accepts `sel = true`, emits the f16 instruction, and reads bf16
-operands as f16, silently producing wrong products. `dot2_f16x2` always passes `false`. f16 is the
-compute type: bf16 and E4M3 widen to it exactly, with the edges handled in the codecs (above 65504
-a widening saturates; below 2^-14 the f16 subnormal grid is coarser than the source's and
-truncates).
+The rule the rows follow: **every dot2 GEMM kernel ships a wave-matrix twin the tune can pick** —
+the m16 rows carry it as the `impl` axis (dot2 vs 16x16x16 wave matrix), the tiled row as one of
+its four arms, and the quantised m64 rows run on the wave matrix directly. The MoE wave-matrix rows
+are the same idea at the grouped-GEMM scale: the 16x128 block makes every wave own unique columns,
+so no wave re-runs a tile, and the run-walk re-stages the expert's weights per run.
 
-**Wave32, a smaller register file than RDNA4.** A SIMD has 1024 VGPRs for wave32, in granules of
-8, against RDNA4's 1536; LDS is 64 KiB per workgroup on both. Occupancy constants do not carry
-across the generation, so `R3D_WAVES` is set per kernel. A CU is 4 SIMDs x 16 wave32s = 64 wave
-slots, and `multiProcessorCount` reports CUs on gfx11 (WGPs on gfx12), so a row-per-block kernel
-with one wave per block reaches 64 waves per CU exactly at the row count where tail waves start
-waiting. A wave64 build is refused
-at compile time (`r3d_common.h`): it would compute garbage rather than run slower.
+### The 16x128 wave-matrix retile
 
-**No vector f64.** Consumer RDNA3 runs doubles at 1:64, in practice soft-float, which sets the
-transcendental policy per unit: the sampler keeps the reference's `(float)exp((double)x)`,
-because a draw must reproduce; attention cannot afford it and uses a polynomial; the gated MLP uses
-`expf` into a bf16 narrowing.
+The retile is 16 rows by 128 columns: eight waves, each wave one 16-column tile on the 16x16x16
+wave matrix, the fragment layout lanes 0..15 replicated into 16..31, A one row per lane, B one
+column per lane, accumulator row i at lane (i%2)*16+j in VGPR i/2. Against the naive 16x16 tile it
+removes the 8x wave redundancy (every wave re-running the same 16 columns), stages the activation
+once per 16x128 block, and reads the weight once per 16-column tile.
 
-**The lane ops are libr4d's:** `update_dpp` (xor and shr controls), `permlanex16`, `readlane`,
-`readfirstlane`, `ballot`, `ds_bpermute`, `v_perm_b32`, `exp2f`, `rcpf`, `s_barrier`,
-`sched_group_barrier`. DPP16 and `v_permlanex16` exist from RDNA1 on, and the encodings in
-[`r3d_common.h`](r3d_common.h) are the ones libr4d verified on hardware.
+### The rows by row count (bf16/f16 and the quantised m64)
 
-**No transposed loads, no VOPD.** There is no `global_load_tr_b128` (RDNA4) and
-`ds_read_b64_tr_b16` is rejected by this assembler, so transposes are done in registers. VOPD is
-RDNA4; the tree's `-mllvm=-amdgpu-enable-vopd=false` comes from the LLVM version. LLVM
-single-buffers LDS and drains before a dependent read unless told otherwise, and without a matrix
-unit there is nothing to overlap a load with, so the plain barrier is the one needed.
+The GEMM band is covered by row count:
 
-## Stored weights: layout hooks and their writers
+* `gemm_nt_bf16_m16` / `gemm_nt_f16_m16` (M ≤ 16) carry the `impl` axis: 0 = the dot2 pairs,
+  1 = the 16x16x16 wave matrix. The two implementations share the row, so the tune can pick per
+  shape.
+* `gemm_nt_bf16_tiled` serves the prefill heights and the M = 17..127 band; its `impl` axis picks
+  the kernel: 0 = 128x128 tiles through LDS with 8x8 f32 accumulators a lane, 1 = the same tile
+  with the bf16 decode in registers (the per-byte ALU formula), 2 = the same tile on the wave
+  matrix (eight 16x16 tiles a wave, 64 f32 accumulators, k in 32-code chunks -- every wave owns
+  unique columns, so no wave re-runs a tile; the compute-dual of arm 0, with the multiply on the
+  wave-matrix pipe), 3 = the 16-column-tile wave-matrix kernel for the 17..127 band (MT 16-row
+  tiles a block, one 16-column tile a wave across the row tiles, k ascending in 16-wide
+  wave-matrix steps; the B-fragment is loaded once a step and reused over the row tiles, so the
+  weight stream is read once per 16-column tile; split-K over scratch, the partials reduced in
+  split order). M ≤ 16 stays with the m16 rows, whose wave-per-run-of-columns shape is the right
+  one there: the two ranges are complements, so neither competes for the other's band.
 
-Four rows declare a `layout`: `gemm_nt_q_w2a8_m16`, `gemm_nt_q_w2a8_tiled`,
-`gemm_nt_q_fp8a8_tiled` and `logits_gemm_bf16`. Each also declares the `relayout` that produces
-the form it names, and `r3d_selftest.cpp` enforces the pair by name: a `layout` without a
-`relayout`, a `relayout` without a `layout`, or any `unrelayout` fails the table.
+The quantised m64 prefill rows run on the wave matrix with the same tiling:
+`gemm_nt_q_w4a16asym_m64` (1..64 rows; unsigned 4-bit codes, an f16 scale and an integer zero per
+128 of K, against an f16 activation) and `gemm_nt_q_w5a16_m64` (1..64 rows; ParoQuant's int5: the
+4-bit row with a fifth bit riding a plane of its own, one word a (tile, 64 of K, lane)) carry the
+`tGemmM64` tune (`sk`, `wv`, `mb`, `npw`, `nt`, `acc`), and `gemm_nt_q_w8a8_m64` (17..127 rows;
+signed int8 weight against int8 activations, the group's integer sub-sum scaled once) is the
+symmetric grid's prefill arm. The weights arrive pre-permuted into fragment order at load (the
+`layout` hooks), the split-K slabs reduce in the block's dynamic LDS in ascending split order. The
+codes are exact in the tile's f16, and the store is the only narrowing.
 
-A dot2 GEMM reads a weight in the order it is stored, so libr3d never repacks: **no
-plugin-private dtype, no repack into a format of this plugin's invention, no container format
-changed from inside a kernel library.** The hooks exist because the container's quantiser itself
-stores some weights as separate planes a kernel cannot read in place, codes and per-block scales
-(for a head, `fp8_e4m3 * bf16[128x128]`). The engine's canonical form for those is the planes
-joined behind one operand, `rad.planes`, sized by `rad_planes_plan` and written by
-`rad_planes_relayout`. A row that reads such a weight describes that form and produces it; the
-engine does the work at load, in the loader's pool behind the container read. The rules:
+### The fp8a8 rows
 
-* **A hook that answers is a promise.** The ABI states: *RAD_OK: out describes the stored form,
-  and `relayout` will produce it*. With `relayout = nullptr` the model does not load
-  (`could not produce '...' (rad.planes) from fp8_e4m3*bf16[128x128]: unsupported`).
-* **A weight is stored once, so the first row to claim it owns its plan.** The engine arbitrates
-  across every row of every band that reads the weight, at declare (*is wanted in two stored
-  forms: 'rad.planes' by row A and '(as it is)' by row B. A weight is stored once.*). A second row
-  gets the same answer by calling the first row's hook, and its kernel reads the stored container
-  by role, not by the arrangement it declared.
-* **`RAD_E_UNSUPPORTED` means stored as is**, the only kind of weight the mapped tier can read in
-  place, and the lever the placement ladder works with. A joined weight is a resident weight. A
-  band that resolves to the host pulls its whole layer group onto the tier that reads the
-  container in place, where a norm weight that needs conversion at load cannot live. A missing
-  device row for `gemm_nt_q` above the decode band therefore shows up as a startup failure, not a
-  slow band: the bands resolve to host kernels, the layer's weights stay in the container's
-  mapping, its norms group with them, and the mapped tier is asked for a widening it cannot do.
-* **A container arrives as a tensor of `rank = 1`, `shape[0] = bytes`.** That is the joined form's
-  stored shape (a byte count, from `rad_planes_layout`), not a plane. A consumer that reads it as a
-  plane measures a scale plane's rows against `ceil(N/group)` and refuses with a geometry the
-  operand never had. Decode it by role on the host, where the header lives: the tag, the entry
-  table and the stored dtype (the first plane's) are host-readable, so the shim reads them once per
-  call and hands the kernel device pointers.
-* **A `zero` plane is refused as `E_DTYPE`, not folded.** `w2a8` is the only scheme here with an
-  activation zero point, and its consumer is a row of this library (`r3d_gemm_nt_q_w2a8`).
-  `fp8a8`'s quantiser is symmetric: the reference's fp8a8 arm refuses `a_sum`
-  (`RAD_E_UNSUPPORTED`), the shape hook skips the operand, and every served band omits it. A row
-  that folded a zero point would compute a number the oracle has no law for.
+The bands this family targets are 42 layers plus a drafter at `group=128 dtype=fp8a8`, band
+ceiling M=2048: N=12288 K=2048 x44 (the gated MLP, two halves of 6144), N=2560 K=2048 x44 (qkv),
+N=2048 K=6144 x44 (o-proj), N=2048 K=2048 x44, and N=2048 K=10240 x3 (the drafter). Three rows
+cover them by row count, with boundaries read from the constraint tables: `gemm_nt_q_fp8a8_m16`
+declares `C_LE("M", 16)`, so `gemm_nt_q_fp8a8_tiled` opens at `C_GE("M", 17)`, and
+`gemm_nt_q_gated_fp8a8` serves M=1..64 with N even and K % 128 == 0.
 
-Gains follow the same rule: they are read in the dtype the checkpoint stores (a 2048-element norm
-gain in f32 is 8 KiB), because a row's `dtype` band names the activation, never the weight. The
-fused norm's kernel takes the gain's dtype as a parameter (`WDT`), as the plain norm does.
+**The m16 row** gives each lane one output element and streams the weight past an activation kept
+in registers, with no wave reduction, so a lane's chain is the reference's and the row is
+bit-comparable at the store. Above 16 rows the same operands use a 128x128 tile through LDS with
+8x8 f32 accumulators per lane. The two ranges are complements, and the m16 row is compared against
+the tiled row on the same bytes, where a moved boundary would show.
 
-## Request-time rules: a plan's vocabulary is not its contents
+**The tiled row folds the scales at staging.** The tile is f16, so both scale streams enter as f16
+multiplies where the codes are staged: the activation's `a_scale[m][g]` per staged row, the
+weight's `b_scale[nb][g]` once per chunk. The products are separable,
+`(a*sa)*(b*sb) = (a*b)*sa*sb`, so the accumulator stays one f32 register. The reference's law is
+the group sub-sum from raw codes scaled once per group (`ref_gemm.h`'s `quant_dot`); the fold
+differs from it by `rel_l2` 2.77e-04 against a bf16 store that costs 3.9e-3, so it is invisible in
+the output (see the divergence table).
 
-A clean graph dump means every band has a row; it does not mean a request runs. At request time
-the engine hands the shim the contents (descriptors, strides, an arena, a step's shape), and a shim
-must not read the band's vocabulary as if it were those contents. These are rules of the ABI, not
-of any one model.
+#### The gated MLP row
 
-**A band's `dtype` is the activation's; a weight's dtype comes from the operand.** The head of a
-`dtype=bf16` band can be E4M3 codes with a bf16 scale per 128x128 block. A shim that trusts the
-key refuses the request the plan is making.
+`gemm_nt_q_gated_fp8a8` fuses the GEMM, the gate and the output quantiser, so the bf16 `[M, N]`
+intermediate is never written, read or allocated. The gate couples column `i` with column `n + i`
+(192 waves apart at n = 6144, out of reach of any lane exchange), so each lane computes both
+products of its column, walking k ascending with two accumulators over weight rows `i` and `n + i`
+— the same traffic the unfused GEMM spends on the two columns. A block is one group of columns by
+`256/group` rows, closing the group's amax inside the block (a wave max folded over the group's
+waves in LDS, one scale store, one code per lane). The op is one launch with no scratch, so the row
+is concurrent. Both halves are narrowed to bf16 before the gate (the pair it replaces stores and
+re-reads them); the activation is not — `gt * sg` is f32 from the narrowed gate, and the product
+with `up` rounds once, at the store. The law is libref's `ref_gemm_nt_q_gated`, and its order must
+be kept.
 
-**An optional operand with no bytes is absent.** Optional operands arrive as descriptors with a
-null `data` when the graph bound none, so the test is `r3d_has(t)` (`t && t->data`). A bare
-`if (t)` dtype-checks a descriptor with no bytes and answers `E_DTYPE` to a band whose dtype is
-fine.
+The launcher picks the arm by row count: fp8a8 at M <= 8 reads the activation and both weight rows
+directly, 16 bytes at a time, decodes them from the block's table and multiplies, with no shared
+memory between load and dot; M >= 9 (and every fp8a16 case) stage through LDS. The M <= 8 threshold
+is a tunable, chosen for decode (M=1) and draft verify (M <= 8).
 
-**A sizing hook runs at declare, where a descriptor has a shape and no bytes** (`data` is null for
-every tensor in the plan). A scratch hook that returns 0 when `a->t[0].data` is null answers 0 for
-the whole run, the engine allocates a zero-byte arena, and the split pass fails at request time
-with `scratch buffer absent or too small`. Size from the shape (`rad_tensor_numel`) or the
-parameters, as the GEMM hook does. Absence at launch means the plan asked for nothing; absence at
-declare means the bytes come later.
+The row carries no relayout: libref reads the gated `[N, K]` weight row-major, libr4d stores fp8a8
+weights in WMMA fragment order, and a row that inherited the fp8 GEMM's `unrelayout` would fail the
+per-op oracle. The launcher refuses M > 64 (beyond the bands' ceiling the weight stream is a tiled
+kernel's problem), N odd, a group not a power of two in [32, 256], `group > n` (the reference would
+use n for the quantiser's group while keeping the weight's K block at the stated width),
+`K % group != 0` (a ragged K block reads past the scale plane), `sk > 1` (the epilogue needs the
+whole row), and an absent `act`.
 
-**A band key is a bound, not the step's value.** A plan's geometry line reads `at M=30 [band
-M<=2048] geometry {N=2560 K=2048 group=128 M=2048}`: the geometry's `M` is the ceiling the band was
-built for, and the height of this step is what the operands say. Geometry comes from the operand
-(`nel / N`, `qnel / n`, `r3d_rows_pitch(y, N, &M)`); the key stays the ceiling, and exceeding it is
-a refusal that prints both numbers.
+### The MoE GEMMs
 
-**The engine sizes vector operands to the step, so their geometry comes from the tensor.** A
-five-token prompt with nothing behind it carries a block table of `[n_seq, 1]`, not one as wide as
-the cache. The reference takes the geometry from the tensor (`max_blocks` from `bt->shape[last]`,
-row pitch from `stride[rank-2]`, column stride from `stride[rank-1]`,
-`jend = min(ctx, max_blocks * block_size)`), so a context longer than the table's columns is
-truncated by the oracle and the kernel alike. The attention shim derives all three from the
-operand and checks the one thing required: that the last reachable index
-`(n_seq-1)*bt_rs + (bt_cols-1)*bt_cs + 1` lies inside the plane. Two counts are kept apart:
-`cache_blocks` bounds a slot's byte offset, `bt_cols` bounds the walk.
+The grouped GEMM rows share the run-walk / gather structure: the block walks the runs in its
+16 rows (a block spanning several experts at decode is correct), each run re-stages that expert's
+weights, rows the run does not own are padding and their output is dropped, and a dropped slot
+(sorted token < 0) writes zero. `y` is in sorted order.
 
-**Serve the unoptimised form when the optimisation has no room.** One split-KV slice is the whole
-walk in one block, the same keys in the same order, so the launcher lowers `splits` to what the
-arena holds, down to 1, instead of refusing.
+* `moe_gemm_bf16` — unquantised experts: the bf16 operands stage straight into the bf16 wave-matrix
+  fragments, f32 accumulate over the whole of K, no scales, `y` bf16. The weight is the checkpoint's
+  own bytes ([n_expert, N, K] row-major, no layout hook). Tunable over `mrows` (the block's row
+  count), `vgpr` and `acc`; the compiled points are the legal ones (the `moe_bf16_tune_valid`
+  table), the rest refuse.
+* `moe_gemm_q_e4m3` — canonical E4M3 experts with F32 block scales, on the `moe_gemm_q`
+  contract: the even experts in `w` / `w_scale`, the odd in `w_odd` / `w_odd_scale`, at index e/2;
+  the scales fold in f32 per (grid_rows columns, 128 of K); `y` is f32. The `impl` axis: 0 = the
+  16x16 tile with the 512-byte LDS decode table, 1 = the same tile with the per-byte ALU formula
+  (no LDS table), 2 = the 16x128 block with the F32 scales folded in f32 (the `vgpr` and `acc`
+  axes are arm 2's). The E4M3 operands widen exactly to f16, the f16 wave matrix (f32 accumulate)
+  runs the multiply. The `grid_rows` parameter takes 1 (w4a8's per-row) or 128 (fp8a8's
+  per-128x128).
+* `moe_gemm_mxfp4a8` — canonical MXFP4 experts: the E4M3 activation and the E2M1 weight (decoded
+  exactly to E4M3) upcast to f16, the f16 wave matrix (f32 accumulate), the E8M0 weight scales fold
+  in f32 per 32 of K; the even/odd split as above, `y` bf16.
 
-**A refusal carries a code, names its fix, and prints what it saw.** `R3D_NO(code)` prints the
-site under `RAD_R3D_TRACE=1`; `R3D_STR` prints the two numbers a stride test compared;
-`r3d_trace_desc` prints dtype, rank, shape and strides in elements, as the engine binds them.
+On the prefill geometry (T = N = K = 4096, 8 experts, best / median of nine launches) the
+`mrows`/`vgpr` points of `moe_gemm_bf16` run 41.67 ms at (16, 512), 26.19 ms at (32, 128) and
+21.16 ms at (64, 512) — the wider the block's row tile the fewer expert re-stages, so (64, 512)
+is the default's best point. The `moe_gemm_q_e4m3` 16x128 arm (vgpr 128) is 215 ms on the same
+bytes: decode-bound on the E4M3 widen, which is why that row's tile is 16 rows and its arm 2 is
+the one the prefill geometry reaches for.
 
-**The ragged query batch is a descriptor, not a second kernel.** `cu_seqlens`, when present, is
-`[n_seq + 1]` i32. `cu[0] == 0`, monotonicity and `cu[n_seq] ==` the plane's row count are
-promises of the description that the engine keeps, but no row may rely on them. The reference's
-`seq_of` walks `while (s + 1 < n && cu[s+1] <= row) ++s`, so rows below `cu[0]` are not excluded:
-they land in sequence 0 with a negative index into its query, and the reference computes them at
-`pos = ctx - qlen + i`, `cu[0]` keys into the past. So `q_len` is per sequence
-(`q_len = cus ? 0 : rows / n_seq`), the total row count is the plane's, and a ragged batch has no
-`q_len`. One grid covers both forms because the clamp a tile needs is per sequence; the
-rectangular case is the descriptor's absence (`len_s = q_len`, `start_s = s * q_len`).
+`r3d_rad_moe_gemm_w4a8` is the WIP int4-weights / int8-activation launcher behind the same run-walk
+structure: a 16x128 block (the eight waves do unique 16-column sub-tiles), the int8 activation and
+the packed int4 weight (decoded exactly to int8, the native i32 wave matrix) with the f32 scales
+folded per 128 of K; a single weight plane, no even/odd split; `y` f32. It is exported and
+value-probed, not a row: the remaining weight forms (the nl64/nl32 magnitude-table nibbles), the
+prefill run map and the SK/UW/RS passes are outstanding, per its kernel header.
 
-**A descriptor carries two row counts, and the store is bounded by the second.**
-`len = cu[s+1] - cu[s]` is what positions count from; `span = cu[s+1] - start`, with
-`start = (s == 0 && cu[0] > 0) ? 0 : cu[s]`, is how many rows the sequence's tiles carry, because
-the grid covers the plane from row 0. The tile count comes from the length and the store bound
-from the span. Bounding the store by the length silently drops the last `cu[0]` rows of an
-in-bounds plane with status 0, which only a whole-plane read-back after a NaN pre-fill detects
-(see [Numerics](#numerics)); the fixture never draws `cu[0] > 0`.
+### Stored weights: the layout hooks
+
+Six GEMM rows declare a `layout` — `gemm_nt_q_{w2a8_m16,w2a8_tiled,fp8a8_tiled,w4a16asym_m64,
+w5a16_m64}` and `logits_gemm_bf16` — each with the `relayout` that produces the form it names;
+`r3d_selftest` enforces the pair by name (a `layout` without a `relayout`, a `relayout` without a
+`layout`, or any `unrelayout`, fails the table).
+
+A GEMM reads a weight in the order it is stored, and what is stored is decided by the row's
+`layout` hook, never by the kernel: **no plugin-private dtype, no repack into a format of this
+plugin's invention, no container format changed from inside a kernel library.** The hooks exist
+because the container's quantiser stores some weights as separate planes a kernel cannot read in
+place (for a head, `fp8_e4m3 * bf16[128x128]`), and the wave-matrix m64 rows want the weight
+pre-permuted into fragment order at load. The engine's canonical form for the split planes is the
+planes joined behind one operand, `rad.planes`, sized by `rad_planes_plan` and written by
+`rad_planes_relayout` at load. The rules:
+
+* **A hook that answers is a promise** — `RAD_OK` means the stored form is described and
+  `relayout` will produce it; with `relayout = nullptr` the model does not load.
+* **A weight is stored once, so the first row to claim it owns its plan**; a second row gets the
+  same answer by calling the first row's hook and reads the container by role, not by the
+  arrangement it declared.
+* **`RAD_E_UNSUPPORTED` means stored as is**, the only form the mapped tier can read in place; a
+  joined weight is a resident weight.
+* **A container arrives as `rank = 1`, `shape[0] = bytes`** (the joined form's byte count, not a
+  plane); decode it by role on the host, where the header lives.
+* **A `zero` plane is refused as `E_DTYPE`, not folded** — `w2a8` is the only scheme with an
+  activation zero point, and a row that folded one would compute a number the oracle has no law for.
+
+Gains are read in the dtype the checkpoint stores (bf16, f16, f32, i32 or i64), and the kernel's
+arithmetic is the reference's in the reference's order.
+
+## The GDN, QSA, and MoE plumbing rows
+
+`gdn_kkt_solve_c64` runs the gated-delta-net's chunk preamble: the gram
+`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk, the gram and the blocked
+triangular inverse in one kernel, the fp32 gram never reaching memory. `gdn_chunk_scan_k128_v128_c64`
+is the chunked scan: WY recompute, the state recurrence and the output in one kernel, the state in
+wave-matrix accumulators across the chunk loop so only q, k, v, A, g, beta, the state cache and o
+touch HBM. `gdn_gated_rmsnorm_h128` is the layer's own output norm, and
+`gdn_gated_norm_had_quant_i8` is the gated norm fused with a block Walsh-Hadamard rotation and the
+per-row int8 quantiser. `gdn_conv_prep_w4_h128` is the causal conv width 4 + silu, the q/k/v split,
+the qk l2norm, the gating and the per-chunk gate cumsum in one prefill kernel, and
+`gdn_conv_update_w4_h128` / `gdn_recurrent_update_k128_v128` are the same convolution and the
+recurrent state update at decode, over a rolling conv-state buffer and a paged fp32 state cache.
+The decode half (`gdn_recurrent_update_k128_v128`) and the single-chunk case of the scan are
+value-verified against a CPU reference; the scan's multi-chunk state carry carries a small
+documented residual on the development card (its kernel header states the band and the suspected
+cause), so the gate there is bounded, not exact.
+
+The QSA rows are the indexer's tail: `kv_len_trim_i32` trims each sequence's context lengths by
+`trim` (the slice's own last row), and `qsa_tail_store_bf16` writes the QSA indexer's tail into a
+per-layer linear KV state, ring addressed by position. The MoE plumbing rows are the router and
+the sort: `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`),
+`moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the
+kept weights scaled by `route_scale`), `moe_router_topk_scatter` (the top-k and the counting sort
+as one op), `moe_scatter_small` (the routed slots' stable counting sort; histogram in LDS,
+T ≤ 1024) and `moe_gather` (fold the expert outputs back to the token,
+`y[t,c] = sum_j expert_w[t,j] * y_expert[slot(t,j),c]`, with the optional shared arm; top_k ≤ 64).
+`expert_scale_bf16` scales the renormalised top-k weights by the expert's per-expert scale in
+place, and `dflash_select_bf16` is the drafter's accept step, a walk over the draft block's
+candidate lattice.
+
+## The paged attention, decode and prefill
+
+Two rows, chosen by `q_len`: the decode entry (which takes `splits`) and the prefill entry. The
+served geometry is n_head 16 over n_head_kv 2 at head_dim 128 (gqa 8), `block_size 16`, a 4096
+context, and an `fp8_e4m3` cache with its descales. One kernel serves decode (q_len 1), speculative
+verify (q_len 7) and a prefill chunk (q_len 2048).
+
+The layout is the reference's: `kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]` (K then V
+inside a slot), `block_table[seq, j / block_size]` names the block holding key j (a negative entry
+hides its key), and `seqused[s]` is the sequence's total key count including this step's query rows.
+
+The block table is the window the kernel may read: `jcap = min(max_ctx, cols * block_size)`, and the
+last reachable index must lie inside the plane. `splits` is a maximum, resolved per sequence from its
+own `seqused`; the contract is that `splits = 1` is bit-identical to the reference and `splits > 1`
+is not (the last-bit difference is in the [Numerics](#numerics) divergence table).
 
 ## Numerics
 
-f32 accumulation, IEEE round-to-nearest-even narrowing, subnormals kept, no reassociation; the
-oracle is `libref`.
+The contract: accumulate in f32, narrow with IEEE round-to-nearest-even, keep subnormals, and do
+not reassociate. `libref` is the oracle.
+
+**The 16-bit-accumulate mode (the `acc` axis) is a documented low-precision mode, off by default.**
+The f16 and bf16 WMMA accumulator forms quantise the running sum at the 16-bit accumulator's
+precision on every wave-matrix step, and the loss grows with the number of steps. It buys no
+throughput (the matrix core runs the same rate on either accumulator), so it is a register-pressure
+option the tune can reach for, not a speed one. Integer-valued operands (e.g. +/-1 codes) stay
+exact, because every partial sum is an integer below the format's exact range; that is also the
+degenerate data AMD's own WMMA verification feeds, and the reason a probe that feeds such data
+cannot see the loss. Reading the 16-bit accumulator is a direct value conversion, never a union
+bit-cast: the `_tied` constraint ties srcC and the result to one physical register, and a bit-cast
+breaks the tie (the compiler returns the stale srcC copy, and the accumulated tile reads back as
+zero). A second trap: mixing the f32-acc and 16-bit-acc builtins in one function behind a runtime
+if/else zeroes the 16-bit path, so the kernels select the accumulator with `if constexpr`
+(separate instantiations), never a runtime branch.
 
 **`-ffp-contract=off` on every HIP source** (`rad_hipify`, library-wide): a fused product-sum
 rounds once where the reference rounds twice, so a contracted kernel cannot match it. The flag
@@ -393,24 +454,13 @@ libref's bytes, the unit that ships it names the divergence:
 | rope divides the position by `scale` and evaluates the frequency ladder in double | `scale` is the position scale (the multiplier on a rotated pair is YaRN's magnitude; the shims refuse YaRN, so it is 1). `powf` leaves the reciprocal an ulp off, and at position 262144 an ulp of a frequency is a hundredth of a radian, the one place in that kernel where f32 is not enough |
 | `block_sum`'s tree | wave butterfly, then partials in wave order: the reference's bracketing at any thread count, so kernel and reference agree at 256 threads and at 64 |
 | `sample_logprobs` keeps a NaN out of the max and in the sum; `sample_mask` skips a row whose `mask_row` is negative | maxima are a strict `>` (`std::max`'s law), so a NaN is never adopted; the sum propagates it, because the reference's `exp(NaN - mx)` is NaN and is added. The k-list is per lane in the reference's order (descending by value, ties to the lower column), merged in the same butterfly; the pool is 64 deep and a larger k is refused, not truncated. The mask bound is the reference's test (`mask_row` is `-1` for no mask), read from the operand, not from M |
-| the sampler's `exp` and `log` are `double` calls narrowed once | draws must reproduce: the device's `(float)exp((double)x)` is bit-identical to the host's over 2^20 points in [-100, 100], where `expf` differs by 1 ulp on 5.7% of them. At 1:64 doubles this is the slow path (one read of the band's logits plane takes 3.6 ms, a read that also sums double exponentials 30.4 ms), affordable on the candidate set (1024 exponentials per row) but not in attention |
-| attention's `exp` is a degree-8 polynomial; the gated MLP's sigmoid uses `expf` | prefill needs tens of millions of exponentials per layer. Against `(float)exp((double)x)` over 1.31M points of [-100, 0], every point is within one f32 ulp and 76.1% are bit-identical (device `expf`: 94.0%, no better in ulps), and `exp(0)` is exactly 1. The polynomial is the only place an explicit `__fmaf_rn` is allowed, because what must be reproduced is a function. The MLP's sigmoid feeds a bf16 narrowing (ulp 2^-8 against `expf`'s ~1e-7), so the bf16 differs only on a tie |
-| `w2a8` has a one-ulp tail | the pair-dot carries about 22 bits on integers: 0.1-0.2% of outputs land one bf16 ulp off, `rel_l2` 5.0e-3 at the band, nothing further. The row's text says so, because the law it transcribes is exact integers |
-| the fp8 scale folds land in f16, not f32 | the tile is f16, so a scale enters as an f16 multiply at staging, one `v_mul_f16` rounding per staged value. Against the reference's exact dequantise law: `rel_l2` 2.77e-04, half an f16 ulp, 250x finer than an E4M3 code's quantum (2^-4). At a bf16 output the store's ulp (3.9e-3) dominates: 83% of outputs bit-exact, 99.93% within the fold plus one store ulp |
-| the bf16 GEMM's long-K tail | each pair is folded into the accumulator with one rounding, so about 0.3% of a long-K output lands one bf16 ulp from the reference's and none further: 99.93% bit-exact at the 512-column case, 100% within two ulps |
+| the sampler's `exp` and `log` are `double` calls narrowed once | draws must reproduce: the device's `(float)exp((double)x)` is bit-identical to the host's over the candidate set, where `expf` differs by 1 ulp on a few percent of points. At 1:64 doubles this is the slow path, affordable on the candidate set (1024 exponentials per row) but not in attention |
+| attention's `exp` is a degree-8 polynomial; the gated MLP's sigmoid uses `expf` | prefill needs tens of millions of exponentials per layer. Against `(float)exp((double)x)` over a dense grid of [-100, 0], every point is within one f32 ulp and most are bit-identical; the polynomial is the only place an explicit `__fmaf_rn` is allowed, because what must be reproduced is a function. The MLP's sigmoid feeds a bf16 narrowing (ulp 2^-8 against `expf`'s ~1e-7), so the bf16 differs only on a tie |
+| `attn_paged`'s split-KV reducer rescales each partial by `exp(m_s - M)` before the sum | every term then arrives as `exp(s - m_s) * exp(m_s - M)` where the reference has `exp(s - M)`, a last-bit difference at f32 (about 2 ulp per term, 1 ulp on the sum) that vanishes under the bf16 store except on rounding boundaries. The row's text states the contract: `splits = 1` is bit-identical to the reference, `splits > 1` is not |
 
-**Proving a plane was written.** Every output plane in a comparison run is pre-filled with the
-dtype's NaN (`0x7fc0` for bf16 and f16) and read back whole. A kernel that returns `RAD_OK`
-without launching leaves the caller's bytes, and zeros are finite, so only a NaN fill shows the row
-ran. A clean case reports `untouched 0` and `nonfinite 0`, no output beyond six ulps of the law the
-kernel implements, and a whole-plane `rel_l2` within what the fusion costs (`2 * sqrt(K/2)` output
-ulps, with room for the fixture's spread). Two planes (an int8 row-sum padded to a 16-row grid, a
-quantiser's per-group statistics) legitimately keep the fill in their padding, because the row
-writes only the rows it was given; the report names that padding, and a NaN anywhere else is a
-silent no-op.
-
-Infinities are part of the contract in the sampler and row top-k: a dropped candidate, a
-narrowing stage's drop and an unfilled `row_topk` slot are all `-inf`.
+The fp8a8 tiled fold (scales applied at staging, the group sub-sum accumulated from raw codes and
+scaled once per group in the reference) differs from the reference's law by a relative 2.77e-04
+against a bf16 store that costs 3.9e-3, so it is invisible in the output.
 
 ## Testing
 
@@ -464,352 +514,24 @@ rad-kbench --fixture "$RADIANCE_HOME/kbrows.rkb" --kernels libref:libr3d --all-r
 
 The first command checks the served checkpoint's own bands against the reference on the
 container's real weight bytes. The second and third take each case to the M and `q_len` values no
-container selects, the edges of each row's constraints where floors and ceilings are exercised.
-Rows the checkpoint's graph never uses report `no recorded case of its op`.
-
-**Checks a tolerance cannot make.** A refactor is proved by the recorded decision lines being
-bit-identical between the old and new builds (diffed with the timing column blanked). A change to
-an index, a scale plane or a row mapping is proved bit for bit against the same fixture: a fixture
-whose scales are statistically alike cannot tell a row-indexing error from rounding (with uniform
-random data the amax of 128 samples is concentrated, every block's scale rounds to the same bf16,
-and reading group 0's scale for group 7 changes nothing), so paired runs spread their activations
-by orders of magnitude one group at a time. The comparison harness carries a `selfcheck` control
-that hands the scorer a plane rebuilt under a known misreading and requires a divergent verdict
-naming it.
-
-The gates test a built binary, not the commit: build a clean export of the commit on the target
-before trusting the gates for that commit.
-
-## The fp8a8 GEMM by row count
-
-The bands this family targets are 42 layers plus a drafter at `group=128 dtype=fp8a8`, band
-ceiling M=2048: N=12288 K=2048 x44 (the gated MLP, two halves of 6144), N=2560 K=2048 x44 (qkv),
-N=2048 K=6144 x44 (o-proj), N=2048 K=2048 x44, and N=2048 K=10240 x3 (the drafter). Three rows
-cover them by row count, with boundaries read from the constraint tables: `gemm_nt_q_fp8a8_m16`
-declares `C_LE("M", 16)`, so `gemm_nt_q_fp8a8_tiled` opens at `C_GE("M", 17)`, and
-`gemm_nt_q_gated_fp8a8` serves M=1..64 with N even and K % 128 == 0.
-
-**The m16 row** gives each lane one output element and streams the weight past an activation kept
-in registers, with no wave reduction, so a lane's chain is the reference's and the row is
-bit-comparable at the store. Above 16 rows the same operands use a 128x128 tile through LDS with
-8x8 f32 accumulators per lane. The two ranges are complements, and the m16 row is compared against
-the tiled row on the same bytes, where a moved boundary would show.
-
-**The tiled row folds the scales at staging.** The tile is f16, so both scale streams enter as f16
-multiplies where the codes are staged: the activation's `a_scale[m][g]` per staged row, the
-weight's `b_scale[nb][g]` once per chunk (TN 128 is the scale plane's row extent, so a tile is one
-scale row, and kKC 32 divides 128, so a chunk sits inside one k-block). The products are
-separable, `(a*sa)*(b*sb) = (a*b)*sa*sb`, so the accumulator stays one f32 register. The
-reference's law is the group sub-sum accumulated from the raw codes and scaled once per group
-(`ref_gemm.h`'s `quant_dot`, the body the m16 and gated rows carry); the fold differs from it by
-`rel_l2` 2.77e-04 against a bf16 store that costs 3.9e-3, so it is invisible in the output (see the
-divergence table). `|y|` is not a usable denominator, since a sum of 2048 random products is often
-near zero; the scale is `S = sqrt(sum (a_k b_k)^2)`, and the fold's floor is 9.8e-4 of it.
-
-**At the band ceiling** (M=2048, container resident): N=12288 K=2048 28.171 ms (3659 GFLOP/s);
-N=2560 K=2048 5.911 ms (3633); N=2048 K=6144 14.699 ms (3506); N=2048 K=2048 4.381 ms (3922);
-N=2048 K=10240 29.798 ms (2883). That is 27 to 36% of the part's dense f16 rate. The bytes floor at
-163 GB/s is 0.051 to 0.257 ms per band, and 2MNK/(K+N) is about 1900 flops per byte at M=2048, so
-prefill is compute-bound and these numbers describe the loop, not memory.
-
-**A grid-shape cliff.** The tiled kernels run one block per CU at 18.4 to 18.5 us per block at the
-column-tile counts the graphs issue (16 and 20); 19 tiles cost 211 us per block (11.4x) and 21
-tiles 385 us (20.9x), deterministic to 0.1%. Every column-tile count the served graphs issue is
-even, so no band hits it. The first things to try are a block-index swizzle, then the `nt`
-streaming loads.
-
-**Verifying the crossing.** One `RadArgs`, the device row and libref's host row on the same bytes,
-the whole `y` plane compared, pre-filled with `0x7fc0` so an unwritten element is visible, every
-other plane poisoned, and 256-byte guards checked after the launch. The run covers every form the
-served plan hands the row (rank-1 `a_scale` of `[M]`, the codes as a rank-3
-`[M][ceil(K/128)][128]` plane, the weight as the container the layout hook writes) at the four
-served bands and at M = 17, 21, 30, 45, 64, 65, 128 and 258, against a 5e-3 tolerance; the same
-band with `b_scale=[scale,zero]` is refused with `E_DTYPE`. The harness has two plugins dlopened,
-both row tables resolved the way the engine's loader resolves them, and scores a plane against nine
-index laws with a hash beside it. It also covers the collapsed mapped and managed tier
-arrangements (the mirror layout, the default, is the served one). The rank-1 `a_scale` binding
-matters: a shim passing the wrong row pitch for it reads rows 0 and 1 correctly and everything past
-the plane after that, which the row's own geometry test cannot see.
-
-### The gated MLP row
-
-`gemm_nt_q_gated_fp8a8` fuses the GEMM, the gate and the output quantiser, so the bf16 `[M, N]`
-intermediate is never written, read or allocated. The gate couples column `i` with column `n + i`,
-192 waves apart at n = 6144, out of reach of any lane exchange; so each lane computes both products
-of its column, walking k ascending with two accumulators over weight rows `i` and `n + i`, the same
-traffic the unfused GEMM spends on the two columns. A block is one group of columns by `256/group`
-rows, which closes the group's amax inside the block: a wave max folded over the group's waves in
-LDS, one scale store, one code per lane. The op is one launch with no scratch, so the row is
-concurrent (`rad_kernel_concurrent(i)` is `scratch == nullptr`). Both halves are narrowed to bf16
-before the gate, because the pair it replaces stores and re-reads them; the activation is not
-(`gt * sg` is f32 from the narrowed gate, and the product with `up` rounds once, at the store). The
-law is libref's `ref_gemm_nt_q_gated`, and its order must be kept.
-
-The launcher picks the arm by row count. fp8a8 at M <= 8 reads the activation and both weight rows
-directly, 16 bytes at a time, decodes them from the block's table and multiplies: no shared memory
-between load and dot, no barrier in the k-loop, six loads in flight. M >= 9, and every fp8a16 case,
-stage through LDS; at those heights the grid is 48 x M/2 blocks and occupancy feeds the stream.
-On the band's stream (24 MiB of codes, resident, loop without the epilogue), staging with the
-arithmetic decoder takes 497 us, direct reads with the table 187 us, and the bare loads 139 us.
-
-Measured on the band (N=12288 K=2048 group=128, codes resident), best / median of nine launches,
-staged arithmetic-decode arm against the shipped arms:
-
-```
-M = 1     987.4 / 1154.9  ->   171.3 /  181.6 us     (147 GB/s of codes; the floor for
-M = 2    1120.6 / 1196.5  ->   166.2 /  177.1 us      24 MiB at 163 GB/s is 154 us, and
-M = 4    1417.3 / 1581.2  ->   221.0 /  229.6 us      the same sixteen loads with no
-M = 8    1874.0 / 2318.0  ->   403.4 /  412.3 us      decode and no dot run in 139 us)
-M = 16   2949.3 / 3226.1  ->  1055.0 / 1160.6 us
-M = 32   5123.4 / 5405.1  ->  1660.6 / 1705.0 us
-M = 64   8395.3 / 9051.0  ->  2786.5 / 2877.3 us
-```
-
-The M <= 8 threshold is a tunable, chosen for decode (M=1) and draft verify (M <= 8). With the table
-decoder in both arms the direct arm takes 402 us against 754 at M=8 and 955 against 1030 at M=16,
-so the crossover is above 16; M=9..15 is unmeasured, and a prefill of 9..16 rows pays about 7% for
-the staged arm. The load window is for the direct arm only: on the staged arm it costs 32
-registers per lane, a fifth wave per SIMD, and at M=64 it costs more than it saves.
-
-The row carries no relayout. libref reads the gated `[N, K]` weight row-major; libr4d stores fp8a8
-weights in WMMA fragment order, and the two readings differ by a relative error of about 1.35, so
-a row that inherited the fp8 GEMM's `unrelayout` would fail the per-op oracle. The launcher refuses
-M > 64 (beyond the bands' ceiling the weight stream is a tiled kernel's problem), N odd, a group
-that is not a power of two in [32, 256], `group > n` (the reference would then use n for the
-quantiser's group while keeping the weight's K block at the stated width, two grids this kernel
-reads as one), `K % group != 0` (a ragged K block reads past the scale plane), `sk > 1` (the
-epilogue needs the whole row), and an absent `act`.
-
-## The paged attention, decode and prefill
-
-Two rows, chosen by `q_len`: the decode entry, which takes `splits`, and the prefill entry. The
-served geometry is n_head 16 over n_head_kv 2 at head_dim 128 (gqa 8), `block_size 16`, a 4096
-context, and an `fp8_e4m3` cache with its descales. The layout is the reference's:
-`kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]`, K then V inside a slot, so a key's row
-is a 512-byte pair and both halves are 16-byte aligned at every slot. `block_table[seq, j /
-block_size]` names the block holding key j; a negative entry is an unmapped block and hides its
-key (the allocator frees a sequence by writing -1, so the kernel keeps the test although the
-fixture never sets it). `seqused[s]` is the sequence's total key count including this step's query
-rows, so query row *i* of a `len_s`-row step sits at absolute position `seqused[s] - len_s + i`.
-One kernel serves decode (q_len 1), speculative verify (q_len 7) and a prefill chunk (q_len 2048).
-
-**A lane owns one output row, and a wave is the GQA heads of one KV head:**
-`h = kh * GQA + (lane & (GQA-1))`, `tok = base + (lane >> lg GQA)` (8 heads over 4 rows at gqa 8),
-so every lane of a wave reads the same cache row at the same time. Every cache read is then an LDS
-broadcast, one `ds_read_b128` serving the wave, and the paged walk is a per-wave event. 32 rows per
-cache read is also the register file's ceiling: a second output row per lane would need 2 x 64
-VGPRs of widened query plus 2 x 128 of f32 accumulator, 384, over the 256 that four waves per SIMD
-allow.
-
-**The walk runs twice.** The reference keeps its scores, but 32 keys x 128 dims of f32 is 512 KiB
-per wave against 64 KiB of LDS, so pass two recomputes them, in the same order over the same
-operands, bit-identically; the op costs half again what keeping them would. A masked key is
-skipped, never scored to -inf, so the denominator has exactly the reference's terms, and a row with
-no visible key stores zeros (the reference's `mx == -INFINITY` case). P*V stays f32: folding the
-softmax weight into V would read every weight to 11 bits, a ~1e-4 change that survives the bf16
-store on a few percent of outputs. `exp` is the degree-8 polynomial from the divergence table, and
-`exp(0)` is exactly 1, the term the row is normalised by.
-
-**Workgroup width is the effective lever.** A row slot past a sequence's length computes a clamped
-duplicate (walk, tile and store all run for it). `pick_waves` picks the narrowest workgroup that
-carries the step's `q_len` (one wave up to 32/GQA rows, two up to 64/GQA, four above); prefill
-keeps four. Against a fixed four-wave workgroup (medians of 15 per-launch event times): 294.7 vs
-158.4 ms at 256 sequences x 7 rows over 4096 keys, 268.0 vs 128.4 ms with 4 splits, 4.33 vs 2.06 ms
-at 8 sequences over 2048, 4.27 vs 3.97 ms at one sequence over 4096, prefill unchanged. The kernel
-issues about 15% of the SIMD's slots at the band and 3.7% at eight sequences, so the gain is not
-explained by arithmetic; the width is therefore chosen at run time.
-
-**Levers that did not help:** `s_setprio` around the consume leg of the walk (|delta| <= 0.7%);
-`R3D_WAVES(2)` to lift the scalar-register ceiling (`sgpr_count` 107 and about 98 SGPRs spilled at
-both 4 and 2 waves per SIMD, timings unchanged: the compute-shader scalar budget is not set by
-waves per SIMD the way the VGPR budget is); `__noinline__` on the staging leg (spills 98 -> 72, a
-160-byte private frame, timings unchanged); a two-stage pipeline (+7% prefill, +7% decode, -5%
-split-KV).
-
-**Split-KV is a rescale.** A slice accumulates its own `(acc[128], sum, max)` into scratch and the
-reducer combines them before the single narrowing, rescaling each partial by `exp(m_s - M)`. Every
-term then arrives as `exp(s - m_s) * exp(m_s - M)` where the reference has `exp(s - M)`, a last-bit
-difference at f32 (about 2 ulp per term, 1 ulp on the sum) that vanishes under the bf16 store
-except on rounding boundaries. The row's text states the contract: `splits = 1` is bit-identical to
-the reference, `splits > 1` is not. `splits` is a maximum, resolved per sequence from its own
-`seqused`: `nslice = ceil(nblk / ceil(nblk / splits))` with `nblk` the sequence's block count, so a
-short sequence uses fewer slices and needs no per-sequence legality check, and the reducer
-recomputes `nslice` from the same two numbers, so a partial needs no header.
-
-The split curve on the served shape (64 sequences, 8 KV heads, fp8 cache, ms per launch at splits
-1/2/4/8/16/32/64): ctx 1024, 8.17 / 5.51 / 9.29 / 1.50 / 2.54 / 0.39 / 0.23; ctx 4096, 35.71 /
-20.92 / 11.41 / 5.79 / 2.67 / 1.44 / 2.60. Each workgroup walks `ceil(nblk / splits)` blocks with
-`nblk = ceil(jcap/16)`, so the total keys read are `jcap` at every split count, and the cost is
-slices times per-slice work plus the reduce. The clamp `splits <= ceil(jcap/block_size)` is a no-op
-at the served shape (`ceil(1024/16)` is 64) and applies only where splits exceed `nblk`; a grid
-built from the requested count then has slices with no blocks, which costs waves but stays
-correct.
-
-**Bounds.** `jcap = min(max_ctx, cols * block_size)`: the block table is the window the kernel may
-read (see [the request-time rules](#request-time-rules-a-plans-vocabulary-is-not-its-contents) for
-`cache_blocks`, `bt_cols` and the last-index check). In the tile walk the descriptor's length gives
-the tile count and its span the store bound, so a sequence with `cu[0] > 0` stores every row the
-grid covers.
-
-**A padding row must not write a partial.** A padding row's `row` clamps to a real row, so the
-split path tests row validity before the partial store. Without it, two lanes write the same
-`(row, h, slice)` record inside the declared arena, their 132-float records interleave, and the
-reducer rescales a full slice by the wrong maximum, producing sums thousands of times too small. It
-needs `q_len < 32/gqa` (at gqa 8, q_len 7 fills a wave and there are no padding rows), and it is a
-schedule, not a sample: it fails identically at every seed. The slots a padding row leaves unwritten
-are exactly those the reduce does not read; its index runs over real rows only.
-
-**Verification** is a paired run with libref and libr3d dlopened in one process, both called with
-the same `RadArgs`, absent optional operands passed as a descriptor with null `data` (never as a
-shorter `n_t`), with the fp8 cache form in the same run. It covers the served shapes, the
-rectangular matrix, deep contexts 512..4096, narrow block tables (`bt cols` 1/2/3/4/8, so `jcap`
-16/32/48/64/128 under a ctx of 512), empty sequences (`cu = [0,0,5,5,17]`), split counts 1 and 4,
-windows 1/3/17/64/512, causal and non-causal.
-
-**Launch tracing.** A served decode step is played: the recorded pass re-issues queue packets and
-never calls the plugin's shim, so a print in the shim never sees played steps. Under
-`RAD_R3D_TRACE` only, `attn_kernel` writes one record per launch: its launch ordinal, the row's
-`ctx` from `seqused`, the whole block-id row of the table, the six operand addresses, and FNV-1a
-folds of the query row and of the first and last block it walks. Records go to a plugin-owned
-`__device__` ring of 256 fixed 216-byte slots that the shim drains to stderr on a traced call; the
-budget is a device global the shim writes, decremented with `atomicSub`, the counter advanced with
-`atomicAdd`. A played step's record is emitted one step late, and the record's own `L` and `ctx`
-restore the order. In a served process the plugin is dlopened, and the runtime's symbol stub for a
-plugin-owned `__device__` global is not the address the kernel's module writes, so the ring cannot
-be armed there; the served channel is a `hipMalloc`'d record slot passed as a kernel argument,
-drained at the launch and armed by the same flag. With the flag unset the kernel pays one scalar
-load and a not-taken branch on one thread, and the launch one cached flag read. With it set, a
-traced call pays one device synchronize (the descriptor probe reads the table on the host) and one
-stream synchronize (the record drain), and the first traced call allocates the record slot; that is
-why the flag is a tracing switch and not a mode.
-
-Device `printf` cannot be used instead: a kernel that calls it takes an extra implicit argument,
-`hidden_hostcall_buffer`, which the AQL backend does not provide, so the engine cannot dispatch it
-(the fixture refuses the row with `refused a geometry its constraints accept: device error`), while
-the same kernel launched with hipLaunch from a standalone harness prints normally. Only a gate that
-dispatches through the engine, here the recorded fixture, sees such dispatch-side problems.
-
-## The sampler spine
-
-Thirteen rows: five pre-filters, `sample_topk` feeding `sample_pick`, and the narrowing stages
-between them. `abi/rad_sample.h` is the wire format, and the central design choice: every scalar
-(`temp`, `top_k`, `top_p`, `min_p`, `typical_p`, the `xtc_*` pair, `seed`, `pos`, the flags, the
-history window) is data, one 96-byte row per sampled position, because parameters are geometry,
-geometry is frozen at declare, and two rows of one batch with different `top_p` must resolve to one
-kernel. `param_rows` is that check, and it is the dtype check libref states: the plane is 32-bit
-words, and a 16-bit view passes a byte-count test and then misreads every row.
-
-**Draws must reproduce, so summation order is transcribed.** Every max is a strict `>`, which also
-keeps NaN out: libref's `if (v > mx) mx = v` from -infinity never adopts a NaN, and the butterfly
-merges with the same comparison. The reference's sums run over the candidates in index order, and
-its CDF scan accumulates in index order, so the exponentials are computed in parallel (each an
-independent value) and the accumulation is serial on one lane, in index order.
-
-**The draw is a function of the ABI, not of a library.** splitmix64 over
-`seed * 0x9E3779B97F4A7C15 + pos`, the top 24 bits over 2^24, in integer arithmetic so device and
-host agree, with independent streams per purpose (the pick XORs `RAD_SAMPLE_KEY_PICK`, XTC's coin
-`RAD_SAMPLE_KEY_XTC`). `ref_exp`/`ref_log` are `(float)std::exp((double)x)` and
-`(float)std::log((double)x)`, transcribed as double calls rounded once (see the divergence table);
-a `u < cum` comparison on an ulp boundary changes the drawn token, which fails the fixture even
-when the distribution is right. The widest softmax here is the candidate set, 1024 exponentials per
-row at about half a millisecond per step, where the 1:64 f64 rate is affordable; attention, at 17M
-exponentials per layer, uses the polynomial.
-
-**The top-R is one scan.** `topk_next` takes, on each of R scans, the largest value strictly below
-the last pick, ties to the lower column; as a whole that is a sort by (-value, +column), and the
-rule `v == *pv && i <= *pi` is "the next one within a run of equal values". One pass keeping the
-best R in that order produces the same R pairs in the same order with the same tie-breaks. At the
-band's row (M=1792, N=130560, R=16, bf16) the reference scans the row sixteen times (7.0 GB); this
-scans it once (468 MB), in 22.0 ms bf16 and 22.4 ms f32. The pass is bound by accepted inserts
-(about 55 sifts per lane at 510 elements per lane), not by memory; filtering against a block-wide
-threshold instead of each lane's own tail would cut that to about 5 sifts and approach the 2 ms
-bandwidth floor. Each lane keeps a 64-deep list and a merge keeps the best 64 of two; testing an
-element against the lane's 64th best is one comparison for almost every element (about 12% of a
-row clears it at 510 elements per lane). 64 covers R=16, the selftest's 64-wide set and every
-practical `top_k`; above it `r3d_sample_topk` and `r3d_row_topk` take `ceil(k/64)` passes, the
-reference's own chain, so the result is the same at any k.
-
-**The candidate plane is the contract.** A row's set is its `top_k` largest logits, descending,
-ties to the lower token id, with `cand_idx` -1 and `cand_val` -infinity for a hole. The width is
-the buffer's declare-time bound: 1024 candidates is the engine's declared width (two f32 arrays of
-it are 8 KiB of the 64 KiB a workgroup has), and the row's `top_k` narrows within it, so `top_k` 40
-in a 1024-wide buffer is 40 candidates and 984 holes. The whole buffer is written every step,
-because later stages test for holes. A greedy row takes no candidates: its token is
-`sample_argmax`'s and the pick must not overwrite it. `cand_val` carries logits, not probabilities:
-every narrowing stage takes its own softmax over the set, so the stages compose in any order and a
-pre-filter can be moved without re-deriving anything.
-
-**The step's row count comes from the operand** (see
-[the request-time rules](#request-time-rules-a-plans-vocabulary-is-not-its-contents)). A candidate
-stage that used the band key's `M` would ask one row of candidates to be 256 rows tall and refuse
-every logprobs request (`refused op sample_topp at M=1 [band M<=256] geometry {n_cand=1024
-M=256}`).
-
-**Verification** is the fixture rather than a paired run: the selftest builds each row's buffers
-from its own `opd_shape`, runs it and checks the plane whole in a child process, and kbench drives
-the `sample_*` bands against libref on the served checkpoint's fixture. What the fixture cannot
-check is the seeded draw against a recording, over the parameter rows a real request sends (see
-[What is not here yet](#what-is-not-here-yet)).
-
-## Measuring
-
-**State the floor beside the number.** 66.8 MB of codes at a part's 22 GB/s is a 3.0 ms floor;
-255 MiB at 163 GB/s is 1.64 ms; a 73.1 MB operand is a 0.449 ms read. Against those, 13.6 ms per
-token or 24.151 ms at M=64 describe the loop, not memory.
-
-**State the placement of every operand on every timing line.** On a part whose memory cannot hold
-the head it is worth an order of magnitude: at M=1, one kernel, the same head in VRAM is 13.6 ms
-per token; on the mapped tier (pinned host bytes read over the host link by 8-byte strided loads)
-643 ms; managed and left alone 2071 ms at 122 MB/s, because managed pages do not migrate for a
-read-mostly device access and the kernel faults page by page. A layout hook makes the mapped
-placement legal, not fast. Benchmarks state which placement produced which number and time after a
-prefetch. A container operand must be host-readable (the shim reads its header on the host), so it
-is pinned or managed, never plain `malloc`, which faults. Allocation history matters too: the same
-shape in the same binary measures 5.911 ms as a process's first case and 85.7 ms after a 24 MiB
-managed container was allocated and freed, because the slow run reads its weight over the host
-link. The row's number is the VRAM one, because the engine moves weights to VRAM at load.
-
-**`vgpr_spill_count` is a gate:** every kernel must report zero VGPR spills. Per-group partials
-scaled into the accumulator cost 64 more accumulators on an arm already at 237 VGPRs, and a runtime
-index into a register array spills the array to private memory; both need a rewrite, not a tunable.
-A scalar spill in a compute-shader wavefront is a slow path, not a stall (see the attention
-measurements), so SGPR spills are reported, not gated.
-
-**Per-op profile times sum to more than the token.** `--profile-ops` restores the synchronisations
-that the engine's overlap removes, as the engine's startup diagnostics state
-([`core/diag/checks.cpp`](../core/diag/checks.cpp)). A per-op table taken under that flag ranks the
-work and does not price it; the token rate is the price. Quote a served run's shape with its
-numbers (context length, prompt lengths), because a ranking is a property of the shape, not the
-model.
+other harness reaches (the prefill and decode bands on the same bytes) and compare the whole
+planes. The gates test a built binary, not the commit: build a clean export of the commit on the
+target before trusting the gates for that commit.
 
 ## Notes on the kernels
 
 Three properties are assumed throughout and not restated per kernel: **wave32 with a 1024-entry
 VGPR file per SIMD**, so every lane map has a lane owning whole dwords and every budget is computed
 against 1024; **64 KiB of LDS per workgroup**, which sets the candidate kernels' `n_cand <= 1024`
-and the tile sizes; and **the dot2 path**, which is why the tile is a dot loop over LDS with an
-8-element XOR swizzle, shared by every tiled row in [`r3d_tiling.h`](r3d_tiling.h).
-
-**The 2-bit grid's tiled staging moves 8x the bytes it uses.** A staged chunk of 8 bytes against a
-row pitch of 512 at `kKC` 32 gives 24.151 ms at M=64, N=130560, K=2048 against a 0.449 ms read
-floor, 3.7 GB/s useful. The lever is a wider k-chunk (64 codes = 16 bytes, paid for in LDS); more
-loads in flight moved it by 0.6%.
-
-**The head is the largest read in a decode step,** and the sampler reads f32, so the store is
-typed, not narrowed, and a 2048-row prefill band writes 1.07 GB. bf16 head: 3.29 ms per token at
-M=1 (163 GB/s), 0.507 ms at M=16 (the head read once for sixteen rows), 269 ms at 2048 rows (4067
-GFLOP/s). E4M3 head with a bf16 scale per 128x128 block, read as its two container planes: 13.6 ms
-per token at M=1, 8x above the 1.64 ms floor. The table decoder gives 2.70x where the decoder binds
-(M=8: 2.500 -> 0.924 ms per token), nothing at prefill, and nothing at M=1. The likely limit at
-M=1 is load width (eight codes per lane through an 8-byte load, where the bf16 arm loads sixteen
-bytes per lane), so the next step there is a 16-byte code load.
+and the tile sizes; and **the dot2 tile**, shared by the tiled quantised rows in
+[`r3d_tiling.h`](r3d_tiling.h) — a dot loop over LDS with an 8-element XOR swizzle. The wave-matrix
+rows carry their own tiling (the 16x128 block tile, above).
 
 **Clear the HIP error flag before a launch check.** `hipGetLastError()` reports the first error
-raised since it was last cleared, so a check that does not clear first attributes to this launch
-whatever the process raised before it (in a served process, the previous op; in a comparison run,
-its own setup). The symptom is a whole timing mode returning the device code on every geometry of
-every row, disappearing under `HIP_LAUNCH_BLOCKING=1` (a synchronous launch clears a pending
-asynchronous error before the check). Clear the flag after the arguments are staged and before the
+since it was last cleared, so a check that does not clear first attributes to this launch whatever
+the process raised before it. The symptom is a timing mode returning the device code on every
+geometry of every row, disappearing under `HIP_LAUNCH_BLOCKING=1` (a synchronous launch clears a
+pending asynchronous error first). Clear the flag after the arguments are staged and before the
 launch, read it straight back, and on a refusal name the error and print the grid, block, waves,
 splits and width the launcher chose.
 
@@ -820,57 +542,26 @@ ABI's own answer.
 
 ## What is not here yet
 
-**The 2-bit grid's staging width.** The packed-code tile at prefill heights moves 8x the bytes it
-uses at `kKC` 32; the fix is a 64-code chunk (16 bytes per lane) paid for in LDS, which is the
-whole gap between 24.151 ms and a 0.449 ms floor at M=64, N=130560, K=2048.
+**The seeded draw against a recording.** The fixture checks the plane whole, not the draw against a
+recorded seed, over the parameter rows a real request sends. The sampler's draw is reproducible by
+construction (the reference's order, the reference's `exp`/`log`), but a recording is the proof,
+and there is no recording harness for the plugin's parameter rows.
 
-**A 16-byte code load for a one-row E4M3 head.** The decode arm loads eight codes per lane through
-an 8-byte load and runs 8x above its floor at M=1; the table decoder is not the lever there.
+**`w4a8` as a row.** `r3d_rad_moe_gemm_w4a8` is a WIP launcher (the i32 wave-matrix core, the
+gather and the run structure are verified bit-exact against a CPU reference); the other weight
+forms (w4nl64a8h / w4nl32a8h / w5nl64a8h, whose nibbles decode through a magnitude table and a
+per-64/32 E4M3 scale), the prefill run map and the SK/UW/RS optimisations are outstanding, per its
+kernel header.
 
-**A gated MLP pass over rows and column groups.** Past M=64 the fused row refuses and the work is
-four ops over a bf16 `[M, N]` tensor (two GEMMs, the gate, the quantiser). At M=64, the ceiling 47
-of the 48 bands declare, the weight read is the limit; a pass that amortises the weight read across
-rows and column groups is what is missing.
-
-**The gated row's arm threshold.** The crossover between the direct and staged arms lies above 16
-rows and M=9..15 is unmeasured; measuring it would move the threshold, not the kernel.
-
-**`gemm_nt_q_bias` has no row.** `gemm_nt_q` has no bias operand; bias is its own op in the
-registry ("gemm_nt_q with a per-column bias"), and this library declares no row for it. Every band
-carrying a bias therefore resolves to the reference's host row: correct and slow, with no `E` line
-in the coverage and no profile entry, because nothing refused and the op never reaches a device. A
-checkpoint whose bias tensors have count 0 (no planes, no bytes) carries no bias band, by the rule
-that an optional operand with no bytes is absent; `rad-info -v <model> | grep -i bias` shows
-whether a model's bias tensors have planes. The row would be a bias load in the tiled rows'
-epilogue plus a declared schema.
-
-**Sliding window over a partial last tile diverges.** With `window` from 2 to 15 over a query plane
-whose last tile is not full, the attention row diverges from the reference (for example 17 rows at
-ctx 33 with w = 3: `rel_l2` 1.196e+00, status 0 from both rows, no non-finite values). Full
-attention (`window = 0`) agrees, and served plans use a 2048 window over 16-wide blocks, so no
-served band reaches it. The fix belongs in the last tile's mask, not the window's clamp.
-
-**`sample_merge_topk`**, the cross-rank candidate merge: under a split vocabulary it holds
-`world_size * n_cand` gathered pairs, and there is no row for it.
-
-**A seeded-draw comparison for the spine.** kbench grades the `sample_*` bands against the
-reference on the fixture, which covers the arithmetic; nothing yet compares the drawn token against
-a captured sequence, over the parameter rows a request actually sends.
-
-**int8 x int8.** The constraint table is written (`i8a8`, group 128, M <= 16, K % 128) and
-`quant_act_i8g` produces the row-major activation it reads; the kernel has not landed, so the row
-is not in the table.
-
-**Chunked logits.** The head's f32 plane is written whole (1.07 GB at a 2048-row prefill band);
-nothing emits it in chunks for the sampler to consume in passes.
+**A chunked logits path.** The head is the largest read in a decode step, and the sampler reads
+f32, so the store is typed, not narrowed, and a 2048-row prefill band writes 1.07 GB. Nothing
+emits it in chunks for the sampler to consume in passes.
 
 **A sub-byte zero plane.** `w2a8` reads a zero point one byte at a time and refuses a zero stored
 as U2/U4/U5 by name; the bit-extract path would be the same `rad_load_bits` the codes use.
 
-**Speculation that pays.** The draft head is served end to end (its bands by the 2-bit grid, its
+**A draft path that pays.** The draft head is served end to end (its bands by the 2-bit grid, its
 accept step by `dflash_select`) and the accepted text is identical. The target's head read
-amortises over the draft block (5x cheaper per token at 8 rows than at 1 on the same kernel), so
-the drafter's own steps have to pay for themselves, and on a 16-CU part they do not (87.6 -> 94.4
-ms per token on a 5-token prompt, 91.6 -> 187.1 on a 16-token chat band with 7 drafts). The
-engine switches the drafter off for a plugin whose rows measured a gain without it; what is missing
-is a draft path that costs less than the head read it saves.
+amortises over the draft block, so the drafter's own steps have to pay for themselves, and on the
+development part they do not; what is missing is a draft path that costs less than the head read it
+saves.

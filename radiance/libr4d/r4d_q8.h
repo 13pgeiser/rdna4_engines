@@ -11,6 +11,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
+#include "r4d_common.h"   // r4d_wave_max, for q8_row_i8g
 
 template <bool I8>
 __device__ __forceinline__ constexpr float q8_top() {
@@ -35,5 +36,32 @@ __device__ __forceinline__ uint32_t q8_pack4(float a, float b, float c, float d,
         pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(c * inv, -448.0f), 448.0f),
                                              fminf(fmaxf(d * inv, -448.0f), 448.0f), pk, true);
         return (uint32_t)pk;
+    }
+}
+
+// The int8 codes of a whole bf16 row as quant_act_i8g writes them, for a producer whose row is
+// staged in LDS (`row`, n values, n % 128 == 0) because it crossed threads on the way: the norm and
+// gelu junctions of a Gemma trunk on an int8-per-(row, 128) grid (rmsnorm_quant_i8g,
+// gelu_mul_quant_i8g). A wave takes a 128-column group and a lane four consecutive columns, as
+// r4d_quant_act_fp8.hip's I8 form maps them; the absmax is a max, which any partition gives, and
+// the scale (1 for an all-zero group), rounding and clamp are that form's. Codes row-major into `q`,
+// the n / 128 scales into `s`. The caller publishes `row` behind a barrier first.
+template <uint32_t THR>
+__device__ __forceinline__ void q8_row_i8g(const uint16_t* row, signed char* __restrict__ q,
+                                           float* __restrict__ s, uint32_t n) {
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5;
+    for (uint32_t kb = wave; kb < n / 128u; kb += THR / 32u) {
+        const uint32_t c0 = kb * 128u + lane * 4u;
+        float v[4];
+        float m = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j] = __uint_as_float((uint32_t)row[c0 + j] << 16);
+            m = fmaxf(m, fabsf(v[j]));
+        }
+        m = r4d_wave_max(m);
+        const float sc = m > 0.0f ? m * (1.0f / q8_top<true>()) : 1.0f;
+        if (lane == 0) s[kb] = sc;
+        *(uint32_t*)(q + c0) = q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
     }
 }

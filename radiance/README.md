@@ -34,7 +34,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
+| Gemma 4 31B: int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-i8g) | `gemma4-31b-i8g.yaml` |
+| Gemma 4 31B heretic-ara (refusals removed): int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-heretic-ara-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-i8g) | `gemma4-31b-heretic-ara-i8g.yaml` |
 | Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (22 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash) | `gemma4-31b-w4a8-df.yaml` |
 | Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
@@ -66,6 +69,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | nomic-embed-text-v2-moe bf16: text embeddings, one card | `nomic-embed-v2-moe-bf16.rad` (959 MB) | [convert](#convert-a-checkpoint) | - |
 | Nemotron 3.5 Embed 1B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | — |
 | Nemotron 3.5 Embed 8B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | — |
+| Nemotron 3.5 Rerank 8B BF16: text/image document relevance, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | — |
 | Anima Aesthetic FP8: anime and illustration, text to image, one card (Base and Turbo convert the same way) | `anima-aesthetic-fp8.rad` (3.0 GiB) | [convert](#convert-a-checkpoint) | `anima.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | — |
 

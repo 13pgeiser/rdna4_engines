@@ -65,4 +65,96 @@ __device__ __forceinline__ uint16_t r3d_e4m3_ld(const uint16_t* tbl, uint8_t cod
     return tbl[code];
 }
 
+/* --- The pure-ALU E4M3 -> f16 decode (no LDS table). ---
+ *
+ * Two E4M3 bytes (a halfword) -> two f16 (a half2 pair, [hi:lo]). E4M3 [s][e:4][m:3] -> f16
+ * [s][e:4 + 8 bias][m:3][0:7], so f16 = (x<<7) + ((x&0x80)<<7) + 0x2000 per byte. Addition carries
+ * the +8 bias when bit 13 is already set (E4M3 exp >= 8); OR would drop it. Denormals/zero map to
+ * tiny f16 (the fold's 2^-11 floor dwarfs the difference from exact zero).
+ *
+ * Shared by the fp8a8_tiled, moe_gemm_q, and mxfp4a8 kernels as the ALU=1 variant; the ALU=0
+ * variant is the table above. The two rows per op let the tune pick the faster per geometry. */
+__device__ __forceinline__ uint32_t r3d_e4m3x2_to_f16x2_alu(const uint32_t pair)
+{
+    const uint32_t lo = ((pair & 0xffu) << 7) + ((pair & 0x80u) << 7) + 0x2000u;
+    const uint32_t hi = (((pair >> 8) & 0xffu) << 7) + (((pair >> 8) & 0x80u) << 7) + 0x2000u;
+    return lo | (hi << 16);
+}
+
+/* Eight codes (two dwords) as four f16 pairs, pure ALU (no table). */
+__device__ __forceinline__ void r3d_e4m3x8_to_f16x8_alu(const uint2 c, uint32_t* w)
+{
+    w[0] = r3d_e4m3x2_to_f16x2_alu(c.x & 0xffffu);
+    w[1] = r3d_e4m3x2_to_f16x2_alu(c.x >> 16);
+    w[2] = r3d_e4m3x2_to_f16x2_alu(c.y & 0xffffu);
+    w[3] = r3d_e4m3x2_to_f16x2_alu(c.y >> 16);
+}
+
+/* --- The ALU-branching decode: one call site per kernel, the branch lives here. ---
+ *
+ * ALU=1: the per-byte formula above (no LDS table). ALU=0: the 256-entry table (tbl). The two
+ * forms are bit-identical for normal-range E4M3 codes; denormals/zero differ by a tiny f16 the
+ * scale fold's 2^-11 floor dwarfs. Kernels keep an `ALU` template param and call these; they do
+ * not branch on ALU themselves, so a new decode form is one change here, not per kernel. */
+
+/* Eight codes (two dwords) as four f16 pairs. */
+template <int ALU>
+__device__ __forceinline__ void r3d_e4m3x8_decode(const uint16_t* tbl, const uint2 c, uint32_t* w)
+{
+    if (ALU) r3d_e4m3x8_to_f16x8_alu(c, w);
+    else r3d_e4m3x8_ld(tbl, c, w);
+}
+
+/* Four codes (one dword) as two f16 pairs. */
+template <int ALU>
+__device__ __forceinline__ void r3d_e4m3x4_decode(const uint16_t* tbl, const uint32_t d,
+                                                  uint32_t* o)
+{
+    if (ALU) {
+        o[0] = r3d_e4m3x2_to_f16x2_alu(d & 0xffffu);
+        o[1] = r3d_e4m3x2_to_f16x2_alu(d >> 16);
+    } else {
+        o[0] = r3d_e4m3x2_ld(tbl, d & 0xffffu);
+        o[1] = r3d_e4m3x2_ld(tbl, d >> 16);
+    }
+}
+
+/* Sixteen codes (four dwords) as eight f16 pairs. */
+template <int ALU>
+__device__ __forceinline__ void r3d_e4m3x16_decode(const uint16_t* tbl, const uint32_t d[4],
+                                                   uint32_t* w)
+{
+    r3d_e4m3x8_decode<ALU>(tbl, uint2{ d[0], d[1] }, w);
+    r3d_e4m3x8_decode<ALU>(tbl, uint2{ d[2], d[3] }, w + 4);
+}
+
+/* --- Shared scale-fold and code-load helpers (the quantised GEMM family). --- */
+
+/* code * scale, in f16 arithmetic: one v_mul_f16 a half, round to nearest, subnormals kept. Not
+ * f16x2_pack, which truncates. Shared by the fp8a8 and mxfp4a8 tiles. */
+__device__ __forceinline__ uint32_t r3d_fold_pair(uint32_t w, float sc)
+{
+    const uint16_t lo16 = (uint16_t)(w & 0xffffu), hi16 = (uint16_t)(w >> 16);
+    const _Float16 a = __builtin_bit_cast(_Float16, lo16);
+    const _Float16 b = __builtin_bit_cast(_Float16, hi16);
+    const _Float16 s = (_Float16)sc;
+    const _Float16 rl = a * s, rh = b * s;
+    return (uint32_t)__builtin_bit_cast(uint16_t, rl) |
+           ((uint32_t)__builtin_bit_cast(uint16_t, rh) << 16);
+}
+
+/* Eight codes (8 bytes) as a uint2, a nontemporal load when NT, a memcpy otherwise. Shared by the
+ * fp8a8, mxfp4a8, and vocab tiles. */
+template <int NT>
+__device__ __forceinline__ uint2 r3d_loadc8(const uint8_t* p)
+{
+    typedef uint32_t __attribute__((ext_vector_type(2))) u8v;
+    u8v v;
+    if (NT) v = __builtin_nontemporal_load((const u8v*)p);
+    else __builtin_memcpy(&v, p, 8);
+    uint2 r;
+    __builtin_memcpy(&r, &v, 8);
+    return r;
+}
+
 #endif /* R3D_FP8_DEQUANT_H */

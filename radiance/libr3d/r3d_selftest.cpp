@@ -159,6 +159,16 @@ static void check_table() {
         const bool joined = 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")
                          || 0 == std::strcmp(k->name, "logits_gemm_bf16")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_fp8a8_tiled")
+                         || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
+                         || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
+                         || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64");
+        /* The query and the writer come as a pair, and the pair is the rule: a row with a hook must
+         * supply the relayout that produces the form the hook names (abi/rad_abi.h -- a query
+         * answering RAD_OK is a promise the loader keeps on the row's word), and no row may carry an
+         * unrelayout, because nothing in this library invents a format a tool would need to invert.
+         * A hook with a null writer is the failure the engine reports at load -- `could not produce
+         * 'output.weight' (rad.planes) from fp8_e4m3*bf16[128x128]: unsupported` -- and a relayout
+         * without a hook is a row repacking a weight nobody asked to have repacked.
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled");
         /* A layout hook and its relayout writer come as a pair (abi/rad_abi.h: a query answering
          * RAD_OK promises the loader the writer produces that form; a hook without one fails at
@@ -393,6 +403,18 @@ static void check_shapes() {
         { "quant_act_fp8", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_act_i8", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_act_i8g", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },
+        { "had_quant_act_i8", { PI("M", 8), PI("n", 1024), PI("group", 128), PS("dtype", "bf16") } },
+        { "gelu_mul_quant_i8", { PI("M", 8), PI("n", 1024), PS("dtype", "bf16") } },
+        { "kv_len_trim", { PI("trim", 4), PI("max_seqs", 8) } },
+        { "qsa_tail_store", { PI("M", 16), PI("n", 128), PI("ratio", 4), PI("ring", 8),
+                              PI("seqs", 2), PS("dtype", "bf16") } },
+        { "gated_had_quant_i8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "had_quant_act_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "gated_had_quant_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "quant_cols_fp8", { PI("M", 32), PI("n", 128), PS("dtype", "bf16") } },
+        { "had_quant_act_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "gated_had_quant_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "rmsnorm_quant_i8", { PI("M", 8), PI("n", 128), PF("eps", 1e-6), PS("dtype", "bf16") } },
         { "gated_quant_fp8", { PI("M", 8), PI("n", 11008), PI("group", 128), PS("dtype", "bf16"),
                                PS("act", "silu") } },
         { "dequant", { PI("M", 11008), PI("n", 4096), PI("group", 128),
@@ -400,6 +422,7 @@ static void check_shapes() {
         { "rmsnorm_quant_fp8", { PI("M", 1792), PI("n", 5120), PF("eps", 1e-5), PI("group", 128),
                                  PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "bf16") } },
+        { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "f16") } },
         { "gemm_nt_q", { PI("M", 8), PI("N", 11008), PI("K", 4096), PI("group", 128),
                          PS("dtype", "fp8a16"), PI("pb1", 128), PI("pb2", 128) } },
         /* The rest are MiniCPM5-2B's bands: vocab 130560, MLP 6144 wide, head 128 with 16 heads
@@ -972,6 +995,1192 @@ static int build_w2a8(Case& c, const RadOpSchema* s) {
 #undef W_PS
 }
 
+/* ------------------------------------------------------------------ the a16 band
+ *
+ * The 4-bit weight against an f16 activation. The coverage is the band a w4a16 checkpoint asks
+ * for once one runs: the codes are read where the container stores them, and the (scale, zero)
+ * pair reaches the row joined by rad_planes_relayout exactly as the loader will do. y is the
+ * only output and it is pre-filled with a bf16 NaN, so a kernel that never launches leaves its
+ * status RAD_OK behind and the NaN says the row did not run. */
+static int build_w4a16asym(Case& c, const RadOpSchema* s) {
+#define W_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+#define W_PS(k, v) { (k), RAD_P_STR, 0, 0, (v), 0.0 }
+    const long long M = 16, N = 11008, K = 4096, group = 128, G = K / group;
+    if (s->n_operands != 7) { fail("w4a16asym: the schema has %d operands, not 7", s->n_operands);
+                              return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { W_PI("M", M), W_PI("N", N), W_PI("K", K), W_PI("group", group),
+                            W_PS("dtype", "w4a16_asym") };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    RadEncoding e;
+    std::memset(&e, 0, sizeof e);
+    rad_enc_copy_str(e.scheme, "affine");
+    e.n_planes = 3;
+    rad_enc_copy_str(e.plane[0].role, "codes");
+    e.plane[0].dtype = RAD_U4; e.plane[0].kind = RAD_PLANE_TILED;
+    e.plane[0].block[0] = 1; e.plane[0].block[1] = 1;
+    rad_enc_copy_str(e.plane[1].role, "scale");
+    e.plane[1].dtype = RAD_F16; e.plane[1].kind = RAD_PLANE_TILED;
+    e.plane[1].block[0] = 1; e.plane[1].block[1] = group;
+    rad_enc_copy_str(e.plane[2].role, "zero");
+    e.plane[2].dtype = RAD_U8; e.plane[2].kind = RAD_PLANE_TILED;
+    e.plane[2].block[0] = 1; e.plane[2].block[1] = group;
+    const int sel_sz[2] = { 1, 2 };
+
+    /* The canonical planes, in the quantiser's own order: the codes the kernel reads where they
+     * lie, the scale and zero the row joins. */
+    std::vector<uint8_t> cd((size_t)N * K / 2);
+    std::vector<uint16_t> sc((size_t)N * G);
+    std::vector<uint8_t> ze((size_t)N * G);
+    uint32_t st = 0x41A15339u;
+    for (size_t i = 0; i < cd.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        cd[i] = (uint8_t)((st & 0xF) | ((st >> 12) & 0xF0));
+    }
+    for (size_t i = 0; i < sc.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        sc[i] = f32_to_f16(0.001f + 0.01f * (float)((st >> 8) & 0xffffu) / 65536.0f);
+        ze[i] = (uint8_t)((st >> 16) & 0xFu);      /* a zero that fits a 4-bit code */
+    }
+    RadTensor ps[2] = {};
+    const uint32_t pdt[2] = { RAD_F16, RAD_U8 };
+    void* pdat[2] = { sc.data(), ze.data() };
+    for (int i = 0; i < 2; ++i) {
+        ps[i].data = pdat[i]; ps[i].dtype = pdt[i]; ps[i].rank = 2;
+        ps[i].shape[0] = N; ps[i].shape[1] = G;
+        ps[i].stride[1] = 1; ps[i].stride[0] = G;
+    }
+    RadPlanesEntry en[RAD_ENC_MAX_PLANES];
+    const long long jb = rad_planes_plan(&e, sel_sz, ps, 2, en);
+    if (jb <= 0) { fail("w4a16asym: rad_planes_plan refused the joined scale+zero"); return 1; }
+    std::vector<uint8_t> jbytes((size_t)jb, 0);
+    if (rad_planes_relayout(&e, sel_sz, ps, 2, jbytes.data(), jb) != RAD_OK) {
+        fail("w4a16asym: rad_planes_relayout refused"); return 1;
+    }
+
+    /* Schema order: a, a_scale (absent), b (the codes, in order), b_scale (the joined pair),
+     * y, a_sum (absent), b_ref (absent). */
+    struct Slot { long long rows, cols; uint32_t dt; int nan; } q[7] = {
+        { M, K, RAD_F16, 0 }, { 0, 0, RAD_F32, 0 }, { N, K, RAD_U4, 0 },
+        { jb, 1, RAD_F16, 0 }, { M, N, RAD_BF16, 1 }, { 0, 0, RAD_F32, 0 },
+        { 0, 0, RAD_F32, 0 } };
+    for (int o = 0; o < 7; ++o) {
+        if (!q[o].rows) { c.t[o] = RadTensor{}; continue; }
+        size_t bytes = o == 2 ? (size_t)N * K / 2      /* codes count elements, not bytes */
+                     : o == 3 ? (size_t)jb
+                     : (size_t)q[o].rows * q[o].cols * dt_bytes(q[o].dt);
+        std::vector<uint8_t> h(bytes, 0);
+        if (o == 2) std::memcpy(h.data(), cd.data(), bytes);
+        else if (o == 3) std::memcpy(h.data(), jbytes.data(), bytes);
+        else if (o == 0) {
+            uint16_t* hf = (uint16_t*)h.data();
+            for (size_t i = 0; i < bytes / 2; ++i) {
+                st = st * 1664525u + 1013904223u;
+                hf[i] = f32_to_f16(((float)((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * 4.0f);
+            }
+        }
+        if (q[o].nan) {
+            uint16_t* b16 = (uint16_t*)h.data();
+            for (size_t i = 0; i < bytes / 2; ++i) b16[i] = 0x7fc0u;
+        }
+        /* The joined operand stays pinned, the mapped tier's shape: the shim reads its header
+         * where it lies and the kernel reads the same bytes over PCIe. */
+        void* d = nullptr;
+        if (o == 3) {
+            if (hipHostMalloc(&d, bytes, 0) != hipSuccess) {
+                fail("w4a16asym: hipHostMalloc(%zu) failed", bytes); return 1; }
+            c.dev.push_back(d); c.host.push_back(d);
+            std::memcpy(d, h.data(), bytes);
+        } else {
+            if (hipMalloc(&d, bytes) != hipSuccess) { fail("w4a16asym: hipMalloc(%zu) failed", bytes);
+                                                      return 1; }
+            c.dev.push_back(d);
+            if (hipMemcpy(d, h.data(), bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                fail("w4a16asym: hipMemcpy in failed"); return 1; }
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = q[o].dt;
+        t.rank = (o == 3) ? 1 : 2;
+        t.shape[0] = q[o].rows; t.shape[1] = q[o].cols;
+        t.stride[1] = 1; t.stride[0] = q[o].cols;
+        if (o == 3) { t.shape[1] = 0; t.stride[0] = 1; }
+    }
+    return 0;
+#undef W_PI
+#undef W_PS
+}
+
+/* The 5-bit row: the 4-bit case with the fifth-bit plane, [N/16][K/2] u32. */
+static int build_w5a16(Case& c, const RadOpSchema* s) {
+#define W_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+#define W_PS(k, v) { (k), RAD_P_STR, 0, 0, (v), 0.0 }
+    const long long M = 16, N = 11008, K = 4096, group = 128, G = K / group;
+    if (s->n_operands != 7) { fail("w5a16: the schema has %d operands, not 7", s->n_operands);
+                              return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { W_PI("M", M), W_PI("N", N), W_PI("K", K), W_PI("group", group),
+                            W_PS("dtype", "w5a16") };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    RadEncoding e;
+    std::memset(&e, 0, sizeof e);
+    rad_enc_copy_str(e.scheme, "affine");
+    e.n_planes = 4;
+    rad_enc_copy_str(e.plane[0].role, "codes");
+    e.plane[0].dtype = RAD_U4; e.plane[0].kind = RAD_PLANE_TILED;
+    e.plane[0].block[0] = 1; e.plane[0].block[1] = 1;
+    rad_enc_copy_str(e.plane[1].role, "scale");
+    e.plane[1].dtype = RAD_F16; e.plane[1].kind = RAD_PLANE_TILED;
+    e.plane[1].block[0] = 1; e.plane[1].block[1] = group;
+    rad_enc_copy_str(e.plane[2].role, "zero");
+    e.plane[2].dtype = RAD_U8; e.plane[2].kind = RAD_PLANE_TILED;
+    e.plane[2].block[0] = 1; e.plane[2].block[1] = group;
+    rad_enc_copy_str(e.plane[3].role, "hi");
+    e.plane[3].dtype = RAD_U32; e.plane[3].kind = RAD_PLANE_TILED;
+    e.plane[3].block[0] = 1; e.plane[3].block[1] = group / 2;
+    const int sel_sz[3] = { 1, 2, 3 };
+
+    std::vector<uint8_t> cd((size_t)N * K / 2);
+    std::vector<uint16_t> sc((size_t)N * G);
+    std::vector<uint8_t> ze((size_t)N * G);
+    std::vector<uint32_t> hi((size_t)(N / 16) * (K / 2));
+    uint32_t st = 0x5A11CE57u;
+    for (size_t i = 0; i < cd.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        cd[i] = (uint8_t)((st & 0xF) | ((st >> 12) & 0xF0));
+    }
+    for (size_t i = 0; i < sc.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        sc[i] = f32_to_f16(0.001f + 0.01f * (float)((st >> 8) & 0xffffu) / 65536.0f);
+        ze[i] = (uint8_t)((st >> 16) & 0x1Fu);     /* a zero that fits a 5-bit code */
+    }
+    for (size_t i = 0; i < hi.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        hi[i] = st;
+    }
+    RadTensor ps[3] = {};
+    const uint32_t pdt[3] = { RAD_F16, RAD_U8, RAD_U32 };
+    void* pdat[3] = { sc.data(), ze.data(), hi.data() };
+    for (int i = 0; i < 3; ++i) {
+        ps[i].data = pdat[i]; ps[i].dtype = pdt[i]; ps[i].rank = 2;
+        ps[i].shape[0] = (i == 2) ? N / 16 : N;
+        ps[i].shape[1] = (i == 2) ? K / 2 : G;
+        ps[i].stride[1] = 1; ps[i].stride[0] = ps[i].shape[1];
+    }
+    RadPlanesEntry en[RAD_ENC_MAX_PLANES];
+    const long long jb = rad_planes_plan(&e, sel_sz, ps, 3, en);
+    if (jb <= 0) { fail("w5a16: rad_planes_plan refused the joined scale+zero+hi"); return 1; }
+    std::vector<uint8_t> jbytes((size_t)jb, 0);
+    if (rad_planes_relayout(&e, sel_sz, ps, 3, jbytes.data(), jb) != RAD_OK) {
+        fail("w5a16: rad_planes_relayout refused"); return 1;
+    }
+
+    struct Slot { long long rows, cols; uint32_t dt; int nan; } q[7] = {
+        { M, K, RAD_F16, 0 }, { 0, 0, RAD_F32, 0 }, { N, K, RAD_U4, 0 },
+        { jb, 1, RAD_F16, 0 }, { M, N, RAD_BF16, 1 }, { 0, 0, RAD_F32, 0 },
+        { 0, 0, RAD_F32, 0 } };
+    for (int o = 0; o < 7; ++o) {
+        if (!q[o].rows) { c.t[o] = RadTensor{}; continue; }
+        size_t bytes = o == 2 ? (size_t)N * K / 2
+                      : o == 3 ? (size_t)jb
+                      : (size_t)q[o].rows * q[o].cols * dt_bytes(q[o].dt);
+        std::vector<uint8_t> h(bytes, 0);
+        if (o == 2) std::memcpy(h.data(), cd.data(), bytes);
+        else if (o == 3) std::memcpy(h.data(), jbytes.data(), bytes);
+        else if (o == 0) {
+            uint16_t* hf = (uint16_t*)h.data();
+            for (size_t i = 0; i < bytes / 2; ++i) {
+                st = st * 1664525u + 1013904223u;
+                hf[i] = f32_to_f16(((float)((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * 4.0f);
+            }
+        }
+        if (q[o].nan) {
+            uint16_t* b16 = (uint16_t*)h.data();
+            for (size_t i = 0; i < bytes / 2; ++i) b16[i] = 0x7fc0u;
+        }
+        void* d = nullptr;
+        if (o == 3) {
+            if (hipHostMalloc(&d, bytes, 0) != hipSuccess) {
+                fail("w5a16: hipHostMalloc(%zu) failed", bytes); return 1; }
+            c.dev.push_back(d); c.host.push_back(d);
+            std::memcpy(d, h.data(), bytes);
+        } else {
+            if (hipMalloc(&d, bytes) != hipSuccess) { fail("w5a16: hipMalloc(%zu) failed", bytes);
+                                                     return 1; }
+            c.dev.push_back(d);
+            if (hipMemcpy(d, h.data(), bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                fail("w5a16: hipMemcpy in failed"); return 1; }
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = q[o].dt;
+        t.rank = (o == 3) ? 1 : 2;
+        t.shape[0] = q[o].rows; t.shape[1] = q[o].cols;
+        t.stride[1] = 1; t.stride[0] = q[o].cols;
+        if (o == 3) { t.shape[1] = 0; t.stride[0] = 1; }
+    }
+    return 0;
+#undef W_PI
+#undef W_PS
+}
+
+/* The gated-delta-net preamble: two sequences of 65 tokens each (two chunks apiece, the second
+ * partial), four k heads and two v heads each, head_k 128, chunk 64. The gate decreases within a
+ * chunk as the kernel assumes; the output starts as NaN, so a row the solve does not write is a
+ * failure. */
+static int build_gdn_kkt(Case& c, const RadOpSchema* s) {
+#define GK_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+    const long long M = 130, Hg = 4, H = 8, K = 128, C = 64;
+    if (s->n_operands != 5) { fail("gdn_kkt: the schema has %d operands, not 5", s->n_operands);
+                              return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { GK_PI("M", M), GK_PI("head_k", K), GK_PI("chunk", C) };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x5A11CE57u;
+    std::vector<uint16_t> hk((size_t)M * Hg * K);
+    for (auto& v : hk) {
+        st = st * 1664525u + 1013904223u;
+        v = f32_to_bf16(((float)((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * 2.0f);
+    }
+    std::vector<float> bt((size_t)M * H), gt((size_t)M * H);
+    for (size_t m = 0; m < M; ++m)
+        for (size_t h = 0; h < H; ++h) {
+            st = st * 1664525u + 1013904223u;
+            bt[m * H + h] = (float)((st >> 8) & 0xffffu) / 65536.0f;   // 0..1
+            gt[m * H + h] = -0.01f * (int)(m % 64);                   // decreasing in the chunk
+        }
+    const int cuv[3] = { 0, 65, (int)M };
+    std::vector<uint16_t> ha((size_t)M * H * C, 0x7fc0u);             // NaN: an unwritten row shows
+
+    struct { uint32_t dt; long long r0, r1; } q[5] = {
+        { RAD_BF16, M, Hg * K }, { RAD_F32, M, H }, { RAD_F32, M, H },
+        { RAD_I32, 3, 1 }, { RAD_BF16, M, H * C } };
+    for (int o = 0; o < 5; ++o) {
+        const size_t bytes = (size_t)q[o].r0 * q[o].r1 * dt_bytes(q[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_kkt: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (o == 0) std::memcpy(d, hk.data(), bytes);
+        else if (o == 1) std::memcpy(d, bt.data(), bytes);
+        else if (o == 2) std::memcpy(d, gt.data(), bytes);
+        else if (o == 3) std::memcpy(d, cuv, sizeof cuv);
+        else std::memcpy(d, ha.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = q[o].dt;
+        t.rank = (o == 3) ? 1 : (o == 0) ? 3 : 2;
+        if (o == 3) { t.shape[0] = 3; t.stride[0] = 1; }
+        else if (o == 0) { t.shape[0] = M; t.shape[1] = Hg; t.shape[2] = K;
+                           t.stride[2] = 1; t.stride[1] = K; t.stride[0] = Hg * K; }
+        else { t.shape[0] = q[o].r0; t.shape[1] = q[o].r1;
+               t.stride[1] = 1; t.stride[0] = q[o].r1; }
+    }
+    return 0;
+#undef GK_PI
+}
+
+/* The chunked scan: the same geometry as the kkt case, with v and the state cache. The state
+ * starts random (an h0 the scan must carry through), ht must come back finite, and the output
+ * starts as NaN so an unwritten row is a failure. No state slot index: the cache is row
+ * indexed. */
+static int build_gdn_chunk_scan(Case& c, const RadOpSchema* s) {
+#define GC_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+    const long long M = 130, Hg = 4, H = 8, K = 128, V = 128, C = 64;
+    if (s->n_operands != 11) { fail("gdn_chunk_scan: the schema has %d operands, not 11",
+                                     s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { GC_PI("M", M), GC_PI("head_k", K), GC_PI("head_v", V),
+                            GC_PI("chunk", C) };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x51B2CE01u;
+    auto rnd16 = [&]() { st = st * 1664525u + 1013904223u; return (st >> 8) & 0xffffu; };
+    auto rndf  = [&]() { st = st * 1664525u + 1013904223u;
+                         return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hq((size_t)M * Hg * K), hk((size_t)M * Hg * K),
+                          hv((size_t)M * H * V), hA((size_t)M * H * C);
+    for (auto& x : hq) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hk) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hv) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    // A: the kkt_solve output's shape -- a unit lower triangular with a small random fill.
+    for (size_t m = 0; m < M; ++m)
+        for (size_t h = 0; h < H; ++h)
+            for (int j = 0; j < C; ++j) {
+                const int i = m % C;
+                hA[m * H * C + h * C + j] =
+                    (j == i) ? f32_to_bf16(1.0f)
+                    : (j < i) ? f32_to_bf16((rndf() - 0.5f) * 0.1f)
+                              : 0x0000u;
+            }
+    std::vector<float> gt((size_t)M * H), btt((size_t)M * H);
+    for (size_t m = 0; m < M; ++m)
+        for (size_t h = 0; h < H; ++h) {
+            btt[m * H + h] = rndf();                          // 0..1
+            gt[m * H + h] = -0.01f * (int)(m % 64);           // decreasing in the chunk
+        }
+    std::vector<float> h0((size_t)M * H * V * K);
+    for (auto& x : h0) x = (rndf() - 0.5f) * 0.1f;
+    const int cuv[3] = { 0, 65, (int)M };
+    std::vector<uint16_t> ho((size_t)M * H * V, 0x7fc0u);     // NaN: an unwritten row shows
+
+    struct { uint32_t dt; long long r0, r1, r2; } qd[11] = {
+        { RAD_BF16, M, Hg * K, K },   // q
+        { RAD_BF16, M, Hg * K, K },   // k
+        { RAD_BF16, M, H * V, V },    // v
+        { RAD_BF16, M, H * C, C },    // A
+        { RAD_F32, M, H, 1 },         // g
+        { RAD_F32, M, H, 1 },         // beta
+        { RAD_F32, M * H, V * K, V * K },  // h0 [M, H, V*K] dense
+        { RAD_I32, 3, 1, 1 },         // cu
+        { RAD_BF16, M, H * V, V },    // o
+        { RAD_F32, M * H, V * K, V * K },  // ht
+        { RAD_I32, 0, 0, 0 }          // state_idx: absent
+    };
+    for (int o = 0; o < 10; ++o) {
+        const long long nel = (o == 6 || o == 9) ? M * H * V * K
+                         : (o == 7) ? 3
+                         : qd[o].r0 * qd[o].r1 / qd[o].r2 * qd[o].r2;
+        const size_t bytes = (size_t)nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_chunk_scan: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (o == 0) std::memcpy(d, hq.data(), bytes);
+        else if (o == 1) std::memcpy(d, hk.data(), bytes);
+        else if (o == 2) std::memcpy(d, hv.data(), bytes);
+        else if (o == 3) std::memcpy(d, hA.data(), bytes);
+        else if (o == 4) std::memcpy(d, gt.data(), bytes);
+        else if (o == 5) std::memcpy(d, btt.data(), bytes);
+        else if (o == 6) std::memcpy(d, h0.data(), bytes);
+        else if (o == 7) std::memcpy(d, cuv, sizeof cuv);
+        else if (o == 8) std::memcpy(d, ho.data(), bytes);
+        else std::memcpy(d, h0.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 7) { t.rank = 1; t.shape[0] = 3; t.stride[0] = 1; }
+        else if (o == 6 || o == 9) {
+            t.rank = 3; t.shape[0] = M; t.shape[1] = H; t.shape[2] = V * K;
+            t.stride[2] = 1; t.stride[1] = V * K; t.stride[0] = H * V * K;
+        } else if (o == 0 || o == 1 || o == 2 || o == 3 || o == 8) {
+            t.rank = 3; t.shape[0] = M; t.shape[1] = qd[o].r1 / qd[o].r2; t.shape[2] = qd[o].r2;
+            t.stride[2] = 1; t.stride[1] = qd[o].r2; t.stride[0] = qd[o].r1;
+        } else {
+            t.rank = 2; t.shape[0] = M; t.shape[1] = H;
+            t.stride[1] = 1; t.stride[0] = H;
+        }
+    }
+    c.t[10] = RadTensor{};   // state_idx absent
+    return 0;
+#undef GC_PI
+}
+
+static int build_gdn_gated_rmsnorm(Case& c, const RadOpSchema* s) {
+#define GR_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+    const long long M = 130, H = 10, C = 128;
+    if (s->n_operands != 4) { fail("gdn_gated_rmsnorm: the schema has %d operands, not 4",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { GR_PI("M", M), GR_PI("channels", C) };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x9E3779B9u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hx((size_t)M * C), hz((size_t)M * C);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hz) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    std::vector<float> hw(C);
+    for (auto& x : hw) x = (rndf() - 0.5f) * 2.0f;
+    std::vector<uint16_t> ho((size_t)M * C, 0x7fc0u);   // NaN: an unwritten row shows
+
+    struct { uint32_t dt; long long r0, r1, r2; } qd[4] = {
+        { RAD_BF16, M, C, 1 },   // x [M, C]
+        { RAD_BF16, M, C, 1 },   // z [M, C]
+        { RAD_F32,  C, 1, 1 },   // w [C]
+        { RAD_BF16, M, C, 1 }    // o [M, C]
+    };
+    for (int o = 0; o < 4; ++o) {
+        const long long nel = qd[o].r0 * qd[o].r1;
+        const size_t bytes = (size_t)nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_gated_rmsnorm: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (o == 0) std::memcpy(d, hx.data(), bytes);
+        else if (o == 1) std::memcpy(d, hz.data(), bytes);
+        else if (o == 2) std::memcpy(d, hw.data(), bytes);
+        else std::memcpy(d, ho.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 2) { t.rank = 1; t.shape[0] = C; t.stride[0] = 1; }
+        else { t.rank = 2; t.shape[0] = M; t.shape[1] = C; t.stride[1] = 1; t.stride[0] = C; }
+    }
+    return 0;
+#undef GR_PI
+}
+
+static int build_gdn_gated_norm_hq(Case& c, const RadOpSchema* s) {
+#define GH_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
+    const long long M = 64, H = 8, C = 128, K = H * C;
+    if (s->n_operands != 5) { fail("gdn_gated_norm_had_quant_i8: the schema has %d operands, not 5",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { GH_PI("M", M), GH_PI("n", K), GH_PI("head_dim", C),
+                            GH_PI("group", 128) };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0xC2B2AE35u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hx((size_t)M * K), hz((size_t)M * K);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hz) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    std::vector<float> hw(C);
+    for (auto& x : hw) x = (rndf() - 0.5f) * 2.0f;
+    std::vector<int8_t> hq((size_t)M * K, 0);
+    std::vector<float> hs(M, 0.0f);
+
+    struct { uint32_t dt; long long r0, r1; } qd[5] = {
+        { RAD_BF16, M, K },   // x [M, K]
+        { RAD_BF16, M, K },   // z [M, K]
+        { RAD_F32,  C, 1 },   // w [C]
+        { RAD_I8,   M, K },   // q [M, K]
+        { RAD_F32,  M, 1 }    // scale [M]
+    };
+    for (int o = 0; o < 5; ++o) {
+        const long long nel = qd[o].r0 * qd[o].r1;
+        const size_t bytes = (size_t)nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_gated_norm_hq: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (o == 0) std::memcpy(d, hx.data(), bytes);
+        else if (o == 1) std::memcpy(d, hz.data(), bytes);
+        else if (o == 2) std::memcpy(d, hw.data(), bytes);
+        else if (o == 3) std::memcpy(d, hq.data(), bytes);
+        else std::memcpy(d, hs.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 2) { t.rank = 1; t.shape[0] = C; t.stride[0] = 1; }
+        else if (o == 4) { t.rank = 1; t.shape[0] = M; t.stride[0] = 1; }
+        else { t.rank = 2; t.shape[0] = M; t.shape[1] = K; t.stride[1] = 1; t.stride[0] = K; }
+    }
+    return 0;
+#undef GH_PI
+}
+
+static int build_gdn_conv_prep(Case& c, const RadOpSchema* s) {
+    const long long T = 64, Hg = 2, H = 4, K = 128, V = 128, W = 4;
+    const long long units = 2 * Hg + H, XD = units * K;   // 8 * 128 = 1024
+    if (s->n_operands != 16) { fail("gdn_conv_prep: the schema has %d operands, not 16",
+                                     s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "head_k", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 },
+                            { "chunk", RAD_P_INT, 64, 0, nullptr, 0.0 },
+                            { "conv_width", RAD_P_INT, W, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x7E57BD71u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hx(T * XD), hw(XD * W), hb(XD);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hb) x = f32_to_bf16((rndf() - 0.5f) * 0.2f);
+    std::vector<uint16_t> hcs(XD * 3, 0), ha(T * H), hbg(T * H);
+    for (auto& x : hcs) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : ha)  x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hbg) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    std::vector<float> halog(H), hdtb(H);
+    for (auto& x : halog) x = logf(0.1f + rndf());
+    for (auto& x : hdtb)  x = (rndf() - 0.5f) * 4.0f;
+    const int cuv[2] = { 0, (int)T };
+    const int cidxv[1] = { 0 }, hin[1] = { 1 };
+    std::vector<uint16_t> hq(T * Hg * K, 0x7fc0u), hk(T * Hg * K, 0x7fc0u), hv(T * H * V, 0x7fc0u);
+    std::vector<float> hg(T * H, 0.0f), hbeta(T * H, 0.0f);
+
+    struct { uint32_t dt; long long nel; } qd[16] = {
+        { RAD_BF16, T * XD },   // x
+        { RAD_BF16, XD * W },   // w
+        { RAD_BF16, XD },       // b
+        { RAD_F32,  H },        // A_log
+        { RAD_F32,  H },        // dt_bias
+        { RAD_BF16, XD * 3 },   // conv_state [XD, 1, 3]
+        { RAD_I32,  2 },        // cu
+        { RAD_BF16, T * H },    // a
+        { RAD_BF16, T * H },    // b_gate
+        { RAD_I32,  1 },        // cache_idx
+        { RAD_I32,  1 },        // has_init
+        { RAD_BF16, T * Hg * K },  // q
+        { RAD_BF16, T * Hg * K },  // k
+        { RAD_BF16, T * H * V },   // v
+        { RAD_F32,  T * H },       // g
+        { RAD_F32,  T * H }        // beta
+    };
+    for (int o = 0; o < 16; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_conv_prep: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        switch (o) {
+            case 0: std::memcpy(d, hx.data(), bytes); break;
+            case 1: std::memcpy(d, hw.data(), bytes); break;
+            case 2: std::memcpy(d, hb.data(), bytes); break;
+            case 3: std::memcpy(d, halog.data(), bytes); break;
+            case 4: std::memcpy(d, hdtb.data(), bytes); break;
+            case 5: std::memcpy(d, hcs.data(), bytes); break;
+            case 6: std::memcpy(d, cuv, sizeof cuv); break;
+            case 7: std::memcpy(d, ha.data(), bytes); break;
+            case 8: std::memcpy(d, hbg.data(), bytes); break;
+            case 9: std::memcpy(d, cidxv, sizeof cidxv); break;
+            case 10: std::memcpy(d, hin, sizeof hin); break;
+            case 11: std::memcpy(d, hq.data(), bytes); break;
+            case 12: std::memcpy(d, hk.data(), bytes); break;
+            case 13: std::memcpy(d, hv.data(), bytes); break;
+            case 14: std::memcpy(d, hg.data(), bytes); break;
+            default: std::memcpy(d, hbeta.data(), bytes); break;
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: t.rank = 2; t.shape[0] = T; t.shape[1] = XD; t.stride[1] = 1; t.stride[0] = XD; break;
+            case 1: t.rank = 2; t.shape[0] = XD; t.shape[1] = W; t.stride[1] = 1; t.stride[0] = W; break;
+            case 2: t.rank = 1; t.shape[0] = XD; t.stride[0] = 1; break;
+            case 3: case 4: t.rank = 1; t.shape[0] = H; t.stride[0] = 1; break;
+            case 5: t.rank = 3; t.shape[0] = XD; t.shape[1] = 1; t.shape[2] = 3;
+                    t.stride[2] = 1; t.stride[1] = 3; t.stride[0] = 3; break;
+            case 6: t.rank = 1; t.shape[0] = 2; t.stride[0] = 1; break;
+            case 7: case 8: t.rank = 2; t.shape[0] = T; t.shape[1] = H; t.stride[1] = 1; t.stride[0] = H; break;
+            case 9: case 10: t.rank = 1; t.shape[0] = 1; t.stride[0] = 1; break;
+            case 11: case 12: t.rank = 3; t.shape[0] = T; t.shape[1] = Hg; t.shape[2] = K;
+                    t.stride[2] = 1; t.stride[1] = K; t.stride[0] = Hg * K; break;
+            case 13: t.rank = 3; t.shape[0] = T; t.shape[1] = H; t.shape[2] = V;
+                    t.stride[2] = 1; t.stride[1] = V; t.stride[0] = H * V; break;
+            case 14: case 15: t.rank = 2; t.shape[0] = T; t.shape[1] = H; t.stride[1] = 1; t.stride[0] = H; break;
+        }
+    }
+    return 0;
+}
+
+static int build_gdn_conv_update(Case& c, const RadOpSchema* s) {
+    const long long T = 1, Hg = 2, H = 4, K = 128, V = 128, W = 4, SL = 4;
+    const long long units = 2 * Hg + H, XD = units * K;
+    if (s->n_operands != 10) { fail("gdn_conv_update: the schema has %d operands, not 10",
+                                     s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "q_len", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "head_k", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 },
+                            { "conv_width", RAD_P_INT, W, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x35A7F12Bu;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hx(T * XD), hw(XD * W), hb(XD);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hb) x = f32_to_bf16((rndf() - 0.5f) * 0.2f);
+    std::vector<uint16_t> hcs(XD * SL, 0);
+    for (auto& x : hcs) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    const int cuv[2] = { 0, (int)T };
+    const int sidxv[1] = { 0 }, nav[1] = { 0 };
+    std::vector<uint16_t> hq(T * Hg * K, 0x7fc0u), hk(T * Hg * K, 0x7fc0u), hv(T * H * V, 0x7fc0u);
+
+    struct { uint32_t dt; long long nel; } qd[10] = {
+        { RAD_BF16, T * XD },   // x
+        { RAD_BF16, XD * W },   // w
+        { RAD_BF16, XD },       // b
+        { RAD_BF16, XD * SL },  // conv_state [XD, 1, SL]
+        { RAD_I32,  1 },        // state_idx
+        { RAD_I32,  1 },        // num_accepted
+        { RAD_I32,  2 },        // cu
+        { RAD_BF16, T * Hg * K },  // q
+        { RAD_BF16, T * Hg * K },  // k
+        { RAD_BF16, T * H * V }    // v
+    };
+    for (int o = 0; o < 10; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_conv_update: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        switch (o) {
+            case 0: std::memcpy(d, hx.data(), bytes); break;
+            case 1: std::memcpy(d, hw.data(), bytes); break;
+            case 2: std::memcpy(d, hb.data(), bytes); break;
+            case 3: std::memcpy(d, hcs.data(), bytes); break;
+            case 4: std::memcpy(d, sidxv, sizeof sidxv); break;
+            case 5: std::memcpy(d, nav, sizeof nav); break;
+            case 6: std::memcpy(d, cuv, sizeof cuv); break;
+            case 7: std::memcpy(d, hq.data(), bytes); break;
+            case 8: std::memcpy(d, hk.data(), bytes); break;
+            default: std::memcpy(d, hv.data(), bytes); break;
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: t.rank = 2; t.shape[0] = T; t.shape[1] = XD; t.stride[1] = 1; t.stride[0] = XD; break;
+            case 1: t.rank = 2; t.shape[0] = XD; t.shape[1] = W; t.stride[1] = 1; t.stride[0] = W; break;
+            case 2: t.rank = 1; t.shape[0] = XD; t.stride[0] = 1; break;
+            case 3: t.rank = 3; t.shape[0] = XD; t.shape[1] = 1; t.shape[2] = SL;
+                    t.stride[2] = 1; t.stride[1] = SL; t.stride[0] = SL; break;
+            case 4: case 5: t.rank = 1; t.shape[0] = 1; t.stride[0] = 1; break;
+            case 6: t.rank = 1; t.shape[0] = 2; t.stride[0] = 1; break;
+            case 7: case 8: t.rank = 3; t.shape[0] = T; t.shape[1] = Hg; t.shape[2] = K;
+                    t.stride[2] = 1; t.stride[1] = K; t.stride[0] = Hg * K; break;
+            default: t.rank = 3; t.shape[0] = T; t.shape[1] = H; t.shape[2] = V;
+                     t.stride[2] = 1; t.stride[1] = V; t.stride[0] = H * V; break;
+        }
+    }
+    return 0;
+}
+
+static int build_expert_scale(Case& c, const RadOpSchema* s) {
+    const long long M = 3, K = 4, NE = 8;
+    if (s->n_operands != 3) { fail("expert_scale: the schema has %d operands, not 3",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, K, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0xA11CEu;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<int32_t> hids(M * K);
+    for (auto& x : hids) x = (int32_t)(rndf() * (NE + 2)) - 1;   // includes an out-of-table id
+    std::vector<uint16_t> hsc(NE), hew(M * K);
+    for (auto& x : hsc) x = f32_to_bf16(0.1f + rndf());
+    for (auto& x : hew) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+
+    struct { uint32_t dt; long long nel; } qd[3] = {
+        { RAD_I32,  M * K },   // ids
+        { RAD_BF16, NE },      // w_e
+        { RAD_BF16, M * K }    // ew
+    };
+    for (int o = 0; o < 3; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("expert_scale: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        switch (o) {
+            case 0: std::memcpy(d, hids.data(), bytes); break;
+            case 1: std::memcpy(d, hsc.data(), bytes); break;
+            default: std::memcpy(d, hew.data(), bytes); break;
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 1) { t.rank = 1; t.shape[0] = NE; t.stride[0] = 1; }
+        else { t.rank = 2; t.shape[0] = M; t.shape[1] = K; t.stride[1] = 1; t.stride[0] = K; }
+    }
+    return 0;
+}
+
+static int build_moe_router_topk(Case& c, const RadOpSchema* s) {
+    const long long M = 6, NE = 48, TK = 8;
+    if (s->n_operands != 3) { fail("router_topk: the schema has %d operands, not 3",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "norm", RAD_P_INT, 1, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x7017u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hlg(M * NE), hw(M * TK, 0);
+    for (auto& x : hlg) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+
+    struct { uint32_t dt; long long nel; } qd[3] = {
+        { RAD_BF16, M * NE },   // logits
+        { RAD_I32,  M * TK },   // expert_ids
+        { RAD_BF16, M * TK }    // expert_w
+    };
+    for (int o = 0; o < 3; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("router_topk: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        std::memcpy(d, o == 0 ? hlg.data() : hw.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 0) { t.rank = 2; t.shape[0] = M; t.shape[1] = NE; t.stride[1] = 1; t.stride[0] = NE; }
+        else { t.rank = 2; t.shape[0] = M; t.shape[1] = TK; t.stride[1] = 1; t.stride[0] = TK; }
+    }
+    return 0;
+}
+
+static int build_moe_scatter(Case& c, const RadOpSchema* s) {
+    const long long M = 16, TK = 8, NE = 32;   // T = 128
+    const long long T = M * TK;
+    if (s->n_operands != 4) { fail("moe_scatter: the schema has %d operands, not 4",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x5CA7u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return (int32_t)((st >> 8) & 0xffffu); };
+    std::vector<int32_t> hids(T), hsorted(T, -1), hoff(NE + 1, -1), hcnt(NE, -1);
+    for (auto& x : hids) x = rnd() % NE;
+
+    struct { uint32_t dt; long long nel; } qd[4] = {
+        { RAD_I32, T },        // expert_ids
+        { RAD_I32, T },        // sorted_tok
+        { RAD_I32, NE + 1 },   // expert_offset
+        { RAD_I32, NE }        // expert_count
+    };
+    for (int o = 0; o < 4; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * 4;
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_scatter: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        std::memcpy(d, o == 0 ? hids.data() : (o == 1 ? hsorted.data()
+                      : (o == 2 ? hoff.data() : hcnt.data())), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = RAD_I32; t.rank = 1;
+        t.shape[0] = qd[o].nel; t.stride[0] = 1;
+    }
+    return 0;
+}
+
+static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
+    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2, GR = 1;   // T = 16; N % 128
+    const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
+    if (s->n_operands != 9) { fail("moe_gemm_q: the schema has %d operands, not 9",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "grid_rows", RAD_P_INT, GR, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"w4a8", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x0E0E5A1Cu;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return (st >> 8) & 0xffu; };
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u; return 0.5f + ((st >> 8) & 0xff) / 255.0f; };
+    // E4M3 codes in the normal range (exp 1..14), a valid bit pattern.
+    auto re4 = [&]() { return (uint8_t)(((rnd() & 0x7) | 1) << 3 | (rnd() & 0x7) | ((rnd() & 1) << 7)); };
+    std::vector<uint8_t> ha((size_t)M * K), hw0((size_t)NE0 * N * K), hw1((size_t)NE1 * N * K);
+    for (auto& x : ha) x = re4();
+    for (auto& x : hw0) x = re4();
+    for (auto& x : hw1) x = re4();
+    std::vector<float> hA((size_t)M * (K / 128)), hW0((size_t)NE0 * (N / GR) * (K / 128)),
+        hW1((size_t)NE1 * (N / GR) * (K / 128));
+    for (auto& x : hA) x = rndf();
+    for (auto& x : hW0) x = rndf();
+    for (auto& x : hW1) x = rndf();
+    std::vector<int32_t> hs(T), ho(NE + 1);
+    for (long long i = 0; i < T; ++i) hs[i] = (int32_t)i;
+    for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
+    ho[NE] = (int32_t)T;
+
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[9] = {
+        { RAD_F8E4M3, 2, { M, K, 1 }, M * K },
+        { RAD_F32, 2, { M, K / 128, 1 }, M * (K / 128) },
+        { RAD_I32, 1, { T, 1, 1 }, T },
+        { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
+        { RAD_F8E4M3, 3, { NE0, N, K }, NE0 * N * K },
+        { RAD_F32, 3, { NE0, N / GR, K / 128 }, NE0 * (N / GR) * (K / 128) },
+        { RAD_F8E4M3, 3, { NE1, N, K }, NE1 * N * K },
+        { RAD_F32, 3, { NE1, N / GR, K / 128 }, NE1 * (N / GR) * (K / 128) },
+        { RAD_F32, 2, { T, N, 1 }, T * N } };
+    const uint32_t bytes_of[] = { 1, 4, 4, 4, 1, 4, 1, 4, 4 };
+    const void* src[] = { ha.data(), hA.data(), hs.data(), ho.data(), hw0.data(), hW0.data(),
+                          hw1.data(), hW1.data(), nullptr };
+    for (int o = 0; o < 9; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_q: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
+        for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
+        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+    }
+    return 0;
+}
+
+static int build_moe_gemm_bf16(Case& c, const RadOpSchema* s) {
+    const long long M = 8, N = 128, K = 64, NE = 8, TK = 2;   // T = 16; N % 128, K % 64
+    const long long T = M * TK;
+    if (s->n_operands != 5) { fail("moe_gemm_bf16: the schema has %d operands, not 5",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x1A2B3C4Du;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> ha((size_t)M * K), hw((size_t)NE * N * K);
+    for (auto& x : ha) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    std::vector<int32_t> hs(T), ho(NE + 1);
+    for (long long i = 0; i < T; ++i) hs[i] = (int32_t)i;
+    for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
+    ho[NE] = (int32_t)T;
+
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[5] = {
+        { RAD_BF16, 2, { M, K, 1 }, M * K },
+        { RAD_BF16, 3, { NE, N, K }, NE * N * K },
+        { RAD_I32, 1, { T, 1, 1 }, T },
+        { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
+        { RAD_BF16, 2, { T, N, 1 }, T * N } };
+    const uint32_t bytes_of[] = { 2, 2, 4, 4, 2 };
+    const void* src[] = { ha.data(), hw.data(), hs.data(), ho.data(), nullptr };
+    for (int o = 0; o < 5; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_bf16: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
+        for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
+        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+    }
+    return 0;
+}
+
+static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
+    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2, GR = 1;   // T = 16; N % 128
+    const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
+    if (s->n_operands != 9) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 9",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "grid_rows", RAD_P_INT, GR, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"mxfp4a8", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x7A6B5C4Du;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return (st >> 8) & 0xffu; };
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u; return 0.5f + ((st >> 8) & 0xff) / 255.0f; };
+    auto re4 = [&]() { return (uint8_t)(((rnd() & 0x7) | 1) << 3 | (rnd() & 0x7) | ((rnd() & 1) << 7)); };
+    auto re2 = [&]() { return (uint8_t)(rnd() & 0xF); };   // E2M1 code (4 bits)
+    auto re8 = [&]() { return (uint8_t)(120 + (rnd() & 14)); };  // E8M0 near 1.0 (exp 120..133)
+    std::vector<uint8_t> ha((size_t)M * K), hw0((size_t)NE0 * N * (K / 2)), hw1((size_t)NE1 * N * (K / 2));
+    for (auto& x : ha) x = re4();
+    for (auto& x : hw0) x = re2();
+    for (auto& x : hw1) x = re2();
+    std::vector<float> hA((size_t)M * (K / 128));
+    std::vector<uint8_t> hW0((size_t)NE0 * (N / GR) * (K / 32)),
+        hW1((size_t)NE1 * (N / GR) * (K / 32));
+    for (auto& x : hA) x = rndf();
+    for (auto& x : hW0) x = re8();
+    for (auto& x : hW1) x = re8();
+    std::vector<int32_t> hs(T), ho(NE + 1);
+    for (long long i = 0; i < T; ++i) hs[i] = (int32_t)i;
+    for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
+    ho[NE] = (int32_t)T;
+
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[9] = {
+        { RAD_F8E4M3, 2, { M, K, 1 }, M * K },
+        { RAD_F32, 2, { M, K / 128, 1 }, M * (K / 128) },
+        { RAD_I32, 1, { T, 1, 1 }, T },
+        { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
+        { RAD_FP4E2M1, 3, { NE0, N, K / 2 }, NE0 * N * (K / 2) },
+        { RAD_U8, 3, { NE0, N / GR, K / 32 }, NE0 * (N / GR) * (K / 32) },
+        { RAD_FP4E2M1, 3, { NE1, N, K / 2 }, NE1 * N * (K / 2) },
+        { RAD_U8, 3, { NE1, N / GR, K / 32 }, NE1 * (N / GR) * (K / 32) },
+        { RAD_BF16, 2, { T, N, 1 }, T * N } };
+    const uint32_t bytes_of[] = { 1, 4, 4, 4, 1, 1, 1, 1, 2 };
+    const void* src[] = { ha.data(), hA.data(), hs.data(), ho.data(), hw0.data(), hW0.data(),
+                          hw1.data(), hW1.data(), nullptr };
+    for (int o = 0; o < 9; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_mxfp4a8: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
+        for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
+        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+    }
+    return 0;
+}
+
+static int build_moe_router_scatter(Case& c, const RadOpSchema* s) {
+    const long long M = 6, NE = 48, TK = 8;
+    const long long T = M * TK;
+    if (s->n_operands != 6) { fail("router_topk_scatter: the schema has %d operands, not 6",
+                                    s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "n_local", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "norm", RAD_P_INT, 1, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"bf16", 0.0 },
+                            { "expert_base", RAD_P_INT, 0, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x8070u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hlg(M * NE);
+    for (auto& x : hlg) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+
+    struct { uint32_t dt; long long nel; } qd[6] = {
+        { RAD_BF16, M * NE },   // logits
+        { RAD_I32,  M * TK },   // expert_ids
+        { RAD_BF16, M * TK },   // expert_w
+        { RAD_I32,  T },        // sorted_tok
+        { RAD_I32,  NE + 1 },   // expert_offset
+        { RAD_I32,  NE }        // expert_count
+    };
+    for (int o = 0; o < 6; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("router_topk_scatter: hipMalloc(%zu) failed",
+                                                       bytes); return 1; }
+        c.dev.push_back(d);
+        if (o == 0) std::memcpy(d, hlg.data(), bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o <= 2) { t.rank = 2; t.shape[0] = M; t.shape[1] = o == 0 ? NE : TK; t.stride[1] = 1;
+                      t.stride[0] = o == 0 ? NE : TK; }
+        else { t.rank = 1; t.shape[0] = qd[o].nel; t.stride[0] = 1; }
+    }
+    return 0;
+}
+
+static int build_moe_router_sigmoid(Case& c, const RadOpSchema* s) {
+    const long long M = 6, NE = 48, TK = 8;
+    if (s->n_operands != 4) { fail("router_sigmoid_topk: the schema has %d operands, not 4",
+                                   s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "route_scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"bf16", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x51A2u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hlg(M * NE);
+    std::vector<float> hbi(NE);
+    for (auto& x : hlg) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hbi) x = (rndf() - 0.5f) * 0.1f;
+
+    struct { uint32_t dt; long long nel; } qd[4] = {
+        { RAD_BF16, M * NE },   // logits
+        { RAD_F32,  NE },       // bias
+        { RAD_I32,  M * TK },   // expert_ids
+        { RAD_BF16, M * TK }    // expert_w
+    };
+    const void* src[] = { hlg.data(), hbi.data(), nullptr, nullptr };
+    for (int o = 0; o < 4; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("router_sigmoid_topk: hipMalloc(%zu) failed",
+                                                       bytes); return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        if (o == 0) { t.rank = 2; t.shape[0] = M; t.shape[1] = NE; t.stride[1] = 1; t.stride[0] = NE; }
+        else if (o == 1) { t.rank = 1; t.shape[0] = NE; t.stride[0] = 1; }
+        else { t.rank = 2; t.shape[0] = M; t.shape[1] = TK; t.stride[1] = 1; t.stride[0] = TK; }
+    }
+    return 0;
+}
+
+
+static int build_moe_gather(Case& c, const RadOpSchema* s, int inv) {
+    const long long M = 8, n = 128, TK = 2;   // T = 16
+    const long long T = M * TK;
+    if (s->n_operands != 6) { fail("moe_gather%s: the schema has %d operands, not 6",
+                                   inv ? "_inv" : "", s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"bf16", 0.0 },
+                            { "act", RAD_P_STR, 0, 0, (const char*)"silu", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x0B0C0Du;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hye((size_t)T * n), hew(M * TK), hsh((size_t)M * n), hsg(M);
+    for (auto& x : hye) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hew) x = f32_to_bf16(rndf());
+    for (auto& x : hsh) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hsg) x = f32_to_bf16(rndf() * 4.0f);
+    std::vector<int32_t> hslot(T);
+    for (long long i = 0; i < T; ++i) hslot[i] = (int32_t)(i % M);
+
+    struct { uint32_t dt; int rank; long long sh[2]; long long nel; } qd[6] = {
+        { RAD_BF16, 2, { T, n }, T * n },   // y_expert
+        { RAD_BF16, 2, { M, TK }, M * TK }, // expert_w
+        { RAD_I32,  1, { T, 1 }, T },       // sorted_tok / inverse
+        { RAD_BF16, 2, { M, n }, M * n },   // shared
+        { RAD_BF16, 1, { M, 1 }, M },       // shared_gate
+        { RAD_BF16, 2, { M, n }, M * n }    // y
+    };
+    const uint32_t bytes_of[] = { 2, 2, 4, 2, 2, 2 };
+    const void* src[] = { hye.data(), hew.data(), hslot.data(), hsh.data(), hsg.data(), nullptr };
+    for (int o = 0; o < 6; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gather: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
+        for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
+        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+    }
+    return 0;
+}
+
+
+static int build_gdn_recurrent(Case& c, const RadOpSchema* s) {
+    const long long T = 4, Hg = 2, H = 4, K = 128, V = 128, SLOTS = 2;
+    if (s->n_operands != 16) { fail("gdn_recurrent_update: the schema has %d operands, not 16",
+                                     s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "q_len", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "head_k", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x4A7B2C9Du;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hq(T*Hg*K), hk(T*Hg*K), hv(T*H*V), ha(T*H), hb(T*H), hz(T*H*V);
+    for (auto& x : hq) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hk) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hv) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : ha) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hb) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hz) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    std::vector<float> halog(H), hdtb(H), hstate(SLOTS*H*V*K), hnw(V);
+    for (auto& x : halog) x = logf(0.1f + rndf());
+    for (auto& x : hdtb)  x = (rndf() - 0.5f) * 4.0f;
+    for (auto& x : hstate) x = (rndf() - 0.5f) * 0.1f;
+    for (auto& x : hnw)    x = (rndf() - 0.5f) * 2.0f;
+    std::vector<uint16_t> ho(T*H*V, 0x7fc0u);
+    const int sidxv[T] = { 0, 0, 1, 1 };
+    const int nav[1] = { 0 };
+    const int cuv[2] = { 0, (int)T };
+
+    struct { uint32_t dt; long long nel; } qd[16] = {
+        { RAD_BF16, T*Hg*K },   // q
+        { RAD_BF16, T*Hg*K },   // k
+        { RAD_BF16, T*H*V },    // v
+        { RAD_BF16, T*H },      // a
+        { RAD_BF16, T*H },      // b
+        { RAD_F32,  H },        // A_log
+        { RAD_F32,  H },        // dt_bias
+        { RAD_F32,  SLOTS*H*V*K },  // state
+        { RAD_I32,  T },        // state_idx [1, T]
+        { RAD_I32,  1 },        // num_accepted
+        { RAD_I32,  2 },        // cu
+        { RAD_BF16, T*H*V },    // z
+        { RAD_F32,  V },        // norm_w
+        { RAD_BF16, T*H*V },    // o
+        { RAD_I8,   0 },        // o_q: absent
+        { RAD_F32,  0 }         // o_scale: absent
+    };
+    for (int o = 0; o < 14; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_recurrent: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        switch (o) {
+            case 0: std::memcpy(d, hq.data(), bytes); break;
+            case 1: std::memcpy(d, hk.data(), bytes); break;
+            case 2: std::memcpy(d, hv.data(), bytes); break;
+            case 3: std::memcpy(d, ha.data(), bytes); break;
+            case 4: std::memcpy(d, hb.data(), bytes); break;
+            case 5: std::memcpy(d, halog.data(), bytes); break;
+            case 6: std::memcpy(d, hdtb.data(), bytes); break;
+            case 7: std::memcpy(d, hstate.data(), bytes); break;
+            case 8: std::memcpy(d, sidxv, sizeof sidxv); break;
+            case 9: std::memcpy(d, nav, sizeof nav); break;
+            case 10: std::memcpy(d, cuv, sizeof cuv); break;
+            case 11: std::memcpy(d, hz.data(), bytes); break;
+            case 12: std::memcpy(d, hnw.data(), bytes); break;
+            default: std::memcpy(d, ho.data(), bytes); break;
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: case 1: t.rank = 3; t.shape[0]=T; t.shape[1]=Hg; t.shape[2]=K;
+                    t.stride[2]=1; t.stride[1]=K; t.stride[0]=Hg*K; break;
+            case 2: t.rank = 3; t.shape[0]=T; t.shape[1]=H; t.shape[2]=V;
+                    t.stride[2]=1; t.stride[1]=V; t.stride[0]=H*V; break;
+            case 3: case 4: t.rank = 2; t.shape[0]=T; t.shape[1]=H; t.stride[1]=1; t.stride[0]=H; break;
+            case 5: case 6: t.rank = 1; t.shape[0]=H; t.stride[0]=1; break;
+            case 7: t.rank = 4; t.shape[0]=SLOTS; t.shape[1]=H; t.shape[2]=V; t.shape[3]=K;
+                    t.stride[3]=1; t.stride[2]=K; t.stride[1]=V*K; t.stride[0]=H*V*K; break;
+            case 8: t.rank = 2; t.shape[0]=1; t.shape[1]=T; t.stride[1]=1; t.stride[0]=T; break;
+            case 9: t.rank = 1; t.shape[0]=1; t.stride[0]=1; break;
+            case 10: t.rank = 1; t.shape[0]=2; t.stride[0]=1; break;
+            case 11: t.rank = 3; t.shape[0]=T; t.shape[1]=H; t.shape[2]=V;
+                    t.stride[2]=1; t.stride[1]=V; t.stride[0]=H*V; break;
+            case 12: t.rank = 1; t.shape[0]=V; t.stride[0]=1; break;
+            default: t.rank = 3; t.shape[0]=T; t.shape[1]=H; t.shape[2]=V;
+                     t.stride[2]=1; t.stride[1]=V; t.stride[0]=H*V; break;
+        }
+    }
+    c.t[14] = RadTensor{};   // o_q absent
+    c.t[15] = RadTensor{};   // o_scale absent
+    return 0;
+}
+
 static int run_row(int i) {
     const RadKernelInfo* k = row_at(i);
     if (!k) return 1;
@@ -988,7 +2197,25 @@ static int run_row(int i) {
         return 0;
     }
     const int hand = k->opd_shape ? 0
-        : (0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")) ? 1 : 2;
+        : (0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")) ? 1
+        : (0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")) ? 3
+        : (0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64")) ? 4
+        : (0 == std::strcmp(k->name, "gdn_kkt_solve_c64")) ? 5
+        : (0 == std::strcmp(k->name, "gdn_chunk_scan_k128_v128_c64")) ? 6
+        : (0 == std::strcmp(k->name, "gdn_gated_rmsnorm_h128")) ? 7
+        : (0 == std::strcmp(k->name, "gdn_gated_norm_had_quant_i8")) ? 8
+        : (0 == std::strcmp(k->name, "gdn_conv_prep_w4_h128")) ? 9
+        : (0 == std::strcmp(k->name, "gdn_conv_update_w4_h128")) ? 10
+        : (0 == std::strcmp(k->name, "gdn_recurrent_update_k128_v128")) ? 11
+        : (0 == std::strcmp(k->name, "expert_scale_bf16")) ? 12
+        : (0 == std::strcmp(k->name, "moe_router_topk_bf16")) ? 13
+        : (0 == std::strcmp(k->name, "moe_scatter_small")) ? 14
+        : (0 == std::strcmp(k->name, "moe_gemm_q_e4m3")) ? 15
+        : (0 == std::strcmp(k->name, "moe_gemm_bf16")) ? 16
+        : (0 == std::strcmp(k->name, "moe_gemm_mxfp4a8")) ? 17
+        : (0 == std::strcmp(k->name, "moe_router_topk_scatter")) ? 18
+        : (0 == std::strcmp(k->name, "moe_router_sigmoid_topk")) ? 19
+        : (0 == std::strcmp(k->name, "moe_gather")) ? 21 : 2;
     if (hand == 2) { skip("no operand description, so no buffers to build"); return 0; }
     const RadOpSchema* s = find_schema(k->op);
     if (!s) { fail("no schema for '%s'", k->op); return 1; }
@@ -999,7 +2226,29 @@ static int run_row(int i) {
     a.p = c.p;
     a.n_p = c.n_p;
 
-    if (hand) { if (build_w2a8(c, s)) return 1; goto launched; }
+    if (hand) {
+        const int rc = hand == 1 ? build_w2a8(c, s)
+                        : hand == 3 ? build_w4a16asym(c, s)
+                        : hand == 4 ? build_w5a16(c, s)
+                        : hand == 5 ? build_gdn_kkt(c, s)
+                        : hand == 7 ? build_gdn_gated_rmsnorm(c, s)
+                        : hand == 8 ? build_gdn_gated_norm_hq(c, s)
+                        : hand == 9 ? build_gdn_conv_prep(c, s)
+                        : hand == 10 ? build_gdn_conv_update(c, s)
+                        : hand == 11 ? build_gdn_recurrent(c, s)
+                        : hand == 12 ? build_expert_scale(c, s)
+                        : hand == 13 ? build_moe_router_topk(c, s)
+                        : hand == 14 ? build_moe_scatter(c, s)
+                        : hand == 15 ? build_moe_gemm_q(c, s)
+                        : hand == 16 ? build_moe_gemm_bf16(c, s)
+                        : hand == 17 ? build_moe_gemm_mxfp4a8(c, s)
+                        : hand == 18 ? build_moe_router_scatter(c, s)
+                        : hand == 19 ? build_moe_router_sigmoid(c, s)
+                        : hand == 21 ? build_moe_gather(c, s, 0)
+                        : build_gdn_chunk_scan(c, s);
+        if (rc) return 1;
+        goto launched;
+    }
     for (int o = 0; o < s->n_operands && o < MAX_OPD; ++o) {
         RadOpdDesc d{};
         const int st = k->opd_shape(c.p, c.n_p, o, &d);
@@ -1140,6 +2389,83 @@ launched:
             }
         }
         if (!ret) ok("ran, %d output plane%s read back finite", outs, outs == 1 ? "" : "s");
+
+        /* The implementation arms. A row that declared an `impl` axis has a second kernel the
+         * default run never touches, and the engine's own way of reaching it is to append the
+         * chosen point to RadArgs::p -- which is what this pass does: the same buffers, the same
+         * fill, the arm's launch, the same finiteness read-back. An arm that faults, declines a
+         * geometry the dot2 arm serves, or leaves a NaN is a failure here, not at a tune run. */
+        for (int t = 0; t < k->n_tunables && !ret; ++t) {
+            if (!k->tunables[t].key || std::strcmp(k->tunables[t].key, "impl")) continue;
+            // impl=1, and sk=1 where the row has a split-K axis: the WMMA arm's ladder would
+            // pick a wide sk that needs a scratch buffer, which this probe does not carry.
+            // sk=1 is a valid point on every axis that has one. The original parameters are
+            // kept: a shim that reads N / K from them must see the same geometry.
+            RadParam extra = { "impl", RAD_P_INT, 1, 0, nullptr, 0.0 };
+            RadArgs a2 = a;
+            static RadParam extra_p[64];
+            int np = 0;
+            for (int u = 0; u < a.n_p && np < 60; ++u) extra_p[np++] = a.p[u];
+            extra_p[np++] = extra;
+            for (int u = 0; u < k->n_tunables; ++u)
+                if (k->tunables[u].key && !std::strcmp(k->tunables[u].key, "sk"))
+                    extra_p[np++] = (RadParam){ "sk", RAD_P_INT, 1, 0, nullptr, 0.0 };
+            a2.p = extra_p;
+            a2.n_p = np;
+            const int rc2 = k->launch(&a2, nullptr);
+            if (rc2 != RAD_OK) {
+                fail("the impl=1 arm declined the geometry the default serves (%d)", rc2);
+                ret = 1;
+            } else {
+                const hipError_t le2 = hipGetLastError();
+                const int sync2 = (int)hipDeviceSynchronize();
+                if (le2 != hipSuccess || sync2 != hipSuccess) {
+                    fail("the impl=1 arm faulted (last error %d, sync %d)", (int)le2, (int)sync2);
+                    ret = 1;
+                } else {
+                    int nan = 0, big = 0, outs2 = 0;
+                    for (int o = 0; o < s->n_operands && !ret; ++o) {
+                        if (s->operands[o].role == RAD_OPD_IN) continue;
+                        const RadTensor& t2 = c.t[o];
+                        if (!t2.data) continue;
+                        if (std::find(c.host.begin(), c.host.end(), t2.data) != c.host.end())
+                            continue;
+                        ++outs2;
+                        long long nel = 1;
+                        for (uint32_t r = 0; r < t2.rank; ++r) nel *= t2.shape[r];
+                        const size_t bytes = t2.dtype == RAD_U2 ? (size_t)(nel / 4)
+                                       : (t2.dtype == RAD_U4 || t2.dtype == RAD_I4 ||
+                                          t2.dtype == RAD_FP4E2M1)
+                                           ? (size_t)(nel / 2)
+                                           : (size_t)nel * dt_bytes(t2.dtype);
+                        std::vector<uint8_t> h(bytes);
+                        if (hipMemcpy(h.data(), t2.data, bytes, hipMemcpyDeviceToHost) !=
+                            hipSuccess) {
+                            fail("impl=1 read-back failed on operand %d", o);
+                            ret = 1;
+                            break;
+                        }
+                        for (long long e = 0; e < nel; ++e) {
+                            float v = 0.f;
+                            switch (t2.dtype) {
+                                case RAD_F32:   v = *(const float*)(h.data() + e * 4); break;
+                                case RAD_BF16:  v = bf16_to_f32(*(const uint16_t*)(h.data() + e * 2)); break;
+                                case RAD_F16:   v = f16_to_f32(*(const uint16_t*)(h.data() + e * 2)); break;
+                                case RAD_F8E4M3: v = e4m3_to_f32(h.data()[e]); break;
+                                default: continue;
+                            }
+                            if (v != v) ++nan;
+                            else if (!(v > -1e31f && v < 1e31f)) ++big;
+                        }
+                        if (nan) { fail("impl=1 arm, operand %d: %d NaN of %lld", o, nan, nel);
+                                   ret = 1; }
+                    }
+                    if (!ret)
+                        ok("impl=1 arm ran, %d output plane%s read back finite", outs2,
+                           outs2 == 1 ? "" : "s");
+                }
+            }
+        }
     }
 
     if (scratch) (void)hipFree(scratch);

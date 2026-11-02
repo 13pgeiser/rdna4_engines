@@ -5,6 +5,7 @@
  * streaming wire format deterministic. No port is bound; transport_test.cpp covers the socket.
  */
 #include "server_fakes.h"
+#include "rad_plugin.h"
 
 #include "lora/slots.h"
 #include "server/liveview.h"
@@ -14,6 +15,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <random>
 
 /* ================================================================== parsing */
@@ -2603,6 +2605,31 @@ TEST(models_and_health_answer) {
     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
 }
 
+/* A device stuck for a minute (#356: both cards spinning in an all-reduce, every request aborted)
+ * turns /health and /ping 503 with status "stuck", so a supervisor restarts the server; under the
+ * minute, or once the device advances again, they answer 200. */
+TEST(health_answers_503_while_the_device_is_stuck) {
+    std::atomic<int64_t> stuck{0};
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) {
+        d.stuck_ms = [&] { return stuck.load(); };
+    } });
+    CHECK_EQ(f.get("/health").status, 200);
+    stuck = 59999;
+    CHECK_EQ(f.get("/health").status, 200);
+    stuck = 61000;
+    for (const char* p : { "/health", "/v1/health", "/ping" }) {
+        const HttpResponse h = f.get(p);
+        CHECK_EQ(h.status, 503);
+        const json j = json::parse(h.body);
+        CHECK(j["status"].get<std::string>() == "stuck");
+        CHECK_EQ(j["stuck_s"].get<int64_t>(), (int64_t)61);
+    }
+    stuck = 0;
+    const HttpResponse h = f.get("/health");
+    CHECK_EQ(h.status, 200);
+    CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+}
+
 /* RUNTIME LoRA admin, over a real slot table (lora/slots.h) the way Engine wires it: a request in
  * flight holds its adapter, an unload then drains it (202, new requests 404 as an unknown model,
  * off /v1/models, a load of the name 409), the request's end frees it, and an idle unload is 200.
@@ -2719,6 +2746,45 @@ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     CHECK_EQ(json::parse(one.body).value("max_model_len", (int64_t)0), (int64_t)262144);
     Fixture unknown;
     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
+}
+
+/* `root` names where the model sits on the server's disk. Keyless it is the operator's own
+ * information -- the rule /diagnostics follows -- and with a key it travels with the key: the
+ * gate admitted the caller, so the card is theirs. */
+TEST(the_models_root_path_follows_the_key) {
+    Fixture f(true, 262144, "/models/m.rad");
+    HttpRequest remote;
+    remote.path = "/v1/models";
+    remote.peer = "192.168.1.20:50122";
+    remote.raw_peer = remote.peer;
+    remote.headers["Host"] = "box.example:8000";
+    CHECK(!json::parse(f.srv->router().dispatch(remote).body)["data"][0].contains("root"));
+    /* The rebinding page: a loopback socket, an attacker's Origin and Host -- the pair the
+     * loopback predicate exists for, and no path to the disk path. */
+    HttpRequest rebinding;
+    rebinding.path = "/v1/models";
+    rebinding.peer = "127.0.0.1:50122";
+    rebinding.raw_peer = rebinding.peer;
+    rebinding.headers["Host"] = "evil.test:8000";
+    rebinding.headers["Origin"] = "http://evil.test:8000";
+    CHECK(!json::parse(f.srv->router().dispatch(rebinding).body)["data"][0].contains("root"));
+    HttpRequest local;
+    local.path = "/v1/models";
+    local.peer = "127.0.0.1:50122";
+    local.raw_peer = local.peer;
+    local.headers["Host"] = "localhost:8000";
+    CHECK_EQ(json::parse(f.srv->router().dispatch(local).body)["data"][0]
+                 .value("root", std::string()),
+             std::string("/models/m.rad"));
+    /* Keyed. The gate ran before the router, so the caller is admitted whoever dialled them;
+     * in-process dispatch stands in for the gate here, and `remote` now reads its path. */
+    Fixture k(Fixture::Tweak{ [](ServerOptions& o, Deps&) {
+        o.model_path = "/models/m.rad";
+        o.api_key = "k";
+    } });
+    CHECK_EQ(json::parse(k.srv->router().dispatch(remote).body)["data"][0]
+                 .value("root", std::string()),
+             std::string("/models/m.rad"));
 }
 
 TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
@@ -3014,8 +3080,10 @@ TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
     CHECK(has(r2.body, "\"arch\":\"testarch\""));
 }
 
-/* /diagnostics describes the host, so without a key it answers this machine only. With a key the
- * transport's gate has already checked the caller, and any address may ask. */
+/* /diagnostics describes the host, so without a key it answers this machine only — and the Host
+ * must name it, since a rebinding victim's browser or a localhost proxy's every remote client
+ * arrives with a loopback socket. With a key the transport's gate has already checked the
+ * caller, and any address may ask. */
 TEST(diagnostics_without_a_key_answers_loopback_only) {
     FakeScheduler sched;
     FakeTokenizer tok;
@@ -3024,29 +3092,94 @@ TEST(diagnostics_without_a_key_answers_loopback_only) {
     d.tok = &tok;
     ServerOptions o;
     o.model_id = "test-model";
+    o.local_hosts = { "box" };
     o.diagnostics_json = [] { return std::string(R"({"findings":[]})"); };
     Server srv(d, o);
-    auto from = [](Server& s, const char* peer) {
+    auto from = [](Server& s, const char* peer, const char* host = nullptr,
+                   const char* origin = nullptr) {
         HttpRequest q;
         q.path = "/diagnostics";
         q.peer = peer;
+        q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        if (origin) q.headers["Origin"] = origin;
         return s.router().dispatch(q).status;
     };
-    CHECK_EQ(from(srv, "127.0.0.1:50122"), 200);
-    CHECK_EQ(from(srv, "127.8.9.10:50122"), 200);
-    CHECK_EQ(from(srv, "::1:50122"), 200);
-    CHECK_EQ(from(srv, "[::1]:50122"), 200);
-    CHECK_EQ(from(srv, "::ffff:127.0.0.1:50122"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000"), 200);
+    CHECK_EQ(from(srv, "127.8.9.10:50122", "127.8.9.10:8000"), 200);
+    CHECK_EQ(from(srv, "::1:50122", "127.0.0.1:8000"), 200);
+    CHECK_EQ(from(srv, "[::1]:50122", "[::1]:8000"), 200);
+    CHECK_EQ(from(srv, "::ffff:127.0.0.1:50122", "127.0.0.1:8000"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000", "http://localhost:8000"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "BOX:8000"), 200);      /* --allow-host, any case */
     CHECK_EQ(from(srv, ""), 200);                       /* in-process */
-    CHECK_EQ(from(srv, "192.168.1.20:50122"), 403);
-    CHECK_EQ(from(srv, "::ffff:10.0.0.7:50122"), 403);
-    CHECK_EQ(from(srv, "fe80::1:50122"), 403);
-    CHECK_EQ(from(srv, "128.0.0.1:50122"), 403);
+    /* Loopback socket, foreign Host: the rebinding page (Origin matching its Host, so the
+     * cross-origin check stays silent) and the localhost proxy handing over the public name
+     * (no Origin at all). Neither names the machine, and a socket that carries no Host does
+     * not either. */
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "evil.test:8000", "http://evil.test:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "api.example.com"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "192.168.1.20:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "other.box:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000", "http://evil.test"), 403);
+    CHECK_EQ(from(srv, "192.168.1.20:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "::ffff:10.0.0.7:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "fe80::1:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "128.0.0.1:50122", "localhost:8000"), 403);
 
     ServerOptions ok = o;
     ok.api_key = "k";
     Server keyed(d, ok);
-    CHECK_EQ(from(keyed, "192.168.1.20:50122"), 200);
+    CHECK_EQ(from(keyed, "192.168.1.20:50122", "api.example.com"), 200);
+}
+
+/* Destroying cache is an operator act: without a key, session release and prefix-cache reset
+ * answer the machine only, judged with the same identity as /diagnostics. The statuses below
+ * say the guard passed (the handler's own answers) rather than the 403 it refuses with. */
+TEST(state_changing_routes_without_a_key_answer_the_machine_only) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.model_id = "test-model";
+    Server srv(d, o);
+    auto del = [](Server& s, const char* peer, const char* host) {
+        HttpRequest q;
+        q.method = "DELETE";
+        q.path = "/sessions";
+        q.query["label"] = "conv-1";
+        q.peer = peer;
+        q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        return s.router().dispatch(q).status;
+    };
+    auto reset = [](Server& s, const char* peer, const char* host) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/reset_prefix_cache";
+        q.peer = peer;
+        q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        return s.router().dispatch(q).status;
+    };
+    CHECK_EQ(del(srv, "", nullptr), 501);             /* no prefix cache: past the guard */
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "localhost:8000"), 501);
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "evil.test:8000"), 403);        /* rebinding */
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "api.example.com"), 403);       /* proxy */
+    CHECK_EQ(del(srv, "192.168.1.20:50122", "localhost:8000"), 403);     /* remote */
+    CHECK_EQ(reset(srv, "", nullptr), 501);            /* no cache to reset: past the guard */
+    CHECK_EQ(reset(srv, "127.0.0.1:50122", "127.0.0.1:8000"), 501);
+    CHECK_EQ(reset(srv, "127.0.0.1:50122", "evil.test:8000"), 403);
+    CHECK_EQ(reset(srv, "192.168.1.20:50122", "localhost:8000"), 403);
+
+    ServerOptions ok = o;
+    ok.api_key = "k";
+    Server keyed(d, ok);
+    CHECK_EQ(del(keyed, "192.168.1.20:50122", "api.example.com"), 501);
+    CHECK_EQ(reset(keyed, "192.168.1.20:50122", "api.example.com"), 501);
 }
 
 TEST(tokenize_takes_a_prompt_or_messages_and_never_both) {
@@ -3883,6 +4016,28 @@ TEST(messages_return_a_tool_call_as_a_tool_use_block) {
     CHECK_EQ(b["name"].get<std::string>(), std::string("get_weather"));
     CHECK_EQ(b["input"].dump(), std::string(R"({"city":"Paris"})"));
     CHECK(f.tmpl.last_n_tools == 1);
+}
+
+/* `arguments` is model output, and the buffered body parses it behind the depth-capped scan
+ * the streaming path applies: neither the recursive parse nor the tree's teardown bounds depth
+ * on its own, and a model made to cooperate can name a tool and nest fifty thousand brackets.
+ * Too deep reads as an empty input, as a discarded parse did; a shallow one rides whole. */
+TEST(messages_empty_a_tool_use_input_too_deep_to_parse) {
+    OaiRequest r;
+    r.id = "msg_test";
+    r.model = "test-model";
+    ChoiceOut c;
+    UsageOut u;
+    c.msg.tool_calls.push_back({ "call_1", "get_weather",
+                                 "{\"city\":" + std::string(50000, '[') +
+                                 std::string(50000, ']') + "}" });
+    const json j = json::parse(anthropic_message_body(r, c, u));
+    CHECK_EQ(j["content"][0]["type"].get<std::string>(), std::string("tool_use"));
+    CHECK_EQ(j["content"][0]["name"].get<std::string>(), std::string("get_weather"));
+    CHECK_EQ(j["content"][0]["input"].dump(), std::string("{}"));
+    c.msg.tool_calls[0].arguments = "{\"city\":\"Paris\"}";
+    const json k = json::parse(anthropic_message_body(r, c, u));
+    CHECK_EQ(k["content"][0]["input"].dump(), std::string(R"({"city":"Paris"})"));
 }
 
 TEST(messages_turns_a_tool_result_back_into_a_tool_message) {
@@ -4751,16 +4906,29 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
          * tear down, parsed bounded and refused. */
         CHECK_EQ(f.post("/admin/control-vector",
                         std::string(20000, '[') + std::string(20000, ']')).status, 400);
-        /* Without --api-key a change comes from loopback only; reading it is not restricted. */
+        /* Without --api-key the vector is read and changed by the machine itself, and its Host
+         * must still name it: under DNS rebinding the victim's browser IS the loopback peer and
+         * its Origin matches its Host — only the dialled name tells the two apart. */
         HttpRequest q;
         q.method = "POST";
         q.path = "/admin/control-vector";
         q.body = R"({"enabled":true})";
         q.peer = "192.168.1.20:50122";
+        q.raw_peer = q.peer;
+        q.headers["Host"] = "127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(q).status, 403);
         CHECK(!def);
         q.peer = "127.0.0.1:50122";
+        q.raw_peer = q.peer;
+        q.headers["Host"] = "localhost:8000";
         CHECK_EQ(f.srv->router().dispatch(q).status, 200);
+        CHECK(def);
+        /* The rebinding page: loopback peer, Origin and Host both the attacker's domain, the
+         * pair no `Origin != Host` check can see. */
+        q.body = R"({"enabled":false})";
+        q.headers["Host"] = "evil.test:8000";
+        q.headers["Origin"] = "http://evil.test:8000";
+        CHECK_EQ(f.srv->router().dispatch(q).status, 403);
         CHECK(def);
         /* A browser page on another origin is not a loopback client, even though its own
          * browser makes the request arrive loopback: defeating the guard that way is exactly
@@ -4770,6 +4938,7 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         x.path = "/admin/control-vector";
         x.body = R"({"enabled":false})";
         x.peer = "127.0.0.1:50122";
+        x.raw_peer = x.peer;
         x.headers["Origin"] = "http://evil.test";
         x.headers["Host"]   = "127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(x).status, 403);
@@ -4777,10 +4946,17 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         x.headers["Origin"] = "http://127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(x).status, 200);
         CHECK(!def);
+        /* Reading is guarded like the change: what a keyless deployment carries — that it has
+         * a vector at all, its family and range — is no remote caller's business. */
         HttpRequest g2;
         g2.path = "/admin/control-vector";
         g2.peer = "192.168.1.20:50122";
-        CHECK_EQ(f.srv->router().dispatch(g2).status, 200);
+        g2.raw_peer = g2.peer;
+        g2.headers["Host"] = "box.example:8000";
+        CHECK_EQ(f.srv->router().dispatch(g2).status, 403);
+        HttpRequest g3;
+        g3.path = "/admin/control-vector";
+        CHECK_EQ(f.srv->router().dispatch(g3).status, 200);   /* in-process */
     }
 }
 
@@ -6157,6 +6333,110 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
     r.route.join();
     CHECK_EQ(r.rig.srv->in_flight(), (int64_t)0);
     CHECK_EQ(r.rig.srv->router().call("GET", "/health").status, 200);
+}
+
+namespace {
+struct RerankInfo final : IEmbedder {
+    const char* keys[6] = {"model_type", "text_config.model_type", "vision_config.model_type",
+                           "is_causal",  "text_config.is_causal",  "architectures"};
+    const char* values[6] = {"mistral3", "ministral3", "pixtral",
+                             "0",        "0",          "Mistral3ForSequenceClassification"};
+    RadModelMeta meta{};
+    int64_t width = 1;
+    RerankInfo() {
+        meta.n_kv = 6;
+        meta.kv_key = keys;
+        meta.kv_val = values;
+    }
+    int64_t dim() const override { return width; }
+    int64_t max_input() const override { return 32768; }
+    const RadModelMeta* metadata() const override { return &meta; }
+};
+} // namespace
+
+TEST(rerank_returns_raw_logits_stable_indices_top_n_and_all_pair_token_usage) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.embed = &info;
+        o.max_ctx = 32768;
+    }});
+    const auto caps = json::parse(f.get("/server_info").body)["capabilities"];
+    CHECK(caps["rerank"].get<bool>());
+    CHECK(!caps["embedding"].get<bool>());
+    CHECK(!caps["chat"].get<bool>());
+    f.sched.embedding = {-2.75f};
+    for (const char* route : {"/rerank", "/v1/rerank"}) {
+        auto r = f.post(route, R"({"query":"q","documents":["short","a longer document"]})");
+        f.sched.join_all();
+        REQUIRE_EQ(r.status, 200);
+        const auto b = json::parse(r.body);
+        REQUIRE_EQ(b["results"].size(), (size_t)2);
+        CHECK_EQ(b["results"][0]["index"].get<int>(), 0);
+        CHECK_EQ(b["results"][1]["index"].get<int>(), 1);
+        CHECK_NEAR(b["results"][0]["relevance_score"].get<float>(), -2.75, 0);
+        CHECK_EQ(b["results"][0]["document"]["text"].get<std::string>(), "short");
+        CHECK_EQ(b["usage"]["prompt_tokens"].get<int>(), 2 * 19 + 5 + 17);
+        CHECK_EQ(f.srv->in_flight(), 0);
+    }
+    f.sched.embed_mark_length = true;
+    auto r = f.post("/rerank", R"({"query":"q","documents":["short","a longer document"],
+                                  "top_n":1,"return_documents":false,"use_activation":false})");
+    f.sched.join_all();
+    REQUIRE_EQ(r.status, 200);
+    const auto b = json::parse(r.body);
+    REQUIRE_EQ(b["results"].size(), (size_t)1);
+    CHECK_EQ(b["results"][0]["index"].get<int>(), 1);
+    CHECK_EQ(b["results"][0]["relevance_score"].get<int>(), 36);
+    CHECK(!b["results"][0].contains("document"));
+    CHECK_EQ(b["usage"]["total_tokens"].get<int>(), 60);
+    CHECK_EQ(f.post("/v1/embeddings", R"({"input":"q"})").status, 501);
+}
+
+TEST(rerank_refuses_invalid_pairs_unsupported_options_and_nonfinite_scores) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions&, Deps& d) { d.embed = &info; }});
+    for (const std::string& body :
+         {R"({"query":"q","documents":[]})", R"({"query":1,"documents":["d"]})",
+          R"({"query":"q","documents":[1]})", R"({"query":"q","documents":["d"],"top_n":-1})",
+          R"({"query":"q","documents":["d"],"top_n":1.5})",
+          R"({"query":"q","documents":["d"],"top_n":18446744073709551615})",
+          R"({"query":"q","documents":["d"],"use_activation":true})",
+          R"({"query":"q","documents":["d"],"truncate_prompt_tokens":16})",
+          R"({"query":"q","documents":["d"],"instruction":"new instruction"})",
+          R"({"query":"q","documents":[{"content":[{"type":"image"},{"type":"image"}]}]})"})
+        CHECK_EQ(f.post("/rerank", body).status, 400);
+    CHECK(f.sched.submitted.empty());
+    f.sched.embedding = {std::numeric_limits<float>::quiet_NaN()};
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 500);
+    f.sched.join_all();
+    CHECK_EQ(f.srv->in_flight(), 0);
+    f.sched.embedding = {-3.25f};
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 200);
+    f.sched.join_all();
+    info.width = 2;
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 501);
+    Fixture generation;
+    CHECK_EQ(generation.post("/rerank", R"({"query":"q","documents":["d"]})").status, 501);
+}
+
+TEST(rerank_pair_context_includes_prefixes_and_accepts_the_exact_boundary) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.embed = &info;
+        o.max_ctx = 64;
+    }});
+    f.sched.embedding = {.125f};
+    for (int n : {44, 45, 46}) {
+        const std::string body =
+            json({{"query", "q"}, {"documents", {std::string(n, 'a')}}}).dump();
+        auto r = f.post("/rerank", body);
+        CHECK_EQ(r.status, n <= 45 ? 200 : 400);
+        if (n > 45)
+            CHECK_EQ(json::parse(r.body)["error"]["code"].get<std::string>(),
+                     "context_length_exceeded");
+        f.sched.join_all();
+    }
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
 RAD_TEST_MAIN()

@@ -17,15 +17,21 @@
 //   * every intermediate the chain stores in bf16 is rounded to bf16 here and the next stage reads
 //     the rounded value: the post-norm output, the residual sum, the scaled residual and the norm
 //     output the quantiser reduces over;
-//   * both sums of squares use the standalone norm's partition: the width r4d_act_threads(M, n)
-//     picks, thread t folding columns t, t+THR, ... in order, then r4d_wave_sum and the waves in
-//     order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and block_sum, which live
-//     in another unit);
+//   * both sums of squares use the standalone norm's partition (kR4dSumLanes, r4d_common.h): lane
+//     v < 256 folds columns v, v+256, ... in order, the lanes past it add nothing, then r4d_wave_sum
+//     and the waves in order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and
+//     block_sum, which live in another unit). At 256 threads a thread's own columns are that
+//     partition; a wider block stages the row in LDS and its first 256 lanes fold it there;
 //   * each element's arithmetic matches the standalone kernels (`x * s * (g + wadd)`,
 //     `a + b`, `x * scalar`, `fmaxf(m, 1e-8f) / 127.f`), under -ffp-contract=off.
 //
 // The residual is read and written; each thread rewrites only the columns it read, so the second
 // pass reads its own writes back.
+//
+// `rmsnorm_quant_i8g` and its two-rank all-reduce form are the same junction with quant_act_i8g's
+// quantiser instead (GRP): row-major codes and an f32 scale per (row, 128 columns), what gemm_nt_q
+// reads at i8a8, w4a8i8_asym and w5a8i8. Only the epilogue differs; it reads the same bf16 norm
+// output from LDS, so the codes are the norm + quant_act_i8g pair's bytes.
 //
 // Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
 #include "r4d_chain.h"
@@ -35,6 +41,7 @@
 #include "r4d_common.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_wide.h"
+#include "r4d_q8.h"
 #include <cstdint>
 
 namespace {
@@ -58,19 +65,32 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
     return s;
 }
 
+// A row's sum of squares in the standalone norm's partition (kR4dSumLanes): lane v < 256 adds
+// columns v, v + 256, ... of `row` in order, the lanes past it add nothing, so a row's bits do not
+// depend on the block's width. `row` holds the row's bf16 values; when the block's threads wrote
+// it, the caller issues the barrier first.
+__device__ __forceinline__ float lanes_sumsq(const uint16_t* row, uint32_t n) {
+    return r4d_lanes_sumsq(row, n, [](uint16_t h) { return bf2f(h); });
+}
+
 __device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {
     return f32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
 }
 
+// quant_act_i8g's group, the width of one scale (r4d_quant_act_fp8.hip's kGroup).
+constexpr uint32_t kGroupI8g = 128;
+
 // RES:  a residual is present; the norm is taken of `res + d` (stored back into `res`), where d is
 //       the branch `x` itself or, with POST, rmsnorm(x; w_post).  Without RES the norm is of `x`.
 // SCL:  the sum is multiplied by the [1] scalar before it is stored and normalised.
-// `ybuf` holds the row's norm output for the fragment-order store, which reads across threads.
+// GRP:  quant_act_i8g's codes and scales (r4d_q8.h's q8_row_i8g) instead of quant_act_i8's; `Sr`
+//       then holds n / 128 scales.
+// `ybuf` holds the row's norm output for the code store, which reads across threads.
 //
 // The row body from the junction on: `s1` is the post-norm's factor, already reduced over `xr` by
 // the caller (the plain kernel takes it off the row; the all-reduce form off the reduced sum it has
 // just stored). l2 and lm are this function's own reduction planes.
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __device__ __forceinline__ void junction_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
     const void* __restrict__ wp, float sv, signed char* __restrict__ qr, float* __restrict__ Sr,
@@ -86,9 +106,10 @@ __device__ __forceinline__ void junction_row(
             if (SCL) v = f32_to_bf16(bf2f(v) * sv);
             rr[i] = v;
         }
-        const float f = bf2f(v);
-        ss2 += f * f;
+        if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+        else ybuf[i] = v;
     }
+    if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
     ss2 = block_sum<THR / kWave>(ss2, l2);
     const float s2 = rsqrtf(ss2 / (float)n + eps);
 
@@ -100,6 +121,11 @@ __device__ __forceinline__ void junction_row(
         ybuf[i] = y;
         if (yr) yr[i] = y;
         m = fmaxf(m, fabsf(bf2f(y)));
+    }
+    if constexpr (GRP) {
+        __syncthreads();   // publishes ybuf to every thread
+        q8_row_i8g<THR>(ybuf, qr, Sr, n);
+        return;
     }
     m = r4d_wave_max(m);
     if ((threadIdx.x & 31) == 0) lm[threadIdx.x >> 5] = m;
@@ -149,7 +175,13 @@ __device__ __forceinline__ int4 fold_word8(const int4* const* src4, size_t k) {
     return a;
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+// A row's scales: one, or n / 128 at quant_act_i8g's grid.
+template <bool GRP>
+__device__ __forceinline__ uint32_t scales_a_row(uint32_t n) {
+    return GRP ? n / kGroupI8g : 1u;
+}
+
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -164,26 +196,29 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
     float s1 = 0.0f;
     if (POST) {
         float ss = 0.0f;
-        for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+        if constexpr (THR == kR4dSumLanes)
+            for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+        else
+            ss = lanes_sumsq(xr, n);   // the branch output, read-only here
         ss = block_sum<THR / kWave>(ss, l1);
         s1 = rsqrtf(ss / (float)n + eps);
     }
-    junction_row<WF32, RES, POST, SCL, THR>(
+    junction_row<WF32, RES, POST, SCL, THR, GRP>(
         xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, SCL ? scalar_of(sc, sc_f32) : 1.0f,
-        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1,
-        ybuf, l2, lm);
+        q + (size_t)row * n, S + (size_t)row * scales_a_row<GRP>(n),
+        yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
 }
 
 // The same kernel at decode heights (THR 1024, n <= 1024 * EPT), with every operand of the row
 // loaded in one go before the first reduction. The kernel above reads the row again in each pass,
 // each read behind a barrier, so a row costs three dependent memory round trips; on gfx1201 at
-// 1 to 16 rows of 5376 that is 11 us a launch against 8.2 us for this form. Every pass partitions
-// the row the same way (thread t takes columns t, t+THR, ...), so each thread keeps its own
-// columns in registers and none needs another's; only the fragment-order store crosses threads,
-// through `ybuf`. The sums, their order and every element's arithmetic are junction_row's, so the
-// output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
-// (ar_rmsnorm_quant_i8_tail_kernel).
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+// 1 to 16 rows of 5376 that is 11 us a launch against 8.2 us for this form. Every elementwise pass
+// partitions the row the same way (thread t takes columns t, t+THR, ...), so each thread keeps its
+// own columns in registers; the sums and the fragment-order store cross threads through `ybuf`,
+// which holds the row each sum folds in the standalone norm's partition. The sums, their order and
+// every element's arithmetic are junction_row's, so the output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
+// (ar_rmsnorm_quant_i8_tail_kernel). GRP as in junction_row.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT, bool GRP = false>
 __device__ __forceinline__ void junction_reg_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -211,7 +246,11 @@ __device__ __forceinline__ void junction_reg_row(
         float ss = 0.0f;
 #pragma unroll
         for (uint32_t e = 0; e < EPT; ++e)
-            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+            if (tid + e * THR < n) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(xv[e]); ss += v * v; }
+                else ybuf[tid + e * THR] = xv[e];
+            }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
     }
 
@@ -229,10 +268,11 @@ __device__ __forceinline__ void junction_reg_row(
                 rr[i] = v;
             }
             xv[e] = v;
-            const float f = bf2f(v);
-            ss2 += f * f;
+            if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+            else ybuf[i] = v;
         }
     }
+    if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
     const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
 
     // ---- the norm output, rounded to bf16 as the standalone norm stores it, and its absmax
@@ -246,6 +286,11 @@ __device__ __forceinline__ void junction_reg_row(
             if (yr) yr[i] = y;
             m = fmaxf(m, fabsf(bf2f(y)));
         }
+    }
+    if constexpr (GRP) {
+        __syncthreads();   // publishes ybuf to every thread
+        q8_row_i8g<THR>(ybuf, qr, Sr, n);
+        return;
     }
     m = r4d_wave_max(m);
     if ((tid & 31) == 0) lm[tid >> 5] = m;
@@ -266,7 +311,7 @@ __device__ __forceinline__ void junction_reg_row(
     }
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT, bool GRP = false>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -275,10 +320,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
     extern __shared__ uint16_t ybuf[];
     __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
     const uint32_t row = blockIdx.x;
-    junction_reg_row<WF32, RES, POST, SCL, THR, EPT>(
+    junction_reg_row<WF32, RES, POST, SCL, THR, EPT, GRP>(
         x + (size_t)row * x_ld, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sc, sc_f32,
-        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf,
-        l1, l2, lm);
+        q + (size_t)row * n, S + (size_t)row * scales_a_row<GRP>(n),
+        yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf, l1, l2, lm);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -301,7 +346,7 @@ __device__ __forceinline__ unsigned int arq8_load_acq(const unsigned int* p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -360,13 +405,19 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
         for (uint32_t i = tid; i < n; i += THR) {
             const uint16_t a = f32_to_bf16(bf2f(xr[i]) + bf2f(pr[i]));
             xr[i] = a;
-            if (POST) { const float v = bf2f(a); ss += v * v; }
+            if (POST) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(a); ss += v * v; }
+                else ybuf[i] = a;
+            }
         }
+        if constexpr (THR != kR4dSumLanes)
+            if (POST) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
-        junction_row<WF32, RES, POST, SCL, THR>(
-            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n, S + row,
-            yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
+        junction_row<WF32, RES, POST, SCL, THR, GRP>(
+            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n,
+            S + (size_t)row * scales_a_row<GRP>(n), yo ? yo + (size_t)row * y_ld : nullptr, n, eps,
+            wadd, s1, ybuf, l2, lm);
         __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
     }
 }
@@ -382,8 +433,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
 //   * A block owns whole rows, the two-rank fused form's partition, since a post-norm's sum of
 //     squares closes over one row. Every rank runs the same grid over the same M, so block b's
 //     words are the same words on every rank and the per-block handshake pairs them.
-//   * The reduce is element by element in the norm's partition (thread t folds columns t, t+THR,
-//     ...), so the post-norm's sum of squares is the standalone norm's. Each element is ar_vsum's
+//   * The reduce is element by element, stored back into `x`, and the post-norm's sum of squares
+//     folds the stored row in the standalone norm's partition (lanes_sumsq). Each element is ar_vsum's
 //     arithmetic exactly: fp32 from 0.0f, the ranks in ascending order, one rounding to bf16 as the
 //     __hip_bfloat16 cast rounds (bf16_hi_rne_nan). So the reduced row is the standalone exact
 //     all-reduce's to the bit, and what follows is rmsnorm_quant_i8's junction over it.
@@ -445,15 +496,15 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_wide_kernel(
         uint16_t* __restrict__ xr = x + o;
         /* The fold a 16-byte word a thread, every source's word in flight at once (the peers' are
          * in fine-grained memory, a round trip each), stored back into `x`; then the post-norm's
-         * sum of squares over the stored row in the norm's partition. Per element it is the fold
-         * fold_word8 documents, and the sum reads the same rounded values in the same order, so
-         * the bytes are those of the fold and the sum taken in one pass. */
+         * sum of squares over the stored row in the standalone norm's partition. Per element it is
+         * the fold fold_word8 documents, and the sum reads the rounded values the standalone
+         * all-reduce stores, so the bytes are those of the all-reduce and the norm taken apart. */
         for (int k = (int)tid; k < wpr; k += (int)THR)
             ((int4*)xr)[k] = fold_word8<WS>(src4, (size_t)row * wpr + k);
         float ss = 0.0f;
         if (POST) {
             __syncthreads();   /* the folded row, read across the block's threads */
-            for (uint32_t i = tid; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+            ss = lanes_sumsq(xr, n);
         }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
@@ -635,8 +686,8 @@ __global__ __launch_bounds__(1024) void r4dchain_ar_rmsnorm_quant_i8_tail(R4D_AR
 //      the two-shot's first hop) and takes the handshake;
 //   2. on its own row it folds the four partials in rank order -- r4d_ar_to_f, f32, rank 0 first,
 //      r4d_ar_from_f, the standalone exact all-reduce's fold, so the same bf16 sum -- and runs the
-//      junction on it in the register form at the standalone norm's width (r4d_act_threads), each
-//      thread holding the columns the standalone's does, so every sum is the standalone's; it
+//      junction on it in the register form, each sum folded in the standalone norm's partition
+//      (lanes_sumsq), so every sum is the standalone's; it
 //      stores the residual row and pushes the row's int8 codes and scale (and with `gres` the
 //      residual row) into every peer's slot past the first hop's region, then takes the handshake;
 //   3. it copies the peers' local row b of codes and scales (and residual) into place.
@@ -719,7 +770,11 @@ __device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(
         float ss = 0.0f;
 #pragma unroll
         for (uint32_t e = 0; e < EPT; ++e)
-            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+            if (tid + e * THR < n) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(xv[e]); ss += v * v; }
+                else ybuf[tid + e * THR] = xv[e];
+            }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         const float s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
         float ss2 = 0.0f;
 #pragma unroll
@@ -731,10 +786,11 @@ __device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(
                 if (sc) v = f32_to_bf16(bf2f(v) * sv);
                 rr[i] = v;
                 xv[e] = v;
-                const float f = bf2f(v);
-                ss2 += f * f;
+                if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+                else ybuf[i] = v;
             }
         }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
         const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
         float m = 0.0f;
 #pragma unroll
@@ -845,9 +901,11 @@ __global__ __launch_bounds__(THR) void r4dchain_ar_rmsnorm_quant_i8_sp(R4D_ARQ8S
 //   5 out_bf16  [M][n] bf16, optional the norm output the unfused norm would have stored
 //   6 w_post    [n]    optional       a post-norm on x before the add; needs the residual
 //   7 scalar    [1]    optional       multiplies the sum; needs the residual
+// rmsnorm_quant_i8g (`grp`) takes the same operands with quant_act_i8g's grid: q row-major, scale
+// [M][n / 128], n a multiple of 128.
 enum { RQ_X = 0, RQ_RES, RQ_W, RQ_Q, RQ_S, RQ_Y, RQ_WP, RQ_SC };
 
-extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
+static int rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream, bool grp) {
     int emit_rc = RAD_OK;
     const RadTensor* x  = r4d_opt(a, RQ_X);
     const RadTensor* rs = r4d_opt(a, RQ_RES);
@@ -868,18 +926,19 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     if (wp && (r4d_numel(wp) != n || wp->dtype != w->dtype)) return R4D_NO(RAD_E_SHAPE);
     if (sc && (r4d_numel(sc) != 1 || (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16)))
         return R4D_NO(RAD_E_SHAPE);
+    if (grp && n % kGroupI8g) return R4D_NO(RAD_E_SHAPE);   // whole scale groups
     if (r4d_numel(q) != M * n || !r4d_contig(q)) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_numel(s) != M || !r4d_contig(s)) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(s) != M * (grp ? n / kGroupI8g : 1) || !r4d_contig(s)) return R4D_NO(RAD_E_SHAPE);
     if (y && r4d_numel(y) != M * n) return R4D_NO(RAD_E_SHAPE);
     if (rs && r4d_numel(rs) != M * n) return R4D_NO(RAD_E_SHAPE);
     const long long xp = r4d_row_pitch(x), rp = rs ? r4d_row_pitch(rs) : n, yp = y ? r4d_row_pitch(y) : n;
     if (xp < 0 || rp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
-    // The row's norm output is staged in LDS for the cross-thread fragment-order store.
+    // The row's norm output is staged in LDS for the cross-thread code store.
     const size_t lds = (size_t)n * sizeof(uint16_t);
     if (lds > 60 * 1024) return R4D_NO(RAD_E_SHAPE);
 
-    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function: it decides which
-    // columns a thread folds into each sum of squares, hence the byte-identity.
+    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function. The sums fold in
+    // kR4dSumLanes' partition at any width, so the width changes speed, not bytes.
     const int thr = r4d_act_threads((int)M, (int)n);
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
@@ -895,35 +954,40 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
                   : thr == 512  ? (n <= 4096 ? 8 : n <= 6144 ? 12 : n <= 8192 ? 16 : 0)
                   : 0;
 
-#define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(stream,                                 \
-    (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
+#define R4D_RQI8_T(WF, RS, PO, SC, T, G) emit_rc = R4D_EMIT(stream,                              \
+    (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G>), dim3((uint32_t)M), dim3(T), lds,            \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
-#define R4D_RQI8_R(WF, RS, PO, SC, T, E) emit_rc = R4D_EMIT(stream,                              \
-    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, T, E>), dim3((uint32_t)M), dim3(T), lds,        \
+#define R4D_RQI8_R(WF, RS, PO, SC, T, E, G) emit_rc = R4D_EMIT(stream,                           \
+    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, T, E, G>), dim3((uint32_t)M), dim3(T), lds,     \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
-#define R4D_RQI8(WF, RS, PO, SC)                                                                  \
-    do { if (thr == 1024 && ept == 4)      R4D_RQI8_R(WF, RS, PO, SC, 1024, 4);                   \
-         else if (thr == 1024 && ept == 6) R4D_RQI8_R(WF, RS, PO, SC, 1024, 6);                   \
-         else if (thr == 1024 && ept == 8) R4D_RQI8_R(WF, RS, PO, SC, 1024, 8);                   \
-         else if (thr == 512 && ept == 8)  R4D_RQI8_R(WF, RS, PO, SC, 512, 8);                    \
-         else if (thr == 512 && ept == 12) R4D_RQI8_R(WF, RS, PO, SC, 512, 12);                   \
-         else if (thr == 512 && ept == 16) R4D_RQI8_R(WF, RS, PO, SC, 512, 16);                   \
-         else if (thr == 1024) R4D_RQI8_T(WF, RS, PO, SC, 1024);                                  \
-         else if (thr == 512) R4D_RQI8_T(WF, RS, PO, SC, 512);                                    \
-         else if (thr == 256) R4D_RQI8_T(WF, RS, PO, SC, 256);                                    \
+#define R4D_RQI8(WF, RS, PO, SC, G)                                                               \
+    do { if (thr == 1024 && ept == 4)      R4D_RQI8_R(WF, RS, PO, SC, 1024, 4, G);                \
+         else if (thr == 1024 && ept == 6) R4D_RQI8_R(WF, RS, PO, SC, 1024, 6, G);                \
+         else if (thr == 1024 && ept == 8) R4D_RQI8_R(WF, RS, PO, SC, 1024, 8, G);                \
+         else if (thr == 512 && ept == 8)  R4D_RQI8_R(WF, RS, PO, SC, 512, 8, G);                 \
+         else if (thr == 512 && ept == 12) R4D_RQI8_R(WF, RS, PO, SC, 512, 12, G);                \
+         else if (thr == 512 && ept == 16) R4D_RQI8_R(WF, RS, PO, SC, 512, 16, G);                \
+         else if (thr == 1024) R4D_RQI8_T(WF, RS, PO, SC, 1024, G);                               \
+         else if (thr == 512) R4D_RQI8_T(WF, RS, PO, SC, 512, G);                                 \
+         else if (thr == 256) R4D_RQI8_T(WF, RS, PO, SC, 256, G);                                 \
          else return R4D_NO(RAD_E_INVAL); } while (0)
-#define R4D_RQI8_W(WF)                                                                            \
-    do { if (!rs)            R4D_RQI8(WF, false, false, false);                                   \
-         else if (!wp && !sc) R4D_RQI8(WF, true, false, false);                                   \
-         else if (wp && !sc)  R4D_RQI8(WF, true, true, false);                                    \
-         else if (wp && sc)   R4D_RQI8(WF, true, true, true);                                     \
-         else                 R4D_RQI8(WF, true, false, true); } while (0)
-    if (w->dtype == RAD_F32) R4D_RQI8_W(true);
-    else                     R4D_RQI8_W(false);
+#define R4D_RQI8_W(WF, G)                                                                         \
+    do { if (!rs)            R4D_RQI8(WF, false, false, false, G);                                \
+         else if (!wp && !sc) R4D_RQI8(WF, true, false, false, G);                                \
+         else if (wp && !sc)  R4D_RQI8(WF, true, true, false, G);                                 \
+         else if (wp && sc)   R4D_RQI8(WF, true, true, true, G);                                  \
+         else                 R4D_RQI8(WF, true, false, true, G); } while (0)
+    if (grp) {
+        if (w->dtype == RAD_F32) R4D_RQI8_W(true, true);
+        else                     R4D_RQI8_W(false, true);
+    } else {
+        if (w->dtype == RAD_F32) R4D_RQI8_W(true, false);
+        else                     R4D_RQI8_W(false, false);
+    }
 #undef R4D_RQI8_W
 #undef R4D_RQI8
 #undef R4D_RQI8_R
@@ -931,20 +995,31 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     return emit_rc;
 }
 
+extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
+    return rad_rmsnorm_quant_i8(a, stream, false);
+}
+
+/* quant_act_i8g's grid: a separate op, not a parameter, since its scale plane has another shape and
+ * its codes another order (as quant_act_i8 and quant_act_i8g are two ops). */
+extern "C" int r4d_rad_rmsnorm_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_rmsnorm_quant_i8(a, stream, true);
+}
+
 // The fused all-reduce form's launch. The IPC arguments are r4d_ar_oneshot_2rank_exact's -- the
 // double-buffered scratch, the per-block flags and the device-resident sequence counters -- and the
 // rest is the junction's. `x` is the message and takes no pitch; `nblocks` is clamped to M (a block
-// owns whole rows). Returns 0, or a negative code for a shape it does not serve.
+// owns whole rows). `grp` takes quant_act_i8g's grid (ar_rmsnorm_quant_i8g): `s` is [M][n / 128]
+// and n a multiple of 128. Returns 0, or a negative code for a shape it does not serve.
 extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                                        long my_flags, long seq_ctrs, long slot_stride16,
                                        long x, long res, long w, long wp, long sc, int sc_f32,
                                        long y, long q, long s, int M, int n, float eps, float wadd,
                                        int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                                       int drain, int acq, long stage) {
+                                       int drain, int acq, int grp, long stage) {
     if (!x || !w || !q || !s) return -1;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
-    if (n % 16) return -3;
+    if (n % 16 || (grp && n % (int)kGroupI8g)) return -3;
     if ((wp || sc) && !res) return -5;
     if ((size_t)n * sizeof(uint16_t) > 60 * 1024) return -6;
     if (!r_ld) r_ld = n;
@@ -955,8 +1030,8 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
     if (nb > nbw) nb = nbw;
     const int thr = r4d_act_threads(M, n);
     const size_t lds = (size_t)n * sizeof(uint16_t);
-#define R4D_ARQ8_T(WF, RS, PO, SC, T)                                                             \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)nb),       \
+#define R4D_ARQ8_T(WF, RS, PO, SC, T, G)                                                          \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G>), dim3((uint32_t)nb),    \
                        dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \
                        (const void*)w, (const void*)wp, (const void*)sc, (uint32_t)sc_f32,       \
                        (signed char*)q, (float*)s, (uint16_t*)y, (int4*)peer_scratch,            \
@@ -964,18 +1039,23 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
                        (unsigned int*)my_flags, (unsigned int*)seq_ctrs, M, (uint32_t)n, eps,    \
                        wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, drain, acq,      \
                        (unsigned)nbw, stage)
-#define R4D_ARQ8(WF, RS, PO, SC)                                                                  \
-    do { if (thr == 1024)     R4D_ARQ8_T(WF, RS, PO, SC, 1024);                                   \
-         else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512);                                    \
-         else                 R4D_ARQ8_T(WF, RS, PO, SC, 256); } while (0)
-#define R4D_ARQ8_W(WF)                                                                            \
-    do { if (!res)            R4D_ARQ8(WF, false, false, false);                                  \
-         else if (!wp && !sc) R4D_ARQ8(WF, true, false, false);                                   \
-         else if (wp && !sc)  R4D_ARQ8(WF, true, true, false);                                    \
-         else if (wp && sc)   R4D_ARQ8(WF, true, true, true);                                     \
-         else                 R4D_ARQ8(WF, true, false, true); } while (0)
-    if (w_f32) R4D_ARQ8_W(true);
-    else       R4D_ARQ8_W(false);
+#define R4D_ARQ8(WF, RS, PO, SC, G)                                                               \
+    do { if (thr == 1024)     R4D_ARQ8_T(WF, RS, PO, SC, 1024, G);                                \
+         else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512, G);                                 \
+         else                 R4D_ARQ8_T(WF, RS, PO, SC, 256, G); } while (0)
+#define R4D_ARQ8_W(WF, G)                                                                         \
+    do { if (!res)            R4D_ARQ8(WF, false, false, false, G);                               \
+         else if (!wp && !sc) R4D_ARQ8(WF, true, false, false, G);                                \
+         else if (wp && !sc)  R4D_ARQ8(WF, true, true, false, G);                                 \
+         else if (wp && sc)   R4D_ARQ8(WF, true, true, true, G);                                  \
+         else                 R4D_ARQ8(WF, true, false, true, G); } while (0)
+    if (grp) {
+        if (w_f32) R4D_ARQ8_W(true, true);
+        else       R4D_ARQ8_W(false, true);
+    } else {
+        if (w_f32) R4D_ARQ8_W(true, false);
+        else       R4D_ARQ8_W(false, false);
+    }
 #undef R4D_ARQ8_W
 #undef R4D_ARQ8
 #undef R4D_ARQ8_T

@@ -46,6 +46,11 @@
 #include "r3d_launch.h"
 #include "r3d_args.h"
 
+/* The wave-matrix arm's launcher, in r3d_gemm_inta8_wmma.hip: the row's `impl` point 1. */
+extern "C" int r3d_gemm_nt_q_w8a8_m16_wmma(long a, long a_scale, long b, long b_scale, long y,
+                                           int M, int N, int K, int a_ld, int y_ld,
+                                           long long b_rb, long long sb_rb, int nt, long stream);
+
 namespace {
 
 constexpr int kWave          = 32;
@@ -411,6 +416,23 @@ extern "C" int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s)
     const long long yp = r3d_rows_pitch(Y, N, &yrows);
     if (yp < N) return R3D_NO(RAD_E_STRIDE);
     if (!r3d_aligned(r3d_p(A), 4) || !r3d_aligned(r3d_p(B), 16)) return R3D_NO(RAD_E_ALIGN);
+
+    R3dGemmCfg c;
+    r3d_cfg_gemm(a, &c);
+    if (c.impl == 1) {
+        /* The wave-matrix arm: same contract, the i8 tile's, its own launcher. */
+        const int rc = r3d_gemm_nt_q_w8a8_m16_wmma(r3d_addr(A), r3d_addr(AS), r3d_addr(B),
+                                                   r3d_addr(BS), r3d_addr(Y), (int)M, (int)N,
+                                                   (int)K, (int)ap, (int)yp,
+                                                   (long long)r3d_row_pitch(B),
+                                                   (long long)r3d_row_pitch(BS), c.nt, (long)s);
+        if (rc == -1) return R3D_NO(RAD_E_INVAL);
+        if (rc == -2) return R3D_NO(RAD_E_SHAPE);
+        if (rc == -3) return R3D_NO(RAD_E_STRIDE);
+        if (rc == -5) return R3D_NO(RAD_E_ALIGN);
+        if (rc == -4) return R3D_NO(RAD_E_DEVICE);
+        return RAD_OK;
+    }
 
     const int rc = r3d_gemm_nt_q_w8a8_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                           r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,

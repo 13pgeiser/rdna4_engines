@@ -15,6 +15,12 @@
 #ifndef R3D_KLAUNCH
 #define R3D_KLAUNCH(kernel, grid, block, stream, ...) kernel<<<grid, block, 0, stream>>>(__VA_ARGS__)
 #endif
+/* The same launch with a dynamic-LDS byte count, for the rows whose stage is sized by the launch
+ * rather than a template constant. */
+#ifndef R3D_KLAUNCH_S
+#define R3D_KLAUNCH_S(kernel, grid, block, smem, stream, ...) \
+    kernel<<<grid, block, smem, stream>>>(__VA_ARGS__)
+#endif
 #ifndef R3D_DYN_LDS
 #define R3D_DYN_LDS(type, name) extern __shared__ type name[]
 #endif

@@ -1153,6 +1153,16 @@ int Builder::declare_scores(rad_buf hidden, rad_weight table) {
             w.name.c_str());
         return RAD_E_INVAL;
     }
+    /* The table must cover the vocabulary: the scored readout indexes it by token id (the
+     * scheduler bounds candidate ids by meta.n_vocab), and a table a few thousand rows short
+     * would turn the last block of the vocabulary into a read off the end of a weight — a device
+     * fault, not a refusal. More rows than the vocabulary is padding and reads fine. */
+    if (w.decl.shape[0] < prog_.meta.n_vocab) {
+        err(RAD_E_INVAL, "declare_scores: the table ('%s') has %lld rows, under the %lld-token "
+            "vocabulary the scored readout indexes it by", w.name.c_str(),
+            (long long)w.decl.shape[0], (long long)prog_.meta.n_vocab);
+        return RAD_E_INVAL;
+    }
     prog_.score_hidden = hidden;
     prog_.score_table  = table;
     return RAD_OK;
@@ -1240,6 +1250,19 @@ int Builder::declare_pooled(rad_buf b) {
         return RAD_E_INVAL;
     }
     prog_.pooled_buf = b;
+    return RAD_OK;
+}
+
+/* The words a request may hand the plugin (rad_declare_plugin_words). A bound, not a buffer: the
+ * batch builder stages them per sequence beside the step's other arrays. */
+int Builder::declare_plugin_words(int64_t max_words) {
+    if (finished_) { err(RAD_E_STATE, "declare_plugin_words after declare finished"); return RAD_E_STATE; }
+    if (max_words < 0 || max_words > (1 << 20)) {
+        err(RAD_E_INVAL, "declare_plugin_words: %lld words a request; the bound is 0 to %d",
+            (long long)max_words, 1 << 20);
+        return RAD_E_INVAL;
+    }
+    prog_.plugin_words = max_words;
     return RAD_OK;
 }
 
@@ -2662,6 +2685,11 @@ int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table) {
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_pooled(pooled);
+}
+
+int rad_declare_plugin_words(RadBuilder* b, int64_t max_words) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_plugin_words(max_words);
 }
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {

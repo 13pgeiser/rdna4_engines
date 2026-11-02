@@ -150,6 +150,16 @@ __device__ __forceinline__ unsigned long long r4d_xor_lane_u64(unsigned long lon
 // broadcast lane 0.
 __device__ __forceinline__ float swap16(float x) { return r4d_xor_lane<16>(x); }
 
+// The same exchange with fetch-inactive set. swap16 assumes every lane is active; where only one half
+// consumes the result (a store under `if (h == 0)`), a compiler may sink the exchange into that half,
+// and with fi = 0 a lane then reads its own value for the inactive partner's. fi = 1 reads the
+// partner's register whatever exec says, so a pair sum stays a pair sum. Identical to swap16 with
+// every lane active.
+__device__ __forceinline__ float swap16_fi(float x) {
+    return __uint_as_float((uint32_t)__builtin_amdgcn_permlanex16(
+        (int)__float_as_uint(x), (int)__float_as_uint(x), 0x76543210u, 0xFEDCBA98u, true, false));
+}
+
 // A wave32 sum on DPP instead of the LDS crossbar. `__shfl_xor` is a `ds_bpermute_b32` on gfx1201
 // at any offset, queued behind other LDS traffic; where little arithmetic separates reductions, a
 // five-stage shuffle butterfly dominates the run. Offsets 8..1 use row_xmask (dpp_ctrl 0x160 | N)
@@ -279,6 +289,35 @@ __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
     if (M <= 32) return 1024;
     const int lim = K >= 8192 ? (1 << 24) : (K >= 4096 ? 120 : 72);
     return M <= lim ? 512 : 256;
+}
+
+// The partition a row's sum is folded over, whatever the workgroup width: lane v < kR4dSumLanes
+// adds columns v, v + kR4dSumLanes, ... in order, the lanes past it add nothing, and block_sum adds
+// the wave sums from the first. Folding over the width instead would round a row's norm by how many
+// rows its launch carries, since r4d_act_threads widens the workgroup at small M: the same token in
+// a 64-token prefill chunk and in a 2048-token one would get different bits. 256 is the narrowest
+// width, so a launch at it keeps the order it always had.
+constexpr uint32_t kR4dSumLanes = 256;
+
+// A row's sum of squares in kR4dSumLanes' partition: lane v < kR4dSumLanes adds f(row[v])^2,
+// f(row[v + 256])^2, ... in column order; the lanes past it return 0. The reads go out eight at a
+// time before their adds: one at a time, a row the block has just written and now reads back costs
+// a memory latency a column (21 in a row for a 5376-wide Gemma 3 hidden state, twice a sandwich
+// norm). The adds keep their order, so the bits are the one-at-a-time loop's.
+template <typename T, typename F>
+__device__ __forceinline__ float r4d_lanes_sumsq(const T* row, uint32_t n, F f) {
+    float ss = 0.0f;
+    if (threadIdx.x >= kR4dSumLanes) return ss;
+    uint32_t i = threadIdx.x;
+    for (; i + 7 * kR4dSumLanes < n; i += 8 * kR4dSumLanes) {
+        float v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v[k] = f(row[i + k * kR4dSumLanes]);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) ss += v[k] * v[k];
+    }
+    for (; i < n; i += kR4dSumLanes) { const float v = f(row[i]); ss += v * v; }
+    return ss;
 }
 
 // The full-card cliff of the R9700 (gfx1201, 64 CUs). A launch whose wavefront count falls in

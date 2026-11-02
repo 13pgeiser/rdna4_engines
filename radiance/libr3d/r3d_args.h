@@ -278,7 +278,15 @@ enum {
  * so no fixed default is legal at every shape, and an illegal default would make an untuned install
  * fail. The GEMM unit resolves the sentinel.
  */
-struct R3dGemmCfg { int wv, sk, kb, nt; };   /* waves a block, split-K, K slab, non-temporal loads */
+/* waves a block, split-K, K slab, non-temporal loads, and the implementation arm (0 = the dot2
+ * pairs, 1 = the 16x16x16 wave matrix) */
+struct R3dGemmCfg { int wv, sk, kb, nt, impl; };
+struct R3dMoeCfg { int mrows; int vgpr; int acc; };
+/* the grouped E4M3 GEMM's point: the kernel arm (0 = the 16x16 tile, 1 = the same tile with the
+ * ALU decode, 2 = the 16x128 block) and the block's register budget and accumulator */
+struct R3dMoeQCfg { int impl, vgpr, acc; };
+/* the block's row count (16, 32 or 64); the per-wave register budget (128 = the 8-wave cap, 512
+ * natural); the accumulator's precision (0 = f32, 1 = the half-precision WMMA tile) */
 struct R3dSplitCfg { int splits; };          /* split-KV segments; 0 is the kernel's own law */
 struct R3dTopkCfg { int rc, nch; };          /* candidates a chunk keeps, chunk width in columns */
 
@@ -290,8 +298,13 @@ extern "C" {
  * untuned install runs. They cannot fail: the loader refuses a plugin whose default is not one of
  * the axis's values. */
 void r3d_cfg_gemm (const RadArgs*, struct R3dGemmCfg*);
+void r3d_cfg_moe  (const RadArgs*, struct R3dMoeCfg*);
+void r3d_cfg_moe_q(const RadArgs*, struct R3dMoeQCfg*);
 void r3d_cfg_split(const RadArgs*, struct R3dSplitCfg*);
 void r3d_cfg_topk (const RadArgs*, struct R3dTopkCfg*);
+/* the 16x128 block's launcher with the register budget and accumulator passed through (the e4m3
+ * row's impl 2 arm reads them from its own tune, not the bf16 row's) */
+int r3d_moe_gemm_fp8_f32scale_run(const RadArgs*, RadStream, int vgpr, int acc);
 
 }  /* extern "C" */
 

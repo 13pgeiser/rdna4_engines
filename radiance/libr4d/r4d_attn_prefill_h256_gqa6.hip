@@ -593,9 +593,13 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             float smax = sc[0];
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
-            if (wave_any(smax > m_ref + PGROW)) {
-                const float rmax  = fmaxf(smax, swap16(smax));
-                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
+            // Both half-waves hold the same query and different keys. The branch must be
+            // wave-uniform, but each query may change scale only on its own growth threshold;
+            // otherwise other live query rows change its rounding when the chunk length changes.
+            const float rmax = fmaxf(smax, swap16(smax));
+            const bool row_grow = live && rmax > m_ref + PGROW;
+            if (wave_any(row_grow)) {
+                const float mnew = row_grow ? fmaxf(fmaxf(m_ref, rmax), -3.0e38f) : m_ref;
                 const float alpha = ex2(m_ref - mnew);
                 #pragma unroll
                 for (int dt = 0; dt < NKS; ++dt)
@@ -679,7 +683,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     }
 
     if (!live) return;
-    l_i += swap16(l_i);
+    // fetch-inactive: the split store reads l_i under `if (h == 0)` only, so the exchange may be sunk
+    // into that half; swap16_fi still reads the partner's half of the row sum.
+    l_i += swap16_fi(l_i);
     if constexpr (SPLIT) {
         // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.
         r4d_prefill_store_partial<NKS, HEAD_DIM>(a, qoff + qpos, qhead, sp, acc, m_ref, l_i, h);

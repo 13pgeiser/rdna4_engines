@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -488,9 +489,11 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-    /* The stage bound for every rank (kvstream/stage.h, "Volume"). Rank 0's allocator hands out the
-     * block ids every rank uses, and the ranks are parked, so no allocation races the read. */
-    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, ranks_[0]->kv);
+    /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
+     * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
+     * parked, so no allocation races the read. */
+    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
 }
 
@@ -552,7 +555,7 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !embedding_ &&
+    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
@@ -631,7 +634,7 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
-        if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
+        if (const int ss = stage_scored_rows(plan, so, cancel); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
          * touches only request state and host grammar automata; Sampler::run issues the uploads
@@ -680,7 +683,9 @@ int Engine::step_loop() {
         return RAD_OK;
         };
 
-        cancel.clear();
+        /* No clear here: `cancel` is empty when the step's staging begins (applied and cleared at
+         * the join below), and stage_scored_rows may already have filled it — a scored request
+         * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
         /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
@@ -1195,16 +1200,25 @@ int Engine::save_checkpoints() {
  * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
  * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
  * collect_scored_rows reads each request's ids after the step's wait, before the commit. A whole
- * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
-int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
+ * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id.
+ *
+ * The pinned host buffer is grow-only and its growth is the one part of staging that can fail
+ * on resources rather than on a broken program: then the scored requests are the ones cancelled
+ * (into `cancel`, applied the way the sampler's cancellations are), not the engine — a request
+ * whose scores the box cannot hold is that request's failure, and every other row on this step
+ * and every other connection on the server keeps running. */
+int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
+                              std::vector<uint64_t>& cancel) {
     score_rows_.clear();
     score_only_ = false;
     score_ids_.clear();
     if (embedding_) return RAD_OK;
+    std::vector<uint64_t> scored;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const Request* r = plan.e[i].req;
         if (so.first_row[i] < 0 || !r || !r->token_scores || !r->output.empty()) continue;
         score_rows_.push_back({ so.first_row[i], r->token_scores.get() });
+        scored.push_back(r->id);
     }
     if (score_rows_.empty()) return RAD_OK;
     const int64_t n = (int64_t)score_rows_.size();
@@ -1221,6 +1235,8 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         std::sort(score_ids_.begin(), score_ids_.end());
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
+    bool host_failed = false;
+    int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
         const int64_t width = rk->sampler.config().n_vocab_local;
         /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
@@ -1235,12 +1251,17 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         rk->score_host = static_cast<float*>(
             rad_dev_alloc(rows * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
         rk->score_rows_cap = rk->score_host ? rows : 0;
-        if (!rk->score_host) {
-            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)rows);
-            return RAD_E_NOMEM;
-        }
+        if (!rk->score_host) { host_failed = true; failed_rows = rows; break; }
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (host_failed) {
+        RAD_ERR("scored rows: no pinned memory for %lld logits rows; cancelling the scored "
+                "requests, not the engine", (long long)failed_rows);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+    }
     return RAD_OK;
 }
 
@@ -2037,11 +2058,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
-    if (cfg_.kld()) {
+    if (cfg_.kld() || cfg_.calib()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -2466,6 +2487,9 @@ int Engine::run_server() {
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
             s.link.ssd_bytes = s.link.prefetched = s.link.prefetch_bytes = 0;
             s.link.stream_bytes = s.link.staged_bytes = 0;
+            s.link.ssd_staging_bytes = s.link.ssd_promoted_bytes = 0;
+            s.link.ssd_deposits = s.link.ssd_deposit_bytes = 0;
+            s.link.pool_evictions = 0;
             s.link.kv_stream_bytes = 0;
             s.link.kv_streaming = cfg_.kv_resident > 0;   /* zeroed here if the arch refused it */
             /* The ring's depth, not the flag: KVStreamStats::resident_blocks sums the device pool
@@ -2478,6 +2502,11 @@ int Engine::run_server() {
                 s.link.d2h_bytes      += (int64_t)rms.d2h_bytes;
                 s.link.ssd_reads      += (int64_t)rms.ssd_reads;
                 s.link.ssd_bytes      += (int64_t)rms.ssd_bytes;
+                s.link.ssd_staging_bytes += (int64_t)rms.ssd_staging_bytes;
+                s.link.ssd_promoted_bytes += (int64_t)rms.ssd_promoted_bytes;
+                s.link.ssd_deposits    += (int64_t)rms.ssd_deposits;
+                s.link.ssd_deposit_bytes += (int64_t)rms.ssd_deposit_bytes;
+                s.link.pool_evictions   += (int64_t)rms.pool_evictions;
                 s.link.prefetched     += (int64_t)rms.prefetched;
                 s.link.prefetch_bytes += (int64_t)rms.prefetch_bytes;
                 s.link.staged_bytes   += (int64_t)rms.staged_bytes;
@@ -2498,6 +2527,7 @@ int Engine::run_server() {
     d.tok   = &tok_bridge;
     d.grammar = &grammar_bridge;
     d.live  = snap;
+    d.stuck_ms = [] { return dev_stuck_ms(); };
     /* The control vector, when one was found. The admin endpoint flips the
      * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
      * and leaves the running ones alone. */
@@ -2567,11 +2597,49 @@ int Engine::run_server() {
     o.audio_model = aud_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
+    /* clef's learned scalars, which the server applies to what the head returns (server/clef.h);
+     * rad-convert writes them beside decision.type. */
+    if (o.decision_type == "clef") {
+        const char* const keys[3] = { "decision.clef.prior_logit_scale",
+                                      "decision.clef.joint_logit_scale",
+                                      "decision.clef.residual_gate" };
+        o.clef_scalars = true;
+        for (const char* k : keys) o.clef_scalars = o.clef_scalars && rad_meta_gets(&meta_, k, nullptr);
+        o.clef_prior_logit_scale = rad_meta_getf(&meta_, keys[0], 0.0);
+        o.clef_joint_logit_scale = rad_meta_getf(&meta_, keys[1], 0.0);
+        o.clef_residual_gate     = rad_meta_getf(&meta_, keys[2], 0.0);
+    }
+    /* Laya's sequence lengths, special tokens and fitted temperatures, which the server builds
+     * and reads each question with (server/laya.h); rad-convert writes them from the checkpoint's
+     * rl_agent_config.json and tokenizer/. */
+    /* Mica's calibration: one temperature, and a bias on a noul's true logit (server/mica.h). */
+    if (o.decision_type == "mica") {
+        o.mica.temperature     = rad_meta_getf(&meta_, "decision.mica.temperature", 1.0);
+        o.mica.noul_logit_bias = rad_meta_getf(&meta_, "decision.mica.noul_logit_bias", 0.0);
+    }
+    if (o.decision_type == "laya") {
+        server::LayaSettings& l = o.laya;
+        l.max_len      = rad_meta_geti(&meta_, "decision.laya.max_len", 0);
+        l.head_max_len = rad_meta_geti(&meta_, "decision.laya.head_max_len", 0);
+        l.cls  = (int32_t)rad_meta_geti(&meta_, "decision.laya.cls", -1);
+        l.sep  = (int32_t)rad_meta_geti(&meta_, "decision.laya.sep", -1);
+        l.mask = (int32_t)rad_meta_geti(&meta_, "decision.laya.mask", -1);
+        l.mask_token = rad_meta_gets(&meta_, "decision.laya.mask_token", "");
+        std::sscanf(rad_meta_gets(&meta_, "decision.laya.temperature", "1 1 1"), "%lf %lf %lf",
+                    &l.temperature[0], &l.temperature[1], &l.temperature[2]);
+        const std::string tbo = "decision.laya.temperature_by_options.";
+        for (int i = 0; i < meta_.n_kv; ++i)
+            if (std::strncmp(meta_.kv_key[i], tbo.c_str(), tbo.size()) == 0)
+                l.temperature_by_options[meta_.kv_key[i] + tbo.size()] = std::strtod(meta_.kv_val[i], nullptr);
+    }
+    o.plugin_words = ranks_.empty() ? 0 : ranks_[0]->program.plugin_words;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
+    o.local_hosts = cfg_.allow_hosts;
+    o.trusted_proxies = cfg_.trusted_proxies;
     o.max_seqs = cfg_.max_seqs;
     /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
      * floor of 8 keeps a small batch from refusing what it would queue. */
@@ -2938,10 +3006,23 @@ int Engine::run_server() {
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
     } image_bridge;
+    if (!img_gen_ && (cfg_.image_gen_max_pixels > 0 || cfg_.image_gen_max_refs > 0))
+        RAD_WARN("--image-gen-max-pixels / --image-gen-max-refs: this model makes no images; "
+                 "ignored");
     if (img_gen_) {
         const Program& pg = ranks_[0]->program;
         const RadGeneratorDecl& gd = pg.generator;
         server::ImageGenInfo& in = image_bridge.inf;
+        /* The bounds are the plugin's to apply: one that keeps fixed buffers is named. */
+        const int64_t px = gd.max_tokens * gd.latent_scale * gd.latent_scale;
+        if (cfg_.image_gen_max_pixels > 0 && px > cfg_.image_gen_max_pixels)
+            RAD_WARN("--image-gen-max-pixels %lld: '%s' sizes its buffers for %lld pixels and does "
+                     "not take the bound", (long long)cfg_.image_gen_max_pixels,
+                     pg.gen_str.name.c_str(), (long long)px);
+        if (cfg_.image_gen_max_refs > 0 && gd.max_refs > cfg_.image_gen_max_refs)
+            RAD_WARN("--image-gen-max-refs %lld: '%s' takes %lld reference pictures and does not "
+                     "take the bound", (long long)cfg_.image_gen_max_refs, pg.gen_str.name.c_str(),
+                     (long long)gd.max_refs);
         in.name = pg.gen_str.name;
         in.tmpl_text = pg.gen_str.tmpl_text;
         in.tmpl_edit = pg.gen_str.tmpl_edit;

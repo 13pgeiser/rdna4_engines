@@ -371,11 +371,26 @@ FileStager::~FileStager() {
         if (done_[b]) rad_event_destroy(done_[b]);
         if (free_[b]) rad_event_destroy(free_[b]);
     }
+    if (scratch_) rad_dev_free(scratch_, RAD_MEM_HOST_PINNED);
 }
 
-int FileStager::init(const Program& prog, const Plan& plan, Mover* mover) {
+int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
+                     RouteCounts routes, void* routes_ud) {
     layers_.clear();
     if (!mover) return RAD_OK;
+
+    /* Routing-aware reads. The source may still decline per layer (a layer that has not
+     * reported this pass is read whole). */
+    routes_ = routes;
+    routes_ud_ = routes_ud;
+    scratch_ = nullptr;
+    scratch_n_ = 0;
+    if (routes_ && prog.meta.n_expert > 0) {
+        scratch_n_ = prog.meta.n_expert;
+        scratch_ = (int32_t*)rad_dev_alloc((size_t)scratch_n_ * sizeof(int32_t),
+                                           RAD_MEM_HOST_PINNED);
+        if (!scratch_) { scratch_n_ = 0; routes_ = nullptr; }
+    }
 
     /* A unit declared and never read has no op span and is left out. */
     size_t c = 0;
@@ -434,14 +449,31 @@ bool FileStager::will_issue(int32_t li) const {
     return it == pass_last_.end() || layers_[(size_t)li].first_op <= it->second;
 }
 
-int FileStager::start(int32_t li) {
+int FileStager::start(int32_t li, RadStream s) {
     const int b = li & 1;
     if (holds_[b] >= 0) return RAD_E_STATE;     /* released before the next read, by construction */
+    /* Routing-aware reads: the trigger (this call) runs at the layer's first expert op,
+     * after the layer's router on the same stream, so this pass's counts are ordered
+     * before the copy. The stream sync costs far less than a gigabyte-scale layer read;
+     * a source that declines (no report yet this pass) reads the whole layer. */
+    const int32_t* ecnt = nullptr;
+    int32_t n_expert = 0;
+    if (routes_) {
+        int64_t n = 0;
+        const int32_t* dev = routes_(routes_ud_, layers_[(size_t)li].layer, &n);
+        if (dev && n > 0 && n <= scratch_n_ &&
+            rad_memcpy_async(scratch_, dev, (size_t)n * sizeof(int32_t), s) >= 0 &&
+            rad_stream_sync(s) >= 0) {
+            ecnt = scratch_;
+            n_expert = (int32_t)n;
+        }
+    }
     const int rc = mover_->stage_file_units(layers_[(size_t)li].units, buf_[b], cap_,
                                             free_rec_[b] ? free_[b] : nullptr, done_[b],
-                                            &staged_[b]);
+                                            &staged_[b], &skipped_[b], ecnt, n_expert,
+                                            &promoted_[b]);
     if (rc < 0) return rc;
-    if (!staged_[b].empty()) holds_[b] = li;
+    if (!staged_[b].empty() || !promoted_[b].empty()) holds_[b] = li;
     return RAD_OK;
 }
 
@@ -450,6 +482,13 @@ int FileStager::finish(int32_t b, RadStream s) {
     free_rec_[b] = true;
     mover_->unstage_units(staged_[b]);
     staged_[b].clear();
+    if (!skipped_[b].empty()) {
+        mover_->unstage_units(skipped_[b]);        /* the dummy publications go to null too */
+        skipped_[b].clear();
+    }
+    /* Hot-cache units are NOT unstaged: their publications name their slots, which outlive
+     * the buffer. The layer's copies into them landed before its ops ran (the done_ wait). */
+    promoted_[b].clear();
     holds_[b] = -1;
     return RAD_OK;
 }
@@ -466,7 +505,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
         if (it != layers_.end()) {
             const int32_t li = (int32_t)(it - layers_.begin());
             if (will_issue(li)) {
-                RAD_TRY(start(li));
+                RAD_TRY(start(li, s));
                 *resync = true;
             }
         }
@@ -482,7 +521,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     /* A layer the read-ahead skipped (the learned bound said the pass ends before it) is read
      * here rather than issued without addresses. */
     if (holds_[li & 1] != li) {
-        RAD_TRY(start(li));
+        RAD_TRY(start(li, s));
         *resync = true;
     }
     if (holds_[li & 1] == li) RAD_TRY(rad_event_wait(s, done_[li & 1]));
@@ -490,7 +529,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
 
     const int32_t next = li + 1;
     if ((size_t)next < layers_.size() && will_issue(next)) {
-        RAD_TRY(start(next));
+        RAD_TRY(start(next, s));
         *resync = true;
     }
     return RAD_OK;

@@ -51,6 +51,7 @@ driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 | Required | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
 | Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
 | With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM there. On a card whose BAR is smaller than its VRAM they stay in pinned host memory and every dispatch reads them over the link: on R9700s, Qwen3.8-27B fp8 decode steps take 0.4-1.8% longer at `--tp 1` and 2 than with the arguments in VRAM. Peer access needs the large BAR too, so at `--tp 2` and above such a card takes the collectives through host memory (§4.7) |
+| With a card | `amdgpu.cwsr_enable=1` (the default). With compute wave save/restore off the driver cannot preempt a queue it must evict, and the card hangs and resets. Startup refuses to serve on cards with it off and says what to change; `--proceed-with-incompatible-configuration` starts anyway, **unsupported**, with a banner at the top of the log and of the startup report and `unsupported_configuration: true` in `/diagnostics` |
 | Optional | OpenMP, used by the host kernel libraries if present |
 | Optional | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` (ffmpeg 6+), for image, video and audio input. CMake option `RAD_WITH_FFMPEG`: `AUTO` (default) uses them when found, `ON` fails the configure without them, `OFF` builds without. A build without them starts and serves text, and refuses every image, video and audio part with HTTP 500; the only warning is the configure log line `radiance: no libavformat ...`. The diagnostics report says which (`media decoders`; `host.media` in `GET /diagnostics`) |
 | Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
@@ -304,7 +305,7 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
-| `nemotron35_embed` | Nemotron 3.5 Embed 1B and 8B, BF16 text/image embeddings at TP1 (§5.6) |
+| `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -339,7 +340,13 @@ It needs only `curl` and `jq`. Re-running resumes: a file whose local size match
 short one is continued. When a repo carries `.safetensors`, other weight formats (`.bin`, ONNX, GGUF,
 ...) are not fetched. `HF_TOKEN` authenticates a gated or private repo; `HFGET_JOBS` sets concurrency
 (default 4). A complete fetch records each file's content key (its LFS sha256, or a small file's size)
-in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. The
+in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. An LFS
+file's recorded key is verified, not just claimed: the download is hashed and compared against
+the sha256 the listing names before the file is kept. A listing that names a file outside the
+destination — an absolute path, a `..` segment — is refused whole rather than half-obeyed.
+Fetch what you will serve from a revision you chose: without `--model-revision` a repo id tracks
+the repo's `main` branch, so a restart can bring weights nobody reviewed; name a tag or a
+commit sha. The
 free-space check counts only what is still to fetch.
 
 `--model` also takes a repo id:
@@ -826,14 +833,7 @@ radiance --model qwen3.8-27b-fp8.rad --tp 1 --vision-tower-placement ram
 
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
-are first-seen, so steps wait on the drive. (That is libavx's `embed_lookup_q`. A host gather
-without a row source of its own, such as libref's `embed_lookup_planes` over a GGUF table's planes,
-reads through the mapping; the engine then asks for every page a step's rows cover before the
-gather runs, so the drive answers them together rather than one fault at a time. A long gather
-(a prefill chunk's) whose sampled rows are already resident is asked for beside the gather
-instead, so a warm chunk does not wait for the asking: ~0.5 us a page, ~240 ms a rank for an
-8192-token Engram chunk.
-`--row-prefetch off` turns that off.) `ram` copies the table into host memory at load (12 to
+are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
 after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
@@ -1363,13 +1363,12 @@ radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's 
 radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
 ```
 
-`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) and asks
-the plugin to leave out any draft head the container carries (`RadBuildCtx::draft_head_off`), so
-the head's weights take no memory: the choice for a model whose head does not fit, or does not pay.
-A plugin that declares its head regardless is refused at startup. Without the flag, prompt lookup
-still drafts for every sequence a declared head declines, and is the only drafter when speculation
-is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
-(`speculation: prompt lookup only (--spec-ngram K)`), and the drafts count in `draft_n` /
+`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) for a
+container that declares no draft head; one that declares a head is refused at startup, because the
+head would draft in lookup's place (serve it with `--num-speculative-tokens N`). Without the flag,
+prompt lookup still drafts for every sequence a declared head declines, and is the only drafter when
+speculation is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
+(`speculation: prompt lookup only -- this container declares no draft head`), and the drafts count in `draft_n` /
 `draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
 committed sequence, so a step is not issued ahead of the previous one's readback.
 
@@ -2036,6 +2035,7 @@ by 0.002-0.003 nats.
 |---|---|
 | `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
+| `--model-revision REV` | the hub revision a repo id is fetched at — a branch, tag, full commit sha or `refs/pr/N`. Default the repo's moving `main` branch; a deployment that must not restart onto weights nobody reviewed should name a tag or a sha (§3.1) |
 | `--control-vector off\|on\|disabled` | `disabled` (and no flag at all) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on. Refused at startup when the model's plugin does not apply control vectors or no compatible file is found (§4.10) |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
@@ -2067,8 +2067,6 @@ by 0.002-0.003 nats.
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
-| `--row-prefetch MODE` | on | `on` or `off`: a host gather from a table read through the container's mapping (`--ngram-placement disk`) asks for its rows' pages before its kernel, or beside it when they are resident (§4.3); the output is the same either way |
-| `--mapped-rewarm MODE` | on | `on` or `off`: at startup, the pages of such a table an earlier run left in the page cache, and the load's own allocations pushed out, are asked for again (at most half of the available memory), so the first requests after a restart do not read them from the drive |
 
 **LoRA adapters** (§4.9.1)
 
@@ -2116,7 +2114,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; no draft head declared; sets the window to K (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
@@ -2129,7 +2127,10 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
+| `--api-key-env NAME` | — | read the API key from the environment variable `NAME` instead of the command line, where every process on the machine reads it in `ps`; an unset or empty `NAME` refuses startup like an empty `--api-key` |
+| `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
+| `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -2177,6 +2178,7 @@ flags are refused on it, and so are the pixel bands.
 | `--video-min-frames N`, `--video-max-frames N` | container's | the fewest and most frames sampled from a video |
 | `--video-max-frame-tokens N` | container's | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
 | `--image-tokens N` | container's | a token-budget processor's image budget: Gemma 4's 70, 140, 280, 560 or 1120, which a request's `image_tokens` overrides; GLM-5.3's ceiling, at most `--mm-max-patches` / 4 (the checkpoint states 8000, which `auto` lowers to 4096). The pixel-band flags are refused on such a model |
+| `--image-gen-max-pixels N`, `--image-gen-max-refs N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. Images in flight follow `--max-num-seqs` |
 | `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
@@ -2186,6 +2188,10 @@ flags are refused on it, and so are the pixel bands.
 | `--kld-record DIR` | run `--kld-corpus` through prefill and write this model's log-probabilities at every scored position to `DIR`: the reference a quantised model is measured against |
 | `--kld-ref DIR` | score this model against the reference in `DIR`: mean, median, 99/99.9/99.99th percentile KL divergence and top-1 agreement |
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
+| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input (docs/TOOLS.md) |
+| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input; beside `--kld-record`, that run records them over the KL corpus too |
+| `--calib-layers LO:HI` | record layers `LO`..`HI-1` only (default every layer), for a model whose statistics do not fit in host memory in one run |
+| `--kld-top N` | `--kld-record` keeps each position's `N` most likely tokens exactly and the mass of the rest instead of the whole vocabulary, for a corpus too large for full rows; 0 (default) keeps the whole vocabulary |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |
 | `--kld-lora NAME` | run the documents through the `--lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
 | `--kld-lora-sources PREFIX` | with `--kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
@@ -2198,8 +2204,8 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
 | `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
-| `--debug-tape-dump` | list the dispatches of the first recorded pass of each kind (`TAPEDUMP` lines on stderr, every rank) and which of them start unordered behind the one before |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
+| `--proceed-with-incompatible-configuration` | start on a machine configuration startup refuses (§1.1: CWSR off where cards serve). **Unsupported**: all guarantees are off, and the log and the startup report say so |
 | `--profile-ops` | per-op device timing |
 | `--expert-stats FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `--live` | the live terminal view (§6.4) |
@@ -2217,7 +2223,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
 | `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API; needs an image model (Qwen-Image 2.1), else 501 (§5.6) |
-| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
+| `POST /v1/systemone` | Decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; LiquidAI's d1, Cloudflare's clef and clef-flash with their joint head on the card, or Convai Innovations' Laya; needs a container converted as one, else 501 (§5.13). `POST /v1/decisions` is the same endpoint under LiteLLM's name |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
@@ -2449,6 +2455,31 @@ attention sequences and existing arithmetic; unsupported multi-launch chains are
 `--mm-max-patches 6400` covers the default 1120-square image in one encoder pass. See
 [ARCHITECTURES.md](ARCHITECTURES.md#nemotron35_embed-embedding-models) for geometry, numerical
 contracts and validation limits.
+
+**Nemotron 3.5 Rerank 8B BF16** uses the same architecture plugin with its own native
+checkpoint and learned scalar head. Serve it with `--max-model-len 32768` and enough
+`--max-num-batched-tokens` for each whole query/document pair. It serves `POST /rerank`
+and `/v1/rerank`, using the vLLM/Jina-style request and result fields:
+
+```sh
+curl -s http://localhost:8000/rerank -H 'Content-Type: application/json' \
+  -d '{"query":"Where can I borrow books?","documents":["A public library lends books.","A football match."],"top_n":2}'
+```
+
+Each result has the original document `index`, a raw `relevance_score` (higher is more
+relevant), and `document`. Scores may be negative; no sigmoid, L2 normalization or
+dimensional truncation applies. Results are sorted descending, with ties retaining
+input order. `top_n` omitted or zero returns all documents; `return_documents:false`
+omits document contents. Token usage includes all scored pairs, even with `top_n`.
+
+Queries are text strings. A document is a string, or `{"content":[...]}` containing
+typed `text` and `image_url` blocks, with an image data URL as for embeddings. At most
+one image is allowed per document. The checkpoint's exact `query`/`document` template
+places its image first, escapes literal controls and adds no BOS/EOS. The 32768-token
+limit covers query, document, prefixes and image tokens together. Overlong pairs are
+rejected, never truncated. Custom instructions, template overrides and activation
+options that change the native score are refused. This model does not serve
+`/v1/embeddings`; the embedding checkpoints continue to use that endpoint unchanged.
 
 ```sh
 # text, a batch of texts, or token ids
@@ -2958,6 +2989,107 @@ together. A single question is one pass of the whole prompt, tokenised as one te
 
 Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long log
 states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
+
+#### clef and clef-flash
+
+Cloudflare's clef (27B) and clef-flash (9B) are decision models on Qwen3.5 that answer the same
+request, every question of it jointly: a joint schema head reads the backbone's final hidden state
+at every prompt position, the mean over each question's instructions and each option's text, and
+the lm_head rows of each option's tokens, and gives one logit an option. radiance runs that head
+on the card, after the trunk, in the `clef_bf16` and `clef_fp8` plugins (`arch/clef_bf16`,
+`arch/clef_fp8`: the qwen35 plugins' own code with `arch/common/rad_block_clef.h` after it): there
+is no second process. The head's own tensors ship as
+`joint_head.safetensors` beside the checkpoint and are added at convert; `joint_head_config.json`
+beside them gives the head's geometry.
+
+```sh
+rad-convert /srv/models/clef-flash -o clef-flash.rad --arch clef \
+    --add /srv/models/clef-flash/joint_head.safetensors --set decision.type=clef
+radiance --model clef-flash.rad --port 8000
+```
+
+`--arch clef` selects the `clef_bf16` and `clef_fp8` plugins, the qwen35 trunk built again with
+the head after it; a container left as `qwen35` serves generation and answers `/v1/systemone`
+with 501.
+
+The request and the response are the same as d1's above; `/v1/decisions` is the same endpoint
+under LiteLLM's name. What differs:
+
+- One request is one prompt, the state and every question together, so questions are not shared
+  through the prefix cache; a state many requests share (the rules in front of each respondent)
+  is, with the head's own per-token rows beside the trunk's cache.
+- `state` must be a non-empty string or JSON value; pictures answer 501 for now.
+- A prompt longer than the context answers 400 with `context_length_exceeded` (clef's own code
+  cuts it silently). A request has at most 64 questions, 512 options and 8192 option tokens.
+- The head runs on one rank, and the lm_head stays bf16 (a recipe that quantises it is refused).
+- `GET /v1/models` reports `"decision": "clef"` in the model's capabilities.
+
+Against clef's own head on the CPU reference, on a tiny model with random weights
+(`tests/clef_decision_test.cpp`): worst probability difference 0.0004.
+
+#### Laya
+
+Convai Innovations' Laya checkpoints (`laya`, `laya-typed-decisions` on ModernBERT-large, and
+`laya-multilingual` on mmBERT-base) are encoder decision models. Laya reads one sequence a
+question, `[CLS] <type> question: <instructions> [SEP] [MASK] option ... [SEP] <state> [SEP]`, and
+scores each option at its `[MASK]` with a small head after the encoder. radiance builds those
+sequences in the server (`core/server/laya.cpp`, a rewrite of the `laya` package's own code) and
+runs the encoder and head in the `laya` plugin (`arch/laya`), on the embedding path: no KV cache,
+every question of a request in one step, each answered in its pooled row.
+
+```sh
+rad-convert /srv/models/laya-typed-decisions -o laya-typed-decisions.rad --set decision.type=laya
+radiance --model laya-typed-decisions.rad --port 8000
+```
+
+rad-convert reads the release's folders: `encoder/config.json` for the geometry,
+`rl_agent_config.json` for the sequence budget and the fitted temperatures, and `tokenizer/`. The
+checkpoint's `config.json` already says `model_type: laya`, so `--set decision.type=laya` is
+optional. A checkpoint as the `laya` package downloads it, with no `config.json` of its own,
+converts the same way. The release ships f16 weights. rad-convert rounds the linears and tables to
+bf16 itself, which is how the release computes them on a card, and records the rule in the
+container's recipe.
+
+The request and the response are the same as d1's above. What differs:
+
+- A state longer than the room a question leaves is cut, as the `laya` package cuts it: to its
+  start, or to its end for a list of turns. `usage` reports the cut with the package's own keys:
+  `state_tokens`, `state_tokens_dropped`, `truncated` and `truncated_questions`.
+- `confidence` is the package's: 1 minus the normalised entropy for choice and score. The fitted
+  temperatures are clamped to [0.5, 5], as the package clamps them.
+- A choice has at most 255 options, and options that do not fit the sequence answer 400.
+- `state` must be a non-empty string or JSON value. Pictures answer 501, and `/v1/embeddings`
+  answers 501 (the pooled row holds option logits, not a vector).
+- `GET /v1/models` reports `"decision": "laya"` in the model's capabilities.
+
+Against the `laya` package's own `Agent.predict` on the CPU reference, on a tiny model with random
+weights (`tests/laya_decision_test.cpp`): every `usage` field equal, worst probability difference
+0.0162 (0.0266 on a score's expected level).
+
+#### Mica
+
+Mica (`sky7350/Mica-v0.5-4B`, a fine-tune of Qwen3.5-4B) answers with d1's readout: one prompt a
+question -- a fixed system message, the state, the question and its candidates under labels -- and
+a softmax over the label tokens' logits at the prompt's last position (`No`/`Yes` for a yes/no
+question, `A`, `B`, ... for a choice or a score). The qwen35 plugins serve it as they serve the base
+model. The prompts and the response are built in the server (`core/server/mica.cpp`, a rewrite of
+Mica's `contract.py` and `native.py`), and a request's questions share the state through the prefix
+cache.
+
+```sh
+rad-convert /srv/models/Mica-v0.5-4B -o mica.rad --set decision.type=mica \
+    --set decision.mica.temperature=T --set decision.mica.noul_logit_bias=B
+radiance --model mica.rad --port 8000
+```
+
+`T` and `B` are the release's calibration (`calibration.json`): one temperature for every question
+type and a bias on a yes/no question's true logit. Unset, the temperature is 1 and the bias 0.
+
+The request and the response are the same as d1's above. What differs: every prompt is Mica's exact
+"plain" profile (its runtime's long-input mode, which approximates prompts over about 1K tokens, is
+not served), and `GET /v1/models` reports `"decision": "mica"`. Against the contract fixtures Mica's
+repository ships (`tests/mica_test.cpp`): every prompt byte for byte, every response value for
+value.
 
 ### 5.14 Speech to text
 
@@ -3685,11 +3817,39 @@ With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's
 or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
 `/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
 `/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
-and sends it on every data fetch.
+and sends it on every data fetch. The exemption follows those paths' methods -- reads, plus the
+`POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
+An empty `--api-key` value is a startup error: it would guard nothing.
 
-Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
-the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
-server with `--api-key`.
+Without a key, the routes that see the machine or change its state answer the machine itself only:
+`/diagnostics` (it describes the host — kernel, boot parameters, PCI layout, memory limits),
+`GET|POST /admin/control-vector`, `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` (they read
+paths from disk), `DELETE /sessions/...` and `/reset_prefix_cache` (they destroy other clients'
+cached conversations). Others get 403. "The machine itself" means the socket comes from loopback,
+carries no foreign `Origin` — a browser page on another origin does not qualify even when its own
+machine serves the port, which is how a hostile web page would reach these routes through a
+victim's browser — **and its `Host` names the loopback** (`localhost`, `127.0.0.1`,
+`[::1]`): a DNS-rebinding page is same-origin with your server and its victim's own browser *is*
+the loopback peer, and behind a localhost TLS proxy every remote client arrives on a loopback
+socket — only the `Host` still tells which machine the client asked for. A browser that typed your
+public name into the address bar is therefore refused; `localhost`, a `127.x` address and an SSH
+tunnel pass. If you reach the box by another name from the box itself, list it: `--allow-host box`
+(repeatable). A local user on the server's own console is admitted either way — the boundary is
+against remote callers, not against whoever owns the machine.
+
+Behind a reverse proxy every socket arrives as the proxy, and every log line names it instead of
+the caller. `--trusted-proxy 127.0.0.0/8` (repeatable; a numeric network with a prefix, like
+`::1/128`) vouches for those networks: a request whose socket belongs to a vouched network is
+attributed to the client it names, reading `X-Forwarded-For` from the right and skipping vouched
+hops — the first address no vouched network covers is the caller, a chain of only vouched hops
+ends at its leftmost, and anything else falls back to the socket. Attribution is not authority:
+the guards above read the socket and never the named address, so a proxy on loopback hands the
+loopback-only routes to none of its clients — it only puts their addresses in the log where the
+proxy's would stand. An `X-Forwarded-For` from an unvouched socket is never read: the header
+says nothing until the machine sending it has been named. (This is why the server parses the
+header itself rather than arming the HTTP library's own trusted-proxy support: that support
+rewrites the very address the handlers read as the socket peer, so one over-broad vouched
+network would move the guard, not just the log line.)
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:
@@ -3714,8 +3874,10 @@ The last block startup prints before `serving on` is `STARTUP REPORT`. A startup
 it too, after the error, with what it had resolved, and ends with an `E` line repeating the error. It
 is the part of a log to paste into an issue. Its sections:
 
-- **CONFIGURATION**: every option `--help` lists, with the value in force and its source
-  (`default`, `command line`, an environment variable, or `auto`). An `auto` line carries the reason
+- **CONFIGURATION**: the options not at their default, with the value in force and its source
+  (`command line`, an environment variable, or `auto`), then a count of the options at their
+  default; `-v` lists every option `--help` lists, and `/diagnostics` always carries every one. An
+  `auto` line carries the reason
   under it: the drafter's depth, where the embedding and n-gram table went, the VRAM split, the
   placement strategy, each sampler default and the file it came from. `--api-key` shows only `set` or
   `not set`.
@@ -3733,7 +3895,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.14.0
+I STARTUP REPORT -- radiance 1.15.1
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -3769,6 +3931,7 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | Message | Meaning | Action |
 |---|---|---|
 | `N declared op(s) resolve only to a reference implementation (libref)` and the engine exits | No kernel library covers those ops on this card (§2) | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are what a new library must implement |
+| `incompatible configuration: ...` and `radiance does not start on a configuration it does not support` | A machine setting known to break radiance (§1.1) | Make the change the line names (`Fix:`) |
 | `DID NOT FIT` in the placement plan, naming a weight class, or `KV group '...': ... did not fit the KV pool` | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If weights did not fit: add or raise `--host-pool-mib`, or lower `--max-model-len` or `--max-num-seqs`. If a KV group did not fit: `--kv-cache-dtype fp8`, or a larger `--host-pool-mib` (RAM permitting), which takes experts off the card. The plan report names which, by class, with the shortfall |
 | `this kernel's amdgpu interface is 3.N ... a map here would never return` | The HIP 7.16 (ROCm 10.1) runtime waits for the kernel to finish every virtual-memory map on a page-table timeline, which amdgpu signals only from interface 3.64 (Linux 6.16) on; an older kernel never signals it, so the card runs without virtual memory management: the KV cache holds its whole carve and lends nothing to the experts (§4.3) | A 6.16 or later kernel, or an amdgpu-dkms driver of interface 3.64 or later |
 | `chat is 501` in the `serving on` line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
