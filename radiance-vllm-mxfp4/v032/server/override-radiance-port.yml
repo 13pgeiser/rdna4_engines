@@ -1,0 +1,78 @@
+# Test 18 Oct 2026: Radiance kernels (MXFP4 W4A8, R4D attention + GDN, DFlash2) as an overlay on the vLLM 0.32 nightly.
+# Overlay: /srv/ai/radiance-port/overlay (see README/TESTPLAN there). Does NOT run at the same time as another GPU model.
+# PREPARE_ONLY=1: only build HIP modules + apply overlay, no serve (no GPU needed).
+services:
+  vllm-radiance-port:
+    image: vllm/vllm-openai-rocm:nightly
+    container_name: vllm-radiance-port
+    restart: unless-stopped
+    env_file:
+      - /srv/ai/radiance-port/radiance.env
+    environment:
+      - PREPARE_ONLY=${PREPARE_ONLY:-0}
+      - RADIANCE_USE_R4D=1
+      - RADIANCE_MXFP4_W4A8=1
+      - RADIANCE_USE_R4D_AR=0
+      - RADIANCE_V032_DEBUG=0
+      - VLLM_CACHE_ROOT=/cache/vllm-fp8fix2
+    ipc: host
+    shm_size: 16gb
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"
+      - "993"
+    volumes:
+      - /srv/ai/models:/models:ro
+      - /srv/ai/radiance-vllm-mxfp4:/patches:ro
+      - /home/andreas/.cache/radiance-libr4d/b9e42ab-rx9:/r4d-src:ro
+      - /srv/ai/radiance-port/overlay:/overlay
+      - /srv/ai/radiance-port/build:/build
+      - /srv/ai/radiance-port/cache:/cache
+    networks:
+      - ollama-internal
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        set -e
+        SP=$$(python3 -c "import sysconfig;print(sysconfig.get_paths()['purelib'])")
+        echo "[port] site-packages: $$SP"
+        if [ ! -f /build/radiance_mxfp4_fp8.so ]; then
+          echo "[port] building radiance_mxfp4_fp8.so"
+          cd /build
+          hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $$(python3 -m pybind11 --includes) /patches/radiance_mxfp4_fp8.hip -o /build/radiance_mxfp4_fp8.so
+        fi
+        if [ ! -f /build/r4d.so ]; then
+          echo "[port] building r4d.so (libr4d b9e42ab-rx9, clean build)"
+          rm -rf /build/r4d-src && cp -r /r4d-src /build/r4d-src && cd /build/r4d-src && rm -f ./*.o r4d.so
+          # ROCm 7.2.3 clang requires a global-addrspace pointer for global_load_tr_b128 (their build: ROCm 7.14)
+          sed -i 's|__builtin_amdgcn_global_load_tr_b128_v8i16((v8s\*)const_cast<void\*>(p))|__builtin_amdgcn_global_load_tr_b128_v8i16((__attribute__((address_space(1))) v8s*)const_cast<void*>(p))|' r4d_common.h
+          grep -n "global_load_tr_b128_v8i16" r4d_common.h
+          GFX_ARCH=gfx1201 OUT=/build/r4d.so ./build.sh
+        fi
+        cp /build/radiance_mxfp4_fp8.so /build/r4d.so "$$SP"/
+        # new aiter: configs/<arch>/triton/gemm/<kernel>/ instead of configs/gemm/gfx1201-<KERNEL>[-N=..-K=..].json
+        CFG="$$SP/aiter/ops/triton/configs/gfx1201/triton/gemm/gemm_afp4wfp4"
+        mkdir -p "$$CFG"
+        cp /patches/mxfp4-configs/gfx1201-GEMM-AFP4WFP4.json "$$CFG/DEFAULT.json"
+        for f in /patches/mxfp4-configs/gfx1201-GEMM-AFP4WFP4-N=*.json; do cp "$$f" "$$CFG/$$(basename "$$f" | sed 's/^gfx1201-//')"; done
+        ls "$$CFG"
+        cd /
+        python3 /overlay/apply_overlay.py --allow-skip
+        python3 /overlay/verify_overlay.py
+        if [ "$${PREPARE_ONLY:-0}" = 1 ]; then echo "[port] prepared, no serve"; exit 0; fi
+        exec vllm serve /models/Qwen3.8-27B-MXFP4-mtpfp8 --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port 8087 \
+          --kv-cache-dtype fp8 --tensor-parallel-size 1 --kv-cache-memory-bytes 6535819798 \
+          --max-model-len 131072 --max-num-seqs 3 --max-num-batched-tokens 2560 \
+          --attention-backend CUSTOM \
+          --speculative-config '{"method":"dflash","model":"/models/Qwen3.8-27B-DFlash2-FP8","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN","disable_padded_drafter_batch":true,"draft_sample_method":"greedy"}' \
+          --no-async-scheduling --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype float16 \
+          --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24],"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true}}' \
+          --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+          --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
+          --chat-template /patches/qwen-fixed-v22.3.jinja

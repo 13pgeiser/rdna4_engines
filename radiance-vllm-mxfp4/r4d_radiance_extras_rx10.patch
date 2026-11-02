@@ -1171,10 +1171,10 @@ index 0000000..a07d43b
 +}
 diff --git a/r4d_gdn_lazy_update_k128_v128.h b/r4d_gdn_lazy_update_k128_v128.h
 new file mode 100644
-index 0000000..ea2aaa2
+index 0000000..1531974
 --- /dev/null
 +++ b/r4d_gdn_lazy_update_k128_v128.h
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,432 @@
 +// r4d_gdn_lazy_update_k128_v128.h -- the GDN recurrent decode update with LAZY state snapshots.
 +//
 +// The eager kernel (r4d_gdn_recurrent_update_k128_v128.h) writes one full [V,K] state per
@@ -1485,7 +1485,14 @@ index 0000000..ea2aaa2
 +  }
 +  const int* bt = (const int*)tb.bt_ptrs[tb.group_idx[si]] + (size_t)b * tb.bt_stride_req;
 +  const int base_slot = bt[base_col], stash_slot = bt[base_col + 1], dst_slot = bt[dst_col];
-+  if (base_slot <= 0 || stash_slot <= 0 || dst_slot <= 0) return;
++  // The stash is needed only to replay candidates (count > 0). A prefill step that spans more than
++  // one mamba block moves the running block by several columns, and on a request's first step after
++  // a prefix hit bt[base_col + 1] is then a null column inside the chunk. Returning here skipped the
++  // migration entirely, so the step ran from whatever the new running block held (garbage after a
++  // resume). With no candidates to replay, the migration is a plain base -> dst copy.
++  if (base_slot <= 0 || dst_slot <= 0) return;
++  const bool have_stash = stash_slot > 0;
++  if (!have_stash && count > 0) return;
 +  gdn_state_t<STDT>* state = (gdn_state_t<STDT>*)tb.state_ptrs[si];
 +  const long st_slot = tb.slot_strides[si] / (long)sizeof(gdn_state_t<STDT>);
 +  const float* A_log = (const float*)tb.alog_ptrs[si];
@@ -1494,14 +1501,18 @@ index 0000000..ea2aaa2
 +  const int tid = threadIdx.x;
 +  const int row = tid / LZ_TPR, quarter = tid % LZ_TPR, k0 = quarter * LZ_HK;
 +  const int hk = hv / (H / Hg);
-+  unsigned char* stash = (unsigned char*)(state + (size_t)stash_slot * st_slot + (size_t)hv * st_head);
++  unsigned char* stash = have_stash
++      ? (unsigned char*)(state + (size_t)stash_slot * st_slot + (size_t)hv * st_head) : nullptr;
 +  __shared__ lz_hdr s_hdr;
-+  if (tid == 0) s_hdr = *(const lz_hdr*)stash;          // region 0
++  if (tid == 0) {
++    if (have_stash) s_hdr = *(const lz_hdr*)stash;      // region 0
++    else { s_hdr.magic = 0; s_hdr.count = 0; s_hdr.base_slot = 0; s_hdr.vs_w = 0; }
++  }
 +  __syncthreads();
 +  const int vs_w = (s_hdr.vs_w == 2) ? 2 : 1;
-+  const unsigned char* vreg = stash + (size_t)((row * vs_w) / LZ_V) * LZ_REGION;
++  const unsigned char* vreg = have_stash ? stash + (size_t)((row * vs_w) / LZ_V) * LZ_REGION : nullptr;
 +  int r = 0;
-+  if (s_hdr.magic == LZ_HDR_MAGIC && (int)s_hdr.base_slot == base_slot) {
++  if (have_stash && s_hdr.magic == LZ_HDR_MAGIC && (int)s_hdr.base_slot == base_slot) {
 +    r = count;
 +    if (r > (int)s_hdr.count) r = (int)s_hdr.count;
 +    if (r > LZ_MAXT - 1) r = LZ_MAXT - 1;
@@ -1512,7 +1523,7 @@ index 0000000..ea2aaa2
 +                                     + (size_t)row * LZ_K + k0);
 +  const float alog = __expf(A_log[hv]), dtb = dt_bias[hv];
 +  float qq[LZ_HK], kk[LZ_HK];
-+  const float* ab_st = (const float*)(stash + LZ_AB_OFF);
++  const float* ab_st = have_stash ? (const float*)(stash + LZ_AB_OFF) : nullptr;
 +  for (int i = 0; i < r; ++i) {
 +    const unsigned char* c = stash + LZ_CAND_OFF + (size_t)i * LZ_CAND_BYTES;
 +    uint4 cq[LZ_HK / 8], ck[LZ_HK / 8];

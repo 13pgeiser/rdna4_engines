@@ -1,0 +1,162 @@
+docker	patch_gfx1201	rc=1	OK=2	NOOP=0	FAIL=1
+    |   OK    honor RADIANCE_GFX_ARCH env
+    |   OK    is_aiter_found_and_supported: allow gfx12x
+    |   FAIL  Triton HIPDriver.is_active: gate on torch.version.hip: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/triton/backends/amd/driver.py missing
+docker	patch_radiance_dispatch	rc=1	OK=0	NOOP=0	FAIL=1
+    |   FAIL  compute_splitk_params scale-alignment fix: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/aiter/ops/triton/utils/gemm_config_utils.py missing
+docker	patch_skinny_gemm	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    route measured skinny bf16 GEMMs -> custom gfx1201 kernel
+docker	patch_unified_attention_lds	rc=1	OK=0	NOOP=0	FAIL=1
+    |   FAIL  unified_attention LDS fit (3D): /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/aiter/ops/triton/attention/unified_attention.py missing
+docker	patch_gdn_wmma	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    solve_tril fp16-WMMA
+docker	patch_preshuffle	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    preshuffle output-shape fix
+docker	patch_radiance_fusion	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    rms+quant fusion coverage fix
+docker	install_radiance_hooks	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    radiance install_all hook -> vllm/plugins/__init__.py
+docker	patch_unpad	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    unpad fix
+docker	patch_mtp_mm_mask	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    mtp mm-mask: token_indices default
+    |   OK    mtp mm-mask: re-index on compaction
+docker	patch_mtp_loopbreak	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    mtp-draft-loop-break
+docker	patch_qwen3_toolparse	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    tool-content-leak
+    |   OK    tool-args-truncation
+docker	patch_from_json_filter	rc=1	OK=0	NOOP=0	FAIL=1
+    |   FAIL  jinja-from_json-filter: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/transformers/utils/chat_template_utils.py missing
+docker	patch_dynamo_metrics	rc=1	OK=0	NOOP=0	FAIL=1
+    |   FAIL  dynamo config metrics: tolerate unserializable values: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/torch/_dynamo/utils.py missing
+docker	patch_conv1d_blockn	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    conv1d BLOCK_N constant
+    |   OK    conv1d BLOCK_N 256 -> 1024 (prefill)
+docker	patch_r4d	rc=0	OK=5	NOOP=0	FAIL=0
+    |   OK    R4D attention backend enum
+    |   OK    RADIANCE all-R4D GDN import
+    |   OK    route the whole GDN layer -> R4D kernels
+    |   OK    RADIANCE fused GDN import
+    |   OK    route GDN prefill wy+delta_h+chunk_o -> fused R4D kernel
+docker	patch_dflash_base	rc=0	OK=6	NOOP=0	FAIL=0
+    |   OK    dflash: inert-row sentinel
+    |   OK    dflash: capture resets to -1
+    |   OK    dflash: num_valid_ctx
+    |   OK    dflash: rejected suffix
+    |   OK    dflash: null block query slot
+    |   OK    dflash: clamp seq_lens
+docker	patch_dflash2	rc=0	OK=17	NOOP=0	FAIL=0
+    |   OK    DFlash draft honours a top-level is_causal
+    |   OK    DFlash model decoder-layer seam
+    |   OK    DFlash model builds layers through the seam
+    |   OK    DFlash wrapper model seam
+    |   OK    DFlash wrapper builds the model through the seam
+    |   OK    DFlash2 architecture -> qwen3_dflash2
+    |   OK    logits processor top-k imports
+    |   OK    vocab-parallel top-k helper
+    |   OK    LogitsProcessor.get_top_k_tokens
+    |   OK    gumbel noised argmax as a callable
+    |   OK    select the DFlash2 speculator
+    |   OK    a DFlash2 draft forces the V2 model runner
+    |   OK    DFlash2 draft detection
+    |   OK    cached proposal distribution is speculator-shaped
+    |   OK    draft_logits_spec default
+    |   OK    installed vllm/model_executor/models/qwen3_dflash2.py
+    |   OK    installed vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+docker	patch_dflash_fused_kv_fp8	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    dflash: quantized fused KV helper
+    |   OK    dflash: defer fused KV build
+    |   OK    dflash: materialize fused KV on first use
+docker	patch_dflash_w4	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    mark the drafter's weight load for radiance_w4
+docker	patch_gdn_metadata	rc=0	OK=4	NOOP=0	FAIL=0
+    |   OK    gdn metadata: helpers
+    |   OK    gdn metadata: spec mask
+    |   OK    gdn metadata: request counts
+    |   OK    gdn metadata: index tensors
+docker	patch_quark_mxfp4	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    mxfp4: register the radiance W4A8 kernel
+    |   OK    mxfp4: relax aiter's CDNA4 gate
+    |   OK    mxfp4: aiter moved-module + fp4 arch allowlist
+docker	patch_ar_maxbytes	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    all-reduce: RADIANCE_AR_MAX_KB / _QUANT_MIN_KB knobs
+docker	patch_topk_triton_rows	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    top-k/top-p: Triton min-rows constant
+    |   OK    top-k/top-p: route <8 rows to Triton
+docker	patch_qwen3_thinkoff	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    qwen3 parser: thinking-off agreement
+serve	patch_quark_mxfp4	rc=0	OK=0	NOOP=3	FAIL=0
+    |   NOOP  mxfp4: register the radiance W4A8 kernel already applied
+    |   NOOP  mxfp4: relax aiter's CDNA4 gate already applied
+    |   NOOP  mxfp4: aiter moved-module + fp4 arch allowlist already applied
+serve	patch_nvfp4_mxfp4	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    nvfp4: NVFP4 branch -> radiance requant scheme
+    |   OK    nvfp4: unmatched bf16 linears -> optional radiance requant scheme
+    |   OK    nvfp4: FP8 branch -> optional radiance requant scheme
+serve	patch_tp3_pad	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    tp3pad: ModelConfig hook (maybe_pad_config)
+    |   OK    tp3pad: DefaultModelLoader hook (pad_weights)
+    |   OK    tp3pad: VocabParallelEmbedding hook (vocab_pad_multiple)
+serve	patch_ar_maxbytes	rc=0	OK=0	NOOP=1	FAIL=0
+    |   NOOP  all-reduce: RADIANCE_AR_MAX_KB / _QUANT_MIN_KB knobs already applied
+serve	patch_topk_triton_rows	rc=0	OK=0	NOOP=2	FAIL=0
+    |   NOOP  top-k/top-p: Triton min-rows constant already applied
+    |   NOOP  top-k/top-p: route <8 rows to Triton already applied
+serve	patch_dflash_calib	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    dflash: activation-statistics hooks for AWQ calibration
+serve	patch_dflash_mxfp4_kv	rc=0	OK=0	NOOP=1	FAIL=0
+    |   NOOP  dflash fused-KV: already widened by patch_dflash_fused_kv_fp8
+serve	patch_rmsquant_fusion	rc=0	OK=0	NOOP=0	FAIL=0
+    | [patch_rmsquant_fusion] applied to /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/compilation/passes/fusion/rocm_aiter_fusion.py
+serve	patch_verify_head	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    verify head: evaluate the sampling-param gate before compute_logits
+serve	patch_kv_group_size	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    kv group size: helper
+    |   OK    kv group size: selection
+    |   OK    kv group size: caller
+serve	patch_topk_composite	rc=0	OK=6	NOOP=0	FAIL=0
+    |   OK    topk composite: metadata field
+    |   OK    topk composite: input batch
+    |   OK    topk composite: rejection sampler
+    |   OK    topk composite: sampler route
+    |   OK    topk composite: new-worker states
+    |   OK    topk composite: new-worker sampler
+serve	patch_gdn_shared_build	rc=0	OK=7	NOOP=0	FAIL=0
+    |   OK    gdn shared build: runner dict
+    |   OK    gdn shared build: runner kwarg
+    |   OK    gdn shared build: signature
+    |   OK    gdn shared build: hit path
+    |   OK    gdn shared build: mask flag
+    |   OK    gdn shared build: fastpath flag
+    |   OK    gdn shared build: stash
+serve	patch_dflash_selector_topk	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    dflash selector top_k override
+    |   OK    dflash selector top_k override (speculator)
+serve	patch_gdn_merge_inproj	rc=0	OK=2	NOOP=0	FAIL=0
+    |   OK    vllm/v1/worker/gpu_model_runner.py
+    |   OK    vllm/v1/worker/gpu/model_runner.py
+serve	patch_dynwidth	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    vllm/v1/core/sched/scheduler.py
+serve	patch_async_dynwidth	rc=0	OK=0	NOOP=0	FAIL=0
+    | [patch_async_dynwidth] applied: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/v1/core/sched/async_scheduler.py
+serve	patch_step_trace	rc=0	OK=0	NOOP=0	FAIL=0
+    | [patch_step_trace] applied: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/v1/worker/gpu/async_utils.py
+    | [patch_step_trace] applied: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/v1/worker/gpu_worker.py
+    | [patch_step_trace] applied: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/v1/core/sched/scheduler.py
+    | [patch_step_trace] applied: /private/tmp/claude-501/-Users-andreas-Documents-ai-clippy/c643f906-c2d1-4500-9b0f-c422f6dccc01/scratchpad/radiance-port/work/rad-v0.27.1/vllm/v1/engine/core.py
+serve	patch_ar_geometry	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    radiance_allreduce.py
+serve	patch_ar_qbits	rc=0	OK=1	NOOP=0	FAIL=0
+    |   OK    radiance_allreduce.py
+serve	patch_ar_3rank	rc=0	OK=4	NOOP=0	FAIL=0
+    |   OK    all-reduce 3-rank: peer list / scratch regions
+    |   OK    all-reduce 3-rank: launch arm
+    |   OK    all-reduce 3-rank: quant path ws gate
+    |   OK    all-reduce 3-rank: install gate
+serve	patch_gdn_glue	rc=0	OK=3	NOOP=0	FAIL=0
+    |   OK    gdn strided gates
+    |   OK    gdn fallback re-pack
+    |   OK    gdn core_attn_out alloc
+serve	patch_qwen3_thinkoff	rc=0	OK=0	NOOP=1	FAIL=0
+    |   NOOP  qwen3 parser: thinking-off agreement already applied

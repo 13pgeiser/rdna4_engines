@@ -210,10 +210,11 @@ def _head_matrix(lm_head):
 
 
 def _head_is_empty(rows, scale):
-    if scale is None:
-        return float(rows.data.abs().max()) == 0.0
-    for i in range(0, rows.shape[0], 8192):          # fp8 has no abs(); bytes are enough
-        if bool((rows.data[i:i + 8192].view(torch.uint8) != 0).any()):
+    for i in range(0, rows.shape[0], 8192):
+        chunk = rows.data[i:i + 8192]
+        # FP8 has no abs(); preserve its byte check and float signed-zero semantics.
+        values = chunk.view(torch.uint8) if scale is not None else chunk
+        if bool((values != 0).any()):
             return False
     return True
 
@@ -373,10 +374,14 @@ def _quantize_head_now(lp, lm_head):
     # the VRAM the KV cache could have used.
     per_byte = 8 // BITS
     lv = (1 << BITS) - 1
+    # Release loader temporaries before the pack can pin their cached segments.
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.empty_cache()
     packed = torch.empty(n, k // per_byte, dtype=torch.uint8, device=w.device)
     scale = torch.empty(n, k // GROUP, dtype=torch.bfloat16, device=w.device)
     zs = torch.empty(n, k // GROUP, dtype=torch.bfloat16, device=w.device)
-    CH = 8192
+    # The lazy build runs inside startup memory profiling; bound its peak temporaries.
+    CH = 1024
     for i in range(0, n, CH):
         j = min(i + CH, n)
         wg = w.data[i:j].to(torch.float32)

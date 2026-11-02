@@ -82,6 +82,7 @@ ARG GFX_ARCH
 # the working directory silently served a kernel older than its own source.
 COPY r4d_radiance_extras.patch        /build/r4d_radiance_extras.patch
 COPY patch_*.py _patchlib.py install_radiance_hooks.py /build/
+COPY kv-cache/patch_*.py            /build/kv-cache/
 COPY radiance_mxfp4_fp8.hip           /build/
 COPY radiance_preamble.py             /build/radiance_preamble.py
 COPY radiance_entrypoint.sh           /build/radiance_entrypoint.sh
@@ -138,6 +139,14 @@ RUN set -e; cd /build; \
   python3 patch_skinny_gemm.py; \
   (python3 patch_qwen3_thinkoff.py \
    || echo "[radiance] WARNING: thinkoff patch did not apply")
+
+RUN set -e; cd /build; export PYTHONPATH=/build; \
+  python3 kv-cache/patch_offload_mixed_hit.py; \
+  python3 kv-cache/patch_eagle_groups.py; \
+  python3 kv-cache/patch_mamba_stride.py; \
+  python3 kv-cache/patch_reconcile_reask.py; \
+  python3 kv-cache/patch_swa_align_touch.py; \
+  python3 kv-cache/patch_sched_align_last_block.py
 
 # ------------------------------------------------------- ship the modules --------
 # The same copy set the launchers do (mxfp4-configs into the triton gemm config
