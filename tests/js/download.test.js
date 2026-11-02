@@ -9,6 +9,7 @@ const src = require("./page.js");           // the <script> block: the handler l
    reason to read it). Read the whole shipped page for markup assertions. */
 const cpp = fs.readFileSync(path.join(__dirname, "..", "..", "core", "server", "dashboard.cpp"), "utf8");
 const page = (cpp.match(/R"HTML\(([\s\S]*)\)HTML"/) || [, ""])[1];
+const css = (cpp.match(/<style>([\s\S]*?)<\/style>/) || [, ""])[1];
 const L = src.split("\n");
 let fails = 0, checks = 0;
 const ok = (c, m) => { checks++; if (!c) { fails++; console.log("  FAIL " + m); } };
@@ -24,16 +25,29 @@ ok(/title="Download JSON file"/.test(btn), "the tooltip says 'Download JSON file
 ok(/aria-label="Download JSON file"/.test(btn), "and is labelled for assistive tech");
 ok(/<svg[\s\S]*<\/svg>/.test(btn), "it holds an icon, not a text label");
 ok(!/>\s*json\s*</.test(btn), "no leftover 'json' text label inside the button");
-/* The glyph must sit ON the baseline, not float above it. The header aligns items on the text
-   baseline, and an inline SVG's baseline is its box bottom -- so the tray bar's STROKE bottom
-   has to land on the viewBox bottom. An inset bar (the original sat at 13.5 of 16) leaves dead
-   space below it and the icon floats a hair above the caps, which is what this replaced. */
+/* Two things put the tray bar level with the bottom of the caption's letters, and BOTH are
+   load-bearing -- measured in headless Chrome, not reasoned out:
+
+   1. the glyph fills its box: the bar's STROKE bottom lands on the viewBox bottom, so there is
+      no dead space inside the SVG. An inset bar (the original sat at 13.5 of 16) shifts the
+      bar up and the nudge below would then be the wrong size.
+   2. the glyph is nudged down 2px: align-items:baseline puts the SVG's BOX on the text
+      baseline, but the baseline sits ABOVE the box bottom, so even a box-filling glyph floated
+      ~2px high. The nudge is what actually closes the gap.
+
+   The first version of this guard checked only (1) and asserted it "sits on the baseline" --
+   that claim was false, and the passing test is why the float survived a commit. */
 const vb = +(btn.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/) || [, , 0])[2];
 const sw = +(btn.match(/stroke-width="([\d.]+)"/) || [, 0])[1];
 const bar = +(btn.match(/M[\d.]+ ([\d.]+)h/) || [, 0])[1];
 ok(vb > 0 && sw > 0 && bar > 0, "parsed the glyph geometry (viewBox " + vb + ", stroke " + sw + ", bar " + bar + ")");
 eq(Math.round((bar + sw / 2) * 1000) / 1000, vb,
-   "the tray bar's stroke bottom is flush with the box bottom, so it sits on the baseline");
+   "the glyph fills its box: the tray bar's stroke bottom is flush with the viewBox bottom");
+/* The nudge that actually delivers the alignment. Pinned because it is a measured value, not a
+   taste value: at 2px the bar's bottom and the caption's bottom land on the same device row. */
+const nudge = css.match(/#reqjson svg \{[^}]*transform:\s*translateY\(([\d.]+)px\)/);
+ok(nudge, "the download glyph carries an explicit vertical nudge");
+eq(nudge ? +nudge[1] : NaN, 2, "the nudge is the measured 2px (removing it floats the bar ~2px high)");
 /* It must sit in the Requests header, in the LEFT group, before the right-hand aside. Index
    ordering is sturdier than a regex across the whole block. */
 const iLeft = page.indexOf('class="pleft"');

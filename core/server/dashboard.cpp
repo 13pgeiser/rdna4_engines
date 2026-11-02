@@ -594,6 +594,11 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
         display:inline-flex; align-items:center; }
 .pbtn:hover { color:var(--fg); }
 .pbtn:focus-visible { outline:1px solid var(--edge); outline-offset:3px; }
+/* The glyph is nudged down 2px so the tray bar's bottom lines up with the bottom of the
+ * caption's letters. align-items:baseline puts the SVG's BOX on the text baseline, but the
+ * baseline sits above the box bottom, so the bar floated ~2px high -- measured in headless
+ * Chrome, not eyeballed. The viewBox-flush geometry alone does not fix this. */
+#reqjson svg { transform: translateY(2px); }
 .pbody { padding:14px 16px 16px; }
 
 /* The control vector's switch: a checkbox row with its explanation under it. The two need a gap
