@@ -587,6 +587,13 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
 .cap { font-size:10.5px; font-weight:600; letter-spacing:.1em; text-transform:uppercase;
        color:var(--dim); }
 .aside { font-family:var(--mono); font-size:11.5px; color:var(--dim); }
+/* A panel header's left side can hold a title plus a control; the header itself is
+ * space-between, so without this group the control would land in the middle. */
+.pleft { display:flex; align-items:baseline; gap:9px; }
+.pbtn { background:none; border:0; padding:0; margin:0; color:var(--faint); cursor:pointer;
+        display:inline-flex; align-items:center; }
+.pbtn:hover { color:var(--fg); }
+.pbtn:focus-visible { outline:1px solid var(--edge); outline-offset:3px; }
 .pbody { padding:14px 16px 16px; }
 
 /* The control vector's switch: a checkbox row with its explanation under it. The two need a gap
@@ -1227,7 +1234,14 @@ nav button.on { color:var(--fg); background:var(--track); }
   <div class="body">
     <div class="stack">
       <section class="panel" id="reqpanel">
-        <div class="phead"><span class="cap">Requests</span>
+        <div class="phead"><span class="pleft"><span class="cap">Requests</span>
+                           <button type="button" class="pbtn" id="reqjson"
+                                   title="Download JSON file" aria-label="Download JSON file">
+                             <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+                               <path d="M8 1.5v8m0 0L4.6 6.1M8 9.5l3.4-3.4M2.2 13.5h11.6"
+                                     fill="none" stroke="currentColor" stroke-width="1.6"
+                                     stroke-linecap="round" stroke-linejoin="round"/>
+                             </svg></button></span>
                            <span class="aside" id="reqaside"></span></div>
         <div class="pbody">
           <div class="hold">
@@ -1240,7 +1254,6 @@ nav button.on { color:var(--fg); background:var(--track); }
           <div id="hist">
             <div class="hhead"><span class="cap">history</span>
               <span class="hsum" id="hsum" title="mean of the per-request figures over all captured rows; each request counts once, so this is not the pooled rate the DECODE tile shows. last 20 and last 5 are the same mean over the most recent 20 and 5 requests. prefill is fresh prompt tokens over the time from admission to first token, so queue wait is not charged to it; on an engine that reports no admission time it falls back to time to first token, which does include queue wait. ttft is the median time to first token, including queue wait."></span>
-              <span class="hbtn" id="hjson" title="copy the stored rows as JSON">json</span>
               <span class="hbtn" id="hclr" title="clear the stored history">clear</span></div>
             <div class="hlist">
               <table>
@@ -2265,6 +2278,10 @@ function histRender(missed) {
   const hsum = $("hsum");
   hsum.textContent = "";
   parts.forEach((p, i) => {
+    /* The zero-width space is the line's ONLY break opportunity. The groups are nowrap so they
+     * cannot split, and with no break point here a long summary overflows the row and clips
+     * whatever follows it -- which is what the padded separators did to this line. */
+    if (i) hsum.appendChild(document.createTextNode("\u200b"));
     const g = el("span", "hgrp");
     /* The dot travels WITH the category it introduces: as a sibling it could be left stranded
      * at the end of a line when the category wrapped, which is the orphan this avoids. */
@@ -2308,8 +2325,13 @@ $("hclr").addEventListener("click", () => {
   lsSet(HK, "[]"); lsSet(HKN, "0"); lsSet(HKC, String(Date.now()));
   hDrawn = null; histRender(0);
 });
-$("hjson").addEventListener("click", () => {
-  try { navigator.clipboard.writeText(JSON.stringify(hRows)); } catch (e) {}
+$("reqjson").addEventListener("click", () => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(hRows, null, 2)],
+                                           { type: "application/json" }));
+  const a = el("a");
+  a.href = url; a.download = "radiance-history.json";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 histLoad();
 histRender(0);

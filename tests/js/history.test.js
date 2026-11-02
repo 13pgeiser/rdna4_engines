@@ -75,9 +75,25 @@ new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
   el, doc, () => hsum, rows,
   (v) => Math.round(v) + " t/s", (v) => String(Math.round(v)), (v) => v + " ms");
 
-const groups = hsum.kids;
+/* #hsum now holds the four category groups AND the zero-width-space break points between them,
+   so select by class rather than assuming every child is a group. */
+const groups = hsum.kids.filter((k) => k.cls === "hgrp");
+const zwsps = hsum.kids.filter((k) => k.tag === "#text" && k.txt === "\u200b");
 eq(groups.length, 4, "four categories: count, tok/s, prefill, ttft");
-ok(groups.every((g) => g.cls === "hgrp"), "every category is a .hgrp (the nowrap unit)");
+console.log("== the line has a break point, so a long summary wraps instead of clipping ==");
+/* The groups are nowrap; without a break opportunity between them the whole line is one
+ * unbreakable run that overflows the row and clips whatever follows it. */
+eq(zwsps.length, 3, "a zero-width break point between each pair of categories");
+ok(hsum.kids.every((k) => k.cls === "hgrp" || (k.tag === "#text" && k.txt === "\u200b")),
+   "#hsum holds only groups and break points, nothing else");
+/* The break point must sit BETWEEN groups, not inside one: a ZWSP inside a nowrap span cannot
+ * break, so it would buy nothing. */
+for (let i = 1; i < groups.length; i++) {
+  const first = hsum.kids.indexOf(groups[i]);
+  eq(hsum.kids[first - 1].txt, "\u200b", "break point immediately precedes category " + i);
+}
+ok(!JSON.stringify(groups.map((g) => g.kids)).includes("\u200b"),
+   "no break point buried inside a nowrap group, where it could not act");
 console.log("== the dot introduces its category and travels with it ==");
 eq(groups[0].kids.filter((k) => k.cls === "hsep").length, 0, "the first category carries no leading dot");
 [1, 2, 3].forEach((i) => {
