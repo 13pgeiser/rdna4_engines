@@ -3750,6 +3750,28 @@ passing 56%, 75% and 77% of the time they are reached, a step reaches 1 + 0.56 +
 positions on average and accepts 0.56 + 0.42 + 0.32 = 1.30 tokens: 66% accepted / reached against
 1.30 / 3 = 43% accepted / drafted.
 
+Under the live request table, **history** keeps every finished request a poll saw. A request is in
+`/stats` only while it exists -- a finished row leaves the payload within about 20 ms to half a
+second -- so without this the numbers would be gone before they could be read. The last 200 are
+kept in this browser's `localStorage`, not on the server, and rows are keyed by the engine's start
+and the request id, so a second tab or a reload keys a request alike rather than counting it twice.
+A request that began and finished between two polls cannot be sampled at all; those are counted in
+a grey row so the total still adds up. **clear** empties it, and the marker it leaves is a
+timestamp every tab honours, so a clear in one window is a clear in all of them.
+
+The line above the table summarises those rows: how many are done, then decode rate, prefill rate
+and time to first token. Each of the three carries its mean over all the rows and, where enough
+rows exist, the same mean over the last 20 and the last 5. A window appears only once enough rows
+exist for it to be a different question: with 12 rows stored, the mean over the last 20 would just
+be the mean over all 12, so only *last 5* shows; both appear from 20 rows up.
+These are means of per-request rates, not the pooled rate the tiles above show: one long request
+does not get to decide the headline. A dot separates one category from the next; a pipe separates
+the windows within a category.
+
+The download icon beside the **Requests** heading saves those stored rows as
+`radiance-history.json`, indented, from the browser -- it is the same data **clear** would discard,
+so a run worth keeping can be written out before it is cleared.
+
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
 prompt share its blocks.
