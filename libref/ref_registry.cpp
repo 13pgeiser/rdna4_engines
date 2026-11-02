@@ -197,6 +197,9 @@ static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") 
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pSegPool[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
+/* `n` is the point's values; y has n (2 freqs + 1) columns. */
+static const RadParamSpec pPointFourier[] = { P_INT("M"), P_INT("n"), P_INT("freqs"), P_INTO("pi"),
+                                          P_STR("dtype") };
 /* `M` is the input row count, a multiple of `k`; y has M / k rows. */
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
@@ -1201,6 +1204,10 @@ static const RadOpSchema kSchemas[] = {
   "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and rounded "
   "to y's dtype, then times `mult` (default 1) and rounded again. n, the input width, is a "
   "multiple of k." },
+{ "point_fourier", ARR(pPointFourier), ARR(oUnary),
+  "A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)] over x's n values, "
+  "sines then cosines each i-major then j, f_j = 2^j for j < freqs (times pi with `pi` 1); the "
+  "products f32, the sine and cosine f32 rounded once to y's dtype. y is [M, n (2 freqs + 1)]." },
 { "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0), each operand at its own row pitch." },
 { "clamp", ARR(pMnD), ARR(oClamp),
   "y = min(max(x, lo), hi), `lo` and `hi` WEIGHTS of one element each: a clipped linear's range." },
@@ -2289,6 +2296,8 @@ SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, 
        DT_FLOAT, ref_pool_rows),
 SIMPLE("ref_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
        "multiplier", DT_FLOAT, ref_pool_cols),
+SIMPLE("ref_point_fourier", "point_fourier", "elem", "a point's sines and cosines at octaves",
+       DT_FLOAT, ref_point_fourier),
 SIMPLE("ref_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, ref_relu),
 SIMPLE("ref_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, ref_clamp),
 SIMPLE("ref_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",

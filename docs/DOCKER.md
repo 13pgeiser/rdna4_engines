@@ -7,7 +7,8 @@ Docker, an AMD GPU and an `amdgpu` kernel driver that supports ROCm 10.1. It doe
 compiler or FFmpeg.
 
 The image is published as [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance),
-with its kernels built for `gfx1201`: `docker pull stilldeadcode/radiance`. Build it yourself for
+with its kernels built for RDNA4 (`gfx1201`, libr4d), RDNA3 (`gfx11-generic`, libr3d) and Strix Halo
+(`gfx1151`, libhalo): `docker pull stilldeadcode/radiance`. Build it yourself for
 other cards or another commit. The examples below use `radiance`, the tag a local build gets; with
 the published image, write `stilldeadcode/radiance` instead.
 
@@ -26,7 +27,7 @@ docker/build.sh -j 8                   # cap compile jobs (a device kernel takes
 docker/build.sh -J 4                   # tests at a time (default: the compile jobs)
 docker/build.sh -B 5                   # every test's CPU budget times 5, for a host slower per thread
 docker/build.sh -E tokenizer_perf_test # leave tests matching a regex out of the test stage
-docker/build.sh -t 'gfx1200;gfx1201'   # GPU architectures to compile kernels for (default gfx1201)
+docker/build.sh -t 'gfx1200;gfx1201'   # GPU architectures (default 'gfx1201;gfx11-generic;gfx1151')
 docker/build.sh -r <commit>            # any other commit
 docker/build.sh --target build         # stop at a stage, tagged radiance-<stage>
 ```

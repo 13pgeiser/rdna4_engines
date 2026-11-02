@@ -535,7 +535,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         canvas_for(rw, rh, se, info.max_area, info.size_multiple, &W, &H);
     }
     if (W % info.size_multiple || H % info.size_multiple || W < info.min_side ||
-        H < info.min_side || W * H > info.max_area ||
+        H < info.min_side || W > info.max_area || H > info.max_area || W * H > info.max_area ||
         std::max(W, H) > info.max_aspect * std::min(W, H)) {
         int64_t sw = 0, sh = 0;
         canvas_for((double)W, (double)H, short_def, info.max_area, info.size_multiple, &sw, &sh);

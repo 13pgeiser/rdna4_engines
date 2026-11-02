@@ -22,7 +22,8 @@
 struct RadModelMeta;
 
 namespace rad {
-namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket; }
+namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket;
+                struct ShapeRequest; struct ShapeGenInfo; }
 namespace mm { struct Frame; struct Item; }
 namespace server {
 
@@ -812,6 +813,20 @@ public:
     virtual const VideoGenInfo& info() const = 0;
     /* Queue a request; refused at once, with `why`, when it can never run. */
     virtual int submit(std::unique_ptr<gen::VideoRequest> r, std::string* why) = 0;
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
+
+/* The shape generator (core/gen/shape_driver.h), for a model that makes a 3-D shape from a
+ * picture: its declared picture, sampler and grid (gen::ShapeGenInfo) and its request queue. The
+ * server prepares the picture (gen::shape_picture), queues the request, and meshes the field the
+ * ticket hands back. */
+class IShapeGen {
+public:
+    virtual ~IShapeGen() = default;
+    virtual const gen::ShapeGenInfo& info() const = 0;
+    /* Queue a request; refused at once, with `why`, when it can never run. */
+    virtual int submit(std::unique_ptr<gen::ShapeRequest> r, std::string* why) = 0;
     virtual int64_t queued() const = 0;
     virtual int64_t running() const = 0;
 };

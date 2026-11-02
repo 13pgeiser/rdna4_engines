@@ -970,7 +970,8 @@ TEST(op_vocabulary) {
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
         "seg_mean_bf16_sum",
-        "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
+        "pool_rows", "pool_cols", "point_fourier", "relu", "clamp", "conv2d", "conv2d_unfold",
+        "conv1d_dw",
         "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
         "fill",
@@ -3506,6 +3507,30 @@ TEST(op_pool_cols) {
     CHECK_NEAR(y.at(2), 11.0f, 1e-6); CHECK_NEAR(y.at(3), 16.0f, 1e-6);
     A bad; bad.t(x).t(y).i("M", 2).i("n", 4).i("k", 3).s("dtype", "f32");
     CHECK(run("pool_cols", bad) < 0);
+}
+
+/* point_fourier: [x | sin(x 2^j) | cos(x 2^j)], sines and cosines each value-major then octave;
+ * with `pi`, the octaves times pi. */
+TEST(op_point_fourier) {
+    T x(RAD_F32, {2, 2}); x.f({ 0.5f, -0.25f,  1.0f, 0.0f });
+    T y(RAD_F32, {2, 10});
+    A a; a.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 2).s("dtype", "f32");
+    CHECK_OK(run("point_fourier", a));
+    const float v[2][2] = { { 0.5f, -0.25f }, { 1.0f, 0.0f } };
+    for (int r = 0; r < 2; ++r)
+        for (int i = 0; i < 2; ++i) {
+            CHECK_EQ(y.at(r * 10 + i), v[r][i]);
+            for (int j = 0; j < 2; ++j) {
+                const float t = v[r][i] * (float)(1 << j);
+                CHECK_NEAR(y.at(r * 10 + 2 + i * 2 + j), std::sin(t), 1e-6);
+                CHECK_NEAR(y.at(r * 10 + 6 + i * 2 + j), std::cos(t), 1e-6);
+            }
+        }
+    A b; b.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 2).i("pi", 1).s("dtype", "f32");
+    CHECK_OK(run("point_fourier", b));
+    CHECK_NEAR(y.at(3), std::sin(0.5f * 2.0f * 3.14159265f), 1e-6);
+    A bad; bad.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 3).s("dtype", "f32");
+    CHECK(run("point_fourier", bad) < 0);
 }
 
 /* rmsnorm with no gain: a unit gain. */
@@ -9655,6 +9680,7 @@ std::vector<Geo> geometries() {
         G("seg_mean_bf16_sum", "M", 6, a.i("M", R).i("n", 8).s("dtype", "bf16").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
+        G("point_fourier", "M", 3, a.i("M", R).i("n", 3).i("freqs", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("clamp", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("conv2d", "M", 8, a.i("M", R).i("width", 4).i("cin", 2).i("cout", 3).i("kh", 3).i("kw", 3)

@@ -1253,6 +1253,9 @@ int main(int argc, char** argv) {
             w.abort();
             return 1;
         }
+    } else if (meta_textless(ck.meta().get("radiance.text"))) {
+        RAD_INFO("vocab    none: the model reads no text");
+        vocab_textless(vb);
     } else if (file_exists(ck.tok_dir() + "/tokenizer.json")) {
         const std::string tj = ck.tok_dir() + "/tokenizer.json";
         RAD_INFO("vocab    %s", tj.c_str());

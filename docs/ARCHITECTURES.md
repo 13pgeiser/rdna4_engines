@@ -35,6 +35,7 @@ plugin claims.
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
 | `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
+| `arch/hunyuan3d2` | `hunyuan3d2` | *(empty)* | Hunyuan3D-2's shape model (hunyuan3d-dit-v2-0), an untextured 3-D shape from one picture: DINOv2-giant over the picture, a FLUX-shaped flow-matching DiT (16 double-stream and 32 single-stream blocks of 1024) over a set of 3072 latents, and the shape VAE's geometry decoder, whose occupancy field the core samples on a grid and meshes; from the release folder (config.yaml and one safetensors), its fp16 weights cast to bf16 (`data/recipes/hunyuan3d-2-bf16.recipe`) |
 | `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`), or the DiT's per-token linears int8, served w8a8 (`minimax-h3-w8a8.recipe`); a curve-form checkpoint, whose timestep embeddings ship as a table, by the `minimax-h3-curve-*` recipes |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
@@ -2337,3 +2338,43 @@ with and without a first frame; diffusers on CUDA and on the CPU differ from eac
 On an R9700 (libr4d) the same five renders land within 0.15% of diffusers' CUDA rows, every op
 agreeing with its host reference under the op oracle. Block fp8 moves the random model's rows by
 0.2 to 0.4% (the card's fp8a8 GEMMs, the CPU's fp8 codes widened to bf16).
+
+# `hunyuan3d2`: Hunyuan3D-2, a 3-D shape from a picture
+
+`arch/hunyuan3d2` declares a shape generator (`rad_declare_shape_generator`), which makes the
+program one the engine drives through `core/gen/shape_driver.h`: SCOND runs the image encoder over
+the picture and `cond_in` over its rows and over the unconditioned branch's zeros, into the lane;
+SSTEP is one denoising step of both branches together; SLATENT runs the shape VAE's latent network
+and leaves the geometry decoder's keys and values in the lane; each SQUERY pass is the geometry
+decoder at up to 32768 points the core chose. The core samples the grid coarse to fine (FlashVDM's
+hierarchical decoding with full attention) and meshes the finest level with marching cubes. A
+request is a lane; two hold state at once. It is served on Hunyuan3D-2's own routes, `/generate`,
+`/send` and `/status/{uid}` ([GUIDE §5.17](GUIDE.md)), bf16 on one card. The checkpoint is the
+release's hunyuan3d-dit-v2-0 folder: config.yaml (its keys under their dotted paths) and one
+safetensors holding `model.`, `conditioner.` and `vae.`.
+
+```
+picture   the alpha's box at 85% of the picture's square, centred on white (OpenCV's INTER_AREA),
+          512 x 512 (INTER_CUBIC), then 518 x 518 (bilinear) normalised by ImageNet's statistics,
+          in 37 x 37 patches of 14 x 14, f32 into the patch projection
+encoder   DINOv2-giant: 40 layers of 1536 (24 heads of 64), LayerNorm eps 1e-6, SwiGLU 4096 with
+          biases, layer scales on both branches, the class token and a learned position table;
+          the last hidden state after the final LayerNorm, 1370 rows. The unconditioned branch is
+          zeros, so its rows after cond_in are cond_in's bias
+DiT       FLUX's layout without a rotary: 16 double-stream blocks (the conditioning and the latent
+          each with their own weights, one joint attention) and 32 single-stream blocks
+          (linear1 = [qkv | mlp], linear2 over [attn | gelu_tanh(mlp)]), width 1024, 16 heads of
+          64, q and k RMS-normed per head (eps 1e-6), LayerNorms without affine modulated as
+          (1 + scale) LN(x) + shift with gates and no tanh. The timestep embedding is the sinusoid
+          of 1000 sigma at a period of 1000 (the reference passes its time factor where
+          timestep_embedding takes max_period), then time_in. Rows a step: [cond | latent] for
+          the picture's branch and [latent | cond] for the unconditioned one, so each branch is
+          one attention run and the two latents one run for the latent stream's ops
+sampler   flow matching from sigma 0 (noise) to 1: Euler on numpy's linspace(0, 1, steps), the
+          last grid point's evaluation (a zero step in the reference) skipped; guidance 5
+VAE       latent / scale_factor, post_kl 64 -> 1024, 16 self-attention blocks (q, k, v and the
+          geometry decoder's k, v are head-interleaved in the checkpoint and gathered per head at
+          conversion; per-head LayerNorms on q and k, exact GELU MLP 4096)
+geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier), query_proj, one
+          cross-attention block over the latent rows (its own MLP), ln_post (eps 1e-5), a logit
+```

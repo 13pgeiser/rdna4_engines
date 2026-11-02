@@ -2345,9 +2345,12 @@ int main(int argc, char** argv) {
         else if (a == "--coverage") ro.coverage_dir = next("--coverage");
         else if (a == "--coverage-write") ro.coverage_write = true;
         else if (a == "--analysis") analysis_path = next("--analysis");
-        else if (a == "--max-cases") max_cases = std::atoi(next("--max-cases"));
+        else if (a == "--max-cases")
+            max_cases = (int)rad_flag_int("rad-kbench", "--max-cases", next("--max-cases"), 0,
+                                          INT32_MAX);
         else if (a == "--max-bytes")
-            max_case_bytes = (int64_t)std::atoll(next("--max-bytes")) << 20;
+            max_case_bytes = rad_flag_int("rad-kbench", "--max-bytes", next("--max-bytes"), 1,
+                                          INT32_MAX) << 20;
         else if (a == "--no-fusion") fuse_check = false;
         else if (a == "--bench")   bench = true;
         else if (a == "--timing-only") timing_only = true;

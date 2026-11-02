@@ -134,6 +134,10 @@ void Server::register_routes() {
                  [this](const HttpRequest& q) { return handle_video_delete(q); });
     router_.get ("/v1/videos/:id/content",
                  [this](const HttpRequest& q) { return handle_video_content(q); });
+    /* Hunyuan3D-2's API server: a shape from a picture. */
+    router_.post("/generate",        [this](const HttpRequest& q) { return handle_shape_generate(q); });
+    router_.post("/send",            [this](const HttpRequest& q) { return handle_shape_send(q); });
+    router_.get ("/status/:uid",     [this](const HttpRequest& q) { return handle_shape_status(q); });
     router_.post("/v1/audio/transcriptions",
                  [this](const HttpRequest& q) { return handle_transcription(q); });
     /* The same, live over a WebSocket (OpenAI's realtime transcription session). A plain GET
@@ -374,6 +378,7 @@ void Server::stop() {
     stopping_.store(true);
     transport_.stop();
     stop_videos();
+    stop_shapes();
     drain_graveyard(2000);
 }
 
@@ -1389,6 +1394,8 @@ std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShap
                                      "generates no text"
         : opt_.video_model         ? "this is a video model: it serves /v1/videos and generates "
                                      "no text"
+        : opt_.shape_model         ? "this is a 3-D shape model: it serves /generate and generates "
+                                     "no text"
                                    : nullptr;
     if (!why) return std::nullopt;
     return error_response(err_not_implemented(why), peer, shape);
@@ -1675,6 +1682,7 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
             : opt_.audio_model ? "/v1/embeddings requires an embedding model; this one makes audio"
             : opt_.video_model ? "/v1/embeddings requires an embedding model; this one makes video"
+            : opt_.shape_model ? "/v1/embeddings requires an embedding model; this one makes shapes"
                                : "/v1/embeddings requires an embedding model; this one generates "
                                  "text"), req.peer);
 

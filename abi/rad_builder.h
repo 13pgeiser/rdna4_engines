@@ -1471,6 +1471,87 @@ typedef struct RadVideoGenDecl {
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
 
+/* ================================================================== the shape generator */
+/* A program that makes a 3-D shape from one picture: an image encoder reads the picture, a
+ * denoiser steps a set of latent rows by flow matching, guided against an unconditioned branch,
+ * and a decoder turns the latent into an occupancy field that the core samples at points of its
+ * choosing and meshes. The core drives the passes (RadBatch::gen, RadShapeGenBatch), one request
+ * a pass:
+ *
+ *   RAD_GEN_PASS_SCOND    the request's picture through the image encoder into the request's
+ *                         lane: what the denoiser reads of it at every step, for both branches
+ *                         (the picture's and the unconditioned one).
+ *   RAD_GEN_PASS_SSTEP    one denoising step of one lane over both branches, `step_rows` rows:
+ *                         each branch's conditioning and latent, laid out as the plugin likes, the
+ *                         latents two entries of `latent_rows` (the conditioned first) for the
+ *                         image generator's sampler ops. The first step draws the lane's noise.
+ *   RAD_GEN_PASS_SLATENT  the lane's final latent through the decoder's network, into the lane:
+ *                         what every query pass of the request reads. Runs once, after the last
+ *                         step.
+ *   RAD_GEN_PASS_SQUERY   the field at `n_query` points (RadShapeGenBatch::query, at most
+ *                         `max_query`), one f32 a point in `field_out`, which the core reads
+ *                         back.
+ *
+ * The picture. The core decodes it with its alpha (opaque without one) and prepares it as
+ * Hunyuan3D-2's ImageProcessorV2 and image encoder do: the alpha's bounding box (its last row and
+ * column left out, as the reference's slice leaves them) scaled with OpenCV's INTER_AREA to
+ * (1 - border_ratio) of the longer side of the square that holds the picture, centred on it and
+ * flattened onto white; that square resized to `canvas` x `canvas` with INTER_CUBIC; then as 0..1
+ * values bilinearly resized to `enc_size` x `enc_size` (half-pixel centres, torchvision's), each
+ * channel normalised by `pix_mean` and `pix_std`, and cut into (enc_size / enc_patch)^2 patches of
+ * enc_patch x enc_patch pixels, row-major, each patch's values channel-major then row-major (a
+ * convolution's weight order). An SCOND pass carries those patches.
+ *
+ * The sampler: a request's `steps` are sigma grid points, sigma_i = i / (steps - 1) for i in
+ * [0, steps), numpy's linspace(0, 1) taken to f32; the latent starts as noise at sigma 0 and an
+ * evaluation at each sigma but the last steps it to the next (the reference evaluates at the
+ * last too, against itself, a step of zero). The model's timestep is sigma, the guided velocity
+ * neg + cfg (pos - neg), and the step x + (sigma_next - sigma) v.
+ *
+ * The field: the decoder's logit at a point, inside the shape above `level`. The core samples the
+ * cube [-bounds, bounds]^3 on a grid of `resolution` cells a side ((resolution + 1)^3 points,
+ * numpy's linspace in f32 along each axis), coarse to fine as FlashVDM's hierarchical decoding
+ * does: the whole grid at the coarsest level (resolution halved while it stays at least 63), then
+ * at each finer level only the points near where the coarser one crosses `level` or is within
+ * 0.95 of it. The surface is marching cubes over the finest grid, a vertex at grid index g placed
+ * at g 2 bounds / (resolution + 1) - bounds, as the reference places it.
+ *
+ * A program declares exactly one of this, the other generators, logits or pooled vectors. */
+enum { RAD_GEN_PASS_SCOND = 15, RAD_GEN_PASS_SSTEP = 16, RAD_GEN_PASS_SLATENT = 17,
+       RAD_GEN_PASS_SQUERY = 18 };
+
+typedef struct RadShapeGenDecl {
+    const char* name;             /* "hunyuan3d-2" -- the served model id and messages */
+
+    /* The picture (above). */
+    int64_t     canvas;
+    double      border_ratio;
+    int64_t     enc_size, enc_patch;
+    double      pix_mean[3], pix_std[3];
+
+    /* The latent: `latent_rows` rows of `latent_channels` a branch; a step's rows, both branches
+     * with their conditioning. */
+    int64_t     latent_rows, latent_channels, step_rows;
+
+    /* The sampler (above) and the guidance a request that names none runs at. */
+    int64_t     default_steps, max_steps;
+    double      default_guidance;
+
+    /* The field (above): the cube's half side, the iso value, and the grid's resolution a request
+     * that names none is sampled at, with the range a request may name. */
+    double      bounds;
+    double      level;
+    int64_t     default_resolution, min_resolution, max_resolution;
+
+    /* `max_lanes` requests may hold state at once. `field_out` is a device f32 buffer of at least
+     * `max_query` elements. */
+    int64_t     max_lanes;
+    int64_t     max_query;
+    rad_buf     field_out;
+} RadShapeGenDecl;
+
+int rad_declare_shape_generator(RadBuilder* b, const RadShapeGenDecl* d);
+
 /* ================================================================== diagnostics */
 /* A plugin may annotate the graph dump. Free-form, printed under --debug-graph. */
 void rad_note(RadBuilder* b, const char* fmt, ...);
@@ -1605,6 +1686,12 @@ typedef struct RadArchProbe {
      * gen_patches answer for them. */
     int64_t gen_max_pixels;
     int64_t gen_max_refs;
+
+    /* ---- appended in ABI 33 (the shape generator) */
+    /* Nonzero for a shape generator, which the engine sizes as it does a video generator from
+     * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
+     * KV. */
+    int32_t gen_shape;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

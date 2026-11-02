@@ -105,6 +105,10 @@ std::vector<Case> build_cases() {
                              HS("dtype", dt) }, EB(27, 648, w, 1));
         add("pool_cols",   { HI("M", 40), HI("n", 256), HI("k", 8), HS("dtype", dt) },
             EB(40, 256, w, 1));
+        add("point_fourier", { HI("M", 37), HI("n", 3), HI("freqs", 8), HS("dtype", dt) },
+            EB(37, 51, w, 1));
+        add("point_fourier", { HI("M", 5), HI("n", 4), HI("freqs", 3), HI("pi", 1),
+                               HS("dtype", dt) }, EB(5, 28, w, 1));
         add("scatter_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("scale_rows",  { HI("M", 6), HI("n", 645), HS("act", "sigmoid"), HS("dtype", dt) },
                            EB(6, 645, w, 2));

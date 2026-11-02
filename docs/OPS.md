@@ -1908,6 +1908,24 @@ over its encoded rows after the VAE encoder's fold. The weight is a declared con
   rows at a time, so each item's draws start at `e = 0`. MiniMax-H3: `n` 96, `stream` 2, `aug`
   0.999.
 
+## Shape generation
+
+The op a shape generator (Hunyuan3D-2, `rad_declare_shape_generator`) needs beyond an image
+generator's: the embedding of the points its geometry decoder is queried at. Its encoder, denoiser
+and decoder are otherwise built of the image and video generators' ops (`rms_mod` `norm` layer,
+`gate_add` `act` none, `flow_euler`, `attn_cross`).
+
+| op | params | operands |
+|---|---|---|
+| `point_fourier` | `M`(range) `n` `freqs` `pi`/opt `dtype` | `x` → `y` |
+
+- `point_fourier`: row m of `y` is `[x | sin(x_i f_j) | cos(x_i f_j)]` over `x`'s `n` values, the
+  sines and then the cosines each `i`-major then `j`, with `f_j = 2^j` for `j < freqs` (times pi
+  with `pi` 1), so `y` is `[M, n (2 freqs + 1)]`: the shape VAE's FourierEmbedder with its input
+  included. The products are f32 (exact without pi, a power of two), the sine and cosine f32 and
+  rounded once to `y`'s dtype. `freqs` is at most 30. libr4d's `point_fourier_f32` serves f32 in
+  and out with the device's `sinf` and `cosf`.
+
 ## LTX-2
 
 The ops LTX-2's audio-video transformer adds (`libref/ref_ltx.cpp`): its rotary over fractional

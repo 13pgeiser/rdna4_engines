@@ -155,6 +155,20 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
         }
     }
 
+    /* The view's rectangles come from plugin-stated spans and parts, sum-checked only. A single
+     * selected plane takes them as its own rectangles below, with no enc_plane_rect to bound
+     * them, so every one is held to the entry here. */
+    for (int g = 0; !whole && g < w.n_part_spans; ++g)
+        if (w.part_lo[g] < 0 || w.part_lo[g] > w.part_hi[g] || w.part_hi[g] > w.part_total[g])
+            return refuse(fmt("part %d's span [%lld, %lld) is outside its %lld", g,
+                              (long long)w.part_lo[g], (long long)w.part_hi[g],
+                              (long long)w.part_total[g]));
+    for (const VRect& q : view)
+        if (q.r0 < 0 || q.r0 > q.r1 || q.r1 > VR || q.c0 < 0 || q.c0 > q.c1 || q.c1 > VC)
+            return refuse(fmt("the slice [%lld, %lld) x [%lld, %lld) is outside the entry's "
+                              "%lld x %lld", (long long)q.r0, (long long)q.r1, (long long)q.c0,
+                              (long long)q.c1, (long long)VR, (long long)VC));
+
     for (int k = 0; k < w.n_sel; ++k) {
         const RadEncPlane& p = enc.plane[w.sel[k]];
         PlaneShare& s = out[k];
