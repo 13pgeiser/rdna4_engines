@@ -524,6 +524,7 @@ extern "C" int rad_step_fail(RadCtx* c, const char* what) {
 extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
+extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }

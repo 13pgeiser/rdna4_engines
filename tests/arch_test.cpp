@@ -1882,6 +1882,55 @@ RadModelMeta qwen4exp_meta() {
 }
 }  /* namespace */
 
+TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx build = build_ctx(0, 1);
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 0; build.max_ctx = 4096;
+    RadBuilder graph;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&graph, &meta, &build), RAD_OK);
+    rad_kvgroup kv_full = 0;
+    for (size_t i = 0; i < graph.kv_groups.size(); ++i)
+        if (graph.kv_groups[i].name.find("kv_attn") != std::string::npos) {
+            kv_full = (rad_kvgroup)(i + 1);
+            break;
+        }
+    REQUIRE(kv_full != 0);
+
+    RadCtx ctx{};
+    RadKVGroupBatch group{};
+    group.group = kv_full;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_PREFILL;
+    batch.n_tok = 64; batch.n_seq = 1; batch.max_q_len = 64;
+    batch.max_ctx_len = 4096; batch.n_kv_groups = 1; batch.kv = &group;
+    int32_t used[1] = {2304};
+    const uint64_t key6 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(key6 != 0);
+    used[0] = 2305;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), key6);
+    used[0] = 3072;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != key6);
+
+    /* A shorter one-sequence chunk still proves q_len = n_tok; do not require the model max_tok. */
+    used[0] = 2304;
+    batch.n_tok = 32; batch.max_q_len = 32;
+    const uint64_t key_chunk = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(key_chunk != 0);
+    CHECK(key_chunk != key6);
+    batch.n_tok = 64; batch.max_q_len = 64;
+
+    batch.phase = RAD_PHASE_MIXED;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.phase = RAD_PHASE_DECODE; batch.n_spec = 1;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.n_spec = 0; batch.draft_pass = -1;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.draft_pass = 0; batch.phase = RAD_PHASE_PREFILL; batch.n_seq = 2;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.n_seq = 1; used[0] = 0;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+}
+
 TEST(qwen4exp_yarn_reaches_attention_indexer_and_compressed_keys) {
     RadModelMeta meta = qwen4exp_meta();
     std::vector<const char*> keys(meta.kv_key, meta.kv_key + meta.n_kv);

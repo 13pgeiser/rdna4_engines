@@ -2178,12 +2178,14 @@ int k_copy(const RadArgs* a, RadStream s) {
 }
 
 /* A host row for every band of `op`, from a library that is not the reference. */
-void attach_host_row(Fixture& f, rad_op op, RadLaunchFn fn, const char* name) {
+void attach_host_row(Fixture& f, rad_op op, RadLaunchFn fn, const char* name,
+                     uint64_t capabilities = 0) {
     for (rad::Band& band : f.P.ops[op].bands) {
         f.infos.push_back(RadKernelInfo{});
         RadKernelInfo& ki = f.infos.back();
         ki.name = name; ki.op = "rope"; ki.family = "test"; ki.domain = RAD_DOMAIN_HOST;
         ki.launch = fn;
+        ki.capabilities = capabilities;
         f.rows.push_back(rad::KernelRow{});
         rad::KernelRow& kr = f.rows.back();
         kr.info = &ki;
@@ -2339,6 +2341,42 @@ static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const in
                                                     (int)b->n_tok, (int)b->n_seq, kv_heads,
                                                     b->max_ctx_len, used[0], wgps);
     return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
+}
+
+TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_op op = loose_op(f);
+        attach_host_row(f, op, k_host_read, "unaffected_prefill");
+        CHECK_OK(f.start());
+
+        RadBatch b{};
+        b.phase = RAD_PHASE_PREFILL;
+        b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+        CHECK(f.ctx.pass_key(&b) != 0);  // Unaffected legacy prefill retains reuse.
+    }
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_op op = loose_op(f);
+        attach_host_row(f, op, k_host_read, "live_split_prefill",
+                        RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT);
+        CHECK_OK(f.start());
+
+        RadBatch b{};
+        b.phase = RAD_PHASE_PREFILL;
+        b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        b.phase = RAD_PHASE_MIXED;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        b.phase = RAD_PHASE_DECODE; b.n_spec = 1;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        b.n_spec = 0; b.draft_pass = -1;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        b.draft_pass = 0;
+        CHECK(f.ctx.pass_key(&b) != 0);  // Ordinary decode remains recordable.
+    }
 }
 
 TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {

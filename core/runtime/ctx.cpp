@@ -957,6 +957,17 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some. */
     if (b->enc || b->n_mm_rows > 0) return 0;
+    /* Legacy architecture plugins have no pass-key callback. Only refuse them when the resolved
+     * program contains a launcher explicitly marked as using live prefill splits, and this batch
+     * can issue a prefill, mixed, speculative-verify or draft query through it. */
+    if (!arch_pass_key_ &&
+        (b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED || b->draft_pass != 0 ||
+         b->n_spec > 0)) {
+        for (const IssuePlan& ip : issue_table_)
+            if (ip.row && ip.row->info &&
+                (ip.row->info->capabilities & RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT))
+                return 0;
+    }
     /* A pass carrying a request's words for the plugin is shaped by them (a head issues per
      * sequence from their counts), and such a step samples a prompt's first token, which is not
      * the repeating decode pass. */

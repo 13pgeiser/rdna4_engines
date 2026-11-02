@@ -1703,6 +1703,10 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     /* MTP owns another attention path on the same KV group. The present batch key cannot prove
      * whether that head's attention row takes a split grid, so keep only those passes live. */
     if (batch->draft_pass != 0) return 0;
+    /* Mixed batches split the query rows into decode and prefill subsets before attention, and a
+     * speculative verify can choose another q_len band. The whole-batch host summary cannot key
+     * those subset geometries exactly. */
+    if (batch->phase == RAD_PHASE_MIXED || batch->n_spec > 0) return 0;
     if (batch->phase != RAD_PHASE_PREFILL) return 1;
 
     Model& m = g_model[rad_rank(c)];
@@ -1722,12 +1726,18 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
         if (batch->kv[i].group == m.kv_full) { group = i; break; }
     if (group < 0) return 0;
 
-    const int q_len = (int)batch->max_q_len;
+    /* Qwen always passes cu_seqlens, so fill_paged takes q_len = min(band, total_q). That equals
+     * n_tok only for one sequence; a ragged or multi-sequence launch's band is not the host group
+     * max, and mixed decode-prefix / prefill-suffix launches use the suffix's own KV lengths. */
+    if (batch->n_seq != 1 || batch->n_tok <= 0 || batch->max_ctx_len <= 0) return 0;
+    const int q_len = (int)batch->n_tok;
     const int total_q = (int)batch->n_tok;
-    const int num_seqs = (int)batch->n_seq;
+    const int num_seqs = 1;
     const int kv_heads = (int)m.g.n_head_kv;
     const int used = used_max_h[group];
+    if (used <= 0) return 0;  // Missing host summary is not the same as an empty KV cache.
     const int wgps = rad_ctx_wgp_count(c);
+    if (wgps <= 0) return 0;
     constexpr int tile = 48, nwarps = 24;
     const int bq = nwarps * 16 / m.g.gqa();
     const int splits = rad_prefill_splits_for_live(bq, tile, q_len, total_q, num_seqs,

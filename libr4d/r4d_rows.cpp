@@ -6642,7 +6642,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8, r4d_rad_attn_prefill_h256_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 /* Lossy: they match only a caller whose `prefill_fp8` accepts their legs. */
 { "attn_prefill_h256_gqa6_fp8kv_qk8", "attn_paged", "attn",
@@ -6683,7 +6683,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillFp8v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8v4, r4d_rad_attn_prefill_h256_v4_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa6_fp8v4_qk8", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill), Q.K^T as e4m3 WMMA",
@@ -6726,7 +6726,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillK6v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_k6v4, r4d_rad_attn_prefill_h256_k6_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa6_k6v4_qk8", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill), Q.K^T as e4m3 WMMA",
@@ -6769,7 +6769,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_bf16, r4d_rad_attn_prefill_h256_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa6_fp8kv", "attn_paged", "attn",
   "paged causal attention, split-KV (decode / speculative verify)",
@@ -6842,7 +6842,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256Gqa2Fp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa2_fp8, r4d_rad_attn_prefill_h256_gqa2_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa2_bf16kv", "attn_paged", "attn",
   "paged causal attention with a sliding window, query-tiled (prefill / chunked prefill)",
@@ -6853,7 +6853,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256Gqa2Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa2_bf16, r4d_rad_attn_prefill_h256_gqa2_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa2_fp8kv", "attn_paged", "attn",
   "paged causal attention with a sliding window, split-KV (decode / verify)",
@@ -7031,7 +7031,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256G8Fp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa8_fp8, r4d_rad_attn_prefill_h256_gqa8_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa8_bf16kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -7041,7 +7041,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256G8Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa8_bf16, r4d_rad_attn_prefill_h256_gqa8_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa8_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7071,7 +7071,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256G4Fp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa4_fp8, r4d_rad_attn_prefill_h256_gqa4_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa4_bf16kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -7081,7 +7081,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnPrefillH256G4Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa4_bf16, r4d_rad_attn_prefill_h256_gqa4_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa4_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7182,7 +7182,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G12Fp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_fp8, r4d_rad_attn_prefill_h256_gqa12_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa12_bf16kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -7192,7 +7192,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G12Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_bf16, r4d_rad_attn_prefill_h256_gqa12_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa12_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7250,7 +7250,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G6Bs4Fp8), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_fp8, r4d_rad_attn_prefill_h256_gqa6_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_prefill_h256_gqa6_bs4_bf16kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -7260,7 +7260,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G6Bs4Bf16), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_bf16, r4d_rad_attn_prefill_h256_gqa6_scratch,
   nullptr, nullptr,
-  r4d_shape_attn_paged },
+  r4d_shape_attn_paged, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa6_bs4_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7316,7 +7316,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G12Fp8v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_fp8v4, r4d_rad_attn_prefill_h256_gqa12_fp8v4_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa12_fp8v4", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7347,7 +7347,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G12K6v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_k6v4, r4d_rad_attn_prefill_h256_gqa12_k6v4_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa12_k6v4", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7378,7 +7378,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G6Bs4Fp8v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_fp8v4, r4d_rad_attn_prefill_h256_gqa6_fp8v4_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa6_bs4_fp8v4", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
@@ -7409,7 +7409,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnPrefillH256G6Bs4K6v4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_k6v4, r4d_rad_attn_prefill_h256_gqa6_k6v4_scratch,
   nullptr, nullptr,
-  nullptr },
+  nullptr, nullptr, nullptr, RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT },
 
 { "attn_decode_h256_gqa6_bs4_k6v4", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",

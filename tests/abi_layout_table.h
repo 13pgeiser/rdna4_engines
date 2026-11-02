@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 33 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 34 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -33,7 +33,7 @@
 { "RadArgs", "instance", 48, 8 },
 { "RadArgs", "rank", 56, 4 },
 { "RadArgs", "world_size", 60, 4 },
-{ "RadBatch", "", 0, 416 },
+{ "RadBatch", "", 0, 424 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -91,6 +91,7 @@
 { "RadBatch", "plugin_words_h", 392, 8 },
 { "RadBatch", "plugin_cu_h", 400, 8 },
 { "RadBatch", "sgen_b", 408, 8 },
+{ "RadBatch", "kv_used_max_h", 416, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -516,7 +517,7 @@
 { "RadKVStream", "host_layer_stride", 48, 8 },
 { "RadKVStream", "slots", 56, 8 },
 { "RadKVStream", "host_bytes", 64, 8 },
-{ "RadKernelInfo", "", 0, 168 },
+{ "RadKernelInfo", "", 0, 176 },
 { "RadKernelInfo", "name", 0, 8 },
 { "RadKernelInfo", "op", 8, 8 },
 { "RadKernelInfo", "family", 16, 8 },
@@ -539,6 +540,7 @@
 { "RadKernelInfo", "opd_shape", 144, 8 },
 { "RadKernelInfo", "unrelayout", 152, 8 },
 { "RadKernelInfo", "replaces", 160, 8 },
+{ "RadKernelInfo", "capabilities", 168, 8 },
 { "RadLayout", "", 0, 80 },
 { "RadLayout", "tag", 0, 8 },
 { "RadLayout", "dtype", 8, 4 },
