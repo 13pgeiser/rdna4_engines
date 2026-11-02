@@ -2253,7 +2253,9 @@ function histRender(missed) {
   if (tpsV.length) parts.push(group(tpsV, tps, "tok/s"));
   if (pfV.length)  parts.push(group(pfV, cnt3, "prefill"));
   if (tfs.length)  parts.push("ttft median " + dur(tfs[Math.floor(tfs.length / 2)]));
-  $("hsum").textContent = parts.join(" · ");
+  /* The wide dot is the page's major-break separator (the KV and version lines use it); the
+   * tight dot inside each group stays tight, so group edges read heavier than window edges. */
+  $("hsum").textContent = parts.join("  ·  ");
 
   /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
   const body = $("hbody");
