@@ -3657,7 +3657,7 @@ completions entry point), so prompt parity with the reference is a chat-endpoint
 
 ### 6.1 The dashboard
 
-Open `http://<host>:<port>/` in a browser. It has three tabs.
+Open `http://<host>:<port>/` in a browser. It has four tabs.
 
 **Dashboard**: the live strip across the top (decode step time, decode and prefill throughput,
 requests in flight, KV cache in VRAM, draft acceptance), then cards for the batch, memory and
@@ -3727,8 +3727,9 @@ best 58 · recent 54 · now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
-current concurrency, `recent` the mean of its last 30 samples there (15 s at one poll every 500 ms;
-5 s for prefill), and `now` the current value as a share of the extreme. Past one sequence the line
+current concurrency, `recent` the mean of the last 15 s there (5 s for prefill), and `now` the
+current value as a share of the extreme. The windows are kept by elapsed time rather than sample
+count, so a span means the same span whatever rate is set on Advanced. Past one sequence the line
 names its concurrency (`@c4`); requests in flight keeps a single set. Reloading the page resets these
 figures, a server restart does not. While nothing runs, the big figure reads 0 and the line keeps its
 last figures without `now`.
@@ -3738,8 +3739,8 @@ verified only when every earlier one passed, so:
 
 - **accepted / reached** (conditional): of the drafts verified at a position, the share that passed.
   The acceptance tile, the Speculation panel's large "conditionally accepted" figure and the
-  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the last 30
-  polls that drafted as a ratio of sums.
+  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the polls
+  that drafted in the last 15 s as a ratio of sums.
 - **accepted / drafted**: of every drafted token, the share that became text, since the process
   started. The Speculation panel's "Accepted of drafted", `draft_accept` on `/stats` and
   `radiance:draft_acceptance_ratio` on `/metrics` show it.
@@ -3757,6 +3758,12 @@ On a hybrid model, a session with blocks but no reachable snapshot reuses zero t
 scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's headline.
 
 **Model**: the resolved graph: every op, which library serves it, and what did not resolve.
+
+**Advanced**: two editable poll intervals -- *Idle interval* while nothing runs and *Busy interval*
+while a request is in flight, each clamped to 100-5000 ms. Set them equal for one fixed rate; the
+line under the fields names what is set. The values live in the browser, not on the server, so they
+survive a restart and apply to this browser only. Polling pauses on every view but Dashboard, so
+the figures hold while you are reading another page.
 
 ### 6.2 The JSON behind it
 
