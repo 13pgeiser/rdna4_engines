@@ -19,7 +19,10 @@ Written by Deadcode, with contributions from:
   Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files, Gemma 4's E2B/E4B form (KV-shared
   layers, per-layer embeddings, clipped vision linears) with NVIDIA-Nemotron-3.5-Bolt-E4B, its audio
   encoder, its i8a8 linears and its KV heads replicated over ranks, 4-bit weights at decode heights
-  through w4a16_asym, and the Ornith-1.5-122B compose files
+  through w4a16_asym, the Ornith-1.5-122B compose files, the Gemma 4 31B's asymmetric int5
+  linears (w5a8i8 and w5a16), the junctions at quant_act_i8g's grid (rmsnorm_quant_i8g,
+  gelu_mul_quant_i8g and ar_rmsnorm_quant_i8g) with the prefill overlap on the i8a8, a4 and w5
+  grids, and the 31B's i8g, heretic-ara-i8g and w5 compose files
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
   coupling with its cooperative verify (--draft-coupling), the W4A8 prefill's tail scale read, the
@@ -85,7 +88,8 @@ Written by Deadcode, with contributions from:
   split by depth, the delta net's out-projection read beside its decode recurrent update, the MXFP4
   feed-forward's gated fold up to 16 rows, the three-wave verify floor bounded by the batch's
   workgroups, the split-KV row sum read with fetch-inactive, KLATE again for the head-256 gqa6
-  paged prefill, and the preempted-prefill gate past a KV group that holds no blocks
+  paged prefill, the preempted-prefill gate past a KV group that holds no blocks, and the norms'
+  lane sum issuing its reads eight at a time
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -118,7 +122,8 @@ Written by Deadcode, with contributions from:
 - farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
 - gostar: snapshot-backed prefix KV kept across recomputes, and Tencent's Hy-Memory (HYV3) -- its
   BF16, FP8 and GGUF adapters, its KV scales, its native sectioned tool calls, and its W4 decode
-  (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds)
+  (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds),
+  and the head-256 prefill softmax rescaled by row rather than by wave
 - launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
   per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch
 - hugypufy: M2XFP4 -- its quantiser, its GEMMs and its linears in the Qwen3.8 trunk and the DFlash2
@@ -134,7 +139,9 @@ Written by Deadcode, with contributions from:
 - Dad_Vibes: hc_read's decode kernels as one grid, its tiled up-mix pipelined and its one-grid
   wait trapping past its deadline, and gemm_fp8a8's narrow form with its scales staged through LDS
   and its gated three-tile form at 8 waves
-- RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library
+- RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library, and its wave-matrix rewrite: the GEMMs
+  retiled to 16x128 blocks, the grouped MoE GEMMs, the norms and quantisers, and the QSA and MoE
+  router rows
 - fl0l0u: every request entry point bounded, gated and sanitised (JSON parses bounded in depth,
   errors safe on invalid UTF-8, control bytes kept off the log, the dashboard's CSP, cross-origin
   browsers refused on the loopback-only routes, method-scoped API-key exemptions), prompt ids that

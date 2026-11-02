@@ -942,9 +942,9 @@ int Ctx::lane_join(int from, int to) {
 
 /* The key below reads every RadBatch field a pass's shape or arguments can depend on, by hand. A
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
- * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
- * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 408,
+ * size here. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are never
+ * recorded (below). */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 416,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -957,8 +957,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
      * sequence from their counts), and such a step samples a prompt's first token, which is not
      * the repeating decode pass. */
     if (b->n_plugin_words > 0) return 0;
-    /* A generator pass is shaped by what RadBatch::gen_b, agen_b or vgen_b carries, which no key
-     * below reads. */
+    /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
+     * no key below reads. */
     if (b->gen) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {

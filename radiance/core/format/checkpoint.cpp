@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <map>
 
 namespace rad {
@@ -688,6 +689,124 @@ int Checkpoint::open_diffusers() {
     return RAD_OK;
 }
 
+/* config.yaml's maps of scalars as dotted keys, a list's items space-separated, booleans as 1 and
+ * 0 and a trailing comment dropped: the subset Hunyuan3D-2's configs are written in. Anything else
+ * (a multi-line value, a list of maps) is refused, not guessed at. */
+static int meta_from_yaml(const std::string& path, MetaOwn* out) {
+    std::ifstream f(path);
+    if (!f) {
+        RAD_ERR("%s: cannot read", path.c_str());
+        return RAD_E_IO;
+    }
+    std::vector<std::pair<size_t, std::string>> stack;   /* indentation, key */
+    std::string line;
+    int ln = 0;
+    auto trim = [](std::string s) {
+        const size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    while (std::getline(f, line)) {
+        ++ln;
+        if (const size_t h = line.find(" #"); h != std::string::npos) line.resize(h);
+        const std::string body = trim(line);
+        if (body.empty() || body[0] == '#') continue;
+        const size_t ind = line.find_first_not_of(' ');
+        const size_t colon = body.find(':');
+        if (colon == std::string::npos || body[0] == '-') {
+            RAD_ERR("%s:%d: not a `key: value` line of the YAML this importer reads", path.c_str(), ln);
+            return RAD_E_FORMAT;
+        }
+        while (!stack.empty() && stack.back().first >= ind) stack.pop_back();
+        const std::string key = trim(body.substr(0, colon));
+        std::string val = trim(body.substr(colon + 1));
+        std::string full;
+        for (const auto& s : stack) full += s.second + ".";
+        full += key;
+        if (val.empty()) {
+            stack.emplace_back(ind, key);
+            continue;
+        }
+        if (val.front() == '[') {
+            if (val.back() != ']') {
+                RAD_ERR("%s:%d: a list must close on its line", path.c_str(), ln);
+                return RAD_E_FORMAT;
+            }
+            std::string items;
+            for (char& ch : val) if (ch == '[' || ch == ']' || ch == ',') ch = ' ';
+            std::istringstream is(val);
+            for (std::string it; is >> it;) items += (items.empty() ? "" : " ") + it;
+            val = items;
+        } else if (val == "True" || val == "true") {
+            val = "1";
+        } else if (val == "False" || val == "false") {
+            val = "0";
+        } else if (val.size() >= 2 && (val.front() == '"' || val.front() == '\'') &&
+                   val.back() == val.front()) {
+            val = val.substr(1, val.size() - 2);
+        }
+        out->set(full, val);
+    }
+    return RAD_OK;
+}
+
+/* A Hunyuan3D-2 shape model (tencent/Hunyuan3D-2's hunyuan3d-dit-v2-0 and its kin): a folder of
+ * config.yaml and one safetensors holding three networks under `model.` (the DiT),
+ * `conditioner.` (DINOv2's image encoder) and `vae.` (the shape VAE), the names kept. config.yaml's
+ * keys go into the metadata by dotted path (model.params.hidden_size, vae.params.scale_factor,
+ * conditioner.params.main_image_encoder.kwargs.config.num_hidden_layers, ...). The architecture
+ * is `hunyuan3d2`, and the model reads no text (`radiance.text` none). */
+int Checkpoint::open_hy3d(const std::string& weights) {
+    kind_ = SafeT;
+    RAD_TRY(add_shard(weights));
+    RAD_TRY(meta_from_yaml(dir_ + "/config.yaml", &meta_));
+    meta_.arch = "hunyuan3d2";
+    meta_.set("radiance.text", "none");
+    /* The typed dimensions are the denoiser's: its blocks, width and heads, read off its tensors;
+     * the vocabulary is the one token of a model that reads no text, and the context a step's
+     * rows (both branches of the 1370 conditioning rows and the latent). */
+    {
+        RadModelMeta& m = meta_.m;
+        const SrcTensor* lat = find("model.latent_in.weight");
+        const SrcTensor* mlp = find("model.double_blocks.0.img_mlp.0.weight");
+        const SrcTensor* qn = find("model.double_blocks.0.img_attn.norm.query_norm.scale");
+        const SrcTensor* vae = find("vae.post_kl.weight");
+        int64_t layers = 0;
+        while (find("model.double_blocks." + std::to_string(layers) + ".img_mod.lin.weight"))
+            ++layers;
+        for (int64_t s = 0; find("model.single_blocks." + std::to_string(s) + ".linear1.weight"); ++s)
+            ++layers;
+        if (!lat || lat->shape.size() != 2 || !mlp || mlp->shape.size() != 2 || !qn ||
+            qn->shape.size() != 1 || qn->shape[0] <= 0 || !vae || !layers) {
+            RAD_ERR("%s: Hunyuan3D-2's DiT or shape VAE is incomplete", weights.c_str());
+            return RAD_E_FORMAT;
+        }
+        m.n_layers = layers;
+        m.n_embd = lat->shape[0];
+        m.head_dim = qn->shape[0];
+        m.n_head = m.n_head_kv = m.n_embd / m.head_dim;
+        m.n_ff = mlp->shape[0];
+        m.n_vocab = 1;
+        m.n_ctx_train = 2 * (1370 + 3072);
+        m.rms_eps = 1e-6f;
+        m.rope_theta = 10000.0f;
+        m.rope_scale = 1.0f;
+    }
+    meta_.finish();
+    return RAD_OK;
+}
+
+/* Whether `file` is a Hunyuan3D-2 shape checkpoint: its DiT and image encoder by name. */
+static bool hy3d_weights(const std::string& file) {
+    SafeTensorsFile probe;
+    if (probe.open(file) != RAD_OK) return false;
+    bool dit = false, enc = false;
+    for (const auto& t : probe.tensors()) {
+        dit = dit || t.name == "model.latent_in.weight";
+        enc = enc || t.name.rfind("conditioner.main_image_encoder.", 0) == 0;
+    }
+    return dit && enc;
+}
+
 /* A single-file Stable Diffusion XL checkpoint in Stability's (sgm) layout, the form SDXL and its
  * finetunes (Illustrious, NoobAI, Pony and the rest) are published in: one safetensors holding
  *
@@ -887,6 +1006,16 @@ int Checkpoint::open_safetensors(const std::string& path) {
         ((path_exists(dir_ + "/model_index.json") && !path_exists(dir_ + "/config.json")) ||
          path_exists(dir_ + "/modular_model_index.json")))
         return open_diffusers();
+    /* A Hunyuan3D-2 shape model: config.yaml beside its one safetensors (the fp16 one when the
+     * folder holds both). */
+    if (!is_index && path_exists(dir_ + "/config.yaml")) {
+        std::string w = path;
+        if (!is_file)
+            for (const char* f : { "/model.fp16.safetensors", "/model.safetensors" })
+                if (path_exists(dir_ + f)) { w = dir_ + f; break; }
+        if (w != path || is_file)
+            if (hy3d_weights(w)) return open_hy3d(w);
+    }
     if (is_file) {
         shards.push_back(path);
         /* A single-file Stable Diffusion XL checkpoint, as Stability and every SDXL finetune

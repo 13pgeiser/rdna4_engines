@@ -209,6 +209,7 @@ private:
     int open_safetensors(const std::string& path);
     int open_diffusers();
     int open_sgm();
+    int open_hy3d(const std::string& weights);
     int add_companions();
     int add_torch_files();
     int open_gguf(const std::string& path);

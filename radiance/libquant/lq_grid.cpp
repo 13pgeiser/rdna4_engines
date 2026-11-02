@@ -418,8 +418,11 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         g->tcq_L = (int)L;
         g->tcq_k = k;
         g->tcq_rows = rad_param_geti(o, n_o, "tcq_rows", 256);
-        if (g->tcq_rows < 1) {
-            if (why) *why = "tcq_rows= is the rows one trellis runs over, 1 or more";
+        /* A run holds its seam state in its rows' codes, so it needs at least a state's worth
+         * of them; the decoder refuses a shorter run. */
+        if (g->tcq_rows < (L + k - 1) / k) {
+            if (why) *why = "tcq_rows= is the rows one trellis runs over, at least the " +
+                            std::to_string((L + k - 1) / k) + " whose codes hold one state";
             return RAD_E_INVAL;
         }
         const int64_t S = (int64_t)1 << L;

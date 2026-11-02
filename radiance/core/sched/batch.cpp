@@ -725,7 +725,13 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 first = kv.first_block_pos(e.seq, (int32_t)gi);
                 has_win = kv.runtime_window(e.seq, (int32_t)gi, &win);
                 if (has_win) {
-                    assert(!ring_blocks || ring_blocks == (int32_t)win.ring_blocks);
+                    /* The ring size sets the group header's geometry, so every sequence in the
+                     * group must report the same one. */
+                    if (ring_blocks && ring_blocks != (int32_t)win.ring_blocks) {
+                        RAD_ERR("kv group %d: sequences report ring sizes of %d and %d blocks",
+                                (int)gi, (int)ring_blocks, (int)win.ring_blocks);
+                        return RAD_E_STATE;
+                    }
                     ring_blocks = (int32_t)win.ring_blocks;
                 }
                 bt_len = (int64_t)bt.size();

@@ -589,7 +589,7 @@ KernelRec* kernel_for(const void* stub, int ord, std::string* why) {
 struct Stream {
     uint64_t        magic = kStreamMagic;
     int             ord = 0;
-    uint32_t        id = 0;                   /* index into g_queue_by_id, never reused */
+    uint32_t        id = 0;                   /* queue_of's key, never reused (see there) */
     hsa_agent_t     agent{};
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
@@ -623,12 +623,27 @@ struct Stream {
     void unlock() { busy.store(false, std::memory_order_release); }
 };
 
-/* Every queue this process has made, by an id that is never reused, so "packet i of queue n"
- * stays meaningful after the queue is destroyed. A destroyed queue's entry is null; everything
- * it held has been consumed. */
+/* Every live queue, by an id that is never reused, so "packet i of queue n" stays meaningful after
+ * the queue is destroyed: queue_of answers null for a destroyed queue's id, and everything it held
+ * has been consumed. At most kMaxQueues are live at once; a destroyed queue's slot is taken again
+ * under a new generation, id = generation * kMaxQueues + slot, so a stale id never names the
+ * slot's next queue. */
 constexpr uint32_t kMaxQueues = 1024;
 std::atomic<hsa_queue_t*> g_queue_by_id[kMaxQueues];
-std::atomic<uint32_t>     g_next_queue_id{0};
+std::atomic<uint32_t>     g_queue_id_at[kMaxQueues];   /* the id holding each slot now */
+std::mutex                g_queue_slot_mu;
+std::vector<uint32_t>     g_queue_free;               /* destroyed queues' slots */
+uint32_t                  g_queue_next_slot = 0;
+uint32_t                  g_queue_gen[kMaxQueues];
+
+/* The queue an id names, or null once it is destroyed. The slot's id is stored before its queue
+ * (release), so a queue read here that belongs to a later generation is seen with that
+ * generation's id and refused. */
+inline hsa_queue_t* queue_of(uint32_t id) {
+    const uint32_t slot = id % kMaxQueues;
+    hsa_queue_t* q = g_queue_by_id[slot].load(std::memory_order_acquire);
+    return g_queue_id_at[slot].load(std::memory_order_acquire) == id ? q : nullptr;
+}
 
 inline Stream* ours(const void* s) {
     if ((uintptr_t)s < 4096) return nullptr;
@@ -1127,6 +1142,9 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     if (!gx || !gy || !gz) return RAD_OK;
     if (gx > UINT32_MAX || gy > UINT32_MAX || gz > UINT32_MAX) return RAD_E_INVAL;
     if ((uint64_t)k->group_size + shm > 65536) return RAD_E_INVAL;
+    /* The packet's fields are 16 bits wide and the card runs at most 1024 work-items a group;
+     * HIP refuses a larger block, and so does this. */
+    if ((uint64_t)b.x * b.y * b.z > 1024) return RAD_E_INVAL;
 
     alignas(64) unsigned char ka[kKargMax];
     const uint32_t n = (k->kernarg_size + 15u) & ~15u;
@@ -1562,6 +1580,7 @@ int a_stream_create(RadStream* out, int high_priority) {
     if (hsa_amd_memory_pool_allocate(kpool, (size_t)(s->mask + 2) * kKargSlot, 0, &ka) !=
             HSA_STATUS_SUCCESS ||
         hsa_amd_agents_allow_access(1, &kpeer, nullptr, ka) != HSA_STATUS_SUCCESS) {
+        if (ka) hsa_amd_memory_pool_free(ka);   /* allocated, then refused access */
         hsa_queue_destroy(s->q);
         device_set_error("rad_stream_create: the kernel argument ring could not be placed in %s",
                          d.host_kargs ? "pinned host memory" : "VRAM the host can write");
@@ -1582,17 +1601,28 @@ int a_stream_create(RadStream* out, int high_priority) {
     s->bounce = static_cast<char*>(bb);
     note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, -1);
     note_alloc(bb, kBounceBytes, -1);
-    s->id = g_next_queue_id.fetch_add(1, std::memory_order_relaxed);
-    if (s->id >= kMaxQueues) {
+    uint32_t slot = kMaxQueues;
+    {
+        std::lock_guard<std::mutex> lk(g_queue_slot_mu);
+        if (!g_queue_free.empty()) {
+            slot = g_queue_free.back();
+            g_queue_free.pop_back();
+        } else if (g_queue_next_slot < kMaxQueues) {
+            slot = g_queue_next_slot++;
+        }
+        if (slot < kMaxQueues) s->id = g_queue_gen[slot]++ * kMaxQueues + slot;
+    }
+    if (slot >= kMaxQueues) {
         note_free(bb);
         note_free(ka);
         hsa_amd_memory_pool_free(bb);
         hsa_amd_memory_pool_free(ka);
         hsa_queue_destroy(s->q);
-        device_set_error("rad_stream_create: more than %u streams in one process", kMaxQueues);
+        device_set_error("rad_stream_create: more than %u streams live at once", kMaxQueues);
         return RAD_E_NOMEM;
     }
-    g_queue_by_id[s->id].store(s->q, std::memory_order_release);
+    g_queue_id_at[slot].store(s->id, std::memory_order_release);
+    g_queue_by_id[slot].store(s->q, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         G().streams.push_back(s.get());
@@ -1604,14 +1634,24 @@ int a_stream_create(RadStream* out, int high_priority) {
 void a_stream_destroy(RadStream rs) {
     Stream* s = ours(rs);
     if (!s) return;
-    (void)stream_drain(s);
+    /* Undrained (a closed gate, a fault), the queue may still be read by the card, and so may its
+     * kernel argument ring: both are left allocated rather than freed under it. */
+    if (const int rc = stream_drain(s); rc < 0) {
+        RAD_WARN("device: a stream was destroyed with work it could not drain (%s); its queue and "
+                 "argument ring stay allocated", rad_strerror(rc));
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(G().streams_mu);
         auto& v = G().streams;
         for (size_t i = 0; i < v.size(); ++i) if (v[i] == s) { v.erase(v.begin() + (long)i); break; }
     }
-    g_queue_by_id[s->id].store(nullptr, std::memory_order_release);
+    g_queue_by_id[s->id % kMaxQueues].store(nullptr, std::memory_order_release);
     hsa_queue_destroy(s->q);
+    {
+        std::lock_guard<std::mutex> lk(g_queue_slot_mu);
+        g_queue_free.push_back(s->id % kMaxQueues);
+    }
     note_free(s->karg);
     note_free(s->bounce);
     hsa_amd_memory_pool_free(s->karg);
@@ -1676,7 +1716,7 @@ bool xp_list_finished(int ord, uint32_t k);
 bool reusable(const Sig* g) {
     if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
     for (const auto& w : g->waiters) {
-        hsa_queue_t* q = g_queue_by_id[w.first].load(std::memory_order_acquire);
+        hsa_queue_t* q = queue_of(w.first);
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
     }
     const int32_t xd = g->xp_dev.load(std::memory_order_acquire);
@@ -1902,7 +1942,7 @@ std::vector<Tape*> g_tape_retired;
  * kReserveMargin past it has launched, which proves it as in reserve(). */
 bool tape_idle(const Tape* t) {
     for (const auto& l : t->last) {
-        hsa_queue_t* q = g_queue_by_id[l.first].load(std::memory_order_acquire);
+        hsa_queue_t* q = queue_of(l.first);
         if (q && hsa_queue_load_read_index_scacquire(q) < l.second + kReserveMargin) return false;
     }
     return true;

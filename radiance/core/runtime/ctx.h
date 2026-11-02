@@ -40,10 +40,6 @@ class Registry;
 struct XpState;
 struct XpLayer;
 
-/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
- * room for an architecture plugin's private ops without a variable-length array on the hot path. */
-constexpr int MAX_OPERANDS = 32;
-
 typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
 
 /* "[shape]/[stride]" of a tensor's live dimensions, for diagnostics. */

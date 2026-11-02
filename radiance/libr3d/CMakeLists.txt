@@ -115,16 +115,15 @@ set(R3D_UNITS
   # fragment-order permute is the row's own relayout hook, at load.
   "r3d_gemm_w4a16_nt_m64|"
   "r3d_gemm_w5a16_nt_m64|"
-  # The gated-delta-net chunk preamble: the gram and the blocked inverse of I + the strictly
-  # lower decayed gram, one 64-chunk a workgroup, the gram per k head.
-  "r3d_gdn_kkt_solve_c64|"
-  # The gated-delta-net chunked scan: the chunk's output and its closing state, the recurrent
-  # state in wave-matrix accumulators across the chunk loop.
-  "r3d_gdn_chunk_scan_k128_v128_c64|"
+  # The gated-delta-net chunk preamble, chunked scan and recurrent update: libhalo's kernels
+  # (r3dh_*, the halo_ -> r3dh_ rename), checked against libref on gfx1151 and compiled here for
+  # the whole family. The recurrent update serves both state forms (per_candidate and anchor).
+  "r3dh_gdn_kkt_solve|"
+  "r3dh_gdn_chunk_scan|"
+  "r3dh_gdn_recurrent_update|"
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"
-  "r3d_gdn_recurrent_update_k128_v128|"
   # Mixture of experts: each routing weight times its expert's own scale, in place.
   "r3d_expert_scale_bf16|"
   # The router: softmax over the expert logits, the top_k by value, renormalised if `norm`.

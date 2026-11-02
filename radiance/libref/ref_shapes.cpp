@@ -634,6 +634,16 @@ int ref_pool_cols_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("pool_cols", operand, out);
 }
 
+int ref_point_fourier_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), F = gi(p, n_p, "freqs", 0);
+    if (M <= 0 || n <= 0 || F <= 0 || F > 30) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(RAD_F32, { M, n });              /* x */
+    o.t(D, { M, n * (2 * F + 1) });      /* y */
+    return o.finish("point_fourier", operand, out);
+}
+
 int ref_relu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

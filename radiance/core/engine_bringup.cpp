@@ -11,6 +11,7 @@
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
+#include "gen/shape_driver.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -1110,6 +1111,25 @@ int Engine::declare() {
             if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0 && pb.gen_shape) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "a shape generator: a denoising step's two branches or a query pass's "
+                       "points, whichever is more");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 1;
+                decide("--max-num-seqs", "1", "a shape generator: a pass is one request's");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "a shape generator: a pass's rows");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0 && pb.gen_video) {
             if (!cfg_.given.count("--max-num-batched-tokens")) {
                 cfg_.max_tok = pb.gen_rows;
@@ -1809,6 +1829,7 @@ int Engine::plan() {
             f.staging = r->program.is_generator()       ? gen::Driver::device_bytes(r->program)
                       : r->program.is_audio_generator() ? gen::AudioDriver::device_bytes(r->program)
                       : r->program.is_video_generator() ? gen::VideoDriver::device_bytes(r->program)
+                      : r->program.is_shape_generator() ? gen::ShapeDriver::device_bytes(r->program)
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
@@ -4185,6 +4206,8 @@ int Engine::load_vocab() {
             return RAD_E_FORMAT;
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
+    } else if (meta_textless(rad_meta_gets(&meta_, "radiance.text", nullptr))) {
+        vocab_textless(vb);
     } else if (ckpt_->is_gguf()) {
         /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
          * container converted with --tokenizer bakes in the declared one). */

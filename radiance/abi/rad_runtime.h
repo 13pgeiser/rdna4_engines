@@ -325,6 +325,11 @@ typedef struct RadBatch {
     const int32_t* plugin_cu;          /* [n_seq + 1] device */
     const int32_t* plugin_words_h;
     const int32_t* plugin_cu_h;
+
+    /* ---- appended in ABI 33 (the shape generator) */
+    /* A shape generator's pass (rad_declare_shape_generator; `gen` is one of its
+     * RAD_GEN_PASS_S*): its payload. Null on every other step. */
+    const struct RadShapeGenBatch* sgen_b;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -711,6 +716,44 @@ typedef struct RadVideoGenBatch {
 } RadVideoGenBatch;
 
 enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+
+/* What a shape generator's pass carries beside the step batch's own fields (rad_builder.h,
+ * RadShapeGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
+ *
+ *   SCOND    `n_tok` is the picture's patches, `patches` [n_tok, 3 enc_patch^2] f32.
+ *   SSTEP    `n_tok` is step_rows. The two branches' latents are entries 0 (the picture's) and 1
+ *            (the unconditioned one) of the image generator's sampler ops (`randn_lanes`,
+ *            `lane_gather`, `flow_euler`): `lat_cu` bounds them and the per-entry arrays are
+ *            theirs, entry 0 guided against entry 1 (`pair` {1, -2}) at the request's scale.
+ *   SLATENT  `n_tok` is latent_rows; nothing of the pass's own.
+ *   SQUERY   `n_tok` is n_query, `query` [n_query, 3] f32: x, y, z a point, and `query_cu`
+ *            {0, n_query}.
+ *
+ * `lanes` and `lat_cu` are staged on every pass; the latent's rows are lat_cu[0..1]. Every
+ * pointer is device memory. */
+typedef struct RadShapeGenBatch {
+    int32_t         lane;
+
+    /* ---- SCOND */
+    const float*    patches;
+
+    /* ---- SSTEP: the step (from 0) of the request's `n_steps` evaluations, then the two
+     * entries' sampler operands, [2] each but `seed` [2, 2] (low word first) and `lat_cu` [3]. */
+    int32_t         step, n_steps;
+    const float*    sigma;
+    const float*    sigma_next;
+    const float*    cfg;
+    const int32_t*  pair;
+    const int32_t*  lanes;
+    const int32_t*  flags;         /* RAD_GEN_F_FIRST on entry 0 of the first step */
+    const uint32_t* seed;
+    const int32_t*  lat_cu;
+
+    /* ---- SQUERY */
+    int64_t         n_query;
+    const float*    query;
+    const int32_t*  query_cu;
+} RadShapeGenBatch;
 
 /* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
  * keyframe is 1 for the first frame and 2 for the last. */

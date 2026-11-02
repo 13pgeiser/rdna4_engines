@@ -166,6 +166,8 @@ static const RadParamSpec pSegPool[]  = { P_INT("M"), P_INT("n"), P_STR("dtype")
 static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
+static const RadParamSpec pPointFourier[]  = { P_INT("M"), P_INT("n"), P_INT("freqs"), P_INTO("pi"),
+                                          P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]  = { OPD("x"), OUT("y") };
 /* The audio (USM conformer) tower's operators, as in libref. */
@@ -992,6 +994,10 @@ static const RadOpSchema kSchemas[] = {
 { "pool_cols", ARR(pPoolRows), ARR(oUnary),
   "y[m][c] = the mean of x[m]'s columns [c*k, c*k + k), rounded to y's dtype, times mult, rounded "
   "again." },
+{ "point_fourier", ARR(pPointFourier), ARR(oUnary),
+  "A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)] over x's n values, "
+  "sines then cosines each i-major then j, f_j = 2^j for j < freqs (times pi with `pi` 1); the "
+  "products f32, the sine and cosine f32 rounded once to y's dtype. y is [M, n (2 freqs + 1)]." },
 { "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
   "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
@@ -1612,6 +1618,8 @@ SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, 
        DT_FLOAT, L(pool_rows)),
 SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
        "multiplier", DT_FLOAT, L(pool_cols)),
+SIMPLE("avx_point_fourier", "point_fourier", "elem", "a point's sines and cosines at octaves",
+       DT_FLOAT, L(point_fourier)),
 SIMPLE("avx_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, L(relu)),
 SIMPLE("avx_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, L(clamp)),
 SIMPLE("avx_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",

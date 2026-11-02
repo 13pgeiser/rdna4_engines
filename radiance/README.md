@@ -6,7 +6,8 @@ APIs, Anthropic's Messages API and llama-server's native one, so their clients a
 unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this
 tree are built and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
-The bundled device kernels (`libr4d`) target AMD RDNA4 (`gfx1200`, `gfx1201`). The serve flags
+The bundled device kernels target AMD RDNA4 (`libr4d`: `gfx1200`, `gfx1201`), RDNA3 (`libr3d`:
+`gfx11xx`) and Strix Halo (`libhalo`: `gfx1151`). The serve flags
 below are for two 32 GB cards (Radeon AI PRO R9700). The engine starts on any AMD GPU family;
 another card needs a kernel library for it. A machine with no GPU builds the host backend, whose
 AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (EmbeddingGemma 2,
@@ -150,8 +151,8 @@ card works best with Resizable BAR on (Above 4G Decoding and Resizable BAR in th
 without it the engine keeps kernel arguments in pinned host memory, and every dispatch reads them
 over the link. The image
 is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its kernels
-built for `gfx1201`. Pull it, clone this repository for its compose files, then start a model from
-one of them:
+built for `gfx1201` (RDNA4), `gfx11-generic` (RDNA3) and `gfx1151` (Strix Halo). Pull it, clone
+this repository for its compose files, then start a model from one of them:
 
 ```sh
 docker pull stilldeadcode/radiance

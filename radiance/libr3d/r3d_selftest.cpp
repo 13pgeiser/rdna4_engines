@@ -1774,16 +1774,23 @@ static int build_moe_scatter(Case& c, const RadOpSchema* s) {
     return 0;
 }
 
+/* moe_gemm_q at fp8a8f32 (the e4m3 row's dtype): E4M3 activation and experts, an f32 scale per
+ * (row, 128 of K) and per 128x128 tile of each expert, the even/odd weight tables stacked, y bf16. */
 static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
-    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2, GR = 1;   // T = 16; N % 128
-    const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
-    if (s->n_operands != 9) { fail("moe_gemm_q: the schema has %d operands, not 9",
-                                    s->n_operands); return 1; }
+    constexpr int NOPD = 9;
+    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
+    const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2, NB = (N + 127) / 128;
+    if (s->n_operands != NOPD) { fail("moe_gemm_q: the schema has %d operands, not 9",
+                                      s->n_operands); return 1; }
     c.n_p = 0;
-    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
+                            { "K", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
                             { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
-                            { "grid_rows", RAD_P_INT, GR, 0, nullptr, 0.0 },
-                            { "dtype", RAD_P_STR, 0, 0, (const char*)"w4a8", 0.0 } };
+                            { "group", RAD_P_INT, 128, 0, nullptr, 0.0 },
+                            { "a_order", RAD_P_STR, 0, 0, (const char*)"token", 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"fp8a8f32", 0.0 } };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
 
     uint32_t st = 0x0E0E5A1Cu;
@@ -1795,8 +1802,8 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
     for (auto& x : ha) x = re4();
     for (auto& x : hw0) x = re4();
     for (auto& x : hw1) x = re4();
-    std::vector<float> hA((size_t)M * (K / 128)), hW0((size_t)NE0 * (N / GR) * (K / 128)),
-        hW1((size_t)NE1 * (N / GR) * (K / 128));
+    std::vector<float> hA((size_t)M * (K / 128)), hW0((size_t)NE0 * NB * (K / 128)),
+        hW1((size_t)NE1 * NB * (K / 128));
     for (auto& x : hA) x = rndf();
     for (auto& x : hW0) x = rndf();
     for (auto& x : hW1) x = rndf();
@@ -1805,21 +1812,22 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
     for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
     ho[NE] = (int32_t)T;
 
-    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[9] = {
+    // The contract's order: a, a_scale, w, w_scale, sorted_tok, expert_offset, w_odd, w_odd_scale, y.
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[NOPD] = {
         { RAD_F8E4M3, 2, { M, K, 1 }, M * K },
         { RAD_F32, 2, { M, K / 128, 1 }, M * (K / 128) },
+        { RAD_F8E4M3, 3, { NE0, N, K }, NE0 * N * K },
+        { RAD_F32, 3, { NE0, NB, K / 128 }, NE0 * NB * (K / 128) },
         { RAD_I32, 1, { T, 1, 1 }, T },
         { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
-        { RAD_F8E4M3, 3, { NE0, N, K }, NE0 * N * K },
-        { RAD_F32, 3, { NE0, N / GR, K / 128 }, NE0 * (N / GR) * (K / 128) },
         { RAD_F8E4M3, 3, { NE1, N, K }, NE1 * N * K },
-        { RAD_F32, 3, { NE1, N / GR, K / 128 }, NE1 * (N / GR) * (K / 128) },
-        { RAD_F32, 2, { T, N, 1 }, T * N } };
-    const uint32_t bytes_of[] = { 1, 4, 4, 4, 1, 4, 1, 4, 4 };
-    const void* src[] = { ha.data(), hA.data(), hs.data(), ho.data(), hw0.data(), hW0.data(),
-                          hw1.data(), hW1.data(), nullptr };
-    for (int o = 0; o < 9; ++o) {
-        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+        { RAD_F32, 3, { NE1, NB, K / 128 }, NE1 * NB * (K / 128) },
+        { RAD_BF16, 2, { T, N, 1 }, T * N } };
+    const uint32_t bits_of[NOPD] = { 8, 32, 8, 32, 32, 32, 8, 32, 16 };
+    const void* src[NOPD] = { ha.data(), hA.data(), hw0.data(), hW0.data(), hs.data(), ho.data(),
+                              hw1.data(), hW1.data(), nullptr };
+    for (int o = 0; o < NOPD; ++o) {
+        const size_t bytes = (size_t)((qd[o].nel * bits_of[o] + 7) / 8);
         void* d = nullptr;
         if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_q: hipMalloc(%zu) failed", bytes);
                                                   return 1; }
@@ -1835,13 +1843,19 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
 }
 
 static int build_moe_gemm_bf16(Case& c, const RadOpSchema* s) {
+    constexpr int NOPD = 5;
     const long long M = 8, N = 128, K = 64, NE = 8, TK = 2;   // T = 16; N % 128, K % 64
     const long long T = M * TK;
-    if (s->n_operands != 5) { fail("moe_gemm_bf16: the schema has %d operands, not 5",
-                                    s->n_operands); return 1; }
+    if (s->n_operands != NOPD) { fail("moe_gemm_bf16: the schema has %d operands, not 5",
+                                      s->n_operands); return 1; }
     c.n_p = 0;
-    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
-                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 } };
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
+                            { "K", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "a_order", RAD_P_STR, 0, 0, (const char*)"token", 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"bf16", 0.0 } };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
 
     uint32_t st = 0x1A2B3C4Du;
@@ -1855,16 +1869,17 @@ static int build_moe_gemm_bf16(Case& c, const RadOpSchema* s) {
     for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
     ho[NE] = (int32_t)T;
 
-    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[5] = {
+    // The contract's order: a, w (one stacked table), sorted_tok, expert_offset, y.
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[NOPD] = {
         { RAD_BF16, 2, { M, K, 1 }, M * K },
         { RAD_BF16, 3, { NE, N, K }, NE * N * K },
         { RAD_I32, 1, { T, 1, 1 }, T },
         { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
         { RAD_BF16, 2, { T, N, 1 }, T * N } };
-    const uint32_t bytes_of[] = { 2, 2, 4, 4, 2 };
-    const void* src[] = { ha.data(), hw.data(), hs.data(), ho.data(), nullptr };
-    for (int o = 0; o < 5; ++o) {
-        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+    const uint32_t bits_of[NOPD] = { 16, 16, 32, 32, 16 };
+    const void* src[NOPD] = { ha.data(), hw.data(), hs.data(), ho.data(), nullptr };
+    for (int o = 0; o < NOPD; ++o) {
+        const size_t bytes = (size_t)((qd[o].nel * bits_of[o] + 7) / 8);
         void* d = nullptr;
         if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_bf16: hipMalloc(%zu) failed", bytes);
                                                   return 1; }
@@ -1879,15 +1894,22 @@ static int build_moe_gemm_bf16(Case& c, const RadOpSchema* s) {
     return 0;
 }
 
+/* moe_gemm_q at mxfp4a8: E4M3 activation with an f32 scale per (row, 128 of K); E2M1 experts (two
+ * codes a byte, shaped in codes) with an E8M0 exponent per (row, 32 of K), typed raw u8; y bf16. */
 static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
-    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2, GR = 1;   // T = 16; N % 128
+    constexpr int NOPD = 9;
+    const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
     const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
-    if (s->n_operands != 9) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 9",
-                                    s->n_operands); return 1; }
+    if (s->n_operands != NOPD) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 9",
+                                      s->n_operands); return 1; }
     c.n_p = 0;
-    const RadParam pp[] = { { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
+                            { "K", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
                             { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
-                            { "grid_rows", RAD_P_INT, GR, 0, nullptr, 0.0 },
+                            { "group", RAD_P_INT, 128, 0, nullptr, 0.0 },
+                            { "a_order", RAD_P_STR, 0, 0, (const char*)"token", 0.0 },
                             { "dtype", RAD_P_STR, 0, 0, (const char*)"mxfp4a8", 0.0 } };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
 
@@ -1895,15 +1917,14 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
     auto rnd = [&]() { st = st * 1664525u + 1013904223u; return (st >> 8) & 0xffu; };
     auto rndf = [&]() { st = st * 1664525u + 1013904223u; return 0.5f + ((st >> 8) & 0xff) / 255.0f; };
     auto re4 = [&]() { return (uint8_t)(((rnd() & 0x7) | 1) << 3 | (rnd() & 0x7) | ((rnd() & 1) << 7)); };
-    auto re2 = [&]() { return (uint8_t)(rnd() & 0xF); };   // E2M1 code (4 bits)
+    auto re2x2 = [&]() { return (uint8_t)(rnd() & 0xFF); };   // two E2M1 codes
     auto re8 = [&]() { return (uint8_t)(120 + (rnd() & 14)); };  // E8M0 near 1.0 (exp 120..133)
     std::vector<uint8_t> ha((size_t)M * K), hw0((size_t)NE0 * N * (K / 2)), hw1((size_t)NE1 * N * (K / 2));
     for (auto& x : ha) x = re4();
-    for (auto& x : hw0) x = re2();
-    for (auto& x : hw1) x = re2();
+    for (auto& x : hw0) x = re2x2();
+    for (auto& x : hw1) x = re2x2();
     std::vector<float> hA((size_t)M * (K / 128));
-    std::vector<uint8_t> hW0((size_t)NE0 * (N / GR) * (K / 32)),
-        hW1((size_t)NE1 * (N / GR) * (K / 32));
+    std::vector<uint8_t> hW0((size_t)NE0 * N * (K / 32)), hW1((size_t)NE1 * N * (K / 32));
     for (auto& x : hA) x = rndf();
     for (auto& x : hW0) x = re8();
     for (auto& x : hW1) x = re8();
@@ -1912,21 +1933,22 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
     for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
     ho[NE] = (int32_t)T;
 
-    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[9] = {
+    // The contract's order: a, a_scale, w, w_scale, sorted_tok, expert_offset, w_odd, w_odd_scale, y.
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[NOPD] = {
         { RAD_F8E4M3, 2, { M, K, 1 }, M * K },
         { RAD_F32, 2, { M, K / 128, 1 }, M * (K / 128) },
+        { RAD_FP4E2M1, 3, { NE0, N, K }, NE0 * N * K },
+        { RAD_U8, 3, { NE0, N, K / 32 }, NE0 * N * (K / 32) },
         { RAD_I32, 1, { T, 1, 1 }, T },
         { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
-        { RAD_FP4E2M1, 3, { NE0, N, K / 2 }, NE0 * N * (K / 2) },
-        { RAD_U8, 3, { NE0, N / GR, K / 32 }, NE0 * (N / GR) * (K / 32) },
-        { RAD_FP4E2M1, 3, { NE1, N, K / 2 }, NE1 * N * (K / 2) },
-        { RAD_U8, 3, { NE1, N / GR, K / 32 }, NE1 * (N / GR) * (K / 32) },
+        { RAD_FP4E2M1, 3, { NE1, N, K }, NE1 * N * K },
+        { RAD_U8, 3, { NE1, N, K / 32 }, NE1 * N * (K / 32) },
         { RAD_BF16, 2, { T, N, 1 }, T * N } };
-    const uint32_t bytes_of[] = { 1, 4, 4, 4, 1, 1, 1, 1, 2 };
-    const void* src[] = { ha.data(), hA.data(), hs.data(), ho.data(), hw0.data(), hW0.data(),
-                          hw1.data(), hW1.data(), nullptr };
-    for (int o = 0; o < 9; ++o) {
-        const size_t bytes = (size_t)qd[o].nel * bytes_of[o];
+    const uint32_t bits_of[NOPD] = { 8, 32, 4, 8, 32, 32, 4, 8, 16 };
+    const void* src[NOPD] = { ha.data(), hA.data(), hw0.data(), hW0.data(), hs.data(), ho.data(),
+                              hw1.data(), hW1.data(), nullptr };
+    for (int o = 0; o < NOPD; ++o) {
+        const size_t bytes = (size_t)((qd[o].nel * bits_of[o] + 7) / 8);
         void* d = nullptr;
         if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_mxfp4a8: hipMalloc(%zu) failed", bytes);
                                                   return 1; }
@@ -1995,6 +2017,7 @@ static int build_moe_router_sigmoid(Case& c, const RadOpSchema* s) {
     const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
                             { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
                             { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "norm", RAD_P_INT, 1, 0, nullptr, 0.0 },
                             { "route_scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
                             { "dtype", RAD_P_STR, 0, 0, (const char*)"bf16", 0.0 } };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
@@ -2090,7 +2113,8 @@ static int build_gdn_recurrent(Case& c, const RadOpSchema* s) {
     c.n_p = 0;
     const RadParam pp[] = { { "q_len", RAD_P_INT, T, 0, nullptr, 0.0 },
                             { "head_k", RAD_P_INT, K, 0, nullptr, 0.0 },
-                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 } };
+                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 },
+                            { "eps", RAD_P_F64, 0, 0, nullptr, 1e-6 } };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
 
     uint32_t st = 0x4A7B2C9Du;
@@ -2111,7 +2135,9 @@ static int build_gdn_recurrent(Case& c, const RadOpSchema* s) {
     for (auto& x : hnw)    x = (rndf() - 0.5f) * 2.0f;
     std::vector<uint16_t> ho(T*H*V, 0x7fc0u);
     const int sidxv[T] = { 0, 0, 1, 1 };
-    const int nav[1] = { 0 };
+    /* num_accepted counts from 1 (docs/OPS.md): the window's history is read at column
+     * num_accepted - 1, so 1 is the handover out of a prefill. */
+    const int nav[1] = { 1 };
     const int cuv[2] = { 0, (int)T };
 
     struct { uint32_t dt; long long nel; } qd[16] = {
@@ -2478,6 +2504,278 @@ launched:
 }
 
 /* ================================================================== main */
+/* ================================================================== the grouped GEMMs, by value
+ *
+ * The row cases above check that each MoE GEMM runs and writes finite planes; this checks what it
+ * writes. A routed batch (random ids, some outside the local slice and so dropped, stably sorted
+ * by expert as moe_scatter sorts them) runs through moe_gemm at bf16 and moe_gemm_q at fp8a8f32
+ * (every impl arm) and mxfp4a8, in both a_orders, with the experts as the engine hands them: a
+ * device table of one pointer per expert (stride[0] 0), even and odd experts in separate classes.
+ * N is not a multiple of the 128-column block, so the tail block is checked too. The reference is
+ * libref's arithmetic on the host (the products exact, the sums in double); a dropped row must be
+ * zero. Agreement is the relative L2 error over y, as rad-kbench measures it.
+ */
+#ifdef RAD_HAVE_HIP
+namespace moenum {
+
+struct Dev {
+    std::vector<void*> p;
+    ~Dev() { for (void* x : p) hipFree(x); }
+    void* put(const void* h, size_t n) {
+        void* d = nullptr;
+        if (hipMalloc(&d, n ? n : 4) != hipSuccess) return nullptr;
+        p.push_back(d);
+        if (h && n) hipMemcpy(d, h, n, hipMemcpyHostToDevice);
+        else hipMemset(d, 0, n ? n : 4);
+        return d;
+    }
+};
+
+RadTensor dense(void* d, uint32_t dt, long long r, long long c) {
+    RadTensor t{};
+    t.data = d; t.dtype = dt; t.rank = 2;
+    t.shape[0] = r; t.shape[1] = c; t.stride[0] = c; t.stride[1] = 1;
+    return t;
+}
+RadTensor vec(void* d, uint32_t dt, long long n) {
+    RadTensor t{};
+    t.data = d; t.dtype = dt; t.rank = 1; t.shape[0] = n; t.stride[0] = 1;
+    return t;
+}
+/* A weight table of `n` entries, each [rows, cols] (cols in elements): the device array of
+ * pointers the core builds for a run of separately placed experts. */
+RadTensor table(Dev& dv, const std::vector<std::vector<uint8_t>>& ent, uint32_t dt, long long rows,
+                long long cols) {
+    std::vector<void*> ptr;
+    for (const auto& e : ent) ptr.push_back(dv.put(e.data(), e.size()));
+    if (ptr.empty()) ptr.push_back(dv.put(nullptr, 64));
+    RadTensor t{};
+    t.data = dv.put(ptr.data(), ptr.size() * sizeof(void*));
+    t.dtype = dt; t.rank = 3;
+    t.shape[0] = (long long)ent.size(); t.shape[1] = rows; t.shape[2] = cols;
+    t.stride[0] = 0; t.stride[1] = cols; t.stride[2] = 1;
+    return t;
+}
+
+struct Route {
+    std::vector<int32_t> sorted, off;
+    long long T = 0;
+};
+/* Each token picks top_k distinct experts out of ne + 1, the last meaning "not on this rank":
+ * those slots are dropped, sorted to the tail as -1. */
+Route route(long long M, long long top_k, long long ne, uint32_t& st) {
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return st >> 8; };
+    Route r;
+    r.T = M * top_k;
+    std::vector<int32_t> ids(r.T);
+    for (long long t = 0; t < M; ++t)
+        for (long long j = 0; j < top_k; ++j) {
+            int32_t e;
+            bool dup;
+            do {
+                e = (int32_t)(rnd() % (uint32_t)(ne + 1));
+                dup = false;
+                for (long long q = 0; q < j; ++q) dup |= ids[t * top_k + q] == e;
+            } while (dup);
+            ids[t * top_k + j] = e;
+        }
+    r.off.assign(ne + 1, 0);
+    for (int32_t e = 0; e < ne; ++e) {
+        r.off[e] = (int32_t)r.sorted.size();
+        for (long long i = 0; i < r.T; ++i) if (ids[i] == e) r.sorted.push_back((int32_t)i);
+    }
+    r.off[ne] = (int32_t)r.sorted.size();
+    while ((long long)r.sorted.size() < r.T) r.sorted.push_back(-1);
+    return r;
+}
+
+int expert_of(const Route& r, long long i, long long ne) {
+    for (long long e = 0; e < ne; ++e) if (r.off[e] <= i && i < r.off[e + 1]) return (int)e;
+    return -1;
+}
+
+void compare(const char* what, const std::vector<double>& ref, const std::vector<uint16_t>& y,
+             double tol) {
+    double num = 0, den = 0, worst_zero = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double v = bf16_to_f32(y[i]);
+        num += (v - ref[i]) * (v - ref[i]);
+        den += ref[i] * ref[i];
+        if (ref[i] == 0.0) worst_zero = std::max(worst_zero, std::fabs(v));
+    }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    if (rel <= tol && worst_zero == 0.0) ok("%s: rel_l2 %.2e", what, rel);
+    else fail("%s: rel_l2 %.2e (tolerance %.0e), a dropped row's largest |y| %.3g", what, rel, tol,
+              worst_zero);
+}
+
+RadParam pi(const char* k, long long v) { return RadParam{ k, RAD_P_INT, v, 0, nullptr, 0.0 }; }
+RadParam ps(const char* k, const char* v) { return RadParam{ k, RAD_P_STR, 0, 0, v, 0.0 }; }
+
+typedef int (*Launch)(const RadArgs*, RadStream);
+
+}  // namespace moenum
+#endif
+
+static void check_moe_numerics() {
+    std::printf("== the grouped GEMMs, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: the grouped GEMMs are not run");
+#else
+    using namespace moenum;
+    auto bf16_launch = (Launch)dlsym(g_h, "r3d_rad_moe_gemm_bf16");
+    auto q_launch    = (Launch)dlsym(g_h, "r3d_rad_moe_gemm_q");
+    auto mx_launch   = (Launch)dlsym(g_h, "r3d_rad_moe_gemm_mxfp4a8");
+    if (!bf16_launch || !q_launch || !mx_launch) {
+        fail("a grouped GEMM entry point is missing");
+        return;
+    }
+
+    const long long M = 12, TK = 2, NE = 6, N = 192;
+    for (int sorted_a = 0; sorted_a < 2; ++sorted_a) {
+        const char* order = sorted_a ? "sorted" : "token";
+        uint32_t st = 0x5EED0000u + (uint32_t)sorted_a;
+        const Route r = route(M, TK, NE, st);
+        const long long T = r.T, AR = sorted_a ? T : M;
+        auto rndf = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f;
+        };
+        auto rnd8 = [&]() { st = st * 1664525u + 1013904223u; return (uint8_t)(st >> 16); };
+        /* An E4M3 code in the normal range (exponent 1..14), either sign. */
+        auto e4 = [&]() {
+            return (uint8_t)(((rnd8() & 0x7) | 1) << 3 | (rnd8() & 0x7) | ((rnd8() & 1) << 7));
+        };
+        auto tok_of = [&](long long i) { return sorted_a ? i : r.sorted[i] / TK; };
+
+        /* ---- moe_gemm, bf16 experts in one class. */
+        {
+            const long long K = 128;
+            Dev dv;
+            std::vector<uint16_t> ha(AR * K);
+            for (auto& x : ha) x = f32_to_bf16(rndf());
+            std::vector<std::vector<uint8_t>> we(NE, std::vector<uint8_t>(N * K * 2));
+            for (auto& e : we) for (long long q = 0; q < N * K; ++q) {
+                const uint16_t b = f32_to_bf16(rndf());
+                std::memcpy(&e[q * 2], &b, 2);
+            }
+            RadTensor t[5] = { dense(dv.put(ha.data(), ha.size() * 2), RAD_BF16, AR, K),
+                               table(dv, we, RAD_BF16, N, K),
+                               vec(dv.put(r.sorted.data(), T * 4), RAD_I32, T),
+                               vec(dv.put(r.off.data(), (NE + 1) * 4), RAD_I32, NE + 1),
+                               dense(dv.put(nullptr, T * N * 2), RAD_BF16, T, N) };
+            const RadParam p[] = { pi("M", T), pi("N", N), pi("K", K), pi("n_expert", NE),
+                                   pi("top_k", TK), ps("a_order", order), ps("dtype", "bf16") };
+            RadArgs a{ t, 5, p, (int)(sizeof(p) / sizeof(p[0])), nullptr, 0, nullptr, 0, 1 };
+            const int rc = bf16_launch(&a, nullptr);
+            std::vector<uint16_t> y(T * N);
+            hipDeviceSynchronize();
+            hipMemcpy(y.data(), t[4].data, y.size() * 2, hipMemcpyDeviceToHost);
+            std::vector<double> ref(T * N, 0.0);
+            for (long long i = 0; i < T; ++i) {
+                const int e = expert_of(r, i, NE);
+                if (e < 0) continue;
+                for (long long n = 0; n < N; ++n) {
+                    double acc = 0;
+                    for (long long k = 0; k < K; ++k) {
+                        uint16_t w; std::memcpy(&w, &we[e][(n * K + k) * 2], 2);
+                        acc += (double)bf16_to_f32(ha[tok_of(i) * K + k]) * bf16_to_f32(w);
+                    }
+                    ref[i * N + n] = acc;
+                }
+            }
+            std::string what = std::string("moe_gemm bf16, a_order ") + order;
+            if (rc != 0) fail("%s: the launch returned %d", what.c_str(), rc);
+            else compare(what.c_str(), ref, y, 1e-2);
+        }
+
+        /* ---- moe_gemm_q at fp8a8f32 (every impl arm) and mxfp4a8: the even and odd classes. */
+        for (int mx = 0; mx < 2; ++mx) {
+            const long long K = 256, NB = (N + 127) / 128;
+            Dev dv;
+            std::vector<uint8_t> ha(AR * K);
+            std::vector<float> has(AR * (K / 128));
+            for (auto& x : ha) x = e4();
+            for (auto& x : has) x = 0.25f + std::fabs(rndf());
+            /* Expert e's codes and scales, and their values for the reference. */
+            const long long wbytes = mx ? N * K / 2 : N * K;
+            const long long scols = mx ? K / 32 : K / 128, srows = mx ? N : NB;
+            std::vector<std::vector<uint8_t>> wc(NE, std::vector<uint8_t>(wbytes)),
+                ws(NE, std::vector<uint8_t>(srows * scols * (mx ? 1 : 4)));
+            for (long long e = 0; e < NE; ++e) {
+                for (auto& x : wc[e]) x = mx ? rnd8() : e4();
+                for (long long q = 0; q < srows * scols; ++q) {
+                    if (mx) {
+                        ws[e][q] = (uint8_t)(120 + (rnd8() & 15));
+                    } else {
+                        const float f = 0.25f + std::fabs(rndf());
+                        std::memcpy(&ws[e][q * 4], &f, 4);
+                    }
+                }
+            }
+            auto wval = [&](int e, long long n, long long k) -> double {
+                if (!mx) {
+                    float sc; std::memcpy(&sc, &ws[e][((n / 128) * scols + k / 128) * 4], 4);
+                    return (double)e4m3_to_f32(wc[e][n * K + k]) * sc;
+                }
+                static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+                const uint8_t b = wc[e][(n * K + k) / 2];
+                const uint8_t nib = (k & 1) ? (uint8_t)(b >> 4) : (uint8_t)(b & 0xf);
+                const double v = (nib & 8) ? -kMag[nib & 7] : kMag[nib & 7];
+                return v * std::ldexp(1.0, (int)ws[e][n * scols + k / 32] - 127);
+            };
+            std::vector<double> ref(T * N, 0.0);
+            for (long long i = 0; i < T; ++i) {
+                const int e = expert_of(r, i, NE);
+                if (e < 0) continue;
+                const long long tk = tok_of(i);
+                for (long long n = 0; n < N; ++n) {
+                    double acc = 0;
+                    for (long long k = 0; k < K; ++k)
+                        acc += (double)e4m3_to_f32(ha[tk * K + k]) * has[tk * (K / 128) + k / 128] *
+                               wval(e, n, k);
+                    ref[i * N + n] = acc;
+                }
+            }
+            std::vector<std::vector<uint8_t>> wc0, wc1, ws0, ws1;
+            for (long long e = 0; e < NE; ++e) {
+                (e % 2 ? wc1 : wc0).push_back(wc[e]);
+                (e % 2 ? ws1 : ws0).push_back(ws[e]);
+            }
+            const uint32_t wdt = mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3;
+            const uint32_t sdt = mx ? (uint32_t)RAD_U8 : (uint32_t)RAD_F32;
+            RadTensor t[9] = { dense(dv.put(ha.data(), ha.size()), RAD_F8E4M3, AR, K),
+                               dense(dv.put(has.data(), has.size() * 4), RAD_F32, AR, K / 128),
+                               table(dv, wc0, wdt, N, K), table(dv, ws0, sdt, srows, scols),
+                               vec(dv.put(r.sorted.data(), T * 4), RAD_I32, T),
+                               vec(dv.put(r.off.data(), (NE + 1) * 4), RAD_I32, NE + 1),
+                               table(dv, wc1, wdt, N, K), table(dv, ws1, sdt, srows, scols),
+                               dense(dv.put(nullptr, T * N * 2), RAD_BF16, T, N) };
+            for (int impl = 0; impl < (mx ? 1 : 3); ++impl) {
+                /* Stale bytes, which a dropped row must not keep. */
+                hipMemset(t[8].data, 0xff, T * N * 2);
+                const RadParam p[] = { pi("M", T), pi("N", N), pi("K", K), pi("n_expert", NE),
+                                       pi("top_k", TK), pi("group", 128), ps("a_order", order),
+                                       ps("dtype", mx ? "mxfp4a8" : "fp8a8f32"), pi("impl", impl),
+                                       pi("vgpr", 128), pi("acc", 0) };
+                RadArgs a{ t, 9, p, (int)(sizeof(p) / sizeof(p[0])), nullptr, 0, nullptr, 0, 1 };
+                const int rc = (mx ? mx_launch : q_launch)(&a, nullptr);
+                std::vector<uint16_t> y(T * N);
+                hipDeviceSynchronize();
+                hipMemcpy(y.data(), t[8].data, y.size() * 2, hipMemcpyDeviceToHost);
+                char what[96];
+                std::snprintf(what, sizeof what, "moe_gemm_q %s%s, a_order %s",
+                              mx ? "mxfp4a8" : "fp8a8f32",
+                              mx ? "" : (impl == 0 ? " impl 0" : impl == 1 ? " impl 1" : " impl 2"),
+                              order);
+                if (rc != 0) fail("%s: the launch returned %d", what, rc);
+                else compare(what, ref, y, 1e-2);
+            }
+        }
+    }
+#endif
+}
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
@@ -2513,6 +2811,7 @@ int main(int argc, char** argv) {
         check_reference_schemas();
         check_band_reach();
         check_shapes();
+        check_moe_numerics();
 
         const int n = rows();
         int passed = 0, failed = 0;

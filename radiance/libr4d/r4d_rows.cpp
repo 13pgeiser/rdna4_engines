@@ -1960,6 +1960,10 @@ static const RadParamSpec pQkNormRope[] = {
 static const RadParamSpec pPoolRows[] = {
     P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"), P_STR("dtype"),
 };
+/* `n` is the point's values; y has n (2 freqs + 1) columns. */
+static const RadParamSpec pPointFourier[] = {
+    P_INT("M"), P_INT("n"), P_INT("freqs"), P_INTO("pi"), P_STR("dtype"),
+};
 /* `positions` may be absent at `rotary_dim` 0 (the norm alone), and an absent gain is a unit
  * gain. */
 static const RadOperandSpec oQkNormRope[] = {
@@ -3048,6 +3052,10 @@ static const RadOpSchema kSchemas[] = {
            "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and "
            "rounded, then times `mult` and rounded again. n, the input width, is a multiple of k; "
            "y has n / k columns."),
+    SCHEMA("point_fourier", pPointFourier, oUnary,
+           "A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)], f_j = 2^j "
+           "for j < freqs (times pi with `pi` 1), sines then cosines each i-major then j; y is "
+           "[M, n (2 freqs + 1)]."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
     SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
@@ -6046,6 +6054,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_pool_cols },
+
+{ "point_fourier_f32", "point_fourier", "elem",
+  "a point's Fourier features: x, then its sines and cosines at octaves (a shape decoder's query "
+  "embedding)",
+  "any n and freqs up to 30; a thread an output column",
+  "f32 in and out, the device's sinf and cosf",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_point_fourier },
 
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",

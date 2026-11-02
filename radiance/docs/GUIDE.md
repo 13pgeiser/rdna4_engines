@@ -316,6 +316,7 @@ and runs.
 | `fishomni` | Fish Audio drama-3, speech from text with speaker tags and inline direction (§5.15) |
 | `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
 | `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
+| `hunyuan3d2` | Hunyuan3D-2's shape model, an untextured 3-D mesh from one picture (§5.17) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -2132,7 +2133,7 @@ by 0.002-0.003 nats.
 | `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
 | `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
-| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
+| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.18) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -2229,6 +2230,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
+| `POST /generate`, `POST /send`, `GET /status/:uid` | Hunyuan3D-2's API server's routes: a 3-D mesh (GLB, OBJ, PLY or STL) from a picture, at once or in the background; needs a shape model (Hunyuan3D-2), else 501 (§5.17) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
@@ -2638,7 +2640,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 |---|---|
 | `model` | accepted and not enforced: one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.17) |
+| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.18) |
 | `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused (§5.8) |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
@@ -2856,6 +2858,7 @@ each field is read, taken without effect, or refused by name.
 | `role: "system"` in `messages` | after the head of the conversation, its text joins a user message at its position, since templates read a system message only at the head: as a text block ahead of the user message right after it, else after the one right before it, else as a user message of its own, so no two user turns follow each other. `clear_at: "next_user_message"` stops rendering it once a later user message (a `tool_result`-only one included) exists. An effort-only message (no text, `output_config: {"effort": ...}`) sets the effort from the next user message on. Blocks other than text (`tool_addition`, ...) are refused |
 | `tools`, `tool_choice` | client tools; server tools (`web_search_…`, `code_execution_…`) are refused. `tool_choice` as an object (`auto`, `any`, `tool`, `none`, `disable_parallel_tool_use`) or a string (`"auto"`, `"none"`, `"any"`); `any` is the chat path's `required` (§5.4) |
 | `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `stream` | as on the chat path; `max_tokens` is optional there too |
+| `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `repeat_last_n` | not Anthropic's: the chat path's fields with its ranges and meaning (§5.7), for clients that speak only this format. The penalties count a token's occurrences in the last `repeat_last_n` tokens of prompt and reply (64 by default, `--repeat-last-n`), as llama.cpp does |
 | `thinking` | `enabled` (its `budget_tokens` is the chat request's `thinking_token_budget`), `adaptive`, `disabled`, `between_tools` (off). `display` and `block_binding` are taken: the reasoning comes back whole, with an empty `signature` |
 | `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
 | `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
@@ -3526,7 +3529,53 @@ The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 
 Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
 `--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
 
-### 5.17 Documents: Unlimited-OCR
+### 5.17 3-D shapes: `/generate`
+
+A shape generation model (Hunyuan3D-2) makes an untextured 3-D mesh from one picture of an object.
+It answers Hunyuan3D-2's own API server's routes, so that server's clients (its Blender add-on,
+scripts written against it) work unchanged: `POST /generate` makes the shape while the request
+waits and answers with the file; `POST /send` makes it in the background and answers at once with
+`{"uid": ...}`; `GET /status/{uid}` reports `{"status": "processing"}` (with `steps_done` of
+`steps`), then `"completed"` with the file as base64 in `model_base64`, or `"error"` with its
+`message`.
+
+```sh
+# The shape model is tencent/Hunyuan3D-2's hunyuan3d-dit-v2-0 folder: config.yaml and
+# model.fp16.safetensors. Its weights ship in fp16 and are cast to bf16 at conversion.
+rad-convert Hunyuan3D-2/hunyuan3d-dit-v2-0 --recipe data/recipes/hunyuan3d-2-bf16.recipe \
+    -o hunyuan3d-2-bf16.rad
+radiance --model hunyuan3d-2-bf16.rad
+
+curl -s http://localhost:8000/generate -H 'Content-Type: application/json' \
+    -d "{\"image\": \"$(base64 -w0 penguin.png)\"}" -o penguin.glb
+```
+
+- **`image`** is the picture as base64 (a data URL is taken too). Give it an alpha channel that cuts
+  the object out: the reference removes an opaque picture's background with rembg first, which this
+  server does not, so an opaque picture is taken whole, background and all. The picture is prepared
+  as the reference prepares it: the alpha's bounding box scaled to 85% of the square that holds the
+  picture, centred on white, 512 x 512, then the image encoder's 518 x 518.
+- **`num_inference_steps`** counts sigma grid points (50, so 49 evaluations, by default; 2 to
+  200); **`guidance_scale`** is the classifier-free guidance against the unconditioned branch (5
+  by default); **`seed`** makes a shape repeatable (1234 when absent, as the reference).
+- **`octree_resolution`** is the grid's cells a side the field is sampled on (256 by default, 16
+  to 512). The grid is sampled coarse to fine, as FlashVDM's hierarchical decoding does: the whole
+  grid at the coarsest level (the resolution halved while it stays at least 63), then only the
+  points near the surface at each finer level; with `"volume_decoding": "dense"` every point of
+  the finest grid is sampled instead, as the reference's default decoder does (slower, the same
+  field). The surface is marching cubes over the finest grid at level 0.
+- **`type`** is the file: `glb` (the default; positions, smooth normals and faces), `obj`, `ply`
+  (binary) or `stl` (binary). The mesh is the raw surface, as the reference's `/generate` returns
+  it without texturing: no floater removal or face reduction.
+- **`texture`** true (Hunyuan3D-Paint) is refused: this server makes the untextured shape. So are
+  the reference's `text` (its text-to-image front end) and `mesh` (re-texturing) inputs.
+
+A shape is about 3 TFLOP of conditioning, 18 TFLOP a denoising step (both branches) and 34 MFLOP
+a sampled grid point. The model runs on one card (2.2B parameters, 4.4 GiB in bf16); `--tp` above 1
+is refused. The licence (Tencent Hunyuan 3D 2.0 Community License) does not cover the European
+Union, the United Kingdom or South Korea.
+
+### 5.18 Documents: Unlimited-OCR
 
 `unlimited-ocr` (baidu/Unlimited-OCR, bf16; the converted container is
 [Aijuus/unlimited-ocr-bf16](https://huggingface.co/Aijuus/unlimited-ocr-bf16), with its recipe;
@@ -3895,7 +3944,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.15.1
+I STARTUP REPORT -- radiance 1.16.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

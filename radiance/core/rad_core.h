@@ -17,6 +17,11 @@
 
 namespace rad {
 
+/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
+ * room for an architecture plugin's private ops without a variable-length array on the hot path.
+ * The plugin loader refuses a schema with more, so no issue carries more. */
+constexpr int MAX_OPERANDS = 32;
+
 namespace mm { struct Item; struct PromptMedia; }
 
 class Registry;
@@ -451,9 +456,15 @@ public:
         std::vector<int64_t>     decoder_max_area;
     } vgen_str;
     bool is_video_generator() const { return video_gen.max_lanes != 0; }
+    /* The declared shape generator (rad_declare_shape_generator); `max_lanes` 0 when none. Its
+     * name points at `sgen_name`. */
+    RadShapeGenDecl shape_gen{};
+    std::string     sgen_name;
+    bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
     /* Driven by passes, not token steps: any generator. */
     bool is_pass_driven() const {
-        return is_generator() || is_audio_generator() || is_video_generator();
+        return is_generator() || is_audio_generator() || is_video_generator() ||
+               is_shape_generator();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan

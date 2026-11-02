@@ -483,6 +483,16 @@ int gptq_quantise(const Grid& g, float* w, int32_t* codes, Scales& scales, int64
         gptq_tcq_colf(w, scales, N, K);
     }
     if (g.tcq_L) {
+        /* Only the last run can be short, and one shorter than a state's codes cannot hold its
+         * seam: the decoder refuses it (grid_tcq_decode), so the encoder does too. */
+        const int64_t c = (g.tcq_L + g.tcq_k - 1) / g.tcq_k;
+        if (N > 0 && N - (N - 1) / g.tcq_rows * g.tcq_rows < c) {
+            if (why) *why = "the last trellis run is " +
+                            std::to_string(N - (N - 1) / g.tcq_rows * g.tcq_rows) + " row(s) of " +
+                            std::to_string(N) + " (tcq_rows " + std::to_string(g.tcq_rows) +
+                            "), shorter than the " + std::to_string(c) + " a seam state needs";
+            return RAD_E_SHAPE;
+        }
         if (gpu_enabled()) {
             std::string w1;
             const int st = gptq_tcq_gpu(g, w, codes, scales, N, K, u, dynamic, &w1);

@@ -390,10 +390,13 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
 
 /* ================================================================== the launchers */
 
-static int mt_for(int M)
+/* The tile's rows: the power of two that holds M, widened while its chunk (2048 / mt codes) does
+ * not divide K. The extra rows are idle. At 16 rows the chunk is 128, which the row's constraints
+ * (K a multiple of 128) always divide. */
+static int mt_for(int M, int K)
 {
     int mt = 1;
-    while (mt < M && mt < kMTMax) mt *= 2;
+    while ((mt < M || K % (2048 / mt)) && mt < kMTMax) mt *= 2;
     return mt;
 }
 
@@ -407,7 +410,7 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
     if (group != kGroup) return -2;
     if (K % kGroup) return -2;                /* the activation's scale group */
     if (K % kMX) return -2;                   /* the weight's 32-block */
-    const int mt = mt_for(M);
+    const int mt = mt_for(M, K);
     const int chunk = 2048 / mt;
     if (K % chunk) return -2;
     if (!a_ld) a_ld = K;
@@ -433,6 +436,13 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
                         (const uint8_t*)b_scale, (int)e8_row, (uint16_t*)y, M, N, K, chunk, a_ld,      \
                         y_ld);                                                                        \
     } while (0)
+    switch (mt) {
+        case 1:  R3D_MXFP4A8_M16(1);  break;
+        case 2:  R3D_MXFP4A8_M16(2);  break;
+        case 4:  R3D_MXFP4A8_M16(4);  break;
+        case 8:  R3D_MXFP4A8_M16(8);  break;
+        default: R3D_MXFP4A8_M16(16); break;
+    }
 #undef R3D_MXFP4A8_M16
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }

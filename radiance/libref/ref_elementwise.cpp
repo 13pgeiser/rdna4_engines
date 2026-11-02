@@ -8,6 +8,7 @@
 #include "ref_ops.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 using namespace ref;
@@ -520,6 +521,42 @@ int ref_pool_cols(const RadArgs* a, RadStream) {
             for (int64_t j = 0; j < k; ++j) acc += ldt(X, rowoff(X, r, n) + (c * k + j) * xs);
             stt(Y, yb + c * ys, acc * inv);
             stt(Y, yb + c * ys, ldt(Y, yb + c * ys) * mult);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ point_fourier */
+/* A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)] over x's n values,
+ * the sines and the cosines each i-major then j, f_j = 2^j for j < freqs (times pi with `pi` 1),
+ * so y has n (2 freqs + 1) columns. The products are f32 (exact without pi: a power of two), the
+ * sine and cosine f32 and rounded once to y's dtype, as Hunyuan3D-2's shape VAE embeds a query
+ * point. */
+int ref_point_fourier(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), F = p_int(a, "freqs", 0);
+    const bool pi = p_int(a, "pi", 0) != 0;
+    if (n <= 0 || F <= 0 || F > 30) return RAD_E_SHAPE;
+    const int64_t w = n * (2 * F + 1);
+    const int64_t M = rows_of(X, n);
+    if (M <= 0 || numel(Y) < M * w) return RAD_E_SHAPE;
+    float f[30];
+    for (int64_t j = 0; j < F; ++j)
+        f[j] = pi ? (float)std::ldexp(3.14159265358979323846, (int)j) : std::ldexp(1.0f, (int)j);
+
+    REF_PAR_FOR(M * w)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, w);
+        const int64_t xs = laststride(X), ys = laststride(Y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = ldt(X, xb + i * xs);
+            stt(Y, yb + i * ys, v);
+            for (int64_t j = 0; j < F; ++j) {
+                const float t = v * f[j];
+                stt(Y, yb + (n + i * F + j) * ys, std::sin(t));
+                stt(Y, yb + (n + n * F + i * F + j) * ys, std::cos(t));
+            }
         }
     }
     return RAD_OK;
