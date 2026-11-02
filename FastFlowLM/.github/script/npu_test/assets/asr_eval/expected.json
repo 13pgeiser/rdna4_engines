@@ -1,0 +1,65 @@
+{
+  "_note": "Error rates of main (77bc6bdd, flm 1.0.9) per platform, Whisper-V3-Turbo-NPU2, 2026-10-16. Used only by runs with no baseline build. Update a platform's entry when main's accuracy on it changes on purpose.",
+  "platforms": {
+    "linux": {
+      "measured": "Strix NPU, local run of main's CI-built portable",
+      "overall": 0.1855,
+      "sets": {
+        "en-short": 0.0971,
+        "en-long": 0.1189,
+        "en-longform": 0.1653,
+        "de-fleurs": 0.3814,
+        "es-fleurs": 0.1542,
+        "fr-fleurs": 0.2769,
+        "ja-fleurs": 0.194,
+        "zh-fleurs": 0.1348,
+        "ar-fleurs": 0.4171
+      }
+    },
+    "linux-hrx": {
+      "measured": "Strix NPU, local run of main's CI-built portable",
+      "overall": 0.2263,
+      "sets": {
+        "en-short": 0.0971,
+        "en-long": 0.1189,
+        "en-longform": 0.3679,
+        "de-fleurs": 0.386,
+        "es-fleurs": 0.1542,
+        "fr-fleurs": 0.2851,
+        "ja-fleurs": 0.194,
+        "zh-fleurs": 0.1348,
+        "ar-fleurs": 0.4652
+      }
+    },
+    "windows": {
+      "measured": "ASR Test run 38853168399, main's portable as the baseline",
+      "overall": 0.1861,
+      "sets": {
+        "en-short": 0.0835,
+        "en-long": 0.1209,
+        "en-longform": 0.1167,
+        "de-fleurs": 0.4326,
+        "es-fleurs": 0.1542,
+        "fr-fleurs": 0.3347,
+        "ja-fleurs": 0.1902,
+        "zh-fleurs": 0.1509,
+        "ar-fleurs": 0.4599
+      }
+    },
+    "windows-hrx": {
+      "measured": "ASR Test run 38853168399, main's portable as the baseline",
+      "overall": 0.1944,
+      "sets": {
+        "en-short": 0.0971,
+        "en-long": 0.1189,
+        "en-longform": 0.1864,
+        "de-fleurs": 0.3907,
+        "es-fleurs": 0.1583,
+        "fr-fleurs": 0.2975,
+        "ja-fleurs": 0.1883,
+        "zh-fleurs": 0.1482,
+        "ar-fleurs": 0.4545
+      }
+    }
+  }
+}

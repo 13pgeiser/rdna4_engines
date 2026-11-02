@@ -1,0 +1,26 @@
+Source: fastflowlm
+Section: utils
+Priority: optional
+Maintainer: FastFlowLM <noreply@example.com>
+Build-Depends: debhelper-compat (= 13),
+ build-essential,
+ cargo,
+ cmake,
+ git,
+ libboost-dev,
+ libboost-program-options-dev,
+ libcurl4-openssl-dev,
+ libdrm-dev,
+ libedit-dev,
+ libxrt-dev,
+ ninja-build,
+ pkg-config,
+ rustc,
+ uuid-dev
+Standards-Version: 4.7.3
+
+Package: fastflowlm
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${flm:RuntimeDepends}
+Description: FastFlowLM CLI
+ FastFlowLM runtime and CLI.

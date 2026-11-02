@@ -1,0 +1,1057 @@
+{
+ "source": "FLEURS test split (google/fleurs), CC BY 4.0",
+ "parquet_revision": "168de341b3db6859a9bac1c50a2ef5e3b47647e0",
+ "sample_rate": 16000,
+ "items": [
+  {
+   "file": "en-short-00.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 10.68,
+   "fleurs_ids": [
+    1660
+   ],
+   "reference": "romanticism had a large element of cultural determinism drawn from writers such as goethe fichte and schlegel",
+   "raw_reference": "Romanticism had a large element of cultural determinism, drawn from writers such as Goethe, Fichte, and Schlegel."
+  },
+  {
+   "file": "en-short-01.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 6.36,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "he did not set a figure for the cuts saying they will be made based on china's economic output",
+   "raw_reference": "He did not set a figure for the cuts, saying they will be made based on China's economic output."
+  },
+  {
+   "file": "en-short-02.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 8.38,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "alloys are basically a mixture of two or more metals don't forget that there are many elements on the periodic table",
+   "raw_reference": "Alloys are basically a mixture of two or more metals. Don't forget that there are many elements on the periodic table."
+  },
+  {
+   "file": "en-short-03.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 12.12,
+   "fleurs_ids": [
+    1663
+   ],
+   "reference": "cochamó valley - chile's premier climbing destination known as the yosemite of south america with a variety of granite big walls and crags",
+   "raw_reference": "Cochamó Valley - Chile's premier climbing destination, known as the Yosemite of South America, with a variety of granite big walls and crags."
+  },
+  {
+   "file": "en-short-04.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 8.36,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "swirl the two dry powders together and then with clean wet hands squeeze them into a ball",
+   "raw_reference": "Swirl the two dry powders together and then, with clean wet hands, squeeze them into a ball."
+  },
+  {
+   "file": "en-short-05.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 8.28,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "the document according to the leak will refer to the borders dispute which palestine wants based on the borders before the 1967 mideast war",
+   "raw_reference": "The document, according to the leak, will refer to the borders dispute, which Palestine wants based on the borders before the 1967 Mideast War."
+  },
+  {
+   "file": "en-short-06.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 8.34,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "you may also wish to consult the advice of governments other than your own but their advice is designed for their citizens",
+   "raw_reference": "You may also wish to consult the advice of governments other than your own, but their advice is designed for their citizens."
+  },
+  {
+   "file": "en-short-07.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 14.22,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "generally speaking two behaviors can emerge as managers begin to lead their former peers. one end of the spectrum is trying to remain  one of the guys” or gals",
+   "raw_reference": "Generally speaking, two behaviors can emerge as managers begin to lead their former peers. One end of the spectrum is trying to remain “one of the guys” (or gals)."
+  },
+  {
+   "file": "en-short-08.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 13.32,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "it may also be beneficial for one to buy a wild card which provides entry to either selections of parks in south africa or all of the south african national parks",
+   "raw_reference": "It may also be beneficial for one to buy a Wild Card, which provides entry to either selections of parks in South Africa or all of the South African National Parks."
+  },
+  {
+   "file": "en-short-09.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 7.2,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "police superintendent chandra shekhar solanki said the accused appeared in court with covered faces",
+   "raw_reference": "Police superintendent Chandra Shekhar Solanki said the accused appeared in court with covered faces."
+  },
+  {
+   "file": "en-short-10.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 19.8,
+   "fleurs_ids": [
+    1670
+   ],
+   "reference": "their thermal behavior is not as steady as large caves on earth that often maintain a fairly constant temperature but it is consistent with these being deep holes in the ground, said glen cushing of the united states geological survey usgs astrogeology team and of northern arizona university located in flagstaff arizona",
+   "raw_reference": "Their thermal behavior is not as steady as large caves on Earth that often maintain a fairly constant temperature, but it is consistent with these being deep holes in the ground,\" said Glen Cushing of the United States Geological Survey (USGS) Astrogeology Team and of Northern Arizona University located in Flagstaff, Arizona."
+  },
+  {
+   "file": "en-short-11.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 10.02,
+   "fleurs_ids": [
+    1671
+   ],
+   "reference": "congress began funding the obscenity initiative in fiscal 2005 and specified that the fbi must devote 10 agents to adult pornography",
+   "raw_reference": "Congress began funding the obscenity initiative in fiscal 2005 and specified that the FBI must devote 10 agents to adult pornography."
+  },
+  {
+   "file": "en-short-12.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 10.16,
+   "fleurs_ids": [
+    1672
+   ],
+   "reference": "be careful not to allow fabric to become too hot which can cause shrinkage or in extreme cases scorch",
+   "raw_reference": "Be careful not to allow fabric to become too hot (which can cause shrinkage, or in extreme cases, scorch)."
+  },
+  {
+   "file": "en-short-13.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 10.08,
+   "fleurs_ids": [
+    1673
+   ],
+   "reference": "during the revolutionary war the thirteen states first formed a weak central government-with the congress being its only component-under the articles of confederation",
+   "raw_reference": "During the Revolutionary War, the thirteen states first formed a weak central government—with the Congress being its only component—under the Articles of Confederation."
+  },
+  {
+   "file": "en-short-14.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 5.64,
+   "fleurs_ids": [
+    1674
+   ],
+   "reference": "in some areas boiling water for a minute is enough in others several minutes are needed",
+   "raw_reference": "In some areas boiling water for a minute is enough, in others several minutes are needed."
+  },
+  {
+   "file": "en-short-15.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 8.76,
+   "fleurs_ids": [
+    1675
+   ],
+   "reference": "all nouns alongside the word sie for you always begin with a capital letter even in the middle of a sentence",
+   "raw_reference": "All nouns, alongside the word Sie for you, always begin with a capital letter, even in the middle of a sentence."
+  },
+  {
+   "file": "en-short-16.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 9.42,
+   "fleurs_ids": [
+    1676
+   ],
+   "reference": "as with all south african national parks there are daily conservation and entry fees for the park",
+   "raw_reference": "As with all South African National Parks, there are daily conservation and entry fees for the park."
+  },
+  {
+   "file": "en-short-17.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 5.94,
+   "fleurs_ids": [
+    1677
+   ],
+   "reference": "today the only insects that cannot fold back their wings are dragon flies and mayflies",
+   "raw_reference": "Today, the only insects that cannot fold back their wings are dragon flies and mayflies."
+  },
+  {
+   "file": "en-short-18.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 12.78,
+   "fleurs_ids": [
+    1678
+   ],
+   "reference": "oliver sacks in his paper the president's speech indicated how people who are unable to understand speech because of brain damage are nevertheless able to assess sincerity accurately",
+   "raw_reference": "Oliver Sacks, in his paper The President's Speech, indicated how people who are unable to understand speech because of brain damage are nevertheless able to assess sincerity accurately."
+  },
+  {
+   "file": "en-short-19.mp3",
+   "set": "en-short",
+   "language": "en",
+   "metric": "wer",
+   "duration": 4.38,
+   "fleurs_ids": [
+    1679
+   ],
+   "reference": "aerosmith have cancelled their remaining concerts on their tour",
+   "raw_reference": "Aerosmith have cancelled their remaining concerts on their tour."
+  },
+  {
+   "file": "en-long-0.mp3",
+   "set": "en-long",
+   "language": "en",
+   "metric": "wer",
+   "duration": 84.8,
+   "fleurs_ids": [
+    1680,
+    1681,
+    1682,
+    1683,
+    1684,
+    1685
+   ],
+   "reference": "a well rounded athlete the tiger can climb though not well swim leap great distances and pull with five times the force of a strong human it isn't alone though experimentation and an experiment is a test that is used to eliminate one or more of the possible hypotheses asking questions and making observations also guide scientific research while no one knows for certain who wrote it it is known that early in its life the large parchment document it measures 29¾ inches by 24½ inches was rolled up for storage there are still many men and women alive who survived their time here and many more who had loved ones who were murdered or worked to death there jews and non-jews alike apia is the capital of samoa the town is on the island of upolu and has a population of just under 40,000 for example the most common still image photography format in the world is 35mm which was the dominant film size at the close of the analog film era",
+   "raw_reference": "A well rounded athlete, the tiger can climb (though not well), swim, leap great distances and pull with five times the force of a strong human. It isn’t alone though, experimentation, and an experiment is a test that is used to eliminate one or more of the possible hypotheses, asking questions, and making observations also guide scientific research. While no one knows for certain who wrote it, it is known that early in its life, the large parchment document (it measures 29¾ inches by 24½ inches) was rolled up for storage. There are still many men and women alive who survived their time here, and many more who had loved ones who were murdered or worked to death there, Jews and non-Jews alike. Apia is the capital of Samoa. The town is on the island of Upolu and has a population of just under 40,000. For example, the most common still image photography format in the world is 35mm, which was the dominant film size at the close of the analog film era."
+  },
+  {
+   "file": "en-long-1.mp3",
+   "set": "en-long",
+   "language": "en",
+   "metric": "wer",
+   "duration": 83.9,
+   "fleurs_ids": [
+    1686,
+    1687,
+    1688,
+    1689,
+    1690
+   ],
+   "reference": "as a result the process of an organization working together to overcome an obstacle can lead to a new innovative process to serve the customer's need segregation and recombination shuffle variation back and forth between the two pools with each generation the job of navies has traditionally been to ensure that your country maintains the ability to move your people and goods while at the same time interfering with your enemy's ability to move his people and goods europe is a continent that is relatively small but with many independent countries under normal circumstances travelling through multiple countries would mean having to go through visa applications and passport control multiple times we agree with the usoc's statement that the interests of our athletes and clubs and their sport may be better served by moving forward with meaningful change within our organization rather than decertification",
+   "raw_reference": "As a result, the process of an organization working together to overcome an obstacle can lead to a new innovative process to serve the customer's need. Segregation and recombination shuffle variation back and forth between the two pools with each generation. The job of navies has traditionally been to ensure that your country maintains the ability to move your people and goods, while at the same time, interfering with your enemy's ability to move his people and goods. Europe is a continent that is relatively small but with many independent countries. Under normal circumstances, travelling through multiple countries would mean having to go through visa applications and passport control multiple times. We agree with the USOC's statement that the interests of our athletes and clubs, and their sport, may be better served by moving forward with meaningful change within our organization, rather than decertification."
+  },
+  {
+   "file": "en-long-2.mp3",
+   "set": "en-long",
+   "language": "en",
+   "metric": "wer",
+   "duration": 82.84,
+   "fleurs_ids": [
+    1691,
+    1692,
+    1693,
+    1694,
+    1695,
+    1696,
+    1697,
+    1698,
+    1699
+   ],
+   "reference": "on some routes the larger companies have their own planes but for other routes and smaller firms there was a problem according to japan's nuclear agency radioactive caesium and iodine has been identified at the plant but after losing the captain's wicket india only made 36 runs loosing 7 wickets to end the innings children are placed in foster care for a wide variety of reasons that range from neglect to abuse and even to extortion a simple popular dinner especially during the summer is the pa amb oli bread with olive oil tomato and any available condiments such as cheese tunafish etc the two compounds react with one another to form crystals that may block kidney function researchers at the university said he has been unable to take the drugs needed to overcome his pain as they are banned from the games everything in the universe is made of matter all matter is made of tiny particles called atoms bishkek was described as sinking into a state of anarchy by one observer as gangs of people roamed the streets and plundered stores of consumer goods",
+   "raw_reference": "On some routes, the larger companies have their own planes, but for other routes and smaller firms there was a problem. According to Japan's nuclear agency, radioactive caesium and iodine has been identified at the plant. But, after losing the captain's wicket India only made 36 runs loosing 7 wickets to end the innings. Children are placed in Foster Care for a wide variety of reasons that range from neglect, to abuse, and even to extortion. A simple popular dinner, especially during the summer, is the Pa amb Oli: Bread with olive oil, tomato, and any available condiments such as cheese, tunafish, etc. The two compounds react with one another to form crystals that may block kidney function, researchers at the university said. He has been unable to take the drugs needed to overcome his pain as they are banned from the Games. Everything in the Universe is made of matter. All matter is made of tiny particles called atoms. Bishkek was described as sinking into a state of \"anarchy\" by one observer, as gangs of people roamed the streets and plundered stores of consumer goods."
+  },
+  {
+   "file": "en-longform-0.mp3",
+   "set": "en-longform",
+   "language": "en",
+   "metric": "wer",
+   "duration": 307.8,
+   "fleurs_ids": [
+    1700,
+    1701,
+    1702,
+    1703,
+    1704,
+    1705,
+    1706,
+    1707,
+    1708,
+    1709,
+    1710,
+    1711,
+    1712,
+    1713,
+    1714,
+    1715,
+    1716,
+    1717,
+    1718,
+    1719,
+    1720,
+    1721,
+    1722,
+    1723,
+    1724,
+    1725
+   ],
+   "reference": "it is thinner under the maria and thicker under the highlands goats seem to have been first domesticated roughly 10,000 years ago in the zagros mountains of iran in just two weeks the americans and free french forces had liberated southern france and were turning towards germany martelly swore in a new provisional electoral council cep of nine members yesterday in 1990 it was added to the list of world heritage sites in danger due to the threat of desert sands on 15 august 1940 the allies invaded southern france the invasion was called operation dragoon more traditional churches often hold an easter vigil on saturday night during the easter weekend with the congregations often breaking into celebration at the stroke of midnight to celebrate christ's resurrection it is one of the main attractions of south africa and it is considered the flagship of south african national parks sanparks huhne has resigned and he will be replaced in the cabinet by ed davey mp norman lamb mp is expected to take the business minister job davey is vacating the report is highly critical of almost every aspect of the present policy of the executive towards iraq and it urges an immediate change of direction last week meti announced that apple had informed it of 34 additional overheating incidents which the company called non-serious these theories look at what it is about certain people that make them want the things that they do and what things in their environment will make them do or not do certain things since 1966 the sundarbans have been a wildlife sanctuary and it is estimated that there are now 400 royal bengal tigers and about 30,000 spotted deer in the area while goma is reasonably safe any visits outside of goma should be researched to understand the state of the fighting that persists in the north kivu province the satellite was sent into space by a rocket scientists use telescopes in space because the earth's atmosphere distorts some of our light and view regular announcements in the metro are made only in catalan but unplanned disruptions are announced by an automated system in a wide variety of languages including spanish english french arabic and japanese entertainment news website tmz understands the photographer stopped his vehicle on the other side of sepulveda boulevard and attempted to take pictures of the police stop before crossing the road and continuing prompting the california highway patrol police officer conducting the traffic stop to order him back across twice due to the underwater topology the return flow is concentrated at a few deeper sections and a fast current to deep water may form there there is no universal definition for which manufactured items are antiques some tax agencies define goods older than 100 years as antiques severe weather is the generic term for any dangerous weather phenomenon with the potential to cause damage serious social disruption or loss of human life the hot chocolate is up to belgian standards fruit juices are pricey but excellent after the dam was built in 1963 the seasonal floods that would spread sediment throughout the river were halted cuomo 53 began his governorship earlier this year and signed a bill last month legalizing same-sex marriage the harbor was the site of an infamous naval standoff in 1889 when seven ships from germany the us and britain refused to leave the harbor its renown for being an epicenter of luxury began in about 400 a.d. and lasted up until about 1100 a.d asus eee pc earlier launched world-wide for cost-saving and functionality factors became a hot topic in 2007 taipei it month",
+   "raw_reference": "It is thinner under the maria and thicker under the highlands. Goats seem to have been first domesticated roughly 10,000 years ago in the Zagros Mountains of Iran. In just two weeks the Americans and Free French forces had liberated southern France and were turning towards Germany. Martelly swore in a new Provisional Electoral Council (CEP) of nine members yesterday. In 1990, it was added to the list of world heritage sites in danger, due to the threat of desert sands. On 15 August 1940, the Allies invaded southern France, the invasion was called \"Operation Dragoon\". More traditional churches often hold an Easter Vigil on Saturday night during the Easter weekend, with the congregations often breaking into celebration at the stroke of midnight to celebrate Christ's resurrection. It is one of the main attractions of South Africa and it is considered the flagship of South African National Parks (SANParks). Huhne has resigned and he will be replaced in the Cabinet by Ed Davey MP. Norman Lamb MP is expected to take the Business Minister job Davey is vacating. The Report is highly critical of almost every aspect of the present policy of the Executive towards Iraq and it urges an immediate change of direction. Last week, METI announced that Apple had informed it of 34 additional overheating incidents, which the company called \"non-serious.\" These theories look at what it is about certain people that make them want the things that they do and what things in their environment will make them do or not do certain things. Since 1966 the Sundarbans have been a wildlife sanctuary, and it is estimated that there are now 400 Royal Bengal tigers and about 30,000 spotted deer in the area. While Goma is reasonably safe, any visits outside of Goma should be researched to understand the state of the fighting that persists in the North Kivu province. The satellite was sent into space by a rocket. Scientists use telescopes in space because the Earth’s atmosphere distorts some of our light and view. Regular announcements in the Metro are made only in Catalan, but unplanned disruptions are announced by an automated system in a wide variety of languages including Spanish, English, French, Arabic and Japanese. Entertainment news website TMZ understands the photographer stopped his vehicle on the other side of Sepulveda Boulevard and attempted to take pictures of the police stop before crossing the road and continuing, prompting the California Highway Patrol police officer conducting the traffic stop to order him back across, twice. Due to the underwater topology the return flow is concentrated at a few deeper sections, and a fast current to deep water may form there. There is no universal definition for which manufactured items are antiques. Some tax agencies define goods older than 100 years as antiques. Severe weather is the generic term for any dangerous weather phenomenon with the potential to cause damage, serious social disruption, or loss of human life. The hot chocolate is up to Belgian standards. Fruit juices are pricey but excellent. After the dam was built in 1963, the seasonal floods that would spread sediment throughout the river were halted. Cuomo, 53, began his governorship earlier this year and signed a bill last month legalizing same-sex marriage. The harbor was the site of an infamous naval standoff in 1889 when seven ships from Germany, the US, and Britain refused to leave the harbor. Its renown for being an epicenter of luxury began in about 400 A.D. and lasted up until about 1100 A.D. ASUS Eee PC, earlier launched world-wide for cost-saving and functionality factors, became a hot topic in 2007 Taipei IT Month."
+  },
+  {
+   "file": "de-fleurs-00.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 10.38,
+   "fleurs_ids": [
+    1660
+   ],
+   "reference": "die romantik hatte ein starkes kulturell deterministisches element dass sich aus schriftstellern wie goethe fichte und schlegel schöpfte",
+   "raw_reference": "Die Romantik hatte ein starkes, kulturell deterministisches Element, das sich aus Schriftstellern wie Goethe, Fichte und Schlegel schöpfte."
+  },
+  {
+   "file": "de-fleurs-01.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 6.66,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "er nannte keine zahl für die kürzungen sondern sagte sie würden auf der grundlage der wirtschaftsleistung chinas vorgenommen",
+   "raw_reference": "Er nannte keine Zahl für die Kürzungen, sondern sagte, sie würden auf der Grundlage der Wirtschaftsleistung Chinas vorgenommen."
+  },
+  {
+   "file": "de-fleurs-02.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 23.46,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "legierungen sind im grunde eine mischung aus zwei oder mehr metallen vergessen sie nicht dass es viele elemente im periodensystem gibt",
+   "raw_reference": "Legierungen sind im Grunde eine Mischung aus zwei oder mehr Metallen. Vergessen Sie nicht, dass es viele Elemente im Periodensystem gibt."
+  },
+  {
+   "file": "de-fleurs-03.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 9.78,
+   "fleurs_ids": [
+    1663
+   ],
+   "reference": "das cochamó-tal – chiles wichtigstes kletterziel bekannt als der yosemite-nationalpark von südamerika mit einer vielzahl von großen granitwänden und -klippen",
+   "raw_reference": "Das Cochamó-Tal – Chiles wichtigstes Kletterziel, bekannt als der Yosemite-Nationalpark von Südamerika, mit einer Vielzahl von großen Granitwänden und -klippen."
+  },
+  {
+   "file": "de-fleurs-04.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 8.7,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "mischen sie die zwei trockenpulver zusammen und formen sie sie dann mit sauberen nassen händen zu einem ball",
+   "raw_reference": "Mischen Sie die zwei Trockenpulver zusammen und formen Sie sie dann mit sauberen, nassen Händen zu einem Ball."
+  },
+  {
+   "file": "de-fleurs-05.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 10.68,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "dem leak zufolge bezieht sich das dokument auf den grenzstreit in dem die palästinenser ein zurücksetzen der grenzen in den zustand vor dem sechstagekrieg von 1967 fordern",
+   "raw_reference": "Dem Leak zufolge bezieht sich das Dokument auf den Grenzstreit, in dem die Palästinenser ein Zurücksetzen der Grenzen in den Zustand vor dem Sechstagekrieg von 1967 fordern."
+  },
+  {
+   "file": "de-fleurs-06.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 17.76,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "sie können auch die ratschläge anderer regierungen als der ihren konsultieren deren hinweise sind jedoch auf ihre eigenen staatsbürger zugeschnitten",
+   "raw_reference": "Sie können auch die Ratschläge anderer Regierungen als der Ihren konsultieren. Deren Hinweise sind jedoch auf ihre eigenen Staatsbürger zugeschnitten."
+  },
+  {
+   "file": "de-fleurs-07.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 24.06,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "im allgemeinen können sich zwei verhaltensweisen abzeichnen wenn manager beginnen ihre ehemaligen kollegen zu leiten. das eine ende des spektrums ist der versuch einer der jungs  oder eines der mädels zu bleiben",
+   "raw_reference": "Im Allgemeinen können sich zwei Verhaltensweisen abzeichnen, wenn Manager beginnen, ihre ehemaligen Kollegen zu leiten. Das eine Ende des Spektrums ist der Versuch, „einer der Jungs“ (oder eines der Mädels) zu bleiben."
+  },
+  {
+   "file": "de-fleurs-08.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 14.7,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "es kann sich auch lohnen eine wild card zu kaufen die zutritt entweder zu ausgewählten parks in südafrika oder zu allen südafrikanischen nationalparks gewährt",
+   "raw_reference": "Es kann sich auch lohnen, eine Wild Card zu kaufen, die Zutritt entweder zu ausgewählten Parks in Südafrika oder zu allen südafrikanischen Nationalparks gewährt."
+  },
+  {
+   "file": "de-fleurs-09.mp3",
+   "set": "de-fleurs",
+   "language": "de",
+   "metric": "wer",
+   "duration": 12.78,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "die polizeipräsidentin chandra shekhar solanki gab an die angeklagten seien mit bedeckten gesichtern vor gericht erschienen",
+   "raw_reference": "Die Polizeipräsidentin Chandra Shekhar Solanki gab an, die Angeklagten seien mit bedeckten Gesichtern vor Gericht erschienen."
+  },
+  {
+   "file": "es-fleurs-00.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 10.86,
+   "fleurs_ids": [
+    1660
+   ],
+   "reference": "el elemento del determinismo cultural se encontraba muy presente en el romanticismo según estudiosos como goether fichte y schlegel",
+   "raw_reference": "El elemento del determinismo cultural se encontraba muy presente en el romanticismo, según estudiosos como Goether, Fichte y Schlegel."
+  },
+  {
+   "file": "es-fleurs-01.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 7.8,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "no mencionó una cifra para los recortes y manifestó que se harán en base a la producción económica de china",
+   "raw_reference": "No mencionó una cifra para los recortes y manifestó que se harán en base a la producción económica de China."
+  },
+  {
+   "file": "es-fleurs-02.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 8.82,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "las aleaciones son básicamente una combinación de dos o más metales recuerde que la tabla periódica tiene muchos elementos",
+   "raw_reference": "Las aleaciones son, básicamente, una combinación de dos o más metales. Recuerde que la tabla periódica tiene muchos elementos."
+  },
+  {
+   "file": "es-fleurs-03.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 15.42,
+   "fleurs_ids": [
+    1663
+   ],
+   "reference": "el valle de cochamó es el destino para escalar más popular de chile y es conocido como el yosemite de sudamérica con variedad de extensos muros y riscos de granito",
+   "raw_reference": "El Valle de Cochamó es el destino para escalar más popular de Chile y es conocido como el Yosemite de Sudamérica, con variedad de extensos muros y riscos de granito."
+  },
+  {
+   "file": "es-fleurs-04.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 10.02,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "agite ambos polvos secos juntos y después de hacerlo con las manos higienizadas y húmedas exprímalos para formar una bola",
+   "raw_reference": "Agite ambos polvos secos juntos y, después de hacerlo, con las manos higienizadas y húmedas, exprímalos para formar una bola."
+  },
+  {
+   "file": "es-fleurs-05.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 17.1,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "según la información que se filtró el documento tratará sobre el conflicto fronterizo que palestina pretende resolver basándose en los límites vigentes en forma previa a la guerra del medio oriente de 1967",
+   "raw_reference": "Según la información que se filtró, el documento tratará sobre el conflicto fronterizo, que Palestina pretende resolver basándose en los límites vigentes en forma previa a la Guerra del Medio Oriente de 1967."
+  },
+  {
+   "file": "es-fleurs-06.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 10.14,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "es posible que quiera consultar las recomendaciones de otros gobiernos pero están pensadas para sus propios ciudadanos",
+   "raw_reference": "Es posible que quiera consultar las recomendaciones de otros gobiernos, pero están pensadas para sus propios ciudadanos."
+  },
+  {
+   "file": "es-fleurs-07.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 18.3,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "en general pueden darse dos tipos de comportamiento cuando los gerentes comienzan a liderar a sus antiguos compañeros. de un lado del espectro está el intento de continuar siendo «uno de los muchachos» o muchachas",
+   "raw_reference": "En general, pueden darse dos tipos de comportamiento cuando los gerentes comienzan a liderar a sus antiguos compañeros. De un lado del espectro, está el intento de continuar siendo «uno de los muchachos» (o muchachas)."
+  },
+  {
+   "file": "es-fleurs-08.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 12.6,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "también puede ser conveniente comprar una wild card que permite la entrada a selecciones de parques en sudáfrica o a todos los parques nacionales del país",
+   "raw_reference": "También puede ser conveniente comprar una Wild Card que permite la entrada a selecciones de parques en Sudáfrica o a todos los Parques Nacionales del país."
+  },
+  {
+   "file": "es-fleurs-09.mp3",
+   "set": "es-fleurs",
+   "language": "es",
+   "metric": "wer",
+   "duration": 11.22,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "según manifestara el superintendente de la policía chandra shekhar solanki los acusados se presentaron ante el tribunal con sus rostros cubiertos",
+   "raw_reference": "Según manifestara el superintendente de la policía, Chandra Shekhar Solanki, los acusados se presentaron ante el tribunal con sus rostros cubiertos."
+  },
+  {
+   "file": "fr-fleurs-00.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 7.86,
+   "fleurs_ids": [
+    1660
+   ],
+   "reference": "le romantisme présentait un important élément de déterminisme culturel tiré d'écrivains tels que goethe fichte et schlegel",
+   "raw_reference": "Le romantisme présentait un important élément de déterminisme culturel, tiré d'écrivains tels que Goethe, Fichte et Schlegel."
+  },
+  {
+   "file": "fr-fleurs-01.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 10.56,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "il n'a pas chiffré ces réductions disant qu'elles seront basées sur la production économique chinoise",
+   "raw_reference": "Il n'a pas chiffré ces réductions, disant qu'elles seront basées sur la production économique chinoise."
+  },
+  {
+   "file": "fr-fleurs-02.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 7.14,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "les alliages sont essentiellement un mélange de deux métaux ou plus n'oubliez pas que le tableau périodique comporte de nombreux éléments",
+   "raw_reference": "Les alliages sont essentiellement un mélange de deux métaux ou plus. N'oubliez pas que le tableau périodique comporte de nombreux éléments."
+  },
+  {
+   "file": "fr-fleurs-03.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 11.82,
+   "fleurs_ids": [
+    1663
+   ],
+   "reference": "vallée de cochamó – la destination d'excellence pour l'escalade au chili connue comme le yosemite d'amérique du sud avec de nombreuses grandes parois et falaises granitiques différentes",
+   "raw_reference": "Vallée de Cochamó – La destination d'excellence pour l'escalade au Chili, connue comme le Yosemite d'Amérique du Sud, avec de nombreuses grandes parois et falaises granitiques différentes."
+  },
+  {
+   "file": "fr-fleurs-04.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 7.8,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "mélangez les deux poudres sèches ensemble puis avec les mains propres et humides pressez-les en une boule",
+   "raw_reference": "Mélangez les deux poudres sèches ensemble, puis, avec les mains propres et humides, pressez-les en une boule."
+  },
+  {
+   "file": "fr-fleurs-05.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 16.38,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "d'après la fuite le document portera sur le différend à la frontière que la palestine revendique sur la base des frontières existantes avant la guerre du moyen-orient de 1967",
+   "raw_reference": "D'après la fuite, le document portera sur le différend à la frontière que la Palestine revendique sur la base des frontières existantes avant la guerre du Moyen-Orient de 1967."
+  },
+  {
+   "file": "fr-fleurs-06.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 11.64,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "vous pouvez également avoir recours aux conseils d'autres gouvernements que le vôtre mais leurs conseils sont adaptés à leurs citoyens",
+   "raw_reference": "Vous pouvez également avoir recours aux conseils d'autres gouvernements que le vôtre, mais leurs conseils sont adaptés à leurs citoyens."
+  },
+  {
+   "file": "fr-fleurs-07.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 14.88,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "de manière générale deux comportements peuvent émerger lorsqu'un manager devient le chef d'anciens collègues. d'une des extrémités du spectre étant d'essayer de rester « le bon copain » ou la bonne copine",
+   "raw_reference": "De manière générale, deux comportements peuvent émerger lorsqu'un manager devient le chef d'anciens collègues. D'une des extrémités du spectre étant d'essayer de rester « le bon copain » (ou la bonne copine)."
+  },
+  {
+   "file": "fr-fleurs-08.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 7.62,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "il peut être avantageux de se procurer une wild card qui donne accès à certains parcs d'afrique du sud ainsi qu'à tous les parcs nationaux sud-africains",
+   "raw_reference": "Il peut être avantageux de se procurer une Wild Card qui donne accès à certains parcs d'Afrique du Sud, ainsi qu’à tous les parcs nationaux sud-africains."
+  },
+  {
+   "file": "fr-fleurs-09.mp3",
+   "set": "fr-fleurs",
+   "language": "fr",
+   "metric": "wer",
+   "duration": 9.6,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "chandra shekhar solanki commissaire de police a déclaré que les personnes accusées avaient le visage dissimulé lorsqu'elles ont comparu devant le tribunal",
+   "raw_reference": "Chandra Shekhar Solanki, commissaire de police, a déclaré que les personnes accusées avaient le visage dissimulé lorsqu'elles ont comparu devant le tribunal."
+  },
+  {
+   "file": "ja-fleurs-00.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 15.42,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "胡氏は 削減する数値を定めませんでしたが 削減は中国の経済産出量に基づいて実施されるだろうと述べました",
+   "raw_reference": "胡氏は、削減する数値を定めませんでしたが、削減は中国の経済産出量に基づいて実施されるだろうと述べました。"
+  },
+  {
+   "file": "ja-fleurs-01.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 14.58,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "合金とは 基本的には2種類以上の金属の混合物です 周期表に載っているたくさんの元素を思い出してください",
+   "raw_reference": "合金とは、基本的には2種類以上の金属の混合物です。周期表に載っているたくさんの元素を思い出してください。"
+  },
+  {
+   "file": "ja-fleurs-02.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 9.9,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "乾いた粉を2つ合わせてくるくるとこね回し 清潔な濡れた手でぎゅっと握ります",
+   "raw_reference": "乾いた粉を2つ合わせてくるくるとこね回し、清潔な濡れた手でぎゅっと握ります。"
+  },
+  {
+   "file": "ja-fleurs-03.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 16.74,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "漏れ聞いた情報によれば 当該文書は国境紛争に言及するもので パレスチナの希望は1967年の中東戦争前の国境に基づくものです",
+   "raw_reference": "漏れ聞いた情報によれば、当該文書は国境紛争に言及するもので、パレスチナの希望は1967年の中東戦争前の国境に基づくものです。"
+  },
+  {
+   "file": "ja-fleurs-04.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 13.56,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "自国以外の政府からの助言を参考にしてもかいまいませんが そのような助言はその国の国民向けのものです",
+   "raw_reference": "自国以外の政府からの助言を参考にしてもかいまいませんが、そのような助言はその国の国民向けのものです。"
+  },
+  {
+   "file": "ja-fleurs-05.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 17.82,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "一般的に言えば 管理職がかつての仲間を率いることになった場合 2とおりの行動が現れる可能性があります 1つは 仲間の1人 のままでいようとする行動です",
+   "raw_reference": "一般的に言えば、管理職がかつての仲間を率いることになった場合、2とおりの行動が現れる可能性があります。1つは「仲間の1人」のままでいようとする行動です。"
+  },
+  {
+   "file": "ja-fleurs-06.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 13.38,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "ワイルドカードを購入するとお得な場合があります 南アフリカの主な公園または南アフリカのすべての国立公園に入場できます",
+   "raw_reference": "ワイルドカードを購入するとお得な場合があります。南アフリカの主な公園または南アフリカのすべての国立公園に入場できます。"
+  },
+  {
+   "file": "ja-fleurs-07.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 10.08,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "警察のチャンドラ シェカール ソランキ総監によれば 被告人は顔を隠して法廷に出頭したそうです",
+   "raw_reference": "警察のチャンドラ・シェカール・ソランキ総監によれば、被告人は顔を隠して法廷に出頭したそうです。"
+  },
+  {
+   "file": "ja-fleurs-08.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 18.42,
+   "fleurs_ids": [
+    1671
+   ],
+   "reference": "連邦議会は2005年度から猥褻物取締法への資金提供を開始し fbiはアダルトポルノに10人の捜査員を投入しなければならないと規定しました",
+   "raw_reference": "連邦議会は2005年度から猥褻物取締法への資金提供を開始し、FBIはアダルトポルノに10人の捜査員を投入しなければならないと規定しました。"
+  },
+  {
+   "file": "ja-fleurs-09.mp3",
+   "set": "ja-fleurs",
+   "language": "ja",
+   "metric": "cer",
+   "duration": 11.76,
+   "fleurs_ids": [
+    1672
+   ],
+   "reference": "生地の温度が上がりすぎないように気を付けてください縮みの原因になったり 極端な場合は焦げ付きの原因になります",
+   "raw_reference": "生地の温度が上がりすぎないように気を付けてください（縮みの原因になったり、極端な場合は焦げ付きの原因になります）。"
+  },
+  {
+   "file": "zh-fleurs-00.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 9.6,
+   "fleurs_ids": [
+    1660
+   ],
+   "reference": "浪 漫 主 义 具 有 很 强 的 文 化 决 定 论 色 彩 这 源 于 歌 德 费 希 特 和 施 莱 格 尔 等 作 家",
+   "raw_reference": "浪漫主义具有很强的文化决定论色彩。这源于歌德、费希特和施莱格尔等作家。"
+  },
+  {
+   "file": "zh-fleurs-01.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 7.74,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "他 没 有 设 定 削 减 数 额 只 是 表 示 将 根 据 中 国 的 经 济 产 出 来 决 定 数 额",
+   "raw_reference": "他没有设定削减数额，只是表示将根据中国的经济产出来决定数额。"
+  },
+  {
+   "file": "zh-fleurs-02.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 7.5,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "合 金 基 本 上 由 两 种 或 以 上 金 属 混 合 而 成 不 要 忘 记 一 点 元 素 周 期 表 上 有 很 多 元 素",
+   "raw_reference": "合金基本上由两种或以上金属混合而成。不要忘记一点，元素周期表上有很多元素。"
+  },
+  {
+   "file": "zh-fleurs-03.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 13.38,
+   "fleurs_ids": [
+    1663
+   ],
+   "reference": "智利首选登山目的地科茶莫山谷 cochamó valley 被称为南美洲的优胜美地 yosemite这里有各式各样的花岗岩大石壁和峭壁",
+   "raw_reference": "智利首选登山目的地科茶莫山谷 (Cochamó Valley) 被称为南美洲的优胜美地 (Yosemite)，这里有各式各样的花岗岩大石壁和峭壁。"
+  },
+  {
+   "file": "zh-fleurs-04.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 11.4,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "搅 动 两 种 干 粉 使 其 混 合 然 后 用 干 净 的 湿 手 把 它 们 揉 成 一 个 球",
+   "raw_reference": "搅动两种干粉使其混合，然后用干净的湿手把它们揉成一个球。"
+  },
+  {
+   "file": "zh-fleurs-05.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 15.1,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "据 透 露 这 份 文 件 将 提 及 边 界 争 端 巴 勒 斯 坦 希 望 以 1967 年 中 东 战 争 前 的 边 界 为 基 础",
+   "raw_reference": "据透露，这份文件将提及边界争端，巴勒斯坦希望以1967年中东战争前的边界为基础。"
+  },
+  {
+   "file": "zh-fleurs-06.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 8.16,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "你 也 可 以 咨 询 除 贵 国 以 外 其 他 政 府 的 建 议 但 他 们 的 建 议 是 为 他 们 的 公 民 而 制 定 的",
+   "raw_reference": "你也可以咨询除贵国以外其他政府的建议，但他们的建议是为他们的公民而制定的。"
+  },
+  {
+   "file": "zh-fleurs-07.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 15.64,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "一 般 来 说 当 管 理 者 开 始 领 导 过 去 的 同 事 时 会 出 现 两 种 行 为 一 种 情 况 是 他 们 会 努 力 与 团 队 成 员 保 持 亲 密 关 系",
+   "raw_reference": "一般来说，当管理者开始领导过去的同事时，会出现两种行为。一种情况是，他们会努力与团队成员保持“亲密关系”。"
+  },
+  {
+   "file": "zh-fleurs-08.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 8.76,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "买 一 张 万 能 卡 wild card 也 有 不 少 好 处 带 着 这 张 卡 你 可 以 进 入 南 非 的 一 些 公 园 或 全 部 的 国 家 公 园",
+   "raw_reference": "买一张万能卡（Wild Card）也有不少好处。带着这张卡，你可以进入南非的一些公园或全部的国家公园。"
+  },
+  {
+   "file": "zh-fleurs-09.mp3",
+   "set": "zh-fleurs",
+   "language": "zh",
+   "metric": "cer",
+   "duration": 6.84,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "警 察 局 长 钱 德 拉 谢 卡 尔 索 兰 基 说 被 告 人 出 庭 时 都 蒙 住 了 脸",
+   "raw_reference": "警察局长钱德拉·谢卡尔·索兰基说，被告人出庭时都蒙住了脸。"
+  },
+  {
+   "file": "ar-fleurs-00.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 6.12,
+   "fleurs_ids": [
+    1661
+   ],
+   "reference": "لم يحدد رقمًا للتخفيضات قائلًا إنها ستعتمد على الناتج الاقتصادي للصين",
+   "raw_reference": "لم يحدد رقمًا للتخفيضات، قائلًا إنها ستعتمد على الناتج الاقتصادي للصين."
+  },
+  {
+   "file": "ar-fleurs-01.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 9.96,
+   "fleurs_ids": [
+    1662
+   ],
+   "reference": "السبائك هي بشكل أساسي خليط من اثنين أو أكثر من المعادن لا تنسَ أن هناك العديد من العناصر في الجدول الدوري",
+   "raw_reference": "السبائك هي بشكل أساسي خليط من اثنين أو أكثر من المعادن. لا تنسَ أن هناك العديد من العناصر في الجدول الدوري."
+  },
+  {
+   "file": "ar-fleurs-02.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 8.58,
+   "fleurs_ids": [
+    1664
+   ],
+   "reference": "قلّب المسحوقين الجافّين سوية ثم اعصرهما بأيدٍ مبللة نظيفة حتى تصبح على شكل كرة",
+   "raw_reference": "قلّب المسحوقين الجافّين سوية ثم اعصرهما بأيدٍ مبللة نظيفة حتى تصبح على شكل كرة."
+  },
+  {
+   "file": "ar-fleurs-03.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 13.32,
+   "fleurs_ids": [
+    1665
+   ],
+   "reference": "وستشير الوثيقة بحسب التسريب إلى الخلاف على الحدود التي تريدها فلسطين مبنية على حدود ما قبل حرب عام 1967 في الشرق الأوسط",
+   "raw_reference": "وستشير الوثيقة، بحسب التسريب، إلى الخلاف على الحدود، التي تريدها فلسطين مبنية على حدود ما قبل حرب عام 1967 في الشرق الأوسط."
+  },
+  {
+   "file": "ar-fleurs-04.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 10.2,
+   "fleurs_ids": [
+    1666
+   ],
+   "reference": "ربما ترغب أيضاً في طلب المشورة من حكومات غير حكومتك ولكن نصيحة تلك الحكومات صادرة خصيصاً لمواطنيها",
+   "raw_reference": "ربما ترغب أيضاً في طلب المشورة من حكومات غير حكومتك، ولكن نصيحة تلك الحكومات صادرة خصيصاً لمواطنيها."
+  },
+  {
+   "file": "ar-fleurs-05.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 12.24,
+   "fleurs_ids": [
+    1667
+   ],
+   "reference": "بصفة عامة، يمكن أن يظهر سلوكان عندما يبدأ المديرون في قيادة أقرانهم السابقين أحدهما هو محاولة البقاء مثل الآخرين أو الأخريات",
+   "raw_reference": "بصفة عامة، يمكن أن يظهر سلوكان عندما يبدأ المديرون في قيادة أقرانهم السابقين أحدهما هو محاولة البقاء \"مثل الآخرين\" (أو الأخريات)."
+  },
+  {
+   "file": "ar-fleurs-06.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 12.3,
+   "fleurs_ids": [
+    1668
+   ],
+   "reference": "من الممكن أن يكون مفيداً أن تشتري بطاقة wild card فهي تسمح لك بالدخول إلى مجموعة مختارة من متنزهات جنوب إفريقيا أو جميع متنزهات جنوب إفريقيا الوطنية",
+   "raw_reference": "من الممكن أن يكون مفيداً أن تشتري بطاقة Wild Card، فهي تسمح لك بالدخول إلى مجموعة مختارة من متنزهات جنوب إفريقيا أو جميع متنزهات جنوب إفريقيا الوطنية."
+  },
+  {
+   "file": "ar-fleurs-07.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 7.62,
+   "fleurs_ids": [
+    1669
+   ],
+   "reference": "وقال مدير الشرطة شاندرا شيخار سولانكي إن المتهمين مثلوا أمام المحكمة بوجوه مغطاة",
+   "raw_reference": "وقال مدير الشرطة شاندرا شيخار سولانكي إن المتهمين مثلوا أمام المحكمة بوجوه مغطاة."
+  },
+  {
+   "file": "ar-fleurs-08.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 15.78,
+   "fleurs_ids": [
+    1671
+   ],
+   "reference": "بدأ الكونجرس في تمويل مبادرة الفحش في السنة المالية 2005 وحدد أن مكتب التحقيقات الفدرالي يجب أن يخصص 10 عملاء للمواد الإباحية للبالغين",
+   "raw_reference": "بدأ الكونجرس في تمويل مبادرة الفحش في السنة المالية 2005 وحدد أن مكتب التحقيقات الفدرالي يجب أن يخصص 10 عملاء للمواد الإباحية للبالغين."
+  },
+  {
+   "file": "ar-fleurs-09.mp3",
+   "set": "ar-fleurs",
+   "language": "ar",
+   "metric": "wer",
+   "duration": 10.5,
+   "fleurs_ids": [
+    1672
+   ],
+   "reference": "لا تجعل القماش يصبح ساخنًا أكثر من اللازم مما قد يؤدي إلى انكماشه أو احتراقه في أسوأ الحالات",
+   "raw_reference": "لا تجعل القماش يصبح ساخنًا أكثر من اللازم (مما قد يؤدي إلى انكماشه أو احتراقه في أسوأ الحالات)."
+  }
+ ]
+}

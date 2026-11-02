@@ -1,0 +1,33 @@
+---
+layout: docs
+title: Benchmarks
+nav_order: 4
+has_children: true
+---
+
+# 📊 Benchmarks Overview
+
+Browse detailed NPU benchmark results for each major model family supported by FastFlowLM:
+
+- [LLaMA3](llama3_results/)
+- [Gemma3](gemma3_results/)
+- [Gemma4](gemma4_results/)
+- [Qwen2.5](qwen2.5_results/)
+- [Qwen3](qwen3_results/)
+- [Qwen3.5](qwen3.5_results/)
+- [Qwen3.6](qwen3.6_results/)
+- [Qwen3.8](qwen3.8_results/)
+- [gpt-oss](gpt-oss_results/)
+- [Decision 3.0 (d3)](d3_results/)
+- [LiquidAI/LFM2](lfm2_results/)
+- [LiquidAI/LFM3](lfm3_results/)
+- [Microsoft/Phi4](phi4_results/)
+- [Nanbeige4.1](nanbeige4.1_results/)
+- [SmolVLA](smolvla_results/)
+- [Hy-MT2](hy-mt2_results/)
+- [MiniCPM-V 4.7](minicpm-v-4.7_results/)
+- [Nemotron Bolt](nemotron3.5-bolt_results/)
+- [Nemotron Bolt DFlash](nemotron3.5-bolt-dflash_results/)
+- [Flash Models](flash_results/)
+
+Each page includes decoding and prefill speed metrics (tokens per second) and notes about the test setup and hardware. 

@@ -1,0 +1,719 @@
+---
+layout: docs
+title: Qwen
+nav_order: 3
+parent: Models
+---
+
+## 🧩 Model Card: [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
+
+- **Type:** Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** No  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
+- **Quantization:** Q4_1
+- **Max Context Length:** 32k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3:0.6b
+```
+
+📝 **Note:**
+
+- **CLI**: Type `/think` to toggle on/off interactively.  
+- **Server Mode**: Set the `"think"` flag in the request payload.
+
+---
+
+## 🧩 Model Card: [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B)
+
+- **Type:** Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** No  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B)
+- **Quantization:** Q4_1
+- **Max Context Length:** 32k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3:1.7b
+```
+
+📝 **Note:**
+
+- **CLI**: Type `/think` to toggle on/off interactively.  
+- **Server Mode**: Set the `"think"` flag in the request payload.
+
+---
+
+## 🧩 Model Card: [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)
+
+- **Type:** Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)
+- **Quantization:** Q4_1
+- **Max Context Length:** 32k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3:4b
+```
+
+📝 **Note:**
+
+- **CLI**: Type `/think` to toggle on/off interactively.  
+- **Server Mode**: Set the `"think"` flag in the request payload.
+
+---
+
+## 🧩 Model Card: [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
+
+- **Type:** Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
+- **Quantization:** Q4_1
+- **Max Context Length:** 32k tokens  
+- **Default Context Length:** 16k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3:8b
+```
+
+📝 **Note:**
+
+- **CLI**: Type `/think` to toggle on/off interactively.  
+- **Server Mode**: Set the `"think"` flag in the request payload.
+
+---
+
+## 🧪 Qwen3 0.6B / 1.7B / 4B / 8B on the core backend (developer preview)
+
+- **Tags:** `qwen3-core:0.6b`, `qwen3-core:1.7b`, `qwen3-core:4b`, `qwen3-core:8b` — their own tags, beside the NPU2 `qwen3:*` entries. `supported_platforms` is `dev04`, and the `-core` suffix is what asks for corelib's kernels.
+- **Backend:** `core` — one engine for all four sizes. The GGUF's own metadata selects the size and is cross-checked against it.
+- **Source format:** GGUF, read directly by corelib. With a Hugging Face token that can read AMD's private repositories (`HF_TOKEN`, or `hf auth login`), `flm pull` fetches AMD's 4-bit file, which packs exactly as it is; without one it falls back to the public GGUF. A public `Q8_0` is requantized to 4-bit groups on every load, which is lossy.
+- **Context:** each tag's limit is the most corelib runs that model at; the default is lower where corelib or our own runs found answers going wrong past it. Over-capacity requests are rejected with HTTP 400 before any work reaches the device.
+- **Availability:** developer build against corelib 0.53.0 — see [Phi-4 on the core backend](phi.md).
+
+The same corelib path runs every `-core` tag:
+
+| Tag | Default file | Public fallback | Context limit | Default context |
+|---|---|---|---|---|
+| `qwen3-core:0.6b` | unsloth `Q8_0`, refit to group 64 (lm_head 32) | — | 32768 | 32768 |
+| `qwen3-core:1.7b` / `4b` / `8b` | AMD `Q4_G128` | unsloth `Q8_0` | 32768 | 32768 |
+| `qwen3.5-core:4b` / `9b` | AMD `Q4_G128` | unsloth `Q8_0` | 262144 | 32768 |
+| `qwen3.6-moe-core:35b-a3b` | AMD `Q4_G32` | unsloth `Q8_0` | 262144 | 32768 |
+| `qwen3.8-core:27b` | AMD `Q4_G128`, on the NPU | unsloth `Q4_0`, on the GPU | 262144 | 32768 |
+| `gemma4-it-core:e2b` / `e4b` | AMD `Q4_G32` | unsloth `Q8_0` | 131072 | 65536 |
+| `phi4-mini-it-core:4b` | AMD `Q4_G128` | unsloth `Q8_0` | 131072 | 131072 |
+| `llama3.2-core:1b` / `3b`, `llama3.1-core:8b` | `Q8_0`, refit to group 64 | — | 131072 | 131072 |
+
+Every model's attention is paged: corelib keeps the KV cache in 4096-token pages and grows it a page at a time, so a large context costs memory only as a conversation fills it. Raise the context with `--ctx-len` (`-c`), up to the limit.
+
+FastFlowLM sends a long prompt in chunks of `max_prefill_len` (4096) tokens that end on multiples of 4096 counted from the start of the conversation, not from the start of the turn, so every chunk after a turn's first starts on a page boundary, where corelib runs a whole page as one pass. Llama, Qwen3, Phi-4-mini and Gemma 4 run a later turn together with the earlier tokens of the page it starts in. Qwen3.5, Qwen3.6 and Qwen3.8 carry recurrent state and continue from where they are; going back to the last checkpoint restores a snapshot, which copies the filled KV pages into host memory, and going back anywhere else replays the conversation.
+
+Known limits, each corelib's (its `docs/known-problems.md` names them):
+
+- **Qwen3.6 past 32768.** Paged attention can return garbage: a passkey asked for after about 48k tokens came back as `!` repeated (on an AIE4 test machine). A context past 32768 still loads, and says so.
+- **Qwen3.8 on long prompts.** A long prompt can come back as `!` repeated, run to run and from corelib's own runner too: on an AIE4 test machine a passkey was answered at 6k and 14k tokens and garbled at 10k and 28k. Prefill passes shorter than a page past position 0 run their attention on the CPU (`PAGED_PREFILL_SHORT_CHUNK`).
+- **Qwen3.5 and Qwen3.8 decode** drift from the reference the more pages it reads (`PAGED_DECODE_PAGE_DRIFT`).
+- **Gemma 4 past position 65535** (`PAGED_ATTENTION_POSITION_WRAP`).
+- **Llama on a very long, repetitive prompt.** A passkey in about 96k tokens of one repeated sentence came back as `!` repeated, from corelib's own runner too; Phi-4-mini answered the same prompt.
+- **A 4096-token prefill pass can fail to complete** (`PAGED_PREFILL_PREEMPTION_TIMEOUT`), more often while another process uses the NPU. corelib fails only that call, so FastFlowLM resets the session and runs the conversation again from the start, once; a second failure needs an unload and reload.
+Every core model runs as corelib's own model, which packs its weights on every load: there is no packed-weight cache beside the GGUF. A `<gguf name>.core-weights.bin` / `.json` pair left there by an earlier build is no longer read and can be deleted.
+
+```powershell
+flm pull qwen3-core:4b
+flm run  qwen3-core:4b
+```
+
+---
+
+## 🧩 Model Card: [Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507)
+
+- **Type:** Text-to-Text
+- **Think:** Yes
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507)
+- **Quantization:** Q4_1
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3-tk:4b
+```
+
+---
+
+## 🧩 Model Card: [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
+
+- **Type:** Text-to-Text
+- **Think:** No
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
+- **Quantization:** Q4_1
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3-it:4b
+```
+
+---
+
+## 🧩 Model Card: [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+
+- **Type:** Image-Text-to-Text
+- **Think:** No
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Yes, prompts with pictures included (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+- **Quantization:** Q4_1
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3vl-it:4b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3vl-it:3b -r 1
+```
+
+```shell
+flm serve qwen3vl-it:3b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+
+---
+
+## 🧩 Model Card: [Qwen3-VL-4B-Instruct — Flash](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+
+- **Type:** Image-Text-to-Text
+- **Think:** No
+- **Tool Calling Support:** No  
+- **Base Model:** [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+- **Quantization:** Q4_1
+- **Max Context Length:** 1k tokens  
+- **Default Context Length:** 1k tokens (fixed, see note below)
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3vl-flash:4b
+```
+
+⚡ **Note — what "Flash" changes:**
+
+- Same checkpoint as `qwen3vl-it:4b`, served by a different engine. Prefill runs on a single fused NPU overlay instead of swapping between the matmul and attention overlays every layer, which cuts time-to-first-token on short prompts.
+- **Prefill speed: ~350 tokens/s** at a 128-token prompt — the short-prompt case Flash is tuned for.
+- **Decode speed is unchanged.** Flash only changes how prefill runs, so generation tokens/s matches `qwen3vl-it:4b` — see the [Qwen3 benchmarks](https://fastflowlm.com/docs/benchmarks/qwen3_results/).
+- **Single-turn.** Every request starts from a clean KV state — earlier turns are not carried over. A system prompt is the one exception: it is pinned on first use and reused on later requests, so it is not re-prefilled on every call.
+- **Context length is fixed at 1k tokens.** Context-length overrides are ignored for this model.
+- **Tool calling is not supported.** Any tools passed with the request are dropped.
+- **Images are always downscaled to a 256 px longer side** to fit the short context. The `--img-pre-resize` / `-r` option is ignored. Images already smaller than 256 px keep their original resolution.
+- **Example usage:** [Flash models in server mode](https://fastflowlm.com/docs/instructions/server/openapi/#-example-flash-models-single-turn-pinned-system-prompt)
+
+---
+
+## 🧩 Model Card: [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
+
+- **Type:** Text-to-Text
+- **Think:** No
+- **Tool Calling Support:** No  
+- **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
+- **Quantization:** Q4_1
+- **Max Context Length:** 32k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen2.5-it:3b
+```
+
+---
+
+## 🧩 Model Card: [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
+
+- **Type:** Image-Text-to-Text
+- **Think:** No
+- **Tool Calling Support:** No  
+- **Prefix cache (server mode):** Yes, prompts with pictures included (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Base Model:** [Qwen/Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
+- **Quantization:** Q4_1
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen2.5vl-it:3b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen2.5vl-it:3b -r 1
+```
+
+```shell
+flm serve qwen2.5vl-it:3b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+
+---
+
+## 🧩 Model Card: [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** No  
+- **Base Model:** [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.5:0.8b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.5:0.8b -r 1
+```
+
+```shell
+flm serve qwen3.5:0.8b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.5-0.8B model card](https://huggingface.co/Qwen/Qwen3.5-0.8B#using-qwen35-via-the-chat-completions-api) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+- In server mode this model reuses the prompts it has already read (system prompt, tools, earlier turns), so agents such as Hermes wait for new text only. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/).
+- Host memory: the token embeddings are read straight from `model.q4nx` through a read-only memory map, one row per token, instead of being unpacked into a 485 MiB table. This saves about 0.5 GiB of RAM (private memory at 4k context: about 0.8 GiB before, 0.3 GiB now) with the same speed and the same output. Only the rows of tokens that were actually seen stay in memory, and the OS can drop them under memory pressure; if it does, a prompt full of new tokens takes about a second longer to start. On Windows, the loaded model's `model.q4nx` cannot be replaced or deleted, so stop the server before `flm remove` or `flm pull` of this model. This applies to the Qwen3.5 0.8B, 2B and 4B only; the 9B and the other model families still keep their embedding tables in RAM.
+
+---
+
+## 🧩 Model Card: [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Base Model:** [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.5:2b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.5:2b -r 1
+```
+
+```shell
+flm serve qwen3.5:2b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.5-2B model card](https://huggingface.co/Qwen/Qwen3.5-2B#using-qwen35-via-the-chat-completions-api) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+- In server mode this model reuses the prompts it has already read (system prompt, tools, earlier turns), so agents such as Hermes wait for new text only. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/).
+- Host memory: the token embeddings are read straight from `model.q4nx` through a read-only memory map, one row per token, instead of being unpacked into a 970 MiB table. This saves about 1 GiB of RAM (private memory at 4k context: about 1.2 GiB before, 0.3 GiB now) with the same speed and the same output. Only the rows of tokens that were actually seen stay in memory, and the OS can drop them under memory pressure; if it does, a prompt full of new tokens takes about a second longer to start. On Windows, the loaded model's `model.q4nx` cannot be replaced or deleted, so stop the server before `flm remove` or `flm pull` of this model. This applies to the Qwen3.5 0.8B, 2B and 4B only; the 9B and the other model families still keep their embedding tables in RAM.
+
+---
+
+## 🧩 Model Card: [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Base Model:** [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.5:4b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.5:4b -r 1
+```
+
+```shell
+flm serve qwen3.5:4b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.5-4B model card](https://huggingface.co/Qwen/Qwen3.5-4B#using-qwen35-via-the-chat-completions-api) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+- In server mode this model reuses the prompts it has already read (system prompt, tools, earlier turns), so agents such as Hermes wait for new text only. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/).
+- Host memory: the token embeddings are read straight from `model.q4nx` through a read-only memory map, one row per token, instead of being unpacked into a 1.2 GiB table. This saves about 1.2 GiB of RAM (private memory at 4k context: about 1.8 GiB before, 0.6 GiB now) with the same speed and the same output. Only the rows of tokens that were actually seen stay in memory, and the OS can drop them under memory pressure; if it does, a prompt full of new tokens takes about a second longer to start. On Windows, the loaded model's `model.q4nx` cannot be replaced or deleted, so stop the server before `flm remove` or `flm pull` of this model. This applies to the Qwen3.5 0.8B, 2B and 4B only; the 9B and the other model families still keep their embedding tables in RAM.
+
+---
+
+## 🧩 Model Card: [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Base Model:** [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.5:9b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.5:9b -r 1
+```
+
+```shell
+flm serve qwen3.5:9b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px 
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B#using-qwen35-via-the-chat-completions-api) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+- In server mode this model reuses the prompts it has already read (system prompt, tools, earlier turns), so agents such as Hermes wait for new text only. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/).
+
+---
+
+## 🧩 Model Card: [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Toggleable
+- **Tool Calling Support:** Yes  
+- **Base Model:** [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 256k tokens  
+- **Default Context Length:** 32k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.6-moe:35b-a3b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.6-moe:35b-a3b -r 1
+```
+
+```shell
+flm run qwen3.6-moe:35b-a3b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px 
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+📝 **Note**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B#using-qwen36-via-the-chat-completions-api) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+- In server mode this model reuses the prompts it has already read (system prompt, tools, earlier turns), so agents such as Hermes wait for new text only. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/).
+
+---
+
+## 🧩 Model Card: [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+
+- **Type:** Image-Text-to-Text
+- **Think:** Yes
+- **Tool Calling Support:** Yes  
+- **Prefix cache (server mode):** Partly: the shared system prompt of text conversations is saved; a conversation that keeps going uses the older single-checkpoint reuse (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
+- **Speculative Decoding:** Yes — built-in MTP draft head (see note below)
+- **Base Model:** [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+- **Quantization:** Q4_K
+- **Max Context Length:** 8k tokens  
+- **Default Context Length:** 4k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))  
+- **[Set Context Length at Launch](https://fastflowlm.com/docs/instructions/cli/#-set-context-length-at-launch)**
+
+
+▶️ Run with FastFlowLM in PowerShell:  
+
+```shell
+flm run qwen3.8-mtp:27b
+```
+
+▶️ Serve with FastFlowLM in PowerShell:  
+
+```shell
+flm serve qwen3.8-mtp:27b
+```
+
+▶️ Image Resize Options
+
+You can control image resizing when running or serving the model using the `--img-pre-resize` flag or simply `-r`:
+
+```shell
+flm run qwen3.8-mtp:27b -r 1
+```
+
+```shell
+flm serve qwen3.8-mtp:27b -r 1
+```
+
+The `-r` option determines the image's height:
+
+- 0: original size 
+- 1: height = 480 px 
+- 2: height = 720 px (default)
+- 3: height = 1080 px 
+- 4: height = 1440 px 
+- 5: height = 2160 px 
+- 6: height = 2880 px 
+- 7: height = 3240 px 
+- 8: height = 4320 px 
+                 
+> Don't worry—if your image is already smaller than the setup, it keeps its original resolution! ✨
+
+⚡ **Note — MTP speculative decoding:**
+
+Qwen3.8 ships with a **multi-token prediction (MTP) head** — a small draft model trained alongside the main network. FastFlowLM runs it on the NPU:
+
+1. The MTP head **drafts** several candidate tokens in one shot.
+2. The full model **verifies** them in a single pass.
+3. Accepted drafts are kept; the first rejected one is replaced by the base model's own choice, and drafting restarts from there.
+
+What that means in practice:
+
+- **Faster decoding, same output.** Verification is an exact compare against what the base model would have emitted, so every token you receive is a token the base model would have produced on its own. Speculation changes throughput, not quality.
+- **Gains are prompt-dependent.** Predictable, low-entropy stretches — code, structured output, long reasoning chains — see the highest draft acceptance. Highly creative or surprising text accepts fewer drafts and converges toward ordinary decode speed.
+- **Nothing to configure.** Speculation is driven by the engine; there is no flag to set and no API change.
+
+📝 **Note:**
+
+- Optimal sampling parameters for generation vary depending on the task. Check the [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B#api-usage) for details.
+- Image understanding adapts to image size. Image TTFT can range from under 1 second to ~200 seconds depending on resolution. Use lower-resolution images (720p or below) unless high resolution is required (e.g. OCR on small text).
+- Video understanding is not supported yet.
+
+---
+
+## 🧩 Model Card: [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) with the [DFlash 2 draft](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+
+- **Type:** Image-Text-to-Text, with speculative decoding
+- **What it is:** the same model as [`qwen3.8-mtp:27b`](#-model-card-qwen38-27b), decoded with z-lab's DFlash 2 draft instead of the built-in MTP head. The draft reads features of five layers of the main model, writes a block of 7 tokens in one pass and picks one coherent path through its top candidates; the NPU checks all 7 in one pass, with the same kernels as `qwen3.8-mtp:27b`
+- **Speed:** 1.16x the decode speed of `qwen3.8-mtp:27b` on average over ten mixed prompts, from 0.9x to 1.5x per prompt (code and structured answers gain most, short or unpredictable answers least; [benchmarks](https://fastflowlm.com/docs/benchmarks/qwen3.8_results/))
+- **Think / Tool Calling / Vision / Prefix cache:** as `qwen3.8-mtp:27b`
+- **Packages:** two downloads. The main weights are the `qwen3.8-mtp:27b` package (`Qwen3.8-27B-NPU2`, about 18 GB); the draft is [`Qwen3.8-27B-DFlash2-NPU2`](https://huggingface.co/FastFlowLM/Qwen3.8-27B-DFlash2-NPU2) (1.4 GB). `flm pull qwen3.8-dflash2:27b` downloads whichever is missing
+- **Draft:** 5 layers, 2B parameters, Q4_K (the feature projection and the candidate tables stay BF16 where they are read row by row)
+- **Max Context Length:** 8k tokens
+- **Default Context Length:** 4k tokens ([change default](https://fastflowlm.com/docs/instructions/cli/#-change-default-context-length-max))
+- **License:** the draft is [Apache-2.0](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2); the main model's license applies to the main weights
+- **FastFlowLM:** 1.0.12 or later
+
+▶️ Run with FastFlowLM in PowerShell:
+
+```shell
+flm run qwen3.8-dflash2:27b
+```
+
+▶️ Serve with FastFlowLM in PowerShell:
+
+```shell
+flm serve qwen3.8-dflash2:27b
+```
+
+🧪 **Smoke test** (a predictable answer, long enough for many speculative steps):
+
+```shell
+flm run qwen3.8-dflash2:27b
+>>> Write a Python function that checks whether a number is prime.
+```
+
+Expected: a correct function with a docstring, decoding noticeably faster than with `qwen3.8-mtp:27b` (most of the draft is accepted on code).
+
+📝 **Note:**
+
+- Every step drafts 7 tokens and checks them together; the model keeps the longest prefix it agrees with plus one token of its own. As with `qwen3.8-mtp:27b`, drafted tokens are compared with the model's own most likely token and skip the sampler (see the ⚠️ note in [Request Parameters](https://fastflowlm.com/docs/instructions/server/request_parameters/)).
+- Greedy output can differ from `qwen3.8-mtp:27b` at near-ties: the NPU checks 8 positions in one pass, which rounds differently from decoding one token at a time, and the two drafts propose different blocks.
+- The draft sees the last 2048 tokens of the conversation. After a saved prompt is reused (server mode prefix cache) it starts without the reused part and fills up again from the tokens that follow, so the first steps accept less.
+- `FLM_DFLASH=0` in the environment loads the MTP head instead: the tag then behaves like `qwen3.8-mtp:27b`.
+- Image input, the 8k context and the image-resize options work as on `qwen3.8-mtp:27b` (`-r`).
+- `flm remove qwen3.8-dflash2:27b` removes only the draft package; `qwen3.8-mtp:27b` stays installed.
