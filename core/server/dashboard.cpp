@@ -2255,7 +2255,7 @@ function histRender(missed) {
   if (tfs.length)  parts.push("ttft median " + dur(tfs[Math.floor(tfs.length / 2)]));
   /* The wide dot is the page's major-break separator (the KV and version lines use it); the
    * tight dot inside each group stays tight, so group edges read heavier than window edges. */
-  $("hsum").textContent = parts.join("  |  ");
+  $("hsum").textContent = parts.join("  ·  ");
 
   /* Newest first. The rows are rebuilt only when the set changes; a poll only rewrites the ages. */
   const body = $("hbody");
@@ -2426,10 +2426,10 @@ function update(s, dt) {
   $("m-kvdet").textContent = s.kv_bytes_total > 0
       ? (kvStream
           ? "of " + hb(s.kv_bytes_total) + " in host mirror  |  " + cnt3(s.kv_tokens_used) + " tok"
-            + "  |  " + hb(s.kv_bytes_carved || 0) + " VRAM ring"
+            + "  ·  " + hb(s.kv_bytes_carved || 0) + " VRAM ring"
           : "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  |  "
             + cnt3(s.kv_tokens_used) + " tok"
-            + (kvGave > 0 ? "  |  " + hb(kvGave) + " lent to experts" : ""))
+            + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : ""))
       : "";
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
@@ -2473,7 +2473,7 @@ function update(s, dt) {
   const kvCached = Math.min(s.kv_tokens_cached || 0, s.kv_tokens_used || 0);
   const kvLive = Math.max(0, (s.kv_tokens_used || 0) - kvCached);
   const kvCachedShare = (s.kv_tokens_used || 0) > 0 ? kvCached / s.kv_tokens_used : 0;
-  mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  |  " + pct(kvFrac);
+  mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  ·  " + pct(kvFrac);
   /* The two shares are FRACTIONS OF THE FILL, not of the track: spent as widths against a total
    * of 1 they would draw a full bar for a pool holding 29 KiB. */
   setSplit(mKv, (1 - kvCachedShare) * kvFrac, kvCachedShare * kvFrac, 1);
@@ -2488,7 +2488,7 @@ function update(s, dt) {
           ? "a miss streams the missing blocks from the mirror into the ring"
           : "")
       : (s.kv_tokens_max > 0
-          ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  |  " + cnt3(s.kv_tokens_max)
+          ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  ·  " + cnt3(s.kv_tokens_max)
             + " tok, with what the experts borrowed taken back"
           : "");
   mPc.v.textContent = pct(s.prefix_hit_rate); setBar(mPc.i, s.prefix_hit_rate, false);
@@ -2602,7 +2602,7 @@ function update(s, dt) {
      * it, or the figure labelled a second is the count over however long the poll happened to
      * take. */
     $("hitv").textContent = (dr > 0 || ex.routed > 0)
-        ? pct(hf) + "  |  " + (dr > 0 ? num3((dr - drr) / dt) + " missed/s"
+        ? pct(hf) + "  ·  " + (dr > 0 ? num3((dr - drr) / dt) + " missed/s"
                                       : cnt3(ex.routed - ex.routed_res) + " missed")
         : DASH;
     setBar($("hiti"), hf, false);
@@ -2642,7 +2642,7 @@ function update(s, dt) {
         cnt(t.units) + " " + (t.name === "pinned" ? "in host pool"
                             : t.name === "ssd" ? "on the file tier" : t.name));
     $("planev").textContent = cnt(res) + " of " + cnt(ex.n_units) + " in VRAM" +
-        (rest.length ? "  |  " + rest.join("  |  ") : "  |  fully resident");
+        (rest.length ? "  ·  " + rest.join("  ·  ") : "  |  fully resident");
 
     /* ---- the plane itself.
      *
@@ -2808,7 +2808,7 @@ function update(s, dt) {
      * arrive back where it started; the share of promotions that are re-admissions is the number
      * that says whether the guards are set right. */
     moveKv["Re-admitted"].textContent = ex.promotions > 0
-        ? cnt(ex.readmits) + "  |  " + pct(ex.readmits / ex.promotions, 0)
+        ? cnt(ex.readmits) + "  ·  " + pct(ex.readmits / ex.promotions, 0)
         : cnt(ex.readmits);
     moveKv["Refused"].textContent      = ex.dispatches > 0
         ? pct(ex.refused / ex.dispatches, 0) + " of " + cnt3(ex.dispatches) : DASH;
@@ -2816,7 +2816,7 @@ function update(s, dt) {
     /* THE MOVER HAVING NOWHERE TO PUT THE BYTES, which is a different failure from the guard
      * declining and reads identically in a move count: both are "nothing moved". */
     moveKv["Starved"].textContent = cnt(ex.starved_slab + ex.starved_pool + ex.no_record);
-    moveKv["SSD reads"].textContent = lk ? cnt(lk.ssd_reads) + "  |  " + hb(lk.ssd_bytes) : DASH;
+    moveKv["SSD reads"].textContent = lk ? cnt(lk.ssd_reads) + "  ·  " + hb(lk.ssd_bytes) : DASH;
     /* WHAT THE SLAB TOOK FROM THE CACHE. The cache's own line says what it released; this says
      * how much of it is actually holding experts, and the two are read against each other --
      * released-but-not-taken is VRAM in neither pool and a boundary that is not moving. */
@@ -3416,7 +3416,7 @@ function select(gi) {
                            " of " + cnt(graph.order.length)
                          : "position " + cnt(o.first_at + 1) + " of " + cnt(graph.order.length));
   where.push(o.bands.length === 1 ? "one band" : o.bands.length + " bands");
-  head.appendChild(el("div", "gwhere", where.join("  |  ")));
+  head.appendChild(el("div", "gwhere", where.join("  ·  ")));
   if (o.schema && o.schema.doc) head.appendChild(el("div", "gdoc", o.schema.doc));
 
   drawGeometry(host, o);
@@ -3479,7 +3479,7 @@ function drawSummary() {
     d.appendChild(el("span", "n", pl.name));
     const used = libs[pl.name] || 0;
     d.appendChild(el("span", "c", pl.kernels + " kernels" +
-                                 (used ? "  |  " + cnt(used) + " launches" : "  |  unused")));
+                                 (used ? "  ·  " + cnt(used) + " launches" : "  |  unused")));
     gl.appendChild(d);
   }
   $("gsum").textContent = missing ? cnt(missing) + " op(s) with no device kernel"
@@ -3653,7 +3653,7 @@ function sessRow(r, hybrid, manyModels) {
   for (const [k, f, name] of TIERS) {
     if (!(r[f] > 0)) continue;
     bar.appendChild(el("i", "t-" + k)).style.width = (100 * r[f] / held).toFixed(1) + "%";
-    if (parts.length) wh.appendChild(document.createTextNode("  |  "));
+    if (parts.length) wh.appendChild(document.createTextNode("  ·  "));
     wh.appendChild(el("span", "tn-" + k, name));
     wh.appendChild(document.createTextNode(" " + pct(r[f] / held, 0)));
     parts.push(name);
