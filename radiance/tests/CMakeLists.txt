@@ -15,7 +15,7 @@
 # builder. With the archive linked, a new ABI call missing from the fake would pull in
 # rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
 # undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test)
+set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -324,12 +324,14 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    if(t STREQUAL "clef_decision_test")
+    if(t STREQUAL "spark25_convert_test")
+      add_dependencies(${t} rad-convert libref spark25_bf16)
+    elseif(t STREQUAL "clef_decision_test")
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")

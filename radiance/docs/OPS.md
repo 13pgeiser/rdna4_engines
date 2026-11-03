@@ -209,6 +209,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
 | `swiglu_clamped` | `M`(range) `n` `limit`:f64 `dtype` | `gate_up` → `y` |
+| `swiglu_step` | `M`(range) `n` `limit`:f64 `dtype` | `gate_up` → `y` |
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
@@ -265,6 +266,13 @@ clip.
 
 libr4d's `swiglu_clamped_bf16` serves bf16 in and out at any width, pitched rows, `M` up to
 65535.
+
+`swiglu_step` clips in the other order, as Ling-3.0 is served by vLLM and SGLang (vLLM's
+`SwigluStepAndMul`): `min(silu(gate), limit) * clamp(up, -limit, limit)` in f32, rounded once. The
+SiLU is taken first and its value clipped above, so a gate far past `limit` gives exactly `limit`
+where `swiglu_clamped` gives `silu(limit)` (3.93 at a limit of 4). HF's reference model for Ling-3.0
+ignores the clamp; the served form is the one checkpoints are evaluated with.
+libr4d's `swiglu_step_bf16` serves it as `swiglu_clamped_bf16` does.
 
 **`add` and `mul`** broadcast a `b` of exactly `n` elements along the rows of a taller output (a
 bias add). Nothing else broadcasts, in these or any other elementwise op. `add`'s `div` divides
@@ -2062,6 +2070,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
+| `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
@@ -2191,8 +2200,8 @@ expert, and the weights are the selected `p`, never the biased ranks. With `norm
 `p * (route_scale / (sum + 1e-20))` over the row's selected `p`, with `norm` 0 `p * route_scale`;
 `route_scale` is positive and finite. A rank that is NaN or `-inf` is never selected, and a row
 with fewer than `top_k` selectable experts has no defined selection (libref refuses it).
-Grouped selection (`n_group > 1`) is not this op. GLM-5.3 routes 8 of 288 experts in one group
-with `route_scale` 2.5.
+Grouped selection (`n_group > 1`) is `router_sigmoid_group_topk`, below. GLM-5.3 routes 8 of 288
+experts in one group with `route_scale` 2.5.
 
 libr4d's `router_sigmoid_topk_f32` takes up to 512 experts and `top_k` up to 32, f32 logits, bias
 and weights, i32 ids, pitched rows, `M` up to 65535. It selects in one wave per row: each lane
@@ -2200,6 +2209,16 @@ holds its experts as order-preserving keys (`-0` as `+0`, ties to the lower expe
 takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of a
 serial scan with a strict `>`. A NaN rank is never selected, and a row with fewer than `top_k`
 other ranks names expert 0 in its empty slots, weighted by expert 0's `p`.
+
+**`router_sigmoid_group_topk`** is the group-limited form (DeepSeek-V3's `noaux_tc` with
+`n_group > 1`, Ling-3.0's 8 groups of 64 experts, 4 kept). The experts fall into `n_group` equal
+groups of at least two; a group's rank is the sum of its two largest `p + bias`; the `topk_group`
+best groups are kept, ties to the lower group; the selection is `router_sigmoid_topk`'s over the
+kept groups' experts only, and the weights are the same. `top_k` is at most the kept experts.
+
+libr4d's `router_sigmoid_group_topk_f32` is `router_sigmoid_topk_f32`'s wave with the groups ranked
+first, a lane a group: up to 512 experts in up to 32 groups, `top_k` up to 32, pitched rows, `M` up
+to 65535.
 
 **`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
 `ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with
@@ -2941,6 +2960,7 @@ order, not a slow one.
 | `dsa_query` | `M`(range) `n` `dtype` | `x` → `q`, `scale` |
 | `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `row_part`/opt | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score`, `cu_part`? |
 | `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
+| `mla_attn_paged` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`?, `kv`, `block_table`, `seqused`, `cu_seqlens`, `gate`? → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
@@ -3292,6 +3312,30 @@ runs the matrix row's kernel instead. It also takes multiples of 32 heads (two g
 workgroup), which no constraint routes to it. GLM-5.3 splits a prefill's MLA by rows under tensor
 parallelism, so each rank holds all 64 heads of its rows (ARCHITECTURES.md, `glm5next`).
 
+`mla_attn_paged` is the dense, causal form for a model whose MLA keeps a rotary part beside the
+latent (Ling-3.0: latent 512, rotary 64, every key visible). A token's cache row is the normed
+latent followed by the rotated key part, `latent_dim + rope_dim` wide; it is stored as one KV head
+of half that width, its first half in the K slot and the rest in the V slot, so `kv` is
+`[pages, 1, block_size, latent_dim + rope_dim]`. `q` is the absorbed query `[M, heads,
+latent_dim]` and `q_rope` its rotated part `[M, heads, rope_dim]`, each at its own row and head
+pitch. A score is `scale * (q . latent + q_rope . rope)`, `scale` from the original head width
+(`(nope + rope)^-0.5`), and the value is the latent. Sequences, positions and the causal bound are
+`attn_paged`'s: sequence `s` owns query rows `[cu[s], cu[s+1])`, `seqused[s]` is its context after
+the step, row `i` of it sits at position `seqused[s] - qlen + i` and sees keys `0..position` through
+`block_table[s]`. An unmapped page contributes nothing and a row with no visible key outputs zero.
+With `gate` `[M, >= heads]` (a head's gate logit) the output is
+`bf16(bf16(out) * bf16(sigmoid(gate)))`, Ling's head-wise attention gate taken on the latent, ahead
+of the expansion. The softmax is f32 and `out` rounded once before the gate.
+
+libr4d's `mla_attn_paged_bf16` serves `latent_dim` 512 and `rope_dim` 64, up to 64 heads, pages of
+up to 256 tokens: a wave a (query row, head), its lanes holding 16 latent and 2 rotary columns each,
+so a score is one wave sum. A short batch splits each row's history over waves and joins the f32
+partials. The split count comes from the head count alone, never from the rows of the launch or
+its longest table, so a row's bytes do not depend on its batch: a speculative verify of `k + 1`
+rows must give, bit for bit, the single-row decodes at the same positions, or greedy output
+differs from the run without speculation. That holds up to 32 rows a launch, the rows the scratch
+hook sizes for; a larger batch takes as many splits as its scratch holds.
+
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.
 `mode=absorb` multiplies `a` `[M, heads, head_dim]` by the head's key block as stored,
@@ -3301,10 +3345,10 @@ accumulate in f32 and round once to bf16. The KV cache stays latent; only this w
 per-head width. Its rows are head-major, so a tensor-parallel slice of whole heads is a row range.
 `a` and `y` may also be `[M, heads*width]`, heads contiguous, with their own token pitch.
 
-libr4d's `mla_project_bf16` serves `head_dim` 256 and `latent_dim` 512, up to 64 heads, pitched
-tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each weight
-element once for them, with every row's sum in the same order whatever the group, so a row's bytes
-do not depend on the batch.
+libr4d's `mla_project_bf16` serves `head_dim` 128 or 256 and `latent_dim` 512, up to 64 heads,
+pitched tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each
+weight element once for them, with every row's sum in the same order whatever the group, so a row's
+bytes do not depend on the batch.
 
 ## Draft heads
 

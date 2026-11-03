@@ -1371,7 +1371,8 @@ static const SplitGeo kSplitG6 = { 6, 2, 16, "r4d_attn_prefill_h256_gqa6" };
 struct SplitSeq { int64_t q, ctx; };
 static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* name,
                             const char* kv_dtype, const std::vector<SplitSeq>& seqs, int force,
-                            bool law_splits, int64_t lead = 0, int64_t tail = 0) {
+                            bool law_splits, int64_t lead = 0, int64_t tail = 0,
+                            int64_t decl_max_ctx = 0) {
     if (!sel(name) && !sel("attn_prefill_split")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
@@ -1409,6 +1410,18 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     const int64_t span0 = lead, span1 = cu[(size_t)ns];   /* the launch's own rows */
     const int64_t total_q = span1 + tail;
     const bool ragged = ns > 1 || lead || tail;
+    /* This direct-kernel fixture supplies an exact host maximum for a full sequence operand. Its
+     * synthetic partial-row operands do not carry the runtime's host slice/position view, so they
+     * exercise the safe declared-context fallback. */
+    int32_t used_max_h = -1;
+    if (!lead && !tail)
+        for (int32_t x : used) used_max_h = std::max(used_max_h, x);
+    int wgp_count = 32, current_device = 0;
+    hipDeviceProp_t current_props{};
+    if (hipGetDevice(&current_device) == hipSuccess &&
+        hipGetDeviceProperties(&current_props, current_device) == hipSuccess &&
+        current_props.multiProcessorCount > 0)
+        wgp_count = current_props.multiProcessorCount;
     /* one disjoint run of mb blocks per sequence */
     const std::vector<int32_t> bt = iota_i32(ns * mb);
 
@@ -1473,6 +1486,7 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
             PI("block_size", bs), PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
             PS("kv_dtype", kv_dtype),
         };
+        if (decl_max_ctx > 0) ps.push_back(PI("max_ctx", decl_max_ctx));
         if (sp > 0) ps.push_back(PI("splits", sp));
         /* run_case, with the scratch poisoned: 0x7f7f7f7f is m = 3.4e38, so a segment the merge
          * reads but nobody wrote outweighs every real one and the row comes out wrong. Fresh
@@ -1482,6 +1496,8 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
         a.t = ts.data(); a.n_t = (int)ts.size();
         a.p = ps.data(); a.n_p = (int)ps.size();
         a.world_size = 1;
+        a.kv_used_max_h = used_max_h;
+        a.wgp_count = wgp_count;
         const int64_t need = r->scratch ? r->scratch(&a) : 0;
         if (need > 0) {
             a.scratch = dalloc((size_t)need);
@@ -1498,8 +1514,10 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     const int s_un = run(1, d_o[0]);
     const int s_fo = run(force, d_o[1]);
     const int s_lw = run(0, d_o[2]);
+    int law_ctx = decl_max_ctx > 0 ? (int)decl_max_ctx : (int)(mb * bs);
+    if (used_max_h > 0 && used_max_h < law_ctx) law_ctx = used_max_h;
     const int want = law((int)(ragged ? std::min<int64_t>(2048, total_q) : qmax), (int)total_q,
-                         (int)ns, (int)kv_heads, (int)(mb * bs));
+                         (int)ns, (int)kv_heads, law_ctx);
     ok((tag + ": splits 1 / forced / law").c_str(),
        s_un == 1 && s_fo == force && s_lw == want && (!law_splits || want > 1),
        fmt("launched %d / %d / %d, the law says %d%s", s_un, s_fo, s_lw, want,
@@ -16810,8 +16828,10 @@ static void mhc_check(const Plugin& pl, const char* name, int64_t rows, int64_t 
         dlclose(ref);
         return;
     }
-    const bool clipped = !std::strcmp(row->op, "swiglu_clamped");
-    const bool routed = !std::strcmp(row->op, "router_sigmoid_topk");
+    const bool clipped =
+        !std::strcmp(row->op, "swiglu_clamped") || !std::strcmp(row->op, "swiglu_step");
+    const bool grouped = !std::strcmp(row->op, "router_sigmoid_group_topk");
+    const bool routed = grouped || !std::strcmp(row->op, "router_sigmoid_topk");
     const bool pooled = !std::strcmp(row->op, "dsa_pool");
     const bool query = !std::strcmp(row->op, "dsa_query");
     const bool projection = !std::strcmp(row->op, "gemm_nt_f32");
@@ -16821,6 +16841,10 @@ static void mhc_check(const Plugin& pl, const char* name, int64_t rows, int64_t 
         ps.push_back(PI("top_k", 8));
         ps.push_back(PI("norm", hc));
         ps.push_back(PF("route_scale", 2.5));
+        if (grouped) { /* Ling's grouping: 8 groups, the best 4 by their top-2 sums */
+            ps.push_back(PI("n_group", 8));
+            ps.push_back(PI("topk_group", 4));
+        }
     } else if (projection) {
         ps.push_back(PI("N", n));
         ps.push_back(PI("K", hc));
@@ -17410,7 +17434,7 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
 }
 
 static void mla_project_check(const Plugin& pl, int64_t rows, int64_t heads, const char* mode,
-                              bool flat = false) {
+                              bool flat = false, int64_t head_dim = 256) {
     const auto* row = find(pl, "mla_project_bf16");
     if (!row || !g_plugin) {
         ok("MLA projection", false, "kernel missing");
@@ -17434,7 +17458,7 @@ static void mla_project_check(const Plugin& pl, int64_t rows, int64_t heads, con
         dlclose(ref);
         return;
     }
-    std::vector<RadParam> ps = { PI("M", rows + 7),     PI("heads", heads), PI("head_dim", 256),
+    std::vector<RadParam> ps = { PI("M", rows + 7),     PI("heads", heads), PI("head_dim", head_dim),
                                  PI("latent_dim", 512), PS("mode", mode),   PS("dtype", "bf16") };
     std::vector<RadTensor> host, device;
     std::vector<std::vector<uint8_t>> bytes(3);
@@ -17518,14 +17542,166 @@ static void mla_project_check(const Plugin& pl, int64_t rows, int64_t heads, con
                     }
             for (size_t j = 0; j < got.size(); ++j)
                 if (!written[j]) guards = guards && got[j] == 0xa5;
-            ok(fmt("MLA %s M=%lld H=%lld max error %.8g", mode, (long long)rows, (long long)heads,
-                   max_error)
+            ok(fmt("MLA %s M=%lld H=%lld D=%lld max error %.8g", mode, (long long)rows,
+                   (long long)heads, (long long)head_dim, max_error)
                    .c_str(),
                matches);
             ok("MLA projection pitched tensors and guards", guards);
         }
     } else
         ok("MLA projection", false, "allocation or shape failed");
+    dlclose(ref);
+}
+
+/* mla_attn_paged against libref: several sequences with deeper contexts than their queries, an
+ * unmapped page, the rotary query as a column view of a wider projection, an optional head gate,
+ * pitched rows and poisoned margins. */
+static void mla_paged_check(const Plugin& pl, std::vector<int64_t> qlen, std::vector<int64_t> ctx,
+                            int64_t heads, bool gated) {
+    const char* what = "mla_attn_paged_bf16";
+    const auto* row = find(pl, what);
+    if (!row || !g_plugin) {
+        ok(what, false, "kernel missing");
+        return;
+    }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) {
+        ok(what, false, "oracle missing");
+        return;
+    }
+    auto count = (int (*)())dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "mla_attn_paged")) oracle = at(i);
+    if (!oracle) {
+        ok(what, false, "oracle row missing");
+        dlclose(ref);
+        return;
+    }
+    const int64_t L = 512, R = 64, bs = 16, S = (int64_t)qlen.size();
+    int64_t M = 0, bmax = 0, pages = 0;
+    for (int64_t s = 0; s < S; ++s) {
+        M += qlen[(size_t)s];
+        bmax = std::max(bmax, (ctx[(size_t)s] + bs - 1) / bs);
+        pages += (ctx[(size_t)s] + bs - 1) / bs;
+    }
+    std::vector<RadParam> ps = { PI("M", M + 5),       PI("heads", heads),
+                                 PI("latent_dim", L),  PI("rope_dim", R),
+                                 PI("block_size", bs), PF("scale", 1 / std::sqrt(192.0)),
+                                 PS("dtype", "bf16") };
+    /* Operands: q, q_rope (a column view at 192 a head), kv, block_table, seqused, cu_seqlens,
+     * gate, out. */
+    std::vector<RadTensor> host(8);
+    host[0] = T(nullptr, RAD_BF16, { M, heads, L });
+    host[0].stride[1] = L + 3;
+    host[0].stride[0] = heads * (L + 3) + 11;
+    host[1] = T(nullptr, RAD_BF16, { M, heads, R });
+    host[1].stride[1] = 192;
+    host[1].stride[0] = heads * 192 + 4;
+    host[2] = T(nullptr, RAD_BF16, { pages, 1, bs, L + R });
+    host[3] = T(nullptr, RAD_I32, { S, bmax });
+    host[3].stride[0] = bmax + 2;
+    host[4] = T(nullptr, RAD_I32, { S });
+    host[5] = T(nullptr, RAD_I32, { S + 1 });
+    if (gated) {
+        host[6] = T(nullptr, RAD_BF16, { M, heads + 3 });
+        host[6].stride[0] = heads + 9;
+    }
+    host[7] = T(nullptr, RAD_BF16, { M, heads, L });
+    host[7].stride[1] = L + 5;
+    host[7].stride[0] = heads * (L + 5) + 7;
+    std::vector<std::vector<uint8_t>> bytes(8);
+    std::vector<void*> allocations(8, nullptr);
+    std::vector<RadTensor> device(8);
+    bool allocated = true;
+    for (int i = 0; i < 8 && allocated; ++i) {
+        RadTensor& t = host[(size_t)i];
+        if (!t.rank) continue;
+        int64_t elements = t.shape[0] * t.stride[0];
+        bytes[(size_t)i].assign((size_t)elements * esz(t.dtype) + 256, 0xa5);
+        t.data = bytes[(size_t)i].data() + 128;
+        const bool bf = t.dtype == RAD_BF16 && i != 7;
+        if (bf)
+            for (int64_t e = 0; e < elements; ++e) {
+                const float v =
+                    (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919)) % 2001) - 1000) /
+                    (i == 2 ? 1000.0f : i == 6 ? 300.0f : 250.0f);
+                ((uint16_t*)t.data)[e] = h_to_bf16(v);
+            }
+        if (i == 3) {
+            /* Pages in a scrambled order; the second page of the deepest sequence unmapped. */
+            int next = 0;
+            for (int64_t s = 0; s < S; ++s)
+                for (int64_t b = 0; b < bmax; ++b) {
+                    int v = -1;
+                    if (b < (ctx[(size_t)s] + bs - 1) / bs) v = (int)((next++ * 5 + 3) % pages);
+                    if (s == S - 1 && b == 1 && ctx[(size_t)s] > 2 * bs) v = -1;
+                    ((int*)t.data)[s * t.stride[0] + b] = v;
+                }
+        }
+        if (i == 4)
+            for (int64_t s = 0; s < S; ++s) ((int*)t.data)[s] = (int)ctx[(size_t)s];
+        if (i == 5) {
+            int c = 0;
+            for (int64_t s = 0; s <= S; ++s) {
+                ((int*)t.data)[s] = c;
+                if (s < S) c += (int)qlen[(size_t)s];
+            }
+        }
+        allocations[(size_t)i] = dalloc(bytes[(size_t)i].size());
+        if (!allocations[(size_t)i]) {
+            allocated = false;
+            break;
+        }
+        st_memcpy(allocations[(size_t)i], bytes[(size_t)i].data(), bytes[(size_t)i].size(),
+                  hipMemcpyHostToDevice);
+        device[(size_t)i] = t;
+        device[(size_t)i].data = (char*)allocations[(size_t)i] + 128;
+    }
+    std::string label = fmt("mla_attn_paged S=%lld M=%lld H=%lld%s", (long long)S, (long long)M,
+                            (long long)heads, gated ? " gated" : "");
+    if (!allocated) {
+        ok(label.c_str(), false, "allocation failed");
+        dlclose(ref);
+        return;
+    }
+    RadArgs args{};
+    args.t = host.data();
+    args.n_t = 8;
+    args.p = ps.data();
+    args.n_p = (int)ps.size();
+    args.world_size = 1;
+    const int rc = oracle->launch(&args, nullptr);
+    ok(fmt("%s host oracle", label.c_str()).c_str(), rc == RAD_OK);
+    if (rc == RAD_OK) {
+        run_case(row, device, ps);
+        std::vector<uint8_t> got(bytes[7].size());
+        st_memcpy(got.data(), allocations[7], got.size(), hipMemcpyDeviceToHost);
+        std::vector<bool> written(got.size(), false);
+        bool matches = true, guards = true;
+        float max_error = 0;
+        const auto& t = host[7];
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t h = 0; h < heads; ++h)
+                for (int64_t d = 0; d < L; ++d) {
+                    const long off = r * t.stride[0] + h * t.stride[1] + d;
+                    const float want = h_bf16(((uint16_t*)t.data)[off]),
+                                actual = h_bf16(((uint16_t*)(got.data() + 128))[off]);
+                    const float error = std::fabs(actual - want);
+                    max_error = std::max(max_error, error);
+                    matches = matches && std::isfinite(actual) &&
+                              error <= 0.002f + 0.008f * std::fabs(want);
+                    written[128 + off * 2] = written[129 + off * 2] = true;
+                }
+        for (size_t j = 0; j < got.size(); ++j)
+            if (!written[j]) guards = guards && got[j] == 0xa5;
+        ok(fmt("%s max error %.6g", label.c_str(), max_error).c_str(), matches);
+        ok(fmt("%s pitched rows and guards", label.c_str()).c_str(), guards);
+    }
     dlclose(ref);
 }
 
@@ -29941,6 +30117,8 @@ static void device_phase(const Plugin& pl) {
         attn_split_case(pl, g, n, kv, { { 345, 345 } }, 16, false);
         attn_split_case(pl, g, n, kv, { { 345, 1000 } }, 16, true);
         attn_split_case(pl, g, n, kv, { { 640, 2000 } }, 5, true);
+        /* Model max_ctx 2048 with a 128-token KV: occupancy would split, live seqused must not. */
+        attn_split_case(pl, g, n, kv, { { 128, 128 } }, 4, false, 0, 0, 2048);
         attn_split_case(pl, g, n, kv, { { 53, 12000 }, { 1, 20000 } }, 16, true);
         attn_split_case(pl, g, n, kv, { { 11, 8192 }, { 64, 9000 }, { 1, 12000 } }, 6, true);
         attn_split_case(pl, g, n, kv, { { 300, 600 }, { 1, 10000 } }, 16, true);
@@ -32153,6 +32331,16 @@ static void device_phase(const Plugin& pl) {
         for (int64_t rows : { 1, 7, 33 })
             for (int64_t n : { 31, 259, 4096 }) mhc_check(pl, "swiglu_clamped_bf16", rows, n, 0);
     }
+    if (sel("swiglu_step_bf16")) {
+        for (int64_t rows : { 1, 7, 33 })
+            for (int64_t n : { 31, 259, 768 }) mhc_check(pl, "swiglu_step_bf16", rows, n, 0);
+    }
+    if (sel("router_sigmoid_group_topk_f32")) {
+        for (int64_t rows : { 1, 7, 33, 300 })
+            for (int64_t ne : { 64, 512 })
+                for (int norm : { 0, 1 })
+                    mhc_check(pl, "router_sigmoid_group_topk_f32", rows, ne, norm);
+    }
     if (sel("router_sigmoid_topk_f32")) {
         for (int64_t rows : { 1, 7, 33 })
             for (int64_t ne : { 32, 288, 512 })
@@ -32235,7 +32423,21 @@ static void device_phase(const Plugin& pl) {
             mla_project_check(pl, 1, 64, mode);
             for (int64_t rows : { 1, 4, 33 })
                 for (int64_t heads : { 8, 16 }) mla_project_check(pl, rows, heads, mode, true);
+            /* Ling-3.0's 128-wide heads, 8 a rank under TP4 and 32 unsplit. */
+            for (int64_t rows : { 1, 3, 33, 130 })
+                for (int64_t heads : { 8, 32 })
+                    mla_project_check(pl, rows, heads, mode, false, 128);
         }
+    }
+    if (sel("mla_attn_paged_bf16")) {
+        for (int64_t heads : { 8, 32 })
+            for (bool gated : { false, true }) {
+                mla_paged_check(pl, { 1 }, { 1 }, heads, gated);
+                mla_paged_check(pl, { 7 }, { 7 }, heads, gated);
+                mla_paged_check(pl, { 1, 1, 1 }, { 40, 300, 1025 }, heads, gated);
+                mla_paged_check(pl, { 33, 5 }, { 33, 900 }, heads, gated);
+                mla_paged_check(pl, { 130 }, { 130 }, heads, gated);
+            }
     }
     if (sel("mla_attn_rows_bf16")) {
         /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix

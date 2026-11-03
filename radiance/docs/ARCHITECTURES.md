@@ -18,7 +18,9 @@ plugin claims.
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
+| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)) |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
@@ -66,6 +68,72 @@ comes first in one and second in the other. The tables, by plugin:
 | `ltx2` | the checkpoint's names | |
 | `anima` | the checkpoint's names behind `diffusion_model.` / `lora_unet_`; the text encoder as `lora_te_layers_N_...` | DiT under `net.` or `model.diffusion_model.`, Qwen3 under `model.layers.` |
 | `sdxl` | kohya's `lora_unet_` over the single-file UNet paths (convolutions included), `lora_te1_` / `lora_te2_` over the CLIPs' transformers names | UNet under `model.diffusion_model.`, CLIP-L and bigG under `conditioner.embedders.{0,1}.transformer.` |
+
+---
+
+# `spark25`: Spark X2.6
+
+`model_type: spark2_5` / `Spark2_5ForCausalLM`. The 4B checkpoint has 36 layers, hidden size
+2560, 16 query heads and 4 KV heads at head dimension 256, a 10240-wide gated MLP and a tied
+131072-token embedding. It has no q/k norms or projection biases. The residual is accumulated in
+f32; norms write bf16 before the projections.
+
+The checkpoint's fused Q/K/V matrix is split by rows in that order at conversion; gate and up are
+joined in that order. The MLP uses **exact erf GELU**, not `gelu_mul`'s tanh approximation. Each
+attention head's output is multiplied by its own sigmoid gate before the output projection.
+`layer_types` is authoritative: sliding layers use window 512 and full-head NeoX rotary at theta
+10000; full layers use 64 rotary dimensions at theta 5000000. Both use the full KV group, with the
+window applied by the local attention op, so prefix caching remains valid.
+
+## Tensor parallelism
+
+A rank's attention slice is whole GQA groups, so a world that does not divide 4 KV heads still
+shards cleanly: the three ranks of a 3-rank world take 2, 1 and 1 KV heads with the query heads
+that belong to them. Above the KV-head count the KV heads are replicated and one group's query
+heads are split between the ranks sharing its KV head, so every query head still attends the KV
+head the checkpoint gave it -- a rank's own `gqa` can then be smaller than the checkpoint's, while
+the KV cache it stores is a replica of its peer's. The gate and output projections take the
+matching row and column spans, and the tied embedding and lm_head take the contiguous vocabulary
+shard `rad_arch.h`'s `shard_begin` describes, because that is the split the sampler's candidate
+merge assumes.
+
+The FFN splits by channels, whole 128-column blocks where the width has them, and a rank's
+`[gate | up]` keeps both parts the same width. Every split dimension is covered exactly once at
+every world from 1 to 8, asserted in `spark25_arch_test`.
+
+Column-sharded projection outputs are partial sums. Each layer issues two exact bf16
+`all_reduce`s on the projection buffer, rounding the merged output to bf16 **before** widening it
+and adding it to the f32 residual. This preserves the reference's BF16 projection-output boundary
+without rounding away the residual's low bits. Sharding still changes the dot-product reduction
+order, so it does not promise bitwise parity with one card. The embedding uses one exact f32
+`all_reduce` over its widened, disjoint token rows. TP1 declares no collectives. At TP>1, declaration
+requires the exact fp32 embedding reduction and every exact bf16 projection reduction to resolve;
+otherwise it fails with `RAD_E_UNSUPPORTED` rather than running rank-local partial outputs. libr4d
+serves these collectives at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a
+general `all_reduce` (libref), so a card deployment is limited to those worlds.
+
+The initial implementation serves BF16 with tied embeddings, headwise sigmoid gates and the
+checkpoint's own rotary parameters. It does not implement DSpark, quantisation recipes, other gate
+activations or rotary-scaling overrides. The tokenizer and its template come from the checkpoint;
+the architecture declares the `<think>`/`</think>` reasoning markers and the
+`<tool_call>name<arg_key>...` tool-call format.
+
+For a CPU differential against the reference implementation's `configuration_spark.py` and
+`modeling_spark.py`, with Python's torch, transformers and safetensors installed:
+
+```sh
+python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build
+python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build --tp 3
+SPARK25_REFERENCE_TEMPLATE=/path/to/XHToken-Spark-X2.6-4B/chat_template.jinja \
+  build/tests/spark25_chat_test
+```
+
+The first builds a small deterministic checkpoint and compares prefill, chunked prefill and cached
+decode against the reference with GPUs hidden; `--tp` runs the same fixture over that many fake host
+ranks, which is how the sharding and the collectives are checked without cards. ROCm may still open
+GPU device nodes while probing even with visibility masks; on a shared machine run the CPU
+comparison in a device cgroup that denies access to `/dev/kfd` and the GPU render nodes. The last
+also exercises the checkpoint's actual chat template, which is not redistributed in this tree.
 
 ---
 
@@ -810,6 +878,82 @@ prefix cache, and a load generator of agent turns (3.3k-token prompts, 400 token
 A second agent run at eight streams after the same restart gave 482. The links count: with three
 of the x8 links fallen back to Gen4, the same build prefilled 3368 / 3664 / 3610 / 3512 tok/s at
 the four depths above.
+
+---
+
+# `bailing_hybrid`: Ling-3.0-flash
+
+`arch/bailing_hybrid` serves Ling-3.0-flash (`model_type: bailing_hybrid`, BailingMoeV3ForCausalLM)
+and its fine-tunes from the bf16 checkpoint. The reference is vLLM's `bailing_moe_v3.py` and
+SGLang's; the HF `modeling_bailing_moe_v3.py` agrees except for the SwiGLU clamp (below). The plugin
+reuses GLM-5.3's KDA core (`KdaState`), sigmoid router (`GlmRouter`, with groups) and draft head
+(`GlmMtp`), and `MoeFP8`; its KDA and MLA blocks are in the plugin file.
+
+```
+42 layers, hidden 2560, vocab 157184 (embedding and lm_head separate), rope_theta 6e6
+layers 5, 11, ..., 41 ((l + 1) % 6 == 0): dense MLA
+  q 2560 -> 32 x (128 nope + 64 rope), no q LoRA; kv_a 2560 -> 512 + 64: the latent (RMS-normed)
+    and the rotary key, both cached; kv_b 512 -> 32 x (128 + 128)
+  rotary over 64 dims, interleaved pairs (HF de-interleaves, then rotates by halves): `gptj`
+  scores scaled by 1/sqrt(192); a sigmoid gate per head (2560 -> 32); o 4096 -> 2560 (`dense`)
+the other 35 layers: KDA, 32 heads of 128
+  q, k, v 2560 -> 3 x 4096, each with a causal depthwise conv of width 4 + SiLU
+  forget gate per channel, full rank (`f_proj` 2560 -> 4096, no_kda_lora), lower bound -5
+    (safe gate); beta per head (2560 -> 32); output gate full rank (`g_proj`), sigmoid-gated
+    RMS norm per head
+feed-forward: layers 0-1 dense SwiGLU 2 x 6144; layers 2-41 MoE
+  512 routed experts of 768 at top-8, sigmoid scores, correction bias (`expert_bias`), 8 groups of
+    64 ranked by the sum of their two best biased scores, 4 kept (noaux_tc); weights normalized
+    and scaled by 2.5; one shared expert of 768 without a gate
+  SwiGLU clamped where `expert_swiglu_limit_list` / `share_expert_swiglu_limit_list` say: the
+    routed experts at 4 in layers 35-41, the shared one at 5 (34-39) and 7 (40-41)
+MTP: checkpoint layer 42 -- enorm, hnorm, eh_proj 5120 -> 2560, one MLA layer with the full MoE,
+  final_layernorm; the trunk's embedding and lm_head
+```
+
+Traps:
+
+- **The clamp is taken after the SiLU.** vLLM (`SwigluStepAndMul`) and SGLang compute
+  `min(silu(gate), L) * clamp(up, -L, L)`; GLM-5.3's `swiglu_clamped` clips the gate before the
+  SiLU, which at L = 4 caps a large gate at `silu(4) = 3.93` instead of 4. The plugin issues
+  `swiglu_step`. HF's reference model ignores the lists entirely; the served form is the one the
+  checkpoint is evaluated with. The routed and the shared arm clamp at different values, often in
+  different layers (`MoeFP8::Config::shared_swiglu_limit`).
+- **Routing is group-limited.** `router_sigmoid_group_topk`: a group's rank is the sum of its two
+  highest `p + bias`, only the experts of the four best groups are candidates. A single-group
+  top-8 picks other experts with every shape valid.
+- **The query is two projections.** The checkpoint's q rows are per head [nope 128 | rope 64]; the
+  plugin maps them as two weights (row maps over `q_proj`) into two plain planes, `[T, 32 * 64]`
+  for `rope` and `[T, 32 * 128]` for the absorption. A single `[T, 32, 192]` plane with column
+  views turns the wrong rows on libavx, whose `rope` reads a rank-3 operand's head stride as its
+  row stride.
+- **The cache row is [latent | rotary key].** One KV head of 288, the row's first half in the K
+  slot and the second in the V slot, so `kv_store` writes the 576-wide row contiguously and
+  `mla_attn_paged` reads it as `[pages, 1, block, 576]`. Scores are taken in the latent; the head
+  gate multiplies the attention's latent output before the expansion, a reordering of HF's gate on
+  the expanded values that only rounding tells apart.
+- **The pre-tokeniser's pattern has possessive quantifiers** (`[^\r\n\p{L}\p{N}]?+\p{L}+`,
+  ` ?[^\s\p{L}\p{N}]++[\r\n]*`). Both are one class followed by classes that share no codepoint
+  with it, which the tokenizer compiles as greedy (core/text/tokenizer_regex.cpp); the ids match
+  HuggingFace's.
+
+**KV groups.**
+
+| group | kind | per layer | layers |
+|---|---|---|---|
+| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 288, block 16 | the 512-wide normed latent and the 64-wide rotated key | 7 MLA + MTP |
+| `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 32 / tp heads a rank | 35 KDA |
+| `kv_kda_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, 3 x 4096 / tp channels a rank | 35 KDA |
+
+The latent is replicated: every rank computes and stores the whole row.
+
+**Tensor parallelism.** At 1, 2 or 4 ranks. KDA and MLA split their 32 heads (with them the q/k/v
+rows, the convolution taps and the state; the MLA's q, kv_b and gate rows and o's columns); kv_a
+and the latent are replicated. The dense feed-forward splits its 6144 columns. A routed expert's
+768 columns are six 128-column blocks: halves at two ranks, and at four 2, 2, 1, 1 blocks rotated
+by the expert's number mod 4 (`moe_gemm_q_mod4`), so every rank carries six blocks per four
+experts. The shared expert splits the same way, unrotated. A calibration run
+(`RADIANCE_CALIB_DIR`) and bf16 experts give every rank whole experts instead.
 
 ---
 

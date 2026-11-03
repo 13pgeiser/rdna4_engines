@@ -217,6 +217,8 @@ int Registry::commit_(Staged& s, int order) {
         p.arch_declare = dl_fn<int (*)(RadBuilder*, const RadModelMeta*, const RadBuildCtx*)>(
                              s.handle, "rad_arch_declare");
         p.arch_step = dl_fn<void (*)(RadCtx*, const RadBatch*)>(s.handle, "rad_arch_step");
+        p.arch_pass_key = dl_fn<uint64_t (*)(RadCtx*, const RadBatch*, const int32_t*)>(
+                              s.handle, "rad_arch_pass_key");
         if (!id_fn || !p.arch_declare || !p.arch_step) {
             err_("architecture plugin '%s' is missing rad_arch_id, rad_arch_declare or "
                  "rad_arch_step", p.name.c_str());

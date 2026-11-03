@@ -213,6 +213,7 @@ struct RequestStat {
     int32_t     slot = -1;
     double      age_s = 0;
     double      ttft_s = -1;       /* negative until the first token */
+    double      prefill_s = -1;    /* first token minus admission; negative until both */
     double      decode_tps = 0;
 };
 

@@ -34,6 +34,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
+| Spark X2.6 4B bf16: thinking and tool calls, one to four cards | `spark-x2.6-4b-bf16.rad` (8.3 GiB) | [convert](#convert-a-checkpoint) | — |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
@@ -46,6 +47,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-bf16.rad` (17 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-i8g.rad` (13 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B 4-bit (int4 feed-forward, GPTQ, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-a4.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-a4) | `nemotron-3.5-bolt-e4b-a4.yaml` |
+| Ling-3.0-flash-Sante w4a8: 4-bit experts (GPTQ), MTP, four or two cards | `ling-3.0-flash-sante-w4a8.rad` (66 GiB) | [download](https://huggingface.co/keptn/ling-3.0-flash-sante-w4a8) | `ling-3.0-flash-sante-w4a8.yaml`, `ling-3.0-flash-sante-w4a8-tp2.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
@@ -281,6 +283,8 @@ budgets, long context, speculative decoding and operating a server.
 `data/recipes/` names. Download checkpoints with `scripts/hfget.sh <org/repo> <dir>`.
 
 ```sh
+# Spark X2.6 uses the checkpoint's BF16 weights, tokenizer and chat template; no recipe required.
+build/bin/rad-convert /srv/models/hf/XHToken-Spark-X2.6-4B -o spark-x2.6-4b-bf16.rad --max-ctx 4096
 build/bin/rad-convert /srv/models/hf/Qwen/Qwen3.8-27B -o qwen3.8-27b-bf16.rad \
     --recipe data/recipes/q38-27b-bf16.recipe
 build/bin/rad-convert /srv/models/hf/Qwen/Qwen3.8-Flash-Next -o qwen3.8-flash-next-bf16.rad --max-ctx 4096
@@ -318,6 +322,12 @@ W4A16 release, compressed-tensors' AWQ and GPTQ or AutoRound's, on the 4-bit GEM
 reads it: NVFP4 (compressed-tensors' and NVIDIA ModelOpt's) to the MXFP4 kernels, an AutoRound
 Flash-Next's int4 block projections to int8. [docs/GUIDE.md](docs/GUIDE.md) names the recipes of record
 with their `rad-convert` commands.
+
+Spark X2.6 runs BF16 at `--tp 1`, `2`, `3` or `4` -- and `8`, the worlds libr4d has an exact
+all-reduce for -- without a drafter or quantisation recipe. Its checkpoint's chat template enables
+thinking by default; replies return reasoning in `reasoning_content`. Set
+`chat_template_kwargs.enable_thinking` to `false` for a non-thinking request. Tool calls use the
+checkpoint's tagged format and are returned as OpenAI `tool_calls`.
 
 ## Test
 

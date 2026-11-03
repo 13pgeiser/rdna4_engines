@@ -42,6 +42,9 @@ struct SchedReq {
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
     int64_t  first_tok_us = 0;   /* 0 until the first output token: this request's TTFT */
+    int64_t  admitted_us = 0;    /* 0 until the first admission: where the queue ends, so a
+                                  * prefill rate can divide by the prefill alone. ttft covers
+                                  * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
 
@@ -274,6 +277,7 @@ public:
         int32_t  slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
+        double   prefill_s = -1;       /* first token minus admission; negative until both */
         double   decode_tps = 0;       /* this request's own, since its first token */
     };
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were

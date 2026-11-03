@@ -709,7 +709,8 @@ radiance --model m.rad --debug-placement    # the placement plan only
 
 The card is split into resident weights and the paged KV pool. The engine derives the split from the
 card and the model; no flag states either pool. Its inputs: `--gpu-headroom-mib` leaves card space
-alone, `--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
+alone, `--gpu-memory-mib` claims a size (headroom is the card less that; give one of the two),
+`--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
 experts must stay on the card. The startup receipt prints every term. With no visible card (the host
 backend) half of RAM stands in for the card and is split the same way; the weights pool is then host
 memory, holding the weights a host kernel cannot read where the container stores them.
@@ -785,6 +786,7 @@ Related flags:
 
 ```sh
 --gpu-headroom-mib 96         # VRAM left unclaimed on every card
+# --gpu-memory-mib 28000      # the same knob as a claim; not with --gpu-headroom-mib
 --kv-cache-dtype fp8          # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192          # pinned host tier for weights
 --embedding-placement vram    # keep the token embedding on the card (below)
@@ -885,9 +887,10 @@ plane grows into what it releases, so a model whose experts do not fit never str
 for unused cache.
 
 **Headroom.** `--gpu-headroom-mib` is kept for allocations the engine does not make, chiefly a
-kernel's code object, which HIP loads at the kernel's first launch. With too little left, the first
-kernel that has never run (a draft head's, a sampler chain's) fails its load and faults inside the
-HIP runtime: a segfault in a correct kernel on a server that had been serving.
+kernel's code object, which HIP loads at the kernel's first launch. `--gpu-memory-mib N` is the same
+knob written as a claim: headroom is the card less N. The two flags cannot be combined. With too
+little left, the first kernel that has never run (a draft head's, a sampler chain's) fails its load
+and faults inside the HIP runtime: a segfault in a correct kernel on a server that had been serving.
 
 Once everything is allocated, startup logs `card N settled at ... free`. Memory taken after the budget
 read the card (another process such as a desktop, or a driver allocation) comes out of the headroom,
@@ -2058,6 +2061,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
+| `--gpu-memory-mib N` | 0 (use `--gpu-headroom-mib`) | VRAM claimed on every card; inverse of `--gpu-headroom-mib`. Give one (§4.3) |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
@@ -3657,7 +3661,7 @@ completions entry point), so prompt parity with the reference is a chat-endpoint
 
 ### 6.1 The dashboard
 
-Open `http://<host>:<port>/` in a browser. It has three tabs.
+Open `http://<host>:<port>/` in a browser. It has four tabs.
 
 **Dashboard**: the live strip across the top (decode step time, decode and prefill throughput,
 requests in flight, KV cache in VRAM, draft acceptance), then cards for the batch, memory and
@@ -3668,7 +3672,7 @@ The KV cache meter splits what it holds into two segments:
 ```
 KV cache   3.3 / 4.5 GiB  ·  75.5%
 ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-20.8k tok read by running requests  ·  369.3k kept for reuse
+20.8k tok read by running requests  |  369.3k kept for reuse
 ```
 
 The full-strength segment is context running requests are reading; the dim segment is prefix cache,
@@ -3679,7 +3683,7 @@ from the total fill, since a full pool causes preemption.
 The decode step tile carries two figures and a percentage under the big number:
 
 ```
-best 14.79ms · recent 15.21ms · now 97% of best
+best 14.79ms | recent 15.21ms | now 97% of best
 ```
 
 Both are window means of single-sequence decode steps, measured by the engine:
@@ -3723,14 +3727,17 @@ The decode, prefill, requests-in-flight and draft-acceptance tiles carry a line 
 which the page computes from its own polls:
 
 ```
-best 58 · recent 54 · now 93% of best@c4
+best 58.0 | recent 54.0 | now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
-current concurrency, `recent` the mean of its last 30 samples there (15 s at one poll every 500 ms;
-5 s for prefill), and `now` the current value as a share of the extreme. Past one sequence the line
+current concurrency, `recent` the mean of the last 15 s there (5 s for prefill), and `now` the
+current value as a share of the extreme. The windows are kept by elapsed time rather than sample
+count, so a span means the same span whatever rate is set on Advanced. Past one sequence the line
 names its concurrency (`@c4`); requests in flight keeps a single set. Reloading the page resets these
-figures, a server restart does not. While nothing runs, the big figure reads 0 and the line keeps its
+figures, and so does a server restart: the page notices the engine's new start time and
+inherits nothing from the run before it. While nothing runs, the big figure reads 0 and the line
+keeps its
 last figures without `now`.
 
 Draft acceptance is reported as two ratios with different denominators. A draft position is
@@ -3738,8 +3745,8 @@ verified only when every earlier one passed, so:
 
 - **accepted / reached** (conditional): of the drafts verified at a position, the share that passed.
   The acceptance tile, the Speculation panel's large "conditionally accepted" figure and the
-  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the last 30
-  polls that drafted as a ratio of sums.
+  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the polls
+  that drafted in the last 15 s as a ratio of sums.
 - **accepted / drafted**: of every drafted token, the share that became text, since the process
   started. The Speculation panel's "Accepted of drafted", `draft_accept` on `/stats` and
   `radiance:draft_acceptance_ratio` on `/metrics` show it.
@@ -3749,6 +3756,30 @@ passing 56%, 75% and 77% of the time they are reached, a step reaches 1 + 0.56 +
 positions on average and accepts 0.56 + 0.42 + 0.32 = 1.30 tokens: 66% accepted / reached against
 1.30 / 3 = 43% accepted / drafted.
 
+Under the live request table, **history** keeps every finished request a poll saw. A request is in
+`/stats` only while it exists -- a finished row leaves the payload within about 20 ms to half a
+second -- so without this the numbers would be gone before they could be read. The last 200 are
+kept in this browser's `localStorage`, not on the server, and rows are keyed by the engine's start
+and the request id, so a second tab or a reload keys a request alike rather than counting it twice.
+A request that began and finished between two polls cannot be sampled at all; those are counted in
+a grey row so the total still adds up. **clear** empties it, and the marker it leaves is a
+timestamp every tab honours, so a clear in one window is a clear in all of them.
+
+The line above the table summarises those rows: how many are done, then decode rate, prefill rate
+and time to first token. The first two carry their mean over all the rows and, where enough
+rows exist, the same mean over the last 20 and the last 5; time to first token is a median
+over all the rows, with no windows. A window appears only once enough rows
+exist for it to be a different question: with 12 rows stored, the mean over the last 20 would just
+be the mean over all 12, so only *last 5* shows. At exactly 20 rows *last 20* repeats the overall
+mean; from 21 up the three figures are three different questions.
+These are means of per-request rates, not the pooled rate the tiles above show: one long request
+does not get to decide the headline. On this line a dot separates one category from the next and a
+pipe separates the windows within a category.
+
+The download icon beside the **Requests** heading saves those stored rows as
+`radiance-history.json`, indented, from the browser -- it is the same data **clear** would discard,
+so a run worth keeping can be written out before it is cleared.
+
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
 prompt share its blocks.
@@ -3757,6 +3788,14 @@ On a hybrid model, a session with blocks but no reachable snapshot reuses zero t
 scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's headline.
 
 **Model**: the resolved graph: every op, which library serves it, and what did not resolve.
+
+**Advanced**: two editable poll intervals -- *Idle interval* while nothing runs and *Busy interval*
+while a request is in flight, each clamped to 100-5000 ms. Set them equal for one fixed rate; the
+summary beside the panel title names what is set. The values live in the browser, not on the
+server, so they
+survive a restart and apply to this browser only. Polling pauses on every view but Dashboard, so
+the figures hold while you are reading another page -- for about a minute. Past 60 s the
+next poll drops the windows, since there is nothing left to compare them against.
 
 ### 6.2 The JSON behind it
 
@@ -3827,7 +3866,9 @@ Two pitfalls:
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
 
-`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
+`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics. Its first screen shows
+totals over the selected time range (prompt tokens in, prompt tokens read from cache, prompt tokens
+computed, tokens out, requests) and the live status; the detail panels are below.
 
 ### 6.4 The live terminal view
 

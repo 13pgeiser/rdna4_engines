@@ -2060,6 +2060,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     CHECK_EQ(g0.block_table[128], btb[0]);
     CHECK_EQ(g0.seqused[0], 101);
     CHECK_EQ(g0.seqused[1], 64);
+    CHECK_EQ(s2->kv_used_max_h[0], std::max(g0.seqused[0], g0.seqused[1]));
 
     /* The linear group is per sequence, not per token: every token of a sequence maps to its one
      * state instance, and the block table row is that slot. */
@@ -6972,8 +6973,18 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
      * nothing. */
     int64_t at = 0;
     for (int k = 0; k < 8 && at < 160; ++k) {
-        REQUIRE(f.sch.step() != nullptr);
+        const RadBatch* chunk = f.sch.step();
+        REQUIRE(chunk != nullptr);
         REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        const RadKVGroupBatch& paged = chunk->kv[0];
+        REQUIRE(paged.seqused_h != nullptr);
+        REQUIRE(chunk->positions_h != nullptr);
+        CHECK_EQ(paged.seqused_h[0], paged.seqused[0]);
+        CHECK_EQ(chunk->positions_h[0], chunk->positions[0]);
+        int32_t used_max = 0;
+        for (int64_t i = 0; i < chunk->n_seq; ++i)
+            used_max = std::max(used_max, paged.seqused[i]);
+        CHECK_EQ(chunk->kv_used_max_h[0], used_max);
         CHECK_EQ(f.sch.plan().e[0].ctx_len, at);
         at += f.sch.plan().e[0].n_tokens;
         CHECK(at <= 160);
@@ -6985,6 +6996,11 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
     /* The replayed output token on its own, which samples the next. */
     const RadBatch* rb = f.sch.step();
     REQUIRE(rb != nullptr);
+    CHECK_EQ(rb->kv_used_max_h[0], rb->kv[0].seqused[0]);
+    REQUIRE(rb->kv[0].seqused_h != nullptr);
+    REQUIRE(rb->positions_h != nullptr);
+    CHECK_EQ(rb->kv[0].seqused_h[0], rb->kv[0].seqused[0]);
+    CHECK_EQ(rb->positions_h[0], rb->positions[0]);
     CHECK_EQ(f.sch.plan().e[0].ctx_len, 160);
     CHECK_EQ(f.sch.plan().e[0].n_tokens, 1);
     CHECK(f.sch.plan().e[0].produces_token);
@@ -7372,4 +7388,59 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
         CHECK(n > 20);
         CHECK_EQ(h, c.want);
     }
+}
+
+/* A recycled slot keeps its struct: add_locked only allocates when the slot's pointer is null, so
+ * every field it does not list survives from the request before. admitted_us is the one such field
+ * with no backstop where it is read -- the prefill figure is computed from it whenever it is
+ * non-zero, and a stamp left by an earlier request is always older, so the interval is inflated and
+ * reads as a slow prefill rather than as missing data. Admission cannot precede arrival, so
+ * prefill_s may never exceed ttft_s: that is the invariant that catches a stamp carried over from
+ * another request. */
+TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(8, 4);
+    REQUIRE(a != 0);
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* The slot A held, read while its row is still published. The whole case rests on B landing
+     * in this same slot: if the reap ever defers, or the free list is pre-populated, B gets a
+     * fresh struct, the stale stamp is gone by construction, and the invariant below would hold
+     * with the bug unpatched. So the precondition is asserted rather than trusted. */
+    int slot_a = -1;
+    {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) if (st[(size_t)j].id == a) slot_a = st[(size_t)j].slot;
+    }
+    REQUIRE(slot_a >= 0);
+    CHECK_OK(f.sch.reap(a));
+
+    /* A's slot is on the free list, so B takes the slot and the struct that came with it. */
+    const uint64_t b = f.submit(8, 4);
+    REQUIRE(b != 0);
+    for (int i = 0; i < 80; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) {
+            if (st[(size_t)j].id != b) continue;
+            if (st[(size_t)j].ttft_s < 0) break;   /* no first token yet */
+            /* Both figures describe this request alone, so prefill -- admission to first token --
+             * is bounded by ttft, arrival to first token. */
+            CHECK_EQ(st[(size_t)j].slot, slot_a);   /* the reuse this case is about */
+            CHECK(st[(size_t)j].prefill_s >= 0);
+            CHECK(st[(size_t)j].prefill_s <= st[(size_t)j].ttft_s);
+            return;
+        }
+    }
+    CHECK(!"the second request never reached its first token");
 }

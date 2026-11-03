@@ -31,11 +31,15 @@ int Ctx::init(const CtxDesc& d) {
     registry_ = d.registry;
     kv_        = d.kv;
     arch_step_ = d.arch_step;
+    arch_pass_key_ = d.arch_pass_key;
     profiling_ = d.profile_ops;
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
     RAD_TRY(rad_dev_set(device_));
+    RadDeviceProps props{};
+    if (rad_dev_props(device_, &props) >= 0 && !props.is_host_backend && props.n_cu > 0)
+        wgp_count_ = props.n_cu;
 
     if (d.stream) {
         stream_     = d.stream;
@@ -367,6 +371,7 @@ int Ctx::bind_ops() {
                     ip.args.instance      = r.instance;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
+                    ip.args.wgp_count     = wgp_count_;
                     /* A launch that ends its own link hold gets the hold word as an extra
                      * `link_gate` parameter after the geometry's. */
                     if (r.row->releases_link)
@@ -942,17 +947,30 @@ int Ctx::lane_join(int from, int to) {
 
 /* The key below reads every RadBatch field a pass's shape or arguments can depend on, by hand. A
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
- * size here. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are never
- * recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 416,
+ * size here. The ABI-35 host mirrors are used by issue-time split selection; unsupported dynamic
+ * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
+ * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
+ * never recorded (below). */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 432,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some. */
     if (b->enc || b->n_mm_rows > 0) return 0;
+    /* Legacy architecture plugins have no pass-key callback. Only refuse them when the resolved
+     * program contains a launcher explicitly marked as using live prefill splits, and this batch
+     * can issue a prefill, mixed, speculative-verify or draft query through it. */
+    if (!arch_pass_key_ &&
+        (b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED || b->draft_pass != 0 ||
+         b->n_spec > 0)) {
+        for (const IssuePlan& ip : issue_table_)
+            if (ip.row && ip.row->info &&
+                (ip.row->info->capabilities & RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT))
+                return 0;
+    }
     /* A pass carrying a request's words for the plugin is shaped by them (a head issues per
      * sequence from their counts), and such a step samples a prompt's first token, which is not
      * the repeating decode pass. */
@@ -988,6 +1006,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
         /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
         mix(kvstream_view_key(k.stream));
+    }
+    if (arch_pass_key_) {
+        const uint64_t geometry = arch_pass_key_(const_cast<Ctx*>(this), b, b->kv_used_max_h);
+        if (!geometry) return 0;
+        mix(geometry);
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);

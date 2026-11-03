@@ -968,6 +968,7 @@ int Engine::load_plugins() {
 
     const Plugin* ap = rad_tools_registry().plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
@@ -3866,6 +3867,7 @@ int Engine::start() {
         /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
+        d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
@@ -4133,10 +4135,16 @@ int Engine::start() {
                      : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
+            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
+            const std::string fix = cfg_.gpu_memory_mib > 0
+                ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
+                      "for one.",
+                      (long long)(props.vram_bytes / MiB - need_head))
+                : fmt("Set --gpu-headroom-mib to at least %lld: what is left here rises with it "
+                      "one for one.", (long long)need_head);
             RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
                      "launch to load its code object and size its scratch in -- under the %s this "
-                     "engine allows for its own. %s Set --gpu-headroom-mib to at least %lld: what "
-                     "is left here rises with it one for one.",
+                     "engine allows for its own. %s %s",
                      r->device, humanb(got).c_str(), asked.c_str(),
                      humanb(std::max<int64_t>(room, 0)).c_str(), humanb(allowance).c_str(),
                      got < want
@@ -4144,7 +4152,7 @@ int Engine::start() {
                                "another process on it or an allocation the budget does not "
                                "count.", humanb(want - got).c_str()).c_str()
                          : "",
-                     (long long)(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib));
+                     fix.c_str());
         } else if (got < want) {
             RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
                      "the budget read the card, by another process on it or an allocation the "

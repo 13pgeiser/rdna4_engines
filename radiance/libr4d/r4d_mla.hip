@@ -24,7 +24,7 @@ struct ProjectMeta {
  * sum runs over j in the same order whatever R is (expand: each lane's share in ascending j, then
  * r4d_xor_sum<32>), so a row's bytes do not depend on the batch it is in. A tail group past the
  * last row reads that row again and stores nothing for it. */
-template <int R>
+template <int R, int HD>
 __global__ void project_absorb_rows(const uint16_t* x, const uint16_t* w, uint16_t* y,
                                     ProjectMeta m) {
     const int col = blockIdx.x * 128 + threadIdx.x, head = blockIdx.y, r0 = blockIdx.z * R;
@@ -35,8 +35,8 @@ __global__ void project_absorb_rows(const uint16_t* x, const uint16_t* w, uint16
     float sum[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) sum[r] = 0;
-    for (int j = 0; j < 256; ++j) {
-        const float wv = bf16_to_f32(w[((long)head * 512 + j) * m.wp + col]);
+    for (int j = 0; j < HD; ++j) {
+        const float wv = bf16_to_f32(w[((long)head * 2 * HD + j) * m.wp + col]);
 #pragma unroll
         for (int r = 0; r < R; ++r) sum[r] = fmaf(bf16_to_f32(xr[r][j]), wv, sum[r]);
     }
@@ -44,7 +44,7 @@ __global__ void project_absorb_rows(const uint16_t* x, const uint16_t* w, uint16
     for (int r = 0; r < R; ++r)
         if (r0 + r < m.rows) y[(long)(r0 + r) * m.yr + head * m.yh + col] = f32_to_bf16(sum[r]);
 }
-template <int R>
+template <int R, int HD>
 __global__ void project_expand_rows(const uint16_t* x, const uint16_t* w, uint16_t* y,
                                     ProjectMeta m) {
     const int lane = threadIdx.x & 31, col = blockIdx.x * 4 + (threadIdx.x >> 5), head = blockIdx.y,
@@ -52,7 +52,7 @@ __global__ void project_expand_rows(const uint16_t* x, const uint16_t* w, uint16
     const uint16_t* xr[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) xr[r] = x + (long)min(r0 + r, m.rows - 1) * m.xr + head * m.xh;
-    const uint16_t* const wr = w + ((long)head * 512 + 256 + col) * m.wp;
+    const uint16_t* const wr = w + ((long)head * 2 * HD + HD + col) * m.wp;
     float sum[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) sum[r] = 0;
@@ -77,7 +77,7 @@ int project_body(const RadArgs* a, RadStream stream) {
     const char* mode = r4d_gets(a, "mode");
     const bool absorb = mode && !std::strcmp(mode, "absorb"),
                expand = mode && !std::strcmp(mode, "expand");
-    const long h = r4d_geti_or(a, "heads", 0);
+    const long h = r4d_geti_or(a, "heads", 0), hd = r4d_geti_or(a, "head_dim", 0);
     auto heads_view = [&](RadTensor& t, long width) {
         if (h > 0 && t.rank == 2 && t.shape[1] == h * width) {
             t.rank = 3;
@@ -87,15 +87,15 @@ int project_body(const RadArgs* a, RadStream stream) {
             t.stride[1] *= width;
         }
     };
-    heads_view(x, absorb ? 256 : 512);
-    heads_view(y, absorb ? 512 : 256);
+    heads_view(x, absorb ? hd : 512);
+    heads_view(y, absorb ? 512 : hd);
     if (x.dtype != RAD_BF16 || w.dtype != RAD_BF16 || y.dtype != RAD_BF16) return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
-    if ((!absorb && !expand) || h < 1 || h > 64 || r4d_geti_or(a, "head_dim", 0) != 256 ||
+    if ((!absorb && !expand) || h < 1 || h > 64 || (hd != 128 && hd != 256) ||
         r4d_geti_or(a, "latent_dim", 0) != 512 || x.rank != 3 || w.rank != 2 || y.rank != 3 ||
         x.shape[0] < 1 || x.shape[0] > 65535 || x.shape[1] != h ||
-        x.shape[2] != (absorb ? 256 : 512) || w.shape[0] != h * 512 || w.shape[1] != 512 ||
-        y.shape[0] != x.shape[0] || y.shape[1] != h || y.shape[2] != (absorb ? 512 : 256) ||
+        x.shape[2] != (absorb ? hd : 512) || w.shape[0] != h * 2 * hd || w.shape[1] != 512 ||
+        y.shape[0] != x.shape[0] || y.shape[1] != h || y.shape[2] != (absorb ? 512 : hd) ||
         x.stride[2] != 1 || w.stride[1] != 1 || y.stride[2] != 1 || x.stride[1] < x.shape[2] ||
         x.stride[0] < h * x.stride[1] || w.stride[0] < 512 || y.stride[1] < y.shape[2] ||
         y.stride[0] < h * y.stride[1])
@@ -107,20 +107,26 @@ int project_body(const RadArgs* a, RadStream stream) {
     auto* yp = (uint16_t*)y.data;
     /* The largest of 8, 4, 2 and 1 rows a group that the batch fills. */
     const int R = m.rows >= 8 ? 8 : m.rows >= 4 ? 4 : m.rows >= 2 ? 2 : 1;
-#define MLA_PROJECT_ROWS(RR)                                                                       \
+#define MLA_PROJECT_HD(RR, HD)                                                                     \
     do {                                                                                           \
         const unsigned groups = (unsigned)((m.rows + RR - 1) / RR);                                \
         if (absorb)                                                                                \
-            return R4D_EMIT(stream, (project_absorb_rows<RR>), dim3(4, h, groups), dim3(128), 0,   \
-                            xp, wp, yp, m);                                                        \
-        return R4D_EMIT(stream, (project_expand_rows<RR>), dim3(64, h, groups), dim3(128), 0, xp,  \
-                        wp, yp, m);                                                                \
+            return R4D_EMIT(stream, (project_absorb_rows<RR, HD>), dim3(4, h, groups), dim3(128),  \
+                            0, xp, wp, yp, m);                                                     \
+        return R4D_EMIT(stream, (project_expand_rows<RR, HD>), dim3(HD / 4, h, groups), dim3(128), \
+                        0, xp, wp, yp, m);                                                         \
+    } while (0)
+#define MLA_PROJECT_ROWS(RR)                                                                       \
+    do {                                                                                           \
+        if (hd == 128) MLA_PROJECT_HD(RR, 128);                                                    \
+        MLA_PROJECT_HD(RR, 256);                                                                   \
     } while (0)
     if (R == 8) MLA_PROJECT_ROWS(8);
     if (R == 4) MLA_PROJECT_ROWS(4);
     if (R == 2) MLA_PROJECT_ROWS(2);
     MLA_PROJECT_ROWS(1);
 #undef MLA_PROJECT_ROWS
+#undef MLA_PROJECT_HD
 }
 constexpr int D = 512, PART = D + 2;
 constexpr int64_t scratch_bytes = 512ll * PART * 4;
@@ -218,6 +224,184 @@ __global__ __launch_bounds__(128) void merge(const float* scratch, uint16_t* out
     for (int j = 0; j < 16; ++j)
         out[(long)r * m.orr + (long)head * m.oh + lane * 16 + j] =
             f32_to_bf16(den > 0 ? value[j] / den : 0);
+}
+/* mla_attn_paged: dense causal latent attention over a cache row of [latent 512 | rope 64], one
+ * page table a sequence (Ling-3.0's MLA). A wave a (query row, head) as `attend`: lane l holds
+ * latent columns 16l..16l+15 and rotary columns 2l, 2l+1, so a score is one wave sum. A row's
+ * sequence, position and causal bound come from cu_seqlens and seqused as attn_paged reads them.
+ * A short batch splits its history over waves and `merge_paged` joins the f32 partials; the
+ * optional head gate multiplies the rounded output by the rounded sigmoid of the head's logit. */
+constexpr int RD = 64;
+struct PagedMeta {
+    long qr, qh, rr, rh, kp, kt, bp, bc, orr, oh, gr;
+    int rows, heads, seqs, blocks, bs, pages, splits;
+    float scale;
+};
+__device__ __forceinline__ int paged_seq(const int* cu, int seqs, int r) {
+    int s = 0;
+    while (s + 1 < seqs && cu[s + 1] <= r) ++s;
+    return s;
+}
+__device__ __forceinline__ void paged_store(uint16_t* out, const uint16_t* gate, const PagedMeta& m,
+                                            int r, int head, int lane, const float (&value)[16],
+                                            float den) {
+    float g = 1.0f;
+    if (gate) g = bf16_to_f32(f32_to_bf16(1.0f / (1.0f + expf(-bf16_to_f32(gate[(long)r * m.gr + head])))));
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        float v = den > 0 ? value[j] / den : 0;
+        if (gate) v = bf16_to_f32(f32_to_bf16(v)) * g;
+        out[(long)r * m.orr + (long)head * m.oh + lane * 16 + j] = f32_to_bf16(v);
+    }
+}
+__global__ __launch_bounds__(128) void attend_paged(const uint16_t* q, const uint16_t* qrot,
+                                                    const uint16_t* kv, const int* bt,
+                                                    const int* used, const int* cu,
+                                                    const uint16_t* gate, uint16_t* out,
+                                                    float* scratch, PagedMeta m) {
+    const int lane = threadIdx.x & 31, head = blockIdx.y * 4 + (threadIdx.x >> 5), r = blockIdx.x,
+              split = blockIdx.z;
+    if (head >= m.heads) return;
+    const int s = paged_seq(cu, m.seqs, r);
+    const int qlen = cu[s + 1] - cu[s], i = r - cu[s];
+    const int live = min(max(used[s] - qlen + i + 1, 0), m.blocks * m.bs);
+    const int begin = (int)((long)live * split / m.splits),
+              end = (int)((long)live * (split + 1) / m.splits);
+    float query[16], value[16] = {};
+    load_latent(q + (long)r * m.qr + (long)head * m.qh + lane * 16, query);
+    const uint16_t* const qp = qrot + (long)r * m.rr + (long)head * m.rh + lane * 2;
+    const float rq0 = bf16_to_f32(qp[0]), rq1 = bf16_to_f32(qp[1]);
+    float max_score = -INFINITY, den = 0;
+    for (int token = begin; token < end; ++token) {
+        const int page = bt[(long)s * m.bp + (token / m.bs) * m.bc];
+        if (page < 0 || page >= m.pages) continue;
+        const uint16_t* const row = kv + (long)page * m.kp + (token % m.bs) * m.kt;
+        float key[16];
+        load_latent(row + lane * 16, key);
+        float score = rq0 * bf16_to_f32(row[D + lane * 2]) + rq1 * bf16_to_f32(row[D + lane * 2 + 1]);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) score += query[j] * key[j];
+        score = r4d_wave_sum(score) * m.scale;
+        const bool higher = score > max_score;
+        const float weight = expf(higher ? max_score - score : score - max_score);
+        if (higher) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) value[j] = value[j] * weight + key[j];
+            den = den * weight + 1;
+            max_score = score;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) value[j] += key[j] * weight;
+            den += weight;
+        }
+    }
+    if (m.splits == 1) {
+        paged_store(out, gate, m, r, head, lane, value, den);
+    } else {
+        float* dst = scratch + (((long)r * m.heads + head) * m.splits + split) * PART;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[lane * 16 + j] = value[j];
+        if (!lane) {
+            dst[D] = max_score;
+            dst[D + 1] = den;
+        }
+    }
+}
+__global__ __launch_bounds__(128) void merge_paged(const float* scratch, const uint16_t* gate,
+                                                   uint16_t* out, PagedMeta m) {
+    const int lane = threadIdx.x & 31, head = blockIdx.y * 4 + (threadIdx.x >> 5), r = blockIdx.x;
+    if (head >= m.heads) return;
+    const float* src = scratch + ((long)r * m.heads + head) * m.splits * PART;
+    float max_score = -INFINITY;
+    for (int s = 0; s < m.splits; ++s)
+        if (src[s * PART + D + 1] > 0) max_score = fmaxf(max_score, src[s * PART + D]);
+    float value[16] = {}, den = 0;
+    for (int s = 0; s < m.splits; ++s) {
+        const float part_den = src[s * PART + D + 1];
+        if (!(part_den > 0)) continue;
+        const float w = expf(src[s * PART + D] - max_score);
+        den += part_den * w;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) value[j] += src[s * PART + lane * 16 + j] * w;
+    }
+    paged_store(out, gate, m, r, head, lane, value, den);
+}
+/* Splits of a (row, head) job's history. A row's bytes must not depend on the batch it is in: a
+ * speculative verify scores the k + 1 rows of a sequence in one launch, and greedy output equals
+ * the run without speculation only if each row gives the single-row decode at its position bit for
+ * bit. So the count is a function of the head count alone, not of the launch's rows or its longest
+ * table. A history shorter than the count leaves splits empty; they exit at once and merge_paged
+ * skips them. */
+/* The rows the scratch serves at full split: a verify at depth 31. */
+constexpr long kPagedRows = 32;
+int paged_splits(long heads) { return (int)std::min(16l, (256 + heads - 1) / heads); }
+int64_t paged_scratch_bytes(long rows, long heads) {
+    return std::min(rows, kPagedRows) * heads * paged_splits(heads) * PART * 4;
+}
+/* Operands: q [M, heads, 512], q_rope [M, heads, 64], kv [pages, 1, bs, >= 576], block_table
+ * [seqs, blocks], seqused [seqs], cu_seqlens [seqs + 1], gate [M, >= heads] (optional), out
+ * [M, heads, 512]. */
+int paged_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    RadTensor q = a->t[0], qr = a->t[1], o = a->t[7];
+    const auto &kv = a->t[2], &bt = a->t[3], &su = a->t[4], &cu = a->t[5];
+    const RadTensor* gate = r4d_opt(a, 6);
+    const long heads = r4d_geti_or(a, "heads", 0), bs = r4d_geti_or(a, "block_size", 0);
+    const float scale = (float)r4d_getf(a, "scale", 0);
+    auto heads_view = [&](RadTensor& t, long width) {
+        if (heads > 0 && t.rank == 2 && t.shape[1] == heads * width) {
+            t.rank = 3;
+            t.shape[1] = heads;
+            t.shape[2] = width;
+            t.stride[2] = t.stride[1];
+            t.stride[1] *= width;
+        }
+    };
+    heads_view(q, D);
+    heads_view(qr, RD);
+    heads_view(o, D);
+    if (q.dtype != RAD_BF16 || qr.dtype != RAD_BF16 || kv.dtype != RAD_BF16 ||
+        o.dtype != RAD_BF16 || bt.dtype != RAD_I32 || su.dtype != RAD_I32 || cu.dtype != RAD_I32 ||
+        (gate && gate->dtype != RAD_BF16))
+        return RAD_E_DTYPE;
+    if (!q.data || !qr.data || !kv.data || !bt.data || !su.data || !cu.data || !o.data)
+        return RAD_E_INVAL;
+    if (r4d_geti_or(a, "latent_dim", 0) != D || r4d_geti_or(a, "rope_dim", 0) != RD || heads < 1 ||
+        heads > 64 || bs < 1 || bs > 256 || !std::isfinite(scale) || scale <= 0 || q.rank != 3 ||
+        q.shape[0] < 1 || q.shape[0] > 65535 || q.shape[1] != heads || q.shape[2] != D ||
+        q.stride[2] != 1 || q.stride[1] < D || q.stride[0] < heads * q.stride[1] || qr.rank != 3 ||
+        qr.shape[0] != q.shape[0] || qr.shape[1] != heads || qr.shape[2] != RD ||
+        qr.stride[2] != 1 || qr.stride[1] < RD || qr.stride[0] < heads * qr.stride[1] ||
+        kv.rank != 4 || kv.shape[0] < 1 || kv.shape[0] > INT_MAX || kv.shape[1] != 1 ||
+        kv.shape[2] != bs || kv.shape[3] < D + RD || kv.stride[3] != 1 || kv.stride[2] < D + RD ||
+        kv.stride[0] < bs * kv.stride[2] || bt.rank != 2 || bt.shape[1] < 1 ||
+        bt.shape[1] > INT_MAX / bs || bt.stride[1] < 1 || bt.stride[0] < bt.shape[1] * bt.stride[1] ||
+        su.rank != 1 || su.shape[0] < 1 || bt.shape[0] < su.shape[0] || !r4d_contig(&su) ||
+        !r4d_contig(&cu) || r4d_numel(&cu) != su.shape[0] + 1 || o.rank != 3 ||
+        o.shape[0] != q.shape[0] || o.shape[1] != heads || o.shape[2] != D || o.stride[2] != 1 ||
+        o.stride[1] < D || o.stride[0] < heads * o.stride[1] ||
+        (gate && (gate->rank != 2 || gate->shape[0] != q.shape[0] || gate->shape[1] < heads ||
+                  gate->stride[1] != 1)))
+        return RAD_E_SHAPE;
+    /* The split comes from the head count alone (paged_splits). Only a batch whose partials the
+     * scratch cannot hold takes fewer, as many as fit. */
+    const long rows = q.shape[0], slots = a->scratch ? a->scratch_bytes / (PART * 4) : 0;
+    int splits = paged_splits(heads);
+    if (rows * heads * splits > slots) splits = (int)std::max(1l, slots / (rows * heads));
+    const PagedMeta m{ q.stride[0],  q.stride[1],     qr.stride[0],       qr.stride[1],
+                       kv.stride[0], kv.stride[2],    bt.stride[0],       bt.stride[1],
+                       o.stride[0],  o.stride[1],     gate ? (long)gate->stride[0] : 0L,
+                       (int)q.shape[0], (int)heads,  (int)su.shape[0],   (int)bt.shape[1],
+                       (int)bs,      (int)kv.shape[0], splits,           scale };
+    const uint16_t* gp = gate ? (const uint16_t*)gate->data : nullptr;
+    int rc = R4D_EMIT(stream, attend_paged, dim3(m.rows, (m.heads + 3) / 4, m.splits), dim3(128), 0,
+                      (const uint16_t*)q.data, (const uint16_t*)qr.data, (const uint16_t*)kv.data,
+                      (const int*)bt.data, (const int*)su.data, (const int*)cu.data, gp,
+                      (uint16_t*)o.data, (float*)a->scratch, m);
+    if (rc == RAD_OK && splits > 1)
+        rc = R4D_EMIT(stream, merge_paged, dim3(m.rows, (m.heads + 3) / 4), dim3(128), 0,
+                      (const float*)a->scratch, gp, (uint16_t*)o.data, m);
+    return rc;
 }
 /* Heads are the matrix rows, so all sixteen share each latent load even when
  * each query selected different pages. Splitting P into BF16 high/low parts
@@ -896,7 +1080,16 @@ extern "C" int r4d_rad_mla_attn_rows(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_mla_project(const RadArgs* a, RadStream stream) {
     return project_body(a, stream);
 }
+extern "C" int r4d_rad_mla_attn_paged(const RadArgs* a, RadStream stream) {
+    return paged_body(a, stream);
+}
 extern "C" int64_t r4d_rad_mla_attn_scratch(const RadArgs*) { return scratch_bytes; }
+/* Sized at the band's top row count, at most kPagedRows (paged_splits). */
+extern "C" int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs* a) {
+    const long heads = r4d_geti_or(a, "heads", 0), rows = r4d_geti_or(a, "M", kPagedRows);
+    if (heads < 1 || heads > 64 || rows < 1) return RAD_E_SHAPE;
+    return paged_scratch_bytes(rows, heads);
+}
 extern "C" int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*) { return matrix_scratch_bytes; }
 extern "C" void r4d_mla_matrix_pin_form(int form) { g_mla_matrix_form = form; }
 extern "C" void r4d_mla_rows_pin_form(int form) { g_mla_rows_form = form; }

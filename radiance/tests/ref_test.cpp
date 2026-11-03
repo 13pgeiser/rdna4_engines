@@ -832,6 +832,88 @@ TEST(swiglu_clamping_is_asymmetric_and_precedes_the_activation) {
     CHECK_EQ(run("swiglu_clamped", bad), RAD_E_SHAPE);
 }
 
+TEST(swiglu_step_clips_the_activation_not_the_gate) {
+    T gu(RAD_F32, { 1, 8 }), y(RAD_F32, { 1, 4 });
+    gu.f({ -20, 2, 4.02f, 20, 9, 9, 9, -9 });
+    A a;
+    a.t(gu).t(y).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_step", a), RAD_OK);
+    auto silu = [](float g) { return g / (1 + std::exp(-g)); };
+    CHECK_NEAR(y.at(0), silu(-20) * 4, 1e-6);   // a negative activation is not clipped
+    CHECK_NEAR(y.at(1), silu(2) * 4, 1e-5);
+    CHECK_NEAR(y.at(2), silu(4.02f) * 4, 1e-5); // silu(4.02) is under 4: unclipped
+    CHECK_EQ(y.at(3), -16.0f);                  // silu(20) clips to exactly 4, up to -4
+    T gc(RAD_F32, { 1, 4 });
+    A c;
+    c.t(gu).t(gc).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_clamped", c), RAD_OK);
+    CHECK(gc.at(3) > y.at(3));                  // the gate-first form stops at silu(4) * -4
+}
+
+TEST(group_router_selects_only_inside_the_best_groups) {
+    T lg(RAD_F32, { 1, 8 }), bias(RAD_F32, { 8 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
+    auto logit = [](float p) { return std::log(p / (1 - p)); };
+    // Group sums of the top two: 1.0, 1.5, 0.86, 1.2 -> groups 1 and 3 are kept, so the single
+    // best experts (0 at 0.9, 4 at 0.85) are out and 2 and 3 are chosen.
+    lg.f({ logit(0.9f), logit(0.1f), logit(0.8f), logit(0.7f), logit(0.85f), logit(0.01f),
+           logit(0.6f), logit(0.6f) });
+    bias.f({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    A a;
+    a.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 4)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 2);
+    CHECK_EQ(ids.at(1), 3);
+    CHECK_NEAR(w.at(0), 2.5 * 0.8 / 1.5, 1e-5);
+    CHECK_NEAR(w.at(1), 2.5 * 0.7 / 1.5, 1e-5);
+    // The bias ranks groups and experts and never weights them.
+    bias.f({ 0, 0, 0, 0, 0, 0, 1, 0 });
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 6);
+    CHECK_EQ(ids.at(1), 2);
+    CHECK_NEAR(w.at(0), 2.5 * 0.6 / 1.4, 1e-5);
+    A bad;
+    bad.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 3)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    CHECK_EQ(run("router_sigmoid_group_topk", bad), RAD_E_SHAPE);
+}
+
+TEST(paged_latent_attention_is_causal_adds_the_rotary_part_and_gates_per_head) {
+    // One sequence of three tokens, the last two queried (positions 1 and 2). Token 0 and 1 sit
+    // in page 1, token 2 in page 0; a row is the latent (2) then the rotary part (2).
+    T q(RAD_F32, { 2, 1, 2 }), qr(RAD_F32, { 2, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 4 });
+    T bt(RAD_I32, { 1, 2 }), su(RAD_I32, { 1 }), cu(RAD_I32, { 2 }), out(RAD_F32, { 2, 1, 2 });
+    q.f({ 0, 0, 0, 0 });
+    qr.f({ 0, 0, 0, 0 });
+    kv.f({ 5, 6, 0, 0, 77, 77, 77, 77, 1, 2, 1, 0, 3, 4, 0, 0 });
+    bt.n({ 1, 0 });
+    su.n({ 3 });
+    cu.n({ 0, 2 });
+    A a;
+    a.t(q).t(qr).t(kv).t(bt).t(su).t(cu).tnull().t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 2, 1e-6);   // position 1 sees tokens 0 and 1
+    CHECK_NEAR(out.at(1), 3, 1e-6);
+    CHECK_NEAR(out.at(2), 3, 1e-6);   // position 2 sees all three
+    CHECK_NEAR(out.at(3), 4, 1e-6);
+    // The rotary part alone scores token 0 at ln 3 and token 1 at 0: weights 3/4 and 1/4.
+    qr.f({ std::log(3.0f), 0, 0, 0 });
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1.5, 1e-6);
+    CHECK_NEAR(out.at(1), 2.5, 1e-6);
+    // A gate logit of 0 halves the head.
+    T gate(RAD_F32, { 2, 1 });
+    gate.f({ 0, 0 });
+    A g;
+    g.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(gate).t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", g), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.75, 1e-6);
+    CHECK_NEAR(out.at(1), 1.25, 1e-6);
+    CHECK_NEAR(out.at(2), 1.5, 1e-6);
+}
+
 TEST(sigmoid_router_uses_correction_only_for_selection_and_stable_ties) {
     T lg(RAD_F32, { 1, 4 }), bias(RAD_F32, { 4 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
     lg.f({ -std::log(3.0f), std::log(3.0f), 0, 0 });
@@ -966,6 +1048,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
@@ -9894,12 +9977,19 @@ std::vector<Geo> geometries() {
                               .i("block_size", 4).d("scale", 0.125).s("dtype", "f32")),
         G("mla_project", "M", 3, a.i("M", R).i("heads", 2).i("head_dim", 4).i("latent_dim", 6)
                                  .s("mode", "absorb").s("dtype", "bf16")),
+        G("mla_attn_paged", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)
+                                    .i("block_size", 4).d("scale", 0.25).i("ctx", 6)
+                                    .s("dtype", "f32")),
         G("dsa_score", "M", 4, a.i("M", R).i("n", 8).i("heads", 2).i("blocks", 3).i("seqs", 2)
                                .s("dtype", "fp8_e4m3")),
         G("dsa_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "bf16")),
         G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("swiglu_step", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("router_sigmoid_group_topk", "M", 3, a.i("M", R).i("n_expert", 8).i("top_k", 2)
+                                               .i("n_group", 4).i("topk_group", 2).i("norm", 1)
+                                               .d("route_scale", 2.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)

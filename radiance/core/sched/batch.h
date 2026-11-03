@@ -265,6 +265,7 @@ private:
         /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
         std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
+        std::vector<int32_t>                      kv_used_max_h;
         /* The build's sequences in row order (step_seqs); none for an encoder pass. */
         std::vector<uint64_t>                     seqs;
         bool                                      has_seqs = false;

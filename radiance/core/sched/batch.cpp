@@ -245,6 +245,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
         o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
+        o.kv_used_max_h.assign(s.groups.size(), 0);
         o.seqs.clear();
         o.seqs.reserve((size_t)max_seqs_);   /* a build fills it without allocating */
         o.has_seqs = false;
@@ -814,6 +815,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                                    (int)g.sidx_pitch);
             }
         }
+        int32_t group_used = 0;
+        for (int64_t i = 0; i < n_seq; ++i)
+            group_used = std::max(group_used, g.h_used[i]);
+        o.kv_used_max_h[gi] = group_used;
         /* A state group's rows are one slot per sequence: n_seq words, restaged whole. */
         if (!L.paged) {
             stage(g.bt_fix, np, n_seq);
@@ -852,6 +857,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.block_table = on_rank(base, s.dev[0], g.d_bt);
             b.block_table_pitch = pitch;
             b.seqused = on_rank(base, s.dev[0], g.d_used);
+            b.seqused_h = g.h_used;
             b.state_index = on_rank(base, s.dev[0], g.d_sidx);
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
@@ -1211,6 +1217,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_seq = n_seq;
         B.token_ids = on_rank(base, b0, s.d_tok);
         B.positions = on_rank(base, b0, s.d_pos);
+        B.positions_h = s.h_pos;
         B.cu_seqlens = on_rank(base, b0, s.d_cu);
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;
@@ -1226,6 +1233,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.max_q_len_decode = max_q_dec;
         B.max_q_len_prefill = max_q_pf;
         B.max_ctx_len = (int32_t)ctx_bound;
+        B.kv_used_max_h = o.kv_used_max_h.data();
         B.n_kv_groups = (int)o.kv[r].size();
         B.kv = o.kv[r].data();
         B.draft_pass = plan.draft_pass;

@@ -7273,6 +7273,76 @@ TEST(the_prefill_stage_is_two_layers_of_what_the_card_leaves_off) {
     }
 }
 
+/* --gpu-memory-mib N is --gpu-headroom-mib (card - N): the same split, the same pools. Over the
+ * card is a named refuse, and the trial still writes nothing. */
+TEST(gpu_memory_mib_is_the_inverse_of_gpu_headroom_mib) {
+    constexpr int64_t MiB = 1 << 20;
+    constexpr int64_t cap_mib = 16384;
+    {
+        Config via_head = derive_config();
+        via_head.gpu_headroom_mib = 256;
+        Config via_mem = derive_config();
+        via_mem.gpu_memory_mib = cap_mib - 256;
+        VramBudget bh, bm;
+        int rc_h = 0, rc_m = 0;
+        stderr_of([&] {
+            rc_h = vram_budget_resolve(via_head, { hand_facts(false) }, &bh);
+            rc_m = vram_budget_resolve(via_mem, { hand_facts(false) }, &bm);
+        });
+        CHECK_OK(rc_h);
+        CHECK_OK(rc_m);
+        CHECK_EQ(bh.headroom, bm.headroom);
+        CHECK_EQ(bh.claimable, bm.claimable);
+        CHECK_EQ(via_head.vram_weights_mib, via_mem.vram_weights_mib);
+        CHECK_EQ(via_head.vram_kv_mib, via_mem.vram_kv_mib);
+        CHECK_EQ(via_mem.gpu_headroom_mib, 256ll);
+        CHECK_EQ(via_mem.given["--gpu-headroom-mib"], std::string("derived from --gpu-memory-mib"));
+    }
+    {
+        Config c = derive_config();
+        c.gpu_memory_mib = cap_mib;          /* headroom 0 */
+        VramBudget b;
+        int rc = 0;
+        stderr_of([&] { rc = vram_budget_resolve(c, { hand_facts(false) }, &b); });
+        CHECK_OK(rc);
+        CHECK_EQ(c.gpu_headroom_mib, 0ll);
+        CHECK_EQ(b.headroom, 0ll);
+        CHECK_EQ(b.claimable, (15096 + 96) * MiB);
+    }
+    {
+        Config c = derive_config();
+        c.gpu_memory_mib = cap_mib + 1;
+        VramBudget b;
+        int rc = 0;
+        stderr_of([&] { rc = vram_budget_resolve(c, { hand_facts(false) }, &b); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(has(b.report, "--gpu-memory-mib"));
+        CHECK_EQ(c.gpu_headroom_mib, 96ll);  /* not rewritten on refuse */
+    }
+    {
+        Config c = derive_config();
+        c.gpu_memory_mib = cap_mib - 256;
+        const Config before = c;
+        VramBudget t;
+        CHECK_OK(vram_budget_trial(c, { hand_facts(false) }, &t));
+        CHECK_EQ(c.gpu_headroom_mib, before.gpu_headroom_mib);
+        CHECK_EQ(c.vram_weights_mib, before.vram_weights_mib);
+        CHECK_EQ(c.vram_kv_mib, before.vram_kv_mib);
+        CHECK_EQ(t.headroom, 256 * MiB);
+    }
+    /* A device with no capacity has nothing to claim: the flag is ignored. */
+    {
+        Config c = derive_config();
+        c.gpu_memory_mib = 4096;
+        VramFacts f{};
+        f.kv_ceiling = 300LL << 20;
+        VramBudget b;
+        CHECK_OK(vram_budget_resolve(c, { f }, &b));
+        CHECK_EQ(c.gpu_headroom_mib, 96ll);
+        CHECK_EQ(c.vram_kv_mib, 300ll);
+    }
+}
+
 /* Over random cards and programs the split either refuses by name or hands out no more than the
  * card: every granted pool plus every fixed term fits the capacity, with at most the MiB each of
  * the two pools may round into the headroom. The shares add up to the elastic part, the static

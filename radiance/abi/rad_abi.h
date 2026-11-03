@@ -19,7 +19,7 @@ extern "C" {
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 33u
+#define RAD_ABI_VERSION 35u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -60,6 +60,14 @@ typedef struct RadArgs {
     void*            instance;      /* whatever init() returned for this resolved instance */
     int              rank;          /* tensor-parallel rank and world size, for collectives */
     int              world_size;
+    /* ABI 35: host-side maximum KV length represented by this exact launch operand (a seqused
+     * span or a supported one-sequence prefill boundary), or -1 when it cannot be proven. Plugins
+     * must not infer it from a device pointer or synchronously read device memory to get it. */
+    int32_t          kv_used_max_h;
+    /* The current rank's WGP count (HIP multiProcessorCount on RDNA); lets split launchers use
+     * exactly the same per-device occupancy as architecture pass-key callbacks without querying
+     * the process-global current device on the hot path. */
+    int32_t          wgp_count;
 } RadArgs;
 
 /* Read a parameter by key. Inline definitions, because a plugin links only the ABI headers and
@@ -465,14 +473,19 @@ typedef struct RadKernelInfo {
      * against: a named skip, not a failure. */
     RadUnrelayoutFn unrelayout;
     /* The chain of conventional ops this kernel computes in one launch, or null if it is not a
-     * fusion. Non-null also counts in rad-kbench's fusion-claim column.
+     * fusion. Non-null also counts in rad-kbench's fusion-claim column. */
+    RadFuseFn      replaces;
+    /* Flags describing runtime behavior relevant to core safety decisions. Zero means none.
      *
      * Keep this field last. Kernel tables are positional aggregate initialisers
      * (`{..., nullptr, nullptr, r4d_rad_embed_lookup, nullptr, ...}`), so a field inserted
      * anywhere else shifts every later initialiser, and since `nullptr` converts to any function
      * pointer type, part of that shift would still compile. Append new fields after this one. */
-    RadFuseFn      replaces;
+    uint64_t       capabilities;
 } RadKernelInfo;
+
+/* This row's launch grid can depend on live seqused during prefill. */
+#define RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT (1ull << 0)
 
 /* ================================================================== kernel plugin exports */
 /* Every kernel plugin exports the whole set. The first plugin in hierarchy order to declare an op
