@@ -167,6 +167,7 @@ console.log("== the shipped formatters render these exact strings ==");
 eq(tpsF(58), "58.0", "tps keeps one decimal through the middle band");
 eq(tpsF(54), "54.0", "tps: the GUIDE's F1 example figure");
 eq(tpsF(9.995), "10.0", "tps lower band boundary is inclusive");
+eq(tpsF(9.994), "9.99", "tps just under the lower boundary keeps two decimals (kills sig3 9.995->9.994)");
 eq(tpsF(99.949), "99.9", "tps just under the upper boundary keeps a decimal");
 eq(tpsF(99.95), "100", "tps upper band boundary is exclusive");
 eq(tpsF(120), "120", "tps above the band is an integer");
@@ -185,8 +186,8 @@ console.log("== the median is falsifiable: an ODD row count ==");
 const box25 = mk("span", "hsum");
 const r25 = mkRows(25);
 const s25 = r25.map((r) => r.ttft).sort((a, b) => a - b);
-ok(s25[Math.floor(25 / 2)] !== s25[Math.ceil(25 / 2)],
-   "n=25 makes floor and ceil pick different rows, so the guard can tell them apart");
+if (s25[Math.floor(25 / 2)] === s25[Math.ceil(25 / 2)]) throw new Error(
+  "fixture broken: n=25 must make floor and ceil pick different rows");
 new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
   el, doc, () => box25, r25, tpsF, cnt3F, durF);
 const ttft25 = box25.kids.filter((k) => k.cls === "hgrp")[3].kids
