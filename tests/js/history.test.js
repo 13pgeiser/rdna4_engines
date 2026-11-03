@@ -146,8 +146,12 @@ const wantTtft = "ttft median " + durF(tfsSorted[Math.floor(tfsSorted.length / 2
 ok(textNodes[0].txt === wantTtft,
    "value and unit are one string, rendered by the shipped dur(): " + JSON.stringify(textNodes[0].txt) + " want " + JSON.stringify(wantTtft));
 console.log("== the window thresholds: last 20 needs 20 rows, last 5 needs 5 ==");
-/* 12 is the discriminating count: it kills a threshold lowered to <=12 as well as one raised. */
-for (const [n, want20, want5] of [[7, false, true], [12, false, true], [24, true, true]]) {
+/* Every count sits ADJACENT to a threshold, because that is the only place a threshold can move
+   unnoticed: 19/20 pins the 20 boundary (>=19 fails at 19), 4/5 pins the 5 boundary (>=6 or >=7
+   fails at 5). Counts spaced further apart leave the off-by-one free to move. */
+for (const [n, want20, want5] of [[4, false, false], [5, false, true], [6, false, true],
+                                  [7, false, true], [12, false, true], [19, false, true],
+                                  [20, true, true], [24, true, true]]) {
   const box = mk("span", "hsum");
   new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
     el, doc, () => box, mkRows(n), tpsF, cnt3F, durF);
@@ -155,5 +159,39 @@ for (const [n, want20, want5] of [[7, false, true], [12, false, true], [24, true
   eq(t.includes("last 20:"), want20, n + " rows: last 20 " + (want20 ? "shows" : "stays hidden (it would repeat the overall mean)"));
   eq(t.includes("last 5:"), want5, n + " rows: last 5 " + (want5 ? "shows" : "stays hidden"));
 }
+console.log("== the shipped formatters render these exact strings ==");
+/* The window guards above call tpsF/cnt3F/durF on BOTH sides, so a formatter bug cancels out --
+   replacing tps with a constant passed the whole suite. These literals are the only place the
+   formatters are pinned to something that is not themselves. Values derived from the shipped
+   source; DASH is U+2013, not a hyphen. */
+eq(tpsF(58), "58.0", "tps keeps one decimal through the middle band");
+eq(tpsF(54), "54.0", "tps: the GUIDE's F1 example figure");
+eq(tpsF(9.995), "10.0", "tps lower band boundary is inclusive");
+eq(tpsF(99.949), "99.9", "tps just under the upper boundary keeps a decimal");
+eq(tpsF(99.95), "100", "tps upper band boundary is exclusive");
+eq(tpsF(120), "120", "tps above the band is an integer");
+eq(tpsF(0), "0", "tps of zero is 0, not 0.00");
+eq(tpsF(NaN), "\u2013", "tps of a non-finite is the en-dash");
+eq(cnt3F(691), "691", "cnt3 below the kilo step is a plain integer");
+eq(cnt3F(1234567), "1.23M", "cnt3 steps to M with three significant figures");
+eq(durF(0.813), "813 ms", "dur under a second is whole milliseconds");
+eq(durF(0), "0 ms", "dur of zero is 0 ms");
+eq(durF(1.7), "1.70 s", "dur just over a second carries two decimals");
+eq(durF(59.97), "1m 00s", "dur rounds to the shown resolution BEFORE splitting (not 60.0 s)");
+
+console.log("== the median is falsifiable: an ODD row count ==");
+/* At n=24 floor(12) and ceil(12) are the same row, so floor->ceil in the shipped median passed
+   every earlier fixture. Only an odd count makes the two candidates differ. */
+const box25 = mk("span", "hsum");
+const r25 = mkRows(25);
+const s25 = r25.map((r) => r.ttft).sort((a, b) => a - b);
+ok(s25[Math.floor(25 / 2)] !== s25[Math.ceil(25 / 2)],
+   "n=25 makes floor and ceil pick different rows, so the guard can tell them apart");
+new Function("el", "document", "$", "hRows", "tps", "cnt3", "dur", BLOCK)(
+  el, doc, () => box25, r25, tpsF, cnt3F, durF);
+const ttft25 = box25.kids.filter((k) => k.cls === "hgrp")[3].kids
+  .filter((k) => k.cls !== "hsep").map((k) => k.txt || "").join("");
+eq(ttft25, "ttft median 1.70 s", "the shipped median takes the floor row at n=25");
+
 console.log(fails ? "\n" + fails + " FAILURE(S) of " + checks : "\nALL " + checks + " CHECKS PASS on the shipped history line");
 process.exit(fails ? 1 : 0);
