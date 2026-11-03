@@ -12,6 +12,7 @@
  */
 #include <arch/rad_arch.h>
 #include "chat.h"
+#include "spark25_prefill_pass_key.h"
 
 #include <algorithm>
 #include <cmath>
@@ -432,9 +433,41 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+#ifdef SPARK25_HAVE_PREFILL_SPLIT
+static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
+    if (!c || !batch) return 0;
+    Model& m = models[rad_rank(c)];
+    int group = -1;
+    if (batch->kv) for (int i = 0; i < batch->n_kv_groups; ++i)
+        if (batch->kv[i].group == m.kv) { group = i; break; }
+    spark25_prefill_key::Request r;
+    r.phase = batch->phase;
+    r.n_tok = batch->n_tok;
+    r.n_seq = batch->n_seq;
+    r.max_q_len = batch->max_q_len;
+    r.max_ctx = m.g.max_ctx;
+    r.n_spec = batch->n_spec;
+    r.draft_pass = batch->draft_pass;
+    r.enc = batch->enc != 0;
+    r.head_dim = m.g.head_dim;
+    r.gqa = m.g.gqa();
+    r.kv_heads = m.g.n_head_kv;
+    r.kv_group_found = group >= 0;
+    r.used = used_max_h && group >= 0 ? used_max_h[group] : 0;
+    r.wgps = rad_ctx_wgp_count(c);
+    return spark25_prefill_key::pass_key(r);
+}
+#endif
+
 static const RadChatFormat* chat_format(const RadModelMeta*) { return spark_chat_format(); }
 }
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(spark25_bf16, "spark25", "", "0.1.0", "Spark X2.6 BF16")
 RAD_ARCH_CHAT_FORMAT(spark25_bf16)
+#ifdef SPARK25_HAVE_PREFILL_SPLIT
+extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch,
+                                      const int32_t* used_max_h) {
+    return spark25_bf16::pass_key(c, batch, used_max_h);
+}
+#endif
 #endif

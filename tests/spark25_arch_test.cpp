@@ -278,6 +278,39 @@ TEST(tp1_works_without_collectives) {
     CHECK(std::find(issued.begin(), issued.end(), "all_reduce") == issued.end());
 }
 
+TEST(spark_prefill_keys_match_live_r4d_split_grid) {
+#ifdef SPARK25_HAVE_PREFILL_SPLIT
+    spark25_prefill_key::Request r;
+    r.phase = RAD_PHASE_PREFILL; r.n_tok = r.max_q_len = 256; r.n_seq = 1;
+    r.max_ctx = 65536; r.head_dim = 256; r.gqa = 4; r.kv_heads = 4;
+    r.kv_group_found = 1; r.used = 1536; r.wgps = 32;
+    const uint64_t k4 = spark25_prefill_key::pass_key(r);
+    CHECK_EQ(rad_prefill_splits_for_live(96, 48, 256, 256, 1, 4, 65536, 1536, 32), 4);
+    r.used = 2048;
+    CHECK_EQ(rad_prefill_splits_for_live(96, 48, 256, 256, 1, 4, 65536, 2048, 32), 5);
+    CHECK(spark25_prefill_key::pass_key(r) != k4);
+    r = {}; r.phase = RAD_PHASE_PREFILL; r.n_tok = r.max_q_len = 256; r.n_seq = 2;
+    r.max_ctx = 65536; r.head_dim = 256; r.gqa = 4; r.kv_heads = 4;
+    r.kv_group_found = 1; r.used = 1536; r.wgps = 32;
+    CHECK_EQ(spark25_prefill_key::pass_key(r), (uint64_t)0);
+
+    MetaKV meta = spark_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(spark25_bf16::declare(&b, meta.meta(), &ctx), RAD_OK);
+    RadKVGroupBatch kv{}; kv.group = spark25_bf16::models[0].kv;
+    RadBatch batch{}; batch.phase = RAD_PHASE_PREFILL; batch.n_tok = batch.max_q_len = 256;
+    batch.n_seq = batch.n_kv_groups = 1; batch.kv = &kv;
+    int32_t used[1] = {1536}; RadCtx c{};
+    const uint64_t plugin_k4 = spark25_bf16::pass_key(&c, &batch, used);
+    REQUIRE(plugin_k4 != 0);
+    used[0] = 2048;
+    CHECK(spark25_bf16::pass_key(&c, &batch, used) != plugin_k4);
+#else
+    CHECK_EQ(spark25_prefill_key::pass_key({}), (uint64_t)0);
+#endif
+}
+
 TEST(refuses_unimplemented_variants) {
     RadBuildCtx ctx = build_ctx();
     for (const auto& change : {std::pair{"tie_word_embeddings", "0"},
