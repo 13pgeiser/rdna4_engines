@@ -3769,8 +3769,9 @@ exist for it to be a different question: with 12 rows stored, the mean over the 
 be the mean over all 12, so only *last 5* shows. At exactly 20 rows *last 20* repeats the overall
 mean; from 21 up the three figures are three different questions.
 These are means of per-request rates, not the pooled rate the tiles above show: one long request
-does not get to decide the headline. A dot separates one category from the next; a pipe separates
-the windows within a category.
+does not get to decide the headline. On this line a dot separates one category from the next and a
+pipe separates the windows within a category; other panels use both glyphs as plain field
+separators, so neither glyph carries a page-wide meaning.
 
 The download icon beside the **Requests** heading saves those stored rows as
 `radiance-history.json`, indented, from the browser -- it is the same data **clear** would discard,
