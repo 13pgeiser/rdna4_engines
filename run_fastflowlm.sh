@@ -28,7 +28,7 @@ TAGS=(
       "gemma4-it:12b"
       "qwen3.5:9b"
       "nanbeige4.1:3b"
-      "phi4-mini-it-core:4b"
+      "phi4-mini-it:4b"
       "gpt-oss:20b"
       "qwen3.6-moe:35b-a3b"
       "qwen3.8-dflash2:27b"   # source catalog only (unreleased in the 1.0.11 tarballs)
