@@ -14,18 +14,29 @@
 #pragma once
 
 #include "rad_prefill_split.h"
+#include <atomic>
 
-// Workgroups the card runs at once: one a WGP. HIP's multiProcessorCount counts WGPs on RDNA (32 on
-// the R9700, see want_wg in r4d_hc_bf16.hip); 32 if it cannot be read.
-static inline int r4d_prefill_wgps() {
-    static const int v = [] {
-        int dev = 0;
-        hipDeviceProp_t pr{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&pr, dev) != hipSuccess)
-            return 32;
-        return pr.multiProcessorCount > 0 ? pr.multiProcessorCount : 32;
-    }();
-    return v;
+// Workgroups the card runs at once: one a WGP. Kernel launches use RadArgs::wgp_count, the same
+// per-rank property used by pass-key callbacks. Declaration-time scratch sizing has no Ctx yet, so
+// cache that query per HIP device rather than once process-wide (TP ranks can bind unlike cards).
+static inline int r4d_prefill_wgps(const RadArgs* a = nullptr) {
+    if (a && a->wgp_count > 0) return a->wgp_count;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0) return 32;
+    static std::atomic<int> cached[64]{};
+    if (dev < (int)(sizeof(cached) / sizeof(cached[0]))) {
+        const int old = cached[dev].load(std::memory_order_relaxed);
+        if (old > 0) return old;
+    }
+    hipDeviceProp_t pr{};
+    if (hipGetDeviceProperties(&pr, dev) != hipSuccess) return 32;
+    const int count = pr.multiProcessorCount > 0 ? pr.multiProcessorCount : 32;
+    if (dev < (int)(sizeof(cached) / sizeof(cached[0]))) {
+        int expected = 0;
+        cached[dev].compare_exchange_strong(expected, count, std::memory_order_relaxed);
+        return cached[dev].load(std::memory_order_relaxed);
+    }
+    return count;
 }
 
 // The split law, at the launch's own geometry: `bq` query positions a workgroup, `tile` keys a KV
@@ -52,43 +63,25 @@ static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_
 // tells r4d_selftest a split launch from an unsplit one with the same bytes. Not atomic.
 static int g_prefill_last_splits = 0;
 
-/* Live KV length for the 8-tile floor. seqused_k is device-side (r4d_attn_args.h); max_ctx is
- * the model bound and is too wide for a short chunk. A failed copy keeps max_ctx, which only
- * over-splits. Occupancy already returned 1 skips the copy. */
-static inline int r4d_prefill_used_ctx(const R4DArgs* r) {
-    if (!r->seqused_k || r->num_seqs <= 0) return 0;
-    const int n = r->num_seqs;
-    int used = 0;
-    int chunk[64];
-    for (int off = 0; off < n; off += 64) {
-        const int m = n - off < 64 ? n - off : 64;
-        if (hipMemcpy(chunk, r->seqused_k + off, (size_t)m * sizeof(int),
-                      hipMemcpyDefault) != hipSuccess) {
-            (void)hipGetLastError();
-            return 0;
-        }
-        for (int i = 0; i < m; ++i)
-            if (chunk[i] > used) used = chunk[i];
-    }
-    return used;
-}
+/* The runtime supplies the live group maximum only when it can prove that the launch's full
+ * seqused operand is the just-built, non-speculative prefill batch. Other shapes use max_ctx below;
+ * never synchronously copy device seqused from a HIP queue independent of the AQL upload queue. */
 
 /* The KV split's count before the scratch bound: the case's `splits` parameter when it names one
  * (r4d_selftest; the prefill rows declare no such axis, so the engine passes none), else the law,
- * at most 64. The 8-tile floor uses live seqused_k, not the model max_ctx. */
+ * at most 64. Use the runtime's host seqused maximum when exact for this launch; otherwise use the
+ * declared model bound. The launcher and recording callback share that same rule. */
 static inline int r4d_prefill_splits_want(const RadArgs* a, const R4DArgs* r, int bq, int tile) {
     const int sp0 = split_of(a);
     if (sp0 > 0) return std::min(sp0, 64);
-    const int wgps = r4d_prefill_wgps();
+    const int wgps = r4d_prefill_wgps(a);
     const int qtot = r4d_q_total(*r);
-    int sp = r4d_prefill_splits_law(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads, r->max_ctx,
-                                    wgps);
-    if (sp <= 1) return 1;
-    const int used = r4d_prefill_used_ctx(r);
+    const int used = a->kv_used_max_h;
     if (used > 0)
-        sp = rad_prefill_splits_for_live(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads,
-                                         r->max_ctx, used, wgps);
-    return sp;
+        return rad_prefill_splits_for_live(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads,
+                                           r->max_ctx, used, wgps);
+    return r4d_prefill_splits_law(bq, tile, r->q_len, qtot, r->num_seqs, r->kv_heads,
+                                  r->max_ctx, wgps);
 }
 
 /* The launch's split count, 1 for the plain form: what r4d_prefill_splits_want asks, cut to the
@@ -125,7 +118,7 @@ static inline int64_t r4d_prefill_scratch(const RadArgs* a, int head_dim, long l
         const int kv   = (int)std::max(1LL, gqa > 0 ? n_head / gqa : n_head);
         const int band = (int)std::max(1LL, r4d_geti_or(a, "q_len", 1));
         const int mctx = (int)r4d_geti_or(a, "max_ctx", 0);
-        const int w    = r4d_prefill_wgps();
+        const int w    = r4d_prefill_wgps(a);
         const int64_t per_row = (int64_t)n_head * (head_dim + 2) * 4;
         int64_t worst = 0;
         for (long long n = 1; n <= max_seqs; ++n)

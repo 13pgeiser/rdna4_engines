@@ -857,6 +857,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.block_table = on_rank(base, s.dev[0], g.d_bt);
             b.block_table_pitch = pitch;
             b.seqused = on_rank(base, s.dev[0], g.d_used);
+            b.seqused_h = g.h_used;
             b.state_index = on_rank(base, s.dev[0], g.d_sidx);
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
@@ -1216,6 +1217,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_seq = n_seq;
         B.token_ids = on_rank(base, b0, s.d_tok);
         B.positions = on_rank(base, b0, s.d_pos);
+        B.positions_h = s.h_pos;
         B.cu_seqlens = on_rank(base, b0, s.d_cu);
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;

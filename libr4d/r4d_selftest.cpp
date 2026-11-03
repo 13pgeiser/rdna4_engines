@@ -1410,6 +1410,18 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     const int64_t span0 = lead, span1 = cu[(size_t)ns];   /* the launch's own rows */
     const int64_t total_q = span1 + tail;
     const bool ragged = ns > 1 || lead || tail;
+    /* This direct-kernel fixture supplies an exact host maximum for a full sequence operand. Its
+     * synthetic partial-row operands do not carry the runtime's host slice/position view, so they
+     * exercise the safe declared-context fallback. */
+    int32_t used_max_h = -1;
+    if (!lead && !tail)
+        for (int32_t x : used) used_max_h = std::max(used_max_h, x);
+    int wgp_count = 32, current_device = 0;
+    hipDeviceProp_t current_props{};
+    if (hipGetDevice(&current_device) == hipSuccess &&
+        hipGetDeviceProperties(&current_props, current_device) == hipSuccess &&
+        current_props.multiProcessorCount > 0)
+        wgp_count = current_props.multiProcessorCount;
     /* one disjoint run of mb blocks per sequence */
     const std::vector<int32_t> bt = iota_i32(ns * mb);
 
@@ -1484,6 +1496,8 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
         a.t = ts.data(); a.n_t = (int)ts.size();
         a.p = ps.data(); a.n_p = (int)ps.size();
         a.world_size = 1;
+        a.kv_used_max_h = used_max_h;
+        a.wgp_count = wgp_count;
         const int64_t need = r->scratch ? r->scratch(&a) : 0;
         if (need > 0) {
             a.scratch = dalloc((size_t)need);
@@ -1500,12 +1514,8 @@ static void attn_split_case(const Plugin& pl, const SplitGeo& g, const char* nam
     const int s_un = run(1, d_o[0]);
     const int s_fo = run(force, d_o[1]);
     const int s_lw = run(0, d_o[2]);
-    int law_ctx = (int)(mb * bs);
-    if (decl_max_ctx > 0) {
-        law_ctx = 0;
-        for (const SplitSeq& s : seqs)
-            if ((int)s.ctx > law_ctx) law_ctx = (int)s.ctx;
-    }
+    int law_ctx = decl_max_ctx > 0 ? (int)decl_max_ctx : (int)(mb * bs);
+    if (used_max_h > 0 && used_max_h < law_ctx) law_ctx = used_max_h;
     const int want = law((int)(ragged ? std::min<int64_t>(2048, total_q) : qmax), (int)total_q,
                          (int)ns, (int)kv_heads, law_ctx);
     ok((tag + ": splits 1 / forced / law").c_str(),

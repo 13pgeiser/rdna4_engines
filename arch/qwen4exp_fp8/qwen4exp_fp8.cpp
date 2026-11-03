@@ -1729,7 +1729,7 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     /* Qwen always passes cu_seqlens, so fill_paged takes q_len = min(band, total_q). That equals
      * n_tok only for one sequence; a ragged or multi-sequence launch's band is not the host group
      * max, and mixed decode-prefix / prefill-suffix launches use the suffix's own KV lengths. */
-    if (batch->n_seq != 1 || batch->n_tok <= 0 || batch->max_ctx_len <= 0) return 0;
+    if (batch->n_seq != 1 || batch->n_tok <= 0 || m.g.max_ctx <= 0) return 0;
     const int q_len = (int)batch->n_tok;
     const int total_q = (int)batch->n_tok;
     const int num_seqs = 1;
@@ -1741,7 +1741,7 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     constexpr int tile = 48, nwarps = 24;
     const int bq = nwarps * 16 / m.g.gqa();
     const int splits = rad_prefill_splits_for_live(bq, tile, q_len, total_q, num_seqs,
-                                                    kv_heads, batch->max_ctx_len, used, wgps);
+                                                    kv_heads, m.g.max_ctx, used, wgps);
     return rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
 }
 

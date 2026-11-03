@@ -1885,7 +1885,7 @@ RadModelMeta qwen4exp_meta() {
 TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
     RadModelMeta meta = qwen4exp_meta();
     RadBuildCtx build = build_ctx(0, 1);
-    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 0; build.max_ctx = 4096;
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 0; build.max_ctx = 65536;
     RadBuilder graph;
     REQUIRE_EQ(qwen4exp_fp8::declare(&graph, &meta, &build), RAD_OK);
     rad_kvgroup kv_full = 0;
@@ -1902,7 +1902,8 @@ TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
     RadBatch batch{};
     batch.phase = RAD_PHASE_PREFILL;
     batch.n_tok = 64; batch.n_seq = 1; batch.max_q_len = 64;
-    batch.max_ctx_len = 4096; batch.n_kv_groups = 1; batch.kv = &group;
+    /* The split law uses the declared launch context, not this rounded live-batch bound. */
+    batch.max_ctx_len = 1024; batch.n_kv_groups = 1; batch.kv = &group;
     int32_t used[1] = {2304};
     const uint64_t key6 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
     CHECK(key6 != 0);
@@ -1910,6 +1911,12 @@ TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
     CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), key6);
     used[0] = 3072;
     CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != key6);
+
+    /* Same rounded live bound, different exact grids under the launcher's model context. */
+    used[0] = 896;
+    const uint64_t key_896 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    used[0] = 1152;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != key_896);
 
     /* A shorter one-sequence chunk still proves q_len = n_tok; do not require the model max_tok. */
     used[0] = 2304;

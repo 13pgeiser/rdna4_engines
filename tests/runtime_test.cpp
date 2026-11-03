@@ -50,6 +50,7 @@ struct Rec {
     RadTensor   t[8]{};
     long long   M = -1;
     int         rank = 0, world = 0;
+    int32_t     kv_used_max_h = -1;
     void*       scratch = nullptr;
     int64_t     scratch_bytes = 0;
     void*       instance = nullptr;
@@ -67,6 +68,7 @@ static int record(const char* name, const RadArgs* a, RadStream s) {
     rad_args_geti(a, "M", &r.M);
     r.rank = a->rank;
     r.world = a->world_size;
+    r.kv_used_max_h = a->kv_used_max_h;
     r.scratch = a->scratch;
     r.scratch_bytes = a->scratch_bytes;
     r.instance = a->instance;
@@ -2337,9 +2339,10 @@ static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const in
     if (!c || !b || !used) return 0;
     const int bq = 192, tile = 48, kv_heads = 4, threads = 768;
     const int wgps = rad_ctx_wgp_count(c);
+    constexpr int declared_max_ctx = 65536;
     const int splits = rad_prefill_splits_for_live(bq, tile, (int)b->max_q_len,
                                                     (int)b->n_tok, (int)b->n_seq, kv_heads,
-                                                    b->max_ctx_len, used[0], wgps);
+                                                    declared_max_ctx, used[0], wgps);
     return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
 }
 
@@ -2377,6 +2380,53 @@ TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {
         b.draft_pass = 0;
         CHECK(f.ctx.pass_key(&b) != 0);  // Ordinary decode remains recordable.
     }
+}
+
+TEST(issue_passes_only_proven_kv_host_summaries) {
+    Fixture f;
+    rad_op op = f.add_op("rope", "M", { 8192 }, { k_pre }, { "prefill" }, nullptr, {});
+    CHECK_OK(f.start());
+
+    int32_t used_device[2] = { 896, 1152 }, used_host[2] = { 896, 1152 };
+    int32_t positions_device[128]{}, positions_host[128]{};
+    for (int i = 0; i < 128; ++i) positions_host[i] = 2048 + i;
+    RadKVGroupBatch kv{};
+    kv.group = 1;
+    kv.seqused = used_device;
+    kv.seqused_h = used_host;
+    int32_t used_max[1] = { 1152 };
+    f.batch.n_kv_groups = 1;
+    f.batch.kv = &kv;
+    f.batch.kv_used_max_h = used_max;
+    f.batch.positions = positions_device;
+    f.batch.positions_h = positions_host;
+
+    auto issue = [&](const int32_t* ptr, int rows, int batch_seqs, int phase, int n_spec) -> int32_t {
+        f.batch.phase = phase;
+        f.batch.n_tok = 128;
+        f.batch.n_seq = batch_seqs;
+        f.batch.n_spec = n_spec;
+        g_rec.clear();
+        g_body = [&](Ctx& c) {
+            const RadOperand arg[1] = { RAD_P_T2(ptr, RAD_I32, rows, 1) };
+            (void)c.issue(op, arg, 1, RAD_N_BATCH);
+        };
+        const int status = f.ctx.run_step(&f.batch);
+        g_body = nullptr;
+        if (status < 0 || g_rec.size() != 1) return -999;
+        return g_rec[0].kv_used_max_h;
+    };
+
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // full group maximum
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_PREFILL, 0), 1152); // exact sequence slice
+    CHECK_EQ(issue(used_device, 1, 2, RAD_PHASE_PREFILL, 0), 896); // first sequence only
+    CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_PREFILL, 0), -1); // out-of-range span
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_MIXED, 0), 1152); // mixed prefill slice
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 1), 1152); // exact speculative operand
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_PREFILL, 0), positions_host[64]);
+    CHECK_EQ(issue(positions_device + 128, 1, 1, RAD_PHASE_PREFILL, 0), -1); // past step end
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_MIXED, 0), -1);
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_PREFILL, 1), -1);
 }
 
 TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {

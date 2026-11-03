@@ -6977,6 +6977,10 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
         REQUIRE(chunk != nullptr);
         REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
         const RadKVGroupBatch& paged = chunk->kv[0];
+        REQUIRE(paged.seqused_h != nullptr);
+        REQUIRE(chunk->positions_h != nullptr);
+        CHECK_EQ(paged.seqused_h[0], paged.seqused[0]);
+        CHECK_EQ(chunk->positions_h[0], chunk->positions[0]);
         int32_t used_max = 0;
         for (int64_t i = 0; i < chunk->n_seq; ++i)
             used_max = std::max(used_max, paged.seqused[i]);
@@ -6993,6 +6997,10 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
     const RadBatch* rb = f.sch.step();
     REQUIRE(rb != nullptr);
     CHECK_EQ(rb->kv_used_max_h[0], rb->kv[0].seqused[0]);
+    REQUIRE(rb->kv[0].seqused_h != nullptr);
+    REQUIRE(rb->positions_h != nullptr);
+    CHECK_EQ(rb->kv[0].seqused_h[0], rb->kv[0].seqused[0]);
+    CHECK_EQ(rb->positions_h[0], rb->positions[0]);
     CHECK_EQ(f.sch.plan().e[0].ctx_len, 160);
     CHECK_EQ(f.sch.plan().e[0].n_tokens, 1);
     CHECK(f.sch.plan().e[0].produces_token);

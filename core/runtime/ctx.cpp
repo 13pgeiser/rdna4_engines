@@ -371,6 +371,7 @@ int Ctx::bind_ops() {
                     ip.args.instance      = r.instance;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
+                    ip.args.wgp_count     = wgp_count_;
                     /* A launch that ends its own link hold gets the hold word as an extra
                      * `link_gate` parameter after the geometry's. */
                     if (r.row->releases_link)
@@ -946,11 +947,13 @@ int Ctx::lane_join(int from, int to) {
 
 /* The key below reads every RadBatch field a pass's shape or arguments can depend on, by hand. A
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
- * size here. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are never
- * recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 424,
+ * size here. The ABI-35 host mirrors are used by issue-time split selection; unsupported dynamic
+ * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
+ * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
+ * never recorded (below). */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 432,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {

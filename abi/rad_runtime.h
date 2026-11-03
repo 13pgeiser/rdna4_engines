@@ -68,8 +68,10 @@ typedef struct RadKVGroupBatch {
     int64_t     state_index_pitch;
     int64_t     block_size;
     int64_t     max_blocks;
-    /* Null unless this group streams (RadKVStream). Trailing and zero-defaulted. */
+    /* Null unless this group streams (RadKVStream). */
     const RadKVStream* stream;
+    /* ABI 35: host mirror of seqused, retained through this batch for exact sliced-launch bounds. */
+    const int32_t* seqused_h;
 } RadKVGroupBatch;
 
 typedef struct RadBatch {
@@ -334,6 +336,9 @@ typedef struct RadBatch {
     /* ---- appended in ABI 34: host-side max seqused per entry of kv[], for an architecture's
      * optional recorded-pass geometry key. Null when the batch has no host summary. */
     const int32_t* kv_used_max_h;
+    /* ABI 35: host mirror of positions, for a one-sequence prefill op whose exact KV bound is the
+     * position immediately after its first query piece. Valid through the batch's issue pass. */
+    const int32_t* positions_h;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
