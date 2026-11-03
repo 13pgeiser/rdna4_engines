@@ -3827,7 +3827,9 @@ Two pitfalls:
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
 
-`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
+`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics. Its first screen shows
+totals over the selected time range (prompt tokens in, prompt tokens read from cache, prompt tokens
+computed, tokens out, requests) and the live status; the detail panels are below.
 
 ### 6.4 The live terminal view
 
